@@ -102,7 +102,9 @@ public sealed record OrchestratorSettingsUpdate(
 /// <param name="Url">Remote clone URL of the repository.</param>
 /// <param name="DefaultBranch">Default branch to use (e.g. "main").</param>
 /// <param name="Release">Optional release automation configuration.</param>
-public sealed record RepositoryRequest(string Name, string Url, string DefaultBranch, ReleaseRepoConfig? Release = null);
+/// <param name="MonitorCi">Whether CI monitoring is enabled for this repository.</param>
+/// <param name="CiTimeoutMinutes">Timeout in minutes before a CI run is considered failed.</param>
+public sealed record RepositoryRequest(string Name, string Url, string DefaultBranch, ReleaseRepoConfig? Release = null, bool? MonitorCi = null, int? CiTimeoutMinutes = null);
 
 /// <summary>
 /// Describes Composer setting changes to apply. Each field is applied only when non-null.
@@ -668,24 +670,32 @@ public sealed class ConfigModelService
     /// <param name="url">Remote clone URL.</param>
     /// <param name="defaultBranch">Default branch (falls back to "main" when empty).</param>
     /// <param name="release">Optional release automation configuration.</param>
+    /// <param name="monitorCi">Whether CI monitoring is enabled, or <c>null</c> to use the default (<c>false</c>).</param>
+    /// <param name="ciTimeoutMinutes">CI timeout in minutes, or <c>null</c> to use the default (<c>30</c>). Must be 1-120 when provided.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task AddRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, CancellationToken ct = default)
+    public async Task AddRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
         ValidateRepositoryName(name);
         if (string.IsNullOrWhiteSpace(url))
             throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
 
+        if (ciTimeoutMinutes is < 1 or > 120)
+            throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
+
         if (_config.Repositories.Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"Repository '{name}' already exists");
 
         var branch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
-        _config.Repositories.Add(new RepositoryConfig
+        var newRepo = new RepositoryConfig
         {
             Name = name,
             Url = url,
             DefaultBranch = branch,
             Release = NormalizeRelease(release)
-        });
+        };
+        if (monitorCi.HasValue) newRepo.MonitorCi = monitorCi.Value;
+        if (ciTimeoutMinutes.HasValue) newRepo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
+        _config.Repositories.Add(newRepo);
 
         var message = $"chore: add repository '{name}'";
         _logger.LogInformation("Adding repository: {Name} ({Url})", name, url);
@@ -706,12 +716,17 @@ public sealed class ConfigModelService
     /// <param name="url">New remote clone URL.</param>
     /// <param name="defaultBranch">New default branch.</param>
     /// <param name="release">New release configuration, or <c>null</c> to leave unchanged.</param>
+    /// <param name="monitorCi">Whether CI monitoring is enabled, or <c>null</c> to leave unchanged.</param>
+    /// <param name="ciTimeoutMinutes">CI timeout in minutes, or <c>null</c> to leave unchanged. Must be 1-120 when provided.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, CancellationToken ct = default)
+    public async Task UpdateRepositoryAsync(string name, string url, string defaultBranch, ReleaseRepoConfig? release = null, bool? monitorCi = null, int? ciTimeoutMinutes = null, CancellationToken ct = default)
     {
         ValidateRepositoryName(name);
         if (string.IsNullOrWhiteSpace(url))
             throw new ArgumentException("Repository URL cannot be null or empty.", nameof(url));
+
+        if (ciTimeoutMinutes is < 1 or > 120)
+            throw new ArgumentException("CI timeout must be between 1 and 120 minutes.");
 
         var repo = _config.Repositories
             .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -722,6 +737,8 @@ public sealed class ConfigModelService
         repo.DefaultBranch = string.IsNullOrEmpty(defaultBranch) ? "main" : defaultBranch;
         if (release is not null)
             repo.Release = NormalizeRelease(release);
+        if (monitorCi.HasValue) repo.MonitorCi = monitorCi.Value;
+        if (ciTimeoutMinutes.HasValue) repo.CiTimeoutMinutes = ciTimeoutMinutes.Value;
 
         var message = $"chore: update repository '{name}'";
         _logger.LogInformation("Updating repository: {Name} ({Url})", name, url);

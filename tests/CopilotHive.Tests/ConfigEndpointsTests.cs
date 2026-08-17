@@ -137,6 +137,169 @@ public class ConfigEndpointsTests
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
 
+    // ── POST/PUT /api/config/repositories — CI monitoring fields ─────────────────
+    // These tests use CustomEndpointFactory (registered ConfigModelService + fake
+    // config repo) so the endpoints perform real CRUD and the config is observable.
+
+    [Fact]
+    public async Task PostRepository_WithMonitorCiAndTimeout_Returns200AndPersists()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-repo-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existing is not null) services.Remove(existing);
+                services.AddSingleton<IBrainRepoManager>(new ConfigurableFakeBranchRepoManager(["main"]));
+            });
+        });
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main", monitorCi = true, ciTimeoutMinutes = 45 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var repo = Assert.Single(baseFactory.Config.Repositories);
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(45, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task PostRepository_ZeroCiTimeout_Returns400BadRequest()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-repo-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existing is not null) services.Remove(existing);
+                services.AddSingleton<IBrainRepoManager>(new ConfigurableFakeBranchRepoManager(["main"]));
+            });
+        });
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "bad-repo", url = "https://github.com/org/bad-repo.git", defaultBranch = "main", monitorCi = true, ciTimeoutMinutes = 0 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(baseFactory.Config.Repositories);
+    }
+
+    [Fact]
+    public async Task PutRepository_WithMonitorCi_Returns200AndUpdates()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-repo-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existing is not null) services.Remove(existing);
+                services.AddSingleton<IBrainRepoManager>(new ConfigurableFakeBranchRepoManager(["main"]));
+            });
+        });
+        using var client = factory.CreateClient();
+
+        // Seed a repository first.
+        var postResponse = await client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main" },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
+
+        var putResponse = await client.PutAsJsonAsync(
+            "/api/config/repositories/ci-repo",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main", monitorCi = true },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, putResponse.StatusCode);
+        var repo = Assert.Single(baseFactory.Config.Repositories);
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(30, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task PutRepository_WithCiTimeout_Returns200AndPersists()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-repo-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existing is not null) services.Remove(existing);
+                services.AddSingleton<IBrainRepoManager>(new ConfigurableFakeBranchRepoManager(["main"]));
+            });
+        });
+        using var client = factory.CreateClient();
+
+        // Seed a repository first.
+        var postResponse = await client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main", monitorCi = true, ciTimeoutMinutes = 30 },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
+
+        var putResponse = await client.PutAsJsonAsync(
+            "/api/config/repositories/ci-repo",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main", monitorCi = true, ciTimeoutMinutes = 90 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, putResponse.StatusCode);
+        var repo = Assert.Single(baseFactory.Config.Repositories);
+        Assert.True(repo.MonitorCi);
+        Assert.Equal(90, repo.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task PutRepository_OutOfRangeCiTimeout_Returns400BadRequest()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-repo-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                var existing = services.SingleOrDefault(d => d.ServiceType == typeof(IBrainRepoManager));
+                if (existing is not null) services.Remove(existing);
+                services.AddSingleton<IBrainRepoManager>(new ConfigurableFakeBranchRepoManager(["main"]));
+            });
+        });
+        using var client = factory.CreateClient();
+
+        // Seed a repository first.
+        var postResponse = await client.PostAsJsonAsync(
+            "/api/config/repositories",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main" },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, postResponse.StatusCode);
+
+        var putResponse = await client.PutAsJsonAsync(
+            "/api/config/repositories/ci-repo",
+            new { name = "ci-repo", url = "https://github.com/org/ci-repo.git", defaultBranch = "main", ciTimeoutMinutes = 121 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, putResponse.StatusCode);
+        // The original value must be unchanged.
+        var repo = Assert.Single(baseFactory.Config.Repositories);
+        Assert.Equal(30, repo.CiTimeoutMinutes);
+    }
+
     // ── RepositoryRequest.Release JSON binding (System.Text.Json) ────────────────
     // These tests deserialize JSON directly into RepositoryRequest to prove the
     // Release field binds via camelCase property names. They FAIL if the Release

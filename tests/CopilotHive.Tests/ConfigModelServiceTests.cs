@@ -696,7 +696,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.Equal("my-repo", added.Name);
@@ -713,7 +713,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
-            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, TestContext.Current.CancellationToken);
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, ct: TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.NotNull(added.Release);
@@ -729,7 +729,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
-            new ReleaseRepoConfig(), TestContext.Current.CancellationToken);
+            new ReleaseRepoConfig(), ct: TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.Null(added.Release);
@@ -743,7 +743,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
-            new ReleaseRepoConfig { MergeTo = "main", TagBranch = null }, TestContext.Current.CancellationToken);
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = null }, ct: TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.NotNull(added.Release);
@@ -758,10 +758,10 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.AddRepositoryAsync("MY-REPO", "https://github.com/org/other.git", "develop", release: null, TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("MY-REPO", "https://github.com/org/other.git", "develop", release: null, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -771,7 +771,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "", release: null, ct: TestContext.Current.CancellationToken);
 
         var added = Assert.Single(config.Repositories);
         Assert.Equal("main", added.DefaultBranch);
@@ -784,7 +784,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -804,7 +804,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "develop", release: null, TestContext.Current.CancellationToken);
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "develop", release: null, ct: TestContext.Current.CancellationToken);
 
         var updated = Assert.Single(config.Repositories);
         Assert.Equal("https://github.com/org/new.git", updated.Url);
@@ -832,7 +832,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
-            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, TestContext.Current.CancellationToken);
+            new ReleaseRepoConfig { MergeTo = "main", TagBranch = "main" }, ct: TestContext.Current.CancellationToken);
 
         var updated = Assert.Single(config.Repositories);
         Assert.Equal("main", updated.Release!.MergeTo);
@@ -859,7 +859,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         var updated = Assert.Single(config.Repositories);
         Assert.Equal("develop", updated.Release!.MergeTo);
@@ -887,7 +887,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
-            new ReleaseRepoConfig(), TestContext.Current.CancellationToken);
+            new ReleaseRepoConfig(), ct: TestContext.Current.CancellationToken);
 
         var updated = Assert.Single(config.Repositories);
         Assert.Null(updated.Release);
@@ -901,7 +901,120 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            svc.UpdateRepositoryAsync("missing", "https://github.com/org/new.git", "main", release: null, TestContext.Current.CancellationToken));
+            svc.UpdateRepositoryAsync("missing", "https://github.com/org/new.git", "main", release: null, ct: TestContext.Current.CancellationToken));
+    }
+
+    // ── CI monitoring fields ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AddRepositoryAsync_WithMonitorCiAndTimeout_SetsBoth()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+            monitorCi: true, ciTimeoutMinutes: 45, ct: TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.True(added.MonitorCi);
+        Assert.Equal(45, added.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_NullMonitorCiAndTimeout_RetainsDefaults()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+            release: null, monitorCi: null, ciTimeoutMinutes: null, ct: TestContext.Current.CancellationToken);
+
+        var added = Assert.Single(config.Repositories);
+        Assert.False(added.MonitorCi);
+        Assert.Equal(30, added.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_ZeroCiTimeout_Throws()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+                ciTimeoutMinutes: 0, ct: TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task AddRepositoryAsync_CiTimeoutAboveRange_Throws()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig(), Repositories = [] };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main",
+                ciTimeoutMinutes: 121, ct: TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_WithMonitorCi_SetsItAndPreservesTimeout()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    CiTimeoutMinutes = 45
+                }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
+            monitorCi: true, ct: TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.True(updated.MonitorCi);
+        Assert.Equal(45, updated.CiTimeoutMinutes);
+    }
+
+    [Fact]
+    public async Task UpdateRepositoryAsync_NullMonitorCiAndTimeout_PreservesExistingValues()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "my-repo",
+                    Url = "https://github.com/org/old.git",
+                    DefaultBranch = "main",
+                    MonitorCi = true,
+                    CiTimeoutMinutes = 60
+                }
+            ]
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateRepositoryAsync("my-repo", "https://github.com/org/new.git", "main",
+            release: null, monitorCi: null, ciTimeoutMinutes: null, ct: TestContext.Current.CancellationToken);
+
+        var updated = Assert.Single(config.Repositories);
+        Assert.True(updated.MonitorCi);
+        Assert.Equal(60, updated.CiTimeoutMinutes);
     }
 
     // ── RemoveRepositoryAsync tests ──────────────────────────────────────────
@@ -1154,7 +1267,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("my-repo", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
         Assert.Contains("my-repo", yaml);
@@ -1224,7 +1337,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repoManager = new FakeBrainRepoManager();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
 
-        await svc.AddRepositoryAsync("test-repo", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken);
+        await svc.AddRepositoryAsync("test-repo", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken);
 
         var call = Assert.Single(repoManager.CloneCalls);
         Assert.Equal("test-repo", call.Name);
@@ -1244,7 +1357,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repoManager = new FakeBrainRepoManager();
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance, null, repoManager);
 
-        await svc.UpdateRepositoryAsync("existing-repo", "https://new.com/repo.git", "develop", release: null, TestContext.Current.CancellationToken);
+        await svc.UpdateRepositoryAsync("existing-repo", "https://new.com/repo.git", "develop", release: null, ct: TestContext.Current.CancellationToken);
 
         var call = Assert.Single(repoManager.CloneCalls);
         Assert.Equal("existing-repo", call.Name);
@@ -1262,7 +1375,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.AddRepositoryAsync("../../etc", "https://github.com/org/repo.git", "main", release: null, TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("../../etc", "https://github.com/org/repo.git", "main", release: null, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -1273,7 +1386,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            svc.AddRepositoryAsync("test-repo", "", "main", release: null, TestContext.Current.CancellationToken));
+            svc.AddRepositoryAsync("test-repo", "", "main", release: null, ct: TestContext.Current.CancellationToken));
     }
 
     // ── Description on available models ──────────────────────────────────────

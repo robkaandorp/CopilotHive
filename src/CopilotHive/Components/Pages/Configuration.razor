@@ -681,6 +681,18 @@ else
                             <label style="color:var(--text-muted);font-size:0.9rem">Tag branch on release (e.g. main)</label>
                             <input @bind="_newRepoTagBranch" placeholder="main (optional)"
                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+                            <label style="color:var(--text-muted);font-size:0.9rem">CI Monitoring</label>
+                            <div style="display:flex;gap:0.75rem;align-items:center">
+                                <label style="font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" @bind="_newRepoMonitorCi" /> Monitor CI after goal merges
+                                </label>
+                                @if (_newRepoMonitorCi)
+                                {
+                                    <input type="number" @bind="_newRepoCiTimeout" placeholder="30" min="1" max="120"
+                                           style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:5rem" />
+                                    <span style="color:var(--text-muted);font-size:0.8rem">min timeout</span>
+                                }
+                            </div>
                             <div style="grid-column:2;color:var(--text-muted);font-size:0.8rem">Branch dropdowns are available when editing an existing repository.</div>
                         </div>
                         <div style="margin-top:1rem;display:flex;gap:0.75rem">
@@ -708,6 +720,7 @@ else
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Default Branch</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Merge To</th>
                                 <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Tag Branch</th>
+                                <th style="text-align:left;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">CI Monitor</th>
                                 <th style="text-align:right;padding:0.5rem;color:var(--text-muted);font-size:0.85rem;font-weight:600">Actions</th>
                             </tr>
                         </thead>
@@ -796,6 +809,17 @@ else
                                                 }
                                             </select>
                                         </td>
+                                        <td style="padding:0.5rem">
+                                            <label style="font-size:0.85rem;cursor:pointer">
+                                                <input type="checkbox" @bind="_editRepoMonitorCi" /> Monitor CI
+                                            </label>
+                                            @if (_editRepoMonitorCi)
+                                            {
+                                                <input type="number" @bind="_editRepoCiTimeout" min="1" max="120"
+                                                       style="padding:0.35rem 0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;width:5rem;margin-left:0.5rem" />
+                                                <span style="color:var(--text-muted);font-size:0.8rem">min</span>
+                                            }
+                                        </td>
                                         <td style="padding:0.5rem;text-align:right">
                                             <button class="approve-btn" disabled="@_repoSaving" @onclick="SaveEditRepoAsync">💾 Save</button>
                                             <button class="approve-btn" @onclick="CancelEditRepo">Cancel</button>
@@ -808,6 +832,7 @@ else
                                         <td style="padding:0.5rem;font-size:0.9rem">@r.DefaultBranch</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.MergeTo ?? "—")</td>
                                         <td style="padding:0.5rem;font-size:0.9rem">@(r.Release?.TagBranch ?? "—")</td>
+                                        <td style="padding:0.5rem;font-size:0.9rem">@(r.MonitorCi ? $"✅ {r.CiTimeoutMinutes}min" : "—")</td>
                                         <td style="padding:0.5rem">
                                             <div style="display:flex;gap:0.5rem;justify-content:flex-end">
                                                 <button class="approve-btn" @onclick="() => StartEditRepo(r)">✏️ Edit</button>
@@ -1038,7 +1063,9 @@ else
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("url")] string Url,
         [property: JsonPropertyName("defaultBranch")] string DefaultBranch,
-        [property: JsonPropertyName("release")] ReleaseDto? Release);
+        [property: JsonPropertyName("release")] ReleaseDto? Release,
+        [property: JsonPropertyName("monitorCi")] bool MonitorCi,
+        [property: JsonPropertyName("ciTimeoutMinutes")] int CiTimeoutMinutes);
 
     private sealed record ReleaseDto(
         [property: JsonPropertyName("mergeTo")] string? MergeTo,
@@ -1153,11 +1180,15 @@ else
     private string _newRepoDefaultBranch = "main";
     private string _newRepoMergeTo = "";
     private string _newRepoTagBranch = "";
+    private bool _newRepoMonitorCi = false;
+    private int _newRepoCiTimeout = 30;
     private string? _editingRepoName;
     private string _editRepoUrl = "";
     private string _editRepoDefaultBranch = "main";
     private string _editRepoMergeTo = "";
     private string _editRepoTagBranch = "";
+    private bool _editRepoMonitorCi = false;
+    private int _editRepoCiTimeout = 30;
     private List<string>? _repoBranches;
     private bool _loadingBranches;
     private bool _branchLoadError;
@@ -1652,12 +1683,13 @@ else
                 release = new { mergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch };
             }
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release }, ReasoningEffortOptions.JsonOptions),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release, monitorCi = _newRepoMonitorCi, ciTimeoutMinutes = _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PostAsync("/api/config/repositories", body);
             if (response.IsSuccessStatusCode)
             {
                 _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main"; _newRepoMergeTo = ""; _newRepoTagBranch = "";
+                _newRepoMonitorCi = false; _newRepoCiTimeout = 30;
                 _showAddRepoForm = false;
                 await LoadRepositoriesAsync();
                 _repoSuccess = "✅ Repository added and cloned";
@@ -1684,6 +1716,8 @@ else
         _editRepoDefaultBranch = repo.DefaultBranch;
         _editRepoMergeTo = repo.Release?.MergeTo ?? "";
         _editRepoTagBranch = repo.Release?.TagBranch ?? "";
+        _editRepoMonitorCi = repo.MonitorCi;
+        _editRepoCiTimeout = repo.CiTimeoutMinutes == 0 ? 30 : repo.CiTimeoutMinutes;
         _repoError = null; _repoSuccess = null;
 
         _repoBranches = null;
@@ -1742,7 +1776,7 @@ else
                 tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
             };
             var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release }, ReasoningEffortOptions.JsonOptions),
+                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release, monitorCi = _editRepoMonitorCi, ciTimeoutMinutes = _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8, "application/json");
             var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
             if (response.IsSuccessStatusCode)
