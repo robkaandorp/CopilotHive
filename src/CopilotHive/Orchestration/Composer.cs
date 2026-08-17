@@ -442,6 +442,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
     public bool IsConnected => _agentService.IsConnected;
 
+    /// <summary>
+    /// Whether the current Composer session was loaded from disk during connection
+    /// and the connection succeeded.
+    /// </summary>
+    internal bool SessionLoadedFromDisk => _agentService.SessionLoadedFromDisk;
+
+    /// <summary>
+    /// Returns the last session activity timestamp when the Composer is connected,
+    /// or <c>null</c> when disconnected.
+    /// </summary>
+    internal DateTimeOffset? GetLastSessionActivity()
+        => _agentService.IsConnected ? _agentService.Session.LastActivityAt : null;
+
     /// <summary>Returns the system prompt used by the Composer.</summary>
     internal string GetSystemPrompt() => _systemPrompt;
 

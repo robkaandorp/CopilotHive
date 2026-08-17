@@ -128,6 +128,7 @@ public sealed class Program
             // Event bus: typed system events broadcast to subscribers (e.g. the Composer)
             builder.Services.AddSingleton<IEventBus, EventBus>();
             builder.Services.AddSingleton<ComposerEventSubscriber>();
+            builder.Services.AddSingleton<EventBusStartupScanner>();
 
             // Agents: AGENTS.md versioning and rollback
             var agentsDir = Environment.GetEnvironmentVariable("AGENTS_DIR") ?? Path.Combine(AppContext.BaseDirectory, "agents");
@@ -659,6 +660,23 @@ public sealed class Program
                 {
                     logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
                 }
+            }
+
+            // Event bus startup scan: reconstructs events for state changes that happened
+            // while the orchestrator was down (goals completed/failed, issues raised/resolved,
+            // releases completed) so the Composer is aware of them. Fire-and-forget so startup
+            // is never blocked, and bound to the application lifetime so shutdown stops it.
+            // The scan runs regardless of Composer connection state. Skipped in the Testing
+            // environment so integration tests are not polluted by reconstructed events.
+            var startupScanner = app.Services.GetService<EventBusStartupScanner>();
+            if (startupScanner is not null && !app.Environment.IsEnvironment("Testing"))
+            {
+                var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+                _ = Task.Run(async () =>
+                {
+                    try { await startupScanner.ScanAsync(appLifetime.ApplicationStopping); }
+                    catch (Exception ex) { logger.LogWarning(ex, "Event bus startup scan failed"); }
+                }, appLifetime.ApplicationStopping);
             }
 
             // Composer model-management REST API

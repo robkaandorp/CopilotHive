@@ -78,6 +78,12 @@ internal sealed class ComposerAgentService(
     private AgentOptions? _agentOptions;
 
     /// <summary>
+    /// Whether the current session was loaded from disk during <see cref="ConnectAsync"/>
+    /// and the connection succeeded. False for fresh sessions or failed connections.
+    /// </summary>
+    private bool _sessionLoadedFromDisk;
+
+    /// <summary>
     /// Channel-fed consumer holding the current sub-agent status snapshot. Created lazily when the
     /// agent is (re)created and torn down with the rest of the connection state.
     /// </summary>
@@ -146,6 +152,12 @@ internal sealed class ComposerAgentService(
 
     /// <summary>Whether both the chat client and the agent exist.</summary>
     public bool IsConnected => _chatClient is not null && _agent is not null;
+
+    /// <summary>
+    /// Whether the current session was loaded from disk during <see cref="ConnectAsync"/>
+    /// and the connection succeeded. False for fresh sessions or failed connections.
+    /// </summary>
+    public bool SessionLoadedFromDisk => _sessionLoadedFromDisk;
 
     /// <summary>The current model identifier.</summary>
     public string Model => _model;
@@ -319,6 +331,15 @@ internal sealed class ComposerAgentService(
     /// </summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        // LITERALLY the first statement — before the log call below, before teardown, before
+        // anything else fallible. Every operation in this method can throw (ILogger.Log is no
+        // exception: a logger or provider may throw), and any throw exits ConnectAsync. If the
+        // flag were still carrying `true` from a prior successful disk-loaded connection, a
+        // failed reconnect would report a live loaded session that no longer exists. The flag
+        // must only ever mean "session was loaded from disk AND this connection attempt
+        // succeeded", so every invocation starts from `false` with nothing able to run first.
+        _sessionLoadedFromDisk = false;
+
         _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
 
         // Reconnect: dispose old agent + clients. Operation-failure cleanup via SafeDispose in
@@ -340,11 +361,19 @@ internal sealed class ComposerAgentService(
         }
 
         var sessionFile = GetSessionFilePath();
+
+        // Tracked locally and committed to the field only after EVERY step of ConnectAsync has
+        // succeeded (see the end of this method). Assigning the field here instead would let a
+        // later failure — RecreateAgentAsync, the registry update, or any step added in future —
+        // return/throw with a `true` flag that no longer means "connection succeeded".
+        var loadedFromDisk = false;
+
         if (File.Exists(sessionFile))
         {
             try
             {
                 _session = await AgentSession.LoadAsync(sessionFile, ct);
+                loadedFromDisk = true;
                 _logger.LogInformation("Loaded Composer session with {Count} messages from {File}",
                     _session.MessageHistory.Count, sessionFile);
             }
@@ -357,11 +386,13 @@ internal sealed class ComposerAgentService(
             {
                 _logger.LogWarning(ex, "Composer session file {File} is corrupt — starting fresh", sessionFile);
                 _session = AgentSession.Create("composer");
+                loadedFromDisk = false;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
                 or DirectoryNotFoundException or FileNotFoundException)
             {
                 _logger.LogWarning(ex, "Failed to read Composer session from {File} — keeping current session", sessionFile);
+                loadedFromDisk = false;
             }
             catch
             {
@@ -393,6 +424,11 @@ internal sealed class ComposerAgentService(
 
         _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
             _model, _maxContextTokens);
+
+        // Commit last: reaching this point means the session was loaded from disk AND the whole
+        // connection succeeded. Every earlier exit path leaves the field at the `false` set at
+        // the top of the method.
+        _sessionLoadedFromDisk = loadedFromDisk;
     }
 
     /// <summary>
@@ -590,6 +626,7 @@ internal sealed class ComposerAgentService(
         await DisposeAgentAsync(oldAgent);
 
         _session = AgentSession.Create("composer");
+        _sessionLoadedFromDisk = false;
 
         // _agent is already null, so RecreateAgentAsync's own disposal step is a no-op; it
         // simply builds the new agent over the freshly created session.
