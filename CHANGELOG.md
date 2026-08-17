@@ -1,3 +1,14 @@
+## [0.30.0] — 2026-08-17
+
+### Added
+
+- **CI Monitoring** — CopilotHive optionally monitors CI status after goal merges via the GitHub check-runs API. On success, a `CiSucceeded` event is published to the Composer event bus. On failure, issues are automatically created from test failures and a `CiFailed` event is published. Configurable per repository via `monitor_ci` and `ci_timeout_minutes` in `hive-config.yaml` or the Configuration dashboard page. Includes startup scan for restart recovery. (`copilothive-ci-monitor-config`, `copilothive-ci-monitor-service`, `copilothive-ci-monitor-startup-scan`, `copilothive-ci-monitor-config-ui`)
+
+### Fixed
+
+- **.gitignore hygiene** — Added `*.log` and `*.trx` patterns to `.gitignore` to prevent generated test/build output from being committed. (`copilothive-fix-gitignore-log`)
+- **CI Monitor edit layout** — Fixed the CI Monitor column layout in the Configuration page's repository edit row. Checkbox, timeout input, and "min" label now stay on one line via flex layout. (`copilothive-fix-ci-monitor-edit-layout`)
+
 ## [0.29.0] — 2026-08-16
 
 ### Added
