@@ -355,11 +355,11 @@ public sealed class DashboardNotifierWorkerWiringTests
         var hung = MakeWorker("hung");
         hung.IsBusy = true;
         hung.CurrentTaskId = "t";
-        hung.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-90);
+        hung.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
 
         var poolMock = MakePoolMock();
         poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([hung]);
-        poolMock.Setup(p => p.RemoveWorker("hung")).Returns(true);
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("hung", It.IsAny<TimeSpan>())).Returns(true);
         var (svc, count) = CreateCleanup(poolMock.Object);
 
         await svc.RunCleanupCycleAsync();
@@ -367,17 +367,21 @@ public sealed class DashboardNotifierWorkerWiringTests
         Assert.Equal(1, count[0]);
     }
 
+    /// <summary>
+    /// When the atomic re-check refuses the eviction (activity arrived after selection), nothing
+    /// changed in the pool — so the dashboard must not be notified.
+    /// </summary>
     [Fact]
-    public async Task Cleanup_TimedOutWorkerRemoveReturnsFalse_DoesNotNotify()
+    public async Task Cleanup_TimedOutWorkerStillActive_DoesNotNotify()
     {
         var hung = MakeWorker("hung");
         hung.IsBusy = true;
         hung.CurrentTaskId = "t";
-        hung.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-90);
+        hung.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
 
         var poolMock = MakePoolMock();
         poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([hung]);
-        poolMock.Setup(p => p.RemoveWorker("hung")).Returns(false);
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("hung", It.IsAny<TimeSpan>())).Returns(false);
         var (svc, count) = CreateCleanup(poolMock.Object);
 
         await svc.RunCleanupCycleAsync();
@@ -473,6 +477,186 @@ public sealed class DashboardNotifierWorkerWiringTests
 
         Assert.False(state.ContainsKey("ws-false"));
         Assert.Equal(0, count[0]);
+    }
+
+    // ── WorkStream activity → LastActivityAt (activity-based stale detection) ──
+
+    /// <summary>
+    /// A ToolRequest message is task-specific stream activity: it must reset
+    /// <see cref="ConnectedWorker.LastActivityAt"/> so the worker is not reclaimed.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_ToolRequest_ResetsLastActivityAt()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-tool", []);
+        worker.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+
+        var reader = new FakeStreamReader([
+            new WorkerMessage
+            {
+                WorkerId = "ws-tool",
+                ToolRequest = new ToolCallRequest
+                {
+                    RequestId = "r1",
+                    TaskId = "t",
+                    ToolName = "unknown-tool",
+                    ArgumentsJson = "{}",
+                },
+            },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        Assert.True(DateTime.UtcNow - worker.LastActivityAt < TimeSpan.FromSeconds(5),
+            "ToolRequest must reset LastActivityAt to ~now");
+    }
+
+    /// <summary>
+    /// A Progress message is task-specific stream activity: it must reset
+    /// <see cref="ConnectedWorker.LastActivityAt"/> so the worker is not reclaimed.
+    /// The update must go through the pool's synchronized activity authority, so the worker
+    /// immediately stops being an inactivity-reclamation candidate.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Progress_ResetsLastActivityAt()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-progress", []);
+        pool.MarkBusy("ws-progress", "t");
+        worker.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+        // Precondition: the worker is currently a reclamation candidate.
+        Assert.Single(pool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60)));
+
+        var reader = new FakeStreamReader([
+            new WorkerMessage
+            {
+                WorkerId = "ws-progress",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "m",
+                },
+            },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        Assert.True(DateTime.UtcNow - worker.LastActivityAt < TimeSpan.FromSeconds(5),
+            "Progress must reset LastActivityAt to ~now");
+        // The refreshed timestamp is no longer past the timeout, so the worker would not be
+        // selected for inactivity-based reclamation.
+        Assert.False(DateTime.UtcNow - worker.LastActivityAt > TimeSpan.FromMinutes(60));
+    }
+
+    /// <summary>
+    /// A Complete message is task-specific stream activity: it must reset
+    /// <see cref="ConnectedWorker.LastActivityAt"/> so the worker is not reclaimed.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Complete_ResetsLastActivityAt()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-complete", []);
+        worker.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+
+        var reader = new FakeStreamReader([
+            new WorkerMessage
+            {
+                WorkerId = "ws-complete",
+                Complete = new CopilotHive.Shared.Grpc.TaskComplete
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
+                    Output = "done",
+                },
+            },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        Assert.True(DateTime.UtcNow - worker.LastActivityAt < TimeSpan.FromSeconds(5),
+            "Complete must reset LastActivityAt to ~now");
+    }
+
+    /// <summary>
+    /// A Ready message is NOT task-specific stream activity: it must NOT reset
+    /// <see cref="ConnectedWorker.LastActivityAt"/>.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Ready_DoesNotResetLastActivityAt()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-ready", []);
+        var oldActivity = DateTime.UtcNow.AddMinutes(-90);
+        worker.LastActivityAt = oldActivity;
+
+        var reader = new FakeStreamReader([
+            new WorkerMessage
+            {
+                WorkerId = "ws-ready",
+                Ready = new WorkerReady(),
+            },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        Assert.Equal(oldActivity, worker.LastActivityAt);
+    }
+
+    /// <summary>
+    /// An unknown / <see cref="WorkerMessage.PayloadOneofCase.None"/> message is NOT
+    /// task-specific stream activity: it must NOT reset <see cref="ConnectedWorker.LastActivityAt"/>.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_UnknownPayload_DoesNotResetLastActivityAt()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-none", []);
+        var oldActivity = DateTime.UtcNow.AddMinutes(-90);
+        worker.LastActivityAt = oldActivity;
+
+        // No payload set → PayloadOneofCase.None → default/unknown branch
+        var reader = new FakeStreamReader([
+            new WorkerMessage { WorkerId = "ws-none" },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        Assert.Equal(oldActivity, worker.LastActivityAt);
+    }
+
+    /// <summary>
+    /// A heartbeat must NOT update <see cref="ConnectedWorker.LastActivityAt"/>: a worker
+    /// that heartbeats but sends no task-specific stream messages is still reclaimed.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_DoesNotUpdateLastActivityAt_WorkerStillReclaimed()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+        var worker = pool.RegisterWorker("ws-hb", []);
+        pool.MarkBusy("ws-hb", "task-hb");
+        var oldActivity = DateTime.UtcNow.AddMinutes(-90);
+        worker.LastActivityAt = oldActivity;
+
+        await service.Heartbeat(
+            new HeartbeatRequest { WorkerId = "ws-hb", Busy = true, ContextUsagePercent = 10 },
+            MockContext());
+
+        // Heartbeat must not count as task activity.
+        Assert.Equal(oldActivity, worker.LastActivityAt);
+
+        // The worker is still reclaimed by the inactivity-based timeout.
+        var timedOut = pool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60));
+        var only = Assert.Single(timedOut);
+        Assert.Equal("ws-hb", only.Id);
     }
 
     // ── HandleTaskComplete → 1 (criterion 17) ────────────────────────────────
@@ -635,6 +819,10 @@ public sealed class DashboardNotifierWorkerWiringTests
         public WriteOptions? WriteOptions { get; set; }
 
         Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(OrchestratorMessage message)
+            => Task.CompletedTask;
+
+        Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(
+            OrchestratorMessage message, CancellationToken cancellationToken)
             => Task.CompletedTask;
     }
 

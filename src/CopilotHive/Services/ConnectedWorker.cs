@@ -22,9 +22,11 @@ public sealed class ConnectedWorker
     public string? CurrentTaskId { get; set; }
     /// <summary>
     /// UTC timestamp when the worker started its current task, or <c>null</c> when idle.
-    /// Used to detect tasks that hang past a wall-clock limit while still heartbeating.
+    /// For display/statistics only. Stale detection uses <see cref="LastActivityAt"/>.
     /// </summary>
     public DateTime? CurrentTaskStartedAt { get; set; }
+    /// <summary>UTC timestamp of the last task-specific stream activity (ToolRequest, Progress, or Complete message). NOT updated by Ready messages or heartbeats. Used for inactivity-based stale detection. A silently processing worker will time out — intentional, as it's indistinguishable from a hung call.</summary>
+    public DateTime LastActivityAt { get; set; } = DateTime.UtcNow;
     /// <summary>UTC timestamp of the last heartbeat received from this worker.</summary>
     public DateTime LastHeartbeat { get; set; } = DateTime.UtcNow;
     /// <summary>UTC timestamp when this worker first connected.</summary>

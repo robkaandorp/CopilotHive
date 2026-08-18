@@ -225,9 +225,10 @@ public sealed class StaleWorkerCleanupServiceTests
     }
 
     /// <summary>
-    /// A worker whose task has run past the wall-clock limit is still heartbeating, so
-    /// PurgeStaleWorkers ignores it. It must still be evicted and its task reclaimed —
-    /// otherwise the pipeline keeps its ActiveTaskId and holds a parallel-goal slot forever.
+    /// A worker whose task has been inactive (no task-specific stream messages) past the
+    /// configured timeout is still heartbeating, so PurgeStaleWorkers ignores it. It must
+    /// still be evicted and its task reclaimed — otherwise the pipeline keeps its
+    /// ActiveTaskId and holds a parallel-goal slot forever.
     /// </summary>
     [Fact]
     public async Task RunCleanupCycle_TaskExceedsTimeout_WorkerRemovedAndTaskReclaimed()
@@ -235,16 +236,101 @@ public sealed class StaleWorkerCleanupServiceTests
         var hung = MakeWorker("worker-hung");
         hung.IsBusy = true;
         hung.CurrentTaskId = "task-hung";
-        hung.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-90);
+        hung.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
 
         var poolMock = MakePoolMock();
         poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([hung]);
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("worker-hung", It.IsAny<TimeSpan>())).Returns(true);
 
         var svc = CreateServiceWithConfig(poolMock.Object, timeoutMinutes: 60);
         await svc.RunCleanupCycleAsync();
 
         poolMock.Verify(p => p.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60)), Times.Once);
-        poolMock.Verify(p => p.RemoveWorker("worker-hung"), Times.Once);
+        // Eviction must go through the atomic re-check, never the unconditional RemoveWorker.
+        poolMock.Verify(p => p.TryRemoveTimedOutWorker("worker-hung", TimeSpan.FromMinutes(60)), Times.Once);
+        poolMock.Verify(p => p.RemoveWorker(It.IsAny<string>()), Times.Never);
+    }
+
+    /// <summary>
+    /// TOCTOU guard at the service level: when the atomic re-check reports the candidate is no
+    /// longer timed out (activity arrived after selection), the worker must NOT be logged as
+    /// reclaimed and its task must NOT be rescheduled.
+    /// </summary>
+    [Fact]
+    public async Task RunCleanupCycle_ActivityArrivedAfterSelection_NotReclaimedOrLogged()
+    {
+        var candidate = MakeWorker("worker-active");
+        candidate.IsBusy = true;
+        candidate.CurrentTaskId = "task-active";
+        candidate.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+
+        var poolMock = MakePoolMock();
+        poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([candidate]);
+        // Activity arrived between selection and removal → atomic re-check refuses.
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("worker-active", It.IsAny<TimeSpan>())).Returns(false);
+
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+        var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
+        var config = new CopilotHive.Configuration.HiveConfigFile
+        {
+            Orchestrator = new CopilotHive.Configuration.OrchestratorConfig { WorkerTaskTimeoutMinutes = 60 },
+        };
+        var svc = new StaleWorkerCleanupService(poolMock.Object, taskQueue, pipelineManager,
+            loggerMock.Object, goalDispatcher: null, config: config);
+
+        await svc.RunCleanupCycleAsync();
+
+        poolMock.Verify(p => p.TryRemoveTimedOutWorker("worker-active", TimeSpan.FromMinutes(60)), Times.Once);
+        // No reclaim warning at all — the worker was spared.
+        loggerMock.Verify(
+            l => l.Log(
+                LogLevel.Warning,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, _) => v.ToString()!.Contains("reclaiming")),
+                It.IsAny<Exception?>(),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.Never);
+        // And its task was not re-enqueued.
+        Assert.Null(taskQueue.TryDequeue(WorkerRole.Unspecified));
+    }
+
+    /// <summary>
+    /// The reclaim log message must reference <see cref="ConnectedWorker.LastActivityAt"/>
+    /// (inactivity-based), not <see cref="ConnectedWorker.CurrentTaskStartedAt"/> (wall-clock).
+    /// Verifies the log message contains "inactive" and the worker's LastActivityAt timestamp.
+    /// </summary>
+    [Fact]
+    public async Task RunCleanupCycle_TaskExceedsTimeout_LogReferencesLastActivityAt()
+    {
+        var hung = MakeWorker("worker-hung");
+        hung.IsBusy = true;
+        hung.CurrentTaskId = "task-hung";
+        var inactiveSince = DateTime.UtcNow.AddMinutes(-90);
+        hung.LastActivityAt = inactiveSince;
+        // Set a different, much older task-start to prove the log uses LastActivityAt, not start.
+        hung.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-180);
+
+        var poolMock = MakePoolMock();
+        poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([hung]);
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("worker-hung", It.IsAny<TimeSpan>())).Returns(true);
+
+        var loggerMock = new Mock<ILogger<StaleWorkerCleanupService>>();
+        var svc = CreateServiceWithConfig(poolMock.Object, timeoutMinutes: 60, logger: loggerMock.Object);
+        await svc.RunCleanupCycleAsync();
+
+        // The reclaim warning must mention "inactive" and the LastActivityAt timestamp —
+        // NOT "exceeded" or the CurrentTaskStartedAt value.
+        loggerMock.Verify(
+            l => l.Log(
+                LogLevel.Warning,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, _) =>
+                    v.ToString()!.Contains("inactive since") &&
+                    v.ToString()!.Contains(inactiveSince.ToString("MM/dd/yyyy HH:mm:ss"))),
+                It.IsAny<Exception?>(),
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.Once);
     }
 
     [Fact]
@@ -256,14 +342,16 @@ public sealed class StaleWorkerCleanupServiceTests
         await svc.RunCleanupCycleAsync();
 
         poolMock.Verify(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>()), Times.Never);
+        poolMock.Verify(p => p.TryRemoveTimedOutWorker(It.IsAny<string>(), It.IsAny<TimeSpan>()), Times.Never);
         poolMock.Verify(p => p.RemoveWorker(It.IsAny<string>()), Times.Never);
     }
 
     /// <summary>
-    /// A busy worker whose task is still within the limit must not be touched.
+    /// A busy worker whose task has recent activity must not be touched, even if the task
+    /// started long ago — activity, not task start, drives the timeout.
     /// </summary>
     [Fact]
-    public void GetWorkersWithTimedOutTasks_OnlyReturnsOverrunningBusyWorkers()
+    public void GetWorkersWithTimedOutTasks_OnlyReturnsInactiveBusyWorkers()
     {
         var pool = new WorkerPool();
         pool.RegisterWorker("fresh", []);
@@ -275,12 +363,51 @@ public sealed class StaleWorkerCleanupServiceTests
 
         var hung = pool.GetWorker("hung");
         Assert.NotNull(hung);
-        hung.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-90);
+        hung.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
 
         var timedOut = pool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60));
 
         var only = Assert.Single(timedOut);
         Assert.Equal("hung", only.Id);
+    }
+
+    /// <summary>
+    /// Regression: a task that started long ago is NOT reclaimed when the worker has
+    /// recent task-specific stream activity.
+    /// </summary>
+    [Fact]
+    public void GetWorkersWithTimedOutTasks_OldTaskStartButRecentActivity_NotReclaimed()
+    {
+        var pool = new WorkerPool();
+        pool.RegisterWorker("w1", []);
+        pool.MarkBusy("w1", "task-1");
+        var worker = pool.GetWorker("w1")!;
+        worker.CurrentTaskStartedAt = DateTime.UtcNow.AddMinutes(-90); // old start
+        worker.LastActivityAt = DateTime.UtcNow;                        // recent activity
+
+        var timedOut = pool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60));
+
+        Assert.Empty(timedOut);
+    }
+
+    /// <summary>
+    /// A recent heartbeat must NOT count as task activity: a worker that heartbeats but
+    /// sends no task-specific stream messages is still reclaimed.
+    /// </summary>
+    [Fact]
+    public void GetWorkersWithTimedOutTasks_RecentHeartbeatButOldActivity_StillReclaimed()
+    {
+        var pool = new WorkerPool();
+        pool.RegisterWorker("w1", []);
+        pool.MarkBusy("w1", "task-1");
+        var worker = pool.GetWorker("w1")!;
+        worker.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+        pool.UpdateHeartbeat("w1"); // recent heartbeat — must NOT reset LastActivityAt
+
+        var timedOut = pool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(60));
+
+        var only = Assert.Single(timedOut);
+        Assert.Equal("w1", only.Id);
     }
 
     /// <summary>

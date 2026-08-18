@@ -144,14 +144,17 @@ public sealed class HiveOrchestratorService(
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Progress:
+                        workerPool.TouchActivity(worker.Id);
                         HandleTaskProgress(worker, message.Progress);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Complete:
+                        workerPool.TouchActivity(worker.Id);
                         HandleTaskComplete(worker, message.Complete);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.ToolRequest:
+                        workerPool.TouchActivity(worker.Id);
                         _ = HandleToolCallRequestAsync(worker, message.ToolRequest, ct);
                         break;
 

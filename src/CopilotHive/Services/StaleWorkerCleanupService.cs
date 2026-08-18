@@ -109,10 +109,15 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     }
 
     /// <summary>
-    /// Reclaims tasks that have exceeded the configured wall-clock limit. These workers are still
-    /// heartbeating (so <see cref="IWorkerPool.PurgeStaleWorkers"/> ignores them) but their task has
-    /// hung — typically an LLM call that never returns. Without this the pipeline keeps its
-    /// ActiveTaskId forever and permanently consumes a parallel-goal slot.
+    /// Detects workers whose tasks have been inactive (no task-specific stream messages) for
+    /// longer than the configured timeout. Still-heartbeating workers with silent tasks are
+    /// reclaimed — this catches hung LLM calls.
+    /// <para>
+    /// Selection and eviction are two separate steps, so a candidate may report activity in
+    /// between. Eviction therefore goes through <see cref="IWorkerPool.TryRemoveTimedOutWorker"/>,
+    /// which atomically re-checks the inactivity condition; candidates that became active again
+    /// are skipped without being logged or rescheduled.
+    /// </para>
     /// </summary>
     /// <returns><c>true</c> if at least one worker was removed.</returns>
     private bool ReclaimTimedOutTasks()
@@ -123,19 +128,29 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         if (timeoutMinutes <= 0)
             return false;
 
-        var timedOut = _workerPool.GetWorkersWithTimedOutTasks(TimeSpan.FromMinutes(timeoutMinutes));
+        var timeout = TimeSpan.FromMinutes(timeoutMinutes);
+        var timedOut = _workerPool.GetWorkersWithTimedOutTasks(timeout);
 
         var anyRemoved = false;
         foreach (var worker in timedOut)
         {
+            // Capture the task before eviction so the reschedule cannot race the worker's own state.
+            var taskId = worker.CurrentTaskId;
+            if (taskId is null)
+                continue;
+
+            // Atomically re-check inactivity and drop the hung worker so it cannot report a late
+            // completion for a re-dispatched task. Returns false if activity arrived since selection.
+            if (!_workerPool.TryRemoveTimedOutWorker(worker.Id, timeout))
+                continue;
+
+            anyRemoved = true;
+
             _logger.LogWarning(
-                "Worker {WorkerId} task {TaskId} exceeded {TimeoutMinutes} min (started {StartedAt}) — reclaiming",
-                worker.Id, worker.CurrentTaskId, timeoutMinutes, worker.CurrentTaskStartedAt);
+                "Worker {WorkerId} task {TaskId} inactive since {LastActivityAt} — reclaiming",
+                worker.Id, taskId, worker.LastActivityAt);
 
-            // Drop the hung worker so it cannot report a late completion for a re-dispatched task.
-            anyRemoved |= _workerPool.RemoveWorker(worker.Id);
-
-            RescheduleAbandonedTask(worker.Id, worker.CurrentTaskId!);
+            RescheduleAbandonedTask(worker.Id, taskId);
         }
 
         return anyRemoved;

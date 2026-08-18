@@ -20,13 +20,33 @@ public interface IWorkerPool
     IReadOnlyList<ConnectedWorker> GetStaleWorkers(TimeSpan timeout);
 
     /// <summary>
-    /// Returns workers that are busy with a task that started longer ago than <paramref name="timeout"/>.
-    /// These workers are still heartbeating — so they are not "stale" — but their task has hung
-    /// (e.g. an LLM call that never returns) and would otherwise occupy a parallel-goal slot forever.
+    /// Returns workers that are busy with a task whose last task-specific stream activity
+    /// (ToolRequest, Progress, or Complete) occurred longer ago than <paramref name="timeout"/>.
+    /// Such workers are still heartbeating, so <see cref="GetStaleWorkers"/> will not report them,
+    /// but their task has gone silent and would otherwise hold its pipeline slot forever.
+    /// <para>
+    /// This is only a <em>candidate selector</em>: the returned references are live and their
+    /// activity may be refreshed before the caller acts. Callers must remove candidates via
+    /// <see cref="TryRemoveTimedOutWorker"/>, which re-checks the condition atomically.
+    /// </para>
     /// </summary>
-    /// <param name="timeout">Maximum wall-clock duration allowed for a single task.</param>
-    /// <returns>A read-only list of <see cref="ConnectedWorker"/> instances with over-running tasks.</returns>
+    /// <param name="timeout">Maximum acceptable inactivity duration for a single task.</param>
+    /// <returns>A read-only list of <see cref="ConnectedWorker"/> instances with silent tasks.</returns>
     IReadOnlyList<ConnectedWorker> GetWorkersWithTimedOutTasks(TimeSpan timeout);
+
+    /// <summary>
+    /// Atomically re-checks that the identified worker is still busy with a task that has been
+    /// inactive for longer than <paramref name="timeout"/> and, only if so, removes it from the pool.
+    /// Closes the time-of-check/time-of-use race between
+    /// <see cref="GetWorkersWithTimedOutTasks"/> selecting a candidate and the caller evicting it.
+    /// </summary>
+    /// <param name="id">Identifier of the candidate worker to remove.</param>
+    /// <param name="timeout">Maximum acceptable inactivity duration for a single task.</param>
+    /// <returns>
+    /// <c>true</c> if the worker was still timed out and has been removed; <c>false</c> if it is
+    /// gone, is no longer busy with a task, or has shown activity since it was selected.
+    /// </returns>
+    bool TryRemoveTimedOutWorker(string id, TimeSpan timeout);
 
     /// <summary>
     /// Removes a worker from the pool.
