@@ -1,3 +1,4 @@
+using CopilotHive.Actors;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
@@ -12,6 +13,7 @@ using SharpCoder;
 using SharpCoder.SubAgents;
 
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 
 namespace CopilotHive.Orchestration;
@@ -33,6 +35,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly string? _ollamaApiKey;
     private readonly ComposerAgentService _agentService;
     private readonly ComposerStreamingService _streamingService;
+    private readonly ComposerActor _actor;
+    private int _streamingState; // 0=idle, 1=streaming (Interlocked)
+    private volatile string _streamingContent = "";
+    private volatile int _lastToolCalls;
 
     /// <summary>
     /// Stored delegate forwarding <see cref="ComposerAgentService.OnSubAgentChanged"/> to
@@ -86,13 +92,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
 
     /// <summary>Whether the Composer is currently streaming a response.</summary>
-    public bool IsStreaming => _streamingService.IsStreaming;
+    public bool IsStreaming => Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0;
 
     /// <summary>The accumulated streaming text (partial response in progress).</summary>
-    public string StreamingContent => _streamingService.StreamingContent;
+    public string StreamingContent => _streamingContent;
 
     /// <summary>Tool call count from the last completed response.</summary>
-    public int LastToolCalls => _streamingService.LastToolCalls;
+    public int LastToolCalls => _lastToolCalls;
 
     /// <summary>Whether context compaction is currently running.</summary>
     public bool IsCompacting { get; private set; }
@@ -437,6 +443,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
                 if (File.Exists(sessionFile))
                     File.Delete(sessionFile);
             });
+
+        _actor = new ComposerActor(
+            _agentService,
+            SaveSessionAsync,
+            status => RefreshComposerRegistry(status),
+            content => { _streamingContent = content; OnStreamingUpdate?.Invoke(); },
+            toolCalls => { Interlocked.Exchange(ref _streamingState, 0); _lastToolCalls = toolCalls; OnStreamingUpdate?.Invoke(); },
+            error => { _streamingContent += $"\n\n❌ Error: {error}"; OnStreamingUpdate?.Invoke(); },
+            () => { IsCompacting = false; WasCompacted = false; var f = GetSessionFilePath(); if (File.Exists(f)) File.Delete(f); },
+            _logger);
+        _actor.Start();
     }
 
     /// <summary>Whether the Composer has connected and is ready for streaming.</summary>
@@ -457,6 +474,10 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>Returns the system prompt used by the Composer.</summary>
     internal string GetSystemPrompt() => _systemPrompt;
+
+    /// <summary>Test seam: forces the streaming admission gate for tests that exercise the "while streaming" path.</summary>
+    [Conditional("DEBUG")]
+    internal void SetStreamingStateForTest(bool isStreaming) => Interlocked.Exchange(ref _streamingState, isStreaming ? 1 : 0);
 
     /// <summary>Returns current Composer session statistics.</summary>
     public BrainStats? GetStats()
@@ -492,8 +513,20 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <param name="reasoningEffort">The reasoning effort to run with (required).</param>
     /// <param name="ct">Cancellation token.</param>
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
-    public Task SwitchModelAsync(string model, ReasoningEffort reasoningEffort, CancellationToken ct = default)
-        => _agentService.SwitchModelAsync(model, reasoningEffort, ct);
+    public async Task SwitchModelAsync(string model, ReasoningEffort reasoningEffort, CancellationToken ct = default)
+    {
+        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+            throw new InvalidOperationException("Cannot switch model while streaming.");
+        var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_actor.Tell(new ComposerSwitchModelMessage(model, reasoningEffort, reply, ct)))
+            throw new InvalidOperationException("Composer not available.");
+
+        // The reply is the AUTHORITATIVE completion signal: the actor owns the switch and
+        // classifies caller cancellation itself (cancelled reply). Using WaitAsync(ct) here
+        // would abandon the wait while the actor keeps mutating the agent service, leaving
+        // the caller with no way to observe the real outcome.
+        await reply.Task;
+    }
 
     /// <summary>The Composer's current reasoning effort, or <c>null</c> when unset.</summary>
     public ReasoningEffort? ReasoningEffort => _agentService?.ReasoningEffort;
@@ -508,7 +541,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>
     /// Creates the IChatClient and CodingAgent, and loads any persisted session.
     /// </summary>
-    public Task ConnectAsync(CancellationToken ct = default) => _agentService.ConnectAsync(ct);
+    public async Task ConnectAsync(CancellationToken ct = default)
+    {
+        var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_actor.Tell(new ComposerConnectMessage(reply, ct)))
+            throw new InvalidOperationException("Composer not available.");
+        await reply.Task.WaitAsync(ct);
+    }
 
     /// <summary>
     /// Sends a message and streams the response in the background.
@@ -521,29 +560,40 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// Returns the formatted event block prepended, or null if no events were pending.</summary>
     public string? SendMessageWithEvents(string userMessage)
     {
+        // Pre-admission failures bypass the rollback path below — nothing has been claimed yet.
+        if (!_agentService.IsConnected) throw new InvalidOperationException("Composer not connected.");
+        if (Interlocked.CompareExchange(ref _streamingState, 1, 0) != 0)
+            throw new InvalidOperationException("Composer is already streaming a response.");
+
         List<SystemEvent>? events = null;
         string? eventBlock = null;
-        if (_eventSubscriber is not null)
-        {
-            events = _eventSubscriber.DrainPendingEvents();
-            if (events.Count > 0)
-                eventBlock = FormatEventBlock(events);
-        }
-
-        // Always prefix with envelope — every stored message starts with the prefix,
-        // so TrySplitEventBlock can unambiguously identify it at position 0.
-        var eventLen = eventBlock?.Length ?? 0;
-        var wrappedMessage = $"{EnvelopePrefix}{eventLen.ToString(CultureInfo.InvariantCulture)}{EnvelopeSeparator}{eventBlock ?? ""}{EnvelopeSuffix}{userMessage}";
-
         try
         {
-            _streamingService.SendMessage(wrappedMessage);
-            return eventBlock; // null if no events
+            _streamingContent = ""; _lastToolCalls = 0;
+            OnStreamingUpdate?.Invoke();
+
+            if (_eventSubscriber is not null)
+            {
+                events = _eventSubscriber.DrainPendingEvents();
+                if (events.Count > 0) eventBlock = FormatEventBlock(events);
+            }
+            var eventLen = eventBlock?.Length ?? 0;
+            var wrappedMessage = $"{EnvelopePrefix}{eventLen.ToString(CultureInfo.InvariantCulture)}{EnvelopeSeparator}{eventBlock ?? ""}{EnvelopeSuffix}{userMessage}";
+
+            if (!_actor.Tell(new ComposerSendMessageMessage(wrappedMessage)))
+                throw new InvalidOperationException("Composer not available.");
+
+            return eventBlock;
         }
-        catch
+        catch (Exception)
         {
-            if (events is not null && events.Count > 0 && _eventSubscriber is not null)
-                _eventSubscriber.RestoreEvents(events);
+            // Single rollback path for EVERY post-admission failure — including
+            // InvalidOperationException thrown by OnStreamingUpdate, DrainPendingEvents,
+            // FormatEventBlock, or the Tell-failure branch above. Releasing the gate here is
+            // what keeps a failed send from permanently blocking the Composer.
+            Interlocked.Exchange(ref _streamingState, 0);
+            _streamingContent = "";
+            if (events != null && events.Count > 0 && _eventSubscriber != null) _eventSubscriber.RestoreEvents(events);
             throw;
         }
     }
@@ -617,7 +667,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public void CancelStreaming()
     {
-        _streamingService.CancelStreaming();
+        _actor.Tell(new ComposerCancelStreamingMessage());
     }
 
     /// <summary>
@@ -625,7 +675,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        await _agentService.ResetSessionAsync();
+        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+            throw new InvalidOperationException("Cannot reset while streaming.");
+        var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_actor.Tell(new ComposerResetSessionMessage(reply, ct)))
+            throw new InvalidOperationException("Composer not available.");
+
+        // Authoritative wait — see SwitchModelAsync. Abandoning the wait on caller
+        // cancellation would leave the facade cleanup below (attachments, session file,
+        // compaction flags) unrun while the actor completes the reset anyway.
+        await reply.Task;
 
         if (_attachmentService is not null)
             await _attachmentService.ClearAllAsync();
@@ -643,8 +702,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _logger.LogInformation("Composer session reset");
 
         RefreshComposerRegistry(status: "idle", currentTokens: 0);
-
-        await Task.CompletedTask; // keep async signature for future use
     }
 
     /// <summary>Returns the file path for persisting the Composer session.</summary>
@@ -684,36 +741,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
 
-        if (_streamingService.IsStreaming)
+        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
-        IsCompacting = true;
-        OnCompactingStarted?.Invoke();
+        var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_actor.Tell(new ComposerCompactMessage(reply, ct)))
+            throw new InvalidOperationException("Composer not available.");
 
-        try
-        {
-            var compactor = new ContextCompactor(_agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!, _logger);
-            var result = await compactor.ForceCompactAsync(_agentService.Session, _agentService.AgentOptions, ct);
-            if (result)
-            {
-                await SaveSessionAsync(ct);
-                RefreshComposerRegistry();
-                _logger.LogInformation(
-                    "Composer session manually compacted ({Count} messages remaining)",
-                    _agentService.Session.MessageHistory.Count);
-            }
-            return result;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Composer manual compaction failed");
-            return false;
-        }
-        finally
-        {
-            IsCompacting = false;
-            OnCompacted?.Invoke();
-        }
+        // No WaitAsync(ct): the actor classifies cancellation itself and replies false,
+        // preserving the original "cancel → false" contract. The actor persists the session
+        // and refreshes the registry on success.
+        return await reply.Task;
     }
 
     /// <summary>
@@ -725,40 +763,16 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     {
         if (_agentService.Agent is null)
             throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-        if (_streamingService.IsStreaming)
+
+        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
-        IsCompacting = true;
-        OnCompactingStarted?.Invoke();
+        var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_actor.Tell(new ComposerCompactPartialMessage(percent, reply, ct)))
+            throw new InvalidOperationException("Composer not available.");
 
-        try
-        {
-            var compactor = new ContextCompactor(
-                _agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!,
-                _logger);
-
-            var result = await compactor.CompactOldestPercentAsync(_agentService.Session, _agentService.AgentOptions, percent, ct);
-
-            if (result)
-            {
-                await SaveSessionAsync(ct);
-                RefreshComposerRegistry();
-                _logger.LogInformation("Composer session partially compacted ({Percent}% oldest, {Count} messages remaining)",
-                    percent, _agentService.Session.MessageHistory.Count);
-            }
-
-            return result;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Composer partial compaction failed");
-            return false;
-        }
-        finally
-        {
-            IsCompacting = false;
-            OnCompacted?.Invoke();
-        }
+        // See CompactSessionAsync — the actor owns cancellation classification and persistence.
+        return await reply.Task;
     }
 
     private async Task RecreateAgentAsync() => await _agentService.RecreateAgentAsync();
@@ -1125,31 +1139,46 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         // disposal step below fails.
         _agentService.OnSubAgentChanged -= _handleSubAgentChanged;
 
-        Exception? disposeEx = null;
-        try
+        // Actor first: it owns the streaming task, so nothing it depends on may be torn down
+        // while it can still run. DisposeAsync applies its own 5-second timeout.
+        await _actor.DisposeAsync();
+
+        // Retained-but-unused service: its failures must never mask or block the rest.
+        try { await _streamingService.DisposeAsync(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Streaming service disposal failed"); }
+
+        if (_actor.IsCompleted)
         {
-            await _streamingService.DisposeAsync();
-        }
-        catch (Exception ex)
-        {
-            disposeEx = ex;
-        }
-        finally
-        {
+            // The lock is disposed in the finally so an agent-disposal failure cannot leak it,
+            // and the agent failure is still surfaced to the caller.
             try
             {
                 await _agentService.DisposeAsync();
             }
-            catch (Exception ex)
+            finally
             {
-                disposeEx = disposeEx is null ? ex : new AggregateException(disposeEx, ex);
+                _issueUpdateLock.Dispose();
             }
-
-            // Independent of the services above — dispose regardless of their outcome.
-            _issueUpdateLock.Dispose();
         }
-
-        if (disposeEx is not null)
-            throw disposeEx;
+        else
+        {
+            // Timed out: the actor (and its streaming task) may still be using the agent
+            // service and the issue lock, so BOTH are deferred until the loop actually exits.
+            _logger.LogWarning("Actor disposal timed out — agent disposal deferred");
+            _ = _actor.Completion.ContinueWith(
+                _ =>
+                {
+                    try { _agentService.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Deferred agent disposal failed"); }
+                    finally
+                    {
+                        try { _issueUpdateLock.Dispose(); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Deferred issue-lock disposal failed"); }
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.RunContinuationsAsynchronously,
+                TaskScheduler.Default);
+        }
     }
 }

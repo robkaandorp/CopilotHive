@@ -72,15 +72,6 @@ public sealed class ComposerEventIntegrationTests
             ?? throw new InvalidOperationException("_agentService was null");
     }
 
-    /// <summary>Gets the private <c>_streamingService</c> instance from a <see cref="Composer"/>.</summary>
-    private static ComposerStreamingService GetStreamingService(Composer composer)
-    {
-        var field = typeof(Composer).GetField("_streamingService", PrivateFlags)
-            ?? throw new InvalidOperationException("_streamingService field not found on Composer");
-        return (ComposerStreamingService)(field.GetValue(composer)
-            ?? throw new InvalidOperationException("_streamingService was null"));
-    }
-
     /// <summary>Gets the private <c>_session</c> field from the agent service.</summary>
     private static AgentSession GetSession(Composer composer)
     {
@@ -224,15 +215,15 @@ public sealed class ComposerEventIntegrationTests
     }
 
     /// <summary>
-    /// Waits for streaming to complete by polling IsStreaming (synchronously, since
+    /// Waits for streaming to complete by polling composer.IsStreaming (synchronously, since
     /// the fake client completes immediately after Task.Yield).
     /// </summary>
-    private static async Task WaitForStreamingCompleteAsync(ComposerStreamingService streamingService)
+    private static async Task WaitForStreamingCompleteAsync(Composer composer)
     {
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (streamingService.IsStreaming && DateTime.UtcNow < deadline)
+        while (composer.IsStreaming && DateTime.UtcNow < deadline)
             await Task.Delay(20, TestContext.Current.CancellationToken);
-        Assert.False(streamingService.IsStreaming, "Streaming should have completed");
+        Assert.False(composer.IsStreaming, "Streaming should have completed");
     }
 
     // ── 1. Events present → formatted block prepended before user message, inside envelope ──
@@ -258,8 +249,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage("Please review the latest changes");
 
-            var streamingService = GetStreamingService(composer);
-            await WaitForStreamingCompleteAsync(streamingService);
+            await WaitForStreamingCompleteAsync(composer);
 
             // The captured user message must be EXACTLY the envelope-wrapped event block
             // followed by the original user text — full-string equality, no fragments.
@@ -306,7 +296,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage("check status");
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // Full-string equality: exact header, each event line in FIFO order with the exact
             // emoji, quoted ID, and em-dash, then the exact envelope suffix and original user text.
@@ -356,7 +346,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage("user text");
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // The exact multi-line block — any change to an emoji, field reference, header
             // text, or separator in FormatEventBlock (or SendMessageWithEvents) must fail this test.
@@ -402,7 +392,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage("user text");
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // The exact multi-line block — any change to an emoji, field reference, header
             // text, or separator in FormatEventBlock (or SendMessageWithEvents) must fail this test.
@@ -444,7 +434,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage(original);
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // Every message is envelope-wrapped, even with zero events: {{CHV1:E0|}}<message>.
             Assert.NotNull(client.LastUserMessage);
@@ -457,10 +447,10 @@ public sealed class ComposerEventIntegrationTests
         }
     }
 
-    // ── 4. Rejected SendMessage → events restored to subscriber ──
+    // ── 4. Rejected SendMessage when not connected → events remain buffered (not drained) ──
 
     [Fact]
-    public async Task SendMessage_WhenStreamingServiceThrows_RestoresEventsAndPropagates()
+    public async Task SendMessage_WhenNotConnected_EventsRemainBuffered_AndThrows()
     {
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
@@ -479,16 +469,16 @@ public sealed class ComposerEventIntegrationTests
             // Assert events are buffered before the send.
             Assert.Equal(2, subscriber.PeekPendingEvents().Count);
 
-            // Do NOT inject a chat client — the agent is null, so _streamingService.SendMessage
-            // will throw "Composer not connected". This exercises the rejection/restore path.
+            // Do NOT inject a chat client — the agent is null, so the not-connected check in
+            // SendMessageWithEvents throws BEFORE admission and before events are drained.
             var ex = Assert.Throws<InvalidOperationException>(() => composer.SendMessage("test message"));
             Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
 
-            // The drained events must have been restored to the subscriber buffer.
-            var restored = subscriber.PeekPendingEvents();
-            Assert.Equal(2, restored.Count);
-            Assert.Equal("goal-A", restored[0].GoalId);
-            Assert.Equal("goal-B", restored[1].GoalId);
+            // The not-connected check happens before drain, so events remain buffered (not restored).
+            var buffered = subscriber.PeekPendingEvents();
+            Assert.Equal(2, buffered.Count);
+            Assert.Equal("goal-A", buffered[0].GoalId);
+            Assert.Equal("goal-B", buffered[1].GoalId);
         }
         finally
         {
@@ -516,7 +506,7 @@ public sealed class ComposerEventIntegrationTests
 
             composer.SendMessage(original);
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // The message must be wrapped with the empty envelope (E0) even without a subscriber.
             Assert.NotNull(client.LastUserMessage);
@@ -541,7 +531,7 @@ public sealed class ComposerEventIntegrationTests
             // No subscriber — null is the default.
             (composer, dbContext, _) = CreateComposer(tmpDir);
 
-            // Agent is null → streaming service throws.
+            // Agent is null → the not-connected check in SendMessageWithEvents throws.
             var ex = Assert.Throws<InvalidOperationException>(() => composer.SendMessage("test"));
             Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
         }
@@ -573,7 +563,7 @@ public sealed class ComposerEventIntegrationTests
 
             var result = composer.SendMessageWithEvents("Please review the latest changes");
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // The return value is the exact formatted event block.
             var block =
@@ -612,7 +602,7 @@ public sealed class ComposerEventIntegrationTests
             const string original = "no events here";
             var result = composer.SendMessageWithEvents(original);
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // No pending events → return null, but the message is still wrapped with E0|}}.
             Assert.Null(result);
@@ -625,7 +615,7 @@ public sealed class ComposerEventIntegrationTests
     }
 
     [Fact]
-    public async Task SendMessageWithEvents_WhenNotConnected_Throws_RestoresEventsAndReThrows()
+    public async Task SendMessageWithEvents_WhenNotConnected_Throws_EventsRemainBuffered()
     {
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
@@ -642,15 +632,16 @@ public sealed class ComposerEventIntegrationTests
             bus.Publish(new SystemEvent(EventType.GoalFailed, "Build broke", GoalId: "goal-B"));
             Assert.Equal(2, subscriber.PeekPendingEvents().Count);
 
-            // Do NOT inject a chat client — the agent is null, so _streamingService.SendMessage
-            // throws. SendMessageWithEvents must restore the drained events and re-throw.
+            // Do NOT inject a chat client — the agent is null, so the not-connected check
+            // in SendMessageWithEvents throws BEFORE admission and BEFORE events are drained.
             var ex = Assert.Throws<InvalidOperationException>(() => composer.SendMessageWithEvents("test message"));
             Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
 
-            var restored = subscriber.PeekPendingEvents();
-            Assert.Equal(2, restored.Count);
-            Assert.Equal("goal-A", restored[0].GoalId);
-            Assert.Equal("goal-B", restored[1].GoalId);
+            // Events are NOT drained because the check precedes admission — they stay buffered.
+            var buffered = subscriber.PeekPendingEvents();
+            Assert.Equal(2, buffered.Count);
+            Assert.Equal("goal-A", buffered[0].GoalId);
+            Assert.Equal("goal-B", buffered[1].GoalId);
         }
         finally
         {
@@ -679,7 +670,7 @@ public sealed class ComposerEventIntegrationTests
             // SendMessage is a void wrapper — its return value is never used.
             composer.SendMessage("hello");
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             var block =
                 "[System Events since your last message]\n" +
@@ -751,7 +742,7 @@ public sealed class ComposerEventIntegrationTests
             const string literal = "{{CHV1:E3|abc}}hello";
             var result = composer.SendMessageWithEvents(literal);
 
-            await WaitForStreamingCompleteAsync(GetStreamingService(composer));
+            await WaitForStreamingCompleteAsync(composer);
 
             // No pending events → null, and the message is wrapped with an E0 envelope so the
             // literal prefix is protected: {{CHV1:E0|}}{{CHV1:E3|abc}}hello.

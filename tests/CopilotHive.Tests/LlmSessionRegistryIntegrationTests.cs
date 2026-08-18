@@ -76,26 +76,6 @@ public sealed class LlmSessionRegistryIntegrationTests
         return (AgentSession)sessionField.GetValue(agentService)!;
     }
 
-    /// <summary>Gets the private <c>_isStreaming</c> field value from a Composer.</summary>
-    private static bool GetComposerIsStreaming(Composer composer)
-    {
-        var streamingService = GetComposerStreamingService(composer);
-        var field = streamingService.GetType().GetField("_isStreaming",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
-        return (bool)field.GetValue(streamingService)!;
-    }
-
-    /// <summary>Gets the private <c>_streamingService</c> instance from a Composer.</summary>
-    private static object GetComposerStreamingService(Composer composer)
-    {
-        var field = typeof(Composer).GetField("_streamingService",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_streamingService field not found on Composer");
-        return field.GetValue(composer)
-            ?? throw new InvalidOperationException("_streamingService was null");
-    }
-
     /// <summary>Populates a session with a system message plus <paramref name="count"/> user/assistant messages.</summary>
     private static void PopulateSession(AgentSession session, int count)
     {
@@ -1123,7 +1103,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var finished = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             composer.OnStreamingUpdate += () =>
             {
-                if (!GetComposerIsStreaming(composer))
+                if (!composer.IsStreaming)
                     finished.TrySetResult(true);
             };
 
@@ -1131,7 +1111,7 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             await finished.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-            Assert.False(GetComposerIsStreaming(composer), "Streaming should have finished");
+            Assert.False(composer.IsStreaming, "Streaming should have finished");
 
             // During streaming the status must have been "streaming".
             Assert.Equal("streaming", streaming.CapturedStatusDuringStream);

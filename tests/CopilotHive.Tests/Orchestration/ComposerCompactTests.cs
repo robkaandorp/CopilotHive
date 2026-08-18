@@ -70,40 +70,6 @@ public sealed class ComposerCompactTests
     }
 
     /// <summary>
-    /// Gets the private <c>_isStreaming</c> field value from a <see cref="Composer"/>.
-    /// </summary>
-    private static bool GetIsStreaming(Composer composer)
-    {
-        var streamingService = GetStreamingService(composer);
-        var field = streamingService.GetType().GetField("_isStreaming",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
-        return (bool)field.GetValue(streamingService)!;
-    }
-
-    /// <summary>
-    /// Sets the private <c>_isStreaming</c> field on a <see cref="Composer"/>.
-    /// </summary>
-    private static void SetIsStreaming(Composer composer, bool value)
-    {
-        var streamingService = GetStreamingService(composer);
-        var field = streamingService.GetType().GetField("_isStreaming",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_isStreaming field not found on ComposerStreamingService");
-        field.SetValue(streamingService, value);
-    }
-
-    /// <summary>Gets the private <c>_streamingService</c> instance from a <see cref="Composer"/>.</summary>
-    private static object GetStreamingService(Composer composer)
-    {
-        var field = typeof(Composer).GetField("_streamingService",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_streamingService field not found on Composer");
-        return field.GetValue(composer)
-            ?? throw new InvalidOperationException("_streamingService was null");
-    }
-
-    /// <summary>
     /// Creates a standalone <see cref="Composer"/> with a mock chat client that returns
     /// a summary response from <see cref="IChatClient.GetResponseAsync"/>. The Composer
     /// is NOT connected (no <see cref="Composer.ConnectAsync"/> call) — use
@@ -209,7 +175,7 @@ public sealed class ComposerCompactTests
             Assert.False(composer.IsStreaming, "Streaming should have finished after the error");
 
             // Manually set _isStreaming to true to simulate an active stream.
-            SetIsStreaming(composer, true);
+            composer.SetStreamingStateForTest(true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -219,7 +185,7 @@ public sealed class ComposerCompactTests
             finally
             {
                 // Cleanup: reset _isStreaming so the Composer doesn't hang.
-                SetIsStreaming(composer, false);
+                composer.SetStreamingStateForTest(false);
             }
         }
         finally
@@ -447,7 +413,7 @@ public sealed class ComposerCompactTests
             Assert.False(composer.IsStreaming, "Streaming should have finished after the error");
 
             // Manually set _isStreaming to true to simulate an active stream.
-            SetIsStreaming(composer, true);
+            composer.SetStreamingStateForTest(true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -457,7 +423,7 @@ public sealed class ComposerCompactTests
             finally
             {
                 // Cleanup: reset _isStreaming so the Composer doesn't hang.
-                SetIsStreaming(composer, false);
+                composer.SetStreamingStateForTest(false);
             }
         }
         finally

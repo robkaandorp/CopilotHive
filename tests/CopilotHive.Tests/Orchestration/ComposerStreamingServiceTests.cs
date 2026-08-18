@@ -864,24 +864,16 @@ public sealed class ComposerStreamingServiceTests
             }
             cts.Dispose(); // Now Cancel() inside DisposeAsync will throw ObjectDisposedException
 
-            // Composer.DisposeAsync should catch the streaming service exception and still
-            // dispose the agent service in the finally block. The caught exception is rethrown
-            // after the finally block, so we wrap in a try/catch to verify both effects.
-            ObjectDisposedException? thrown = null;
-            try
-            {
-                await composer.DisposeAsync();
-            }
-            catch (ObjectDisposedException ex)
-            {
-                thrown = ex;
-            }
-
-            // The streaming service disposal should have thrown (rethrown by Composer.DisposeAsync).
-            Assert.NotNull(thrown);
+            // Composer.DisposeAsync swallows and logs the streaming-service disposal failure
+            // (try/catch around _streamingService.DisposeAsync) and still disposes the agent
+            // service. DisposeAsync must complete WITHOUT throwing.
+            await composer.DisposeAsync();
 
             // The agent service should have been disposed despite the streaming service throwing.
             Assert.False(composer.IsConnected, "Agent service should be disposed even when streaming service disposal throws");
+
+            // Already disposed — skip the outer cleanup's double-dispose.
+            composer = null;
         }
         finally
         {
@@ -1086,12 +1078,10 @@ public sealed class ComposerStreamingServiceTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
 
-            // Pre-dispose the streaming service's CTS so Composer.DisposeAsync throws.
-            var streamingService = GetStreamingService(composer);
-            var ctsField = typeof(ComposerStreamingService).GetField("_streamCts", PrivateFlags)!;
-            var cts = new CancellationTokenSource();
-            cts.Dispose();
-            ctsField.SetValue(streamingService, cts);
+            // Inject a chat client whose disposal throws, so _agentService.DisposeAsync()
+            // (NOT wrapped in try/catch by the new Composer.DisposeAsync) propagates the failure.
+            var throwingClient = new ThrowingDisposeChatClient();
+            await InjectFakeChatClient(composer, throwingClient);
 
             // CleanupAsync must surface the disposal failure rather than swallowing it…
             var ex = await Assert.ThrowsAsync<AggregateException>(
@@ -1099,7 +1089,7 @@ public sealed class ComposerStreamingServiceTests
 
             Assert.NotEmpty(ex.InnerExceptions);
             Assert.Contains(ex.InnerExceptions,
-                e => e is ObjectDisposedException or AggregateException);
+                e => e is InvalidOperationException or AggregateException);
 
             // …while still releasing the remaining resources.
             Assert.False(Directory.Exists(tmpDir),
@@ -1120,5 +1110,27 @@ public sealed class ComposerStreamingServiceTests
             if (Directory.Exists(tmpDir))
                 Directory.Delete(tmpDir, recursive: true);
         }
+    }
+
+    /// <summary>Chat client whose disposal throws, exercising the agent-service disposal failure path.</summary>
+    private sealed class ThrowingDisposeChatClient : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("throwing-dispose", null, "throwing-dispose-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "ok")));
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Streaming not used in this stub.");
+
+        public void Dispose() => throw new InvalidOperationException("client dispose boom");
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
     }
 }
