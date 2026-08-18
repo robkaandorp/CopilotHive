@@ -1030,7 +1030,8 @@ public sealed class GoalDispatcherStartupLogTests
     public async Task ExecuteAsync_Startup_LogsGoalSourceCount()
     {
         // Arrange
-        var logger = new CollectingLogger<GoalDispatcher>();
+        var innerLogger = new CollectingLogger<GoalDispatcher>();
+        var signalingLogger = new SignalingLogger<GoalDispatcher>(innerLogger, "GoalDispatcher starting with");
         var goal1 = new Goal { Id = "test-goal-1", Description = "Test 1" };
         var goal2 = new Goal { Id = "test-goal-2", Description = "Test 2" };
         var goalSource1 = new FakeGoalSource(goal1);
@@ -1049,22 +1050,23 @@ public sealed class GoalDispatcherStartupLogTests
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             notifier,
-            logger,
+            signalingLogger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
-        // Act - start the background service and cancel immediately after startup log
+        // Act - start the background service and wait for the startup log to be emitted
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
-        var executeTask = dispatcher.StartAsync(linkedCts.Token);
-        await Task.Delay(100, TestContext.Current.CancellationToken); // Allow startup logs to emit
-        cts.Cancel();
-        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
-
-        // Assert
-        var startupLog = logger.Logs.FirstOrDefault(l =>
-            l.Message.Contains("GoalDispatcher starting with") && l.Message.Contains("goal source"));
-
-        Assert.True(startupLog != default, $"Expected startup log with goal source count. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
-        Assert.Contains("2 goal source(s)", startupLog.Message);
+        await dispatcher.StartAsync(linkedCts.Token);
+        try
+        {
+            var startupLog = await signalingLogger.MatchedLog.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Contains("2 goal source(s)", startupLog);
+        }
+        finally
+        {
+            cts.Cancel();
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await dispatcher.StopAsync(stopCts.Token);
+        }
     }
 }
 
@@ -2098,6 +2100,36 @@ file sealed class CollectingLogger<T> : ILogger<T>
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         Logs.Add((logLevel, formatter(state, exception)));
+    }
+}
+
+/// <summary>
+/// Logger that forwards to an inner logger and completes a TCS when a log message
+/// matching the trigger is emitted. Used to await specific log output without polling.
+/// </summary>
+file sealed class SignalingLogger<T> : ILogger<T>
+{
+    private readonly ILogger<T> _inner;
+    private readonly TaskCompletionSource<string> _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly string _trigger;
+
+    public Task<string> MatchedLog => _gate.Task;
+
+    public SignalingLogger(ILogger<T> inner, string trigger)
+    {
+        _inner = inner;
+        _trigger = trigger;
+    }
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => _inner.BeginScope(state);
+    public bool IsEnabled(LogLevel logLevel) => _inner.IsEnabled(logLevel);
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        var formatted = formatter(state, exception);
+        _inner.Log(logLevel, eventId, state, exception, formatter);
+        if (formatted.Contains(_trigger, StringComparison.Ordinal))
+            _gate.TrySetResult(formatted);
     }
 }
 

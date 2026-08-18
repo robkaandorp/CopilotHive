@@ -2219,6 +2219,13 @@ public sealed class ComposerActorTests
             var error = await errorGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.Contains("recovery reset boom", error);
 
+            // The error callback can fire before ReleaseStreamingResources clears the streaming
+            // fields, so poll until the state is fully cleared before asserting on it.
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while ((GetStreamingCts(actor) is not null || GetStreamingTask(actor) is not null)
+                   && DateTime.UtcNow < deadline)
+                await Task.Yield();
+
             // A failed recovery is NOT a successful overflow recovery, and nothing is persisted.
             Assert.Equal(0, overflowRecoveryCalls);
             Assert.True(saveSessionCalls == 0, "A failed overflow recovery must not persist the session");
