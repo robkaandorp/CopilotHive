@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -50,13 +51,27 @@ internal enum CiProbeStatus
 /// <param name="HtmlUrl">Link to the check run on GitHub, or <c>null</c>.</param>
 /// <param name="OutputSummary">The check run's output summary, or <c>null</c>.</param>
 /// <param name="OutputText">The check run's output text, or <c>null</c>.</param>
+/// <param name="DetailsUrl">The check run's <c>details_url</c> (used to locate the job log), or <c>null</c>.</param>
+/// <param name="RunId">The GitHub Actions run ID parsed from <see cref="DetailsUrl"/>, or <c>null</c>.</param>
 internal sealed record CheckRunData(
     string Name,
     string Status,
     string? Conclusion,
     string? HtmlUrl,
     string? OutputSummary,
-    string? OutputText);
+    string? OutputText,
+    string? DetailsUrl,
+    string? RunId);
+
+/// <summary>
+/// Outcome of parsing CI log content: the extracted test failures and, when the log
+/// cannot be parsed into failures, a sanitized snippet of the raw log for context.
+/// </summary>
+/// <param name="Failures">Test failures parsed from the log; empty when none could be parsed.</param>
+/// <param name="FallbackSnippet">Sanitized raw-log snippet to use when <paramref name="Failures"/> is empty, or <c>null</c>.</param>
+internal sealed record LogFetchResult(
+    List<(string TestName, string Error, string StackTrace)> Failures,
+    string? FallbackSnippet);
 
 /// <summary>
 /// Monitors CI status for a goal's merge commit via the GitHub API, publishes
@@ -96,6 +111,65 @@ public class CiMonitorService
         @"Failed\s+([A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+)",
         RegexOptions.Compiled);
 
+    /// <summary>
+    /// Matches an xUnit failure header line: <c>Failed {name} [duration]</c>. The name is
+    /// captured non-greedily up to the trailing duration bracket, so theory names containing
+    /// spaces still parse. Multiline so headers are anchored to their own line, and leading
+    /// whitespace is tolerated because console output indents failure lines.
+    /// </summary>
+    private static readonly Regex XUnitFailedTestRegex = new(
+        @"^\s*Failed\s+(.+?)\s+\[\d+[^\]]*\]\s*$",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>Extracts the GitHub Actions run ID from a check run's <c>details_url</c>.</summary>
+    private static readonly Regex ActionsRunIdRegex = new(
+        @"/actions/runs/(\d+)",
+        RegexOptions.Compiled);
+
+    /// <summary>Redacts <c>ghp_</c> GitHub personal-access tokens (36-character secrets).</summary>
+    private static readonly Regex GhpTokenRegex = new(
+        @"ghp_[A-Za-z0-9]{36}",
+        RegexOptions.Compiled);
+
+    /// <summary>Redacts <c>gho_</c> GitHub OAuth access tokens (36-character secrets).</summary>
+    private static readonly Regex GhoTokenRegex = new(
+        @"gho_[A-Za-z0-9]{36}",
+        RegexOptions.Compiled);
+
+    /// <summary>Redacts <c>ghs_</c> GitHub user-to-server tokens (36-character secrets).</summary>
+    private static readonly Regex GhsTokenRegex = new(
+        @"ghs_[A-Za-z0-9]{36}",
+        RegexOptions.Compiled);
+
+    /// <summary>Redacts HTTP <c>Bearer</c> authorization tokens (any base64-ish value).</summary>
+    private static readonly Regex BearerTokenRegex = new(
+        @"Bearer [A-Za-z0-9._\-]+",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Redacts secret-looking environment variables (names containing TOKEN, KEY, SECRET, or
+    /// PASSWORD) while preserving the key name. Multiline (<c>RegexOptions.Multiline</c>) and
+    /// case-sensitive so ordinary words such as <c>token</c> in prose are never touched.
+    /// </summary>
+    private static readonly Regex SecretEnvVarRegex = new(
+        @"^([A-Z_]*(TOKEN|KEY|SECRET|PASSWORD)[A-Z_]*)=.+$",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>Redacts ADO-style <c>Password=...</c> connection-string fragments.</summary>
+    private static readonly Regex PasswordAssignmentRegex = new(
+        @"Password=[^;]+",
+        RegexOptions.Compiled);
+
+    /// <summary>Matches the <c>Error Message:</c> section header of an xUnit failure block.</summary>
+    private static readonly Regex XUnitErrorMessageRegex = new(
+        @"^\s*Error Message:\s*$",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>Matches the <c>Stack Trace:</c> section header of an xUnit failure block.</summary>
+    private static readonly Regex XUnitStackTraceRegex = new(
+        @"^\s*Stack Trace:\s*$",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
     private readonly IGoalStore? _goalStore;
     private readonly IIssueStore? _issueStore;
     private readonly IEventBus? _eventBus;
@@ -118,6 +192,41 @@ public class CiMonitorService
     /// Guarantees at-most-once publication across the startup scan and live monitoring.
     /// </summary>
     private readonly ConcurrentDictionary<(string GoalId, string Sha, string Repo, EventType Type), bool> _publishedEvents = new();
+
+    /// <summary>Maximum number of per-runId log-fetch results kept in <see cref="_logFetchCache"/>.</summary>
+    private const int LogFetchCacheCapacity = 20;
+
+    /// <summary>
+    /// Guards <see cref="_logFetchCache"/> and <see cref="_logFetchCacheOrder"/> as a single
+    /// unit. Lock-free collections cannot express "insert and record insertion order" as one
+    /// atomic step: two concurrent misses for the same runId would each enqueue the key, and a
+    /// later eviction would then dequeue the stale duplicate and drop a freshly inserted value
+    /// instead of the actual oldest one. Every read, insert, and eviction therefore runs here.
+    /// </summary>
+    private readonly Lock _logFetchCacheLock = new();
+
+    /// <summary>
+    /// Per-runId cache of successful log-fetch results, bounded to <see cref="LogFetchCacheCapacity"/>
+    /// entries. Only non-null results are cached; eviction is FIFO via <see cref="_logFetchCacheOrder"/>.
+    /// Access only under <see cref="_logFetchCacheLock"/>.
+    /// </summary>
+    private readonly Dictionary<string, LogFetchResult> _logFetchCache = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Insertion order of <see cref="_logFetchCache"/> keys, for FIFO eviction. A key is
+    /// enqueued exactly once per insertion, so the queue mirrors the dictionary one-to-one.
+    /// Access only under <see cref="_logFetchCacheLock"/>.
+    /// </summary>
+    private readonly Queue<string> _logFetchCacheOrder = new();
+
+    /// <summary>Size (in bytes) of the UTF-8-aligned ring buffer used when reading a job log body.</summary>
+    private const int LogReadBufferSize = 200_000;
+
+    /// <summary>
+    /// UTF-8 decoder with a replacement fallback: a truncated multi-byte sequence at the tail
+    /// of the ring buffer decodes to U+FFFD instead of throwing.
+    /// </summary>
+    private static readonly UTF8Encoding LenientUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
     /// <summary>
     /// Initialises a new <see cref="CiMonitorService"/> with optional dependencies.
@@ -287,7 +396,10 @@ public class CiMonitorService
                             goalId, repoName, mergeCommitSha, probe.CheckRuns.Count);
                         try
                         {
-                            await HandleCiFailureAsync(goalId, repoName, mergeCommitSha, probe.CheckRuns, ct);
+                            var logsClient = _httpClientFactory!.CreateClient("github-api-logs");
+                            await HandleCiFailureAsync(
+                                goalId, repoName, mergeCommitSha, probe.CheckRuns,
+                                owner, repo, token, logsClient, ct);
                         }
                         catch (OperationCanceledException) when (ct.IsCancellationRequested)
                         {
@@ -545,7 +657,8 @@ public class CiMonitorService
                     break;
 
                 case CiProbeStatus.Failed:
-                    await HandleScannedFailureAsync(goal.Id, repoName, sha, probe.CheckRuns, ct);
+                    var logsClient = _httpClientFactory!.CreateClient("github-api-logs");
+                    await HandleScannedFailureAsync(goal.Id, repoName, sha, probe.CheckRuns, owner, repo, token, logsClient, ct);
                     break;
 
                 case CiProbeStatus.StillRunning:
@@ -598,7 +711,8 @@ public class CiMonitorService
     /// the issues or the event.
     /// </summary>
     private async Task HandleScannedFailureAsync(
-        string goalId, string repoName, string sha, IReadOnlyList<CheckRunData> failedRuns, CancellationToken ct)
+        string goalId, string repoName, string sha, IReadOnlyList<CheckRunData> failedRuns,
+        string owner, string repo, string token, HttpClient logsClient, CancellationToken ct)
     {
         var inFlightKey = (GoalId: goalId, Sha: sha, Repo: repoName);
         if (!_inFlight.TryAdd(inFlightKey, true))
@@ -613,7 +727,7 @@ public class CiMonitorService
             _logger.LogWarning(
                 "CI startup scan: CI already failed for goal {GoalId} repo {Repo} commit {Sha}: {FailedCount} check(s) failed",
                 goalId, repoName, sha, failedRuns.Count);
-            await HandleCiFailureAsync(goalId, repoName, sha, failedRuns, ct);
+            await HandleCiFailureAsync(goalId, repoName, sha, failedRuns, owner, repo, token, logsClient, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1023,11 +1137,428 @@ public class CiMonitorService
                 text = tx.GetString();
         }
 
-        return new CheckRunData(name, status, conclusion, htmlUrl, summary, text);
+        // details_url is always retained when present; the run ID is parsed from it only when
+        // it matches the /actions/runs/<id> shape — otherwise DetailsUrl is kept and RunId is null.
+        string? detailsUrl = null;
+        if (run.TryGetProperty("details_url", out var du) && du.ValueKind == JsonValueKind.String)
+            detailsUrl = du.GetString();
+        string? runId = null;
+        if (!string.IsNullOrEmpty(detailsUrl))
+        {
+            var match = ActionsRunIdRegex.Match(detailsUrl);
+            if (match.Success)
+                runId = match.Groups[1].Value;
+        }
+
+        return new CheckRunData(name, status, conclusion, htmlUrl, summary, text, detailsUrl, runId);
     }
 
+    /// <summary>
+    /// Fetches and parses the CI job logs for a GitHub Actions run, returning the extracted
+    /// test failures (or a sanitized fallback snippet when the log carries no parseable
+    /// failures). Results are cached per runId.
+    /// </summary>
+    /// <param name="runId">The GitHub Actions run ID, or <c>null</c>.</param>
+    /// <param name="owner">GitHub repository owner.</param>
+    /// <param name="repo">GitHub repository name.</param>
+    /// <param name="token">Bearer token for the GitHub API calls.</param>
+    /// <param name="client">The <c>github-api-logs</c> HTTP client (no auto-redirect).</param>
+    /// <param name="ct">Cancellation token; cancellation propagates to the caller.</param>
+    /// <returns>
+    /// The parsed log result, or <c>null</c> when no runId was given, no failed job log could
+    /// be fetched, or a non-cancellation failure occurred.
+    /// </returns>
+    internal async Task<LogFetchResult?> FetchJobLogsAsync(
+        string? runId, string owner, string repo, string token, HttpClient client, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(runId))
+            return null;
+
+        if (TryGetCachedLogFetchResult(runId, out var cached))
+            return cached;
+
+        LogFetchResult? result;
+        try
+        {
+            result = await FetchJobLogsCoreAsync(runId, owner, repo, token, client, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw; // caller cancellation — propagate
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch CI job logs for run {RunId} repo {Owner}/{Repo}", runId, owner, repo);
+            return null;
+        }
+
+        if (result is not null)
+            CacheLogFetchResult(runId, result);
+
+        return result;
+    }
+
+    /// <summary>
+    /// Enumerates a run's failed jobs and fetches each one's log. Partial success is allowed:
+    /// a job whose log cannot be fetched is skipped and the remaining jobs still contribute.
+    /// </summary>
+    private async Task<LogFetchResult?> FetchJobLogsCoreAsync(
+        string runId, string owner, string repo, string token, HttpClient client, CancellationToken ct)
+    {
+        var failedJobIds = new List<long>();
+
+        var jobsUrl = $"https://api.github.com/repos/{owner}/{repo}/actions/runs/{runId}/jobs?per_page=100";
+        using (var jobsRequest = CreateAuthorizedRequest(HttpMethod.Get, jobsUrl, token))
+        {
+            jobsRequest.Headers.Add("Accept", "application/vnd.github+json");
+            jobsRequest.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+
+            using var jobsResponse = await client.SendAsync(jobsRequest, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!jobsResponse.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "GitHub API returned {Status} fetching jobs for run {RunId} — no logs available",
+                    (int)jobsResponse.StatusCode, runId);
+                return null;
+            }
+
+            await using var stream = await jobsResponse.Content.ReadAsStreamAsync(ct);
+            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
+
+            // GitHub caps the page at 100 jobs; anything beyond that is examined only on the
+            // first page (no pagination) per the log-fetch contract.
+            if (root.TryGetProperty("total_count", out var tc)
+                && tc.ValueKind == JsonValueKind.Number
+                && tc.TryGetInt32(out var totalCount)
+                && totalCount > 100)
+            {
+                _logger.LogWarning(
+                    "Run {RunId} has {Count} jobs; only the first 100 are examined", runId, totalCount);
+            }
+
+            if (!root.TryGetProperty("jobs", out var jobs) || jobs.ValueKind != JsonValueKind.Array)
+                return null;
+
+            foreach (var job in jobs.EnumerateArray())
+            {
+                if (!job.TryGetProperty("id", out var idProp)
+                    || idProp.ValueKind != JsonValueKind.Number
+                    || !idProp.TryGetInt64(out var jobId))
+                {
+                    continue; // malformed job entry — skip
+                }
+
+                string? conclusion = null;
+                if (job.TryGetProperty("conclusion", out var c) && c.ValueKind == JsonValueKind.String)
+                    conclusion = c.GetString();
+
+                if (!string.Equals(conclusion, "failure", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                failedJobIds.Add(jobId);
+            }
+        }
+
+        if (failedJobIds.Count == 0)
+            return null; // no failed jobs → no logs to fetch
+
+        var combinedFailures = new List<(string TestName, string Error, string StackTrace)>();
+        string? lastSuccessfulJobLog = null;
+
+        foreach (var jobId in failedJobIds)
+        {
+            string? sanitizedLog;
+            try
+            {
+                sanitizedLog = await FetchJobLogAsync(jobId, owner, repo, token, client, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // caller cancellation — propagate
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to fetch CI log for job {JobId} run {RunId}", jobId, runId);
+                continue; // job failure — partial success is allowed
+            }
+
+            if (sanitizedLog is null)
+                continue; // log not fetched (HTTP error) — job failure
+
+            lastSuccessfulJobLog = sanitizedLog;
+
+            var jobFailures = ParseTestFailuresFromLogs(sanitizedLog);
+            combinedFailures.AddRange(jobFailures);
+        }
+
+        if (lastSuccessfulJobLog is null)
+            return null; // every job's log fetch failed
+
+        if (combinedFailures.Count > 0)
+            return new LogFetchResult(combinedFailures, null);
+
+        // No parseable failures: fall back to a sanitized tail of the last successful log.
+        if (string.IsNullOrWhiteSpace(lastSuccessfulJobLog))
+            return new LogFetchResult([], null);
+
+        var snippet = lastSuccessfulJobLog.Length <= 500
+            ? lastSuccessfulJobLog
+            : lastSuccessfulJobLog[^500..];
+        return new LogFetchResult([], snippet);
+    }
+
+    /// <summary>
+    /// Fetches one failed job's log: requests <c>/actions/jobs/{jobId}/logs</c> with bearer
+    /// auth, manually follows the 302 redirect to the cross-host signed URL WITHOUT auth, and
+    /// reads the body through a bounded UTF-8-aligned ring buffer. The decoded tail is
+    /// sanitized before it is returned.
+    /// </summary>
+    /// <returns>The sanitized log text, or <c>null</c> when the job's log could not be fetched.</returns>
+    private async Task<string?> FetchJobLogAsync(
+        long jobId, string owner, string repo, string token, HttpClient client, CancellationToken ct)
+    {
+        var logsUrl = $"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{jobId}/logs";
+        using (var request = CreateAuthorizedRequest(HttpMethod.Get, logsUrl, token))
+        {
+            request.Headers.Add("Accept", "application/vnd.github+json");
+            request.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                _logger.LogWarning("GitHub API returned 429 fetching logs for job {JobId} — skipping", jobId);
+                return null;
+            }
+
+            if (response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                var remaining = GetHeaderValue(response, "X-RateLimit-Remaining");
+                _logger.LogWarning(
+                    "GitHub API returned 403 (X-RateLimit-Remaining: {Remaining}) fetching logs for job {JobId} — skipping",
+                    remaining ?? "n/a", jobId);
+                return null;
+            }
+
+            if (response.StatusCode == HttpStatusCode.Redirect)
+            {
+                var location = response.Headers.Location?.ToString();
+                if (string.IsNullOrEmpty(location))
+                {
+                    _logger.LogWarning(
+                        "GitHub API returned 302 without a Location header for job {JobId} logs — skipping", jobId);
+                    return null;
+                }
+
+                // The redirect target is a signed cross-host URL that must NOT receive the
+                // bearer token; the fresh request below carries no Authorization header.
+                using var redirectRequest = new HttpRequestMessage(HttpMethod.Get, location);
+                using var redirectResponse = await client.SendAsync(redirectRequest, HttpCompletionOption.ResponseHeadersRead, ct);
+                if (!redirectResponse.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning(
+                        "Log download for job {JobId} returned {Status} at the redirect target — skipping",
+                        jobId, (int)redirectResponse.StatusCode);
+                    return null;
+                }
+
+                return await ReadLogBodyAsync(redirectResponse, ct);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "GitHub API returned {Status} fetching logs for job {JobId} — skipping",
+                    (int)response.StatusCode, jobId);
+                return null;
+            }
+
+            return await ReadLogBodyAsync(response, ct);
+        }
+    }
+
+    /// <summary>
+    /// Streams the log body through a bounded ring buffer (retaining only the most recent
+    /// bytes), decodes it as UTF-8, and sanitizes the result. The ring keeps memory bounded
+    /// regardless of how large the raw log is.
+    /// </summary>
+    private static async Task<string> ReadLogBodyAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        var ring = new ByteRingBuffer(LogReadBufferSize);
+        var chunk = new byte[8192];
+        while (true)
+        {
+            var read = await stream.ReadAsync(chunk.AsMemory(), ct);
+            if (read == 0)
+                break;
+            ring.Write(chunk.AsSpan(0, read));
+        }
+
+        return SanitizeLogContent(ring.DecodeUtf8());
+    }
+
+    /// <summary>Creates a request with the GitHub bearer token attached.</summary>
+    private static HttpRequestMessage CreateAuthorizedRequest(HttpMethod method, string url, string token)
+    {
+        var request = new HttpRequestMessage(method, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        return request;
+    }
+
+    /// <summary>Reads a cached log-fetch result under the cache lock.</summary>
+    /// <param name="runId">The GitHub Actions run ID to look up.</param>
+    /// <param name="result">The cached result when present.</param>
+    /// <returns><c>true</c> when the runId was cached.</returns>
+    private bool TryGetCachedLogFetchResult(string runId, out LogFetchResult? result)
+    {
+        lock (_logFetchCacheLock)
+        {
+            if (_logFetchCache.TryGetValue(runId, out var cached))
+            {
+                result = cached;
+                return true;
+            }
+        }
+
+        result = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Stores a successful log-fetch result, evicting the oldest entry when at capacity.
+    /// The dictionary write, the order-queue enqueue, and the eviction are one atomic step so
+    /// the queue always mirrors the dictionary: a key is enqueued exactly once per insertion,
+    /// so eviction can never dequeue a stale duplicate and drop a value that is still current.
+    /// </summary>
+    private void CacheLogFetchResult(string runId, LogFetchResult result)
+    {
+        lock (_logFetchCacheLock)
+        {
+            // A concurrent duplicate fill overwrites the value in place; the key keeps its
+            // original queue position rather than being enqueued a second time.
+            if (!_logFetchCache.ContainsKey(runId))
+                _logFetchCacheOrder.Enqueue(runId);
+
+            _logFetchCache[runId] = result;
+
+            // FIFO eviction. Every queued key is present in the dictionary, so each dequeue
+            // removes exactly one real entry and the bound is reached in a bounded number of
+            // iterations.
+            while (_logFetchCache.Count > LogFetchCacheCapacity && _logFetchCacheOrder.Count > 0)
+            {
+                var oldest = _logFetchCacheOrder.Dequeue();
+                _logFetchCache.Remove(oldest);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A fixed-capacity ring buffer that retains only the most recent bytes written to it.
+    /// Used to bound the decoded footprint of arbitrarily large CI logs.
+    /// </summary>
+    private sealed class ByteRingBuffer
+    {
+        private readonly byte[] _buffer;
+        private int _start;
+        private int _length;
+
+        public ByteRingBuffer(int capacity)
+        {
+            if (capacity <= 0)
+                throw new ArgumentOutOfRangeException(nameof(capacity));
+            _buffer = new byte[capacity];
+        }
+
+        /// <summary>Number of currently retained bytes.</summary>
+        public int Length => _length;
+
+        /// <summary>Appends data, evicting the oldest bytes once the ring is full.</summary>
+        public void Write(ReadOnlySpan<byte> data)
+        {
+            if (data.IsEmpty)
+                return;
+
+            if (data.Length >= _buffer.Length)
+            {
+                // A single chunk that exceeds the whole ring: keep only its tail.
+                data = data[^_buffer.Length..];
+                _start = 0;
+                _length = 0;
+            }
+
+            var offset = 0;
+            while (offset < data.Length)
+            {
+                var writePos = (_start + _length) % _buffer.Length;
+                var chunk = Math.Min(data.Length - offset, _buffer.Length - writePos);
+                data.Slice(offset, chunk).CopyTo(_buffer.AsSpan(writePos, chunk));
+                offset += chunk;
+
+                var newLength = _length + chunk;
+                if (newLength <= _buffer.Length)
+                {
+                    _length = newLength;
+                }
+                else
+                {
+                    var excess = newLength - _buffer.Length;
+                    _start = (_start + excess) % _buffer.Length;
+                    _length = _buffer.Length;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Decodes the retained bytes as UTF-8. The window may begin mid-way through a
+        /// multi-byte character (its lead byte was evicted), so leading continuation bytes are
+        /// skipped to land on a character boundary; a truncated final sequence decodes to the
+        /// replacement character instead of throwing.
+        /// </summary>
+        public string DecodeUtf8()
+        {
+            if (_length == 0)
+                return string.Empty;
+
+            var start = _start;
+            var length = _length;
+            while (length > 0 && (_buffer[start] & 0b1100_0000) == 0b1000_0000)
+            {
+                start = (start + 1) % _buffer.Length;
+                length--;
+            }
+
+            if (length == 0)
+                return string.Empty;
+
+            var bytes = new byte[length];
+            for (var i = 0; i < length; i++)
+                bytes[i] = _buffer[(start + i) % _buffer.Length];
+
+            return LenientUtf8.GetString(bytes);
+        }
+    }
+
+    /// <summary>
+    /// Handles a failed CI result: creates one issue per parseable test failure, fetching the
+    /// actual job logs when the check-run output carries no test names. Runs are deduplicated
+    /// per runId so the same GitHub Actions run is never fetched twice in one call.
+    /// </summary>
+    /// <param name="goalId">The goal whose merge commit failed CI.</param>
+    /// <param name="repoName">The repository name as configured in hive-config.yaml.</param>
+    /// <param name="sha">The merge commit SHA that failed CI.</param>
+    /// <param name="failedCheckRuns">The failed check runs to turn into issues.</param>
+    /// <param name="owner">GitHub repository owner.</param>
+    /// <param name="repo">GitHub repository name.</param>
+    /// <param name="token">Bearer token for the GitHub API calls.</param>
+    /// <param name="client">The <c>github-api-logs</c> HTTP client (no auto-redirect).</param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task HandleCiFailureAsync(
-        string goalId, string repoName, string sha, IReadOnlyList<CheckRunData> failedRuns, CancellationToken ct)
+        string goalId, string repoName, string sha, IReadOnlyList<CheckRunData> failedCheckRuns,
+        string owner, string repo, string token, HttpClient client, CancellationToken ct)
     {
         var created = 0;
         var updated = 0;
@@ -1036,33 +1567,114 @@ public class CiMonitorService
         {
             try
             {
-                // Parse test names from all failed check runs.
-                var testNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var run in failedRuns)
-                {
-                    foreach (var name in ParseTestNames(CombineOutput(run)))
-                        testNames.Add(name);
-                }
+                // Per-call dedup: a runId is added the first time its logs are fetched so a
+                // later check run pointing at the same Actions run is skipped.
+                var processedRunIds = new HashSet<string>(StringComparer.Ordinal);
 
-                // Create one issue per unique test name.
-                foreach (var testName in testNames)
+                foreach (var run in failedCheckRuns)
                 {
-                    var run = failedRuns.FirstOrDefault(r => ContainsTestName(CombineOutput(r), testName)) ?? failedRuns[0];
-                    var title = $"CI failure: {testName}";
-                    var (c, u) = await CreateOrUpdateIssueAsync(goalId, repoName, sha, title, run, ct);
-                    created += c;
-                    updated += u;
-                }
+                    var output = CombineOutput(run);
+                    var testNames = ParseTestNames(output);
 
-                // Fallback: one issue per failed check run with no parseable test names.
-                foreach (var run in failedRuns)
-                {
-                    if (ParseTestNames(CombineOutput(run)).Count == 0)
+                    if (testNames.Count > 0)
                     {
+                        // (a) The output already names the failing tests — create issues from
+                        // it directly and do NOT mark the runId as processed.
+                        foreach (var testName in testNames)
+                        {
+                            var title = $"CI failure: {testName}";
+                            var (c, u) = await CreateOrUpdateIssueAsync(
+                                goalId, repoName, title,
+                                BuildIssueDescription(goalId, sha, run),
+                                BuildDedupAppend(run), ct);
+                            created += c;
+                            updated += u;
+                        }
+                        continue;
+                    }
+
+                    // No parseable test names in the output.
+                    if (string.IsNullOrEmpty(run.RunId))
+                    {
+                        // (d) No runId to fetch logs from — URL-only fallback.
                         var title = string.IsNullOrWhiteSpace(run.Name)
                             ? "CI failure: unknown check"
                             : $"CI failure: {run.Name}";
-                        var (c, u) = await CreateOrUpdateIssueAsync(goalId, repoName, sha, title, run, ct);
+                        var (c, u) = await CreateOrUpdateIssueAsync(
+                            goalId, repoName, title,
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
+                        created += c;
+                        updated += u;
+                        continue;
+                    }
+
+                    if (!processedRunIds.Add(run.RunId))
+                    {
+                        // (c) This Actions run was already processed — skip.
+                        continue;
+                    }
+
+                    // (b) Fetch the run's job logs and create issues from the log result.
+                    var logResult = await FetchJobLogsAsync(run.RunId, owner, repo, token, client, ct);
+                    if (logResult is null)
+                    {
+                        // Log fetch failed — URL-only fallback.
+                        var title = string.IsNullOrWhiteSpace(run.Name)
+                            ? "CI failure: unknown check"
+                            : $"CI failure: {run.Name}";
+                        var (c, u) = await CreateOrUpdateIssueAsync(
+                            goalId, repoName, title,
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
+                        created += c;
+                        updated += u;
+                        continue;
+                    }
+
+                    if (logResult.Failures.Count > 0)
+                    {
+                        // Log-derived issues, one per parsed test failure.
+                        foreach (var failure in logResult.Failures)
+                        {
+                            var sanitizedTestName = SanitizeLogContent(failure.TestName);
+                            var sanitizedError = SanitizeLogContent(failure.Error);
+                            var sanitizedStackTrace = SanitizeLogContent(failure.StackTrace);
+                            var title = $"CI failure: {sanitizedTestName}";
+                            var (c, u) = await CreateOrUpdateIssueAsync(
+                                goalId, repoName, title,
+                                BuildLogDerivedIssueDescription(
+                                    goalId, sha, run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace),
+                                BuildLogDerivedDedupAppend(
+                                    run.HtmlUrl, sanitizedTestName, sanitizedError, sanitizedStackTrace), ct);
+                            created += c;
+                            updated += u;
+                        }
+                    }
+                    else if (!string.IsNullOrWhiteSpace(logResult.FallbackSnippet))
+                    {
+                        // Log-derived fallback: no tests parsed, but the log yielded a snippet.
+                        var title = string.IsNullOrWhiteSpace(run.Name)
+                            ? "CI failure: unknown check"
+                            : $"CI failure: {run.Name}";
+                        var (c, u) = await CreateOrUpdateIssueAsync(
+                            goalId, repoName, title,
+                            BuildLogFallbackIssueDescription(goalId, sha, run.HtmlUrl, logResult.FallbackSnippet),
+                            BuildLogFallbackDedupAppend(run.HtmlUrl, logResult.FallbackSnippet), ct);
+                        created += c;
+                        updated += u;
+                    }
+                    else
+                    {
+                        // Empty-snippet fallback: the log was fetched but carried nothing
+                        // usable — use the URL-only format, not a log format with an empty body.
+                        var title = string.IsNullOrWhiteSpace(run.Name)
+                            ? "CI failure: unknown check"
+                            : $"CI failure: {run.Name}";
+                        var (c, u) = await CreateOrUpdateIssueAsync(
+                            goalId, repoName, title,
+                            BuildUrlOnlyIssueDescription(goalId, sha, run.HtmlUrl),
+                            BuildUrlOnlyDedupAppend(run.HtmlUrl), ct);
                         created += c;
                         updated += u;
                     }
@@ -1102,13 +1714,18 @@ public class CiMonitorService
 
         _eventBus!.Publish(new SystemEvent(
             Type: EventType.CiFailed,
-            Message: $"{failedRuns.Count} check(s) failed; created {created} issue(s), updated {updated} issue(s)",
+            Message: $"{failedCheckRuns.Count} check(s) failed; created {created} issue(s), updated {updated} issue(s)",
             GoalId: goalId,
             Repository: repoName));
     }
 
+    /// <summary>
+    /// Creates a CI-failure issue (or appends to an existing open/triaged issue with the same
+    /// title and source goal). The description and dedup-append text are pre-built by the
+    /// caller so each issue format (output-derived, log-derived, URL-only) stays in one place.
+    /// </summary>
     private async Task<(int Created, int Updated)> CreateOrUpdateIssueAsync(
-        string goalId, string repoName, string sha, string title, CheckRunData run, CancellationToken ct)
+        string goalId, string repoName, string title, string description, string dedupAppend, CancellationToken ct)
     {
         var issues = await _issueStore!.GetIssuesAsync(repository: repoName, ct: ct);
         var existing = issues.FirstOrDefault(i =>
@@ -1118,7 +1735,7 @@ public class CiMonitorService
 
         if (existing is not null)
         {
-            existing.Description += BuildDedupAppend(run);
+            existing.Description += dedupAppend;
             await _issueStore.UpdateIssueAsync(existing, ct);
             return (0, 1);
         }
@@ -1129,7 +1746,7 @@ public class CiMonitorService
             Id = id,
             Type = IssueType.Bug,
             Title = title,
-            Description = BuildIssueDescription(goalId, sha, run),
+            Description = description,
             Severity = IssueSeverity.High,
             Status = IssueStatus.Open,
             RepositoryNames = [repoName],
@@ -1174,8 +1791,93 @@ public class CiMonitorService
         return names;
     }
 
-    private static bool ContainsTestName(string output, string testName) =>
-        output.Contains(testName, StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Redacts secrets from raw CI log content: GitHub tokens (<c>ghp_</c>/<c>gho_</c>/<c>ghs_</c>),
+    /// <c>Bearer</c> authorization headers, secret-looking environment variables, and
+    /// <c>Password=</c> connection-string fragments. Never truncates the input — every line of
+    /// the log survives, with only the secret values replaced.
+    /// </summary>
+    /// <param name="logContent">The raw log content to sanitize.</param>
+    /// <returns>The sanitized log content.</returns>
+    internal static string SanitizeLogContent(string logContent)
+    {
+        var sanitized = GhpTokenRegex.Replace(logContent, "***REDACTED***");
+        sanitized = GhoTokenRegex.Replace(sanitized, "***REDACTED***");
+        sanitized = GhsTokenRegex.Replace(sanitized, "***REDACTED***");
+        sanitized = BearerTokenRegex.Replace(sanitized, "Bearer ***REDACTED***");
+        sanitized = SecretEnvVarRegex.Replace(sanitized, "$1=***REDACTED***");
+        sanitized = PasswordAssignmentRegex.Replace(sanitized, "Password=***REDACTED***");
+        return sanitized;
+    }
+
+    /// <summary>
+    /// Parses xUnit test failures out of a CI log. Each failure block has the shape
+    /// <c>Failed {name} [duration]</c> followed by an <c>Error Message:</c> section and a
+    /// <c>Stack Trace:</c> section. All such blocks are parsed; logs with no failure headers
+    /// (including count-only summaries such as <c>Failed: 0</c>) yield an empty list.
+    /// </summary>
+    /// <param name="logContent">The raw (unsanitized) log content to parse.</param>
+    /// <returns>The parsed failures, or an empty list when none could be parsed.</returns>
+    internal static List<(string TestName, string Error, string StackTrace)> ParseTestFailuresFromLogs(string logContent)
+    {
+        var failures = new List<(string TestName, string Error, string StackTrace)>();
+
+        if (string.IsNullOrEmpty(logContent))
+            return failures;
+
+        // Split into lines, preserving positions so sections can be sliced by line index.
+        var lines = logContent.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var header = XUnitFailedTestRegex.Match(lines[i]);
+            if (!header.Success)
+                continue;
+
+            var testName = header.Groups[1].Value.Trim();
+
+            // The failure block ends at the next failure header (or the end of the log).
+            var blockEnd = lines.Length;
+            for (var j = i + 1; j < lines.Length; j++)
+            {
+                if (XUnitFailedTestRegex.IsMatch(lines[j]))
+                {
+                    blockEnd = j;
+                    break;
+                }
+            }
+
+            // Locate the Error Message: and Stack Trace: headers inside the block.
+            var errorHeaderIndex = -1;
+            var stackHeaderIndex = -1;
+            for (var j = i + 1; j < blockEnd; j++)
+            {
+                if (errorHeaderIndex < 0 && XUnitErrorMessageRegex.IsMatch(lines[j]))
+                {
+                    errorHeaderIndex = j;
+                    continue;
+                }
+                if (stackHeaderIndex < 0 && XUnitStackTraceRegex.IsMatch(lines[j]))
+                {
+                    stackHeaderIndex = j;
+                    break; // the stack trace is the last section of the failure block
+                }
+            }
+
+            if (errorHeaderIndex < 0)
+                continue; // header without a message section is not a parseable failure
+
+            var errorEnd = stackHeaderIndex >= 0 ? stackHeaderIndex : blockEnd;
+            var error = string.Join("\n", lines[(errorHeaderIndex + 1)..errorEnd]).Trim();
+
+            var stackTrace = string.Empty;
+            if (stackHeaderIndex >= 0)
+                stackTrace = string.Join("\n", lines[(stackHeaderIndex + 1)..blockEnd]).Trim();
+
+            failures.Add((testName, error, stackTrace));
+        }
+
+        return failures;
+    }
 
     private static string CombineOutput(CheckRunData run)
     {
@@ -1187,19 +1889,50 @@ public class CiMonitorService
         return string.Join("\n\n", parts);
     }
 
+    /// <summary>Renders the check run's HTML URL, or <c>(no URL)</c> when absent.</summary>
+    private static string RenderHtmlUrl(string? htmlUrl) =>
+        string.IsNullOrWhiteSpace(htmlUrl) ? "(no URL)" : htmlUrl;
+
+    /// <summary>Builds the description for an issue created from a check run's own output.</summary>
     private static string BuildIssueDescription(string goalId, string sha, CheckRunData run)
     {
         var errorOutput = CombineOutput(run);
-        var htmlUrl = string.IsNullOrWhiteSpace(run.HtmlUrl) ? "(no URL)" : run.HtmlUrl;
-        return $"CI failed for goal '{goalId}' (commit {sha}).\n\n{errorOutput}\n\nCI run: {htmlUrl}";
+        return $"CI failed for goal '{goalId}' (commit {sha}).\n\n{errorOutput}\n\nCI run: {RenderHtmlUrl(run.HtmlUrl)}";
     }
 
+    /// <summary>Builds the dedup-append text for an issue created from a check run's own output.</summary>
     private static string BuildDedupAppend(CheckRunData run)
     {
         var errorOutput = CombineOutput(run);
-        var htmlUrl = string.IsNullOrWhiteSpace(run.HtmlUrl) ? "(no URL)" : run.HtmlUrl;
-        return $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{errorOutput}\nCI run: {htmlUrl}";
+        return $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\n{errorOutput}\nCI run: {RenderHtmlUrl(run.HtmlUrl)}";
     }
+
+    /// <summary>Builds the description for a log-derived issue (one parsed test failure).</summary>
+    private static string BuildLogDerivedIssueDescription(
+        string goalId, string sha, string? htmlUrl, string testName, string error, string stackTrace) =>
+        $"CI failed for goal '{goalId}' (commit {sha}).\n\nTest: {testName}\n\nError: {error}\n\nStack Trace:\n{stackTrace}\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+
+    /// <summary>Builds the dedup-append text for a log-derived issue.</summary>
+    private static string BuildLogDerivedDedupAppend(
+        string? htmlUrl, string testName, string error, string stackTrace) =>
+        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nTest: {testName}\nError: {error}\nStack Trace:\n{stackTrace}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+
+    /// <summary>Builds the description for a log-fallback issue (no tests parsed, snippet available).</summary>
+    private static string BuildLogFallbackIssueDescription(
+        string goalId, string sha, string? htmlUrl, string snippet) =>
+        $"CI failed for goal '{goalId}' (commit {sha}).\n\nLog output (last 500 chars):\n{snippet}\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+
+    /// <summary>Builds the dedup-append text for a log-fallback issue.</summary>
+    private static string BuildLogFallbackDedupAppend(string? htmlUrl, string snippet) =>
+        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nLog output (last 500 chars):\n{snippet}\nCI run: {RenderHtmlUrl(htmlUrl)}";
+
+    /// <summary>Builds the description for a URL-only fallback issue (no logs or empty snippet).</summary>
+    private static string BuildUrlOnlyIssueDescription(string goalId, string sha, string? htmlUrl) =>
+        $"CI failed for goal '{goalId}' (commit {sha}).\n\nCI run: {RenderHtmlUrl(htmlUrl)}";
+
+    /// <summary>Builds the dedup-append text for a URL-only fallback issue.</summary>
+    private static string BuildUrlOnlyDedupAppend(string? htmlUrl) =>
+        $"\n\n---\n[Updated {DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)}]\nCI run: {RenderHtmlUrl(htmlUrl)}";
 
     /// <summary>Whether the response carries the named header at all, regardless of its value.</summary>
     private static bool HasHeader(HttpResponseMessage response, string name) =>

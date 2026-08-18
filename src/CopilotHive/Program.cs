@@ -404,6 +404,20 @@ public sealed class Program
                 client.DefaultRequestHeaders.Add("User-Agent", "CopilotHive");
             });
 
+            // HTTP client for GitHub Actions log download (CI monitoring). Redirects are
+            // deliberately NOT followed: the log URL redirects to a signed storage endpoint,
+            // and the redirect target must be captured rather than transparently followed.
+            builder.Services.AddHttpClient("github-api-logs", client =>
+            {
+                client.BaseAddress = new Uri("https://api.github.com/");
+                client.Timeout = TimeSpan.FromSeconds(30);
+                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
+                client.DefaultRequestHeaders.Add("User-Agent", "CopilotHive");
+            }).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AllowAutoRedirect = false,
+            });
+
             // CI monitoring: polls GitHub check-runs for completed goals' merge commits.
             builder.Services.AddSingleton(sp => new CiMonitorService(
                 goalStore: sp.GetService<IGoalStore>(),

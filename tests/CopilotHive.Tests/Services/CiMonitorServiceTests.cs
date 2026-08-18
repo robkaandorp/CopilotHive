@@ -235,6 +235,47 @@ public sealed class CiMonitorServiceTests : IDisposable
         return factory.Object;
     }
 
+    /// <summary>
+    /// Creates an <see cref="IHttpClientFactory"/> that returns the same handler-backed client
+    /// for every named client. Used by integration tests that drive the real
+    /// <see cref="CiMonitorService.MonitorMergeAsync"/> / <see cref="CiMonitorService.StartupScanAsync"/>
+    /// paths with a routing handler (e.g. <see cref="CiFailureRoutingHandler"/>) that is not a
+    /// <see cref="ScriptedHttpMessageHandler"/>.
+    /// </summary>
+    private static IHttpClientFactory CreateFactory(HttpMessageHandler handler)
+    {
+        var factory = new Mock<IHttpClientFactory>();
+        factory.Setup(f => f.CreateClient(It.IsAny<string>()))
+               .Returns(() => new HttpClient(handler, disposeHandler: false));
+        return factory.Object;
+    }
+
+    /// <summary>
+    /// Creates a <see cref="CiMonitorService"/> wired to a generic routing handler (used by the
+    /// HandleCiFailureAsync integration tests).
+    /// </summary>
+    private static CiMonitorService CreateService(
+        HttpMessageHandler handler,
+        HiveConfigFile? config = null,
+        IIssueStore? issueStore = null,
+        IEventBus? eventBus = null,
+        ILogger<CiMonitorService>? logger = null,
+        IGoalStore? goalStore = null,
+        TimeSpan? startupScanWindow = null,
+        TimeSpan? timeoutOverride = null)
+    {
+        return new CiMonitorService(
+            goalStore: goalStore,
+            issueStore: issueStore,
+            eventBus: eventBus,
+            config: config ?? CreateConfig(CreateRepo()),
+            httpClientFactory: CreateFactory(handler),
+            logger: logger ?? NullLogger<CiMonitorService>.Instance,
+            pollInterval: PollInterval,
+            timeoutOverride: timeoutOverride ?? Timeout,
+            startupScanWindow: startupScanWindow);
+    }
+
     private static string CheckRunsJson(int totalCount, params (string Name, string Status, string? Conclusion, string? Summary, string? Text)[] runs)
     {
         var runObjects = runs.Select(r => new
@@ -2302,5 +2343,1708 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Equal(
             ["repo-a", "repo-b"],
             issueStore.Issues.Values.Select(i => i.RepositoryNames.Single()).Order().ToList());
+    }
+
+    // ── ParseCheckRun: DetailsUrl and RunId capture ───────────────────────
+
+    /// <summary>
+    /// Parses a single check-run JSON element via the internal probe path and returns the
+    /// resulting <see cref="CheckRunData"/>. The check_runs array carries exactly one run.
+    /// </summary>
+    private static async Task<CheckRunData> ParseSingleRunAsync(string checkRunJson)
+    {
+        var body = RawCheckRunsJson(1, $"[{checkRunJson}]");
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(body));
+        var result = await ProbeAsync(handler);
+        return Assert.Single(result.CheckRuns);
+    }
+
+    [Fact]
+    public async Task ParseCheckRun_DetailsUrlPresent_CapturesDetailsUrl()
+    {
+        var run = await ParseSingleRunAsync("""
+            {
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": "https://github.com/org/repo/actions/runs/123456789"
+            }
+            """);
+
+        Assert.Equal("https://github.com/org/repo/actions/runs/123456789", run.DetailsUrl);
+        Assert.Equal("123456789", run.RunId);
+    }
+
+    [Fact]
+    public async Task ParseCheckRun_DetailsUrlAbsent_DetailsUrlIsNull()
+    {
+        var run = await ParseSingleRunAsync("""
+            {
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure"
+            }
+            """);
+
+        Assert.Null(run.DetailsUrl);
+    }
+
+    [Fact]
+    public async Task ParseCheckRun_DetailsUrlWithActionsRuns_ParsesRunId()
+    {
+        var run = await ParseSingleRunAsync("""
+            {
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": "https://github.com/org/repo/actions/runs/9876543210/attempts/1"
+            }
+            """);
+
+        Assert.Equal("9876543210", run.RunId);
+        Assert.Equal("https://github.com/org/repo/actions/runs/9876543210/attempts/1", run.DetailsUrl);
+    }
+
+    [Fact]
+    public async Task ParseCheckRun_DetailsUrlPresentButNoRunPath_RetainsDetailsUrlRunIdNull()
+    {
+        var url = "https://example.com/some-other-page";
+        var run = await ParseSingleRunAsync($$"""
+            {
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": "{{url}}"
+            }
+            """);
+
+        Assert.Equal(url, run.DetailsUrl);
+        Assert.Null(run.RunId);
+    }
+
+    [Fact]
+    public async Task ParseCheckRun_NoDetailsUrl_RunIdIsNull()
+    {
+        var run = await ParseSingleRunAsync("""
+            {
+              "name": "build",
+              "status": "completed",
+              "conclusion": "success"
+            }
+            """);
+
+        Assert.Null(run.RunId);
+    }
+
+    // ── SanitizeLogContent ────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("ghp_")]
+    [InlineData("gho_")]
+    [InlineData("ghs_")]
+    public void SanitizeLogContent_GitHubTokenPrefix_RedactsFull36CharSuffix(string prefix)
+    {
+        // GitHub token secrets are a 4-char prefix + 36-char suffix (e.g. ghp_xxxx...).
+        var suffix = new string('a', 36);
+        var token = prefix + suffix;
+        var input = $"Authorization: {token} and done";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.DoesNotContain(token, sanitized);
+        Assert.Contains("***REDACTED***", sanitized);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_BearerToken_RedactsValue()
+    {
+        var input = "header: Bearer abc.def-ghi_xyz123";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.Equal("header: Bearer ***REDACTED***", sanitized);
+        Assert.DoesNotContain("abc.def-ghi_xyz123", sanitized);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_SecretEnvVar_PreservesKeyNameRedactsValue()
+    {
+        var input = "MY_API_TOKEN=abc123";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.Equal("MY_API_TOKEN=***REDACTED***", sanitized);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_ConnectionStringPassword_RedactsPassword()
+    {
+        var input = "Server=.;Database=db;User Id=sa;Password=s3cr3t;Trusted_Connection=False;";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.DoesNotContain("s3cr3t", sanitized);
+        Assert.Contains("Password=***REDACTED***", sanitized);
+        // The surrounding connection-string fragments survive untouched.
+        Assert.Contains("Server=.", sanitized);
+        Assert.Contains("Database=db", sanitized);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_LongInput_DoesNotTruncate()
+    {
+        // Only matched secrets are redacted; the full length of the input is preserved.
+        var padding = new string('x', 10_000);
+        var input = $"start {padding} ghp_{new string('b', 36)} end {padding}";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.DoesNotContain("ghp_", sanitized);
+        Assert.Contains("***REDACTED***", sanitized);
+        // The non-secret padding (before and after the token) survives at full length.
+        var expectedLength = input.Length - ("ghp_" + new string('b', 36)).Length + "***REDACTED***".Length;
+        Assert.Equal(expectedLength, sanitized.Length);
+    }
+
+    // ── ParseTestFailuresFromLogs ──────────────────────────────────────────
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_SingleFailure_ReturnsOneEntryWithCorrectFields()
+    {
+        var log = """
+            Starting test execution...
+
+            Failed CopilotHive.Tests.MyTests.TestOne [1 ms]
+              Error Message:
+                Assert.Equal() Failure
+                Expected: 1
+                Actual:   2
+              Stack Trace:
+                at MyTests.TestOne() in /src/MyTests.cs:line 10
+                at Xunit.TestRunner.Run()
+            """;
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("CopilotHive.Tests.MyTests.TestOne", failure.TestName);
+        // The error-message and stack-trace section contents are joined and then Trim()'d, which
+        // strips leading whitespace from the first line only; interior lines keep their original
+        // xUnit indentation.
+        Assert.Equal("Assert.Equal() Failure\n    Expected: 1\n    Actual:   2", failure.Error);
+        Assert.Equal("at MyTests.TestOne() in /src/MyTests.cs:line 10\n    at Xunit.TestRunner.Run()", failure.StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MultipleFailures_ReturnsEntriesInOrder()
+    {
+        var log = """
+            Failed Tests.Alpha.First [2 ms]
+              Error Message:
+                alpha failure
+              Stack Trace:
+                at Alpha.First()
+
+            Failed Tests.Beta.Second [3 ms]
+              Error Message:
+                beta failure
+              Stack Trace:
+                at Beta.Second()
+            """;
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Equal(2, failures.Count);
+        Assert.Equal("Tests.Alpha.First", failures[0].TestName);
+        Assert.Equal("alpha failure", failures[0].Error);
+        Assert.Equal("at Alpha.First()", failures[0].StackTrace);
+        Assert.Equal("Tests.Beta.Second", failures[1].TestName);
+        Assert.Equal("beta failure", failures[1].Error);
+        Assert.Equal("at Beta.Second()", failures[1].StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_NoFailures_ReturnsEmptyList()
+    {
+        var log = """
+            Passed!  - Failed:     0, Passed:   10, Skipped:     0, Total:   10
+            Total tests: 10
+            """;
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_CountOnlyOutput_ReturnsEmptyList()
+    {
+        // A bare count-only summary (no per-test "Failed {name} [duration]" blocks) must not be
+        // mistaken for a parseable failure — xUnit's failure blocks are the only signal.
+        var log = "Failed: 3\nPassed: 10\nTotal: 13";
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
+    // ── FetchJobLogsAsync (internal) ───────────────────────────────────────
+
+    /// <summary>
+    /// Builds a JSON body for the <c>/actions/runs/{runId}/jobs</c> endpoint. Each job has an
+    /// integer <c>id</c> and a string <c>conclusion</c>; only jobs whose conclusion is
+    /// <c>failure</c> are fetched.
+    /// </summary>
+    private static string JobsJson(int totalCount, params (long Id, string Conclusion)[] jobs)
+    {
+        var jobObjects = jobs.Select(j => new
+        {
+            id = j.Id,
+            conclusion = j.Conclusion,
+        }).ToArray();
+        return JsonSerializer.Serialize(new { total_count = totalCount, jobs = jobObjects });
+    }
+
+    /// <summary>
+    /// An xUnit failure log body containing exactly one parseable failure, used as the log
+    /// payload returned by the redirect target.
+    /// </summary>
+    private static string SingleFailureLog() => """
+        Starting test execution...
+
+        Failed Tests.Alpha.First [2 ms]
+          Error Message:
+            alpha failure
+          Stack Trace:
+            at Alpha.First()
+        """;
+
+    /// <summary>
+    /// An xUnit failure log body containing two parseable failures in order.
+    /// </summary>
+    private static string TwoFailureLog() => """
+        Failed Tests.Alpha.First [2 ms]
+          Error Message:
+            alpha failure
+          Stack Trace:
+            at Alpha.First()
+
+        Failed Tests.Beta.Second [3 ms]
+          Error Message:
+            beta failure
+          Stack Trace:
+            at Beta.Second()
+        """;
+
+    /// <summary>A log body with no xUnit failure blocks (a passing summary).</summary>
+    private static string NoFailureLog() => """
+        Passed!  - Failed:     0, Passed:   10, Skipped:     0, Total:   10
+        Total tests: 10
+        """;
+
+    /// <summary>
+    /// A 302 redirect response whose <c>Location</c> points at a cross-host signed URL. The
+    /// test's responder serves the configured log body at that URL.
+    /// </summary>
+    private sealed class RedirectHandler : HttpMessageHandler
+    {
+        private readonly string _redirectTarget = $"https://logs.example.com/{Guid.NewGuid():N}";
+        private readonly string _logBody;
+        private readonly List<CapturedRequest> _captured = [];
+        private readonly object _lock = new();
+
+        public IReadOnlyList<CapturedRequest> Captured
+        {
+            get { lock (_lock) return _captured.ToList(); }
+        }
+
+        public RedirectHandler(string logBody) => _logBody = logBody;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                _captured.Add(new CapturedRequest(
+                    request.RequestUri!.ToString(),
+                    request.Headers.Authorization?.Scheme,
+                    request.Headers.Authorization?.Parameter));
+            }
+
+            // The API endpoint (api.github.com) returns 302 to the redirect target.
+            if (request.RequestUri!.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Redirect)
+                {
+                    Headers = { Location = new Uri(_redirectTarget) }
+                });
+            }
+
+            // The redirect target (cross-host) returns the log body with 200.
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(_logBody, Encoding.UTF8, "text/plain")
+            });
+        }
+    }
+
+    /// <summary>
+    /// A handler that returns 302 for api.github.com requests but returns a non-2xx status
+    /// at the redirect target, simulating a failed log download.
+    /// </summary>
+    private sealed class RedirectThenFailHandler : HttpMessageHandler
+    {
+        private readonly string _redirectTarget = $"https://logs.example.com/{Guid.NewGuid():N}";
+        private readonly HttpStatusCode _redirectStatus;
+        private readonly List<CapturedRequest> _captured = [];
+        private readonly object _lock = new();
+
+        public IReadOnlyList<CapturedRequest> Captured
+        {
+            get { lock (_lock) return _captured.ToList(); }
+        }
+
+        public RedirectThenFailHandler(HttpStatusCode redirectStatus) => _redirectStatus = redirectStatus;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                _captured.Add(new CapturedRequest(
+                    request.RequestUri!.ToString(),
+                    request.Headers.Authorization?.Scheme,
+                    request.Headers.Authorization?.Parameter));
+            }
+
+            if (request.RequestUri!.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Redirect)
+                {
+                    Headers = { Location = new Uri(_redirectTarget) }
+                });
+            }
+
+            return Task.FromResult(new HttpResponseMessage(_redirectStatus));
+        }
+    }
+
+    /// <summary>
+    /// A handler that serves the jobs endpoint from api.github.com and serves a configurable
+    /// per-job-log response. The responder function receives the request URL and returns the
+    /// appropriate <see cref="HttpResponseMessage"/>.
+    /// </summary>
+    private sealed class JobsAndLogsHandler : HttpMessageHandler
+    {
+        private readonly string _jobsBody;
+        private readonly Func<Uri, HttpResponseMessage> _logResponder;
+        private readonly List<CapturedRequest> _captured = [];
+        private readonly object _lock = new();
+
+        public IReadOnlyList<CapturedRequest> Captured
+        {
+            get { lock (_lock) return _captured.ToList(); }
+        }
+
+        public JobsAndLogsHandler(string jobsBody, Func<Uri, HttpResponseMessage> logResponder)
+        {
+            _jobsBody = jobsBody;
+            _logResponder = logResponder;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                _captured.Add(new CapturedRequest(
+                    request.RequestUri!.ToString(),
+                    request.Headers.Authorization?.Scheme,
+                    request.Headers.Authorization?.Parameter));
+            }
+
+            var uri = request.RequestUri!;
+            // The jobs endpoint contains "/actions/runs/.../jobs"
+            if (uri.AbsolutePath.Contains("/actions/runs/", StringComparison.Ordinal)
+                && uri.AbsolutePath.EndsWith("/jobs", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(_jobsBody, Encoding.UTF8, "application/json")
+                });
+            }
+
+            // The job-log endpoint contains "/actions/jobs/.../logs"
+            return Task.FromResult(_logResponder(uri));
+        }
+    }
+
+    /// <summary>
+    /// A <see cref="JobsAndLogsHandler"/> variant that awaits an async hook BEFORE producing
+    /// any response. Pairing one instance whose hook waits on a gate with another whose hook
+    /// signals that gate rendezvouses two concurrent <c>FetchJobLogsAsync</c> callers: neither
+    /// response can complete until both callers have already checked the cache and missed.
+    /// </summary>
+    private sealed class GatedJobsAndLogsHandler : HttpMessageHandler
+    {
+        private readonly string _jobsBody;
+        private readonly Func<Uri, HttpResponseMessage> _logResponder;
+        private readonly Func<Task> _beforeResponse;
+        private readonly List<CapturedRequest> _captured = [];
+        private readonly object _lock = new();
+
+        public IReadOnlyList<CapturedRequest> Captured
+        {
+            get { lock (_lock) return _captured.ToList(); }
+        }
+
+        public GatedJobsAndLogsHandler(
+            string jobsBody,
+            Func<Uri, HttpResponseMessage> logResponder,
+            Func<Task> beforeResponse)
+        {
+            _jobsBody = jobsBody;
+            _logResponder = logResponder;
+            _beforeResponse = beforeResponse;
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                _captured.Add(new CapturedRequest(
+                    request.RequestUri!.ToString(),
+                    request.Headers.Authorization?.Scheme,
+                    request.Headers.Authorization?.Parameter));
+            }
+
+            // Runs before ANY response bytes exist, so a caller parked here has already
+            // performed (and missed) its cache lookup.
+            await _beforeResponse();
+
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath.Contains("/actions/runs/", StringComparison.Ordinal)
+                && uri.AbsolutePath.EndsWith("/jobs", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(_jobsBody, Encoding.UTF8, "application/json")
+                };
+            }
+
+            return _logResponder(uri);
+        }
+    }
+
+    private static HttpResponseMessage LogResponse(string body) => new(HttpStatusCode.OK)
+    {
+        Content = new StringContent(body, Encoding.UTF8, "text/plain")
+    };
+
+    private static HttpResponseMessage LogResponse(byte[] body) => new(HttpStatusCode.OK)
+    {
+        Content = new ByteArrayContent(body)
+    };
+
+    private static HttpResponseMessage JobsNotFoundResponse() => new(HttpStatusCode.NotFound);
+
+    private static HttpResponseMessage JobLogNotFoundResponse() => new(HttpStatusCode.NotFound);
+
+    private static HttpResponseMessage JobLog429Response() => new(HttpStatusCode.TooManyRequests);
+
+    private static HttpResponseMessage JobLog403Response(string? rateLimitRemaining = null)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.Forbidden);
+        if (rateLimitRemaining is not null)
+            response.Headers.Add("X-RateLimit-Remaining", rateLimitRemaining);
+        return response;
+    }
+
+    private static LogFetchResult? InvokeFetch(
+        CiMonitorService service, string? runId, HttpClient client, CancellationToken ct = default)
+    {
+        return service.FetchJobLogsAsync(runId, "org", "test-repo", "test-token", client, ct)
+            .GetAwaiter().GetResult();
+    }
+
+    /// <summary>Creates a minimal CiMonitorService for direct internal-method testing.</summary>
+    private static CiMonitorService CreateServiceForLogFetch() =>
+        new(logger: NullLogger<CiMonitorService>.Instance);
+
+    [Fact]
+    public async Task FetchJobLogsAsync_FailedJobWithLog_ReturnsParsedFailures()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(SingleFailureLog()));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal("Tests.Alpha.First", failure.TestName);
+        Assert.Equal("alpha failure", failure.Error);
+        Assert.Equal("at Alpha.First()", failure.StackTrace);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_NoFailedJobs_ReturnsNull()
+    {
+        var jobsBody = JobsJson(2, (111, "success"), (222, "skipped"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse("should not be called"));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+        // No job-log requests should have been issued because there were no failed jobs.
+        Assert.Single(handler.Captured); // only the jobs endpoint request
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_404OnAllJobLogs_ReturnsNull()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => JobLogNotFoundResponse());
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_PartialSuccess_CombinesFailuresFromSuccessfulJobs()
+    {
+        // Two failed jobs: the first log fetch 404s, the second succeeds with two failures.
+        var jobsBody = JobsJson(2, (111, "failure"), (222, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, uri =>
+        {
+            if (uri.AbsolutePath.Contains("/111/", StringComparison.Ordinal))
+                return JobLogNotFoundResponse();
+            return LogResponse(TwoFailureLog());
+        });
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result!.Failures.Count);
+        Assert.Equal("Tests.Alpha.First", result.Failures[0].TestName);
+        Assert.Equal("Tests.Beta.Second", result.Failures[1].TestName);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_429OnJob_SkipsJobNoRetry()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => JobLog429Response());
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        // The single job was skipped (429) so no log was fetched → null.
+        Assert.Null(result);
+        // Only two requests: jobs endpoint + one job-log attempt (no retry).
+        Assert.Equal(2, handler.Captured.Count);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_403RateLimitedOnJob_SkipsJob()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => JobLog403Response(rateLimitRemaining: "0"));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+        Assert.Equal(2, handler.Captured.Count);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_Other403OnJob_SkipsJob()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        // A 403 WITHOUT X-RateLimit-Remaining: 0 is the "other 403" path.
+        var handler = new JobsAndLogsHandler(jobsBody, _ => JobLog403Response());
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+        Assert.Equal(2, handler.Captured.Count);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_NullRunId_ReturnsNull()
+    {
+        var handler = new JobsAndLogsHandler("{}", _ => LogResponse("unused"));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync(null, "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+        Assert.Empty(handler.Captured); // no HTTP requests issued
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_EmptyRunId_ReturnsNull()
+    {
+        var handler = new JobsAndLogsHandler("{}", _ => LogResponse("unused"));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.Null(result);
+        Assert.Empty(handler.Captured);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_LargeLog_BoundedTo200KBytes()
+    {
+        // The ring buffer does NOT bound how many bytes are read — it reads the whole stream
+        // and retains only the final 200,000 bytes. So the observable contract is WHICH content
+        // survives, not how much was read.
+        //
+        // The log below is exactly 300,000 ASCII bytes with a parseable xUnit failure in the
+        // dropped prefix (offset 0, well inside the first 100,000 bytes) and a DIFFERENT
+        // parseable failure in the retained tail (offset 250,000, inside the last 100,000
+        // bytes). The 200,000-byte ring retains bytes [100,000 .. 300,000).
+        //
+        // Removal-proof: if the ring buffer were removed (or its capacity raised to cover the
+        // whole body), the PREFIX failure would also be parsed and the assertion that exactly
+        // one failure — the tail one — is returned would fail.
+        const string PrefixTestName = "Tests.PrefixDroppedByRingBuffer";
+        const string TailTestName = "Tests.TailRetainedByRingBuffer";
+
+        var prefixBlock = $"""
+            Failed {PrefixTestName} [1 ms]
+              Error Message:
+                prefix failure lives in the dropped region
+              Stack Trace:
+                at {PrefixTestName}()
+
+            """;
+        var tailBlock = $"""
+            Failed {TailTestName} [2 ms]
+              Error Message:
+                tail failure lives in the retained region
+              Stack Trace:
+                at {TailTestName}()
+
+            """;
+        // Normalize to '\n' so the byte offsets below hold on every platform.
+        prefixBlock = prefixBlock.Replace("\r\n", "\n", StringComparison.Ordinal);
+        tailBlock = tailBlock.Replace("\r\n", "\n", StringComparison.Ordinal);
+
+        const int TotalBytes = 300_000;
+        const int RingCapacity = 200_000;
+        const int TailBlockOffset = 250_000;
+
+        // Filler is a run of 'y' terminated by a newline: it contains no failure header, no
+        // "Error Message:" and no "Stack Trace:" line, so it can never contribute a parsed
+        // failure of its own. The trailing newline puts the tail block's "Failed ..." header at
+        // the start of its own line, which the xUnit header regex requires.
+        var fillerBefore = new string('y', TailBlockOffset - prefixBlock.Length - 1) + "\n";
+        var fillerAfter = new string('y', TotalBytes - TailBlockOffset - tailBlock.Length);
+        var fullLog = prefixBlock + fillerBefore + tailBlock + fillerAfter;
+
+        // Guard the geometry the assertions depend on (ASCII → 1 byte per char).
+        Assert.Equal(TotalBytes, fullLog.Length);
+        Assert.True(prefixBlock.Length < TotalBytes - RingCapacity,
+            "The prefix failure must lie entirely inside the region the ring buffer drops.");
+        Assert.True(TailBlockOffset >= TotalBytes - RingCapacity,
+            "The tail failure must lie entirely inside the region the ring buffer retains.");
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(fullLog));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+
+        var parsedNames = result!.Failures.Select(f => f.TestName).ToList();
+
+        // The prefix failure was overwritten by the ring buffer → it must NOT be parsed.
+        Assert.DoesNotContain(PrefixTestName, parsedNames);
+        // The tail failure was retained by the ring buffer → it MUST be parsed.
+        Assert.Contains(TailTestName, parsedNames);
+        // Exactly one failure: dropping the ring buffer would add the prefix failure back.
+        var tailFailure = Assert.Single(result.Failures);
+        Assert.Equal(TailTestName, tailFailure.TestName);
+        Assert.Equal("tail failure lives in the retained region", tailFailure.Error);
+        Assert.StartsWith($"at {TailTestName}()", tailFailure.StackTrace, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_CacheHit_ReturnsCachedResultWithoutHttp()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(SingleFailureLog()));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        // First call fetches via HTTP.
+        var first = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+        Assert.NotNull(first);
+        var firstRequestCount = handler.Captured.Count;
+        Assert.True(firstRequestCount >= 2); // jobs + job-log
+
+        // Second call with the same runId must hit the cache and issue NO HTTP requests.
+        var second = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(second);
+        Assert.Same(first, second);
+        Assert.Equal(firstRequestCount, handler.Captured.Count); // no new requests
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_CacheEvictionAt20_OldestEvicted()
+    {
+        // Each runId gets a distinct failure log (TestName encodes the runId) so a cache hit
+        // vs. miss is observable: a cached result carries its original TestName, while a
+        // re-fetch carries the new handler's TestName.
+        string FailureLogFor(string testName) => $$"""
+            Failed {{testName}} [1 ms]
+              Error Message:
+                failure for {{testName}}
+              Stack Trace:
+                at {{testName}}()
+            """;
+
+        HttpClient ClientFor(string runId) =>
+            new(new JobsAndLogsHandler(
+                JobsJson(1, (100, "failure")),
+                _ => LogResponse(FailureLogFor($"Test.{runId}"))),
+                disposeHandler: false);
+
+        var service = CreateServiceForLogFetch();
+
+        // Fill the cache with exactly 20 distinct runIds.
+        for (var i = 0; i < 20; i++)
+        {
+            var runId = $"run-{i:D2}";
+            using var client = ClientFor(runId);
+            var r = await service.FetchJobLogsAsync(runId, "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+            Assert.NotNull(r);
+            Assert.Equal($"Test.run-{i:D2}", r!.Failures[0].TestName);
+        }
+
+        // Insert a 21st distinct runId — this must evict the oldest (run-00).
+        using (var client21 = ClientFor("run-20"))
+        {
+            var result21 = await service.FetchJobLogsAsync("run-20", "org", "test-repo", "test-token", client21, TestContext.Current.CancellationToken);
+            Assert.NotNull(result21);
+            Assert.Equal("Test.run-20", result21!.Failures[0].TestName);
+        }
+
+        // The evicted run-00 must now re-fetch via HTTP (cache miss). The new handler returns a
+        // DIFFERENT TestName ("Evicted.run-00"), proving the stale cached result was evicted.
+        var refetchHandler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Evicted.run-00")));
+        using var refetchClient = new HttpClient(refetchHandler, disposeHandler: false);
+        var refetched = await service.FetchJobLogsAsync("run-00", "org", "test-repo", "test-token", refetchClient, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(refetched);
+        Assert.Equal("Evicted.run-00", refetched!.Failures[0].TestName);
+        // HTTP requests were issued for the re-fetch (cache miss).
+        Assert.True(refetchHandler.Captured.Count >= 2);
+
+        // The most recent entry (run-20) must still be cached — a second call must NOT issue
+        // HTTP requests. Removal-proof: if run-20 were also evicted, this would re-fetch.
+        var run20Handler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("ShouldNotBeFetched.run-20")));
+        using var run20Client = new HttpClient(run20Handler, disposeHandler: false);
+        var run20Cached = await service.FetchJobLogsAsync("run-20", "org", "test-repo", "test-token", run20Client, TestContext.Current.CancellationToken);
+        Assert.NotNull(run20Cached);
+        Assert.Equal("Test.run-20", run20Cached!.Failures[0].TestName); // original cached value, not re-fetched
+        Assert.Empty(run20Handler.Captured); // no HTTP requests — cache hit
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_CacheConcurrency_NeverExceedsBoundAndEvictsOldest()
+    {
+        // A REAL rendezvous: the cache is filled to capacity (20), then two concurrent calls
+        // for two DISTINCT runIds are forced to both reach their cache miss before EITHER
+        // response completes. The first call's handler parks on a gate; the second call's
+        // handler signals that gate — so the second call cannot proceed until the first is
+        // already past its (missed) cache lookup, and the first cannot proceed until the
+        // second is also past its own. Both then fetch and both attempt to insert, so the
+        // cache lock must serialize the two inserts: the bound must still hold at 20 and the
+        // two oldest entries must be the ones evicted.
+        string FailureLogFor(string testName) => $$"""
+            Failed {{testName}} [1 ms]
+              Error Message:
+                failure for {{testName}}
+              Stack Trace:
+                at {{testName}}()
+            """;
+
+        var service = CreateServiceForLogFetch();
+
+        // Fill the cache to exactly its capacity of 20 with distinct runIds.
+        for (var i = 0; i < 20; i++)
+        {
+            var runId = $"concurrent-run-{i:D2}";
+            var fillHandler = new JobsAndLogsHandler(
+                JobsJson(1, (100, "failure")),
+                _ => LogResponse(FailureLogFor($"Test.{runId}")));
+            using var fillClient = new HttpClient(fillHandler, disposeHandler: false);
+            var filled = await service
+                .FetchJobLogsAsync(runId, "org", "test-repo", "test-token", fillClient, TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.NotNull(filled);
+        }
+
+        // The rendezvous gate. RunContinuationsAsynchronously keeps the signalling call from
+        // inlining the parked call's continuation onto its own thread.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // First call: parks on the gate before producing any response — it has already missed
+        // the cache at this point.
+        var handlerA = new GatedJobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Test.race-run-a")),
+            async () => await gate.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        // Second call: reaching its own (missed) cache lookup releases the first call.
+        var handlerB = new GatedJobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Test.race-run-b")),
+            () =>
+            {
+                gate.TrySetResult(true);
+                return Task.CompletedTask;
+            });
+
+        using var clientA = new HttpClient(handlerA, disposeHandler: false);
+        using var clientB = new HttpClient(handlerB, disposeHandler: false);
+
+        var task1 = service.FetchJobLogsAsync("race-run-a", "org", "test-repo", "test-token", clientA, TestContext.Current.CancellationToken);
+        var task2 = service.FetchJobLogsAsync("race-run-b", "org", "test-repo", "test-token", clientB, TestContext.Current.CancellationToken);
+
+#pragma warning disable xUnit1051 // Timeout-only WaitAsync is intentional: the bound must surface a TimeoutException if the rendezvous deadlocks
+        var raceResults = await Task.WhenAll(task1, task2).WaitAsync(TimeSpan.FromSeconds(10));
+#pragma warning restore xUnit1051
+
+        Assert.NotNull(raceResults[0]);
+        Assert.NotNull(raceResults[1]);
+        Assert.Equal("Test.race-run-a", raceResults[0]!.Failures[0].TestName);
+        Assert.Equal("Test.race-run-b", raceResults[1]!.Failures[0].TestName);
+
+        // 22 inserts against a bound of 20: the two oldest must have been evicted. A re-fetch
+        // of concurrent-run-00 must therefore MISS and return the new handler's value.
+        var evictedHandler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Evicted.concurrent-run-00")));
+        using var evictedClient = new HttpClient(evictedHandler, disposeHandler: false);
+        var evictedResult = await service
+            .FetchJobLogsAsync("concurrent-run-00", "org", "test-repo", "test-token", evictedClient, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.NotNull(evictedResult);
+        Assert.Equal("Evicted.concurrent-run-00", evictedResult!.Failures[0].TestName);
+        Assert.True(evictedHandler.Captured.Count >= 2); // re-fetched — cache miss
+
+        var evicted2Handler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Evicted.concurrent-run-01")));
+        using var evicted2Client = new HttpClient(evicted2Handler, disposeHandler: false);
+        var evicted2Result = await service
+            .FetchJobLogsAsync("concurrent-run-01", "org", "test-repo", "test-token", evicted2Client, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.NotNull(evicted2Result);
+        Assert.Equal("Evicted.concurrent-run-01", evicted2Result!.Failures[0].TestName);
+        Assert.True(evicted2Handler.Captured.Count >= 2); // re-fetched — cache miss
+
+        // Both racing inserts are the newest entries and must still be cached: no HTTP at all.
+        // Had the lock failed to serialize the inserts (e.g. one insert lost, or a duplicate
+        // queue entry evicting a live key), one of these would re-fetch.
+        foreach (var (runId, cachedName) in new[]
+                 {
+                     ("race-run-a", "Test.race-run-a"),
+                     ("race-run-b", "Test.race-run-b"),
+                 })
+        {
+            var retainedHandler = new JobsAndLogsHandler(
+                JobsJson(1, (100, "failure")),
+                _ => LogResponse(FailureLogFor($"ShouldNotBeFetched.{runId}")));
+            using var retainedClient = new HttpClient(retainedHandler, disposeHandler: false);
+            var retainedResult = await service
+                .FetchJobLogsAsync(runId, "org", "test-repo", "test-token", retainedClient, TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.NotNull(retainedResult);
+            Assert.Equal(cachedName, retainedResult!.Failures[0].TestName); // original cached value
+            Assert.Empty(retainedHandler.Captured); // no HTTP requests — cache hit
+        }
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_CacheConcurrentDuplicateInsert_NoDuplicateQueueEntries()
+    {
+        // The exact race the production lock guards: two concurrent misses for the SAME runId.
+        // A real rendezvous forces both calls past their cache lookup (both miss) before either
+        // response completes — the first call's handler parks on a gate, the second call's
+        // handler signals it. Both then fetch and both attempt to insert the same key. The
+        // lock must serialize the inserts so the key is enqueued exactly ONCE: a duplicate
+        // queue entry would later make eviction dequeue a stale key and leave the real oldest
+        // entry alive past the bound.
+        string FailureLogFor(string testName) => $$"""
+            Failed {{testName}} [1 ms]
+              Error Message:
+                failure for {{testName}}
+              Stack Trace:
+                at {{testName}}()
+            """;
+
+        var service = CreateServiceForLogFetch();
+        var duplicateRunId = "dup-run-1";
+
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // First call parks on the gate (already past its missed cache lookup).
+        var handler1 = new GatedJobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Test.dup-run-1.v1")),
+            async () => await gate.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        // Second call signals the gate once it too has missed the cache.
+        var handler2 = new GatedJobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Test.dup-run-1.v2")),
+            () =>
+            {
+                gate.TrySetResult(true);
+                return Task.CompletedTask;
+            });
+
+        using var client1 = new HttpClient(handler1, disposeHandler: false);
+        using var client2 = new HttpClient(handler2, disposeHandler: false);
+
+        var task1 = service.FetchJobLogsAsync(duplicateRunId, "org", "test-repo", "test-token", client1, TestContext.Current.CancellationToken);
+        var task2 = service.FetchJobLogsAsync(duplicateRunId, "org", "test-repo", "test-token", client2, TestContext.Current.CancellationToken);
+
+#pragma warning disable xUnit1051 // Timeout-only WaitAsync is intentional: the bound must surface a TimeoutException if the rendezvous deadlocks
+        var results = await Task.WhenAll(task1, task2).WaitAsync(TimeSpan.FromSeconds(10));
+#pragma warning restore xUnit1051
+
+        Assert.NotNull(results[0]);
+        Assert.NotNull(results[1]);
+        // Both calls genuinely missed the cache and fetched: each handler issued its own
+        // jobs + job-log requests. (A cache hit would have issued none.)
+        Assert.True(handler1.Captured.Count >= 2);
+        Assert.True(handler2.Captured.Count >= 2);
+        // Each caller sees its own fetched value; the cache keeps whichever insert ran last,
+        // overwritten in place without a duplicate queue entry.
+        Assert.Equal("Test.dup-run-1.v1", results[0]!.Failures[0].TestName);
+        Assert.Equal("Test.dup-run-1.v2", results[1]!.Failures[0].TestName);
+
+        // Now fill the cache to exactly 20 entries (19 more distinct runIds + the duplicate).
+        for (var i = 2; i <= 20; i++)
+        {
+            var runId = $"dup-run-{i}";
+            var handler = new JobsAndLogsHandler(
+                JobsJson(1, (100, "failure")),
+                _ => LogResponse(FailureLogFor($"Test.dup-run-{i}")));
+            using var client = new HttpClient(handler, disposeHandler: false);
+            await service
+                .FetchJobLogsAsync(runId, "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        }
+
+        // Insert a 21st DISTINCT entry to trigger eviction of the oldest (dup-run-1). If the
+        // duplicate-insert race had left a stale queue entry, the eviction loop could dequeue a
+        // non-existent key and dup-run-1 would NOT be evicted.
+        var triggerHandler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("Trigger.dup-run-21")));
+        using var triggerClient = new HttpClient(triggerHandler, disposeHandler: false);
+        await service
+            .FetchJobLogsAsync("dup-run-21", "org", "test-repo", "test-token", triggerClient, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // The evicted dup-run-1 must now re-fetch via HTTP (cache miss) — proving it was evicted
+        // and the duplicate-insert race did not leave a stale queue entry.
+        var evictedHandler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("EvictedAfterDup.dup-run-1")));
+        using var evictedClient = new HttpClient(evictedHandler, disposeHandler: false);
+        var evicted = await service
+            .FetchJobLogsAsync("dup-run-1", "org", "test-repo", "test-token", evictedClient, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.NotNull(evicted);
+        Assert.Equal("EvictedAfterDup.dup-run-1", evicted!.Failures[0].TestName);
+        Assert.True(evictedHandler.Captured.Count >= 2); // re-fetched — cache miss, proving eviction worked
+
+        // The last inserted (dup-run-20) must still be cached.
+        var lastHandler = new JobsAndLogsHandler(
+            JobsJson(1, (100, "failure")),
+            _ => LogResponse(FailureLogFor("ShouldNotBeFetched.dup-run-20")));
+        using var lastClient = new HttpClient(lastHandler, disposeHandler: false);
+        var lastCached = await service
+            .FetchJobLogsAsync("dup-run-20", "org", "test-repo", "test-token", lastClient, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.Equal("Test.dup-run-20", lastCached!.Failures[0].TestName);
+        Assert.Empty(lastHandler.Captured); // cache hit
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_AuthPresentOnApiAbsentOnRedirect()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, uri =>
+        {
+            // The job-log endpoint returns a 302 to a cross-host URL.
+            if (uri.AbsolutePath.Contains("/logs", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.Redirect)
+                {
+                    Headers = { Location = new Uri($"https://logs.example.com/{Guid.NewGuid():N}") }
+                };
+            }
+            return LogResponse(SingleFailureLog());
+        });
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        // The first two requests (jobs endpoint + job-log endpoint) are to api.github.com and
+        // must carry the bearer token. The third request (the redirect target) is cross-host
+        // and must NOT carry any Authorization header.
+        var apiRequests = handler.Captured
+            .Where(c => c.Url.Contains("api.github.com", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var redirectRequest = handler.Captured
+            .FirstOrDefault(c => !c.Url.Contains("api.github.com", StringComparison.OrdinalIgnoreCase));
+
+        Assert.NotEmpty(apiRequests);
+        Assert.All(apiRequests, c =>
+        {
+            Assert.Equal("Bearer", c.AuthorizationScheme);
+            Assert.Equal("test-token", c.AuthorizationParameter);
+        });
+        Assert.NotNull(redirectRequest);
+        Assert.Null(redirectRequest!.AuthorizationScheme);
+        Assert.Null(redirectRequest.AuthorizationParameter);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_Cancellation_PropagatesOperationCanceledException()
+    {
+        var jobsBody = JobsJson(1, (111, "failure"));
+        using var cts = new CancellationTokenSource();
+        var handler = new JobsAndLogsHandler(jobsBody, _ =>
+        {
+            // Cancel before the job-log fetch can complete, simulating a cancellation that
+            // arrives during the log download.
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, cts.Token));
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_FallbackSnippet_SanitizedBeforeTruncation()
+    {
+        // Removal-proof: the fallback log is >500 chars and contains a ghp_ token positioned so
+        // it lands in the retained last-500 tail. The snippet must equal exactly the last 500
+        // chars of the SANITIZED full log — proving sanitization happens BEFORE the last-500
+        // truncation and that the secret is redacted in the retained tail. If truncation
+        // happened before sanitization (on the raw tail), the raw secret would survive.
+        var token = "ghp_" + new string('a', 36);
+        // Build a >500-char log whose last 500 chars contain the token.
+        var prefix = new string('z', 600);
+        // The token must be within the last 500 chars of the full log.
+        var suffix = "tail-" + token + "-end";
+        var totalLength = prefix.Length + suffix.Length;
+        // Ensure suffix (which contains the token) fits entirely within the last 500 chars.
+        Assert.True(suffix.Length <= 500);
+        Assert.True(totalLength > 500);
+        var log = prefix + suffix;
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures); // no parseable failures → fallback snippet
+        Assert.NotNull(result.FallbackSnippet);
+
+        // The snippet must be the last 500 chars of the SANITIZED full log (sanitization first,
+        // then truncation to the last 500).
+        var sanitizedFull = CiMonitorService.SanitizeLogContent(log);
+        var expectedSnippet = sanitizedFull[^500..];
+        Assert.Equal(expectedSnippet, result.FallbackSnippet);
+        // The token must be redacted in the snippet.
+        Assert.DoesNotContain(token, result.FallbackSnippet);
+        Assert.Contains("***REDACTED***", result.FallbackSnippet);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_LogDerivedFields_SanitizedWithoutTruncation()
+    {
+        // Removal-proof: a parsed test name, error message, and stack trace are each >500 chars
+        // and contain a ghp_ token. The resulting issue fields must contain the COMPLETE
+        // sanitized content (full length, secret redacted) — proving these fields are sanitized
+        // but NOT truncated. If truncation were applied to these fields, the length would be
+        // capped at 500 and the content would be cut.
+        var token = "ghp_" + new string('a', 36);
+        var longName = "Tests." + new string('N', 600);
+        var longError = "Error: " + token + " " + new string('E', 600);
+        var longStack = "at " + token + " " + new string('S', 600);
+
+        var log = $$"""
+            Failed {{longName}} [1 ms]
+              Error Message:
+                {{longError}}
+              Stack Trace:
+                {{longStack}}
+            """;
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        var failure = Assert.Single(result!.Failures);
+
+        // The test name is sanitized (token redacted) but NOT truncated — full length preserved.
+        var expectedTestName = CiMonitorService.SanitizeLogContent(longName);
+        Assert.Equal(expectedTestName, failure.TestName);
+        Assert.True(failure.TestName.Length > 500);
+        Assert.DoesNotContain(token, failure.TestName);
+
+        // The error message is sanitized but NOT truncated.
+        var expectedError = CiMonitorService.SanitizeLogContent(longError);
+        Assert.Equal(expectedError, failure.Error);
+        Assert.True(failure.Error.Length > 500);
+        Assert.DoesNotContain(token, failure.Error);
+        Assert.Contains("***REDACTED***", failure.Error);
+
+        // The stack trace is sanitized but NOT truncated.
+        var expectedStack = CiMonitorService.SanitizeLogContent(longStack);
+        Assert.Equal(expectedStack, failure.StackTrace);
+        Assert.True(failure.StackTrace.Length > 500);
+        Assert.DoesNotContain(token, failure.StackTrace);
+        Assert.Contains("***REDACTED***", failure.StackTrace);
+    }
+
+    [Fact]
+    public void SanitizeLogContent_LongInput_FullLengthWithSecretsRedacted()
+    {
+        // Boundary: SanitizeLogContent does NOT truncate. A very long input is returned at
+        // full length with only secrets redacted. The expected length is the input length minus
+        // each secret's length plus the replacement length.
+        var padding = new string('x', 50_000);
+        var token = "ghp_" + new string('b', 36);
+        var input = $"start {padding} {token} end {padding}";
+
+        var sanitized = CiMonitorService.SanitizeLogContent(input);
+
+        Assert.DoesNotContain(token, sanitized);
+        Assert.Contains("***REDACTED***", sanitized);
+        var expectedLength = input.Length - token.Length + "***REDACTED***".Length;
+        Assert.Equal(expectedLength, sanitized.Length);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_FallbackSnippet_TruncatedToLast500AfterSanitization()
+    {
+        // Boundary: the fallback snippet is truncated to the last 500 chars AFTER sanitization.
+        // A log with no parseable failures and >500 chars of plain text (no secrets) must yield
+        // a snippet of exactly 500 chars — the last 500 of the full log.
+        var log = new string('w', 800);
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(log));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures);
+        Assert.NotNull(result.FallbackSnippet);
+        Assert.Equal(500, result.FallbackSnippet!.Length);
+        Assert.All(result.FallbackSnippet, ch => Assert.Equal('w', ch));
+    }
+
+    // ── HandleCiFailureAsync integration (via MonitorMergeAsync / StartupScanAsync) ──
+
+    /// <summary>
+    /// A routing handler that simulates the full GitHub API surface for CI failure issue
+    /// creation. It serves three endpoints by URL path:
+    /// <list type="bullet">
+    /// <item>The check-runs probe endpoint (<c>/commits/{sha}/check-runs</c>).</item>
+    /// <item>The jobs endpoint (<c>/actions/runs/{runId}/jobs</c>).</item>
+    /// <item>The job-log endpoint (<c>/actions/jobs/{jobId}/logs</c>), which returns a 302 to a
+    /// cross-host URL where the log body is served with no auth required.</item>
+    /// </list>
+    /// The check-runs body, jobs body, and log body are all configurable.
+    /// </summary>
+    private sealed class CiFailureRoutingHandler : HttpMessageHandler
+    {
+        private readonly string _checkRunsBody;
+        private readonly Func<long, string?> _jobsBodyForRun;
+        private readonly Func<long, string?> _logBodyForJob;
+        private readonly List<CapturedRequest> _captured = [];
+        private readonly List<string> _jobsEndpointHits = [];
+        private readonly List<long> _jobLogHits = [];
+        private readonly object _lock = new();
+
+        public IReadOnlyList<CapturedRequest> Captured
+        {
+            get { lock (_lock) return _captured.ToList(); }
+        }
+
+        /// <summary>Every URL that hit the jobs endpoint (<c>/actions/runs/.../jobs</c>), in order.</summary>
+        public IReadOnlyList<string> JobsEndpointHits
+        {
+            get { lock (_lock) return _jobsEndpointHits.ToList(); }
+        }
+
+        /// <summary>Every jobId whose log endpoint (<c>/actions/jobs/.../logs</c>) was hit, in order.</summary>
+        public IReadOnlyList<long> JobLogHits
+        {
+            get { lock (_lock) return _jobLogHits.ToList(); }
+        }
+
+        /// <param name="checkRunsBody">The JSON body for the check-runs probe response.</param>
+        /// <param name="jobsBodyForRun">Returns the jobs JSON body for a given runId (as long), or null to 404.</param>
+        /// <param name="logBodyForJob">Returns the log body for a given jobId (as long), or null to skip (302→404).</param>
+        public CiFailureRoutingHandler(
+            string checkRunsBody,
+            Func<long, string?> jobsBodyForRun,
+            Func<long, string?> logBodyForJob)
+        {
+            _checkRunsBody = checkRunsBody;
+            _jobsBodyForRun = jobsBodyForRun;
+            _logBodyForJob = logBodyForJob;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var uri = request.RequestUri!;
+            lock (_lock)
+            {
+                _captured.Add(new CapturedRequest(
+                    uri.ToString(),
+                    request.Headers.Authorization?.Scheme,
+                    request.Headers.Authorization?.Parameter));
+            }
+
+            var path = uri.AbsolutePath;
+
+            // Check-runs probe: /repos/{owner}/{repo}/commits/{sha}/check-runs
+            if (path.Contains("/commits/", StringComparison.Ordinal)
+                && path.EndsWith("/check-runs", StringComparison.Ordinal))
+            {
+                return Task.FromResult(OkResponse(_checkRunsBody));
+            }
+
+            // Jobs endpoint: /repos/{owner}/{repo}/actions/runs/{runId}/jobs
+            if (path.Contains("/actions/runs/", StringComparison.Ordinal)
+                && path.EndsWith("/jobs", StringComparison.Ordinal))
+            {
+                var runId = ExtractRunIdFromJobsPath(path);
+                lock (_lock) _jobsEndpointHits.Add(uri.ToString());
+                var jobsBody = _jobsBodyForRun(runId);
+                if (jobsBody is null)
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                return Task.FromResult(OkResponse(jobsBody));
+            }
+
+            // Job-log endpoint: /repos/{owner}/{repo}/actions/jobs/{jobId}/logs
+            if (path.Contains("/actions/jobs/", StringComparison.Ordinal)
+                && path.EndsWith("/logs", StringComparison.Ordinal))
+            {
+                var jobId = ExtractJobIdFromLogsPath(path);
+                lock (_lock) _jobLogHits.Add(jobId);
+                var logBody = _logBodyForJob(jobId);
+                if (logBody is null)
+                {
+                    // Simulate a failed log download: 302 to a URL that returns 404.
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Redirect)
+                    {
+                        Headers = { Location = new Uri($"https://logs.example.com/{jobId}") }
+                    });
+                }
+                // 302 to a cross-host URL where the body is served.
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Redirect)
+                {
+                    Headers = { Location = new Uri($"https://logs.example.com/{jobId}") }
+                });
+            }
+
+            // Redirect target (cross-host): serve the log body if one was configured.
+            if (uri.Host.Equals("logs.example.com", StringComparison.OrdinalIgnoreCase))
+            {
+                // Extract jobId from the URL path (the last segment).
+                var seg = uri.AbsolutePath.Trim('/');
+                if (long.TryParse(seg, out var jobId))
+                {
+                    var logBody = _logBodyForJob(jobId);
+                    if (logBody is null)
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(logBody, Encoding.UTF8, "text/plain")
+                    });
+                }
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            }
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
+
+        private static long ExtractRunIdFromJobsPath(string path)
+        {
+            // /repos/{owner}/{repo}/actions/runs/{runId}/jobs
+            var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < parts.Length - 1; i++)
+            {
+                if (parts[i] == "runs" && long.TryParse(parts[i + 1], out var runId))
+                    return runId;
+            }
+            return 0;
+        }
+
+        private static long ExtractJobIdFromLogsPath(string path)
+        {
+            // /repos/{owner}/{repo}/actions/jobs/{jobId}/logs
+            var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < parts.Length - 1; i++)
+            {
+                if (parts[i] == "jobs" && long.TryParse(parts[i + 1], out var jobId))
+                    return jobId;
+            }
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Builds a check-runs JSON body where the single check run carries a <c>details_url</c>
+    /// pointing at <c>/actions/runs/{runId}</c> (so the RunId is parsed), the given output
+    /// summary/text, and the given html_url.
+    /// </summary>
+    private static string CheckRunsJsonWithDetailsUrl(
+        string runId,
+        string name = "build",
+        string? summary = null,
+        string? text = null,
+        string? htmlUrl = null) =>
+        RawCheckRunsJson(1, $$"""
+            [{
+              "name": "{{name}}",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "{{htmlUrl ?? $"https://github.com/org/test-repo/actions/runs/{runId}"}}",
+              "details_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "output": { "summary": {{JsonString(summary)}}, "text": {{JsonString(text)}} }
+            }]
+            """);
+
+    /// <summary>
+    /// Builds a check-runs JSON body with two check runs, each with a <c>details_url</c>
+    /// pointing at the same <c>/actions/runs/{runId}</c>. Both have no output.
+    /// </summary>
+    private static string CheckRunsJsonTwoNoOutputSameRunId(string runId, string name1 = "build", string name2 = "lint") =>
+        RawCheckRunsJson(2, $$"""
+            [{
+              "name": "{{name1}}",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "details_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "output": { "summary": null, "text": null }
+            },
+            {
+              "name": "{{name2}}",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "details_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "output": { "summary": null, "text": null }
+            }]
+            """);
+
+    /// <summary>
+    /// Builds a check-runs JSON body with two check runs: the first has parseable output, the
+    /// second has no output but shares the same runId.
+    /// </summary>
+    private static string CheckRunsJsonOutputThenNoOutputSameRunId(string runId) =>
+        RawCheckRunsJson(2, $$"""
+            [{
+              "name": "build",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "details_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "output": { "summary": "✗ MyApp.Tests.FooTests.Bar", "text": null }
+            },
+            {
+              "name": "lint",
+              "status": "completed",
+              "conclusion": "failure",
+              "html_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "details_url": "https://github.com/org/test-repo/actions/runs/{{runId}}",
+              "output": { "summary": null, "text": null }
+            }]
+            """);
+
+    /// <summary>Renders a C# string as a JSON string literal (with quotes), or <c>null</c>.</summary>
+    private static string JsonString(string? value) =>
+        value is null ? "null" : JsonSerializer.Serialize(value);
+
+    /// <summary>Jobs JSON body for one failed job with the given jobId.</summary>
+    private static string JobsJsonOneFailedJob(long jobId) =>
+        JsonSerializer.Serialize(new { total_count = 1, jobs = new[] { new { id = jobId, conclusion = "failure" } } });
+
+    /// <summary>An xUnit failure log body containing one parseable failure.</summary>
+    private static string LogWithOneFailure() => """
+        Starting test execution...
+
+        Failed Tests.Alpha.First [2 ms]
+          Error Message:
+            alpha failure
+          Stack Trace:
+            at Alpha.First()
+        """;
+
+    /// <summary>An xUnit failure log body with no parseable failures (a passing summary).</summary>
+    private static string LogWithNoFailuresAndSnippet() => """
+        Passed!  - Failed:     0, Passed:   10, Skipped:     0, Total:   10
+        Total tests: 10
+        """;
+
+    /// <summary>An empty log body (whitespace only), yielding an empty snippet.</summary>
+    private static string EmptyLog() => "   ";
+
+    [Fact]
+    public async Task MonitorMergeAsync_NoOutputLogWithTestFailures_CreatesLogDerivedIssues()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // One issue created from the log-derived test failure.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: Tests.Alpha.First", issue.Title);
+        Assert.Contains("Test: Tests.Alpha.First", issue.Description);
+        Assert.Contains("Error: alpha failure", issue.Description);
+        Assert.Contains("Stack Trace:", issue.Description);
+        Assert.Contains("at Alpha.First()", issue.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
+        Assert.Equal("goal-1", issue.SourceGoalId);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_NoOutputLogNoTestsWithSnippet_CreatesFallbackIssue()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithNoFailuresAndSnippet());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // One fallback issue: no tests parsed but the log yielded a snippet.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: build", issue.Title);
+        Assert.Contains("Log output (last 500 chars):", issue.Description);
+        Assert.Contains("Passed!", issue.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
+        Assert.Equal("goal-1", issue.SourceGoalId);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_NoOutputLogNoTestsEmptySnippet_CreatesUrlOnlyIssue()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => EmptyLog());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // Empty snippet → URL-only fallback (no "Log output" section).
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: build", issue.Title);
+        Assert.DoesNotContain("Log output", issue.Description);
+        Assert.DoesNotContain("Test:", issue.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_NoOutputNoLogs_CreatesUrlOnlyIssue()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            // The jobs endpoint returns 404 → FetchJobLogsAsync returns null → URL-only fallback.
+            runId => null,
+            jobId => null);
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: build", issue.Title);
+        Assert.DoesNotContain("Log output", issue.Description);
+        Assert.DoesNotContain("Test:", issue.Description);
+        Assert.Contains("CI run: https://github.com/org/test-repo/actions/runs/123", issue.Description);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_TwoNoOutputSameRunId_LogFetchedOnceSecondSkipped()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonTwoNoOutputSameRunId("123"),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // The jobs endpoint must be hit exactly once (the second run with the same runId is skipped).
+        Assert.Single(handler.JobsEndpointHits);
+        // The job-log endpoint is hit once (only for the first run's failed job).
+        Assert.Equal([111], handler.JobLogHits);
+        // Only one issue is created (from the first run's log); the second run is skipped entirely.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: Tests.Alpha.First", issue.Title);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_OutputThenNoOutputSameRunId_BothProcessed()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonOutputThenNoOutputSameRunId("123"),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // The first run has parseable output (✗ MyApp.Tests.FooTests.Bar) → an output-derived
+        // issue is created and the runId is NOT added to the processed set.
+        // The second run has no output but shares the runId → it still fetches logs (output does
+        // not mark the runId as processed) and creates a log-derived issue.
+        Assert.Equal(2, issueStore.Issues.Count);
+        var titles = issueStore.Issues.Values.Select(i => i.Title).Order().ToList();
+        Assert.Contains("CI failure: MyApp.Tests.FooTests.Bar", titles);
+        Assert.Contains("CI failure: Tests.Alpha.First", titles);
+
+        // The jobs endpoint is hit once (the second run fetches logs for the same runId; the
+        // FetchJobLogsAsync cache returns the cached result without a second jobs HTTP call).
+        Assert.Single(handler.JobsEndpointHits);
+    }
+
+    [Fact]
+    public async Task MonitorMergeAsync_DedupAppends_LogDerivedAppendBlockAppended()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(handler, issueStore: issueStore, eventBus: eventBus);
+
+        // Pre-seed an existing open issue with the same title and source goal — this is the
+        // issue that CreateOrUpdateIssueAsync will find and append to.
+        var existingIssue = new Issue
+        {
+            Id = "issue-existing",
+            Type = IssueType.Bug,
+            Title = "CI failure: Tests.Alpha.First",
+            Description = "Original description for the first failure.",
+            Severity = IssueSeverity.High,
+            Status = IssueStatus.Open,
+            RepositoryNames = ["test-repo"],
+            SourceGoalId = "goal-1",
+            SourceRole = "ci",
+        };
+        issueStore.Issues[existingIssue.Id] = existingIssue;
+
+        await service.MonitorMergeAsync("goal-1", "test-repo", "abc123", TestContext.Current.CancellationToken);
+
+        // No new issue is created; the existing one is updated with the log-derived append block.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("issue-existing", issue.Id);
+        Assert.StartsWith("Original description for the first failure.", issue.Description);
+        // The log-derived dedup append block is appended.
+        Assert.Contains("---", issue.Description);
+        Assert.Contains("[Updated ", issue.Description);
+        Assert.Contains("Test: Tests.Alpha.First", issue.Description);
+        Assert.Contains("Error: alpha failure", issue.Description);
+        Assert.Contains("Stack Trace:", issue.Description);
+        Assert.Contains("at Alpha.First()", issue.Description);
+    }
+
+    [Fact]
+    public async Task StartupScanAsync_FailedCiWithLogs_CreatesLogDerivedIssues()
+    {
+        var issueStore = new FakeIssueStore();
+        var eventBus = new RecordingEventBus();
+        var handler = new CiFailureRoutingHandler(
+            CheckRunsJsonWithDetailsUrl("123", summary: null),
+            runId => JobsJsonOneFailedJob(111),
+            jobId => LogWithOneFailure());
+        var service = CreateService(
+            handler, issueStore: issueStore, eventBus: eventBus, goalStore: StoreWith(CompletedGoal()));
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        // The startup scan probes the failed check run and, because it has no parseable output,
+        // fetches the job logs and creates a log-derived issue.
+        var issue = Assert.Single(issueStore.Issues.Values);
+        Assert.Equal("CI failure: Tests.Alpha.First", issue.Title);
+        Assert.Contains("Test: Tests.Alpha.First", issue.Description);
+        Assert.Contains("Error: alpha failure", issue.Description);
+        Assert.Contains("at Alpha.First()", issue.Description);
+        Assert.Equal("goal-1", issue.SourceGoalId);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.CiFailed, evt.Type);
     }
 }
