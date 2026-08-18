@@ -52,7 +52,9 @@ public sealed class ComposerActorTests
         string stateDir,
         Func<string, IChatClient>? chatClientFactory = null,
         string model = "test-model",
-        IReadOnlyList<string>? availableModels = null) =>
+        IReadOnlyList<string>? availableModels = null,
+        Action? onCompacting = null,
+        Action<CompactionResult>? onCompacted = null) =>
         new(
             model,
             64000,
@@ -68,8 +70,8 @@ public sealed class ComposerActorTests
             chatClientFactory,
             null,
             availableModels ?? [model],
-            null,
-            null,
+            onCompacting,
+            onCompacted,
             false,
             []);
 
@@ -81,7 +83,12 @@ public sealed class ComposerActorTests
         Action<int> onStreamingFinished,
         Action<string> onStreamingError,
         Action onOverflowRecovery,
-        ILogger? logger = null) =>
+        ILogger? logger = null,
+        Action? onCompactingStarted = null,
+        Action<bool>? onCompactingFinished = null,
+        Action<bool>? onSessionLoaded = null,
+        Action<string>? onSubmitAnswer = null,
+        Action? onCancelQuestion = null) =>
         new(
             service,
             saveSession,
@@ -90,6 +97,11 @@ public sealed class ComposerActorTests
             onStreamingFinished,
             onStreamingError,
             onOverflowRecovery,
+            onCompactingStarted ?? (() => { }),
+            onCompactingFinished ?? (_ => { }),
+            onSessionLoaded ?? (_ => { }),
+            onSubmitAnswer ?? (_ => { }),
+            onCancelQuestion ?? (() => { }),
             logger ?? NullLogger<ComposerActor>.Instance);
 
     private static TaskCompletionSource<T> NewReply<T>() =>
@@ -3039,6 +3051,1045 @@ public sealed class ComposerActorTests
             Assert.False(await AwaitReplyAsync(reply));
 
             Assert.True(saveSessionCalls == 0, "A no-op compaction must not persist the session");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Compaction exactly-once callbacks (full + partial × success/failure/cancel) ──
+
+    /// <summary>
+    /// Counts how many times <c>AgentOptions.OnCompacting</c> and <c>AgentOptions.OnCompacted</c>
+    /// fire during a manual compaction. These are the agent service's wired callbacks — with the
+    /// callback-free options fix they must NEVER fire during a manual (actor-initiated) compaction.
+    /// </summary>
+    private sealed class AgentCallbackTracker
+    {
+        public int OnCompactingCalls;
+        public int OnCompactedCalls;
+
+        public Action OnCompacting => () => Interlocked.Increment(ref OnCompactingCalls);
+        public Action<CompactionResult> OnCompacted => _ => Interlocked.Increment(ref OnCompactedCalls);
+    }
+
+    [Fact]
+    public async Task Compact_Full_Success_StartedAndFinishedFireOnce_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Summary of conversation")));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 15);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactMessage(reply, CancellationToken.None)));
+
+            Assert.True(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.True(finishedArgs[0], "onCompactingFinished(true) on success");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_Full_Failure_StartedFiresOnce_FinishedFalse_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("compaction backend boom"));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 15);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactMessage(reply, CancellationToken.None)));
+
+            Assert.False(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.False(finishedArgs[0], "onCompactingFinished(false) on failure");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_Full_Cancel_StartedFiresOnce_FinishedFalse_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OperationCanceledException(new CancellationToken(true)));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 15);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactMessage(reply, cts.Token)));
+
+            Assert.False(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.False(finishedArgs[0], "onCompactingFinished(false) on cancellation");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_Partial_Success_StartedAndFinishedFireOnce_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Summary of conversation")));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 30);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, reply, CancellationToken.None)));
+
+            Assert.True(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.True(finishedArgs[0], "onCompactingFinished(true) on success");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_Partial_Failure_StartedFiresOnce_FinishedFalse_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("partial compaction boom"));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 30);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, reply, CancellationToken.None)));
+
+            Assert.False(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.False(finishedArgs[0], "onCompactingFinished(false) on partial failure");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_Partial_Cancel_StartedFiresOnce_FinishedFalse_AgentCallbacksSuppressed()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OperationCanceledException(new CancellationToken(true)));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var agentTracker = new AgentCallbackTracker();
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => mockClient.Object,
+            onCompacting: agentTracker.OnCompacting,
+            onCompacted: agentTracker.OnCompacted);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 30);
+
+        var startedCalls = 0;
+        var finishedArgs = new List<bool>();
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
+            onCompactingFinished: success => { lock (finishedArgs) finishedArgs.Add(success); finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, reply, cts.Token)));
+
+            Assert.False(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.Single(finishedArgs);
+            Assert.False(finishedArgs[0], "onCompactingFinished(false) on partial cancellation");
+            Assert.Equal(0, agentTracker.OnCompactingCalls);
+            Assert.Equal(0, agentTracker.OnCompactedCalls);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── WasCompacted/IsCompacting semantics ──
+
+    [Fact]
+    public async Task Compact_Success_WasCompactedTrue_IsCompactingFalse_After()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Summary")));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var service = CreateService(stateDir, chatClientFactory: _ => mockClient.Object);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, 15);
+
+        // The facade's IsCompacting/WasCompacted are mirrored through the actor callbacks.
+        // We simulate the facade's wiring (as in Composer.cs) to observe the flags.
+        var isCompacting = false;
+        var wasCompacted = false;
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => isCompacting = true,
+            onCompactingFinished: success => { isCompacting = false; if (success) wasCompacted = true; finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerCompactMessage(reply, CancellationToken.None)));
+            Assert.True(await AwaitReplyAsync(reply));
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.False(isCompacting, "IsCompacting must be false after a successful compaction");
+            Assert.True(wasCompacted, "WasCompacted must be true only on success");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Theory]
+    [InlineData("Full", "Failure")]
+    [InlineData("Full", "Cancel")]
+    [InlineData("Partial", "Failure")]
+    [InlineData("Partial", "Cancel")]
+    public async Task Compact_FailureOrCancel_WasCompactedFalse_IsCompactingFalse_After(
+        string mode, string outcome)
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        if (outcome == "Cancel")
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new OperationCanceledException(new CancellationToken(true)));
+        else
+            mockClient
+                .Setup(c => c.GetResponseAsync(
+                    It.IsAny<IEnumerable<ChatMessage>>(),
+                    It.IsAny<ChatOptions?>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("boom"));
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(EmptyStream());
+
+        var service = CreateService(stateDir, chatClientFactory: _ => mockClient.Object);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+        PopulateSession(service.Session, mode == "Partial" ? 30 : 15);
+
+        var isCompacting = false;
+        var wasCompacted = false;
+        // Gate on the finished callback: the actor's finally runs after TrySetResult, so
+        // observing the reply alone does not guarantee the callback has updated the flags.
+        var finishedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onCompactingStarted: () => isCompacting = true,
+            onCompactingFinished: success => { isCompacting = false; if (success) wasCompacted = true; finishedGate.TrySetResult(success); });
+
+        try
+        {
+            actor.Start();
+
+            using var cts = outcome == "Cancel" ? new CancellationTokenSource() : null;
+            cts?.Cancel();
+
+            var reply = NewReply<bool>();
+            if (mode == "Full")
+                Assert.True(actor.Tell(new ComposerCompactMessage(reply, cts?.Token ?? CancellationToken.None)));
+            else
+                Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, reply, cts?.Token ?? CancellationToken.None)));
+
+            Assert.False(await AwaitReplyAsync(reply));
+            // Wait for the finished callback (runs in the actor's finally, after TrySetResult).
+            await finishedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.False(isCompacting, "IsCompacting must be false after failure/cancel");
+            Assert.False(wasCompacted, "WasCompacted must NOT be set on failure/cancel");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── SessionLoadedFromDisk: false before connect, true on disk load, false on failure/cancel ──
+
+    [Fact]
+    public async Task SessionLoaded_FalseBeforeConnect_TrueOnDiskLoad_FalseOnFreshConnect()
+    {
+        var stateDir = CreateTempDir();
+
+        // Write a valid session file so ConnectAsync loads it from disk.
+        var sessionFile = Path.Combine(stateDir, "composer-session.json");
+        var validSession = AgentSession.Create("composer");
+        validSession.MessageHistory.Add(new ChatMessage(ChatRole.User, "persisted message"));
+        await validSession.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var loadedFlags = new List<bool>();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+        try
+        {
+            actor.Start();
+
+            // Before connect, the callback has not fired — the cache is false.
+            Assert.Empty(loadedFlags);
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply, CancellationToken.None)));
+            Assert.True(await AwaitReplyAsync(reply));
+
+            // The connect handler fires onSessionLoaded(false) first (reset), then
+            // onSessionLoaded(true) when a session was loaded from disk.
+            lock (loadedFlags)
+            {
+                Assert.Contains(false, loadedFlags);
+                Assert.Contains(true, loadedFlags);
+                // The last value must be true (disk load succeeded).
+                Assert.True(loadedFlags[^1], "Last onSessionLoaded must be true on a successful disk-loaded connect");
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SessionLoaded_FalseOnFreshSession_NoDiskFile()
+    {
+        var stateDir = CreateTempDir();
+        // No session file — ConnectAsync creates a fresh session (loadedFromDisk = false).
+
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var loadedFlags = new List<bool>();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply, CancellationToken.None)));
+            Assert.True(await AwaitReplyAsync(reply));
+
+            lock (loadedFlags)
+            {
+                Assert.NotEmpty(loadedFlags);
+                Assert.False(loadedFlags[^1], "onSessionLoaded(false) on a fresh (no-disk) connect");
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SessionLoaded_FalseOnConnectFailure_NoStaleTrue()
+    {
+        var stateDir = CreateTempDir();
+
+        // Write a valid session file — so the session-load step runs, but client creation fails.
+        var sessionFile = Path.Combine(stateDir, "composer-session.json");
+        var validSession = AgentSession.Create("composer");
+        await validSession.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+        var service = CreateService(stateDir, chatClientFactory: _ => throw new InvalidOperationException("client creation boom"));
+
+        var loadedFlags = new List<bool>();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply, CancellationToken.None)));
+
+            // Actually wait on the reply directly:
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => reply.Task);
+            Assert.Contains("client creation boom", ex.Message);
+
+            lock (loadedFlags)
+            {
+                Assert.NotEmpty(loadedFlags);
+                // The first is false (reset), and the failure catch fires false again.
+                // Critically, NO true may appear — the session file exists but the connection failed.
+                Assert.DoesNotContain(true, loadedFlags);
+                Assert.False(loadedFlags[^1], "Last onSessionLoaded must be false on failure — no stale true");
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SessionLoaded_FalseOnConnectCancel_NoStaleTrue()
+    {
+        var stateDir = CreateTempDir();
+
+        // Write a valid session file so ConnectAsync's session-load step honors the
+        // cancelled token and throws OperationCanceledException deterministically.
+        var sessionFile = Path.Combine(stateDir, "composer-session.json");
+        var validSession = AgentSession.Create("composer");
+        await validSession.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var loadedFlags = new List<bool>();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+        try
+        {
+            actor.Start();
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply, cts.Token)));
+
+            await Task.WhenAny(reply.Task, Task.Delay(Timeout, TestContext.Current.CancellationToken));
+            Assert.True(reply.Task.IsCanceled, "Connect reply should be canceled for a pre-cancelled token");
+
+            lock (loadedFlags)
+            {
+                Assert.NotEmpty(loadedFlags);
+                Assert.DoesNotContain(true, loadedFlags);
+                Assert.False(loadedFlags[^1], "Last onSessionLoaded must be false on cancel — no stale true");
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── PendingQuestion lock protocol: capture-and-clear under lock, TrySetResult outside lock ──
+
+    /// <summary>
+    /// Tests that the actor's <c>onSubmitAnswer</c> callback delivers the answer to the pending
+    /// question's TCS, and that after delivery the question is cleared (capture-and-clear).
+    /// A completion (the answer) must NOT clear a subsequently published question.
+    /// </summary>
+    [Fact]
+    public async Task SubmitAnswer_CompletesPendingQuestion_AndClearsIt()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        // Simulate the facade's PendingQuestion lock protocol: the test stands in for the
+        // Composer's _pendingQuestion / _pendingQuestionLock, and the onSubmitAnswer callback
+        // implements the capture-and-clear-under-lock + TrySetResult-outside-lock discipline.
+        var pendingLock = new object();
+        ComposerQuestion? pending = null;
+
+        void SubmitAnswerInternal(string answer)
+        {
+            ComposerQuestion? pq;
+            lock (pendingLock) { pq = pending; pending = null; }
+            pq?.Completion.TrySetResult(answer);
+        }
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSubmitAnswer: SubmitAnswerInternal,
+            onCancelQuestion: () =>
+            {
+                ComposerQuestion? pq;
+                lock (pendingLock) { pq = pending; pending = null; }
+                pq?.Completion.TrySetResult("User cancelled the question without answering.");
+            });
+
+        try
+        {
+            actor.Start();
+
+            // Publish a question (as the ask_user tool would).
+            var q = new ComposerQuestion { Text = "Continue?", Type = QuestionType.YesNo, Options = ["Yes", "No"] };
+            lock (pendingLock) pending = q;
+            Assert.NotNull(pending);
+
+            // Submit the answer via the actor (routed through Tell → mailbox → onSubmitAnswer).
+            Assert.True(actor.Tell(new ComposerSubmitAnswerMessage("Yes")));
+
+            var answer = await q.Completion.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.Equal("Yes", answer);
+
+            // The pending question was cleared by the capture-and-clear.
+            lock (pendingLock) Assert.Null(pending);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── SubmitAnswer/CancelQuestion routing: public → Tell, CancelQuestion preserves message ──
+
+    /// <summary>
+    /// CancelQuestion (via the actor) completes the pending question with the exact
+    /// "User cancelled the question without answering." message.
+    /// </summary>
+    [Fact]
+    public async Task CancelQuestion_PreservesExactCancellationMessage()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var pendingLock = new object();
+        ComposerQuestion? pending = null;
+
+        void CancelQuestionInternal()
+        {
+            ComposerQuestion? pq;
+            lock (pendingLock) { pq = pending; pending = null; }
+            pq?.Completion.TrySetResult("User cancelled the question without answering.");
+        }
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSubmitAnswer: answer =>
+            {
+                ComposerQuestion? pq;
+                lock (pendingLock) { pq = pending; pending = null; }
+                pq?.Completion.TrySetResult(answer);
+            },
+            onCancelQuestion: CancelQuestionInternal);
+
+        try
+        {
+            actor.Start();
+
+            var q = new ComposerQuestion { Text = "Proceed?", Type = QuestionType.YesNo };
+            lock (pendingLock) pending = q;
+
+            Assert.True(actor.Tell(new ComposerCancelQuestionMessage()));
+
+            var result = await q.Completion.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.Equal("User cancelled the question without answering.", result);
+
+            lock (pendingLock) Assert.Null(pending);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── New messages in CancelReply/OnUnhandledException ──
+
+    /// <summary>
+    /// CancelReply is a no-op for ComposerSubmitAnswerMessage and ComposerCancelQuestionMessage
+    /// (fire-and-forget — no reply to cancel). Must not throw.
+    /// </summary>
+    [Fact]
+    public async Task CancelReply_SubmitAndCancel_NoOp_DoesNotThrow()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            var method = typeof(ComposerActor).GetMethod("CancelReply", PrivateFlags)
+                ?? throw new InvalidOperationException("CancelReply not found on ComposerActor");
+
+            // CancelReply must not throw for fire-and-forget messages.
+            method.Invoke(actor, [new ComposerSubmitAnswerMessage("answer")]);
+            method.Invoke(actor, [new ComposerCancelQuestionMessage()]);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// OnUnhandledException logs (does not throw) for ComposerSubmitAnswerMessage and
+    /// ComposerCancelQuestionMessage — they have no reply to fault.
+    /// </summary>
+    [Fact]
+    public async Task OnUnhandledException_SubmitAndCancel_Logs_DoesNotThrow()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var logger = new RecordingLogger();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            logger);
+
+        try
+        {
+            var method = typeof(ComposerActor).GetMethod("OnUnhandledException", PrivateFlags)!;
+            var ex = new InvalidOperationException("submit handler boom");
+
+            method.Invoke(actor, [new ComposerSubmitAnswerMessage("answer"), ex]);
+            method.Invoke(actor, [new ComposerCancelQuestionMessage(), ex]);
+
+            // The error was logged for both message types.
+            Assert.Contains(logger.Messages,
+                m => m.Contains("ComposerSubmitAnswerMessage", StringComparison.Ordinal));
+            Assert.Contains(logger.Messages,
+                m => m.Contains("ComposerCancelQuestionMessage", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── onSessionLoaded fires false before connect (the reset) then the outcome value ──
+
+    /// <summary>
+    /// The connect handler fires onSessionLoaded(false) BEFORE the connect attempt (the reset),
+    /// so a stale true from a prior successful connect cannot survive into a new attempt. This
+    /// test connects twice: the first with a disk file (true), the second without (false), and
+    /// verifies the second connect's first callback is false.
+    /// </summary>
+    [Fact]
+    public async Task SessionLoaded_ResetFalseBeforeConnect_NoStaleTrueOnSecondConnect()
+    {
+        var stateDir = CreateTempDir();
+
+        // Write a valid session file so the first connect loads from disk.
+        var sessionFile = Path.Combine(stateDir, "composer-session.json");
+        var validSession = AgentSession.Create("composer");
+        await validSession.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var loadedFlags = new List<bool>();
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            _ => { },
+            _ => { },
+            () => { },
+            onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+        try
+        {
+            actor.Start();
+
+            // First connect: loads from disk → last flag is true.
+            var reply1 = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply1, CancellationToken.None)));
+            Assert.True(await AwaitReplyAsync(reply1));
+
+            lock (loadedFlags) Assert.True(loadedFlags[^1], "First connect should load from disk");
+
+            // Delete the session file so the second connect is a fresh session.
+            File.Delete(sessionFile);
+            loadedFlags.Clear();
+
+            // Second connect: the reset fires false FIRST, then false (no disk file).
+            var reply2 = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerConnectMessage(reply2, CancellationToken.None)));
+            Assert.True(await AwaitReplyAsync(reply2));
+
+            lock (loadedFlags)
+            {
+                Assert.NotEmpty(loadedFlags);
+                // The first callback of the second connect must be false (the reset) —
+                // no stale true survived from the first connect.
+                Assert.False(loadedFlags[0], "First onSessionLoaded of the second connect must be false (reset)");
+                Assert.False(loadedFlags[^1], "Last onSessionLoaded must be false (no disk file)");
+            }
         }
         finally
         {

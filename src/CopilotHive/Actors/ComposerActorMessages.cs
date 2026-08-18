@@ -36,6 +36,18 @@ internal sealed record ComposerCompactPartialMessage(
     TaskCompletionSource<bool> Reply,
     CancellationToken Ct) : IComposerMessage;
 
+/// <summary>
+/// Submits the user's answer to the currently pending question, resuming the streaming loop.
+/// Fire-and-forget: the answer is delivered through the <c>onSubmitAnswer</c> callback.
+/// </summary>
+internal sealed record ComposerSubmitAnswerMessage(string Answer) : IComposerMessage;
+
+/// <summary>
+/// Cancels the currently pending question, returning a cancellation message to the LLM.
+/// Fire-and-forget: the cancellation is delivered through the <c>onCancelQuestion</c> callback.
+/// </summary>
+internal sealed record ComposerCancelQuestionMessage : IComposerMessage;
+
 /// <summary>Internal self-Tell carrying the accumulated streaming content.</summary>
 internal sealed record ComposerStreamingUpdateMessage(string Content) : IComposerMessage;
 

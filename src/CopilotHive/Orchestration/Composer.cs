@@ -22,6 +22,42 @@ namespace CopilotHive.Orchestration;
 /// The Composer helps users break down high-level intent into well-scoped goals
 /// and manages the goal lifecycle (create → approve → dispatch).
 /// Uses a persistent SharpCoder session with streaming for real-time interaction.
+/// <para>
+/// <b>State ownership model.</b> The <see cref="ComposerActor"/> owns all streaming and
+/// session mutations (streaming task/CTS/content, session lifecycle, compaction, connect).
+/// The facade owns the UI caches and cross-thread state: <see cref="IsCompacting"/>,
+/// <see cref="WasCompacted"/>, <see cref="SessionLoadedFromDisk"/>, <see cref="PendingQuestion"/>,
+/// <see cref="StreamingContent"/>, <see cref="IsStreaming"/>, and <see cref="LastToolCalls"/>.
+/// The facade caches are updated from actor callbacks, so reads of those properties are
+/// asynchronous with respect to the actor's mailbox: they may be STALE by the time they are
+/// observed, and are only guaranteed to converge after the corresponding actor operation has
+/// completed. Code that needs an authoritative answer must await the operation's reply
+/// (e.g. <see cref="ConnectAsync"/>, <see cref="CompactSessionAsync"/>) rather than read a
+/// cached flag. <see cref="PendingQuestion"/> is additionally lock-protected against concurrent
+/// UI submits, and <see cref="SessionLoadedFromDisk"/> is a volatile cache of the agent
+/// service's flag, refreshed through the connect callback.
+/// </para>
+/// <para>
+/// <b>Direct reads and their consistency guarantees.</b> Each read below is intentionally
+/// non-authoritative (a direct read is a snapshot that can lag the actor's mailbox), with an
+/// individual guarantee that makes the staleness acceptable for its UI purpose:
+/// <list type="bullet">
+/// <item><see cref="GetSubAgents"/> — returns defensive clones of the sub-agent snapshots;
+/// safe to read from any thread, and callers can never mutate tracked state.</item>
+/// <item><see cref="AvailableModels"/> / <see cref="ReasoningEffort"/> — the model catalog is
+/// read straight from the LIVE, mutable Hive configuration on every access, so it can change
+/// whenever the configuration is reloaded (not only on an explicit model switch); the effort
+/// tracks the current selection. UI staleness of a render-frame is acceptable for both.</item>
+/// <item><see cref="GetStats"/> — reads the live session; during streaming it is stale by at
+/// most the message currently being produced (the in-flight delta is not yet in the history),
+/// which is acceptable for a stats panel.</item>
+/// <item><see cref="GetChatHistory"/> — intended to be called after streaming completes; the
+/// terminal handler has already committed the full response to the session by then, so the
+/// returned snapshot is stable for the rendered view.</item>
+/// <item><see cref="GetLastSessionActivity"/> — reads the session's activity timestamp; a
+/// slightly stale value only shifts the startup-scan cutoff, which is acceptable.</item>
+/// </list>
+/// </para>
 /// </summary>
 public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 {
@@ -38,6 +74,27 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private int _streamingState; // 0=idle, 1=streaming (Interlocked)
     private volatile string _streamingContent = "";
     private volatile int _lastToolCalls;
+
+    /// <summary>
+    /// Facade cache of whether the current session was loaded from disk during connection.
+    /// Written only from actor callbacks (on the mailbox thread, or the streaming task's
+    /// failed-Tell fallback): the connect callback publishes true/false, and the reset and
+    /// overflow-recovery callbacks clear it to false — all in actor order, before the
+    /// corresponding reply/terminal signal completes. Read from arbitrary threads, hence
+    /// volatile. Direct reads are stale by design — see the class comment's state ownership
+    /// model.
+    /// </summary>
+    private volatile bool _sessionLoadedFromDisk;
+
+    /// <summary>
+    /// Serializes access to <see cref="_pendingQuestion"/>: the ask_user tool sets it under
+    /// lock, UI submits capture-and-clear it under lock, and the awaiting tool's finally clears
+    /// it only when it still holds the same reference. Guards against a stale clear wiping out
+    /// a newer question.
+    /// </summary>
+    private readonly object _pendingQuestionLock = new();
+
+    private ComposerQuestion? _pendingQuestion;
 
     /// <summary>
     /// Stored delegate forwarding <see cref="ComposerAgentService.OnSubAgentChanged"/> to
@@ -120,8 +177,15 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public event Action<SubAgentInfo>? OnSubAgentChanged;
 
-    /// <summary>The question currently waiting for a user answer, or <c>null</c> if none.</summary>
-    public ComposerQuestion? PendingQuestion { get; private set; }
+    /// <summary>
+    /// The question currently waiting for a user answer, or <c>null</c> if none.
+    /// Lock-protected: see <see cref="_pendingQuestionLock"/>. Direct reads are stale by design.
+    /// </summary>
+    public ComposerQuestion? PendingQuestion
+    {
+        get { lock (_pendingQuestionLock) { return _pendingQuestion; } }
+        private set { lock (_pendingQuestionLock) { _pendingQuestion = value; } }
+    }
 
     /// <summary>Raised when the Composer asks a new question so the UI can re-render.</summary>
     public event Action? OnQuestionAsked;
@@ -450,7 +514,42 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             content => { _streamingContent = content; OnStreamingUpdate?.Invoke(); },
             toolCalls => { Interlocked.Exchange(ref _streamingState, 0); _lastToolCalls = toolCalls; OnStreamingUpdate?.Invoke(); },
             error => { _streamingContent += $"\n\n❌ Error: {error}"; OnStreamingUpdate?.Invoke(); },
-            () => { IsCompacting = false; WasCompacted = false; var f = GetSessionFilePath(); if (File.Exists(f)) File.Delete(f); },
+            () =>
+            {
+                // Overflow recovery replaced the session with a fresh one: clear the facade's
+                // compaction caches, delete the stale session file so the overflowing session
+                // is never reloaded, and clear the loaded-from-disk cache — a fresh session
+                // was NOT loaded from disk. Runs in actor order (on the mailbox thread or the
+                // streaming task's failed-Tell fallback) before streaming completion is
+                // signalled, so it can never race a newer connect's publish.
+                IsCompacting = false;
+                WasCompacted = false;
+                _sessionLoadedFromDisk = false;
+                var f = GetSessionFilePath();
+                if (File.Exists(f)) File.Delete(f);
+            },
+            () =>
+            {
+                // Manual compaction started (the actor owns the mailbox-side dispatch; this
+                // callback updates the facade's UI caches). Subscribers are fire-and-forget:
+                // a throwing subscriber must not break the compaction.
+                IsCompacting = true;
+                try { OnCompactingStarted?.Invoke(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Composer OnCompactingStarted subscriber threw"); }
+            },
+            success =>
+            {
+                // Manual compaction finished. IsCompacting is cleared ALWAYS; WasCompacted is
+                // set only when the compaction actually succeeded (never on cancellation or
+                // failure).
+                IsCompacting = false;
+                if (success) WasCompacted = true;
+                try { OnCompacted?.Invoke(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Composer OnCompacted subscriber threw"); }
+            },
+            loadedFromDisk => _sessionLoadedFromDisk = loadedFromDisk,
+            SubmitAnswerInternal,
+            CancelQuestionInternal,
             _logger);
         _actor.Start();
     }
@@ -460,9 +559,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>
     /// Whether the current Composer session was loaded from disk during connection
-    /// and the connection succeeded.
+    /// and the connection succeeded. Cached facade copy of the agent service's flag,
+    /// refreshed through the actor's connect callback — reads are stale by design
+    /// (see the class comment).
     /// </summary>
-    internal bool SessionLoadedFromDisk => _agentService.SessionLoadedFromDisk;
+    internal bool SessionLoadedFromDisk => _sessionLoadedFromDisk;
 
     /// <summary>
     /// Returns the last session activity timestamp when the Composer is connected,
@@ -544,7 +645,14 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_actor.Tell(new ComposerConnectMessage(reply, ct)))
             throw new InvalidOperationException("Composer not available.");
-        await reply.Task.WaitAsync(ct);
+
+        // Authoritative wait — see SwitchModelAsync and ResetSessionAsync. NO WaitAsync(ct):
+        // the actor owns cancellation classification and settles the reply itself. Abandoning
+        // the wait here would let the caller observe a cancellation while the actor is still
+        // connecting, and the facade's _sessionLoadedFromDisk cache — published by the actor
+        // on every connect path — could then be updated after the caller had already given up,
+        // leaving a stale `true` for a connection nobody is waiting on.
+        await reply.Task;
     }
 
     /// <summary>
@@ -682,6 +790,14 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         // Authoritative wait — see SwitchModelAsync. Abandoning the wait on caller
         // cancellation would leave the facade cleanup below (attachments, session file,
         // compaction flags) unrun while the actor completes the reset anyway.
+        //
+        // NOTE: the _sessionLoadedFromDisk cache is deliberately NOT touched here. The actor
+        // clears it in actor order, before this reply completes (see ComposerResetSessionMessage
+        // handling), so by the time we reach this continuation the flag already says `false` for
+        // the fresh session. Clearing it again here would be both too late (a throwing
+        // attachment cleanup below would leave the stale `true` untouched anyway) and racy
+        // (a Connect queued behind the reset could publish a newer `true` that this late
+        // assignment would then overwrite with `false`).
         await reply.Task;
 
         if (_attachmentService is not null)
@@ -957,7 +1073,14 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             }
             finally
             {
-                PendingQuestion = null;
+                // Conditional clear: only this question may be cleared. If the UI already
+                // answered and the actor's capture-and-clear ran, this is a no-op; if a NEWER
+                // question has replaced this one (submit raced a re-ask), it must survive.
+                lock (_pendingQuestionLock)
+                {
+                    if (ReferenceEquals(_pendingQuestion, yesNoPending))
+                        _pendingQuestion = null;
+                }
             }
         }
 
@@ -1002,28 +1125,72 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         }
         finally
         {
-            PendingQuestion = null;
+            // Conditional clear — same-reference guard as the YesNo branch above.
+            lock (_pendingQuestionLock)
+            {
+                if (ReferenceEquals(_pendingQuestion, pending))
+                    _pendingQuestion = null;
+            }
         }
     }
 
     /// <summary>
     /// Submits the user's answer to the currently pending question, resuming the streaming loop.
+    /// Delivered to the actor's mailbox so the answer capture/clear and the
+    /// <c>TrySetResult</c> that resumes the awaiting <c>ask_user</c> tool are serialized with
+    /// the question lifecycle on the mailbox thread.
     /// </summary>
     /// <param name="answer">The answer string to return to the Composer LLM.</param>
     public void SubmitAnswer(string answer)
     {
-        var pending = PendingQuestion;
-        if (pending is null) return;
-        pending.Completion.TrySetResult(answer);
+        _actor.Tell(new ComposerSubmitAnswerMessage(answer));
     }
 
     /// <summary>
     /// Cancels the currently pending question, returning a cancellation message to the LLM.
+    /// Delivered to the mailbox, like <see cref="SubmitAnswer"/>.
     /// </summary>
     public void CancelQuestion()
     {
-        var pending = PendingQuestion;
-        if (pending is null) return;
+        _actor.Tell(new ComposerCancelQuestionMessage());
+    }
+
+    /// <summary>
+    /// Captures and clears the pending question under the lock, then completes its TCS
+    /// OUTSIDE the lock so a resuming continuation can never re-enter the lock reentrantly
+    /// while the capture is in progress. No-ops when there is no pending question.
+    /// </summary>
+    private void SubmitAnswerInternal(string answer)
+    {
+        ComposerQuestion? pending;
+        lock (_pendingQuestionLock)
+        {
+            pending = _pendingQuestion;
+            _pendingQuestion = null;
+        }
+
+        if (pending is null)
+            return;
+
+        pending.Completion.TrySetResult(answer);
+    }
+
+    /// <summary>
+    /// Captures and clears the pending question under lock and completes it with the exact
+    /// cancellation message — see <see cref="SubmitAnswerInternal"/> for the lock discipline.
+    /// </summary>
+    private void CancelQuestionInternal()
+    {
+        ComposerQuestion? pending;
+        lock (_pendingQuestionLock)
+        {
+            pending = _pendingQuestion;
+            _pendingQuestion = null;
+        }
+
+        if (pending is null)
+            return;
+
         pending.Completion.TrySetResult("User cancelled the question without answering.");
     }
 

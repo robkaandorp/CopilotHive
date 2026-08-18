@@ -22,6 +22,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     private readonly Action<int> _onStreamingFinished;
     private readonly Action<string> _onStreamingError;
     private readonly Action _onOverflowRecovery;
+    private readonly Action _onCompactingStarted;
+    private readonly Action<bool> _onCompactingFinished;
+    private readonly Action<bool> _onSessionLoaded;
+    private readonly Action<string> _onSubmitAnswer;
+    private readonly Action _onCancelQuestion;
     private readonly ILogger _logger;
 
     // Cross-thread state. The mailbox loop and the streaming task both read/write these, so
@@ -48,6 +53,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         Action<int> onStreamingFinished,
         Action<string> onStreamingError,
         Action onOverflowRecovery,
+        Action onCompactingStarted,
+        Action<bool> onCompactingFinished,
+        Action<bool> onSessionLoaded,
+        Action<string> onSubmitAnswer,
+        Action onCancelQuestion,
         ILogger logger)
     {
         _agentService = agentService;
@@ -57,6 +67,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         _onStreamingFinished = onStreamingFinished;
         _onStreamingError = onStreamingError;
         _onOverflowRecovery = onOverflowRecovery;
+        _onCompactingStarted = onCompactingStarted;
+        _onCompactingFinished = onCompactingFinished;
+        _onSessionLoaded = onSessionLoaded;
+        _onSubmitAnswer = onSubmitAnswer;
+        _onCancelQuestion = onCancelQuestion;
         _logger = logger;
     }
 
@@ -66,17 +81,44 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         switch (message)
         {
             case ComposerConnectMessage m:
+                // Reset the facade's cache BEFORE the connect attempt: whatever happens next,
+                // no stale "loaded from disk" value may survive into a new connection attempt
+                // (the agent service resets its own flag first, but the facade cache must be
+                // told before the service can flip it again). The caller's ConnectAsync waits
+                // on the reply AUTHORITATIVELY (no WaitAsync(ct)), so every path below both
+                // publishes the flag and settles the reply on the mailbox thread — a caller
+                // can never observe a cancellation while a later `true` is still pending.
+                TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
                 try
                 {
                     await _agentService.ConnectAsync(m.Ct);
-                    m.Reply.TrySetResult(true);
+
+                    // Cancellation is checked FIRST: ConnectAsync has token-insensitive stages
+                    // after the disk load, so a request cancelled during one of them must NOT
+                    // publish the service's `true` — the caller asked to abandon this
+                    // connection, and a loaded-from-disk `true` would outlive it.
+                    if (m.Ct.IsCancellationRequested)
+                    {
+                        TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                        m.Reply.TrySetCanceled(m.Ct);
+                    }
+                    else
+                    {
+                        // The service's flag is only true when a session was actually loaded
+                        // from disk AND the whole connection succeeded — mirror it into the
+                        // facade, before the reply so the caller observes it in actor order.
+                        TryInvoke(() => _onSessionLoaded(_agentService.SessionLoadedFromDisk), nameof(_onSessionLoaded));
+                        m.Reply.TrySetResult(true);
+                    }
                 }
                 catch (OperationCanceledException) when (m.Ct.IsCancellationRequested)
                 {
+                    TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
                     m.Reply.TrySetCanceled(m.Ct);
                 }
                 catch (Exception ex)
                 {
+                    TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
                     m.Reply.TrySetException(ex);
                 }
                 break;
@@ -109,17 +151,51 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                     break;
                 }
 
+                // Captured BEFORE any mutation so the outcome paths below can tell whether the
+                // session was actually replaced. The facade cache is the SINGLE authority and is
+                // updated from the ACTUAL session state — never re-derived from
+                // _agentService.SessionLoadedFromDisk, which can be stale-`true` after a
+                // late-cancelled connect (the service commits its flag while the actor publishes
+                // `false` and cancels the reply).
+                //
+                // The unified rule for every outcome: session REPLACED → publish `false`;
+                // session NOT replaced → publish nothing and preserve the facade's value.
+                var sessionBefore = _agentService.Session;
+
                 try
                 {
                     await DoResetAsync(m.Ct);
+                    // A successful reset always replaces the session with a fresh one, so the
+                    // publish is unconditional here. It runs IN ACTOR ORDER, before the reply
+                    // completes, so the facade never observes a stale `true` for the new session
+                    // and an older reset can never overwrite a newer connect's publish.
+                    TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
                     m.Reply.TrySetResult();
                 }
                 catch (OperationCanceledException) when (m.Ct.IsCancellationRequested)
                 {
+                    // Pre-mutation cancellation leaves the previous (possibly disk-loaded)
+                    // session intact, so the facade's existing value is still accurate and must
+                    // be preserved. Only a cancellation observed AFTER the replacement describes
+                    // a fresh, not-loaded-from-disk session.
+                    if (!ReferenceEquals(sessionBefore, _agentService.Session))
+                    {
+                        TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                    }
+
                     m.Reply.TrySetCanceled(m.Ct);
                 }
                 catch (Exception ex)
                 {
+                    // Same rule as the cancellation path: a failure before the replacement (e.g.
+                    // thrown from agent disposal) leaves the old session — and therefore the
+                    // facade's value — correct; a failure after it (e.g. thrown from agent
+                    // recreation) leaves a fresh session that was not loaded from disk.
+                    if (!ReferenceEquals(sessionBefore, _agentService.Session))
+                    {
+                        TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                    }
+
                     m.Reply.TrySetException(ex);
                 }
                 break;
@@ -146,6 +222,17 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 }
                 break;
 
+            case ComposerSubmitAnswerMessage m:
+                // Runs on the mailbox thread: the facade's answer capture/clear and the
+                // TrySetResult that resumes the awaiting ask_user tool happen here, so a
+                // submit can never race the question lifecycle.
+                TryInvoke(() => _onSubmitAnswer(m.Answer), nameof(_onSubmitAnswer));
+                break;
+
+            case ComposerCancelQuestionMessage:
+                TryInvoke(_onCancelQuestion, nameof(_onCancelQuestion));
+                break;
+
             case ComposerCompactMessage m:
                 // The facade's gate check is a TOCTOU probe; the mailbox is the authority,
                 // so a compact that races an admitted send is rejected here.
@@ -155,20 +242,33 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                     break;
                 }
 
+                // The actor's own callbacks are the sole source for manual-compaction state:
+                // the callback-free options handed to the compactor suppress the agent's wired
+                // callbacks so exactly ONE started/finished pair fires per manual compaction.
+                // The finished callback runs BEFORE the reply completes (in the finally, which
+                // always runs) so the facade's OnCompacted/IsCompacting/WasCompacted updates
+                // are observable in actor order by the time the caller sees the outcome.
+                var compactResult = false;
                 try
                 {
-                    var result = await DoCompactAsync(m.Ct);
-                    m.Reply.TrySetResult(result);
+                    TryInvoke(_onCompactingStarted, nameof(_onCompactingStarted));
+                    compactResult = await DoCompactAsync(m.Ct);
                 }
                 catch (OperationCanceledException)
                 {
-                    m.Reply.TrySetResult(false);
+                    // Cancelled — keep false.
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Compact failed");
-                    m.Reply.TrySetResult(false);
                 }
+                finally
+                {
+                    // Always runs: `true` on success, `false` on cancellation/failure (and on
+                    // a successful run that simply had nothing to compact).
+                    TryInvoke(() => _onCompactingFinished(compactResult), nameof(_onCompactingFinished));
+                }
+                m.Reply.TrySetResult(compactResult);
                 break;
 
             case ComposerCompactPartialMessage m:
@@ -178,20 +278,28 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                     break;
                 }
 
+                var partialResult = false;
                 try
                 {
-                    var result = await DoCompactPartialAsync(m.Percent, m.Ct);
-                    m.Reply.TrySetResult(result);
+                    TryInvoke(_onCompactingStarted, nameof(_onCompactingStarted));
+                    partialResult = await DoCompactPartialAsync(m.Percent, m.Ct);
                 }
                 catch (OperationCanceledException)
                 {
-                    m.Reply.TrySetResult(false);
+                    // Cancelled — keep false.
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Compact failed");
-                    m.Reply.TrySetResult(false);
                 }
+                finally
+                {
+                    // Always runs: `true` on success, `false` on cancellation/failure (and on
+                    // a successful run that simply had nothing to compact). Runs BEFORE the
+                    // reply so the facade callbacks are observable in actor order.
+                    TryInvoke(() => _onCompactingFinished(partialResult), nameof(_onCompactingFinished));
+                }
+                m.Reply.TrySetResult(partialResult);
                 break;
 
             case ComposerStreamingUpdateMessage m:
@@ -257,14 +365,21 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         _isStreaming = false;
 
         TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-        TryInvoke(() => _onStreamingFinished(m.LastToolCalls), nameof(_onStreamingFinished));
+
         if (m.OverflowRecovered)
         {
-            // Must run even on the failed-Tell path: the facade deletes the stale session file
-            // and clears the compaction flags here, so skipping it would let the overflowing
+            // BEFORE the completion signal: overflow recovery replaced the session with a
+            // fresh one, and this callback is what clears the facade's compaction flags and
+            // _sessionLoadedFromDisk and deletes the stale session file. Running it after
+            // _onStreamingFinished would let completion subscribers observe the fresh session
+            // through a stale-true loaded-from-disk flag.
+            //
+            // Must run even on the failed-Tell path: skipping it would let the overflowing
             // session be reloaded on the next start.
             TryInvoke(_onOverflowRecovery, nameof(_onOverflowRecovery));
         }
+
+        TryInvoke(() => _onStreamingFinished(m.LastToolCalls), nameof(_onStreamingFinished));
     }
 
     /// <summary>
@@ -383,6 +498,10 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         catch (Exception ex) when (ComposerStreamingService.IsContextOverflowError(ex))
         {
             _logger.LogWarning(ex, "Composer context overflow — resetting session");
+
+            // Captured BEFORE the reset so the failure branch can tell whether the session was
+            // actually replaced — see the reset handler for the shared rule.
+            var sessionBeforeRecovery = _agentService.Session;
             try
             {
                 await _agentService.ResetSessionAsync();
@@ -390,9 +509,40 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             }
             catch (Exception resetEx)
             {
-                // Recovery itself failed (agent disposal is allowed to propagate). Report it
-                // as a real error — silently finishing would hide a broken session from the UI.
-                _logger.LogError(resetEx, "Composer overflow recovery failed");
+                // Recovery itself failed (agent disposal is allowed to propagate). The error
+                // terminal below routes through HandleStreamingError, which does NOT run the
+                // overflow-recovery callback, so the facade's loaded-from-disk cache must be
+                // published HERE.
+                //
+                // Same authority rule as the reset handler: publish from the ACTUAL session
+                // state, never from _agentService.SessionLoadedFromDisk (which can be
+                // stale-`true` after a late-cancelled connect). A pre-replacement failure
+                // (thrown from DisposeAgentAsync) leaves the old session intact, so the facade's
+                // existing value is still accurate and is deliberately left untouched; only a
+                // post-replacement failure (thrown from RecreateAgentAsync) describes a fresh,
+                // not-loaded-from-disk session.
+                //
+                // Published FIRST — before the fallible log call and before the terminal — so a
+                // throwing logger can never skip it, and so it lands in actor order ahead of
+                // the public error/completion signal.
+                if (!ReferenceEquals(sessionBeforeRecovery, _agentService.Session))
+                {
+                    TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                }
+
+                // Reported as a real error — silently finishing would hide a broken session
+                // from the UI. Swallowed: a logging failure must not displace the error
+                // terminal that the UI depends on.
+                try
+                {
+                    _logger.LogError(resetEx, "Composer overflow recovery failed");
+                }
+                catch
+                {
+                    // Logger failures are non-actionable here — the terminal below is what
+                    // surfaces the failure to the user.
+                }
+
                 PostTerminal(new ComposerStreamingErrorMessage(resetEx.Message));
             }
         }
@@ -446,6 +596,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerSwitchModelMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerCompactMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerCompactPartialMessage m: m.Reply.TrySetCanceled(); break;
+            case ComposerSubmitAnswerMessage: break; // fire-and-forget — no reply to cancel
+            case ComposerCancelQuestionMessage: break; // fire-and-forget — no reply to cancel
         }
     }
 
@@ -459,6 +611,10 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerSwitchModelMessage m: m.Reply.TrySetException(ex); break;
             case ComposerCompactMessage m: m.Reply.TrySetException(ex); break;
             case ComposerCompactPartialMessage m: m.Reply.TrySetException(ex); break;
+            case ComposerSubmitAnswerMessage:
+            case ComposerCancelQuestionMessage:
+                _logger.LogError(ex, "Composer actor failed to handle {MessageType}", message.GetType().Name);
+                break;
             default: CancelReply(message); break;
         }
     }
@@ -545,7 +701,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     private async Task<bool> DoCompactAsync(CancellationToken ct)
     {
         var compactor = new ContextCompactor(_agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!, _logger);
-        var result = await compactor.ForceCompactAsync(_agentService.Session, _agentService.AgentOptions, ct);
+        var result = await compactor.ForceCompactAsync(_agentService.Session, CloneOptionsWithoutCompactionCallbacks(_agentService.AgentOptions), ct);
         if (result)
         {
             await PersistCompactionAsync(ct);
@@ -560,13 +716,52 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     private async Task<bool> DoCompactPartialAsync(int percent, CancellationToken ct)
     {
         var compactor = new ContextCompactor(_agentService.AgentOptions.CompactionClient ?? _agentService.ChatClient!, _logger);
-        var result = await compactor.CompactOldestPercentAsync(_agentService.Session, _agentService.AgentOptions, percent, ct);
+        var result = await compactor.CompactOldestPercentAsync(_agentService.Session, CloneOptionsWithoutCompactionCallbacks(_agentService.AgentOptions), percent, ct);
         if (result)
         {
             await PersistCompactionAsync(ct);
         }
         return result;
     }
+
+    /// <summary>
+    /// Copies every property of <paramref name="original"/> into a fresh <see cref="AgentOptions"/>
+    /// with <c>OnCompacting</c> and <c>OnCompacted</c> cleared. <see cref="AgentOptions"/> is a
+    /// sealed class (not a record), so this manual clone is the only way to get a callback-free
+    /// copy. Manual compaction (full and partial) passes this clone to
+    /// <see cref="ContextCompactor"/> so the agent service's wired callbacks — which are also the
+    /// streaming/automatic-compaction callbacks — are never double-fired: the actor's own
+    /// <c>_onCompactingStarted</c>/<c>_onCompactingFinished</c> are the sole source for manual
+    /// compaction state. Automatic compaction (during streaming) is unchanged and still uses the
+    /// service's original options.
+    /// </summary>
+    private static AgentOptions CloneOptionsWithoutCompactionCallbacks(AgentOptions original) => new()
+    {
+        WorkDirectory = original.WorkDirectory,
+        MaxSteps = original.MaxSteps,
+        EnableBash = original.EnableBash,
+        BashShellPath = original.BashShellPath,
+        BashShellArgsFormat = original.BashShellArgsFormat,
+        EnableFileOps = original.EnableFileOps,
+        EnableFileWrites = original.EnableFileWrites,
+        EnableSkills = original.EnableSkills,
+        SystemPrompt = original.SystemPrompt,
+        CustomInstructions = original.CustomInstructions,
+        AutoLoadWorkspaceInstructions = original.AutoLoadWorkspaceInstructions,
+        CompactionThreshold = original.CompactionThreshold,
+        CompactionRetainRecent = original.CompactionRetainRecent,
+        EnableAutoCompaction = original.EnableAutoCompaction,
+        OnCompacting = null,
+        OnCompacted = null,
+        Logger = original.Logger,
+        ReasoningEffort = original.ReasoningEffort,
+        ShowToolCallsInStream = original.ShowToolCallsInStream,
+        CompactionMaxTokens = original.CompactionMaxTokens,
+        SubAgents = original.SubAgents,
+        CustomTools = original.CustomTools,
+        CompactionClient = original.CompactionClient,
+        MaxContextTokens = original.MaxContextTokens,
+    };
 
     /// <summary>Persists a successful compaction and refreshes the registry entry.</summary>
     private async Task PersistCompactionAsync(CancellationToken ct)
