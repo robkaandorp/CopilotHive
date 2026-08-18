@@ -11,6 +11,7 @@ using Polly;
 
 using System.ClientModel;
 using System.Net.Http.Headers;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace CopilotHive.Shared.AI;
@@ -48,7 +49,7 @@ public static class ChatClientFactory
                     var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
                     if (string.IsNullOrEmpty(apiKey)) throw new InvalidOperationException("OLLAMA_API_KEY is required for ollama-cloud provider");
 
-                    var httpClient = new HttpClient(CreateResilientHandler())
+                    var httpClient = new HttpClient(CreateOllamaHandlerChain())
                     {
                         BaseAddress = new Uri("https://ollama.com"),
                         Timeout = Timeout.InfiniteTimeSpan,
@@ -58,16 +59,44 @@ public static class ChatClientFactory
                     model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "gpt-oss:120b";
                     var ollamaClient = new OllamaApiClient(httpClient);
                     ollamaClient.SelectedModel = model;
-                    return ollamaClient;
+
+                    // OllamaSharp collapses ExtraHigh into "high" during ChatOptions→request
+                    // mapping, so the distinction must be preserved before serialization.
+                    // See OllamaExtraHighReasoningClient for the investigation and mechanism.
+                    //
+                    // The wrapper is also given ownership of httpClient: OllamaSharp only disposes
+                    // an HTTP client it created itself, so an injected one would otherwise leak its
+                    // handler chain and sockets.
+                    return new OllamaExtraHighReasoningClient(ollamaClient, httpClient);
                 }
 
             case "ollama-local":
                 {
                     var url = Environment.GetEnvironmentVariable("OLLAMA_URL") ?? "http://localhost:11434";
                     model ??= Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3";
-                    var ollamaClient = new OllamaApiClient(new Uri(url));
+
+                    // Converted from `new OllamaApiClient(new Uri(url))` to HttpClient-based
+                    // construction so the reasoning-effort mapping handler can be injected into the
+                    // transport chain (see CreateOllamaHandlerChain). OllamaApiClient(HttpClient)
+                    // uses the client's BaseAddress as the API endpoint, so behaviour is otherwise
+                    // identical apart from the (previously 100 s) default timeout, which is now
+                    // infinite — consistent with every other provider here, since reasoning models
+                    // routinely exceed the default. The conversion also moves HttpClient ownership
+                    // to us (OllamaSharp only disposes clients it created itself), which is why the
+                    // returned wrapper is handed the instance to dispose.
+                    var httpClient = new HttpClient(CreateOllamaHandlerChain())
+                    {
+                        BaseAddress = new Uri(url),
+                        Timeout = Timeout.InfiniteTimeSpan,
+                    };
+
+                    var ollamaClient = new OllamaApiClient(httpClient);
                     ollamaClient.SelectedModel = model;
-                    return ollamaClient;
+
+                    // See the ollama-cloud branch / OllamaExtraHighReasoningClient for why the
+                    // ExtraHigh mapping must happen at the ChatOptions level, and why the wrapper
+                    // takes ownership of the injected httpClient.
+                    return new OllamaExtraHighReasoningClient(ollamaClient, httpClient);
                 }
 
             case "github":
@@ -82,7 +111,11 @@ public static class ChatClientFactory
                         new OpenAIClientOptions { Endpoint = new Uri("https://models.github.ai") }
                     );
 
-                    return openAiClient.GetChatClient(model).AsIChatClient();
+                    // GitHub Models does not accept a reasoning effort above "high"; clamp the
+                    // internal ExtraHigh level at the provider boundary. The wrapper owns the
+                    // inner client's disposal.
+                    return new ReasoningEffortClampingClient(
+                        openAiClient.GetChatClient(model).AsIChatClient(), ReasoningEffort.High);
                 }
 
             case "copilot":
@@ -130,18 +163,93 @@ public static class ChatClientFactory
     }
 
     /// <summary>
-    /// Creates a resilient <see cref="HttpMessageHandler"/> chain with per-attempt timeout
-    /// and retry policy. Wraps the given outer handler (if any) around the resilience handler.
+    /// The value the Ollama API uses for the highest thinking level, mapped from the internal
+    /// <c>extra_high</c> wire value.
     /// </summary>
-    /// <param name="outerHandler">Optional handler (e.g. CopilotChoiceMergingHandler) that wraps
-    /// the resilience handler. Its <c>InnerHandler</c> will be set to the resilience handler.</param>
-    internal static HttpMessageHandler CreateResilientHandler(DelegatingHandler? outerHandler = null)
+    internal const string OllamaExtraHighMapping = "max";
+
+    /// <summary>The Ollama request property carrying the reasoning/thinking level.</summary>
+    internal const string OllamaReasoningPropertyName = "think";
+
+    /// <summary>
+    /// Builds the Ollama transport chain: <c>ResilienceHandler → ReasoningEffortMappingHandler →
+    /// HttpClientHandler</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is defence-in-depth only. The load-bearing ExtraHigh mechanism for Ollama is
+    /// <see cref="OllamaExtraHighReasoningClient"/>, which acts at the <see cref="ChatOptions"/>
+    /// level — see that type for the full investigation. The handler still runs so that a
+    /// hand-built body (or a future OllamaSharp that emits the canonical <c>extra_high</c> value,
+    /// or a <c>reasoning_effort</c>/<c>reasoning.effort</c> property) is normalized too. It never
+    /// rewrites <c>"high"</c>, which is indistinguishable from a genuine
+    /// <see cref="ReasoningEffort.High"/> request.
+    /// </para>
+    /// </remarks>
+    private static HttpMessageHandler CreateOllamaHandlerChain() =>
+        CreateResilientHandler(BuildHandlerChain(
+            new ReasoningEffortMappingHandler(OllamaExtraHighMapping, customPropertyName: OllamaReasoningPropertyName),
+            new HttpClientHandler()));
+
+    /// <summary>
+    /// Composes an <see cref="HttpMessageHandler"/> chain from outermost to innermost without
+    /// disturbing links that are already wired up by the caller.
+    /// </summary>
+    /// <param name="handlers">
+    /// The handlers in outermost→innermost order. Every element except the last must be a
+    /// <see cref="DelegatingHandler"/>; the last element is the terminal handler (typically an
+    /// <see cref="HttpClientHandler"/> or another handler that actually performs the transport).
+    /// </param>
+    /// <returns>The outermost handler of the composed chain.</returns>
+    /// <remarks>
+    /// This replaces the previous pattern where <see cref="CreateResilientHandler"/> assigned
+    /// <c>InnerHandler</c> on a caller-supplied handler that might already have had one — silently
+    /// disconnecting the existing chain. <c>BuildHandlerChain</c> links each handler to its
+    /// successor exactly once, so the caller decides the full order.
+    /// </remarks>
+    internal static HttpMessageHandler BuildHandlerChain(params HttpMessageHandler[] handlers)
+    {
+        ArgumentNullException.ThrowIfNull(handlers);
+        if (handlers.Length == 0)
+            throw new ArgumentException("At least one handler is required.", nameof(handlers));
+
+        for (var i = 0; i < handlers.Length - 1; i++)
+        {
+            if (handlers[i] is not DelegatingHandler delegating)
+                throw new ArgumentException(
+                    $"Handler at index {i} ({handlers[i].GetType().Name}) must be a DelegatingHandler because it is not the terminal handler.",
+                    nameof(handlers));
+
+            delegating.InnerHandler = handlers[i + 1];
+        }
+
+        return handlers[0];
+    }
+
+    /// <summary>
+    /// Creates a resilient <see cref="HttpMessageHandler"/> chain with per-attempt timeout
+    /// and retry policy.
+    /// </summary>
+    /// <param name="innerHandler">
+    /// Optional handler placed <em>beneath</em> the resilience handler. When <see langword="null"/>,
+    /// a fresh <see cref="HttpClientHandler"/> is used. The supplied handler's own
+    /// <c>InnerHandler</c> is never overwritten, so callers can pass an already-composed chain
+    /// (e.g. built with <see cref="BuildHandlerChain"/>).
+    /// </param>
+    /// <param name="retryDelay">
+    /// Optional override for the base retry delay. Production uses the default 5 s; tests pass a
+    /// near-zero value so retry behaviour can be exercised without slowing the suite. The retry
+    /// count, backoff type and timeout are identical either way, so tests still exercise the real
+    /// strategy.
+    /// </param>
+    internal static HttpMessageHandler CreateResilientHandler(
+        HttpMessageHandler? innerHandler = null, TimeSpan? retryDelay = null)
     {
         var retryPipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
             .AddRetry(new HttpRetryStrategyOptions
             {
                 MaxRetryAttempts = 3,
-                Delay = TimeSpan.FromSeconds(5),
+                Delay = retryDelay ?? TimeSpan.FromSeconds(5),
                 BackoffType = DelayBackoffType.Exponential,
                 OnRetry = static args =>
                 {
@@ -154,19 +262,17 @@ public static class ChatClientFactory
             .AddTimeout(TimeSpan.FromMinutes(10))
             .Build();
 
-        var resilienceHandler = new ResilienceHandler(retryPipeline)
-        {
-            InnerHandler = new HttpClientHandler()
-        };
-
-        if (outerHandler is not null)
-        {
-            outerHandler.InnerHandler = resilienceHandler;
-            return outerHandler;
-        }
-
-        return resilienceHandler;
+        return BuildHandlerChain(
+            new ResilienceHandler(retryPipeline),
+            innerHandler ?? new HttpClientHandler());
     }
+
+    /// <summary>
+    /// The value the GitHub Copilot API expects for the internal <c>extra_high</c> reasoning effort.
+    /// The OpenAI SDK serializes <see cref="ReasoningEffort.ExtraHigh"/> as <c>"xhigh"</c> already,
+    /// but our own wire format uses <c>extra_high</c>; the mapping handler normalizes both.
+    /// </summary>
+    internal const string CopilotExtraHighMapping = "xhigh";
 
     private static IChatClient CreateCopilotClient(string model)
     {
@@ -176,38 +282,123 @@ public static class ChatClientFactory
             ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
         if (string.IsNullOrEmpty(ghToken)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
 
-        if (RequiresResponsesEndpoint(model))
+        var useResponsesApi = RequiresResponsesEndpoint(model);
+        var httpClient = new HttpClient(CreateCopilotHandlerChain(
+            useResponsesApi, CopilotExtraHighMapping, new HttpClientHandler()))
         {
-            var handler = CreateResilientHandler(new CopilotResponsesHandler());
-            var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            Timeout = Timeout.InfiniteTimeSpan
+        };
 
-            var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(ghToken),
-                new OpenAIClientOptions
-                {
-                    Endpoint = new Uri("https://api.githubcopilot.com"),
-                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
-                    NetworkTimeout = TimeSpan.FromMinutes(30)
-                }
-            );
-            return openAiClient.GetResponsesClient().AsIChatClient(model);
-        }
-        else
+        var openAiClient = new OpenAIClient(
+            new ApiKeyCredential(ghToken),
+            new OpenAIClientOptions
+            {
+                Endpoint = new Uri("https://api.githubcopilot.com"),
+                Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
+                NetworkTimeout = TimeSpan.FromMinutes(30)
+            }
+        );
+
+        return useResponsesApi
+            ? openAiClient.GetResponsesClient().AsIChatClient(model)
+            : openAiClient.GetChatClient(model).AsIChatClient();
+    }
+
+    /// <summary>
+    /// Builds the outbound handler chain used for the Copilot provider:
+    /// <c>ResilienceHandler → CopilotResponsesHandler/CopilotChoiceMergingHandler →
+    /// ReasoningEffortMappingHandler → terminalHandler</c>.
+    /// </summary>
+    /// <remarks>
+    /// Order matters: the Copilot handler rewrites the request body first (tool-call argument
+    /// fix-ups / responses-API input reconstruction), then the mapping handler translates
+    /// <c>extra_high</c> into the provider spelling on the final body, then the terminal handler
+    /// transmits it.
+    /// </remarks>
+    private static HttpMessageHandler CreateCopilotHandlerChain(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler)
+        => CreateCopilotHandlerChain(useResponsesApi, extraHighMapping, terminalHandler, out _);
+
+    /// <summary>
+    /// Builds the Copilot chain and also hands back the Copilot handler instance, so tests can
+    /// assert on its accumulated conversation state.
+    /// </summary>
+    private static HttpMessageHandler CreateCopilotHandlerChain(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
+        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+    {
+        copilotHandler = useResponsesApi
+            ? new CopilotResponsesHandler()
+            : new CopilotChoiceMergingHandler();
+
+        return CreateResilientHandler(
+            BuildHandlerChain(
+                copilotHandler,
+                new ReasoningEffortMappingHandler(extraHighMapping),
+                terminalHandler),
+            retryDelay);
+    }
+
+    /// <summary>
+    /// Test seam: builds an <see cref="HttpClient"/> over the FULL production Copilot handler
+    /// chain (resilience → Copilot handler → reasoning-effort mapping) but with an injectable
+    /// terminal handler, so the chain can be exercised without any network access.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    internal static HttpClient CreateCopilotClientForTest(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler)
+        => CreateCopilotClientForTest(useResponsesApi, extraHighMapping, terminalHandler, out _);
+
+    /// <summary>
+    /// Test seam overload that also exposes the Copilot handler instance, so retry tests can assert
+    /// that its conversation state was not corrupted or duplicated.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    /// <param name="copilotHandler">The Copilot handler instance inside the chain.</param>
+    /// <param name="retryDelay">Optional retry-delay override so retry tests run fast.</param>
+    internal static HttpClient CreateCopilotClientForTest(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
+        out DelegatingHandler copilotHandler, TimeSpan? retryDelay = null)
+    {
+        ArgumentNullException.ThrowIfNull(terminalHandler);
+        var chain = CreateCopilotHandlerChain(
+            useResponsesApi, extraHighMapping, terminalHandler, out copilotHandler, retryDelay);
+        return new HttpClient(chain)
         {
-            var handler = CreateResilientHandler(new CopilotChoiceMergingHandler());
-            var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+    }
 
-            var openAiClient = new OpenAIClient(
-                new ApiKeyCredential(ghToken),
-                new OpenAIClientOptions
-                {
-                    Endpoint = new Uri("https://api.githubcopilot.com"),
-                    Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
-                    NetworkTimeout = TimeSpan.FromMinutes(30)
-                }
-            );
-            return openAiClient.GetChatClient(model).AsIChatClient();
-        }
+    /// <summary>
+    /// Test seam: builds the FULL production Ollama client stack —
+    /// <see cref="OllamaExtraHighReasoningClient"/> over an <see cref="OllamaApiClient"/> whose
+    /// transport is the production handler chain (resilience → reasoning-effort mapping) — but with
+    /// an injectable terminal handler, so the real
+    /// <c>ChatOptions → OllamaApiClient → handler → terminal</c> path can be exercised offline.
+    /// </summary>
+    /// <param name="model">The model to select on the underlying client.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    internal static IChatClient CreateOllamaClientForTest(string model, HttpMessageHandler terminalHandler)
+    {
+        ArgumentNullException.ThrowIfNull(terminalHandler);
+
+        var httpClient = new HttpClient(CreateResilientHandler(BuildHandlerChain(
+            new ReasoningEffortMappingHandler(OllamaExtraHighMapping, customPropertyName: OllamaReasoningPropertyName),
+            terminalHandler)))
+        {
+            BaseAddress = new Uri("http://localhost:11434"),
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+
+        var ollamaClient = new OllamaApiClient(httpClient);
+        ollamaClient.SelectedModel = model;
+
+        // Mirror production ownership so disposal behaviour is exercised by tests too.
+        return new OllamaExtraHighReasoningClient(ollamaClient, httpClient);
     }
 
     /// <summary>
@@ -385,6 +576,45 @@ public static class ChatClientFactory
         private static readonly string ResponsesLogDir =
             Environment.GetEnvironmentVariable("DIAGNOSTICS_DIR") ?? Path.Combine(Path.GetTempPath(), "copilothive-diagnostics");
 
+        /// <summary>
+        /// Conversation state produced by the request transformation, staged on the request itself
+        /// so it survives across resilience retry attempts and is committed by whichever attempt
+        /// finally receives an authoritative response.
+        /// </summary>
+        private sealed class PendingConversationState
+        {
+            public JsonArray? BaseInput { get; init; }
+            public List<JsonNode>? TurnHistory { get; init; }
+
+            /// <summary>Guards against committing the same staged state more than once.</summary>
+            public bool Committed { get; set; }
+        }
+
+        /// <summary>
+        /// Carries the transformation result across retry attempts of the same request.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This handler sits <em>beneath</em> the <c>ResilienceHandler</c>, so a retry re-enters
+        /// <see cref="SendAsync"/> with the <b>same</b> <see cref="HttpRequestMessage"/> instance
+        /// carrying the <b>already-transformed</b> body (verified with a forced-transient-failure
+        /// probe: Polly reuses the request instance and preserves both <c>request.Options</c> and any
+        /// replaced <c>Content</c> across attempts). Each attempt is a fresh <see cref="SendAsync"/>
+        /// stack frame, so anything staged in a local would be lost by the attempt that actually
+        /// succeeds — the staged state therefore has to live on the request.
+        /// </para>
+        /// <para>
+        /// The presence of this entry also serves as the idempotence marker. Without it a retry
+        /// would see a body that no longer contains <c>previous_response_id</c> — because the first
+        /// attempt removed it — and would fall into the "first request" branch, overwriting
+        /// <see cref="_baseInput"/> with the fully expanded conversation and corrupting every later
+        /// reconstruction. <see cref="HttpRequestOptions"/> travels with the request instance and is
+        /// never sent over the wire, which makes it the right place for this attempt-scoped state.
+        /// </para>
+        /// </remarks>
+        private static readonly HttpRequestOptionsKey<PendingConversationState> PendingStateKey =
+            new("CopilotHive.CopilotResponsesHandler.PendingState");
+
         public CopilotResponsesHandler() { }
         public CopilotResponsesHandler(HttpMessageHandler inner) : base(inner) { }
 
@@ -393,9 +623,17 @@ public static class ChatClientFactory
         {
             var seq = Interlocked.Increment(ref _requestCount);
 
-            if (request.Content != null && request.RequestUri?.AbsolutePath?.Contains("responses") == true)
+            var isResponsesRequest = request.Content != null
+                && request.RequestUri?.AbsolutePath?.Contains("responses") == true;
+
+            // Idempotence guard: on a retry the body is already transformed and the resulting
+            // conversation state is already staged on the request, so re-running the transformation
+            // would mutate the body a second time. Reuse the staged state instead.
+            var hasPendingState = request.Options.TryGetValue(PendingStateKey, out var pending);
+
+            if (isResponsesRequest && !hasPendingState)
             {
-                var body = await request.Content.ReadAsStringAsync();
+                var body = await request.Content!.ReadAsStringAsync(ct);
                 var json = JsonNode.Parse(body);
 
                 if (json is JsonObject obj && obj.ContainsKey("previous_response_id"))
@@ -414,24 +652,36 @@ public static class ChatClientFactory
                         combined.Add(item.DeepClone());
 
                     // 3. Current input (new tool results from FunctionInvokingChatClient)
+                    List<JsonNode>? stagedTurnHistory = null;
                     if (obj["input"] is JsonArray currentInput)
                     {
+                        stagedTurnHistory = new List<JsonNode>(currentInput.Count);
                         foreach (var item in currentInput)
                         {
                             var clone = item!.DeepClone();
                             combined.Add(clone);
-                            _turnHistory.Add(item.DeepClone());
+                            // Staged, not committed: only an authoritative response promotes these.
+                            stagedTurnHistory.Add(item.DeepClone());
                         }
                     }
 
                     obj["input"] = combined;
                     body = obj.ToJsonString();
                     request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+
+                    pending = new PendingConversationState { TurnHistory = stagedTurnHistory };
+                    request.Options.Set(PendingStateKey, pending);
                 }
                 else if (json is JsonObject firstObj)
                 {
-                    // First request — save the original input as the base context
-                    _baseInput = firstObj["input"]?.DeepClone() as JsonArray;
+                    // First request — stage the original input as the base context. Committing it
+                    // before the response would let a retry (which re-reads an already-expanded
+                    // body) overwrite it with the expanded conversation.
+                    pending = new PendingConversationState
+                    {
+                        BaseInput = firstObj["input"]?.DeepClone() as JsonArray,
+                    };
+                    request.Options.Set(PendingStateKey, pending);
                 }
 
                 LogResponsesExchange(seq, "request", body);
@@ -439,36 +689,160 @@ public static class ChatClientFactory
 
             var response = await base.SendAsync(request, ct);
 
-            // Skip response interception for streaming responses — the SSE stream
-            // must be consumed directly by the OpenAI SDK's streaming parser.
             var contentType = response.Content?.Headers?.ContentType?.MediaType;
-            if (contentType == "text/event-stream")
+
+            // HTTP media types are case-insensitive, and the media type may be accompanied by
+            // parameters (e.g. "Text/Event-Stream; charset=utf-8"). ContentType.MediaType already
+            // strips parameters but preserves the sender's casing, so the comparison must ignore
+            // case. Getting this wrong is not cosmetic: a failed response whose casing differs would
+            // fall through to ReadAsStringAsync below and consume an unbounded event stream,
+            // blocking until timeout and preventing the resilience layer from retrying.
+            var isStreaming = string.Equals(contentType, "text/event-stream", StringComparison.OrdinalIgnoreCase);
+
+            if (!response.IsSuccessStatusCode)
             {
+                // Failure — streaming or not — must never commit conversation state. The resilience
+                // handler above may retry, which re-enters this method with the same request
+                // instance; the staged state makes that attempt skip the transformation and lets it
+                // commit exactly once if it succeeds. If the retries are exhausted the caller sees
+                // the error and no partial conversation state was ever recorded.
+                //
+                // This branch deliberately precedes the streaming check: an error response can
+                // carry a text/event-stream content type (the Copilot API echoes the requested
+                // stream mode on some 429/5xx replies), and committing on it would leave phantom
+                // base input / turn history behind.
+                if (isStreaming)
+                {
+                    // Never read a failed event stream to completion: a real SSE error body can stay
+                    // open indefinitely, which would block here until the timeout fires and prevent
+                    // the resilience handler above from ever observing the failure status and
+                    // retrying. Log the status only and hand the response straight back.
+                    LogResponsesExchange(seq, "error",
+                        $"HTTP {(int)response.StatusCode}: <streaming error body not read>");
+                }
+                else if (response.Content is not null)
+                {
+                    var errBody = await response.Content.ReadAsStringAsync(ct);
+                    LogResponsesExchange(seq, "error", $"HTTP {(int)response.StatusCode}: {errBody}");
+                }
+                else
+                {
+                    LogResponsesExchange(seq, "error", $"HTTP {(int)response.StatusCode}: <no content>");
+                }
+
                 return response;
             }
 
-            if (response.IsSuccessStatusCode)
+            // Successful streaming response: the SSE stream must be consumed directly by the
+            // OpenAI SDK's streaming parser, so this is the last point at which the exchange can be
+            // treated as authoritative. Commit here, before handing the untouched stream back.
+            if (isStreaming)
             {
-                var respBody = await response.Content!.ReadAsStringAsync();
-                var respJson = JsonNode.Parse(respBody);
-
-                // Accumulate response output into turn history
-                if (respJson?["output"] is JsonArray outputArray)
-                    foreach (var item in outputArray)
-                        _turnHistory.Add(item!.DeepClone());
-
-                response.Content = new StringContent(respBody, System.Text.Encoding.UTF8, "application/json");
-
-                LogResponsesExchange(seq, "response", respBody);
+                CommitConversationState(pending);
+                return response;
             }
-            else
+
+            // Successful non-streaming response: read and parse the authoritative body BEFORE
+            // committing. A 2xx carrying a missing, truncated or malformed body means the operation
+            // did not actually complete, and committing first would poison every later
+            // reconstruction with state from a request whose result the caller never received.
+            if (response.Content is null)
+                throw new InvalidOperationException(
+                    $"Copilot responses endpoint returned HTTP {(int)response.StatusCode} with no content.");
+
+            var respBody = await response.Content.ReadAsStringAsync(ct);
+
+            JsonNode? respJson;
+            try
             {
-                var errBody = await response.Content!.ReadAsStringAsync();
-                LogResponsesExchange(seq, "error", $"HTTP {(int)response.StatusCode}: {errBody}");
+                respJson = JsonNode.Parse(respBody);
             }
+            catch (JsonException ex)
+            {
+                LogResponsesExchange(seq, "error",
+                    $"HTTP {(int)response.StatusCode}: unparseable response body: {respBody}");
+                throw new InvalidOperationException(
+                    "Copilot responses endpoint returned a successful status with a malformed JSON body.", ex);
+            }
+
+            // The body parsed syntactically, but that is not enough to call the exchange complete:
+            // the response output must also be structurally sound. Materialize every output item
+            // into a fully-detached clone FIRST, so any structural failure (e.g. a null element in
+            // the output array) throws before a single piece of durable state has been touched.
+            // Only once everything is validated is the state committed, atomically.
+            List<JsonNode>? responseOutput = null;
+            if (respJson?["output"] is JsonArray outputArray)
+            {
+                responseOutput = new List<JsonNode>(outputArray.Count);
+                for (var i = 0; i < outputArray.Count; i++)
+                {
+                    var item = outputArray[i];
+                    if (item is null)
+                    {
+                        LogResponsesExchange(seq, "error",
+                            $"HTTP {(int)response.StatusCode}: output[{i}] is null: {respBody}");
+                        throw new InvalidOperationException(
+                            $"Copilot responses endpoint returned a successful status with a structurally invalid " +
+                            $"response: output[{i}] is null.");
+                    }
+
+                    responseOutput.Add(item.DeepClone());
+                }
+            }
+
+            // Response-content replacement comes next, still before any durable state is touched.
+            // If building the replacement fails, the exchange has not been fully processed, so the
+            // caller must see the error with the conversation state left exactly as it was.
+            response.Content = ResponseContentFactory(respBody);
+
+            LogResponsesExchange(seq, "response", respBody);
+
+            // COMMIT — the final step. Everything fallible is done: the body is read, parsed,
+            // structurally validated, materialized into detached clones, and the response content is
+            // replaced. Only now is durable state mutated. Request-side state goes in first so turn
+            // history stays in request→response order, then the already-materialized response
+            // output. Neither can fail part-way, and nothing after this point can throw.
+            CommitConversationState(pending);
+
+            if (responseOutput is not null)
+                _turnHistory.AddRange(responseOutput);
 
             return response;
         }
+
+        /// <summary>
+        /// Builds the replacement content for a successful non-streaming response.
+        /// </summary>
+        /// <remarks>
+        /// Overridable as a test seam so tests can observe the exact moment of response-content
+        /// replacement, and force it to fail, in order to prove that the conversation-state commit
+        /// happens strictly afterwards. It is an instance member so each handler — and therefore
+        /// each test — is independent, with no shared static state to reset.
+        /// </remarks>
+        internal Func<string, HttpContent> ResponseContentFactory { get; set; } =
+            static body => new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+
+        /// <summary>
+        /// Promotes state staged for this request into the durable conversation state. Called only
+        /// once an authoritative response has been received, and at most once per staged state.
+        /// </summary>
+        private void CommitConversationState(PendingConversationState? pending)
+        {
+            if (pending is null || pending.Committed) return;
+            pending.Committed = true;
+
+            if (pending.BaseInput is not null)
+                _baseInput = pending.BaseInput;
+
+            if (pending.TurnHistory is not null)
+                _turnHistory.AddRange(pending.TurnHistory);
+        }
+
+        /// <summary>Test accessor: the committed base input, or <see langword="null"/> if none.</summary>
+        internal JsonArray? BaseInputForTest => _baseInput;
+
+        /// <summary>Test accessor: the committed turn history.</summary>
+        internal IReadOnlyList<JsonNode> TurnHistoryForTest => _turnHistory;
 
         private static void LogResponsesExchange(int seq, string phase, string content)
         {
