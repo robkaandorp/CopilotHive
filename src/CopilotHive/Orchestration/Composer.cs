@@ -13,7 +13,6 @@ using SharpCoder;
 using SharpCoder.SubAgents;
 
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Globalization;
 
 namespace CopilotHive.Orchestration;
@@ -476,7 +475,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     internal string GetSystemPrompt() => _systemPrompt;
 
     /// <summary>Test seam: forces the streaming admission gate for tests that exercise the "while streaming" path.</summary>
-    [Conditional("DEBUG")]
     internal void SetStreamingStateForTest(bool isStreaming) => Interlocked.Exchange(ref _streamingState, isStreaming ? 1 : 0);
 
     /// <summary>Returns current Composer session statistics.</summary>
@@ -738,11 +736,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <returns><c>true</c> if compaction occurred; otherwise <c>false</c>.</returns>
     public async Task<bool> CompactSessionAsync(CancellationToken ct = default)
     {
-        if (_agentService.Agent is null)
-            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-
         if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
             throw new InvalidOperationException("Cannot compact while streaming.");
+
+        if (_agentService.Agent is null)
+            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
 
         var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_actor.Tell(new ComposerCompactMessage(reply, ct)))
@@ -761,11 +759,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task<bool> CompactOldestPercentAsync(int percent, CancellationToken ct = default)
     {
-        if (_agentService.Agent is null)
-            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
-
         if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
             throw new InvalidOperationException("Cannot compact while streaming.");
+
+        if (_agentService.Agent is null)
+            throw new InvalidOperationException("Composer not connected. Call ConnectAsync first.");
 
         var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_actor.Tell(new ComposerCompactPartialMessage(percent, reply, ct)))
