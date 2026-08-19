@@ -861,35 +861,27 @@ public sealed class ComposerFacadeGateTests
         var tmpDir = CreateTempDir();
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var streamStartedGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var streamBlockGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             (composer, dbContext) = CreateComposer(tmpDir);
 
             // A stream that ignores the cancellation token keeps the actor's loop busy past
             // the 5-second dispose timeout, so DisposeAsync takes the deferred branch.
-            await InjectFakeChatClient(composer, new UncancellableStreamingClient(release.Task));
+            await InjectFakeChatClient(
+                composer, new UncancellableStreamingClient(streamStartedGate, streamBlockGate));
 
             var lockField = typeof(Composer).GetField("_issueUpdateLock", PrivateFlags)!;
             var issueLock = (SemaphoreSlim)lockField.GetValue(composer)!;
 
             composer.SendMessage("hello");
 
-            var actorField = typeof(Composer).GetField("_actor", PrivateFlags)!;
-            var actor = actorField.GetValue(composer)!;
-            var completionProp = actor.GetType().GetProperty("Completion")!;
-            var actorTaskField = actor.GetType().GetField("_streamingTask", PrivateFlags)!;
-
-            // Wait for the actor's _streamingTask to be ASSIGNED, not merely for _isStreaming.
-            // The send handler sets _isStreaming BEFORE creating the task, so polling the flag
-            // from this thread can observe that window; disposing there would snapshot a null
-            // task, complete immediately, and dispose the lock — a test-only race (in
-            // production the send handler and OnShutdownAsync both run on the mailbox loop and
-            // cannot interleave).
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (actorTaskField.GetValue(actor) is null && DateTime.UtcNow < deadline)
-                await Task.Delay(20, TestContext.Current.CancellationToken);
-            Assert.NotNull(actorTaskField.GetValue(actor));
+            // The streaming handler signals this gate when it begins, inside the actor's
+            // streaming task (which is already assigned by then). Awaiting it deterministically
+            // means the actor is in streaming state — no reflection on _streamingTask needed.
+            await streamStartedGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             await composer.DisposeAsync();
 
@@ -898,7 +890,10 @@ public sealed class ComposerFacadeGateTests
             Assert.NotNull(issueLock.AvailableWaitHandle);
 
             // Let the stream finish so the actor loop exits and the deferred cleanup runs.
-            release.TrySetResult();
+            streamBlockGate.TrySetResult();
+            var actorField = typeof(Composer).GetField("_actor", PrivateFlags)!;
+            var actor = actorField.GetValue(composer)!;
+            var completionProp = actor.GetType().GetProperty("Completion")!;
             var completion = (Task)completionProp.GetValue(actor)!;
             await completion.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
 
@@ -908,7 +903,7 @@ public sealed class ComposerFacadeGateTests
             {
                 try { _ = issueLock.AvailableWaitHandle; }
                 catch (ObjectDisposedException) { break; }
-                await Task.Delay(20, TestContext.Current.CancellationToken);
+                await Task.Yield();
             }
 
             Assert.Throws<ObjectDisposedException>(() => _ = issueLock.AvailableWaitHandle);
@@ -917,7 +912,7 @@ public sealed class ComposerFacadeGateTests
         }
         finally
         {
-            release.TrySetResult();
+            streamBlockGate.TrySetResult();
             if (composer is not null)
             {
                 try { await composer.DisposeAsync(); }
@@ -972,9 +967,13 @@ public sealed class ComposerFacadeGateTests
 
     /// <summary>
     /// Chat client whose stream ignores the cancellation token entirely, so actor disposal
-    /// cannot complete within its 5-second timeout.
+    /// cannot complete within its 5-second timeout. Signals <paramref name="streamStartedGate"/>
+    /// when streaming begins (BEFORE blocking), then blocks on <paramref name="streamBlockGate"/>
+    /// until the test releases it.
     /// </summary>
-    private sealed class UncancellableStreamingClient(Task release) : IChatClient
+    private sealed class UncancellableStreamingClient(
+        TaskCompletionSource<bool> streamStartedGate,
+        TaskCompletionSource streamBlockGate) : IChatClient
     {
         public ChatClientMetadata Metadata => new("uncancellable", null, "uncancellable-model");
 
@@ -990,8 +989,12 @@ public sealed class ComposerFacadeGateTests
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.Yield();
+            // Deterministically announce that streaming has begun. This runs inside the
+            // actor's streaming task (which is already assigned by now), so the test can
+            // await this gate instead of polling the private _streamingTask field.
+            streamStartedGate.TrySetResult(true);
             // Deliberately does NOT observe cancellationToken.
-            await release;
+            await streamBlockGate.Task;
             yield return new ChatResponseUpdate(ChatRole.Assistant, "done")
             {
                 FinishReason = ChatFinishReason.Stop,
