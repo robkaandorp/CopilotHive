@@ -321,24 +321,97 @@ public static class ConfigHub
 
         // ── Composer settings ───────────────────────────────────────────────
 
-        // Get composer settings
+        // Get composer settings (runtime-effective values, not raw storage)
         app.MapGet("/api/config/composer", ([FromServices] HiveConfigFile? config) =>
         {
             if (config is null)
                 return Results.NotFound(new { error = "Config repo not configured." });
-            return Results.Ok(config.Composer);
+
+            if (config.Composer is null)
+            {
+                return Results.Ok(new
+                {
+                    model = (string?)null,
+                    models = Array.Empty<string>(),
+                    maxSteps = Constants.DefaultBrainMaxSteps,
+                    reasoningEffort = (string?)null,
+                    eventNotifications = new
+                    {
+                        mode = "passive",
+                        activeEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised" },
+                        throttleSeconds = 30,
+                    },
+                });
+            }
+
+            var notif = config.Composer.EventNotifications;
+            var activeTypes = notif?.GetActiveEventTypes();
+            // Map through the whitelist order so the response is always canonical and stable.
+            var activeEvents = activeTypes is { Count: > 0 }
+                ? new[] { EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised }
+                    .Where(activeTypes.Contains)
+                    .Select(ToSnakeCase)
+                    .ToArray()
+                : new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised" };
+
+            return Results.Ok(new
+            {
+                model = config.Composer.Model,
+                models = (IEnumerable<string>?)config.Composer.Models ?? Array.Empty<string>(),
+                maxSteps = config.Composer.MaxSteps,
+                reasoningEffort = config.Composer.ReasoningEffort,
+                eventNotifications = new
+                {
+                    mode = notif?.EffectiveMode ?? "passive",
+                    activeEvents,
+                    throttleSeconds = notif?.EffectiveThrottleSeconds ?? 30,
+                },
+            });
         });
 
         // Update composer settings
         app.MapMethods("/api/config/composer", ["PATCH"], async (
             ComposerSettingsUpdate update,
-            [FromServices] ConfigModelService? svc) =>
+            [FromServices] ConfigModelService? svc,
+            CancellationToken ct) =>
         {
             if (svc is null)
                 return Results.Problem("Config service is not configured.");
-            await svc.UpdateComposerSettingsAsync(update.MaxSteps);
-            return Results.Ok(new { saved = true });
+            try
+            {
+                await svc.UpdateComposerSettingsAsync(update, ct);
+                return Results.Ok(new { saved = true });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
+    }
+
+    /// <summary>
+    /// Converts an <see cref="EventType"/> to its canonical snake_case wire form
+    /// (e.g. <c>GoalCompleted</c> → <c>"goal_completed"</c>).
+    /// </summary>
+    private static string ToSnakeCase(EventType type)
+    {
+        var name = type.ToString();
+        var sb = new System.Text.StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (char.IsUpper(c))
+            {
+                if (i > 0)
+                    sb.Append('_');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
     }
 }
 

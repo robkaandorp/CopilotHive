@@ -110,7 +110,14 @@ public sealed record RepositoryRequest(string Name, string Url, string DefaultBr
 /// Describes Composer setting changes to apply. Each field is applied only when non-null.
 /// </summary>
 /// <param name="MaxSteps">New maximum Composer tool-call steps.</param>
-public sealed record ComposerSettingsUpdate(int? MaxSteps);
+/// <param name="EventNotificationsMode">New event notification mode ("passive", "active", "off").</param>
+/// <param name="EventNotificationsActiveEvents">New active event names (snake_case or PascalCase, case-insensitive).</param>
+/// <param name="EventNotificationsThrottleSeconds">New throttle window in seconds (clamped to 1-300).</param>
+public sealed record ComposerSettingsUpdate(
+    int? MaxSteps = null,
+    string? EventNotificationsMode = null,
+    List<string>? EventNotificationsActiveEvents = null,
+    int? EventNotificationsThrottleSeconds = null);
 
 /// <summary>
 /// Applies model configuration changes in-memory, writes the config file,
@@ -826,22 +833,147 @@ public sealed class ConfigModelService
     }
 
     /// <summary>
+    /// The canonical wire forms accepted for an active event name. Each whitelisted event has
+    /// exactly two canonical spellings — snake_case (the persisted form) and PascalCase (the
+    /// <see cref="EventType"/> member name) — and an input must equal one of them
+    /// case-insensitively. No further normalization is applied: underscores are never stripped
+    /// or collapsed, so malformed spellings such as <c>goal__completed</c>,
+    /// <c>_goal_completed</c> and <c>goal_completed_</c> are rejected rather than canonicalized.
+    /// </summary>
+    private static readonly (string Canonical, string Pascal)[] KnownActiveEvents =
+    [
+        ("goal_completed", "GoalCompleted"),
+        ("goal_failed",    "GoalFailed"),
+        ("ci_failed",      "CiFailed"),
+        ("issue_raised",   "IssueRaised"),
+    ];
+
+    /// <summary>
+    /// The canonical snake_case active event names, used in validation error messages.
+    /// </summary>
+    private static readonly string[] KnownActiveEventNames =
+        [.. KnownActiveEvents.Select(e => e.Canonical)];
+
+    /// <summary>
+    /// Resolves an active event name to its canonical snake_case form. The input must equal one
+    /// of the eight canonical spellings (four snake_case, four PascalCase) case-insensitively;
+    /// anything else — including near-matches that differ only in underscore placement — returns
+    /// <c>null</c> so the caller can reject it.
+    /// </summary>
+    /// <param name="name">Raw active event name from the request.</param>
+    /// <returns>The canonical snake_case name, or <c>null</c> when the input is not whitelisted.</returns>
+    private static string? TryResolveActiveEventName(string name)
+    {
+        foreach (var (canonical, pascal) in KnownActiveEvents)
+        {
+            if (string.Equals(canonical, name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(pascal, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return canonical;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Validates the event-notification fields carried by a <see cref="ComposerSettingsUpdate"/>.
+    /// All supplied fields are checked BEFORE any config mutation so a failed update never
+    /// leaves a partially-applied state behind.
+    /// </summary>
+    /// <param name="update">The pending composer settings update.</param>
+    /// <returns>
+    /// The normalized active event names (canonical snake_case, deduplicated), or <c>null</c>
+    /// when the update does not carry an active-events field.
+    /// </returns>
+    private static List<string>? ValidateEventNotifications(ComposerSettingsUpdate update)
+    {
+        if (update.EventNotificationsMode is not null)
+        {
+            var mode = update.EventNotificationsMode.Trim().ToLowerInvariant();
+            if (mode is not ("passive" or "active" or "off"))
+                throw new ArgumentException(
+                    $"Invalid event notification mode '{update.EventNotificationsMode}'. Valid values: passive, active, off.");
+        }
+
+        if (update.EventNotificationsThrottleSeconds is not null)
+        {
+            // Clamped to [1, 300]; no validation failure for out-of-range values.
+            _ = Math.Clamp(update.EventNotificationsThrottleSeconds.Value, 1, 300);
+        }
+
+        if (update.EventNotificationsActiveEvents is null)
+            return null;
+
+        if (update.EventNotificationsActiveEvents.Count == 0)
+            throw new ArgumentException("At least one active event is required.");
+
+        var normalized = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in update.EventNotificationsActiveEvents)
+        {
+            if (entry is null)
+                throw new ArgumentException("Active event names cannot be null.");
+
+            // Strict: a case-insensitive exact match against a canonical spelling, nothing more.
+            var match = TryResolveActiveEventName(entry);
+            if (match is null)
+                throw new ArgumentException(
+                    $"Invalid active event '{entry}'. Valid values: {string.Join(", ", KnownActiveEventNames)}.");
+
+            if (seen.Add(match))
+                normalized.Add(match);
+        }
+
+        return normalized;
+    }
+
+    /// <summary>
     /// Applies Composer setting changes. Only non-null fields are applied.
     /// Creates a <see cref="ComposerConfig"/> if none exists.
     /// </summary>
-    /// <param name="maxSteps">New maximum tool-call steps, or <c>null</c> to leave unchanged.</param>
+    /// <param name="update">The composer settings to apply.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task UpdateComposerSettingsAsync(int? maxSteps, CancellationToken ct = default)
+    public async Task UpdateComposerSettingsAsync(ComposerSettingsUpdate update, CancellationToken ct = default)
     {
-        _config.Composer ??= new ComposerConfig();
+        await _saveLock.WaitAsync(ct);
+        try
+        {
+            // ── Step 1: validate everything before mutating anything ────────
+            var normalizedActiveEvents = ValidateEventNotifications(update);
 
-        if (maxSteps is not null)
-            _config.Composer.MaxSteps = maxSteps.Value;
+            // ── Step 2: mutate the in-memory config ─────────────────────────
+            _config.Composer ??= new ComposerConfig();
 
-        var message = "chore: update composer settings";
-        _logger.LogInformation("Updating composer settings");
+            if (update.MaxSteps is not null)
+                _config.Composer.MaxSteps = update.MaxSteps.Value;
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            if (update.EventNotificationsMode is not null
+                || update.EventNotificationsActiveEvents is not null
+                || update.EventNotificationsThrottleSeconds is not null)
+            {
+                _config.Composer.EventNotifications ??= new EventNotificationsConfig();
+
+                if (update.EventNotificationsMode is not null)
+                    _config.Composer.EventNotifications.Mode = update.EventNotificationsMode.Trim().ToLowerInvariant();
+
+                if (normalizedActiveEvents is not null)
+                    _config.Composer.EventNotifications.ActiveEvents = normalizedActiveEvents;
+
+                if (update.EventNotificationsThrottleSeconds is not null)
+                    _config.Composer.EventNotifications.ThrottleSeconds =
+                        Math.Clamp(update.EventNotificationsThrottleSeconds.Value, 1, 300);
+            }
+
+            // ── Step 3: persist (write + commit) ────────────────────────────
+            var message = "chore: update composer settings";
+            _logger.LogInformation("Updating composer settings");
+
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 }

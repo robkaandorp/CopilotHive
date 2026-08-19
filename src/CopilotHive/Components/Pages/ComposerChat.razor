@@ -264,6 +264,19 @@ else
                         <text>📦 Compact 50%</text>
                     }
                 </button>
+                <button @onclick="ToggleActiveNotifications"
+                        disabled="@(!CanToggleActiveNotifications(_activeNotifMode, Composer.IsStreaming, _notifTogglePending))"
+                        class="chat-action-btn">
+                    @ActiveNotificationsButtonText
+                </button>
+                @if (_restartRequiredForNotifications)
+                {
+                    <span class="chat-hint">⚠️ Restart required</span>
+                }
+                @if (!string.IsNullOrEmpty(_notifToggleError))
+                {
+                    <span class="chat-attach-error">@_notifToggleError</span>
+                }
                 <span class="text-muted chat-hint">
                     @(_messages.Count) msgs
                     @if (Composer.LastToolCalls > 0)
@@ -315,6 +328,12 @@ else
     private string? _sendError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
+    // Authoritative event-notification mode. Null until GET /api/config/composer reports it —
+    // a fabricated default would let the toggle PATCH a transition the server never implied.
+    private string? _activeNotifMode;
+    private bool _notifTogglePending;
+    private bool _restartRequiredForNotifications;
+    private string? _notifToggleError;
 
     protected override async Task OnInitializedAsync()
     {
@@ -324,8 +343,14 @@ else
             LoadHistory();
             await LoadAvailableModelsAsync();
             await LoadCurrentModelAsync();
-            StateHasChanged();
         }
+
+        // The config endpoint is independent of the Composer agent connection, so the
+        // notification mode is loaded either way — otherwise a disconnected-then-reconnected
+        // page would render the toggle from an unloaded state.
+        await LoadActiveNotificationsModeAsync();
+        StateHasChanged();
+
         Composer.OnStreamingUpdate += HandleStreamingUpdate;
         Composer.OnQuestionAsked += HandleQuestionAsked;
         Composer.OnCompactingStarted += HandleCompactingStarted;
@@ -881,6 +906,230 @@ else
             Console.Error.WriteLine($"[ComposerChat] Partial compact failed: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// The button label for the active-notifications toggle: passive → "🔕 Passive",
+    /// active → "🔔 Active", off → "🔕 Off". A mode that has not loaded yet (<c>null</c>)
+    /// shows a neutral placeholder rather than a fabricated default, so the UI never claims
+    /// a mode the server never reported.
+    /// </summary>
+    /// <param name="mode">The authoritative loaded mode, or <c>null</c> when not yet loaded.</param>
+    internal static string ActiveNotificationsLabel(string? mode) => mode switch
+    {
+        "passive" => "🔕 Passive",
+        "active" => "🔔 Active",
+        "off" => "🔕 Off",
+        _ => "🔕 …",
+    };
+
+    private string ActiveNotificationsButtonText => ActiveNotificationsLabel(_activeNotifMode);
+
+    /// <summary>
+    /// The next mode in the cycle passive → active → off → passive.
+    /// </summary>
+    /// <param name="current">The authoritative current mode.</param>
+    internal static string NextActiveNotificationsMode(string current) => current switch
+    {
+        "passive" => "active",
+        "active" => "off",
+        "off" => "passive",
+        _ => throw new InvalidOperationException($"Unhandled event notification mode '{current}'."),
+    };
+
+    /// <summary>
+    /// Normalizes a mode reported by <c>GET /api/config/composer</c>. The endpoint already
+    /// returns the effective (normalized) mode, so anything outside the three known values is
+    /// treated as "not loaded" (<c>null</c>) rather than being coerced into a default that
+    /// would let the toggle PATCH a transition derived from a value the server never sent.
+    /// </summary>
+    /// <param name="mode">The raw mode from the response.</param>
+    internal static string? NormalizeLoadedNotificationsMode(string? mode) => mode switch
+    {
+        "passive" or "active" or "off" => mode,
+        _ => null,
+    };
+
+    /// <summary>
+    /// Whether the toggle may run right now. It requires an authoritative loaded mode
+    /// (<paramref name="mode"/> non-null), an idle Composer, and no toggle already in flight —
+    /// the last of which stops two rapid clicks from both deriving their next mode from the
+    /// same stale value and persisting the same transition twice.
+    /// </summary>
+    /// <param name="mode">The authoritative loaded mode, or <c>null</c> when not yet loaded.</param>
+    /// <param name="isStreaming">Whether the Composer is streaming.</param>
+    /// <param name="togglePending">Whether a toggle request is already in flight.</param>
+    internal static bool CanToggleActiveNotifications(string? mode, bool isStreaming, bool togglePending)
+        => mode is not null && !isStreaming && !togglePending;
+
+    /// <summary>
+    /// Narrow seam over the component state the notification toggle touches, so the PRODUCTION
+    /// toggle body (<see cref="ToggleActiveNotificationsCoreAsync"/>) can be exercised by tests
+    /// without a live Blazor circuit. The component itself is the only production implementation.
+    /// </summary>
+    internal interface INotificationToggleHost
+    {
+        /// <summary>The authoritative mode, or <c>null</c> until the config GET has loaded it.</summary>
+        string? Mode { get; set; }
+
+        /// <summary>Whether a toggle PATCH is currently in flight.</summary>
+        bool TogglePending { get; set; }
+
+        /// <summary>Whether a mode change has been persisted and needs a restart to take effect.</summary>
+        bool RestartRequired { get; set; }
+
+        /// <summary>Error surfaced next to the toggle button, if any.</summary>
+        string? ToggleError { get; set; }
+
+        /// <summary>Whether the Composer is currently streaming a response.</summary>
+        bool IsStreaming { get; }
+
+        /// <summary>Sends the mode change to <c>PATCH /api/config/composer</c>.</summary>
+        /// <param name="mode">The mode to persist.</param>
+        Task<HttpResponseMessage> PatchModeAsync(string mode);
+
+        /// <summary>Requests a re-render (the component's <c>StateHasChanged</c>).</summary>
+        void Notify();
+    }
+
+    /// <summary>Binds <see cref="INotificationToggleHost"/> to this component's own fields and services.</summary>
+    private sealed class ComponentNotificationToggleHost(ComposerChat owner) : INotificationToggleHost
+    {
+        /// <inheritdoc />
+        public string? Mode
+        {
+            get => owner._activeNotifMode;
+            set => owner._activeNotifMode = value;
+        }
+
+        /// <inheritdoc />
+        public bool TogglePending
+        {
+            get => owner._notifTogglePending;
+            set => owner._notifTogglePending = value;
+        }
+
+        /// <inheritdoc />
+        public bool RestartRequired
+        {
+            get => owner._restartRequiredForNotifications;
+            set => owner._restartRequiredForNotifications = value;
+        }
+
+        /// <inheritdoc />
+        public string? ToggleError
+        {
+            get => owner._notifToggleError;
+            set => owner._notifToggleError = value;
+        }
+
+        /// <inheritdoc />
+        public bool IsStreaming => owner.Composer.IsStreaming;
+
+        /// <inheritdoc />
+        public Task<HttpResponseMessage> PatchModeAsync(string mode)
+        {
+            var body = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(
+                    new { eventNotificationsMode = mode }, ReasoningEffortOptions.JsonOptions),
+                System.Text.Encoding.UTF8,
+                "application/json");
+            return owner.HttpClient.PatchAsync("/api/config/composer", body);
+        }
+
+        /// <inheritdoc />
+        public void Notify() => owner.StateHasChanged();
+    }
+
+    private INotificationToggleHost? _notificationToggleHost;
+
+    private INotificationToggleHost NotificationToggleHost =>
+        _notificationToggleHost ??= new ComponentNotificationToggleHost(this);
+
+    /// <summary>
+    /// Loads the effective event-notification mode from <c>GET /api/config/composer</c>.
+    /// This runs regardless of whether the Composer agent is connected — the config endpoint is
+    /// independent of that connection. A failed load leaves the mode <c>null</c> (not loaded),
+    /// which keeps the toggle disabled instead of letting it PATCH a transition computed from a
+    /// fabricated <c>passive</c> default that could overwrite a stored <c>active</c>/<c>off</c>.
+    /// </summary>
+    private async Task LoadActiveNotificationsModeAsync()
+    {
+        try
+        {
+            var response = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ReasoningEffortOptions.JsonOptions);
+            _activeNotifMode = NormalizeLoadedNotificationsMode(response?.EventNotifications?.Mode);
+            if (_activeNotifMode is null)
+                _notifToggleError = "Could not determine the current notification mode.";
+        }
+        catch (Exception ex)
+        {
+            // Left unloaded on purpose: the toggle stays disabled rather than guessing.
+            _activeNotifMode = null;
+            _notifToggleError = $"Failed to load notification mode: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// The PRODUCTION toggle body, written against <see cref="INotificationToggleHost"/> so tests
+    /// exercise this exact code rather than a re-implementation.
+    /// </summary>
+    /// <remarks>
+    /// The next mode is derived from the authoritative loaded mode, and the in-flight claim is
+    /// taken BEFORE the first await so a second click cannot compute its transition from the same
+    /// pre-PATCH value. The <c>finally</c> always releases the claim, so a failed toggle never
+    /// leaves the button permanently disabled.
+    /// </remarks>
+    /// <param name="host">State seam the outcome is written to.</param>
+    internal static async Task ToggleActiveNotificationsCoreAsync(INotificationToggleHost host)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+
+        // Not loaded / streaming / already toggling: drop the click entirely.
+        if (!CanToggleActiveNotifications(host.Mode, host.IsStreaming, host.TogglePending))
+            return;
+
+        // Authoritative: the transition is computed from the loaded mode, never a default.
+        var nextMode = NextActiveNotificationsMode(host.Mode!);
+
+        // Claimed BEFORE the first await so an overlapping click is refused by the guard above.
+        host.TogglePending = true;
+        host.ToggleError = null;
+        host.Notify();
+
+        try
+        {
+            var response = await host.PatchModeAsync(nextMode);
+            if (response.IsSuccessStatusCode)
+            {
+                host.Mode = nextMode;
+                host.RestartRequired = true;
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                host.ToggleError = $"Notification mode toggle failed ({(int)response.StatusCode}): {error}";
+            }
+        }
+        catch (Exception ex)
+        {
+            host.ToggleError = $"Notification mode toggle failed: {ex.Message}";
+        }
+        finally
+        {
+            // Released on every path so a failure can be retried.
+            host.TogglePending = false;
+            host.Notify();
+        }
+    }
+
+    /// <summary>Runs the shared toggle body against this component's own state.</summary>
+    private Task ToggleActiveNotifications() => ToggleActiveNotificationsCoreAsync(NotificationToggleHost);
+
+    private sealed record ComposerConfigResponse(
+        [property: JsonPropertyName("eventNotifications")] EventNotificationsDto? EventNotifications);
+
+    private sealed record EventNotificationsDto(
+        [property: JsonPropertyName("mode")] string Mode);
 
     private async Task LoadAvailableModelsAsync()
     {

@@ -968,6 +968,51 @@ else
                                style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
                     </div>
 
+                    <div style="margin-top:1.5rem;padding:1rem 1.25rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;max-width:600px">
+                        <h3 style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">Event Notifications</h3>
+                        <div style="display:grid;grid-template-columns:14rem 1fr;gap:0.75rem 1rem;align-items:center">
+                            <label style="color:var(--text-muted);font-size:0.9rem">Mode</label>
+                            <select @bind="_composerNotifMode"
+                                    style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                                <option value="passive">Passive</option>
+                                <option value="active">Active</option>
+                                <option value="off">Off</option>
+                            </select>
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Throttle (seconds)</label>
+                            <input type="number" min="1" max="300" @bind="_composerNotifThrottle"
+                                   style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;width:100%" />
+
+                            <label style="color:var(--text-muted);font-size:0.9rem">Active Events</label>
+                            <div style="display:flex;flex-direction:column;gap:0.4rem">
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("goal_completed")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("goal_completed", (bool)(e.Value ?? false))' />
+                                    Goal Completed
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("goal_failed")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("goal_failed", (bool)(e.Value ?? false))' />
+                                    Goal Failed
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("ci_failed")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("ci_failed", (bool)(e.Value ?? false))' />
+                                    CI Failed
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("issue_raised")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("issue_raised", (bool)(e.Value ?? false))' />
+                                    Issue Raised
+                                </label>
+                                @if (_composerNotifActiveEvents.Count == 0)
+                                {
+                                    <span style="color:var(--red);font-size:0.8rem">At least one active event is required.</span>
+                                }
+                            </div>
+                        </div>
+                    </div>
+
                     <div style="margin-top:1.25rem;display:flex;align-items:center;gap:1rem">
                         <button class="approve-btn" disabled="@_composerSaving" @onclick="SaveComposerAsync">
                             @(_composerSaving ? "Saving…" : "💾 Save")
@@ -1089,7 +1134,13 @@ else
 
     private sealed record ComposerConfigResponse(
         [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("maxSteps")] int MaxSteps);
+        [property: JsonPropertyName("maxSteps")] int MaxSteps,
+        [property: JsonPropertyName("eventNotifications")] EventNotificationsDto? EventNotifications);
+
+    private sealed record EventNotificationsDto(
+        [property: JsonPropertyName("mode")] string Mode,
+        [property: JsonPropertyName("activeEvents")] List<string> ActiveEvents,
+        [property: JsonPropertyName("throttleSeconds")] int ThrottleSeconds);
 
     private bool _loading = true;
     private string? _error;
@@ -1229,6 +1280,9 @@ else
     private string? _composerSaveError;
     private string? _composerSaveSuccess;
     private int _composerMaxSteps;
+    private string _composerNotifMode = "passive";
+    private int _composerNotifThrottle = 30;
+    private readonly HashSet<string> _composerNotifActiveEvents = [];
 
     protected override async Task OnInitializedAsync()
     {
@@ -1537,11 +1591,26 @@ else
             if (_composerData is not null)
             {
                 _composerMaxSteps = _composerData.MaxSteps;
+                _composerNotifMode = _composerData.EventNotifications?.Mode ?? "passive";
+                _composerNotifThrottle = _composerData.EventNotifications?.ThrottleSeconds ?? 30;
+                _composerNotifActiveEvents.Clear();
+                if (_composerData.EventNotifications?.ActiveEvents is { Count: > 0 } active)
+                {
+                    foreach (var name in active)
+                        _composerNotifActiveEvents.Add(name);
+                }
             }
             else
             {
                 // Composer not configured yet — show defaults so the user can create it
                 _composerMaxSteps = CopilotHive.Constants.DefaultBrainMaxSteps;
+                _composerNotifMode = "passive";
+                _composerNotifThrottle = 30;
+                _composerNotifActiveEvents.Clear();
+                _composerNotifActiveEvents.Add("goal_completed");
+                _composerNotifActiveEvents.Add("goal_failed");
+                _composerNotifActiveEvents.Add("ci_failed");
+                _composerNotifActiveEvents.Add("issue_raised");
             }
         }
         catch (Exception ex)
@@ -1630,6 +1699,14 @@ else
         finally { _workersSaving = false; StateHasChanged(); }
     }
 
+    private void ToggleComposerNotifEvent(string name, bool selected)
+    {
+        if (selected)
+            _composerNotifActiveEvents.Add(name);
+        else
+            _composerNotifActiveEvents.Remove(name);
+    }
+
     private async Task SaveComposerAsync()
     {
         _composerSaving = true;
@@ -1637,10 +1714,19 @@ else
         _composerSaveError = null;
         try
         {
+            if (_composerNotifActiveEvents.Count == 0)
+            {
+                _composerSaveError = "At least one active event must be selected.";
+                return;
+            }
+
             var body = new StringContent(
                 System.Text.Json.JsonSerializer.Serialize(new
                 {
                     maxSteps = _composerMaxSteps,
+                    eventNotificationsMode = _composerNotifMode,
+                    eventNotificationsActiveEvents = _composerNotifActiveEvents.ToList(),
+                    eventNotificationsThrottleSeconds = _composerNotifThrottle,
                 }, ReasoningEffortOptions.JsonOptions),
                 System.Text.Encoding.UTF8,
                 "application/json");

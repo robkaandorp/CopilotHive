@@ -1210,7 +1210,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(null, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(), TestContext.Current.CancellationToken);
 
         Assert.Equal(50, config.Composer!.MaxSteps);
     }
@@ -1226,7 +1226,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(99, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(MaxSteps: 99), TestContext.Current.CancellationToken);
 
         Assert.Equal(99, config.Composer!.MaxSteps);
     }
@@ -1238,7 +1238,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(50, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(MaxSteps: 50), TestContext.Current.CancellationToken);
 
         Assert.NotNull(config.Composer);
         Assert.Equal(50, config.Composer!.MaxSteps);
@@ -1251,7 +1251,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(50, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(MaxSteps: 50), TestContext.Current.CancellationToken);
 
         Assert.Single(repo.Commits);
         Assert.Equal("hive-config.yaml", repo.Commits[0].File);
@@ -1321,10 +1321,407 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        await svc.UpdateComposerSettingsAsync(75, TestContext.Current.CancellationToken);
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(MaxSteps: 75), TestContext.Current.CancellationToken);
 
         var yaml = await File.ReadAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), TestContext.Current.CancellationToken);
         Assert.Contains("max_steps: 75", yaml);
+    }
+
+    // ── UpdateComposerSettingsAsync — event notifications ────────────────────
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_ValidModeEventsThrottle_Persisted()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsMode: "active",
+                EventNotificationsActiveEvents: ["goal_completed", "ci_failed"],
+                EventNotificationsThrottleSeconds: 60),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer);
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal("active", config.Composer.EventNotifications!.Mode);
+        Assert.Equal(["goal_completed", "ci_failed"], config.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal(60, config.Composer.EventNotifications.ThrottleSeconds);
+        Assert.Single(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_InvalidMode_ThrowsAndDoesNotMutate()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(EventNotificationsMode: "bogus"),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Empty(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_InvalidEvent_ThrowsAndDoesNotMutate()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(EventNotificationsActiveEvents: ["not_an_event"]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Empty(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_EmptyActiveEvents_Throws()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(EventNotificationsActiveEvents: []),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Empty(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_NullActiveEventEntry_Throws()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(EventNotificationsActiveEvents: ["goal_completed", null!]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer);
+        Assert.Empty(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_NullFields_NoChange()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig
+            {
+                MaxSteps = 50,
+                EventNotifications = new EventNotificationsConfig
+                {
+                    Mode = "active",
+                    ActiveEvents = ["goal_completed"],
+                    ThrottleSeconds = 45
+                }
+            }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(new ComposerSettingsUpdate(), TestContext.Current.CancellationToken);
+
+        Assert.Equal(50, config.Composer!.MaxSteps);
+        Assert.Equal("active", config.Composer.EventNotifications!.Mode);
+        Assert.Equal(["goal_completed"], config.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal(45, config.Composer.EventNotifications.ThrottleSeconds);
+        Assert.Single(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_NullEventNotifications_Created()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsMode: "off"),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal("off", config.Composer.EventNotifications!.Mode);
+        Assert.Single(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_ValidationBeforeMutation_InvalidEventsAfterValidMode_NoMutation()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // Mode is valid but events are invalid — the whole update must be rejected
+        // before ANY field is applied.
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(
+                    EventNotificationsMode: "active",
+                    EventNotificationsActiveEvents: ["bogus_event"]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Empty(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_SnakeCaseAndPascalCase_Accepted()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsMode: "ACTIVE",
+                EventNotificationsActiveEvents: ["GoalCompleted", "CI_FAILED", "issue_raised"]),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal("active", config.Composer.EventNotifications!.Mode);
+        Assert.Equal(
+            ["goal_completed", "ci_failed", "issue_raised"],
+            config.Composer.EventNotifications.ActiveEvents);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_Duplicates_DeduplicatedSilently()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsActiveEvents: ["goal_completed", "goal_completed", "GoalCompleted", "ci_failed"]),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal(2, config.Composer.EventNotifications!.ActiveEvents!.Count);
+        Assert.Contains("goal_completed", config.Composer.EventNotifications.ActiveEvents);
+        Assert.Contains("ci_failed", config.Composer.EventNotifications.ActiveEvents);
+    }
+
+    // ── Strict whitelist: only the 8 canonical spellings, case-insensitively ──
+
+    /// <summary>
+    /// Each whitelisted event has exactly two canonical spellings — snake_case and PascalCase —
+    /// and both (in any casing) resolve to the canonical snake_case form.
+    /// </summary>
+    [Theory]
+    [InlineData("goal_completed", "goal_completed")]
+    [InlineData("GOAL_COMPLETED", "goal_completed")]
+    [InlineData("Goal_Completed", "goal_completed")]
+    [InlineData("GoalCompleted", "goal_completed")]
+    [InlineData("goalcompleted", "goal_completed")]
+    [InlineData("GOALCOMPLETED", "goal_completed")]
+    [InlineData("goal_failed", "goal_failed")]
+    [InlineData("GoalFailed", "goal_failed")]
+    [InlineData("goalfailed", "goal_failed")]
+    [InlineData("ci_failed", "ci_failed")]
+    [InlineData("CI_FAILED", "ci_failed")]
+    [InlineData("CiFailed", "ci_failed")]
+    [InlineData("cifailed", "ci_failed")]
+    [InlineData("issue_raised", "issue_raised")]
+    [InlineData("IssueRaised", "issue_raised")]
+    [InlineData("issueraised", "issue_raised")]
+    public async Task UpdateComposerSettingsAsync_CanonicalSpelling_IsAcceptedAndCanonicalized(
+        string input, string expected)
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsActiveEvents: [input]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal([expected], config.Composer!.EventNotifications!.ActiveEvents);
+        Assert.Single(repo.Commits);
+    }
+
+    /// <summary>
+    /// Regression: the validator must NOT strip or collapse underscores before comparing.
+    /// Malformed spellings that differ from a canonical form only in underscore structure —
+    /// or surrounding whitespace — were previously accepted and silently canonicalized; they
+    /// must now be rejected with no mutation and no commit.
+    /// </summary>
+    [Theory]
+    [InlineData("goal__completed")]
+    [InlineData("_goal_completed")]
+    [InlineData("goal_completed_")]
+    [InlineData("goal_com_pleted")]
+    [InlineData("_goalcompleted")]
+    [InlineData("ci__failed")]
+    [InlineData("issue_raised__")]
+    [InlineData("not_an_event")]
+    [InlineData("goal_dispatched")]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(" goal_completed ")]
+    public async Task UpdateComposerSettingsAsync_MalformedNearWhitelistName_ThrowsAndDoesNotMutate(string input)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(EventNotificationsActiveEvents: [input]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Contains("Invalid active event", ex.Message, StringComparison.Ordinal);
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Empty(repo.Commits);
+    }
+
+    /// <summary>
+    /// A malformed entry anywhere in the list rejects the WHOLE update — the valid entries that
+    /// precede it must not be partially applied.
+    /// </summary>
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_MalformedEntryAfterValidOnes_RejectsWholeUpdate()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { MaxSteps = 50 }
+        };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(
+                    MaxSteps: 99,
+                    EventNotificationsMode: "active",
+                    EventNotificationsActiveEvents: ["goal_completed", "ci_failed", "goal__completed"]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Null(config.Composer!.EventNotifications);
+        Assert.Equal(50, config.Composer.MaxSteps);
+        Assert.Empty(repo.Commits);
+    }
+
+    /// <summary>
+    /// All four whitelisted events, mixed between the two canonical spellings, are accepted and
+    /// stored in their canonical snake_case form.
+    /// </summary>
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_AllFourMixedSpellings_AreAccepted()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsActiveEvents: ["GoalCompleted", "goal_failed", "CI_FAILED", "IssueRaised"]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised"],
+            config.Composer!.EventNotifications!.ActiveEvents);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_ThrottleClamped()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsThrottleSeconds: 999),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal(300, config.Composer.EventNotifications!.ThrottleSeconds);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsThrottleSeconds: 0),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, config.Composer.EventNotifications.ThrottleSeconds);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_ServiceLockSerializes()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // First call enters the lock and parks inside CommitFileAsync until we release it.
+        var first = svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsMode: "active"),
+            TestContext.Current.CancellationToken);
+
+        await repo.CommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // Second call must block on the save lock — it cannot mutate or commit yet.
+        var second = svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(EventNotificationsMode: "off"),
+            TestContext.Current.CancellationToken);
+
+        var completedEarly = await Task.WhenAny(second, Task.Delay(500, TestContext.Current.CancellationToken));
+        Assert.NotSame(second, completedEarly);
+        Assert.False(second.IsCompleted, "Second UpdateComposerSettingsAsync must block until the first releases the lock.");
+        Assert.Equal(1, repo.CommitCalls);
+        // Without the lock the second caller would already have overwritten the singleton here.
+        Assert.Equal("active", config.Composer!.EventNotifications!.Mode);
+
+        // Release the first call; only then may the second proceed.
+        repo.Release();
+        await first.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await second.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, repo.CommitCalls);
+        Assert.Equal("off", config.Composer!.EventNotifications!.Mode);
     }
 
     // ── Clone-triggering tests ─────────────────────────────────────────────────

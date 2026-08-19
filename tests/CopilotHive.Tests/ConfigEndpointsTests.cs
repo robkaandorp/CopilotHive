@@ -609,4 +609,349 @@ public class ConfigEndpointsTests
         Assert.NotEqual(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
     }
+
+    // ── PATCH /api/config/composer — event notifications (real service) ────────
+
+    [Fact]
+    public async Task PatchComposer_EventNotifications_Returns200AndPersists()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new
+            {
+                maxSteps = 75,
+                eventNotificationsMode = "active",
+                eventNotificationsActiveEvents = new[] { "goal_completed", "ci_failed" },
+                eventNotificationsThrottleSeconds = 60,
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotNull(baseFactory.Config.Composer);
+        Assert.Equal(75, baseFactory.Config.Composer!.MaxSteps);
+        Assert.NotNull(baseFactory.Config.Composer.EventNotifications);
+        Assert.Equal("active", baseFactory.Config.Composer.EventNotifications!.Mode);
+        Assert.Equal(["goal_completed", "ci_failed"], baseFactory.Config.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal(60, baseFactory.Config.Composer.EventNotifications.ThrottleSeconds);
+    }
+
+    [Fact]
+    public async Task PatchComposer_InvalidMode_Returns400()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsMode = "bogus" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Null(baseFactory.Config.Composer);
+    }
+
+    [Fact]
+    public async Task PatchComposer_InvalidEvents_Returns400()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsActiveEvents = new[] { "not_an_event" } },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Null(baseFactory.Config.Composer);
+    }
+
+    [Fact]
+    public async Task PatchComposer_EmptyEvents_Returns400()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsActiveEvents = Array.Empty<string>() },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Null(baseFactory.Config.Composer);
+    }
+
+    /// <summary>
+    /// Regression: names that differ from a canonical whitelist entry only in underscore
+    /// structure must be rejected with a 400, not silently canonicalized and persisted.
+    /// </summary>
+    [Theory]
+    [InlineData("goal__completed")]
+    [InlineData("_goal_completed")]
+    [InlineData("goal_completed_")]
+    [InlineData("ci__failed")]
+    [InlineData(" goal_completed ")]
+    public async Task PatchComposer_MalformedNearWhitelistEvent_Returns400(string malformed)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsActiveEvents = new[] { malformed } },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("Invalid active event", body, StringComparison.Ordinal);
+        // Nothing was persisted — validation runs before any mutation.
+        Assert.Null(baseFactory.Config.Composer);
+    }
+
+    /// <summary>
+    /// The counterpart to the malformed cases: both canonical spellings (snake_case and
+    /// PascalCase) are accepted case-insensitively and persist the canonical snake_case form.
+    /// </summary>
+    [Theory]
+    [InlineData("goal_completed")]
+    [InlineData("GoalCompleted")]
+    [InlineData("GOAL_COMPLETED")]
+    [InlineData("goalcompleted")]
+    public async Task PatchComposer_CanonicalEventSpelling_Returns200AndCanonicalizes(string spelling)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsActiveEvents = new[] { spelling } },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(["goal_completed"], baseFactory.Config.Composer!.EventNotifications!.ActiveEvents);
+    }
+
+    [Fact]
+    public async Task PatchComposer_PartialUpdate_OnlyChangedFields()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        // Seed a composer with existing event notification settings.
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = ["goal_completed", "goal_failed"],
+                ThrottleSeconds = 45
+            }
+        };
+
+        // Only change the mode; everything else must stay.
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsMode = "off" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(50, baseFactory.Config.Composer!.MaxSteps);
+        Assert.Equal("off", baseFactory.Config.Composer.EventNotifications!.Mode);
+        Assert.Equal(["goal_completed", "goal_failed"], baseFactory.Config.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal(45, baseFactory.Config.Composer.EventNotifications.ThrottleSeconds);
+    }
+
+    [Fact]
+    public async Task PatchComposer_ThrottleOutOfRange_ClampedAndReturns200()
+    {
+        // Out-of-range throttle is clamped, not rejected — PATCH must return 200.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = ["goal_completed"],
+                ThrottleSeconds = 30
+            }
+        };
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new { eventNotificationsThrottleSeconds = 9999 },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(300, baseFactory.Config.Composer!.EventNotifications!.ThrottleSeconds);
+    }
+
+    // ── GET /api/config/composer — effective values ────────────────────────────
+
+    [Fact]
+    public async Task GetComposer_NullComposer_ReturnsDefaults()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        Assert.Equal(JsonValueKind.Null, body.GetProperty("model").ValueKind);
+        Assert.Equal(0, body.GetProperty("models").GetArrayLength());
+        Assert.Equal(50, body.GetProperty("maxSteps").GetInt32());
+        Assert.Equal(JsonValueKind.Null, body.GetProperty("reasoningEffort").ValueKind);
+        Assert.Equal("passive", body.GetProperty("eventNotifications").GetProperty("mode").GetString());
+        var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Equal(["goal_completed", "goal_failed", "ci_failed", "issue_raised"], activeEvents);
+        Assert.Equal(30, body.GetProperty("eventNotifications").GetProperty("throttleSeconds").GetInt32());
+    }
+
+    [Fact]
+    public async Task GetComposer_EmptyActiveEvents_ReturnsAllFour()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = [],
+                ThrottleSeconds = 30
+            }
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Equal(["goal_completed", "goal_failed", "ci_failed", "issue_raised"], activeEvents);
+    }
+
+    [Fact]
+    public async Task GetComposer_InvalidMode_ReturnsPassive()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "bogus",
+                ActiveEvents = ["goal_completed"],
+                ThrottleSeconds = 30
+            }
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        Assert.Equal("passive", body.GetProperty("eventNotifications").GetProperty("mode").GetString());
+    }
+
+    [Fact]
+    public async Task GetComposer_OutOfRangeThrottle_ClampedToRange()
+    {
+        // Seed a config whose raw ThrottleSeconds exceeds the [1, 300] window. The GET
+        // endpoint must return the clamped effective value (300), not the raw 999.
+        // This verifies the "throttle clamped" effective-value requirement.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = ["goal_completed"],
+                ThrottleSeconds = 999
+            }
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        Assert.Equal(300, body.GetProperty("eventNotifications").GetProperty("throttleSeconds").GetInt32());
+    }
+
+    [Fact]
+    public async Task GetComposer_NullThrottle_ReturnsDefault30()
+    {
+        // When ThrottleSeconds is null the effective value defaults to 30.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = ["goal_completed"],
+                ThrottleSeconds = null
+            }
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        Assert.Equal(30, body.GetProperty("eventNotifications").GetProperty("throttleSeconds").GetInt32());
+    }
 }
