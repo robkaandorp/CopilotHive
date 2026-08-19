@@ -8,18 +8,22 @@ namespace CopilotHive.Actors;
 
 /// <summary>
 /// Channel-based actor owning the Composer's streaming and session lifecycle. All mutable
-/// state (streaming task, CTS, content, streaming flag) is accessed only from
-/// <see cref="HandleAsync"/> (the mailbox thread) or the background streaming task, so no
-/// locking is required. Streaming work runs outside the mailbox and posts results back via
-/// self-<c>Tell</c> so the mailbox never blocks on the LLM stream.
+/// state (streaming task, CTS, content, streaming flag, pending-notification queue) is
+/// accessed only from <see cref="HandleAsync"/> (the mailbox thread) or the background
+/// streaming task, so no locking is required. Streaming work runs outside the mailbox and
+/// posts results back via self-<c>Tell</c> so the mailbox never blocks on the LLM stream.
 /// </summary>
 internal sealed class ComposerActor : Actor<IComposerMessage>
 {
+    /// <summary>Maximum number of queued active notifications; oldest are dropped beyond this.</summary>
+    private const int MaxPendingNotifications = 10;
+
     private readonly ComposerAgentService _agentService;
     private readonly Func<CancellationToken, Task> _saveSession;
     private readonly Action<string> _refreshRegistry;
     private readonly Action<string> _onStreamingUpdate;
-    private readonly Action<int> _onStreamingFinished;
+    private readonly Action _onStreamingStarted;
+    private readonly Action<int, bool> _onStreamingTransition;
     private readonly Action<string> _onStreamingError;
     private readonly Action _onOverflowRecovery;
     private readonly Action _onCompactingStarted;
@@ -30,19 +34,37 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     private readonly ILogger _logger;
 
     // Cross-thread state. The mailbox loop and the streaming task both read/write these, so
-    // every one is volatile: the streaming task's failed-Tell path latches _terminated and
-    // clears _isStreaming on ITS thread, and OnShutdownAsync must observe those writes on the
-    // mailbox-loop thread (a stale `_terminated == false` would re-run terminal cleanup).
+    // every one is volatile: the streaming task's failed-Tell path latches _terminalCleanupDone
+    // and clears _isStreaming on ITS thread, and OnShutdownAsync must observe those writes on
+    // the mailbox-loop thread (a stale `_terminalCleanupDone == false` would re-run terminal
+    // cleanup).
     //
-    // OWNERSHIP: the mailbox loop is the SOLE owner of _streamingTask/_streamingCts — only it
-    // may dispose the CTS or null either field. The streaming task never nulls its own
-    // reference, so a snapshot taken by OnShutdownAsync stays valid until the task (including
-    // its terminal callbacks) has fully completed.
+    // OWNERSHIP: the mailbox loop is the SOLE owner of _streamingTask — only it may null that
+    // field. The streaming task never nulls its own task reference, so a snapshot taken by
+    // OnShutdownAsync stays valid until the task (including its terminal callbacks) has fully
+    // completed. The CTS may be disposed by either the mailbox loop or the streaming task's
+    // failed-Tell fallback; OnShutdownAsync guards its own cancel with ObjectDisposedException.
     private volatile CancellationTokenSource? _streamingCts;
     private volatile Task? _streamingTask;
     private string _streamingContent = "";
     private volatile bool _isStreaming;
     private volatile bool _terminated;
+
+    /// <summary>
+    /// Latch guarding the final terminal cleanup (transition, idle registry, queue clear).
+    /// Reset in <see cref="StartStream"/> and set after the final transition of a stream —
+    /// either by the mailbox handler's terminal sequence or by the streaming task's
+    /// failed-<c>Tell</c> fallback. <see cref="OnShutdownAsync"/> checks it to avoid
+    /// double-running the terminal sequence.
+    /// </summary>
+    private volatile bool _terminalCleanupDone;
+
+    /// <summary>
+    /// Queue of active notifications waiting for the current stream to finish. Access is
+    /// confined to the mailbox thread. Bounded by <see cref="MaxPendingNotifications"/>;
+    /// the oldest entry is dropped when full.
+    /// </summary>
+    private readonly Queue<string> _pendingNotifications = new();
 
     /// <summary>Creates a composer actor bound to the given agent service and callbacks.</summary>
     internal ComposerActor(
@@ -50,7 +72,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         Func<CancellationToken, Task> saveSession,
         Action<string> refreshRegistry,
         Action<string> onStreamingUpdate,
-        Action<int> onStreamingFinished,
+        Action onStreamingStarted,
+        Action<int, bool> onStreamingTransition,
         Action<string> onStreamingError,
         Action onOverflowRecovery,
         Action onCompactingStarted,
@@ -64,7 +87,8 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         _saveSession = saveSession;
         _refreshRegistry = refreshRegistry;
         _onStreamingUpdate = onStreamingUpdate;
-        _onStreamingFinished = onStreamingFinished;
+        _onStreamingStarted = onStreamingStarted;
+        _onStreamingTransition = onStreamingTransition;
         _onStreamingError = onStreamingError;
         _onOverflowRecovery = onOverflowRecovery;
         _onCompactingStarted = onCompactingStarted;
@@ -126,18 +150,27 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerSendMessageMessage m:
                 if (_isStreaming)
                 {
-                    _logger.LogWarning("Send ignored — already streaming");
+                    m.Reply.TrySetResult(false);
                     break;
                 }
 
-                // Reset the terminal latch so the actor is reusable: without this a second
-                // stream could never complete (its terminal message would be swallowed).
-                _terminated = false;
-                _isStreaming = true;
-                _streamingContent = "";
-                _streamingCts = new CancellationTokenSource();
-                _refreshRegistry("streaming");
-                _streamingTask = Task.Run(() => RunStreamingAsync(m.WrappedMessage, _streamingCts.Token), LoopToken);
+                StartStream(m.WrappedMessage);
+                // The reply completes AFTER StartStream, so by the time the caller observes
+                // `true`, _onStreamingStarted has fired (the facade's _isStreaming is set).
+                m.Reply.TrySetResult(true);
+                break;
+
+            case ComposerSendActiveNotificationMessage m:
+                if (_isStreaming)
+                {
+                    _pendingNotifications.Enqueue(m.WrappedNotification);
+                    while (_pendingNotifications.Count > MaxPendingNotifications)
+                        _pendingNotifications.Dequeue();
+                }
+                else
+                {
+                    StartStream(m.WrappedNotification);
+                }
                 break;
 
             case ComposerCancelStreamingMessage:
@@ -308,29 +341,90 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 _streamingContent = m.Content;
                 _onStreamingUpdate(m.Content);
                 break;
-
             case ComposerStreamingCompleteMessage m:
                 await HandleStreamingCompleteAsync(m);
-                // Mailbox loop owns the task/CTS — release them here, never from the
-                // streaming task (see HandleStreamingCompleteAsync's remarks).
-                ReleaseStreamingResources();
+                // The terminal sequence runs here, on the mailbox thread: release the
+                // task/CTS, then transition (idle or next queued notification).
+                RunTerminalSequence(m.LastToolCalls);
                 break;
 
             case ComposerStreamingErrorMessage m:
                 HandleStreamingError(m);
-                ReleaseStreamingResources();
+                RunTerminalSequence(0);
                 break;
         }
     }
 
     /// <summary>
-    /// The terminal sequence for a completed stream. Shared by the mailbox handler and by the
+    /// The terminal sequence for a completed stream, run on the mailbox thread AFTER the
+    /// terminal handler (save classification, overflow recovery, callbacks) has completed.
+    /// Releases the task/CTS owned by the mailbox loop, then either transitions to the next
+    /// queued active notification or reports idle.
+    /// </summary>
+    private void RunTerminalSequence(int toolCalls)
+    {
+        // Mailbox loop owns the task/CTS — release them here, never from the streaming task
+        // (see HandleStreamingCompleteAsync's remarks on ownership).
+        _streamingCts?.Dispose();
+        _streamingCts = null;
+        _streamingTask = null;
+
+        // Shutdown discriminator: if the loop token is cancelled, OnShutdownAsync performs
+        // the final state cleanup (transition, idle registry, queue clear). We return here
+        // so the terminal sequence does not race the shutdown path.
+        if (LoopToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        if (_pendingNotifications.TryDequeue(out var pending))
+        {
+            // Release the facade's admission gate BEFORE starting the next notification so
+            // the actor stays responsive: transition(true) fires OnStreamingUpdate while
+            // _isStreaming remains true (keepStreaming), then StartStream re-admits.
+            TryInvoke(() => _onStreamingTransition(toolCalls, true), nameof(_onStreamingTransition));
+            StartStream(pending);
+        }
+        else
+        {
+            _isStreaming = false;
+            TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
+            TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+            _terminalCleanupDone = true;
+        }
+    }
+
+    /// <summary>
+    /// Starts a streaming response for the given wrapped message. Resets the terminal latches,
+    /// publishes the streaming-started callback, registers the streaming status and launches
+    /// the background streaming task.
+    /// </summary>
+    private void StartStream(string wrappedMessage)
+    {
+        // Reset the terminal latches so the actor is reusable: without this a second
+        // stream could never complete (its terminal message would be swallowed).
+        _terminalCleanupDone = false;
+        _terminated = false;
+        _isStreaming = true;
+        _streamingContent = "";
+        _streamingCts = new CancellationTokenSource();
+        // Fires BEFORE the streaming task starts, so the facade observes _isStreaming=true
+        // and cleared content before any reply completes.
+        TryInvoke(_onStreamingStarted, nameof(_onStreamingStarted));
+        _refreshRegistry("streaming");
+        _streamingTask = Task.Run(() => RunStreamingAsync(wrappedMessage, _streamingCts.Token), LoopToken);
+    }
+
+    /// <summary>
+    /// The terminal handler for a completed stream. Shared by the mailbox handler and by the
     /// streaming task's failed-<c>Tell</c> path, so a mailbox that closes during shutdown loses
     /// none of the terminal semantics (save classification, overflow recovery, callbacks).
     /// Idempotent: the <c>_terminated</c> latch guarantees it runs at most once per stream.
     /// <para>
-    /// Deliberately does NOT dispose the CTS or null <c>_streamingTask</c>/<c>_streamingCts</c>:
-    /// this can run on the streaming task, and nulling its own task reference would let
+    /// Deliberately does NOT dispose the CTS or null <c>_streamingTask</c>/<c>_streamingCts</c>,
+    /// nor perform the idle transition: those belong to the mailbox loop's
+    /// <see cref="RunTerminalSequence"/> (or the failed-Tell fallback). This can run on the
+    /// streaming task, and nulling its own task reference would let
     /// <see cref="OnShutdownAsync"/> skip the await and signal completion while the callbacks
     /// below are still running. Only the mailbox loop owns those fields.
     /// </para>
@@ -360,30 +454,22 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             }
         }
 
-        // Release the facade's admission gate before the callbacks: a throwing callback must
-        // never leave the actor (or the facade) stuck in the streaming state.
-        _isStreaming = false;
-
-        TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-
         if (m.OverflowRecovered)
         {
-            // BEFORE the completion signal: overflow recovery replaced the session with a
+            // BEFORE the terminal sequence: overflow recovery replaced the session with a
             // fresh one, and this callback is what clears the facade's compaction flags and
             // _sessionLoadedFromDisk and deletes the stale session file. Running it after
-            // _onStreamingFinished would let completion subscribers observe the fresh session
+            // the transition would let completion subscribers observe the fresh session
             // through a stale-true loaded-from-disk flag.
             //
             // Must run even on the failed-Tell path: skipping it would let the overflowing
             // session be reloaded on the next start.
             TryInvoke(_onOverflowRecovery, nameof(_onOverflowRecovery));
         }
-
-        TryInvoke(() => _onStreamingFinished(m.LastToolCalls), nameof(_onStreamingFinished));
     }
 
     /// <summary>
-    /// The terminal sequence for a failed stream. Shared by the mailbox handler and by the
+    /// The terminal handler for a failed stream. Shared by the mailbox handler and by the
     /// streaming task's failed-<c>Tell</c> path so the error is reported either way.
     /// Idempotent via the <c>_terminated</c> latch. Like the completion handler it never
     /// disposes or nulls the task/CTS fields — see the note there.
@@ -398,24 +484,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         _terminated = true;
         _streamingContent += $"\n\n❌ Error: {m.Error}";
 
-        // State before callbacks — see the completion case above.
-        _isStreaming = false;
-
         TryInvoke(() => _onStreamingError(m.Error), nameof(_onStreamingError));
-        TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
-        TryInvoke(() => _onStreamingFinished(0), nameof(_onStreamingFinished));
-    }
-
-    /// <summary>
-    /// Releases the streaming task/CTS owned by the mailbox loop. ONLY the mailbox loop may
-    /// call this: disposing the CTS or nulling the task from the streaming task itself would
-    /// invalidate the reference <see cref="OnShutdownAsync"/> relies on to await that task.
-    /// </summary>
-    private void ReleaseStreamingResources()
-    {
-        _streamingCts?.Dispose();
-        _streamingCts = null;
-        _streamingTask = null;
     }
 
     /// <summary>Invokes a facade callback, logging and swallowing failures so cleanup continues.</summary>
@@ -438,8 +507,9 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     /// mailbox handler owns the sequence. When it is REJECTED (the mailbox closed during
     /// shutdown) the streaming task runs the SAME shared handler with the SAME message, so the
     /// terminal semantics — save classification, overflow recovery, error reporting — are
-    /// identical on both paths. A failure BEFORE any terminal <c>Tell</c> is attempted (e.g.
-    /// overflow recovery's session reset throwing) is reported as a real error.
+    /// identical on both paths, followed by the cohesive cleanup block below. A failure BEFORE
+    /// any terminal <c>Tell</c> is attempted (e.g. overflow recovery's session reset throwing)
+    /// is reported as a real error.
     /// </para>
     /// </summary>
     private async Task RunStreamingAsync(string userMessage, CancellationToken ct)
@@ -553,10 +623,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         }
         finally
         {
-            // Reached when a terminal Tell was REJECTED, or when an unexpected failure escaped
-            // before any terminal was attempted. No mailbox handler will run, so the terminal
-            // sequence is executed here — with the SAME message, through the SAME handler.
-            if (!accepted && !_terminated)
+            // Failed-Tell fallback: reached when a terminal Tell was REJECTED (the mailbox
+            // closed during shutdown) and the mailbox handler never ran the terminal sequence.
+            // Guarded by _terminalCleanupDone so the cleanup runs at most once per stream —
+            // the mailbox handler's terminal sequence sets it, and OnShutdownAsync checks it.
+            if (!accepted && !_terminalCleanupDone)
             {
                 var terminal = pendingTerminal;
                 if (terminal is null)
@@ -565,23 +636,42 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                     terminal = new ComposerStreamingErrorMessage("Composer streaming ended unexpectedly.");
                 }
 
-                // Runs on the STREAMING TASK: invoke the shared terminal handler only. The
-                // task/CTS fields belong to the mailbox loop, so they are deliberately left
-                // untouched here — nulling _streamingTask would invalidate the reference
-                // OnShutdownAsync is awaiting and let completion be signalled underneath
-                // these very callbacks.
+                // Invoke the shared terminal handler for the callbacks (save classification,
+                // overflow recovery, error reporting) with the SAME message.
+                int toolCalls;
                 switch (terminal)
                 {
                     case ComposerStreamingCompleteMessage complete:
                         await HandleStreamingCompleteAsync(complete);
+                        toolCalls = complete.LastToolCalls;
                         break;
                     case ComposerStreamingErrorMessage error:
                         HandleStreamingError(error);
+                        toolCalls = 0;
                         break;
                     default:
                         throw new InvalidOperationException(
                             $"Unhandled terminal message type '{terminal.GetType().Name}'.");
                 }
+
+                // Cohesive cleanup block. Note: _streamingTask is deliberately NOT nulled here —
+                // nulling it would invalidate the reference OnShutdownAsync is awaiting and let
+                // completion be signalled underneath these very callbacks.
+                //
+                // KNOWN LIMITATION (accepted-but-discarded race): during shutdown,
+                // Actor<T>.MessageLoopAsync drains queued messages without calling HandleAsync.
+                // If a terminal Tell returns true but the message is drained (not handled), this
+                // fallback does NOT run (accepted is true). In that rare case, save/overflow/
+                // error callbacks are lost, but OnShutdownAsync performs the final state cleanup
+                // (transition, idle, queue clear). The session may not be saved — acceptable
+                // during shutdown.
+                _streamingCts?.Dispose();
+                _streamingCts = null;
+                _isStreaming = false;
+                _pendingNotifications.Clear();
+                TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
+                TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+                _terminalCleanupDone = true;
             }
         }
     }
@@ -591,6 +681,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     {
         switch (message)
         {
+            case ComposerSendMessageMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerConnectMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerResetSessionMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerSwitchModelMessage m: m.Reply.TrySetCanceled(); break;
@@ -598,6 +689,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerCompactPartialMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerSubmitAnswerMessage: break; // fire-and-forget — no reply to cancel
             case ComposerCancelQuestionMessage: break; // fire-and-forget — no reply to cancel
+            case ComposerSendActiveNotificationMessage: break; // fire-and-forget — no reply to cancel
         }
     }
 
@@ -606,6 +698,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
     {
         switch (message)
         {
+            case ComposerSendMessageMessage m: m.Reply.TrySetException(ex); break;
             case ComposerConnectMessage m: m.Reply.TrySetException(ex); break;
             case ComposerResetSessionMessage m: m.Reply.TrySetException(ex); break;
             case ComposerSwitchModelMessage m: m.Reply.TrySetException(ex); break;
@@ -613,6 +706,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerCompactPartialMessage m: m.Reply.TrySetException(ex); break;
             case ComposerSubmitAnswerMessage:
             case ComposerCancelQuestionMessage:
+            case ComposerSendActiveNotificationMessage:
                 _logger.LogError(ex, "Composer actor failed to handle {MessageType}", message.GetType().Name);
                 break;
             default: CancelReply(message); break;
@@ -627,15 +721,16 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         // the mutable fields here: awaiting a snapshot (rather than a field that could be
         // observed as null) is what guarantees Completion is not signalled while the fallback's
         // terminal callbacks are still running. The streaming task deliberately does NOT null
-        // these fields (see HandleStreamingCompleteAsync), so the captured task reference stays
-        // valid until that task — callbacks included — has fully finished.
+        // _streamingTask (see HandleStreamingCompleteAsync), so the captured task reference
+        // stays valid until that task — callbacks included — has fully finished.
         var streamingTask = _streamingTask;
         var streamingCts = _streamingCts;
 
         try { streamingCts?.Cancel(); }
         catch (ObjectDisposedException)
         {
-            // The mailbox terminal case disposed it first — cancellation is moot either way.
+            // The mailbox terminal case or the failed-Tell fallback disposed it first —
+            // cancellation is moot either way.
         }
 
         if (streamingTask is not null)
@@ -653,17 +748,19 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         // The await above guarantees the streaming task (and therefore any fallback terminal
         // sequence it ran) has fully completed, so this volatile latch read observes its write
         // and cannot re-run a terminal sequence that already happened.
-        if (!_terminated)
+        _pendingNotifications.Clear();
+
+        if (!_terminalCleanupDone)
         {
-            _terminated = true;
             _isStreaming = false;
-            TryInvoke(() => _onStreamingFinished(0), nameof(_onStreamingFinished));
+            TryInvoke(() => _onStreamingTransition(0, false), nameof(_onStreamingTransition));
             TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+            _terminalCleanupDone = true;
         }
 
         // Only now — after the task and its callbacks are done — may the owner release the
         // captured CTS and clear the fields. Dispose is idempotent, so a mailbox terminal case
-        // that already released them is harmless.
+        // or fallback that already released them is harmless.
         streamingCts?.Dispose();
         _streamingCts = null;
         _streamingTask = null;

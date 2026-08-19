@@ -6,10 +6,19 @@ namespace CopilotHive.Actors;
 internal interface IComposerMessage { }
 
 /// <summary>
-/// Sends a user message and starts streaming a response in the background. Fire-and-forget:
-/// no reply is carried, so send failures surface through the streaming callbacks.
+/// Sends a user message and starts streaming a response in the background. The reply
+/// completes with <c>true</c> once the stream has been admitted (StartStream called and
+/// <c>_onStreamingStarted</c> fired), or <c>false</c> when the send was rejected because
+/// the actor is already streaming.
 /// </summary>
-internal sealed record ComposerSendMessageMessage(string WrappedMessage) : IComposerMessage;
+internal sealed record ComposerSendMessageMessage(string WrappedMessage, TaskCompletionSource<bool> Reply) : IComposerMessage;
+
+/// <summary>
+/// Sends an active system notification to the Composer. If idle, the notification starts
+/// streaming immediately; if streaming, it is queued (bounded, oldest dropped) and starts
+/// after the current stream's terminal transition. Fire-and-forget.
+/// </summary>
+internal sealed record ComposerSendActiveNotificationMessage(string WrappedNotification) : IComposerMessage;
 
 /// <summary>Cancels the in-flight streaming response. Fire-and-forget.</summary>
 internal sealed record ComposerCancelStreamingMessage : IComposerMessage;

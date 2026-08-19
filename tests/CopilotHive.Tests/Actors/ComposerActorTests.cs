@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -54,7 +55,8 @@ public sealed class ComposerActorTests
         string model = "test-model",
         IReadOnlyList<string>? availableModels = null,
         Action? onCompacting = null,
-        Action<CompactionResult>? onCompacted = null) =>
+        Action<CompactionResult>? onCompacted = null,
+        List<AITool>? tools = null) =>
         new(
             model,
             64000,
@@ -62,7 +64,7 @@ public sealed class ComposerActorTests
             null,
             null,
             "system prompt",
-            new List<AITool>(),
+            tools ?? new List<AITool>(),
             null,
             stateDir,
             null,
@@ -80,7 +82,8 @@ public sealed class ComposerActorTests
         Func<CancellationToken, Task> saveSession,
         Action<string> refreshRegistry,
         Action<string> onStreamingUpdate,
-        Action<int> onStreamingFinished,
+        Action onStreamingStarted,
+        Action<int, bool> onStreamingTransition,
         Action<string> onStreamingError,
         Action onOverflowRecovery,
         ILogger? logger = null,
@@ -94,7 +97,8 @@ public sealed class ComposerActorTests
             saveSession,
             refreshRegistry,
             onStreamingUpdate,
-            onStreamingFinished,
+            onStreamingStarted,
+            onStreamingTransition,
             onStreamingError,
             onOverflowRecovery,
             onCompactingStarted ?? (() => { }),
@@ -153,6 +157,24 @@ public sealed class ComposerActorTests
         var field = typeof(ComposerActor).GetField("_streamingTask", PrivateFlags)
             ?? throw new InvalidOperationException("_streamingTask field not found on ComposerActor");
         return (Task?)field.GetValue(actor);
+    }
+
+    private static bool GetTerminalCleanupDone(ComposerActor actor)
+    {
+        var field = typeof(ComposerActor).GetField("_terminalCleanupDone", PrivateFlags)
+            ?? throw new InvalidOperationException("_terminalCleanupDone field not found on ComposerActor");
+        return (bool)field.GetValue(actor)!;
+    }
+
+    /// <summary>
+    /// Number of active notifications currently waiting in the actor's bounded queue. Lets a
+    /// test distinguish "queued behind the live stream" from "silently dropped".
+    /// </summary>
+    private static int GetPendingNotificationCount(ComposerActor actor)
+    {
+        var field = typeof(ComposerActor).GetField("_pendingNotifications", PrivateFlags)
+            ?? throw new InvalidOperationException("_pendingNotifications field not found on ComposerActor");
+        return ((Queue<string>)field.GetValue(actor)!).Count;
     }
 
     /// <summary>
@@ -283,6 +305,216 @@ public sealed class ComposerActorTests
     {
         await Task.Yield();
         yield break;
+    }
+
+    /// <summary>
+    /// Chat client that RECORDS the last user message of every request and gates each request
+    /// on an individually-released semaphore. Recording the actual prompt is what makes the
+    /// bounded-queue test removal-proof: it proves WHICH notifications ran and in what order,
+    /// not merely how many.
+    /// </summary>
+    private sealed class RecordingBlockingClient : IChatClient
+    {
+        private readonly SemaphoreSlim _releaseSignal = new(0, int.MaxValue);
+        private readonly List<string> _prompts = [];
+        private readonly List<(int Threshold, TaskCompletionSource Gate)> _waiters = [];
+        private readonly TaskCompletionSource _allEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly int _expectedRequests;
+
+        internal RecordingBlockingClient(int expectedRequests) => _expectedRequests = expectedRequests;
+
+        /// <summary>Completes once <c>expectedRequests</c> requests have been ENTERED.</summary>
+        internal Task AllEntered => _allEntered.Task;
+
+        /// <summary>Snapshot of the last user message of each request, in request order.</summary>
+        internal List<string> Prompts { get { lock (_prompts) return [.. _prompts]; } }
+
+        /// <summary>
+        /// Completes once at least <paramref name="count"/> requests have been ENTERED (i.e. the
+        /// streaming task actually reached the client and recorded its prompt). Gating on this
+        /// rather than on <c>_onStreamingStarted</c> is required: the started callback fires in
+        /// <c>StartStream</c> BEFORE the background streaming task runs, so the prompt is not
+        /// yet recorded when it fires.
+        /// </summary>
+        internal Task WaitForRequestsAsync(int count)
+        {
+            lock (_prompts)
+            {
+                if (_prompts.Count >= count) return Task.CompletedTask;
+                var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waiters.Add((count, gate));
+                return gate.Task;
+            }
+        }
+
+        public ChatClientMetadata Metadata => new("recording-blocking", null, "recording-blocking-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+
+            // Record the LAST user message — that is the wrapped message the actor supplied.
+            ChatMessage? lastUser = null;
+            foreach (var m in messages)
+            {
+                if (m.Role == ChatRole.User) lastUser = m;
+            }
+
+            int count;
+            List<TaskCompletionSource> ready = [];
+            lock (_prompts)
+            {
+                _prompts.Add(lastUser?.Text ?? "");
+                count = _prompts.Count;
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    if (_waiters[i].Threshold > count) continue;
+                    ready.Add(_waiters[i].Gate);
+                    _waiters.RemoveAt(i);
+                }
+            }
+            foreach (var gate in ready) gate.TrySetResult();
+            if (count >= _expectedRequests) _allEntered.TrySetResult();
+
+            await _releaseSignal.WaitAsync(cancellationToken);
+
+            yield return new ChatResponseUpdate(ChatRole.Assistant, "done")
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
+        }
+
+        /// <summary>Releases <paramref name="count"/> pending (or future) requests.</summary>
+        internal void Release(int count = 1)
+        {
+            try { _releaseSignal.Release(count); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
+        }
+
+        public void Dispose() => _releaseSignal.Dispose();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>
+    /// Chat client whose FIRST request emits a configurable number of real tool calls (so the
+    /// agent's <c>AgentResult.ToolCallCount</c> is genuinely non-zero) and whose second request
+    /// optionally emits a text delta and then parks on a gate before completing.
+    /// <para>
+    /// The delta gives a test a way to OCCUPY the mailbox loop (its
+    /// <c>ComposerStreamingUpdateMessage</c> handler calls <c>onStreamingUpdate</c>, which the
+    /// test can block in), and the gate holds the stream open. Together they let a test close
+    /// the mailbox while the streaming CTS is still ALIVE, so the stream can complete NORMALLY
+    /// (real <c>ToolCallCount</c>) into a REJECTED terminal <c>Tell</c>.
+    /// </para>
+    /// </summary>
+    private sealed class ToolCallsThenGatedStopClient : IChatClient
+    {
+        private readonly SemaphoreSlim _finalGate = new(0, int.MaxValue);
+        private readonly TaskCompletionSource _finalEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly int _toolCallCount;
+        private readonly bool _gateFinalRequest;
+        private readonly string? _finalDelta;
+        private int _requests;
+
+        internal ToolCallsThenGatedStopClient(int toolCallCount, bool gateFinalRequest, string? finalDelta = null)
+        {
+            _toolCallCount = toolCallCount;
+            _gateFinalRequest = gateFinalRequest;
+            _finalDelta = finalDelta;
+        }
+
+        /// <summary>Completes once the FINAL (completing) request has been entered.</summary>
+        internal Task FinalEntered => _finalEntered.Task;
+
+        public ChatClientMetadata Metadata => new("toolcalls-then-stop", null, "toolcalls-then-stop-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+
+            if (Interlocked.Increment(ref _requests) == 1)
+            {
+                // Real tool calls: the agent executes each one and counts it, so the
+                // Completed update's AgentResult.ToolCallCount is genuinely _toolCallCount.
+                var calls = new List<AIContent>(_toolCallCount);
+                for (var i = 0; i < _toolCallCount; i++)
+                {
+                    calls.Add(new FunctionCallContent(
+                        $"call-{i}",
+                        ToolName,
+                        new Dictionary<string, object?> { ["value"] = i.ToString(CultureInfo.InvariantCulture) }));
+                }
+
+                yield return new ChatResponseUpdate(ChatRole.Assistant, calls)
+                {
+                    FinishReason = ChatFinishReason.ToolCalls,
+                };
+                yield break;
+            }
+
+            _finalEntered.TrySetResult();
+
+            // Emitted BEFORE the gate so the mailbox loop can be occupied while this request
+            // is still parked — that is what lets a test close the mailbox without the
+            // streaming CTS having been cancelled yet.
+            if (_finalDelta is not null)
+            {
+                yield return new ChatResponseUpdate(ChatRole.Assistant, _finalDelta);
+            }
+
+            if (_gateFinalRequest)
+            {
+                // Deliberately does NOT observe cancellationToken: the stream must be able to
+                // complete NORMALLY even after the actor's loop token has been cancelled.
+                await _finalGate.WaitAsync(CancellationToken.None);
+            }
+
+            yield return new ChatResponseUpdate(ChatRole.Assistant, "final")
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
+        }
+
+        internal void ReleaseFinal()
+        {
+            try { _finalGate.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
+        }
+
+        public void Dispose() => _finalGate.Dispose();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        /// <summary>Name of the no-op tool the fake calls; registered via <see cref="CreateTool"/>.</summary>
+        internal const string ToolName = "counting_probe_tool";
+
+        /// <summary>Builds the tool the client invokes, so the agent can actually execute the calls.</summary>
+        internal static AITool CreateTool() =>
+            AIFunctionFactory.Create(
+                (string value) => $"ok:{value}",
+                ToolName,
+                "Test-only no-op tool used to produce a genuine non-zero ToolCallCount.");
     }
 
     /// <summary>
@@ -546,7 +778,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -586,7 +819,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -620,7 +854,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -671,14 +906,15 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             content => streamContents.Add(content),
-            _ => Interlocked.Increment(ref finishedCalls),
+            () => { },
+            (_, keepStreaming) => { if (!keepStreaming) Interlocked.Increment(ref finishedCalls); },
             _ => { },
             () => { });
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // The save-session callback fires inside the mailbox's completion handler,
             // so this gate deterministically signals the handler has run.
@@ -721,7 +957,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -730,7 +967,7 @@ public sealed class ComposerActorTests
             actor.Start();
 
             // First send starts a stream that blocks.
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("first")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
             await Task.WhenAny(
                 Task.Run(() =>
                 {
@@ -741,7 +978,7 @@ public sealed class ComposerActorTests
             Assert.Contains("streaming", registryStatuses);
 
             // Second send while streaming is ignored — no second "streaming" transition.
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("second")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("second", NewReply<bool>())));
             await Task.Delay(200, TestContext.Current.CancellationToken);
             Assert.Equal(1, registryStatuses.Count(s => s == "streaming"));
 
@@ -782,7 +1019,8 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -791,7 +1029,7 @@ public sealed class ComposerActorTests
             actor.Start();
 
             // Start a stream that blocks.
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
             await Task.WhenAny(
                 Task.Run(() =>
                 {
@@ -841,7 +1079,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -849,7 +1088,7 @@ public sealed class ComposerActorTests
         {
             actor.Start();
 
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
             await Task.WhenAny(
                 Task.Run(() =>
                 {
@@ -901,7 +1140,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -942,7 +1182,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -950,7 +1191,7 @@ public sealed class ComposerActorTests
         {
             actor.Start();
 
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
             await Task.WhenAny(
                 Task.Run(() =>
                 {
@@ -1000,7 +1241,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1055,7 +1297,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1109,7 +1352,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1161,7 +1405,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1225,7 +1470,8 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             error =>
             {
                 errors.Add(error);
@@ -1236,7 +1482,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // The error callback fires inside the mailbox handler — wait for it directly.
             await errorGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -1298,7 +1544,8 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () =>
             {
@@ -1309,7 +1556,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // The overflow-recovery callback fires inside the mailbox terminal handler, so
             // this gate deterministically signals that the full overflow path completed.
@@ -1350,14 +1597,15 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             status => registryStatuses.Add(status),
             _ => { },
-            calls => finishedCalls.Add(calls),
+            () => { },
+            (calls, keepStreaming) => { if (!keepStreaming) finishedCalls.Add(calls); },
             _ => { },
             () => { });
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // Wait until the stream is actually running and blocked.
             await Task.WhenAny(
@@ -1400,7 +1648,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1432,19 +1681,22 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
         try
         {
             // Never Start() — disposal drains the mailbox and CancelReply must fire.
+            var sendReply = NewReply<bool>();
             var connectReply = NewReply<bool>();
             var resetReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var switchReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var compactReply = NewReply<bool>();
             var compactPartialReply = NewReply<bool>();
 
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", sendReply)));
             Assert.True(actor.Tell(new ComposerConnectMessage(connectReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerResetSessionMessage(resetReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerSwitchModelMessage("model-b", ReasoningEffort.Medium, switchReply, CancellationToken.None)));
@@ -1453,6 +1705,7 @@ public sealed class ComposerActorTests
 
             await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
+            Assert.True(sendReply.Task.IsCanceled);
             Assert.True(connectReply.Task.IsCanceled);
             Assert.True(resetReply.Task.IsCanceled);
             Assert.True(switchReply.Task.IsCanceled);
@@ -1481,7 +1734,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1532,7 +1786,8 @@ public sealed class ComposerActorTests
             },
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             logger);
@@ -1540,7 +1795,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // Wait until the complete handler is stuck inside saveSession.
             await saveEntry.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -1591,7 +1846,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1646,7 +1902,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1688,7 +1945,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1766,7 +2024,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -1777,7 +2036,7 @@ public sealed class ComposerActorTests
 
             // Fire-and-forget messages have no reply to fault — the default branch calls
             // CancelReply which is a no-op for them. This must not throw.
-            method.Invoke(actor, [new ComposerSendMessageMessage("msg"), ex]);
+            method.Invoke(actor, [new ComposerSendMessageMessage("msg", NewReply<bool>()), ex]);
             method.Invoke(actor, [new ComposerCancelStreamingMessage(), ex]);
             method.Invoke(actor, [new ComposerStreamingUpdateMessage("content"), ex]);
             method.Invoke(actor, [new ComposerStreamingCompleteMessage(0, false, false), ex]);
@@ -1830,14 +2089,15 @@ public sealed class ComposerActorTests
                 }
             },
             _ => { },
-            calls => { lock (finishedCalls) finishedCalls.Add(calls); },
+            () => { },
+            (calls, keepStreaming) => { if (!keepStreaming) { lock (finishedCalls) finishedCalls.Add(calls); } },
             _ => { },
             () => { });
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // Wait until the stream is actually running and blocked on the client's gate.
             await WaitForStreamingStatusAsync(registryStatuses);
@@ -1935,15 +2195,19 @@ public sealed class ComposerActorTests
                 updateEntered.TrySetResult();
                 releaseUpdate.Task.Wait(TimeSpan.FromSeconds(30));
             },
-            calls =>
+            () => { },
+            (calls, keepStreaming) =>
             {
-                lock (finishedCalls) finishedCalls.Add(calls);
+                if (!keepStreaming)
+                {
+                    lock (finishedCalls) finishedCalls.Add(calls);
 
-                // Runs on the STREAMING TASK, after the fallback has latched _terminated and
-                // (with the defect) already nulled _streamingTask. Hold the terminal sequence
-                // open — this is the window a skipped await would race with.
-                finishedEntered.TrySetResult();
-                releaseFinished.Task.Wait(TimeSpan.FromSeconds(30));
+                    // Runs on the STREAMING TASK, after the fallback has latched _terminated and
+                    // (with the defect) already nulled _streamingTask. Hold the terminal sequence
+                    // open — this is the window a skipped await would race with.
+                    finishedEntered.TrySetResult();
+                    releaseFinished.Task.Wait(TimeSpan.FromSeconds(30));
+                }
             },
             _ => { },
             () => { });
@@ -1952,7 +2216,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // 1. The mailbox loop is now parked inside the update handler.
             await updateEntered.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -2040,7 +2304,8 @@ public sealed class ComposerActorTests
             },
             status => { lock (registryStatuses) registryStatuses.Add(status); },
             _ => { },
-            calls => { lock (finishedCalls) finishedCalls.Add(calls); },
+            () => { },
+            (calls, keepStreaming) => { if (!keepStreaming) { lock (finishedCalls) finishedCalls.Add(calls); } },
             _ => { },
             () =>
             {
@@ -2051,7 +2316,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await WaitForStreamingStatusAsync(registryStatuses);
             await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -2119,7 +2384,8 @@ public sealed class ComposerActorTests
             },
             status => { lock (registryStatuses) registryStatuses.Add(status); },
             _ => { },
-            calls => { lock (finishedCalls) finishedCalls.Add(calls); },
+            () => { },
+            (calls, keepStreaming) => { if (!keepStreaming) { lock (finishedCalls) finishedCalls.Add(calls); } },
             error =>
             {
                 lock (errors) errors.Add(error);
@@ -2130,7 +2396,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await WaitForStreamingStatusAsync(registryStatuses);
             await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -2214,7 +2480,8 @@ public sealed class ComposerActorTests
             },
             status => { lock (registryStatuses) registryStatuses.Add(status); },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             error =>
             {
                 lock (errors) errors.Add(error);
@@ -2225,7 +2492,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // The failure must surface as an error, not a silent finish.
             var error = await errorGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
@@ -2290,7 +2557,8 @@ public sealed class ComposerActorTests
             },
             status => { lock (registryStatuses) registryStatuses.Add(status); },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2298,15 +2566,23 @@ public sealed class ComposerActorTests
         {
             actor.Start();
 
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("first")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
             await firstGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // The save fires inside HandleStreamingCompleteAsync; _isStreaming is cleared by
+            // the terminal sequence AFTER the save returns. Poll briefly for the transition.
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
             Assert.False(GetIsStreaming(actor), "First stream must have terminated");
-            Assert.False(GetTerminated(actor) && GetIsStreaming(actor));
 
             // Second stream must be admitted AND complete (the terminal latch was reset).
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("second")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("second", NewReply<bool>())));
             await secondGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
+            deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
             Assert.Equal(2, saveSessionCalls);
             Assert.False(GetIsStreaming(actor), "Second stream must have terminated too");
 
@@ -2355,10 +2631,14 @@ public sealed class ComposerActorTests
                 lock (registryStatuses) registryStatuses.Add(status);
             },
             _ => { },
-            _ =>
+            () => { },
+            (_, keepStreaming) =>
             {
-                Interlocked.Increment(ref finishedCalls);
-                completedGate.TrySetResult();
+                if (!keepStreaming)
+                {
+                    Interlocked.Increment(ref finishedCalls);
+                    completedGate.TrySetResult();
+                }
             },
             _ => { },
             () => { });
@@ -2366,7 +2646,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
@@ -2420,14 +2700,15 @@ public sealed class ComposerActorTests
             },
             _ => { },
             _ => { },
-            _ => finishedGate.TrySetResult(),
+            () => { },
+            (_, keepStreaming) => { if (!keepStreaming) finishedGate.TrySetResult(); },
             _ => { },
             () => { });
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // Only cancel once the stream is genuinely running — a pre-request cancellation
             // would be vacuous and would not exercise the yield-break exit.
@@ -2467,7 +2748,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2524,7 +2806,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2579,7 +2862,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2617,7 +2901,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2680,14 +2965,15 @@ public sealed class ComposerActorTests
                 // that regressed value — permanently dropping deltas.
                 Thread.Sleep(5);
             },
-            _ => completedGate.TrySetResult(),
+            () => { },
+            (_, keepStreaming) => { if (!keepStreaming) completedGate.TrySetResult(); },
             _ => { },
             () => { });
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
@@ -2731,7 +3017,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2741,7 +3028,7 @@ public sealed class ComposerActorTests
             // handler sets _isStreaming before the compact handler runs. No polling needed.
             var compactReply = NewReply<bool>();
             var partialReply = NewReply<bool>();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
             Assert.True(actor.Tell(new ComposerCompactMessage(compactReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, partialReply, CancellationToken.None)));
 
@@ -2794,10 +3081,14 @@ public sealed class ComposerActorTests
                 if (status == "idle") throw new InvalidOperationException("registry boom");
             },
             _ => { },
-            _ =>
+            () => { },
+            (_, keepStreaming) =>
             {
-                Interlocked.Increment(ref finishedCalls);
-                finishedGate.TrySetResult();
+                if (!keepStreaming)
+                {
+                    Interlocked.Increment(ref finishedCalls);
+                    finishedGate.TrySetResult();
+                }
             },
             _ => { },
             () => { });
@@ -2805,7 +3096,7 @@ public sealed class ComposerActorTests
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             // onStreamingFinished runs AFTER the throwing registry callback — reaching it at
             // all proves the throw did not abort the remaining cleanup.
@@ -2816,7 +3107,7 @@ public sealed class ComposerActorTests
 
             // The actor is still usable: a second stream can be admitted and completed.
             var secondGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var secondActorReady = actor.Tell(new ComposerSendMessageMessage("second"));
+            var secondActorReady = actor.Tell(new ComposerSendMessageMessage("second", NewReply<bool>()));
             Assert.True(secondActorReady, "Actor must still accept messages after a throwing callback");
             _ = secondGate;
         }
@@ -2861,15 +3152,20 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            // Throws BEFORE the overflow-recovery callback in the terminal sequence.
-            _ => throw new InvalidOperationException("finished boom"),
+            () => { },
+            // Throws on the terminal transition (keepStreaming=false), BEFORE the overflow-recovery
+            // callback in the terminal sequence.
+            (_, keepStreaming) =>
+            {
+                if (!keepStreaming) throw new InvalidOperationException("finished boom");
+            },
             _ => { },
             () => recoveryGate.TrySetResult());
 
         try
         {
             actor.Start();
-            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello")));
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await recoveryGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.False(GetIsStreaming(actor), "State must be reset even when a callback throws");
@@ -2923,7 +3219,8 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -2981,7 +3278,8 @@ public sealed class ComposerActorTests
             },
             status => registryStatuses.Add(status),
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -3038,7 +3336,8 @@ public sealed class ComposerActorTests
             },
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -3111,7 +3410,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3176,7 +3476,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3241,7 +3542,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3309,7 +3611,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3374,7 +3677,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3439,7 +3743,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => Interlocked.Increment(ref startedCalls),
@@ -3506,7 +3811,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => isCompacting = true,
@@ -3577,7 +3883,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onCompactingStarted: () => isCompacting = true,
@@ -3633,7 +3940,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
@@ -3682,7 +3990,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
@@ -3727,7 +4036,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
@@ -3780,7 +4090,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
@@ -3846,7 +4157,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSubmitAnswer: SubmitAnswerInternal,
@@ -3912,7 +4224,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSubmitAnswer: answer =>
@@ -3964,7 +4277,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { });
 
@@ -4003,7 +4317,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             logger);
@@ -4057,7 +4372,8 @@ public sealed class ComposerActorTests
             _ => Task.CompletedTask,
             _ => { },
             _ => { },
-            _ => { },
+            () => { },
+            (_, _) => { },
             _ => { },
             () => { },
             onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
@@ -4093,6 +4409,1250 @@ public sealed class ComposerActorTests
         }
         finally
         {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Active notifications: SendActiveNotificationMessage ──
+
+    [Fact]
+    public async Task SendActiveNotification_WhenIdle_StartsStreamingImmediately()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("notification reply");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var startedCalls = 0;
+        var transitionCalls = new List<(int ToolCalls, bool KeepStreaming)>();
+        var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => registryStatuses.Add(status),
+            _ => { },
+            () => Interlocked.Increment(ref startedCalls),
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) completedGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage("{{CHV1:E0|}}[System Notification] test")));
+
+            await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+            Assert.False(GetIsStreaming(actor));
+            Assert.Equal(["streaming", "idle"], registryStatuses);
+
+            // Exactly one final transition with keepStreaming=false.
+            lock (transitionCalls)
+            {
+                Assert.Single(transitionCalls);
+                Assert.False(transitionCalls[0].KeepStreaming);
+            }
+            Assert.True(GetTerminalCleanupDone(actor));
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SendActiveNotification_WhileStreaming_QueuesAndStartsAfterTerminalTransition()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var startedCalls = 0;
+        var streamStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => registryStatuses.Add(status),
+            _ => { },
+            () =>
+            {
+                var n = Interlocked.Increment(ref startedCalls);
+                if (n == 1) streamStartGate.TrySetResult();
+                if (n == 2) secondStartGate.TrySetResult();
+            },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            // First stream blocks.
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
+            await streamStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Second notification is queued while streaming.
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage("{{CHV1:E0|}}[System Notification] queued")));
+
+            // Release the first stream — the queued notification starts immediately after.
+            blockingClient.Release();
+            await secondStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Let the second stream finish too.
+            blockingClient.Release();
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, startedCalls);
+            Assert.False(GetIsStreaming(actor));
+            Assert.True(GetTerminalCleanupDone(actor));
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// The notification queue is bounded at 10 with OLDEST-first eviction. Twelve
+    /// notifications (n0…n11) are enqueued while a stream is in flight; n0 and n1 — the two
+    /// OLDEST — must be dropped, and the retained n2…n11 must execute in FIFO order.
+    /// <para>
+    /// Removal-proof by construction: the assertions are on the exact wrapped prompts the
+    /// streaming client received, so the test fails if the queue drops the NEWEST entries,
+    /// drops arbitrary entries, reorders the retained ones, or admits more than ten. A test
+    /// that only counted eleven starts would pass under every one of those defects.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SendActiveNotification_WhileStreaming_QueueBoundedAt10_DropsOldestAndPreservesFifo()
+    {
+        var stateDir = CreateTempDir();
+
+        // 1 user send + 10 retained notifications = 11 requests expected.
+        const int expectedRequests = 11;
+        var client = new RecordingBlockingClient(expectedRequests);
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var startedCalls = 0;
+        var firstStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { if (status == "idle") idleGate.TrySetResult(); },
+            _ => { },
+            () =>
+            {
+                if (Interlocked.Increment(ref startedCalls) == 1) firstStartGate.TrySetResult();
+            },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        // Wrapped notification text for index i, exactly as the facade would build it.
+        static string Wrapped(int i) => $"{{{{CHV1:E0|}}}}[System Notification] n{i}";
+
+        try
+        {
+            actor.Start();
+
+            // A user send occupies the actor so every notification below is QUEUED, never
+            // started immediately.
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("user-send", NewReply<bool>())));
+            await firstStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Enqueue 12 notifications while the actor is busy. All are Tell'd BEFORE any
+            // release, so the mailbox handles all 12 enqueues against the same live stream —
+            // the drop decision is therefore genuinely the queue bound, not a timing artifact.
+            for (var i = 0; i < 12; i++)
+                Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage(Wrapped(i))));
+
+            // Release generously: each queued notification chains as the previous completes.
+            client.Release(expectedRequests + 4);
+
+            await client.AllEntered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            var prompts = client.Prompts;
+
+            // Exactly 11 requests: the user send plus the 10 retained notifications.
+            Assert.Equal(expectedRequests, prompts.Count);
+            Assert.Equal("user-send", prompts[0]);
+
+            // THE EVICTION ASSERTION: n2…n11 ran, in FIFO order.
+            var expected = Enumerable.Range(2, 10).Select(Wrapped).ToList();
+            Assert.Equal(expected, prompts.Skip(1).ToList());
+
+            // THE DROP ASSERTION: the two OLDEST never executed.
+            Assert.DoesNotContain(Wrapped(0), prompts);
+            Assert.DoesNotContain(Wrapped(1), prompts);
+
+            Assert.Equal(expectedRequests, startedCalls);
+            Assert.False(GetIsStreaming(actor));
+            Assert.True(GetTerminalCleanupDone(actor));
+        }
+        finally
+        {
+            client.Release(32);
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SendMessage_WhileStreaming_ReplyFalse_AndNoStreamStarted()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var streamStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => registryStatuses.Add(status),
+            _ => { },
+            () => streamStartGate.TrySetResult(),
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
+            await streamStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Second send while streaming must reply false.
+            var secondReply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("second", secondReply)));
+            Assert.False(await AwaitReplyAsync(secondReply), "Second send while streaming must reply false");
+
+            // No second stream started.
+            Assert.Equal(1, registryStatuses.Count(s => s == "streaming"));
+
+            blockingClient.Release();
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SendMessage_ReplyCompletesAfterStreamingStarted()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var startedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => startedGate.TrySetResult(),
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", reply)));
+
+            // The reply completes AFTER StartStream, so _onStreamingStarted must already
+            // have fired by the time the reply is observable.
+            Assert.True(await AwaitReplyAsync(reply));
+            Assert.True(startedGate.Task.IsCompleted,
+                "_onStreamingStarted must fire before the send reply completes");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task CancelReply_SendMessage_TrySetCanceled()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            var method = typeof(ComposerActor).GetMethod("CancelReply", PrivateFlags)
+                ?? throw new InvalidOperationException("CancelReply not found on ComposerActor");
+
+            var reply = NewReply<bool>();
+            method.Invoke(actor, [new ComposerSendMessageMessage("msg", reply)]);
+
+            Assert.True(reply.Task.IsCanceled, "CancelReply must cancel the send reply");
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task OnUnhandledException_SendMessage_TrySetException()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hi");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            var method = typeof(ComposerActor).GetMethod("OnUnhandledException", PrivateFlags)
+                ?? throw new InvalidOperationException("OnUnhandledException not found on ComposerActor");
+
+            var reply = NewReply<bool>();
+            var ex = new InvalidOperationException("send handler boom");
+            method.Invoke(actor, [new ComposerSendMessageMessage("msg", reply), ex]);
+
+            Assert.True(reply.Task.IsFaulted, "OnUnhandledException must fault the send reply");
+            Assert.Same(ex, reply.Task.Exception!.InnerException);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Terminal sequence: transition ordering and latches ──
+
+    [Fact]
+    public async Task TerminalSequence_TransitionFiresBeforeRegistryIdle()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var order = new List<string>();
+        var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { lock (order) order.Add($"registry:{status}"); },
+            _ => { },
+            () => { lock (order) order.Add("started"); },
+            (tc, keep) =>
+            {
+                lock (order) order.Add($"transition:{tc}:{keep}");
+                if (!keep) completedGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            List<string> snapshot;
+            lock (order) snapshot = [.. order];
+            // started → streaming registry → transition(false) → idle registry
+            Assert.Contains("started", snapshot);
+            Assert.Contains("registry:streaming", snapshot);
+            var transitionIdx = snapshot.FindIndex(s => s.StartsWith("transition:", StringComparison.Ordinal));
+            var idleIdx = snapshot.FindIndex(s => s == "registry:idle");
+            Assert.True(transitionIdx >= 0, "transition must fire");
+            Assert.True(idleIdx > transitionIdx, "transition must fire BEFORE registry idle");
+            Assert.Equal("transition:0:False", snapshot[transitionIdx]);
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task TerminalCleanupDone_LatchSetExactlyOnce_AfterFinalTransition()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var transitionCalls = 0;
+        var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (_, keep) =>
+            {
+                Interlocked.Increment(ref transitionCalls);
+                if (!keep) completedGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, transitionCalls);
+            Assert.True(GetTerminalCleanupDone(actor), "_terminalCleanupDone must be set after the final transition");
+
+            // A second stream resets the latch.
+            var secondGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondActor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, keep) => { if (!keep) secondGate.TrySetResult(); },
+                _ => { },
+                () => { });
+            secondActor.Start();
+            Assert.True(secondActor.Tell(new ComposerSendMessageMessage("second", NewReply<bool>())));
+            await secondGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await secondActor.DisposeAsync();
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Shutdown: OnShutdownAsync skips transition when _terminalCleanupDone ──
+
+    [Fact]
+    public async Task DisposeAfterCompletedStream_DoesNotDoubleTransition()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var transitionCalls = new List<(int, bool)>();
+        var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) completedGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.True(GetTerminalCleanupDone(actor));
+
+            // Disposing after a completed stream must NOT fire another transition.
+            await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (transitionCalls)
+            {
+                Assert.Single(transitionCalls);
+                Assert.False(transitionCalls[0].Item2, "Final transition must have keepStreaming=false");
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Shutdown_WhileStreaming_OnShutdownAsyncRunsTransition()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var transitionCalls = new List<(int, bool)>();
+        var startedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { lock (registryStatuses) registryStatuses.Add(status); },
+            _ => { },
+            () => startedGate.TrySetResult(),
+            (tc, keep) => { lock (transitionCalls) transitionCalls.Add((tc, keep)); },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+            await startedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Dispose while streaming: the mailbox drains without handling the terminal
+            // message, and OnShutdownAsync runs the final transition.
+            await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (transitionCalls)
+            {
+                Assert.Single(transitionCalls);
+                Assert.False(transitionCalls[0].Item2, "Shutdown transition must have keepStreaming=false");
+            }
+            lock (registryStatuses) Assert.Contains("idle", registryStatuses);
+            Assert.True(GetTerminalCleanupDone(actor));
+            Assert.False(GetIsStreaming(actor));
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Failed-Tell fallback: cohesive block with correct toolCalls ──
+
+    /// <summary>
+    /// MAILBOX path: the completion terminal must forward
+    /// <c>ComposerStreamingCompleteMessage.LastToolCalls</c> verbatim to the transition
+    /// callback. The fake emits three REAL tool calls, so the agent reports
+    /// <c>ToolCallCount == 3</c> and the transition must observe exactly 3.
+    /// <para>
+    /// Removal-proof: a completion path that hardcoded 0 (or forwarded the error path's 0)
+    /// fails this assertion. The previous version of this test expected 0 and therefore
+    /// passed under exactly that defect.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CompletionPath_MailboxTerminal_ForwardsNonZeroLastToolCalls()
+    {
+        var stateDir = CreateTempDir();
+        const int expectedToolCalls = 3;
+        var client = new ToolCallsThenGatedStopClient(expectedToolCalls, gateFinalRequest: false);
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => client,
+            tools: [ToolCallsThenGatedStopClient.CreateTool()]);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var transitionCalls = new List<(int ToolCalls, bool KeepStreaming)>();
+        var terminalGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) terminalGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("run tools", NewReply<bool>())));
+
+            await terminalGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (transitionCalls)
+            {
+                var final = Assert.Single(transitionCalls);
+                Assert.Equal(expectedToolCalls, final.ToolCalls);
+                Assert.False(final.KeepStreaming);
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// FAILED-TELL FALLBACK path: when the COMPLETION terminal <c>Tell</c> is REJECTED (the
+    /// mailbox closed during shutdown), the streaming task's fallback must still forward the
+    /// completion message's <c>LastToolCalls</c> — not 0 — to the transition callback.
+    /// <para>
+    /// Removal-proof: the fallback's <c>toolCalls</c> switch is the code under test. If the
+    /// completion arm were changed to hardcode 0 (matching the error arm), this fails. The
+    /// pre-existing fallback test covered only the ERROR path, which legitimately expects 0,
+    /// so it could not detect that defect.
+    /// </para>
+    /// <para>
+    /// Determinism — the ordering is forced so the stream completes NORMALLY into a closed
+    /// mailbox (a cancelled stream would post <c>Complete(0, …, cancelled: true)</c> and prove
+    /// nothing):
+    /// </para>
+    /// <list type="number">
+    /// <item>The tool calls execute, then the client emits one text delta and parks on a gate
+    /// that deliberately ignores the cancellation token.</item>
+    /// <item>The delta's update handler OCCUPIES the mailbox loop (the test blocks inside
+    /// <c>onStreamingUpdate</c>), so the loop cannot reach <c>OnShutdownAsync</c>.</item>
+    /// <item><c>DisposeAsync</c> starts in the background: it closes the mailbox, but because
+    /// the loop is still parked it has NOT yet cancelled/awaited anything the stream observes.</item>
+    /// <item>The client gate is released, so the stream completes normally with the real
+    /// <c>ToolCallCount</c>; its terminal <c>Tell</c> is REJECTED and the fallback runs.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task CompletionPath_TellFailsFallback_ForwardsNonZeroLastToolCalls()
+    {
+        var stateDir = CreateTempDir();
+        const int expectedToolCalls = 3;
+        var client = new ToolCallsThenGatedStopClient(
+            expectedToolCalls, gateFinalRequest: true, finalDelta: "delta");
+        var service = CreateService(
+            stateDir,
+            chatClientFactory: _ => client,
+            tools: [ToolCallsThenGatedStopClient.CreateTool()]);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var transitionCalls = new List<(int ToolCalls, bool KeepStreaming)>();
+        var saveSessionCalls = 0;
+
+        // Rendezvous: the mailbox loop is held inside the update handler.
+        var updateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseUpdate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ =>
+            {
+                Interlocked.Increment(ref saveSessionCalls);
+                return Task.CompletedTask;
+            },
+            status => { lock (registryStatuses) registryStatuses.Add(status); },
+            _ =>
+            {
+                // Runs on the MAILBOX LOOP: occupy it so it cannot reach OnShutdownAsync.
+                updateEntered.TrySetResult();
+                releaseUpdate.Task.Wait(TimeSpan.FromSeconds(30));
+            },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) cleanupGate.TrySetResult();
+            },
+            _ => { },
+            () => { });
+
+        var disposeTask = Task.CompletedTask;
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("run tools", NewReply<bool>())));
+
+            // 1. Tool calls executed; the completing request emitted its delta and is parked.
+            await client.FinalEntered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // 2. The mailbox loop is now parked inside the update handler.
+            await updateEntered.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // 3. Begin disposal: closes the mailbox. The loop is still blocked in the update
+            //    callback, so OnShutdownAsync has NOT started.
+            disposeTask = actor.DisposeAsync().AsTask();
+
+            // 4. Let the stream complete normally into the now-closed mailbox. Its terminal
+            //    Tell is rejected, so the fallback owns the terminal sequence.
+            client.ReleaseFinal();
+            await cleanupGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // THE ASSERTION: the fallback forwarded the completion's REAL tool-call count.
+            lock (transitionCalls)
+            {
+                var final = Assert.Single(transitionCalls);
+                Assert.Equal(expectedToolCalls, final.ToolCalls);
+                Assert.False(final.KeepStreaming);
+            }
+
+            // The fallback also ran the shared terminal HANDLER: a normal (non-cancelled,
+            // non-overflow) completion saves the session.
+            Assert.Equal(1, saveSessionCalls);
+
+            // Release the loop so disposal can finish, then verify the cohesive cleanup.
+            releaseUpdate.TrySetResult();
+            await disposeTask.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (registryStatuses) Assert.Equal(1, registryStatuses.Count(s => s == "idle"));
+            Assert.True(GetTerminalCleanupDone(actor));
+            Assert.False(GetIsStreaming(actor));
+            Assert.Null(GetStreamingCts(actor));
+
+            // Exactly ONE transition overall — OnShutdownAsync skipped it (latch closed).
+            lock (transitionCalls) Assert.Single(transitionCalls);
+        }
+        finally
+        {
+            releaseUpdate.TrySetResult();
+            client.ReleaseFinal();
+            try { await disposeTask; } catch (Exception) { /* asserted above */ }
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// The error path passes 0 to the transition callback.
+    /// </summary>
+    [Fact]
+    public async Task ErrorPath_TransitionGetsZero()
+    {
+        var stateDir = CreateTempDir();
+        var mockClient = new Mock<IChatClient>();
+        mockClient
+            .Setup(c => c.GetStreamingResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .Throws(new InvalidOperationException("stream failure"));
+        mockClient
+            .Setup(c => c.GetResponseAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(),
+                It.IsAny<ChatOptions?>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("stream failure"));
+
+        var service = CreateService(stateDir, chatClientFactory: _ => mockClient.Object);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var transitionCalls = new List<(int, bool)>();
+        var terminalGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) terminalGate.TrySetResult();
+            },
+            error => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            // Wait for the terminal transition to fire.
+            await terminalGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (transitionCalls)
+            {
+                var final = transitionCalls.Last();
+                Assert.Equal(0, final.Item1);
+                Assert.False(final.Item2);
+            }
+        }
+        finally
+        {
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Race: user send always gets explicit reply (both orderings, AC17) ──
+
+    /// <summary>
+    /// Race ordering 1 (send-then-notification): a user send that arrives while the actor is
+    /// IDLE must be admitted with an explicit <c>true</c> reply, and an active notification
+    /// racing immediately behind it must be QUEUED (never dropped, never starting a second
+    /// concurrent stream) and must chain afterwards.
+    /// <para>
+    /// Determinism: both messages are enqueued BEFORE <c>Start()</c>, so the mailbox's FIFO
+    /// ordering guarantees the send handler runs first and the notification handler second —
+    /// the race outcome is forced rather than raced.
+    /// </para>
+    /// <para>
+    /// Removal-proof: the assertions are (a) the user reply is exactly <c>true</c>, (b) only
+    /// ONE stream is live while the notification waits, and (c) the notification's exact
+    /// wrapped prompt is executed afterwards. A regression that dropped the racing
+    /// notification, replied <c>false</c> to the admitted send, or ran both concurrently fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SendMessageThenActiveNotification_SendGetsTrueReply_AndNotificationChainsAfter()
+    {
+        var stateDir = CreateTempDir();
+
+        // 1 user send + 1 chained notification.
+        const int expectedRequests = 2;
+        var client = new RecordingBlockingClient(expectedRequests);
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        const string notificationText = "{{CHV1:E0|}}[System Notification] goal completed";
+
+        var startedCalls = 0;
+        var firstStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { if (status == "idle") idleGate.TrySetResult(); },
+            _ => { },
+            () =>
+            {
+                var n = Interlocked.Increment(ref startedCalls);
+                if (n == 1) firstStartGate.TrySetResult();
+                if (n == 2) secondStartGate.TrySetResult();
+            },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            // FORCED ORDERING: enqueue send FIRST, notification SECOND, then start the loop.
+            var sendReply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("user-send", sendReply)));
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage(notificationText)));
+
+            actor.Start();
+
+            // (a) The user send was ADMITTED — explicit true, never a silent drop.
+            Assert.True(await AwaitReplyAsync(sendReply),
+                "A user send admitted while idle must receive an explicit true reply");
+
+            // Gate on the CLIENT actually receiving request 1 — _onStreamingStarted fires in
+            // StartStream, before the background streaming task runs, so it cannot be used to
+            // observe the prompt.
+            await client.WaitForRequestsAsync(1).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await firstStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // (b) The racing notification did NOT start a second concurrent stream: it is
+            //     queued behind the admitted user send.
+            Assert.Equal(1, startedCalls);
+            Assert.Equal(1, GetPendingNotificationCount(actor));
+            Assert.Equal(["user-send"], client.Prompts);
+
+            // Release the user stream; the queued notification chains immediately after.
+            client.Release(expectedRequests + 2);
+            await secondStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await client.AllEntered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // (c) The notification really ran, with its exact wrapped text, AFTER the send.
+            Assert.Equal(["user-send", notificationText], client.Prompts);
+            Assert.Equal(expectedRequests, startedCalls);
+            Assert.Equal(0, GetPendingNotificationCount(actor));
+            Assert.False(GetIsStreaming(actor));
+        }
+        finally
+        {
+            client.Release(8);
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Race ordering 2 (notification-then-send): an active notification starts streaming while
+    /// idle, and a user send that arrives WHILE the notification stream is active must get an
+    /// explicit false reply — never a silent drop. Both <c>ComposerSendMessageMessage</c> and
+    /// <c>ComposerSendActiveNotificationMessage</c> call the same <c>StartStream</c>, so
+    /// <c>_isStreaming</c> is true regardless of which message started the stream. The send
+    /// handler checks <c>_isStreaming</c> and replies <c>false</c> authoritatively.
+    /// </summary>
+    [Fact]
+    public async Task SendActiveNotificationThenSendMessage_SendGetsExplicitFalseReply()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var startedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () => startedGate.TrySetResult(),
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            // 1. A notification starts streaming immediately (idle → StartStream).
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage(
+                "{{CHV1:E0|}}[System Notification] goal completed")));
+            await startedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            Assert.True(GetIsStreaming(actor), "Notification must start streaming when idle");
+
+            // 2. A user send that arrives while the notification stream is active must get an
+            //    explicit false reply — never a silent drop.
+            var sendReply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("user message", sendReply)));
+            Assert.False(await AwaitReplyAsync(sendReply),
+                "User send while a notification is streaming must get explicit false reply");
+
+            // 3. No second stream started — the notification stream is still the only one.
+            Assert.True(GetIsStreaming(actor), "Only the notification stream should be active");
+
+            // Cleanup: release the blocking client and wait for idle.
+            blockingClient.Release();
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+            Assert.False(GetIsStreaming(actor), "Streaming must finish after release");
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Cancellation continues the queue; shutdown discards it ──
+
+    [Fact]
+    public async Task CancelStreaming_QueuedNotification_StillStartsAfterCancelledStream()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var startedCalls = 0;
+        var firstStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () =>
+            {
+                var n = Interlocked.Increment(ref startedCalls);
+                if (n == 1) firstStartGate.TrySetResult();
+                if (n == 2) secondStartGate.TrySetResult();
+            },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            // First stream blocks.
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
+            await firstStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Queue a notification while streaming.
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage("{{CHV1:E0|}}[System Notification] queued")));
+
+            // Cancel the first stream — the queued notification must still start.
+            actor.Tell(new ComposerCancelStreamingMessage());
+            blockingClient.Release();
+
+            // The queued notification starts (and blocks on the same semaphore).
+            await secondStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Release it to finish.
+            blockingClient.Release();
+            var deadline = DateTime.UtcNow.Add(Timeout);
+            while (GetIsStreaming(actor) && DateTime.UtcNow < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, startedCalls);
+            Assert.False(GetIsStreaming(actor));
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task Shutdown_DiscardsQueuedNotifications()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var startedCalls = 0;
+        var firstStartGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            _ => { },
+            _ => { },
+            () =>
+            {
+                var n = Interlocked.Increment(ref startedCalls);
+                if (n == 1) firstStartGate.TrySetResult();
+            },
+            (_, _) => { },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+
+            // First stream blocks.
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("first", NewReply<bool>())));
+            await firstStartGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Queue notifications.
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage("{{CHV1:E0|}}[System Notification] q1")));
+            Assert.True(actor.Tell(new ComposerSendActiveNotificationMessage("{{CHV1:E0|}}[System Notification] q2")));
+
+            // Shutdown discards the queue — no more streams start.
+            await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, startedCalls);
+        }
+        finally
+        {
+            blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Failed-Tell fallback: cohesive block ──
+
+    /// <summary>
+    /// When the terminal Tell is REJECTED (mailbox closed during shutdown), the fallback must
+    /// invoke the shared terminal handler (save/overflow/error callbacks) and then perform the
+    /// cohesive cleanup (CTS dispose, _isStreaming=false, queue clear, transition, idle,
+    /// latch). The transition must receive the correct toolCalls from the terminal message.
+    /// </summary>
+    [Fact]
+    public async Task TellFails_CohesiveBlock_RunsHandlerThenCleanupWithCorrectToolCalls()
+    {
+        var stateDir = CreateTempDir();
+        var failure = new InvalidOperationException("tell-fail error");
+        var client = new BlockOnCancelThenThrowClient(failure);
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var transitionCalls = new List<(int, bool)>();
+        var errors = new List<string>();
+        var cleanupGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { lock (registryStatuses) registryStatuses.Add(status); },
+            _ => { },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+                if (!keep) cleanupGate.TrySetResult();
+            },
+            error => { lock (errors) errors.Add(error); },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            await WaitForStreamingStatusAsync(registryStatuses);
+            await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Dispose while the client is blocked: the terminal Tell is rejected.
+            await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            await cleanupGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // The error callback ran (handler invoked).
+            lock (errors) Assert.Single(errors);
+
+            // Transition fired with toolCalls=0 (error path), keepStreaming=false.
+            lock (transitionCalls)
+            {
+                var final = Assert.Single(transitionCalls);
+                Assert.Equal(0, final.Item1);
+                Assert.False(final.Item2);
+            }
+
+            // Idle registry + latch.
+            lock (registryStatuses)
+            {
+                Assert.Equal(1, registryStatuses.Count(s => s == "idle"));
+            }
+            Assert.True(GetTerminalCleanupDone(actor));
+            Assert.False(GetIsStreaming(actor));
+            Assert.Null(GetStreamingCts(actor));
+        }
+        finally
+        {
+            client.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// When the terminal Tell is REJECTED and the mailbox's OnShutdownAsync runs, it must
+    /// SKIP the transition if the fallback already performed the final cleanup (_terminalCleanupDone).
+    /// </summary>
+    [Fact]
+    public async Task TellFails_FallbackCleanup_OnShutdownAsyncSkipsTransition()
+    {
+        var stateDir = CreateTempDir();
+        var blockingClient = new BlockingStreamingClient();
+        var service = CreateService(stateDir, chatClientFactory: _ => blockingClient);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var transitionCalls = new List<(int, bool)>();
+        var idleGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status =>
+            {
+                if (status == "idle") idleGate.TrySetResult();
+            },
+            _ => { },
+            () => { },
+            (tc, keep) => { lock (transitionCalls) transitionCalls.Add((tc, keep)); },
+            _ => { },
+            () => { });
+
+        try
+        {
+            actor.Start();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
+
+            // Dispose while blocked — the terminal Tell is rejected and the fallback runs.
+            await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Exactly ONE transition: the fallback's, not OnShutdownAsync's.
+            lock (transitionCalls) Assert.Single(transitionCalls);
+            Assert.True(GetTerminalCleanupDone(actor));
+        }
+        finally
+        {
+            blockingClient.Release();
             await actor.DisposeAsync();
             await service.DisposeAsync();
             TryDeleteDir(stateDir);

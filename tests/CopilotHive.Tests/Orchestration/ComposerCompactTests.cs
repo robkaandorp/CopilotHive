@@ -71,6 +71,16 @@ public sealed class ComposerCompactTests
             ?? throw new InvalidOperationException("_agentService was null");
     }
 
+    /// <summary>Test seam: sets the facade's volatile _isStreaming flag via reflection.</summary>
+    private static void SetFacadeStreaming(Composer composer, bool isStreaming)
+    {
+        var field = typeof(Composer).GetField(
+            "_isStreaming",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_isStreaming field not found on Composer");
+        field.SetValue(composer, isStreaming);
+    }
+
     /// <summary>
     /// Creates a standalone <see cref="Composer"/> with a mock chat client that returns
     /// a summary response from <see cref="IChatClient.GetResponseAsync"/>. The Composer
@@ -383,7 +393,7 @@ public sealed class ComposerCompactTests
             Assert.False(composer.IsStreaming, "Streaming should have finished after the error");
 
             // Manually set _isStreaming to true to simulate an active stream.
-            composer.SetStreamingStateForTest(true);
+            SetFacadeStreaming(composer, true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -393,7 +403,7 @@ public sealed class ComposerCompactTests
             finally
             {
                 // Cleanup: reset _isStreaming so the Composer doesn't hang.
-                composer.SetStreamingStateForTest(false);
+                SetFacadeStreaming(composer, false);
             }
         }
         finally
@@ -621,7 +631,7 @@ public sealed class ComposerCompactTests
             Assert.False(composer.IsStreaming, "Streaming should have finished after the error");
 
             // Manually set _isStreaming to true to simulate an active stream.
-            composer.SetStreamingStateForTest(true);
+            SetFacadeStreaming(composer, true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -631,7 +641,7 @@ public sealed class ComposerCompactTests
             finally
             {
                 // Cleanup: reset _isStreaming so the Composer doesn't hang.
-                composer.SetStreamingStateForTest(false);
+                SetFacadeStreaming(composer, false);
             }
         }
         finally

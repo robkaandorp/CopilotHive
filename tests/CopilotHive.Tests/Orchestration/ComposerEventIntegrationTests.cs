@@ -19,7 +19,7 @@ using SharpCoder;
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
-/// Integration tests for <see cref="Composer.SendMessageWithEvents"/> event-block prepending,
+/// Integration tests for <see cref="Composer.SendMessageWithEventsAsync"/> event-block prepending,
 /// <see cref="Composer.TrySplitEventBlock"/> envelope splitting, and event restoration on
 /// rejection. Uses a real <see cref="Composer"/> with a fake chat client injected via
 /// reflection (same pattern as <see cref="ComposerStreamingServiceTests"/>).
@@ -33,7 +33,7 @@ public sealed class ComposerEventIntegrationTests
 
     /// <summary>
     /// Builds a length-delimited envelope-wrapped message exactly as
-    /// <see cref="Composer.SendMessageWithEvents"/> does: the envelope header (with the
+    /// <see cref="Composer.SendMessageWithEventsAsync"/> does: the envelope header (with the
     /// invariant-culture event-block length) followed by the event block and closing
     /// <c>}}</c>, then the user message.
     /// </summary>
@@ -561,7 +561,7 @@ public sealed class ComposerEventIntegrationTests
             var client = new CapturingStreamingClient();
             await InjectFakeChatClient(composer, client);
 
-            var result = composer.SendMessageWithEvents("Please review the latest changes");
+            var result = await composer.SendMessageWithEventsAsync("Please review the latest changes");
 
             await WaitForStreamingCompleteAsync(composer);
 
@@ -600,7 +600,7 @@ public sealed class ComposerEventIntegrationTests
             await InjectFakeChatClient(composer, client);
 
             const string original = "no events here";
-            var result = composer.SendMessageWithEvents(original);
+            var result = await composer.SendMessageWithEventsAsync(original);
 
             await WaitForStreamingCompleteAsync(composer);
 
@@ -634,7 +634,7 @@ public sealed class ComposerEventIntegrationTests
 
             // Do NOT inject a chat client — the agent is null, so the not-connected check
             // in SendMessageWithEvents throws BEFORE admission and BEFORE events are drained.
-            var ex = Assert.Throws<InvalidOperationException>(() => composer.SendMessageWithEvents("test message"));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => composer.SendMessageWithEventsAsync("test message"));
             Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // Events are NOT drained because the check precedes admission — they stay buffered.
@@ -740,7 +740,7 @@ public sealed class ComposerEventIntegrationTests
 
             // The user sends text that looks like an envelope prefix as literal content.
             const string literal = "{{CHV1:E3|abc}}hello";
-            var result = composer.SendMessageWithEvents(literal);
+            var result = await composer.SendMessageWithEventsAsync(literal);
 
             await WaitForStreamingCompleteAsync(composer);
 

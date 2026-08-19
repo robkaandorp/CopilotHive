@@ -331,6 +331,7 @@ else
         Composer.OnCompactingStarted += HandleCompactingStarted;
         Composer.OnCompacted += HandleCompacted;
         Composer.OnSubAgentChanged += HandleSubAgentChanged;
+        Composer.OnActiveInjection += HandleActiveInjection;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -379,7 +380,12 @@ else
                 var (eventBlock, userMessage) = Composer.TrySplitEventBlock(content);
                 if (eventBlock is not null)
                     _messages.Add(new ChatMessage { Role = "system", Content = eventBlock });
-                _messages.Add(new ChatMessage { Role = "user", Content = userMessage });
+                // Active system notifications are E0-envelope-wrapped with a
+                // "[System Notification]" prefix — render them as system messages.
+                if (userMessage.StartsWith("[System Notification]", StringComparison.Ordinal))
+                    _messages.Add(new ChatMessage { Role = "system", Content = userMessage });
+                else
+                    _messages.Add(new ChatMessage { Role = "user", Content = userMessage });
             }
             else
             {
@@ -426,7 +432,7 @@ else
         string? eventBlock = null;
         try
         {
-            eventBlock = Composer.SendMessageWithEvents(text);
+            eventBlock = await Composer.SendMessageWithEventsAsync(text);
         }
         catch (Exception ex)
         {
@@ -440,7 +446,7 @@ else
 
         _messages.Add(new ChatMessage { Role = "user", Content = text });
 
-        // Call Composer.SendMessageWithEvents first. Only after it returns without throwing do we
+        // Call Composer.SendMessageWithEventsAsync first. Only after it returns without throwing do we
         // perform destructive state transitions (MarkAsSent, clear pending/input/error).
         // This keeps _pending and _inputText intact for retry if the call fails.
         if (_pending is not null)
@@ -1055,6 +1061,7 @@ else
         Composer.OnCompactingStarted -= HandleCompactingStarted;
         Composer.OnCompacted -= HandleCompacted;
         Composer.OnSubAgentChanged -= HandleSubAgentChanged;
+        Composer.OnActiveInjection -= HandleActiveInjection;
 
         if (_pasteModule is not null)
         {
@@ -1157,6 +1164,20 @@ else
     private void HandleQuestionAsked()
     {
         InvokeAsync(StateHasChanged);
+    }
+
+    /// <summary>
+    /// Raised when an active system notification was injected: reload history so the
+    /// notification message appears in the chat, then re-render.
+    /// </summary>
+    private void HandleActiveInjection(string _)
+    {
+        InvokeAsync(async () =>
+        {
+            LoadHistory();
+            StateHasChanged();
+            await SyncPasteAllowedAsync();
+        });
     }
 
     private void SelectSingle(string option)

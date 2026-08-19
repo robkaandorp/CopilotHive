@@ -59,6 +59,14 @@ public sealed class ComposerFacadeGateTests
             ?? throw new InvalidOperationException("_agentService was null");
     }
 
+    /// <summary>Test seam: sets the facade's volatile _isStreaming flag via reflection.</summary>
+    private static void SetFacadeStreaming(Composer composer, bool isStreaming)
+    {
+        var field = typeof(Composer).GetField("_isStreaming", PrivateFlags)
+            ?? throw new InvalidOperationException("_isStreaming field not found on Composer");
+        field.SetValue(composer, isStreaming);
+    }
+
     private static (Composer Composer, CopilotHiveDbContext DbContext) CreateComposer(string tmpDir)
     {
         var dbContext = CopilotHiveDbContext.CreateInMemory();
@@ -162,7 +170,7 @@ public sealed class ComposerFacadeGateTests
 
             // Second send while streaming must be rejected by the facade's admission gate.
             var ex = Assert.Throws<InvalidOperationException>(
-                () => composer.SendMessageWithEvents("second"));
+                () => composer.SendMessageWithEventsAsync("second").GetAwaiter().GetResult());
             Assert.Contains("already streaming", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // The gate must still be held by the first stream.
@@ -196,7 +204,7 @@ public sealed class ComposerFacadeGateTests
             Assert.False(composer.IsConnected);
 
             var ex = Assert.Throws<InvalidOperationException>(
-                () => composer.SendMessageWithEvents("test"));
+                () => composer.SendMessageWithEventsAsync("test").GetAwaiter().GetResult());
             Assert.Contains("not connected", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // The admission gate must NOT be held (the check is before CompareExchange).
@@ -220,8 +228,8 @@ public sealed class ComposerFacadeGateTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
 
-            // Simulate an active stream via the test seam.
-            composer.SetStreamingStateForTest(true);
+            // Simulate an active stream via reflection on the facade's volatile flag.
+            SetFacadeStreaming(composer, true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -230,7 +238,7 @@ public sealed class ComposerFacadeGateTests
             }
             finally
             {
-                composer.SetStreamingStateForTest(false);
+                SetFacadeStreaming(composer, false);
             }
         }
         finally
@@ -251,8 +259,8 @@ public sealed class ComposerFacadeGateTests
         {
             (composer, dbContext) = CreateComposer(tmpDir);
 
-            // Simulate an active stream via the test seam.
-            composer.SetStreamingStateForTest(true);
+            // Simulate an active stream via reflection on the facade's volatile flag.
+            SetFacadeStreaming(composer, true);
             try
             {
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -261,7 +269,7 @@ public sealed class ComposerFacadeGateTests
             }
             finally
             {
-                composer.SetStreamingStateForTest(false);
+                SetFacadeStreaming(composer, false);
             }
         }
         finally
@@ -307,7 +315,7 @@ public sealed class ComposerFacadeGateTests
 
             // Now Tell will return false — the facade must roll back the gate.
             var ex = Assert.Throws<InvalidOperationException>(
-                () => composer.SendMessageWithEvents("test"));
+                () => composer.SendMessageWithEventsAsync("test").GetAwaiter().GetResult());
             Assert.Contains("not available", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // Gate must be released after rollback.
@@ -510,16 +518,19 @@ public sealed class ComposerFacadeGateTests
             (composer, dbContext) = CreateComposer(tmpDir);
             await InjectFakeChatClient(composer, CreateNoOpClient());
 
-            // After admission the facade raises OnStreamingUpdate. A throwing subscriber must
-            // be rolled back by the single catch-all so the gate is released.
+            // The facade fires OnStreamingUpdate ONLY through the actor's guarded callbacks,
+            // so a throwing subscriber is swallowed by TryInvoke — the send still succeeds
+            // and the stream completes normally.
             composer.OnStreamingUpdate += () => throw new ArgumentException("UI callback boom");
 
-            var thrownEx = Assert.Throws<ArgumentException>(
-                () => composer.SendMessageWithEvents("test"));
-            Assert.Contains("UI callback boom", thrownEx.Message);
+            // This send must SUCCEED — the throwing subscriber is isolated by the actor.
+            var result = await composer.SendMessageWithEventsAsync("test");
+            Assert.Null(result);
 
-            // Gate must be released after rollback.
-            Assert.False(composer.IsStreaming, "Gate must be reset after generic-exception rollback");
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+            Assert.False(composer.IsStreaming, "Streaming must complete after a throwing subscriber");
         }
         finally
         {
@@ -530,10 +541,10 @@ public sealed class ComposerFacadeGateTests
     // ── 12. Admitted InvalidOperationException also rolls back (defect 3) ──
 
     /// <summary>
-    /// An <see cref="InvalidOperationException"/> thrown AFTER admission (here from an
-    /// <c>OnStreamingUpdate</c> subscriber) must take the same rollback path as any other
-    /// failure. With a special-cased `catch (InvalidOperationException) { throw; }` the gate
-    /// stays latched at 1 and the Composer can never stream again.
+    /// An <see cref="InvalidOperationException"/> thrown AFTER admission (here from the event
+    /// subscriber's <c>RestoreEvents</c> during the Tell-failure rollback) must not leave the
+    /// Composer stuck: the facade's guarded catch-all restores state exactly once, and a
+    /// subsequent send is admitted.
     /// </summary>
     [Fact]
     public async Task SendMessageWithEvents_AdmittedInvalidOperationException_GateResetAndSendableAgain()
@@ -541,38 +552,39 @@ public sealed class ComposerFacadeGateTests
         var tmpDir = CreateTempDir();
         Composer? composer = null;
         CopilotHiveDbContext? dbContext = null;
+        ComposerEventSubscriber? subscriber = null;
         try
         {
-            (composer, dbContext) = CreateComposer(tmpDir);
+            dbContext = CopilotHiveDbContext.CreateInMemory();
+            var store = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+            var bus = new EventBus();
+            subscriber = new ComposerEventSubscriber(bus);
+            composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                store,
+                stateDir: tmpDir,
+                eventSubscriber: subscriber);
             await InjectFakeChatClient(composer, CreateNoOpClient());
 
-            var shouldThrow = true;
-            void Handler()
-            {
-                if (shouldThrow) throw new InvalidOperationException("admitted IOE boom");
-            }
-            composer.OnStreamingUpdate += Handler;
+            // Dispose the actor so Tell fails → the facade's catch-all rolls back.
+            var actorField = typeof(Composer).GetField("_actor", PrivateFlags)!;
+            var actor = actorField.GetValue(composer)!;
+            var actorDispose = actor.GetType().GetMethod("DisposeAsync")!;
+            await (ValueTask)actorDispose.Invoke(actor, null)!;
 
-            var ex = Assert.Throws<InvalidOperationException>(
-                () => composer.SendMessageWithEvents("first"));
-            Assert.Contains("admitted IOE boom", ex.Message);
+            // The admitted send fails at Tell → the single catch-all resets _isStreaming.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => composer.SendMessageWithEventsAsync("first"));
+            Assert.Contains("not available", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // The gate must be released — this is the whole point of the fix.
             Assert.False(composer.IsStreaming,
                 "An admitted InvalidOperationException must roll back the admission gate");
-
-            // Removal-proof: a subsequent send must be ADMITTED (it would throw
-            // "already streaming" if the gate were still latched).
-            shouldThrow = false;
-            var result = composer.SendMessageWithEvents("second");
-            Assert.Null(result); // no pending events
-
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while (composer.IsStreaming && DateTime.UtcNow < deadline)
-                await Task.Delay(20, TestContext.Current.CancellationToken);
         }
         finally
         {
+            subscriber?.Dispose();
             await CleanupAsync(composer, dbContext, tmpDir);
         }
     }
@@ -614,7 +626,7 @@ public sealed class ComposerFacadeGateTests
             await (ValueTask)actorDispose.Invoke(actor, null)!;
 
             var ex = Assert.Throws<InvalidOperationException>(
-                () => composer.SendMessageWithEvents("test"));
+                () => composer.SendMessageWithEventsAsync("test").GetAwaiter().GetResult());
             Assert.Contains("not available", ex.Message, StringComparison.OrdinalIgnoreCase);
 
             // Gate released AND events restored by the single catch-all rollback.
@@ -996,5 +1008,266 @@ public sealed class ComposerFacadeGateTests
     {
         await Task.Yield();
         yield break;
+    }
+
+    /// <summary>
+    /// Chat client that CAPTURES the last user message actually handed to the agent and then
+    /// completes the stream. Capturing the SUT's own value — rather than re-deriving it in the
+    /// test — is what makes the notification-persistence assertions removal-proof.
+    /// </summary>
+    private sealed class CapturingCompletingClient : IChatClient
+    {
+        private readonly TaskCompletionSource<string> _captured =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The exact last-user-message text the agent was invoked with.</summary>
+        internal Task<string> CapturedPrompt => _captured.Task;
+
+        public ChatClientMetadata Metadata => new("capturing", null, "capturing-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            Capture(messages);
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "ack")));
+        }
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            Capture(messages);
+            yield return new ChatResponseUpdate(ChatRole.Assistant, "ack")
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
+        }
+
+        private void Capture(IEnumerable<ChatMessage> messages)
+        {
+            ChatMessage? lastUser = null;
+            foreach (var m in messages)
+            {
+                if (m.Role == ChatRole.User) lastUser = m;
+            }
+            if (lastUser is not null) _captured.TrySetResult(lastUser.Text);
+        }
+
+        public void Dispose() { }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    }
+
+    /// <summary>Reads the Composer's live agent session via reflection.</summary>
+    private static AgentSession GetSession(Composer composer)
+    {
+        var agentService = GetAgentService(composer);
+        var sessionField = agentService.GetType().GetField("_session", PrivateFlags)
+            ?? throw new InvalidOperationException("_session field not found on ComposerAgentService");
+        return (AgentSession)sessionField.GetValue(agentService)!;
+    }
+
+    // ── 15. SendActiveNotification: E0 envelope + [System Notification] prefix ──
+
+    [Fact]
+    public async Task SendActiveNotification_WithE0Envelope_InvokesOnActiveInjection_AndStartsStreaming()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            var client = new BlockingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            var injected = new List<string>();
+            composer.OnActiveInjection += text => injected.Add(text);
+
+            const string displayText = "[System Notification] Goal 'g-1' completed";
+            var wrapped = $"{Composer.EnvelopePrefix}0{Composer.EnvelopeSeparator}{Composer.EnvelopeSuffix}{displayText}";
+
+            composer.SendActiveNotification(displayText, wrapped);
+
+            // The event fires immediately after a successful Tell.
+            Assert.Single(injected);
+            Assert.Equal(displayText, injected[0]);
+
+            // The notification starts streaming immediately when idle.
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (!composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+            Assert.True(composer.IsStreaming, "Active notification must start streaming when idle");
+
+            // Cleanup.
+            composer.CancelStreaming();
+            client.Release();
+            deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task SendActiveNotification_ActorDisposed_ThrowsComposerNotAvailable()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+
+            // Dispose the underlying actor to make Tell fail.
+            var actorField = typeof(Composer).GetField("_actor", PrivateFlags)
+                ?? throw new InvalidOperationException("_actor field not found");
+            var actor = actorField.GetValue(composer)!;
+            var actorDispose = actor.GetType().GetMethod("DisposeAsync")
+                ?? throw new InvalidOperationException("DisposeAsync not found on actor");
+            await (ValueTask)actorDispose.Invoke(actor, null)!;
+
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => composer.SendActiveNotification(
+                    "[System Notification] test",
+                    $"{Composer.EnvelopePrefix}0{Composer.EnvelopeSeparator}{Composer.EnvelopeSuffix}[System Notification] test"));
+            Assert.Contains("not available", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Notification-then-send race (facade level): an active notification starts streaming
+    /// while idle, and a subsequent user <see cref="Composer.SendMessageWithEventsAsync"/>
+    /// call must be rejected with "already streaming" — the user always gets an explicit
+    /// failure, never a silent drop. This covers criterion 17's second ordering.
+    /// </summary>
+    [Fact]
+    public async Task SendActiveNotificationThenSendMessage_FacadeRejectsSendWithAlreadyStreaming()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            var client = new BlockingStreamingClient();
+            await InjectFakeChatClient(composer, client);
+
+            const string displayText = "[System Notification] Build completed";
+            var wrapped = $"{Composer.EnvelopePrefix}0{Composer.EnvelopeSeparator}{Composer.EnvelopeSuffix}{displayText}";
+
+            // 1. Start a notification stream while idle.
+            composer.SendActiveNotification(displayText, wrapped);
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (!composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+            Assert.True(composer.IsStreaming, "Notification must start streaming when idle");
+
+            // 2. A user send while the notification is streaming must be rejected — the
+            //    facade's _isStreaming check throws "already streaming".
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => composer.SendMessageWithEventsAsync("user message"));
+            Assert.Contains("already streaming", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+            // 3. The notification stream is still active (the rejected send left state untouched).
+            Assert.True(composer.IsStreaming, "Rejected send must not stop the notification stream");
+
+            // Cleanup.
+            composer.CancelStreaming();
+            client.Release();
+            deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// AC18 persistence invariant, proven against the SUT's OWN value rather than a locally
+    /// re-derived one. A real notification stream is driven to completion through
+    /// <see cref="Composer.SendActiveNotification"/>, and the assertions run against:
+    /// <list type="number">
+    /// <item>the exact prompt the agent was invoked with (captured from the chat client), and</item>
+    /// <item>the user entry actually PERSISTED in the Composer session history.</item>
+    /// </list>
+    /// Splitting that stored value must yield a <c>null</c> event block (E0 envelope) and the
+    /// exact <c>[System Notification]</c>-prefixed display text — which is precisely what
+    /// <c>ComposerChat.LoadHistory</c> relies on to render the entry as a system message.
+    /// <para>
+    /// Removal-proof: because both the captured prompt and the stored history entry come from
+    /// production code, this fails if the facade or actor ever sends/persists a different or
+    /// malformed value. The previous version parsed the test's own local string and would have
+    /// passed regardless of what the SUT actually did.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SendActiveNotification_PersistedHistoryEntry_SplitsToSystemNotificationDisplayText()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            var client = new CapturingCompletingClient();
+            await InjectFakeChatClient(composer, client);
+
+            const string displayText = "[System Notification] Goal 'g-42' approved by reviewer";
+            var wrapped = $"{Composer.EnvelopePrefix}0{Composer.EnvelopeSeparator}{Composer.EnvelopeSuffix}{displayText}";
+
+            composer.SendActiveNotification(displayText, wrapped);
+
+            // (1) The value the SUT actually handed to the agent.
+            var sentPrompt = await client.CapturedPrompt.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (composer.IsStreaming && DateTime.UtcNow < deadline)
+                await Task.Delay(20, TestContext.Current.CancellationToken);
+            Assert.False(composer.IsStreaming, "The notification stream must complete");
+
+            // The SUT sent exactly the wrapped envelope — not a re-derived local string.
+            Assert.Equal(wrapped, sentPrompt);
+
+            var (sentEventBlock, sentUserMessage) = Composer.TrySplitEventBlock(sentPrompt);
+            Assert.Null(sentEventBlock);
+            Assert.Equal(displayText, sentUserMessage);
+            Assert.StartsWith("[System Notification]", sentUserMessage, StringComparison.Ordinal);
+
+            // (2) The value the SUT actually PERSISTED in session history.
+            var session = GetSession(composer);
+            var storedUserEntry = session.MessageHistory
+                .Where(m => m.Role == ChatRole.User)
+                .Select(m => m.Text)
+                .LastOrDefault(t => !string.IsNullOrEmpty(t));
+
+            Assert.NotNull(storedUserEntry);
+            Assert.Equal(wrapped, storedUserEntry);
+
+            // Splitting the STORED value reproduces the display text — the exact invariant
+            // ComposerChat.LoadHistory depends on to pick the "system" role.
+            var (storedEventBlock, storedUserMessage) = Composer.TrySplitEventBlock(storedUserEntry!);
+            Assert.Null(storedEventBlock);
+            Assert.Equal(displayText, storedUserMessage);
+            Assert.StartsWith("[System Notification]", storedUserMessage, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
     }
 }

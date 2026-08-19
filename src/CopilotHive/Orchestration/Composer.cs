@@ -71,7 +71,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     private readonly ComposerAgentService _agentService;
     private readonly ComposerStreamingService _streamingService;
     private readonly ComposerActor _actor;
-    private int _streamingState; // 0=idle, 1=streaming (Interlocked)
+    private volatile bool _isStreaming;
     private volatile string _streamingContent = "";
     private volatile int _lastToolCalls;
 
@@ -148,7 +148,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     public IReadOnlyList<string> AvailableModels => _agentService.AvailableModels;
 
     /// <summary>Whether the Composer is currently streaming a response.</summary>
-    public bool IsStreaming => Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0;
+    public bool IsStreaming => _isStreaming;
 
     /// <summary>The accumulated streaming text (partial response in progress).</summary>
     public string StreamingContent => _streamingContent;
@@ -164,6 +164,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
 
     /// <summary>Raised when streaming state changes (new text, completion, error).</summary>
     public event Action? OnStreamingUpdate;
+
+    /// <summary>
+    /// Raised when an active system notification was successfully injected into the Composer
+    /// (the <c>Tell</c> was accepted). The payload is the display text of the notification.
+    /// </summary>
+    public event Action<string>? OnActiveInjection;
 
     /// <summary>Raised when context compaction starts.</summary>
     public event Action? OnCompactingStarted;
@@ -512,7 +518,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             SaveSessionAsync,
             status => RefreshComposerRegistry(status),
             content => { _streamingContent = content; OnStreamingUpdate?.Invoke(); },
-            toolCalls => { Interlocked.Exchange(ref _streamingState, 0); _lastToolCalls = toolCalls; OnStreamingUpdate?.Invoke(); },
+            () =>
+            {
+                _isStreaming = true;
+                _streamingContent = "";
+                _lastToolCalls = 0;
+                OnStreamingUpdate?.Invoke();
+            },
+            (toolCalls, keepStreaming) =>
+            {
+                _lastToolCalls = toolCalls;
+                if (!keepStreaming) _isStreaming = false;
+                OnStreamingUpdate?.Invoke();
+            },
             error => { _streamingContent += $"\n\n❌ Error: {error}"; OnStreamingUpdate?.Invoke(); },
             () =>
             {
@@ -575,9 +593,6 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Returns the system prompt used by the Composer.</summary>
     internal string GetSystemPrompt() => _systemPrompt;
 
-    /// <summary>Test seam: forces the streaming admission gate for tests that exercise the "while streaming" path.</summary>
-    internal void SetStreamingStateForTest(bool isStreaming) => Interlocked.Exchange(ref _streamingState, isStreaming ? 1 : 0);
-
     /// <summary>Returns current Composer session statistics.</summary>
     public BrainStats? GetStats()
     {
@@ -614,7 +629,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
     public async Task SwitchModelAsync(string model, ReasoningEffort reasoningEffort, CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+        if (_isStreaming)
             throw new InvalidOperationException("Cannot switch model while streaming.");
         var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_actor.Tell(new ComposerSwitchModelMessage(model, reasoningEffort, reply, ct)))
@@ -660,23 +675,27 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// The streaming state is owned by the Composer service and survives component navigation.
     /// Subscribe to <see cref="OnStreamingUpdate"/> to receive updates.
     /// </summary>
-    public void SendMessage(string userMessage) => SendMessageWithEvents(userMessage);
+    public void SendMessage(string userMessage) => SendMessageWithEventsAsync(userMessage).GetAwaiter().GetResult();
 
     /// <summary>Sends a message, prepending any pending system events.
     /// Returns the formatted event block prepended, or null if no events were pending.</summary>
-    public string? SendMessageWithEvents(string userMessage)
+    public async Task<string?> SendMessageWithEventsAsync(string userMessage)
     {
         // Pre-admission failures bypass the rollback path below — nothing has been claimed yet.
         if (!_agentService.IsConnected) throw new InvalidOperationException("Composer not connected.");
-        if (Interlocked.CompareExchange(ref _streamingState, 1, 0) != 0)
+        if (_isStreaming)
             throw new InvalidOperationException("Composer is already streaming a response.");
 
         List<SystemEvent>? events = null;
         string? eventBlock = null;
+        var restored = false;
         try
         {
-            _streamingContent = ""; _lastToolCalls = 0;
-            OnStreamingUpdate?.Invoke();
+            // NOTE: the facade does NOT reset _streamingContent/_lastToolCalls or fire
+            // OnStreamingUpdate here — that is the _onStreamingStarted callback's job,
+            // invoked by StartStream BEFORE the reply completes. Firing OnStreamingUpdate
+            // before admission would let subscribers observe IsStreaming == false at a
+            // moment that in the old gate-based design was already claimed.
 
             if (_eventSubscriber is not null)
             {
@@ -686,22 +705,57 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             var eventLen = eventBlock?.Length ?? 0;
             var wrappedMessage = $"{EnvelopePrefix}{eventLen.ToString(CultureInfo.InvariantCulture)}{EnvelopeSeparator}{eventBlock ?? ""}{EnvelopeSuffix}{userMessage}";
 
-            if (!_actor.Tell(new ComposerSendMessageMessage(wrappedMessage)))
+            var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_actor.Tell(new ComposerSendMessageMessage(wrappedMessage, reply)))
                 throw new InvalidOperationException("Composer not available.");
+
+            // Await the actor's admission reply: the actor rejects when already streaming
+            // (authoritative — the facade's _isStreaming check above is a TOCTOU probe).
+            var accepted = await reply.Task;
+            if (!accepted)
+                throw new InvalidOperationException("Composer is already streaming a response.");
 
             return eventBlock;
         }
         catch (Exception)
         {
             // Single rollback path for EVERY post-admission failure — including
-            // InvalidOperationException thrown by OnStreamingUpdate, DrainPendingEvents,
-            // FormatEventBlock, or the Tell-failure branch above. Releasing the gate here is
-            // what keeps a failed send from permanently blocking the Composer.
-            Interlocked.Exchange(ref _streamingState, 0);
-            _streamingContent = "";
-            if (events != null && events.Count > 0 && _eventSubscriber != null) _eventSubscriber.RestoreEvents(events);
+            // InvalidOperationException thrown by DrainPendingEvents, FormatEventBlock,
+            // the Tell-failure branch above, or a rejected actor reply. The facade's
+            // _isStreaming/_streamingContent are set ONLY by the actor's _onStreamingStarted
+            // callback (on actual admission), so a rejected send leaves facade state
+            // untouched. The `restored` flag guarantees events are restored at most once
+            // even if RestoreEvents itself throws (in which case the catch-all would re-enter
+            // the catch and must not double-restore).
+            if (!restored)
+            {
+                restored = true;
+                if (events != null && events.Count > 0 && _eventSubscriber != null)
+                    _eventSubscriber.RestoreEvents(events);
+            }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Sends an active system notification to the Composer. If the Composer is idle, the
+    /// notification starts streaming immediately; if streaming, it is queued (bounded, oldest
+    /// dropped) and starts after the current stream's terminal transition. The
+    /// <paramref name="wrappedNotification"/> must be an E0-envelope-wrapped message whose
+    /// user message starts with <c>[System Notification]</c> so the chat UI renders it as a
+    /// system message.
+    /// </summary>
+    /// <param name="displayText">The user-visible text of the notification, starting with <c>[System Notification]</c>.</param>
+    /// <param name="wrappedNotification">
+    /// The envelope-wrapped notification: <c>{EnvelopePrefix}0{EnvelopeSeparator}{EnvelopeSuffix}{displayText}</c>.
+    /// After <see cref="TrySplitEventBlock"/>, the resulting user message IS <paramref name="displayText"/>
+    /// (E0 envelope = no event block).
+    /// </param>
+    public void SendActiveNotification(string displayText, string wrappedNotification)
+    {
+        if (!_actor.Tell(new ComposerSendActiveNotificationMessage(wrappedNotification)))
+            throw new InvalidOperationException("Composer not available.");
+        OnActiveInjection?.Invoke(displayText);
     }
 
     /// <summary>
@@ -781,7 +835,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task ResetSessionAsync(CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+        if (_isStreaming)
             throw new InvalidOperationException("Cannot reset while streaming.");
         var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_actor.Tell(new ComposerResetSessionMessage(reply, ct)))
@@ -852,7 +906,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <returns><c>true</c> if compaction occurred; otherwise <c>false</c>.</returns>
     public async Task<bool> CompactSessionAsync(CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+        if (_isStreaming)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
         if (_agentService.Agent is null)
@@ -875,7 +929,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// </summary>
     public async Task<bool> CompactOldestPercentAsync(int percent, CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _streamingState, 0, 0) != 0)
+        if (_isStreaming)
             throw new InvalidOperationException("Cannot compact while streaming.");
 
         if (_agentService.Agent is null)
