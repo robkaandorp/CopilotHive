@@ -1,3 +1,21 @@
+## [0.31.0] — 2026-08-19
+
+### Added
+
+- **Event bus startup scan** — On restart, the `EventBusStartupScanner` queries recent state changes (goals completed/failed, issues raised/resolved, releases completed) since the last Composer session activity and pre-populates the `ComposerEventSubscriber` buffer. Uses `AgentSession.LastActivityAt` as the cutoff with a 60-minute fallback. (`copilothive-event-bus-startup-scan`)
+- **Composer actor architecture (Phase 1)** — Extracted `ComposerActor` using the `Actor<TMessage>` mailbox pattern. The actor owns the streaming loop, CTS, and streaming state. Streaming and session mutation operations are serialized through the actor mailbox. (`copilothive-composer-actor-phase1`)
+- **Composer actor architecture (Phase 2)** — Added compaction callbacks (exactly-once, no duplication from `ContextCompactor`), `SessionLoadedFromDisk` caching, `SubmitAnswer`/`CancelQuestion` through the actor with synchronized `PendingQuestion`. (`copilothive-composer-actor-phase2`)
+- **Active event bus mode** — When significant system events occur (goal completed, goal failed, CI failed, issue raised), the Composer automatically receives a `[System Notification]` message and can take autonomous action. The `ActiveEventInjector` subscribes to `IEventBus`, filters by configured event types, and `Tell`s the `ComposerActor` — the actor queues notifications while streaming and launches them from the terminal handler. Includes throttling and batching. Configurable via `composer.event_notifications` in `hive-config.yaml`. (`copilothive-active-mode-actor`, `copilothive-active-mode-injector`, `copilothive-active-mode-config-ui`)
+- **Active mode configuration UI** — Toggle button in the Composer chat window (🔔 Active / 🔕 Passive / 🔕 Off) and a Configuration page section for detailed settings (mode, active events, throttle seconds). Shows "⚠️ Restart required" when toggled. (`copilothive-active-mode-config-ui`)
+- **CI monitor log fetching** — When CI fails, `CiMonitorService` fetches actual test failure logs from the GitHub Actions API. Auto-created issues now contain the test name, error message, and stack trace instead of just a check run name and URL. Includes secret sanitization, bounded streaming, per-runId caching, and redirect-safe authentication. (`copilothive-fix-ci-monitor-tests`)
+
+### Fixed
+
+- **Reasoning effort mapping** — `ReasoningEffort.ExtraHigh` now maps to provider-specific values: `"xhigh"` for Copilot, `"max"` for Ollama (via `OllamaExtraHighReasoningClient` using `ChatOptions.RawRepresentationFactory`), and clamped to `High` for GitHub Models. Previously `"extra_high"` was sent to all providers but not recognized by any. (`copilothive-fix-reasoning-effort-mapping`)
+- **Streaming gate CI failures** — Fixed CI test failures caused by `[Conditional("DEBUG")]` on a test seam (compiled out in Release) and streaming gate ordering in compact methods. (`copilothive-fix-streaming-gate-order`)
+- **CI test flakiness** — Fixed overflow recovery test race and flaky startup log test (replaced timing-based `Task.Delay` with `SignalingLogger` + TCS). (`copilothive-fix-ci-failures-2`)
+- **Stale worker reclamation** — `StaleWorkerCleanupService` now uses `LastActivityAt` (last task-specific WorkStream message) instead of `CurrentTaskStartedAt` (wall clock). Active workers are no longer reclaimed when their total task duration exceeds the timeout. Heartbeats don't count as activity (preserves hung-call detection). (`copilothive-fix-stale-worker-activity`)
+
 ## [0.30.0] — 2026-08-17
 
 ### Added
