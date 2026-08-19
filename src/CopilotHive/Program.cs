@@ -360,6 +360,15 @@ public sealed class Program
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
+            // Active event injector: registered via a factory with GetService so a missing
+            // Composer, event bus, or config produces a disabled (no-op) instance instead of
+            // crashing DI resolution. Resolved after the Composer connection block below.
+            builder.Services.AddSingleton(sp => new ActiveEventInjector(
+                sp.GetService<Composer>(),
+                sp.GetService<IEventBus>(),
+                sp.GetService<HiveConfigFile>(),
+                sp.GetRequiredService<ILogger<ActiveEventInjector>>()));
+
             builder.Services.AddSingleton<GoalDispatcher>();
             // The GoalDispatcher hosted loop races endpoint tests that create/delete Pending goals.
             // Keep the singleton registered so dependent services resolve, but do not start the
@@ -675,6 +684,12 @@ public sealed class Program
                     logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
                 }
             }
+
+            // Active event injector: resolved after the Composer connection block so the
+            // Composer's actor is ready to accept injected notifications. The factory uses
+            // GetService for every dependency — the injector must be a no-op (disabled)
+            // when any of them is missing rather than crashing startup.
+            app.Services.GetService<ActiveEventInjector>();
 
             // Event bus startup scan: reconstructs events for state changes that happened
             // while the orchestrator was down (goals completed/failed, issues raised/resolved,

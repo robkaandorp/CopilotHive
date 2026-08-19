@@ -301,7 +301,15 @@ public sealed class HiveConfigFile
                 Model = source.Composer.Model,
                 Models = source.Composer.Models?.ToList(),
                 MaxSteps = source.Composer.MaxSteps,
-                ReasoningEffort = source.Composer.ReasoningEffort
+                ReasoningEffort = source.Composer.ReasoningEffort,
+                EventNotifications = source.Composer.EventNotifications is null
+                    ? null
+                    : new EventNotificationsConfig
+                    {
+                        Mode = source.Composer.EventNotifications.Mode,
+                        ActiveEvents = source.Composer.EventNotifications.ActiveEvents?.ToList(),
+                        ThrottleSeconds = source.Composer.EventNotifications.ThrottleSeconds
+                    }
             };
         }
         else

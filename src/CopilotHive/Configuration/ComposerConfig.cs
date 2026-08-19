@@ -20,6 +20,13 @@ public sealed class ComposerConfig
     public string? ReasoningEffort { get; set; }
 
     /// <summary>
+    /// Active event notification configuration. When null, active injection is disabled
+    /// (passive mode). Null stays null in YAML — do not initialize with <c>new()</c>,
+    /// as that would emit an empty <c>event_notifications: {}</c> key on serialization.
+    /// </summary>
+    public EventNotificationsConfig? EventNotifications { get; set; }
+
+    /// <summary>
     /// Returns a merged, deduplicated list of available models, with <see cref="Model"/> as the first entry.
     /// Falls back to <paramref name="fallback"/> if neither <see cref="Model"/> nor <see cref="Models"/> is set.
     /// </summary>

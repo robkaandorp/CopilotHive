@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Services;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -2029,5 +2030,321 @@ public sealed class HiveConfigFileTests
         source.Repositories[0].CiTimeoutMinutes = 10;
         Assert.True(repo.MonitorCi);
         Assert.Equal(45, repo.CiTimeoutMinutes);
+    }
+
+    // ── EventNotificationsConfig: modes, whitelist, throttle, YAML round-trip ────
+
+    [Theory]
+    [InlineData("passive", "passive")]
+    [InlineData("active", "active")]
+    [InlineData("off", "off")]
+    [InlineData("PASSIVE", "passive")]
+    [InlineData("  Active  ", "active")]
+    [InlineData(null, "passive")]
+    [InlineData("", "passive")]
+    [InlineData("   ", "passive")]
+    [InlineData("bogus", "passive")]
+    public void EventNotificationsConfig_EffectiveMode_NormalizesMode(string? mode, string expected)
+    {
+        var config = new EventNotificationsConfig { Mode = mode };
+
+        Assert.Equal(expected, config.EffectiveMode);
+    }
+
+    [Theory]
+    [InlineData(null, 30)]
+    [InlineData(0, 1)]
+    [InlineData(1, 1)]
+    [InlineData(30, 30)]
+    [InlineData(300, 300)]
+    [InlineData(301, 300)]
+    [InlineData(-5, 1)]
+    public void EventNotificationsConfig_EffectiveThrottleSeconds_ClampsToRange(int? seconds, int expected)
+    {
+        var config = new EventNotificationsConfig { ThrottleSeconds = seconds };
+
+        Assert.Equal(expected, config.EffectiveThrottleSeconds);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_NullList_ReturnsAllFourWhitelisted()
+    {
+        var config = new EventNotificationsConfig { ActiveEvents = null };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(4, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.GoalFailed, types);
+        Assert.Contains(EventType.CiFailed, types);
+        Assert.Contains(EventType.IssueRaised, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_EmptyList_ReturnsAllFourWhitelisted()
+    {
+        var config = new EventNotificationsConfig { ActiveEvents = [] };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(4, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.GoalFailed, types);
+        Assert.Contains(EventType.CiFailed, types);
+        Assert.Contains(EventType.IssueRaised, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_InvalidOnly_DefaultsToAllFour()
+    {
+        var config = new EventNotificationsConfig { ActiveEvents = ["not_an_event", "also_invalid"] };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(4, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.GoalFailed, types);
+        Assert.Contains(EventType.CiFailed, types);
+        Assert.Contains(EventType.IssueRaised, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_ParsesSnakeCaseNames()
+    {
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["goal_completed", "ci_failed"]
+        };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(2, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.CiFailed, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_IgnoresNonWhitelistedValidParses()
+    {
+        // goal_dispatched and release_completed parse but are NOT in the whitelist.
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["goal_completed", "goal_dispatched", "release_completed"]
+        };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Single(types);
+        Assert.Contains(EventType.GoalCompleted, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetInvalidEventNames_ReturnsUnparseableAndNonWhitelisted()
+    {
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["goal_completed", "not_an_event", "goal_dispatched", "123", "a,b"]
+        };
+
+        var invalid = config.GetInvalidEventNames();
+
+        Assert.Equal(4, invalid.Count);
+        Assert.Contains("not_an_event", invalid);
+        Assert.Contains("goal_dispatched", invalid);
+        Assert.Contains("123", invalid);
+        Assert.Contains("a,b", invalid);
+        Assert.DoesNotContain("goal_completed", invalid);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetInvalidEventNames_NullList_ReturnsEmpty()
+    {
+        var config = new EventNotificationsConfig { ActiveEvents = null };
+
+        Assert.Empty(config.GetInvalidEventNames());
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_MixedValidInvalid_FiltersToWhitelisted()
+    {
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["goal_completed", "bogus_event", "issue_raised"]
+        };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(2, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.IssueRaised, types);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_GetActiveEventTypes_ReturnsFreshSet_NotSharedReference()
+    {
+        var config = new EventNotificationsConfig();
+
+        var first = config.GetActiveEventTypes();
+        var second = config.GetActiveEventTypes();
+
+        Assert.NotSame(first, second);
+    }
+
+    [Fact]
+    public void Deserialize_EventNotificationsSection_PopulatesFields()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+              event_notifications:
+                mode: active
+                active_events:
+                  - goal_completed
+                  - ci_failed
+                throttle_seconds: 60
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config.Composer);
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal("active", config.Composer.EventNotifications!.Mode);
+        Assert.Equal(2, config.Composer.EventNotifications.ActiveEvents!.Count);
+        Assert.Equal("goal_completed", config.Composer.EventNotifications.ActiveEvents[0]);
+        Assert.Equal("ci_failed", config.Composer.EventNotifications.ActiveEvents[1]);
+        Assert.Equal(60, config.Composer.EventNotifications.ThrottleSeconds);
+        Assert.Equal("active", config.Composer.EventNotifications.EffectiveMode);
+    }
+
+    [Fact]
+    public void Deserialize_NoEventNotificationsSection_EventNotificationsIsNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config.Composer);
+        Assert.Null(config.Composer!.EventNotifications);
+    }
+
+    [Fact]
+    public void RoundTrip_EventNotifications_NullYieldsNoKey()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "composer-model" }
+        };
+
+        var yaml = Serializer.Serialize(original);
+
+        Assert.DoesNotContain("event_notifications", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RoundTrip_EventNotifications_OnlyYamlFieldsSerialized()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig
+            {
+                Model = "composer-model",
+                EventNotifications = new EventNotificationsConfig
+                {
+                    Mode = "active",
+                    ActiveEvents = ["goal_completed", "issue_raised"],
+                    ThrottleSeconds = 45
+                }
+            }
+        };
+
+        var yaml = Serializer.Serialize(original);
+
+        Assert.Contains("event_notifications:", yaml, StringComparison.Ordinal);
+        Assert.Contains("mode: active", yaml, StringComparison.Ordinal);
+        Assert.Contains("active_events:", yaml, StringComparison.Ordinal);
+        Assert.Contains("goal_completed", yaml, StringComparison.Ordinal);
+        Assert.Contains("issue_raised", yaml, StringComparison.Ordinal);
+        Assert.Contains("throttle_seconds: 45", yaml, StringComparison.Ordinal);
+
+        // Computed properties must NOT be serialized.
+        Assert.DoesNotContain("effective_mode", yaml, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("effective_throttle", yaml, StringComparison.OrdinalIgnoreCase);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var notif = reloaded.Composer!.EventNotifications!;
+        Assert.Equal("active", notif.Mode);
+        Assert.Equal(2, notif.ActiveEvents!.Count);
+        Assert.Equal("goal_completed", notif.ActiveEvents[0]);
+        Assert.Equal("issue_raised", notif.ActiveEvents[1]);
+        Assert.Equal(45, notif.ThrottleSeconds);
+    }
+
+    [Fact]
+    public void ReloadFrom_CopiesEventNotifications_DeepCopiesActiveEvents()
+    {
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig
+            {
+                Model = "composer-model",
+                EventNotifications = new EventNotificationsConfig
+                {
+                    Mode = "active",
+                    ActiveEvents = ["goal_completed"],
+                    ThrottleSeconds = 15
+                }
+            }
+        };
+
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        target.ReloadFrom(source);
+
+        Assert.NotNull(target.Composer);
+        Assert.NotNull(target.Composer!.EventNotifications);
+        Assert.NotSame(source.Composer.EventNotifications, target.Composer.EventNotifications);
+        Assert.NotSame(source.Composer.EventNotifications.ActiveEvents, target.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal("active", target.Composer.EventNotifications!.Mode);
+        Assert.Equal(["goal_completed"], target.Composer.EventNotifications.ActiveEvents);
+        Assert.Equal(15, target.Composer.EventNotifications.ThrottleSeconds);
+
+        // Mutating source must not affect receiver.
+        source.Composer.EventNotifications.ActiveEvents!.Add("ci_failed");
+        source.Composer.EventNotifications.Mode = "off";
+
+        Assert.Single(target.Composer.EventNotifications.ActiveEvents!);
+        Assert.Equal("active", target.Composer.EventNotifications.Mode);
+    }
+
+    [Fact]
+    public void ReloadFrom_NullEventNotifications_ReceiverBecomesNull()
+    {
+        var receiver = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig
+            {
+                Model = "old-composer",
+                EventNotifications = new EventNotificationsConfig { Mode = "active" }
+            }
+        };
+
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "new-composer", EventNotifications = null }
+        };
+
+        receiver.ReloadFrom(source);
+
+        Assert.NotNull(receiver.Composer);
+        Assert.Null(receiver.Composer!.EventNotifications);
     }
 }
