@@ -4,6 +4,157 @@ namespace CopilotHive.Tests;
 
 public sealed class GoalTests
 {
+    // ── ResolveTargetRepositoryNames ─────────────────────────────────────
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_Null_ReturnsAllRepositories()
+    {
+        var result = Goal.ResolveTargetRepositoryNames(null, ["repo-a", "repo-b"]);
+
+        Assert.Equal(["repo-a", "repo-b"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_EmptyString_ReturnsAllRepositories()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("", ["repo-a", "repo-b"]);
+
+        Assert.Equal(["repo-a", "repo-b"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_WhitespaceOnly_ReturnsAllRepositories()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("   ,  , ", ["repo-a", "repo-b"]);
+
+        Assert.Equal(["repo-a", "repo-b"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_NullAndEmptyRepositories_ReturnsEmptyList()
+    {
+        var result = Goal.ResolveTargetRepositoryNames(null, []);
+
+        Assert.Empty(result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_NonEmptyAndEmptyRepositories_Throws()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            Goal.ResolveTargetRepositoryNames("repo-a", []));
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_ValidEntries_ReturnsCanonicalInInputOrder()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("repo-b, repo-a", ["repo-a", "repo-b", "repo-c"]);
+
+        Assert.Equal(["repo-b", "repo-a"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_CaseInsensitiveMatch_UsesCanonicalSpelling()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("REPO-B, repo-a", ["Repo-A", "Repo-B"]);
+
+        Assert.Equal(["Repo-B", "Repo-A"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_Deduplicates()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("repo-a, repo-a, repo-b", ["repo-a", "repo-b"]);
+
+        Assert.Equal(["repo-a", "repo-b"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_UnknownEntry_Throws()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            Goal.ResolveTargetRepositoryNames("repo-x", ["repo-a", "repo-b"]));
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_TrimsEntries()
+    {
+        var result = Goal.ResolveTargetRepositoryNames("  repo-a , repo-b  ", ["repo-a", "repo-b"]);
+
+        Assert.Equal(["repo-a", "repo-b"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_MalformedCommaOnly_ReturnsAllRepos()
+    {
+        // Malformed "," (just a comma, zero non-empty entries) → all repos, no exception.
+        var result = Goal.ResolveTargetRepositoryNames(",", ["A", "B"]);
+
+        Assert.Equal(["A", "B"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_SpecExample_CanonicalDeduplicatedInInputOrder()
+    {
+        // Spec example: "a, A, B" with repos ["A","B"] → ["A","B"] (canonical, deduplicated, target input order).
+        // "a" matches canonical "A", then "A" is a duplicate of "a", then "B" is new.
+        var result = Goal.ResolveTargetRepositoryNames("a, A, B", ["A", "B"]);
+
+        Assert.Equal(["A", "B"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_SingleRepoNull_AllReposTargeted()
+    {
+        // Backward compatibility: single-repo with null targets → that one repo is targeted.
+        var result = Goal.ResolveTargetRepositoryNames(null, ["only-repo"]);
+
+        Assert.Equal(["only-repo"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_MultiRepoNull_AllReposTargeted()
+    {
+        // Multi-repo with null targets → all repos targeted.
+        var result = Goal.ResolveTargetRepositoryNames(null, ["repo-1", "repo-2", "repo-3"]);
+
+        Assert.Equal(["repo-1", "repo-2", "repo-3"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_MultiRepoExplicitOne_OnlyThatTarget()
+    {
+        // Multi-repo explicit (one entry) → only that one target returned.
+        var result = Goal.ResolveTargetRepositoryNames("repo-2", ["repo-1", "repo-2", "repo-3"]);
+
+        Assert.Equal(["repo-2"], result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_EmptyReposAndMalformedTargets_ReturnsEmptyList()
+    {
+        // Empty RepositoryNames + null/malformed targets → empty list (no exception).
+        var result = Goal.ResolveTargetRepositoryNames(",", []);
+
+        Assert.Empty(result);
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_EmptyReposAndNonEmptyTargets_Throws()
+    {
+        // Empty RepositoryNames + non-empty targets → ArgumentException.
+        Assert.Throws<ArgumentException>(() =>
+            Goal.ResolveTargetRepositoryNames("repo-a", []));
+    }
+
+    [Fact]
+    public void ResolveTargetRepositoryNames_InvalidTarget_ThrowsArgumentException()
+    {
+        // Invalid target (entry not in RepositoryNames) → ArgumentException.
+        Assert.Throws<ArgumentException>(() =>
+            Goal.ResolveTargetRepositoryNames("repo-x", ["A", "B"]));
+    }
+
     // ── ApiGoalSource ────────────────────────────────────────────────────────
 
     [Fact]

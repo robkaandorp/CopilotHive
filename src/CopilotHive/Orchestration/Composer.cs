@@ -207,7 +207,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Drill into worker phase output, brain prompts, or worker prompts for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
-        - Update existing goals (update_goal) — description, priority, scope, repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
+        - Update existing goals (update_goal) — description, priority, scope, repositories, target_repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
         - Extend the iteration budget for failed goals that exhausted their max iterations (extend_goal_iterations)
@@ -242,6 +242,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Files NOT to change: if certain files must not be modified (e.g. source files for a
           docs-only goal, or docs files for an internal refactor), list them explicitly in the
           description so workers know to leave them untouched.
+        - Target repositories: when a goal spans multiple repositories, use create_goal's
+          target_repositories parameter to specify which repositories are editable targets.
+          Repositories not listed as targets are source repositories (reference — do not modify).
+          Omitted target_repositories means ALL repositories are targets. Merge/dispatch
+          enforcement of target repositories is handled in a follow-up goal.
         - Always call list_goals (or get_goal) to check the current live status of goals before
           making any statement about them — e.g. whether a goal is still in progress, completed,
           or failed. Never rely on previously seen status from earlier in the conversation.

@@ -88,6 +88,28 @@ public static class BrainPromptBuilder
         """;
 
     /// <summary>
+    /// Builds per-repo labeled lines distinguishing target repositories (editable) from
+    /// source repositories (reference — do not modify). Uses
+    /// <see cref="Goal.ResolveTargetRepositoryNames"/> to determine which repos are targets.
+    /// </summary>
+    internal static string BuildRepositoryLines(Goal goal)
+    {
+        var targets = Goal.ResolveTargetRepositoryNames(goal.TargetRepositoryNames, goal.RepositoryNames);
+        var targetSet = new HashSet<string>(targets, StringComparer.OrdinalIgnoreCase);
+
+        var sb = new StringBuilder();
+        foreach (var repo in goal.RepositoryNames)
+        {
+            if (targetSet.Contains(repo))
+                sb.AppendLine($"- {repo}: Target repository (editable)");
+            else
+                sb.AppendLine($"- {repo}: Source repository (reference — do not modify)");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
     /// Builds the raw prompt text that will be sent to the Brain to craft a worker prompt.
     /// Extracted for testability — allows verifying prompt content without a connected agent.
     /// </summary>
@@ -166,7 +188,7 @@ public static class BrainPromptBuilder
             Craft a prompt for the {{roleName}} worker.
 
             Goal: {{pipeline.GoalId}} (iteration {{pipeline.Iteration}}, phase {{phase}})
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
+            {{BuildRepositoryLines(pipeline.Goal)}}
             {{phaseInstructions}}
             {{(previousFeedback.Length > 0 ? $"\n{previousFeedback}" : "")}}
             {{(additionalContext is not null ? $"\n=== Additional context ===\n{additionalContext}\n=== End additional context ===" : "")}}
@@ -322,7 +344,7 @@ public static class BrainPromptBuilder
         var planningPrompt = $$"""
             {{(additionalContext is not null ? $"=== Additional context ===\n{additionalContext}\n=== End additional context ===\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
+            {{BuildRepositoryLines(pipeline.Goal)}}
             (You can browse the code under these folder names in your working directory)
 
             {{retryContext}}
@@ -403,11 +425,13 @@ public static class BrainPromptBuilder
     /// <returns>The fully assembled commit message prompt string.</returns>
     internal static string BuildCommitMessagePrompt(GoalPipeline pipeline)
     {
+        var targetRepos = Goal.ResolveTargetRepositoryNames(pipeline.Goal.TargetRepositoryNames, pipeline.Goal.RepositoryNames);
+
         return $$"""
             Generate a concise git commit message for a squash merge of goal: {{pipeline.Description}}
 
             Goal ID: {{pipeline.GoalId}}
-            Target repositories: {{string.Join(", ", pipeline.Goal.RepositoryNames)}}
+            Target repositories: {{string.Join(", ", targetRepos)}}
 
             Format:
             - First line: a short imperative subject (~72 characters, no "Goal:" prefix)

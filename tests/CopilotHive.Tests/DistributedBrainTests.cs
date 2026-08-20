@@ -1224,9 +1224,99 @@ public sealed class DistributedBrainTests
         var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
 
         // Assert
-        Assert.Contains("Target repositories:", prompt);
+        Assert.Contains("- repo-alpha: Target repository (editable)", prompt);
+        Assert.Contains("- repo-beta: Target repository (editable)", prompt);
         Assert.Contains("repo-alpha", prompt);
         Assert.Contains("repo-beta", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ExplicitTargets_MarksSourceRepositories()
+    {
+        // Verify that non-target repos are labeled as source repositories
+        var goal = new Goal
+        {
+            Id = "goal-target-source",
+            Description = "Mixed repos",
+            RepositoryNames = ["repo-alpha", "repo-beta"],
+            TargetRepositoryNames = "repo-alpha",
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+
+        Assert.Contains("- repo-alpha: Target repository (editable)", prompt);
+        Assert.Contains("- repo-beta: Source repository (reference — do not modify)", prompt);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_NullTargets_AllReposAreTargets()
+    {
+        var goal = new Goal
+        {
+            Id = "goal-null-targets",
+            Description = "All targets",
+            RepositoryNames = ["repo-1", "repo-2"],
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+
+        Assert.Contains("- repo-1: Target repository (editable)", prompt);
+        Assert.Contains("- repo-2: Target repository (editable)", prompt);
+        Assert.DoesNotContain("Source repository", prompt);
+    }
+
+    [Fact]
+    public void BuildPlanningPrompt_ExplicitTargets_MarksSourceRepositories()
+    {
+        var goal = new Goal
+        {
+            Id = "plan-mixed",
+            Description = "Plan mixed repos",
+            RepositoryNames = ["repo-1", "repo-2"],
+            TargetRepositoryNames = "repo-2",
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+
+        Assert.Contains("- repo-1: Source repository (reference — do not modify)", prompt);
+        Assert.Contains("- repo-2: Target repository (editable)", prompt);
+    }
+
+    [Fact]
+    public void BuildCommitMessagePrompt_ListsOnlyTargetRepositories()
+    {
+        var goal = new Goal
+        {
+            Id = "commit-targets",
+            Description = "Commit message targets",
+            RepositoryNames = ["repo-1", "repo-2", "repo-3"],
+            TargetRepositoryNames = "repo-2, repo-1",
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildCommitMessagePrompt(pipeline);
+
+        Assert.Contains("Target repositories: repo-2, repo-1", prompt);
+        Assert.DoesNotContain("repo-3", prompt);
+    }
+
+    [Fact]
+    public void BuildCommitMessagePrompt_NoExplicitTargets_ListsAllRepositories()
+    {
+        var goal = new Goal
+        {
+            Id = "commit-all",
+            Description = "All targets for commit",
+            RepositoryNames = ["repo-1", "repo-2"],
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildCommitMessagePrompt(pipeline);
+
+        Assert.Contains("Target repositories: repo-1, repo-2", prompt);
     }
 
     // -- Tester Output Truncation Tests (Change E) --

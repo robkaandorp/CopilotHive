@@ -50,6 +50,18 @@ public class GoalsApiEndpointTests
         return new StringContent(JsonSerializer.Serialize(goalData, JsonOpts), Encoding.UTF8, "application/json");
     }
 
+    private static StringContent GoalJsonWithTargets(string id, string description, string repositories, string targetRepositories)
+    {
+        var goalData = new
+        {
+            id,
+            description,
+            repositoryNames = repositories.Split(", "),
+            targetRepositoryNames = targetRepositories,
+        };
+        return new StringContent(JsonSerializer.Serialize(goalData, JsonOpts), Encoding.UTF8, "application/json");
+    }
+
     // ── POST /api/goals ───────────────────────────────────────────────────
 
     [Fact]
@@ -210,6 +222,61 @@ public class GoalsApiEndpointTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── TargetRepositoryNames REST round-trip ──────────────────────────────
+
+    [Fact]
+    public async Task PostGoal_WithTargetRepositoryNames_RoundTrips()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync("/api/goals",
+            GoalJsonWithTargets(id, "Round-trip targets", "repo-a, repo-b", "repo-b, repo-a"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        var targetRepos = doc.RootElement.GetProperty("targetRepositoryNames").GetString();
+        Assert.Equal("repo-b,repo-a", targetRepos);
+        // The canonical format must be "A,B" (no space), not "A, B".
+        Assert.NotNull(targetRepos);
+        Assert.DoesNotContain(" ", targetRepos);
+    }
+
+    [Fact]
+    public async Task PostGoal_WithoutTargetRepositoryNames_RoundTripsAsNull()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync("/api/goals",
+            GoalJson(id, "No targets", "repo-a"),
+            TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var getResponse = await _client.GetAsync($"/api/goals/{id}",
+            TestContext.Current.CancellationToken);
+        getResponse.EnsureSuccessStatusCode();
+
+        var body = await getResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var doc = JsonDocument.Parse(body);
+        var prop = doc.RootElement.GetProperty("targetRepositoryNames");
+        Assert.Equal(JsonValueKind.Null, prop.ValueKind);
+    }
+
+    [Fact]
+    public async Task PostGoal_InvalidTargetRepository_Returns400BadRequest()
+    {
+        var id = UniqueId();
+        var response = await _client.PostAsync("/api/goals",
+            GoalJsonWithTargets(id, "Invalid targets", "repo-a", "repo-x"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
     // ── PATCH /api/goals/{id}/status ──────────────────────────────────────

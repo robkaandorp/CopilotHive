@@ -161,6 +161,7 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.Scope).HasColumnName("scope").IsRequired().HasConversion(LowercaseEnumConverter<GoalScope>());
         entity.Property(e => e.ReviewStatus).HasColumnName("review_status").IsRequired().HasConversion(LowercaseEnumConverter<ReviewStatus>()).HasDefaultValue(ReviewStatus.None);
         entity.Property(e => e.RepositoryNames).HasColumnName("repositories").HasJsonConversion<List<string>>();
+        entity.Property(e => e.TargetRepositoryNames).HasColumnName("target_repositories");
         entity.Property(e => e.Metadata).HasColumnName("metadata").HasJsonConversion<Dictionary<string, string>>();
         entity.Property(e => e.CreatedAt).HasColumnName("created_at").IsRequired().HasConversion(DateTimeToIsoConverter);
         entity.Property(e => e.StartedAt).HasColumnName("started_at").HasConversion(DateTimeToIsoConverter);

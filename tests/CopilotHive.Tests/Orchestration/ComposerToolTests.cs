@@ -77,6 +77,301 @@ public sealed class ComposerToolTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateGoal_WithTargetRepositories_SetsAndNormalizesTargets()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateGoalAsync(
+            "multi-repo-targets", "Fix across repos", "Repo-A, Repo-B, Repo-C",
+            target_repositories: "repo-b, REPO-A, repo-b");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: Repo-B,Repo-A", result);
+        // The canonical format must be comma-separated with NO space ("A,B" not "A, B").
+        Assert.DoesNotContain("target_repositories: Repo-B, Repo-A", result);
+
+        var goal = await _store.GetGoalAsync("multi-repo-targets", ct);
+        Assert.NotNull(goal);
+        Assert.Equal("Repo-B,Repo-A", goal!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithTargetRepositories_Omitted_IsAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateGoalAsync("all-targets", "All repos", "repo-a, repo-b");
+
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("all-targets", ct);
+        Assert.NotNull(goal);
+        Assert.Null(goal!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoal_WithInvalidTargetRepository_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var result = await _composer.CreateGoalAsync(
+            "invalid-targets",
+            "Invalid target repos",
+            "repo-a",
+            target_repositories: "repo-x");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not in the goal's repositories", result);
+
+        var goal = await _store.GetGoalAsync("invalid-targets", ct);
+        Assert.Null(goal);
+    }
+
+    [Fact]
+    public async Task CreateGoal_TargetRepositoriesWithoutRepositories_ReturnsError()
+    {
+        var result = await _composer.CreateGoalAsync(
+            "targets-no-repos",
+            "Targets but no repos",
+            target_repositories: "repo-a");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("no repositories", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_TargetRepositories_DraftGoal_UpdatesTargets()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("targets-update", "Test goal", "repo-a, repo-b, repo-c");
+        var result = await _composer.UpdateGoalAsync("targets-update", "target_repositories", "repo-b, repo-c");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: repo-b,repo-c", result);
+        // The canonical format must be comma-separated with NO space ("A,B" not "A, B").
+        Assert.DoesNotContain("target_repositories: repo-b, repo-c", result);
+
+        var goal = await _store.GetGoalAsync("targets-update", ct);
+        Assert.NotNull(goal);
+        Assert.Equal("repo-b,repo-c", goal!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_TargetRepositories_EmptyValue_ClearsToAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("targets-clear", "Clear targets", "repo-a, repo-b", target_repositories: "repo-a");
+        var result = await _composer.UpdateGoalAsync("targets-clear", "target_repositories", "");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("targets-clear", ct);
+        Assert.NotNull(goal);
+        Assert.Null(goal!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_TargetRepositories_InvalidEntry_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("targets-invalid-update", "Invalid update", "repo-a");
+        var result = await _composer.UpdateGoalAsync("targets-invalid-update", "target_repositories", "repo-x");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("not in the goal's repositories", result);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_WithExplicitTargets_PrunesRemovedTargets()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("prune-targets", "Prune targets", "repo-a, repo-b, repo-c", target_repositories: "repo-b, repo-c");
+        var result = await _composer.UpdateGoalAsync("prune-targets", "repositories", "repo-a, repo-b");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: repo-b", result);
+
+        var goal = await _store.GetGoalAsync("prune-targets", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-a", "repo-b"], goal!.RepositoryNames);
+        Assert.Equal("repo-b", goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_AllTargetsPruned_SetsTargetsToNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("prune-all", "Prune all targets", "repo-a, repo-b", target_repositories: "repo-a, repo-b");
+        var result = await _composer.UpdateGoalAsync("prune-all", "repositories", "repo-c");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("prune-all", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-c"], goal!.RepositoryNames);
+        Assert.Null(goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_NullTargets_StaysNull()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("null-targets-stay", "Null targets", "repo-a, repo-b");
+        var result = await _composer.UpdateGoalAsync("null-targets-stay", "repositories", "repo-a, repo-c");
+
+        Assert.Contains("✅", result);
+        // The update_goal(repositories) response must emit target_repositories.
+        // Null targets stay null → response shows "all".
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("null-targets-stay", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-a", "repo-c"], goal!.RepositoryNames);
+        Assert.Null(goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_NullTargets_ShrinkRepos_StaysNull()
+    {
+        // Null targets + repos [A,B] → [B]: targets stay null (all repos, just B).
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("null-targets-shrink", "Null targets shrink", "repo-a, repo-b");
+        var result = await _composer.UpdateGoalAsync("null-targets-shrink", "repositories", "repo-b");
+
+        Assert.Contains("✅", result);
+        // The update_goal(repositories) response must emit target_repositories.
+        // Null targets stay null → response shows "all".
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("null-targets-shrink", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-b"], goal!.RepositoryNames);
+        Assert.Null(goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_ExplicitTargets_AddRepo_TargetsStayUnchanged()
+    {
+        // Explicit [A,B] + repos [A,B] → [A,B,C]: targets stay [A,B] (C is not a target).
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("explicit-add-repo", "Explicit add repo", "repo-a, repo-b",
+            target_repositories: "repo-a, repo-b");
+        var result = await _composer.UpdateGoalAsync("explicit-add-repo", "repositories", "repo-a, repo-b, repo-c");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: repo-a,repo-b", result);
+        // The canonical format must be comma-separated with NO space ("A,B" not "A, B").
+        Assert.DoesNotContain("target_repositories: repo-a, repo-b", result);
+
+        var goal = await _store.GetGoalAsync("explicit-add-repo", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-a", "repo-b", "repo-c"], goal!.RepositoryNames);
+        Assert.Equal("repo-a,repo-b", goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_ExplicitSingleTarget_PruneToNull()
+    {
+        // Explicit [A] + repos [A,B] → [B]: A pruned, all pruned → null.
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("prune-single-target", "Prune single target", "repo-a, repo-b",
+            target_repositories: "repo-a");
+        var result = await _composer.UpdateGoalAsync("prune-single-target", "repositories", "repo-b");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: all", result);
+
+        var goal = await _store.GetGoalAsync("prune-single-target", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-b"], goal!.RepositoryNames);
+        Assert.Null(goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_Repositories_ExplicitTargets_PrunesOneRemainder()
+    {
+        // Explicit [A,B] + repos [A,B] → [A]: B pruned → [A].
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("prune-one-remainder", "Prune one remainder", "repo-a, repo-b",
+            target_repositories: "repo-a, repo-b");
+        var result = await _composer.UpdateGoalAsync("prune-one-remainder", "repositories", "repo-a");
+
+        Assert.Contains("✅", result);
+        Assert.Contains("target_repositories: repo-a", result);
+
+        var goal = await _store.GetGoalAsync("prune-one-remainder", ct);
+        Assert.NotNull(goal);
+        Assert.Equal(["repo-a"], goal!.RepositoryNames);
+        Assert.Equal("repo-a", goal.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoal_TargetRepositories_NonDraft_ReturnsError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("targets-nondraft", "Test goal");
+        var goal = await _store.GetGoalAsync("targets-nondraft", ct);
+        Assert.NotNull(goal);
+        goal!.Status = GoalStatus.Pending;
+        await _store.UpdateGoalAsync(goal, ct);
+
+        var result = await _composer.UpdateGoalAsync("targets-nondraft", "target_repositories", "repo-a");
+
+        Assert.Contains("❌", result);
+        Assert.Contains("Cannot edit target_repositories", result);
+        Assert.Contains("Only Draft goals can be edited", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_WithTargetRepositories_ShowsTargetsInOutput()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("get-targets", "Show targets", "repo-a, repo-b", target_repositories: "repo-a");
+        var result = await _composer.GetGoalAsync("get-targets");
+
+        Assert.Contains("target_repositories: repo-a", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_WithMultipleTargetRepositories_ShowsNoSpaceFormat()
+    {
+        // get_goal output must use "A,B" (no space) format, not "A, B".
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("get-targets-multi", "Show multi targets", "repo-a, repo-b, repo-c",
+            target_repositories: "repo-c, repo-a");
+        var result = await _composer.GetGoalAsync("get-targets-multi");
+
+        Assert.Contains("target_repositories: repo-c,repo-a", result);
+        Assert.DoesNotContain("target_repositories: repo-c, repo-a", result);
+    }
+
+    [Fact]
+    public async Task GetGoal_WithoutTargetRepositories_ShowsAll()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("get-targets-all", "Show all targets", "repo-a, repo-b");
+        var result = await _composer.GetGoalAsync("get-targets-all");
+
+        Assert.Contains("target_repositories: all", result);
+    }
+
+    [Fact]
     public async Task CreateGoal_WithPriority_SetsPriority()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -2951,6 +3246,26 @@ public sealed class ComposerToolTests : IDisposable
         Assert.Contains("repositories", prompt);
         Assert.Contains("depends_on", prompt);
         Assert.Contains("documents", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_MentionsTargetRepositoryDistinction()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("target_repositories", prompt);
+        Assert.Contains("Target repositories", prompt);
+        Assert.Contains("source repositories", prompt);
+        Assert.Contains("do not modify", prompt);
+        Assert.Contains("follow-up goal", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_UpdateGoal_ListsTargetRepositoriesField()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("target_repositories", prompt);
     }
 
     // ── git tools — no repo manager configured ──

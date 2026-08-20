@@ -66,6 +66,248 @@ public sealed class GoalStoreIntegrationTests
         Assert.Equal("rel-x", retrieved.ReleaseId);
         Assert.False(retrieved.BranchCleanedUp);
         Assert.Equal(ReviewStatus.Approved, retrieved.ReviewStatus);
+        Assert.Null(retrieved.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_Null_PersistsNull()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-null",
+            Description = "Null targets",
+            RepositoryNames = ["repo-a", "repo-b"],
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("targets-null", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Null(retrieved!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_WhitespaceOnly_PersistsNull()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-whitespace",
+            Description = "Whitespace targets",
+            RepositoryNames = ["repo-a", "repo-b"],
+            TargetRepositoryNames = "  , ,  ",
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("targets-whitespace", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Null(retrieved!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_CanonicalizesAndPersists()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-canonical",
+            Description = "Canonical targets",
+            RepositoryNames = ["Repo-A", "Repo-B", "Repo-C"],
+            TargetRepositoryNames = "repo-b, REPO-A, repo-b",
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("targets-canonical", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Equal("Repo-B,Repo-A", retrieved!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_UnknownEntry_ThrowsArgumentException()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-invalid",
+            Description = "Invalid targets",
+            RepositoryNames = ["repo-a"],
+            TargetRepositoryNames = "repo-x",
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.CreateGoalAsync(goal, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_NoRepos_ThrowsArgumentException()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-norepos",
+            Description = "Targets without repos",
+            TargetRepositoryNames = "repo-a",
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.CreateGoalAsync(goal, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task UpdateGoalAsync_TargetRepositoryNames_CanonicalizesAndPersists()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "update-targets",
+            Description = "Update targets",
+            RepositoryNames = ["repo-a", "repo-b"],
+        };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var fetched = await store.GetGoalAsync("update-targets", TestContext.Current.CancellationToken);
+        Assert.NotNull(fetched);
+        fetched!.TargetRepositoryNames = "repo-b, repo-a, repo-b";
+        await store.UpdateGoalAsync(fetched, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("update-targets", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Equal("repo-b,repo-a", retrieved!.TargetRepositoryNames);
+        // The canonical format must be "A,B" (no space), not "A, B".
+        Assert.DoesNotContain(" ", retrieved.TargetRepositoryNames!);
+    }
+
+    [Fact]
+    public async Task UpdateGoalAsync_TargetRepositoryNames_Empty_PersistsNull()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "update-targets-empty",
+            Description = "Update targets to empty",
+            RepositoryNames = ["repo-a", "repo-b"],
+            TargetRepositoryNames = "repo-a",
+        };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var fetched = await store.GetGoalAsync("update-targets-empty", TestContext.Current.CancellationToken);
+        Assert.NotNull(fetched);
+        fetched!.TargetRepositoryNames = "";
+        await store.UpdateGoalAsync(fetched, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("update-targets-empty", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Null(retrieved!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task UpdateGoalAsync_TargetRepositoryNames_InvalidEntry_ThrowsArgumentException()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "update-targets-invalid",
+            Description = "Update targets invalid",
+            RepositoryNames = ["repo-a"],
+        };
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var fetched = await store.GetGoalAsync("update-targets-invalid", TestContext.Current.CancellationToken);
+        Assert.NotNull(fetched);
+        fetched!.TargetRepositoryNames = "repo-x";
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.UpdateGoalAsync(fetched, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_MalformedCommaOnly_PersistsNull()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-malformed-comma",
+            Description = "Malformed comma targets",
+            RepositoryNames = ["repo-a", "repo-b"],
+            TargetRepositoryNames = ",",
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("targets-malformed-comma", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Null(retrieved!.TargetRepositoryNames);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_SpecExample_PersistsCanonicalCommaSeparated()
+    {
+        // Spec example: "a, A, B" with repos ["A","B"] → "A,B" persisted (canonical comma-separated).
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-spec-example",
+            Description = "Spec example targets",
+            RepositoryNames = ["A", "B"],
+            TargetRepositoryNames = "a, A, B",
+        };
+
+        await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var retrieved = await store.GetGoalAsync("targets-spec-example", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Equal("A,B", retrieved!.TargetRepositoryNames);
+        // The canonical format must be "A,B" (no space), not "A, B".
+        Assert.DoesNotContain(" ", retrieved.TargetRepositoryNames!);
+    }
+
+    [Fact]
+    public async Task CreateGoalAsync_TargetRepositoryNames_RoundTrip_ExplicitTargets()
+    {
+        // Persistence round-trip: create with explicit targets, read back, verify value.
+        // The canonical serialized format must be "A,B" (no space), not "A, B".
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        var store = CreateStore(db);
+
+        var goal = new Goal
+        {
+            Id = "targets-roundtrip",
+            Description = "Round-trip explicit targets",
+            RepositoryNames = ["repo-a", "repo-b", "repo-c"],
+            TargetRepositoryNames = "repo-c, repo-a",
+        };
+
+        var created = await store.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        Assert.Equal("repo-c,repo-a", created.TargetRepositoryNames);
+        Assert.DoesNotContain(" ", created.TargetRepositoryNames!);
+
+        var retrieved = await store.GetGoalAsync("targets-roundtrip", TestContext.Current.CancellationToken);
+        Assert.NotNull(retrieved);
+        Assert.Equal("repo-c,repo-a", retrieved!.TargetRepositoryNames);
+        Assert.DoesNotContain(" ", retrieved.TargetRepositoryNames!);
     }
 
     [Fact]

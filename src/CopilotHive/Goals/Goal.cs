@@ -19,6 +19,16 @@ public sealed class Goal
     public GoalStatus Status { get; set; } = GoalStatus.Pending;
     /// <summary>Names of repositories this goal applies to.</summary>
     public List<string> RepositoryNames { get; set; } = [];
+
+    /// <summary>
+    /// Optional comma-separated list of repository names that are the editable targets of this goal.
+    /// Null, empty, whitespace, or malformed (zero non-empty entries after parsing) means ALL
+    /// repositories in <see cref="RepositoryNames"/> are targets (backward compatible). Non-empty
+    /// parsed entries mean only those listed repositories are targets; the remaining repositories
+    /// in <see cref="RepositoryNames"/> are source repositories (reference — do not modify).
+    /// </summary>
+    public string? TargetRepositoryNames { get; set; }
+
     /// <summary>IDs of goals that must complete before this goal can be dispatched.</summary>
     public List<string> DependsOn { get; set; } = [];
     /// <summary>Arbitrary key/value metadata associated with the goal.</summary>
@@ -58,6 +68,66 @@ public sealed class Goal
 
     /// <summary>Pre-execution review status. None = not reviewed, Pending = in progress, Approved = passed, NeedsChanges = issues found.</summary>
     public ReviewStatus ReviewStatus { get; set; } = ReviewStatus.None;
+
+    /// <summary>
+    /// Resolves the effective target repository names for a goal.
+    /// Parses <paramref name="targetRepositoryNames"/> as comma-separated, trims each entry,
+    /// and removes empty/whitespace entries. Zero parsed entries → returns all
+    /// <paramref name="repositoryNames"/> (empty list if repos empty; no exception).
+    /// Non-empty entries + empty <paramref name="repositoryNames"/> → throws
+    /// <see cref="ArgumentException"/>. Non-empty entries + non-empty
+    /// <paramref name="repositoryNames"/> → case-insensitively matches each entry against
+    /// <paramref name="repositoryNames"/>, using the canonical spelling from the first occurrence
+    /// in <paramref name="repositoryNames"/>, deduplicating, and preserving target input order.
+    /// Any entry not found → throws <see cref="ArgumentException"/>.
+    /// </summary>
+    /// <param name="targetRepositoryNames">Comma-separated target repository names, or <c>null</c>.</param>
+    /// <param name="repositoryNames">All repository names the goal applies to.</param>
+    /// <returns>The resolved list of target repository names.</returns>
+    /// <exception cref="ArgumentException">
+    /// Thrown when non-empty target entries are given but <paramref name="repositoryNames"/> is
+    /// empty, or when a target entry does not match any repository name.
+    /// </exception>
+    internal static IReadOnlyList<string> ResolveTargetRepositoryNames(string? targetRepositoryNames, IReadOnlyList<string> repositoryNames)
+    {
+        // 1. Parse comma-separated, trim each entry, remove empty/whitespace entries.
+        var entries = string.IsNullOrWhiteSpace(targetRepositoryNames)
+            ? []
+            : targetRepositoryNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(e => !string.IsNullOrWhiteSpace(e))
+                .ToList();
+
+        // 2. Zero parsed entries → return all repositoryNames (empty list if repos empty). No exception.
+        if (entries.Count == 0)
+            return repositoryNames.ToList();
+
+        // 3. Non-empty entries + empty repositoryNames → throw.
+        if (repositoryNames.Count == 0)
+            throw new ArgumentException("Target repository names were specified but the goal has no repositories.");
+
+        // 4. Non-empty entries + non-empty repositoryNames → case-insensitive match each entry,
+        //    using canonical spelling from first occurrence in repositoryNames. Deduplicate.
+        //    Preserve target input order. Any entry not found → throw.
+        var canonicalByLower = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var repo in repositoryNames)
+        {
+            if (!canonicalByLower.ContainsKey(repo))
+                canonicalByLower[repo] = repo;
+        }
+
+        var resolved = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in entries)
+        {
+            if (!canonicalByLower.TryGetValue(entry, out var canonical))
+                throw new ArgumentException($"Target repository '{entry}' is not in the goal's repositories.");
+
+            if (seen.Add(canonical))
+                resolved.Add(canonical);
+        }
+
+        return resolved;
+    }
 }
 
 /// <summary>Structured summary of a single completed (or failed) pipeline iteration.</summary>

@@ -50,6 +50,7 @@ public sealed partial class Composer
         [Description("Unique goal ID in lowercase-kebab-case (e.g. 'add-user-auth')")] string id,
         [Description("Clear description including acceptance criteria")] string description,
         [Description("Comma-separated repository names this goal applies to")] string? repositories = null,
+        [Description("Comma-separated repository names that are the editable targets of this goal; omitted means all repositories are targets")] string? target_repositories = null,
         [Description("Priority: Low, Normal, High, or Critical. Default: Normal")] string? priority = null,
         [Description("Comma-separated goal IDs this goal depends on")] string? depends_on = null,
         [Description("Scope: Patch, Feature, or Breaking. Default: Patch")] string? scope = null,
@@ -78,6 +79,27 @@ public sealed partial class Composer
             ? new List<string>()
             : repositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
+        // Validate target_repositories upfront (matches the store's normalization semantics)
+        // so invalid input returns a tool error instead of throwing.
+        // Note: only non-empty parsed entries count — zero entries means null (implicit "all repos").
+        IReadOnlyList<string>? resolvedTargets = null;
+        var parsedTargetEntries = string.IsNullOrWhiteSpace(target_repositories)
+            ? []
+            : target_repositories.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(e => !string.IsNullOrWhiteSpace(e))
+                .ToList();
+        if (parsedTargetEntries.Count > 0)
+        {
+            try
+            {
+                resolvedTargets = Goal.ResolveTargetRepositoryNames(target_repositories, repos);
+            }
+            catch (ArgumentException ex)
+            {
+                return $"❌ {ex.Message}";
+            }
+        }
+
         var deps = string.IsNullOrWhiteSpace(depends_on)
             ? new List<string>()
             : depends_on.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -94,6 +116,7 @@ public sealed partial class Composer
             Scope = goalScope,
             Status = GoalStatus.Draft,
             RepositoryNames = repos,
+            TargetRepositoryNames = resolvedTargets is { Count: > 0 } ? string.Join(",", resolvedTargets) : null,
             DependsOn = deps,
             Documents = docs,
         };
@@ -107,6 +130,7 @@ public sealed partial class Composer
         sb.AppendLine($"- Priority: {goalPriority}");
         sb.AppendLine($"- Scope: {goalScope}");
         sb.AppendLine($"- Repositories: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}");
+        sb.AppendLine($"- target_repositories: {(string.IsNullOrWhiteSpace(goal.TargetRepositoryNames) ? "all" : goal.TargetRepositoryNames)}");
         sb.AppendLine($"- Dependencies: {(deps.Count > 0 ? string.Join(", ", deps) : "(none)")}");
         sb.Append("- Status: Draft (not yet dispatched — use approve_goal to queue it)");
         AppendDocumentsList(sb, goal.Documents);
@@ -268,7 +292,7 @@ public sealed partial class Composer
     [Description("Update a field on an existing goal.")]
     internal async Task<string> UpdateGoalAsync(
         [Description("Goal ID to update")] string id,
-        [Description("Field to update: description, priority, scope, repositories, depends_on, documents, status, or release")] string field,
+        [Description("Field to update: description, priority, scope, repositories, target_repositories, depends_on, documents, status, or release")] string field,
         [Description("New value for the field")] string value)
     {
         var error = Shared.ToolValidation.Check(
@@ -277,6 +301,7 @@ public sealed partial class Composer
             (string.Equals(field, "release", StringComparison.OrdinalIgnoreCase)
              || string.Equals(field, "depends_on", StringComparison.OrdinalIgnoreCase)
              || string.Equals(field, "documents", StringComparison.OrdinalIgnoreCase)
+             || string.Equals(field, "target_repositories", StringComparison.OrdinalIgnoreCase)
              || !string.IsNullOrWhiteSpace(value), "value is required"));
         if (error is not null) return error;
 
@@ -358,9 +383,70 @@ public sealed partial class Composer
                     return $"❌ Cannot edit repositories of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
                 var repos = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
                 goal.RepositoryNames = repos;
+
+                // Prune TargetRepositoryNames per the explicit-targets rules:
+                //   - null (implicit "all repos") → keep null; new repos automatically become targets.
+                //   - non-null (explicit targets) → parse, remove entries not in the new RepositoryNames,
+                //     preserve target input order. If all removed → set to null. If some remain → canonicalize.
+                if (goal.TargetRepositoryNames is not null)
+                {
+                    // Prune-only: remove target entries not present in the new repository list,
+                    // canonicalize to the new RepositoryNames spelling, preserve target input order.
+                    // Unlike ResolveTargetRepositoryNames (which throws for unknown entries),
+                    // pruning silently drops removed repos.
+                    var canonicalByLower = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var repo in repos)
+                    {
+                        if (!canonicalByLower.ContainsKey(repo))
+                            canonicalByLower[repo] = repo;
+                    }
+
+                    var remaining = new List<string>();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var entry in goal.TargetRepositoryNames
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Where(e => !string.IsNullOrWhiteSpace(e)))
+                    {
+                        if (canonicalByLower.TryGetValue(entry, out var canonical) && seen.Add(canonical))
+                            remaining.Add(canonical);
+                    }
+
+                    goal.TargetRepositoryNames = remaining.Count > 0 ? string.Join(",", remaining) : null;
+                }
+
                 await _goalStore.UpdateGoalAsync(goal);
                 _logger.LogInformation("Composer updated goal '{GoalId}' repositories to {Repositories}", id, string.Join(", ", repos));
-                return AppendDocuments($"✅ Goal '{id}' repositories updated to: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}.", goal);
+                return AppendDocuments($"✅ Goal '{id}' repositories updated to: {(repos.Count > 0 ? string.Join(", ", repos) : "(none)")}. target_repositories: {(goal.TargetRepositoryNames is not null ? goal.TargetRepositoryNames : "all")}.", goal);
+
+            case "target_repositories":
+                if (goal.Status != GoalStatus.Draft)
+                    return $"❌ Cannot edit target_repositories of a goal in '{goal.Status}' status. Only Draft goals can be edited.";
+                // Empty value or zero non-empty parsed entries → null (implicit "all repos").
+                // Non-empty → validated/canonicalized.
+                var targetEntries = string.IsNullOrWhiteSpace(value)
+                    ? []
+                    : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Where(e => !string.IsNullOrWhiteSpace(e))
+                        .ToList();
+                if (targetEntries.Count == 0)
+                {
+                    goal.TargetRepositoryNames = null;
+                }
+                else
+                {
+                    try
+                    {
+                        var resolved = Goal.ResolveTargetRepositoryNames(value, goal.RepositoryNames);
+                        goal.TargetRepositoryNames = string.Join(",", resolved);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        return $"❌ {ex.Message}";
+                    }
+                }
+                await _goalStore.UpdateGoalAsync(goal);
+                _logger.LogInformation("Composer updated goal '{GoalId}' target_repositories to {TargetRepositories}", id, goal.TargetRepositoryNames ?? "all");
+                return AppendDocuments($"✅ Goal '{id}' updated. target_repositories: {(goal.TargetRepositoryNames is not null ? goal.TargetRepositoryNames : "all")}.", goal);
 
             case "scope":
                 if (int.TryParse(value, out _))
@@ -415,7 +501,7 @@ public sealed partial class Composer
                 return AppendDocuments($"✅ Goal '{id}' release set to '{release.Id}'.", goal);
 
             default:
-                return $"❌ Unknown field '{field}'. Valid fields: description, priority, scope, repositories, depends_on, documents, status, release.";
+                return $"❌ Unknown field '{field}'. Valid fields: description, priority, scope, repositories, target_repositories, depends_on, documents, status, release.";
         }
     }
 
@@ -440,6 +526,7 @@ public sealed partial class Composer
         sb.AppendLine($"- **Priority:** {goal.Priority}");
         sb.AppendLine($"- **Created:** {goal.CreatedAt:yyyy-MM-dd HH:mm}");
         sb.AppendLine($"- **Repositories:** {(goal.RepositoryNames.Count > 0 ? string.Join(", ", goal.RepositoryNames) : "(none)")}");
+        sb.AppendLine($"- target_repositories: {(goal.TargetRepositoryNames is not null ? goal.TargetRepositoryNames : "all")}");
         sb.AppendLine($"- **Description:** {goal.Description}");
 
         if (!string.IsNullOrWhiteSpace(goal.ReleaseId))

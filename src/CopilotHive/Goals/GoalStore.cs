@@ -301,6 +301,10 @@ public sealed class GoalStore : IGoalStore
     {
         GoalId.Validate(goal.Id);
 
+        // Normalize and validate TargetRepositoryNames before persisting:
+        // zero non-empty entries → null; non-empty → canonical comma-separated; every entry must be in RepositoryNames.
+        NormalizeTargetRepositoryNames(goal);
+
         var (db, ownsContext) = ResolveDbContext();
         try
         {
@@ -333,6 +337,10 @@ public sealed class GoalStore : IGoalStore
     /// <inheritdoc />
     public async Task UpdateGoalAsync(Goal goal, CancellationToken ct = default)
     {
+        // Normalize and validate TargetRepositoryNames before persisting:
+        // zero non-empty entries → null; non-empty → canonical comma-separated; every entry must be in RepositoryNames.
+        NormalizeTargetRepositoryNames(goal);
+
         var callStack = Environment.StackTrace;
         var (db, ownsContext) = ResolveDbContext();
         try
@@ -352,6 +360,7 @@ public sealed class GoalStore : IGoalStore
             existing.Priority = goal.Priority;
             existing.Scope = goal.Scope;
             existing.RepositoryNames = goal.RepositoryNames;
+            existing.TargetRepositoryNames = goal.TargetRepositoryNames;
             existing.StartedAt = goal.StartedAt;
             existing.CompletedAt = goal.CompletedAt;
             existing.Iterations = goal.Iterations;
@@ -791,6 +800,31 @@ public sealed class GoalStore : IGoalStore
     }
 
     // ── Internals ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Normalizes <see cref="Goal.TargetRepositoryNames"/> for persistence:
+    /// zero non-empty entries → <c>null</c>; non-empty → canonical comma-separated
+    /// (case from <see cref="Goal.RepositoryNames"/>, deduplicated, target input order).
+    /// Every entry must be in <see cref="Goal.RepositoryNames"/> — otherwise throws
+    /// <see cref="ArgumentException"/>.
+    /// </summary>
+    private static void NormalizeTargetRepositoryNames(Goal goal)
+    {
+        var entries = string.IsNullOrWhiteSpace(goal.TargetRepositoryNames)
+            ? []
+            : goal.TargetRepositoryNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(e => !string.IsNullOrWhiteSpace(e))
+                .ToList();
+
+        if (entries.Count == 0)
+        {
+            goal.TargetRepositoryNames = null;
+            return;
+        }
+
+        var resolved = Goal.ResolveTargetRepositoryNames(goal.TargetRepositoryNames, goal.RepositoryNames);
+        goal.TargetRepositoryNames = string.Join(",", resolved);
+    }
 
     private static string Truncate(string text, int maxLength) =>
         text.Length <= maxLength ? text : text[..maxLength] + "...";

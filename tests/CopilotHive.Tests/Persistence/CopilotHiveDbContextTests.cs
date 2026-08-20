@@ -985,6 +985,85 @@ public sealed class CopilotHiveDbContextTests
     }
 
     /// <summary>
+    /// Verifies that <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> adds the
+    /// <c>target_repositories</c> column to an existing <c>goals</c> table that was created
+    /// before the column existed. This is the generic schema reconciliation path that
+    /// ensures the column exists via <c>PRAGMA table_info</c>.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_ExistingDb_MissingTargetRepositoriesColumn_AddsColumn()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // Create a goals table with columns that predate target_repositories.
+        ctx.Database.ExecuteSqlRaw(
+            """
+            CREATE TABLE goals (
+                id TEXT NOT NULL PRIMARY KEY,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                scope TEXT NOT NULL DEFAULT 'patch',
+                review_status TEXT NOT NULL DEFAULT 'none',
+                repositories TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                iterations INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                notes TEXT,
+                phase_durations TEXT,
+                total_duration_seconds REAL,
+                depends_on TEXT,
+                documents TEXT,
+                branch_cleaned_up INTEGER NOT NULL DEFAULT 0,
+                merge_commit_hash TEXT,
+                release_id TEXT,
+                title TEXT,
+                source_conversation_id TEXT
+            )
+            """);
+
+        ctx.Database.ExecuteSqlRaw(
+            "INSERT INTO goals (id, description, created_at) VALUES ('legacy-target-1', 'Legacy target goal', '2025-01-01T00:00:00Z')");
+
+        // Sanity: target_repositories column should NOT exist yet.
+        var columnsBefore = GetTableColumns(conn, "goals");
+        Assert.DoesNotContain("target_repositories", columnsBefore);
+
+        // Run migration — should add the missing target_repositories column.
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        // Verify the column was added (checked via PRAGMA table_info).
+        var columnsAfter = GetTableColumns(conn, "goals");
+        Assert.Contains("target_repositories", columnsAfter);
+
+        // The existing row should have NULL for target_repositories (nullable column, no default).
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT target_repositories FROM goals WHERE id = 'legacy-target-1'";
+        var value = cmd.ExecuteScalar();
+        // SQLite ALTER TABLE ADD COLUMN on a nullable column returns NULL for existing rows.
+        Assert.True(value is null || value is DBNull, $"Expected null/DBNull but got {value?.GetType().Name}: '{value}'");
+    }
+
+    /// <summary>
+    /// Verifies that a fresh database created via <c>EnsureCreated()</c> includes the
+    /// <c>target_repositories</c> column on the <c>goals</c> table, confirming the EF Core
+    /// mapping is wired up correctly.
+    /// </summary>
+    [Fact]
+    public void EnsureCreated_GoalsTable_HasTargetRepositoriesColumn()
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        var columns = GetTableColumns(conn, "goals");
+        Assert.Contains("target_repositories", columns);
+    }
+
+    /// <summary>
     /// Verifies that indexes defined in the EF Core model are created by
     /// <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> on a fresh database — specifically the
     /// unique composite index <c>idx_goal_iterations_goal_iteration</c> on
