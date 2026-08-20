@@ -374,14 +374,14 @@ public sealed class ProgressDocumentTests
     // ── Idempotent dispatch ──────────────────────────────────────────────────
 
     [Fact]
-    public async Task Dispatch_WhenProgressDocumentAlreadyExists_DoesNotThrow()
+    public async Task Dispatch_WhenProgressDocumentAlreadyExists_ResetsAndContinues()
     {
         var ct = TestContext.Current.CancellationToken;
         var graph = new KnowledgeGraph();
         var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
 
         // Pre-create the progress document so the dispatch's CreateDocumentAsync would throw
-        // (document ID already exists). The catch block should swallow the exception.
+        // (document ID already exists). The catch block should reset it.
         var docId = $"progress-{goal.Id}";
         await graph.CreateDocumentAsync(
             id: docId,
@@ -396,10 +396,46 @@ public sealed class ProgressDocumentTests
         // Should complete without throwing despite the pre-existing document
         await InvokeDispatchNextGoalAsync(dispatcher, ct);
 
-        // The original document content should still be there (the catch swallowed the error)
+        // The stale content should be reset and the goal linking/plan append should continue
         var doc = graph.GetDocument(docId);
         Assert.NotNull(doc);
-        Assert.Contains("Pre-existing", doc!.Content);
+        Assert.DoesNotContain("Pre-existing", doc!.Content);
+        Assert.Contains("(Previous progress from cancelled attempt was reset.)", doc.Content);
+        Assert.Contains($"# Progress: {goal.Id}", doc.Content);
+        Assert.Equal(DocumentStatus.Draft, doc.Status);
+    }
+
+    [Fact]
+    public async Task Dispatch_WhenProgressDocumentAlreadyExists_LogsResetWarning()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+
+        // Pre-create the progress document so the dispatch's CreateDocumentAsync would throw
+        // (document ID already exists). The catch block should reset it and log a warning.
+        var docId = $"progress-{goal.Id}";
+        await graph.CreateDocumentAsync(
+            id: docId,
+            title: "Pre-existing progress",
+            type: DocumentType.Scratch,
+            content: "# Pre-existing\n",
+            topic: "progress",
+            ct: ct);
+
+        var capturingLogger = new ProgressCapturingLogger<GoalDispatcher>();
+        var dispatcher = CreateDispatcher(goal, graph, out _, out _, logger: capturingLogger);
+
+        // Should complete without throwing despite the pre-existing document
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        // The reset warning should have been logged and must contain the expected fragment.
+        var warnings = capturingLogger.Logs
+            .Where(l => l.Level == LogLevel.Warning
+                && l.Message.Contains("Reset stale progress document", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(warnings);
+        Assert.Contains(goal.Id, warnings[0].Message, StringComparison.Ordinal);
     }
 
     // ── Config repo commit ───────────────────────────────────────────────────
@@ -1289,4 +1325,21 @@ file sealed class FakeGoalStore : IGoalStore
 
     public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>(Array.Empty<(string, PersistedClarification)>());
+}
+
+/// <summary>
+/// Capturing logger that records all log entries so tests can assert on emitted messages.
+/// </summary>
+file sealed class ProgressCapturingLogger<T> : ILogger<T>
+{
+    public List<(LogLevel Level, string Message)> Logs { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        Logs.Add((logLevel, formatter(state, exception)));
+    }
 }

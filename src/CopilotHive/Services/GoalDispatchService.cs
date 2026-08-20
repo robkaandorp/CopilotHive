@@ -378,13 +378,23 @@ internal sealed class GoalDispatchService
             var title = $"Progress: {goal.Id}";
             var headerContent = $"# {title}\n";
 
-            await _knowledgeGraph.CreateDocumentAsync(
-                id: docId,
-                title: title,
-                type: DocumentType.Scratch,
-                content: headerContent,
-                topic: "progress",
-                ct: ct);
+            try
+            {
+                await _knowledgeGraph.CreateDocumentAsync(
+                    id: docId,
+                    title: title,
+                    type: DocumentType.Scratch,
+                    content: headerContent,
+                    topic: "progress",
+                    ct: ct);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already exists"))
+            {
+                await _knowledgeGraph.UpdateDocumentAsync($"progress-{goal.Id}",
+                    content: $"# Progress: {goal.Id}\n\n(Previous progress from cancelled attempt was reset.)",
+                    status: DocumentStatus.Draft);
+                _logger.LogWarning("Reset stale progress document for re-dispatched goal {GoalId}", goal.Id);
+            }
 
             // Link the document to the goal via the documents field
             if (_goalStore is not null && !goal.Documents.Contains(docId))
