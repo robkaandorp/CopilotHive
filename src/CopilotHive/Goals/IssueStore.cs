@@ -16,6 +16,13 @@ public sealed class IssueStore : IIssueStore
     private readonly CopilotHiveDbContext? _directDbContext;
     private readonly ILogger<IssueStore> _logger;
 
+    /// <summary>
+    /// Serializes <see cref="UpdateIssueAsync"/> calls on this <see cref="IssueStore"/> instance.
+    /// Scope is per-instance only; it does not protect against concurrent creates/deletes or
+    /// cross-process writers.
+    /// </summary>
+    private readonly SemaphoreSlim _updateLock = new(1, 1);
+
     /// <summary>Creates a new <see cref="IssueStore"/> using a DbContext factory (production/DI).</summary>
     /// <param name="dbContextFactory">Factory used to create transient <see cref="CopilotHiveDbContext"/> instances.</param>
     /// <param name="logger">Logger instance.</param>
@@ -172,48 +179,63 @@ public sealed class IssueStore : IIssueStore
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// This method serializes update-vs-update on this singleton <see cref="IssueStore"/>
+    /// instance only (via a per-instance <see cref="SemaphoreSlim"/>). It does NOT prevent
+    /// stale read-modify-write lost updates (the read and write are still separate round-trips),
+    /// concurrent <see cref="CreateIssueAsync"/> / <see cref="DeleteIssueAsync"/> calls, or
+    /// writes from other processes sharing the same database.
+    /// </remarks>
     public async Task UpdateIssueAsync(Issue issue, CancellationToken ct = default)
     {
-        var (db, ownsContext) = ResolveDbContext();
+        await _updateLock.WaitAsync(ct);
         try
         {
-            var existing = await db.Issues.FirstOrDefaultAsync(e => e.Id == issue.Id, ct);
-            if (existing is null)
-                throw new InvalidOperationException($"Issue '{issue.Id}' not found in SQLite store.");
+            var (db, ownsContext) = ResolveDbContext();
+            try
+            {
+                var existing = await db.Issues.FirstOrDefaultAsync(e => e.Id == issue.Id, ct);
+                if (existing is null)
+                    throw new InvalidOperationException($"Issue '{issue.Id}' not found in SQLite store.");
 
-            // ResolvedAt transition logic — compare incoming status against the existing
-            // status BEFORE overwriting it.
-            var wasTerminal = existing.Status is IssueStatus.Resolved or IssueStatus.Closed;
-            var isTerminal = issue.Status is IssueStatus.Resolved or IssueStatus.Closed;
+                // ResolvedAt transition logic — compare incoming status against the existing
+                // status BEFORE overwriting it.
+                var wasTerminal = existing.Status is IssueStatus.Resolved or IssueStatus.Closed;
+                var isTerminal = issue.Status is IssueStatus.Resolved or IssueStatus.Closed;
 
-            if (isTerminal && !wasTerminal)
-                existing.ResolvedAt = DateTime.UtcNow;
-            else if (!isTerminal)
-                existing.ResolvedAt = null;
-            // else: terminal → terminal — preserve the existing ResolvedAt.
+                if (isTerminal && !wasTerminal)
+                    existing.ResolvedAt = DateTime.UtcNow;
+                else if (!isTerminal)
+                    existing.ResolvedAt = null;
+                // else: terminal → terminal — preserve the existing ResolvedAt.
 
-            // Copy mutable fields from the incoming issue.
-            existing.Type = issue.Type;
-            existing.Title = issue.Title;
-            existing.Description = issue.Description;
-            existing.Severity = issue.Severity;
-            existing.Status = issue.Status;
-            existing.RepositoryNames = issue.RepositoryNames;
-            existing.LinkedGoalId = issue.LinkedGoalId;
+                // Copy mutable fields from the incoming issue.
+                existing.Type = issue.Type;
+                existing.Title = issue.Title;
+                existing.Description = issue.Description;
+                existing.Severity = issue.Severity;
+                existing.Status = issue.Status;
+                existing.RepositoryNames = issue.RepositoryNames;
+                existing.LinkedGoalId = issue.LinkedGoalId;
 
-            // Immutable fields (Id, CreatedAt, SourceGoalId, SourceRole, SourceIteration)
-            // are intentionally NOT copied.
+                // Immutable fields (Id, CreatedAt, SourceGoalId, SourceRole, SourceIteration)
+                // are intentionally NOT copied.
 
-            existing.UpdatedAt = DateTime.UtcNow;
+                existing.UpdatedAt = DateTime.UtcNow;
 
-            await db.SaveChangesAsync(ct);
+                await db.SaveChangesAsync(ct);
 
-            _logger.LogInformation("Updated issue {IssueId}", issue.Id);
+                _logger.LogInformation("Updated issue {IssueId}", issue.Id);
+            }
+            finally
+            {
+                if (ownsContext)
+                    await db.DisposeAsync();
+            }
         }
         finally
         {
-            if (ownsContext)
-                await db.DisposeAsync();
+            _updateLock.Release();
         }
     }
 

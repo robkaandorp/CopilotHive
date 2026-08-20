@@ -3,6 +3,7 @@ using CopilotHive.Persistence;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Goals;
@@ -499,6 +500,187 @@ public sealed class IssueStoreTests : IDisposable
             _store.UpdateIssueAsync(issue, TestContext.Current.CancellationToken));
     }
 
+    // ── Update serialization (per-instance SemaphoreSlim) ──────────────────
+
+    [Fact]
+    public async Task UpdateIssueAsync_ConcurrentUpdates_SerializedBySemaphore()
+    {
+        var dbPath = Path.GetTempFileName();
+        var gate = new GatedSaveInterceptor();
+        GatedDbContextFactory? factory = null;
+        var tasks = new List<Task>();
+
+        try
+        {
+            // Seed three issues using ungated options.
+            await SeedIssuesAsync(dbPath, "lock-a", "lock-b", "lock-c");
+
+            factory = new GatedDbContextFactory(dbPath, gate);
+            var store = new IssueStore(factory, NullLogger<IssueStore>.Instance);
+
+            // Start update A — the interceptor blocks on the gate.
+            var issueA = MakeIssue("lock-a");
+            issueA.Title = "A updated";
+            var taskA = store.UpdateIssueAsync(issueA, TestContext.Current.CancellationToken);
+            tasks.Add(taskA);
+
+            var enteredDeadline = DateTime.UtcNow.AddSeconds(5);
+            while (gate.EntryCount == 0 && DateTime.UtcNow < enteredDeadline)
+                await Task.Yield();
+            Assert.Equal(1, gate.EntryCount);
+
+            // Start update B concurrently — it must queue on the semaphore.
+            var issueB = MakeIssue("lock-b");
+            issueB.Title = "B updated";
+            var taskB = store.UpdateIssueAsync(issueB, TestContext.Current.CancellationToken);
+            tasks.Add(taskB);
+
+            // Give B a bounded scheduling opportunity: it must NOT reach the save.
+            var pollDeadline = DateTime.UtcNow.AddSeconds(2);
+            while (gate.ReachedSaveCount < 2 && DateTime.UtcNow < pollDeadline)
+                await Task.Yield();
+
+            Assert.Equal(1, gate.ReachedSaveCount);
+            Assert.Equal(1, gate.EntryCount);
+
+            gate.ReleaseGate();
+            await Task.WhenAll(taskA, taskB).WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, gate.EntryCount);
+        }
+        finally
+        {
+            gate.ReleaseGate();
+            try
+            {
+                await Task.WhenAll(tasks).WaitAsync(
+                    TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            }
+            catch
+            {
+                // Body assertions already reported; drain is best-effort cleanup.
+            }
+
+            factory?.Dispose();
+            SqliteConnection.ClearAllPools();
+            try { File.Delete(dbPath); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    [Fact]
+    public async Task UpdateIssueAsync_CancelledWaiter_DoesNotReleaseSemaphore()
+    {
+        var dbPath = Path.GetTempFileName();
+        var gate = new GatedSaveInterceptor();
+        GatedDbContextFactory? factory = null;
+        var tasks = new List<Task>();
+
+        try
+        {
+            // Seed three issues using ungated options.
+            await SeedIssuesAsync(dbPath, "cancel-a", "cancel-b", "cancel-c");
+
+            factory = new GatedDbContextFactory(dbPath, gate);
+            var store = new IssueStore(factory, NullLogger<IssueStore>.Instance);
+
+            // Start update A — the interceptor blocks on the gate.
+            var issueA = MakeIssue("cancel-a");
+            issueA.Title = "A updated";
+            var taskA = store.UpdateIssueAsync(issueA, TestContext.Current.CancellationToken);
+            tasks.Add(taskA);
+
+            var enteredDeadline = DateTime.UtcNow.AddSeconds(5);
+            while (gate.EntryCount == 0 && DateTime.UtcNow < enteredDeadline)
+                await Task.Yield();
+            Assert.Equal(1, gate.EntryCount);
+
+            // Start update B with a cancellable token, then cancel it while it
+            // waits on the semaphore.
+            using var cts = new CancellationTokenSource();
+            var issueB = MakeIssue("cancel-b");
+            issueB.Title = "B updated";
+            var taskB = store.UpdateIssueAsync(issueB, cts.Token);
+            tasks.Add(taskB);
+
+            // Give B a bounded scheduling opportunity to queue on the semaphore.
+            var bDeadline = DateTime.UtcNow.AddSeconds(1);
+            while (DateTime.UtcNow < bDeadline)
+                await Task.Yield();
+            cts.Cancel();
+
+            // Bounded await: with the semaphore in place B is parked on it and cancellation
+            // completes it promptly. If the semaphore were removed (or acquired too late), B
+            // would instead reach the gated interceptor, which deliberately ignores the token,
+            // so an unbounded await would hang forever and never run the finally cleanup.
+            // WaitAsync turns that mutation into a fast TimeoutException-driven failure.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => taskB.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+            // Start update C while A is still gated — C must also queue on the
+            // semaphore (B did not release it on cancellation).
+            var issueC = MakeIssue("cancel-c");
+            issueC.Title = "C updated";
+            var taskC = store.UpdateIssueAsync(issueC, TestContext.Current.CancellationToken);
+            tasks.Add(taskC);
+
+            var pollDeadline = DateTime.UtcNow.AddSeconds(2);
+            while (gate.ReachedSaveCount < 2 && DateTime.UtcNow < pollDeadline)
+                await Task.Yield();
+            Assert.Equal(1, gate.ReachedSaveCount);
+
+            gate.ReleaseGate();
+            // Awaiting A proves it completes without SemaphoreFullException.
+            await Task.WhenAll(taskA, taskC).WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, gate.EntryCount);
+        }
+        finally
+        {
+            gate.ReleaseGate();
+            try
+            {
+                await Task.WhenAll(tasks).WaitAsync(
+                    TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            }
+            catch
+            {
+                // Body assertions already reported; drain is best-effort cleanup.
+            }
+
+            factory?.Dispose();
+            SqliteConnection.ClearAllPools();
+            try { File.Delete(dbPath); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    [Fact]
+    public async Task UpdateIssueAsync_CompletesWithinTimeout()
+    {
+        var dbPath = Path.GetTempFileName();
+        PlainDbContextFactory? factory = null;
+
+        try
+        {
+            await SeedIssuesAsync(dbPath, "timeout-issue");
+
+            factory = new PlainDbContextFactory(dbPath);
+            var store = new IssueStore(factory, NullLogger<IssueStore>.Instance);
+
+            var issue = MakeIssue("timeout-issue");
+            issue.Title = "Updated within timeout";
+            await store.UpdateIssueAsync(issue, TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            factory?.Dispose();
+            SqliteConnection.ClearAllPools();
+            try { File.Delete(dbPath); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
     // ── Delete ─────────────────────────────────────────────────────────────
 
     [Fact]
@@ -565,5 +747,104 @@ public sealed class IssueStoreTests : IDisposable
         Assert.Contains("Repo-A", fetched.RepositoryNames);
         Assert.Contains("Repo-B", fetched.RepositoryNames);
         Assert.Contains("Repo-C", fetched.RepositoryNames);
+    }
+
+    // ── Concurrency test helpers ───────────────────────────────────────────
+
+    /// <summary>
+    /// Creates the schema and seeds issues into a file-based SQLite database using
+    /// ungated <see cref="DbContextOptions"/> (no interceptors).
+    /// </summary>
+    private static async Task SeedIssuesAsync(string dbPath, params string[] ids)
+    {
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite($"Data Source={dbPath}")
+            .Options;
+        await using var db = new CopilotHiveDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        foreach (var id in ids)
+            db.Issues.Add(MakeIssue(id));
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Blocks every <c>SavingChangesAsync</c> call on a gate until released, counting how many
+    /// saves reached the interceptor (<see cref="ReachedSaveCount"/>) and how many entered it
+    /// (<see cref="EntryCount"/>). Both counters are incremented at entry, before the gate.
+    /// </summary>
+    private sealed class GatedSaveInterceptor : SaveChangesInterceptor
+    {
+        private readonly TaskCompletionSource<bool> _gate =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _reachedSaveCount;
+        private int _entryCount;
+
+        /// <summary>Number of saves that reached <c>SavingChangesAsync</c>.</summary>
+        public int ReachedSaveCount => Volatile.Read(ref _reachedSaveCount);
+
+        /// <summary>Number of saves that entered <c>SavingChangesAsync</c>.</summary>
+        public int EntryCount => Volatile.Read(ref _entryCount);
+
+        /// <summary>Releases the gate, letting blocked (and future) saves proceed.</summary>
+        public void ReleaseGate() => _gate.TrySetResult(true);
+
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _reachedSaveCount);
+            Interlocked.Increment(ref _entryCount);
+            await _gate.Task;
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Factory that creates contexts over a file-based SQLite database wired with a
+    /// <see cref="GatedSaveInterceptor"/>. A file (rather than <c>:memory:</c>) is used because
+    /// each created context opens its own connection.
+    /// </summary>
+    private sealed class GatedDbContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly string _path;
+        private readonly GatedSaveInterceptor _interceptor;
+
+        public GatedDbContextFactory(string path, GatedSaveInterceptor interceptor)
+        {
+            _path = path;
+            _interceptor = interceptor;
+        }
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={_path}")
+                .AddInterceptors(_interceptor)
+                .Options;
+            return new CopilotHiveDbContext(options);
+        }
+
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Factory that creates ungated contexts over a file-based SQLite database.
+    /// </summary>
+    private sealed class PlainDbContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly string _path;
+
+        public PlainDbContextFactory(string path) => _path = path;
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={_path}")
+                .Options;
+            return new CopilotHiveDbContext(options);
+        }
+
+        public void Dispose() { }
     }
 }
