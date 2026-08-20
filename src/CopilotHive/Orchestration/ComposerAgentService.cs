@@ -2,11 +2,11 @@ using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.Providers;
 using SharpCoder.SubAgents;
 
 using System.Text.Json;

@@ -5,11 +5,11 @@ using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
-using CopilotHive.Shared.AI;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using SharpCoder;
+using SharpCoder.Providers;
 
 namespace CopilotHive.Services;
 

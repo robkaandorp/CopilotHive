@@ -7,7 +7,6 @@ using CopilotHive.Goals;
 using CopilotHive.Git;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;

@@ -4,12 +4,12 @@ using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
 using CopilotHive.Goals;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 
 using SharpCoder;
+using SharpCoder.Providers;
 using SharpCoder.SubAgents;
 
 namespace CopilotHive.Actors;

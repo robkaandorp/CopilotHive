@@ -7,12 +7,12 @@ using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.Providers;
 
 
 namespace CopilotHive.Orchestration;

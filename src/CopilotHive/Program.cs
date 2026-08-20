@@ -599,7 +599,7 @@ public sealed class Program
             // when no user has authenticated yet. Done regardless of authEnabled — the provider
             // returns null when no users exist.
             var userService = app.Services.GetRequiredService<UserService>();
-            CopilotHive.Shared.AI.ChatClientFactory.SetTokenProvider(() =>
+            SharpCoder.Providers.ChatClientFactory.SetTokenProvider(() =>
                 userService.GetActiveAccessTokenAsync(CancellationToken.None).GetAwaiter().GetResult());
 
             if (!string.IsNullOrEmpty(brainModel))

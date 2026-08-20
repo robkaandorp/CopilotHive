@@ -2,12 +2,12 @@
 #pragma warning disable OPENAI001 // ResponsesClient.AsIChatClient is experimental
 using CopilotHive.Services;
 using CopilotHive.Shared;
-using CopilotHive.Shared.AI;
 using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
 
 using SharpCoder;
+using SharpCoder.Providers;
 using SharpCoder.SubAgents;
 
 using System.ComponentModel;
@@ -39,7 +39,7 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     /// <summary>
     /// Internal constructor for unit testing: injects a pre-created <see cref="IChatClient"/>
-    /// and model name, bypassing <see cref="Shared.AI.ChatClientFactory"/> so that tests
+    /// and model name, bypassing <see cref="SharpCoder.Providers.ChatClientFactory"/> so that tests
     /// can run without real LLM credentials.
     /// </summary>
     /// <param name="chatClient">The chat client to use for agent execution.</param>

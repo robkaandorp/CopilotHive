@@ -5,12 +5,12 @@ using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using SharpCoder;
+using SharpCoder.Providers;
 
 using Xunit;
 

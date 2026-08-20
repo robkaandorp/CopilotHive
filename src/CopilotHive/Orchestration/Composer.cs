@@ -5,7 +5,6 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Services;
-using CopilotHive.Shared.AI;
 
 using Microsoft.Extensions.AI;
 
