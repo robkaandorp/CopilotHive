@@ -151,6 +151,21 @@ public class GoalReviewService
                 if (_goalStore is not null)
                     await _goalStore.UpdateGoalAsync(goal, ct);
 
+                // Reset any existing review document to a fresh placeholder BEFORE gathering
+                // knowledge context, so stale verdict/issues/verified content from a previous
+                // review is never fed into the review prompt (which would cause false rejections
+                // based on already-addressed concerns). The reviewer writes the new verdict into
+                // this reset document via CreateOrUpdateReviewDocumentAsync below.
+                var reviewDocId = $"review-{goal.Id}";
+                if (_knowledgeGraph is not null && _knowledgeGraph.GetDocument(reviewDocId) is not null)
+                {
+                    await _knowledgeGraph.UpdateDocumentAsync(
+                        reviewDocId,
+                        content: $"# Review: {goal.Id}\n\n(Review in progress...)",
+                        status: DocumentStatus.Draft,
+                        ct: ct);
+                }
+
                 // Gather knowledge context.
                 var knowledgeContext = string.Empty;
                 if (_knowledgeGraph is not null && goal.Documents.Count > 0)

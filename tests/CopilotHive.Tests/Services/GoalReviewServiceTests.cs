@@ -258,6 +258,68 @@ public sealed class GoalReviewServiceTests
     }
 
     [Fact]
+    public async Task ReviewGoalAsync_ExistingReviewDocument_ResetBeforeNewVerdictWritten()
+    {
+        // Simulate a re-review: a review-{goal.Id} document with stale NeedsChanges content
+        // (old issues/verified text) already exists and is linked to the goal.
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var docId = $"review-{goal.Id}";
+        const string staleContent =
+            "# Review: goal-1\n\n## Verdict: NeedsChanges\n\n## Issues\n\n### [MAJOR] File does not exist\n\n## Verified\n- ❌ src/Foo.cs does not exist\n\n## Recommendation\nFix the file path";
+
+        await kg.CreateDocumentAsync(
+            id: docId,
+            title: $"Review: {goal.Id}",
+            type: DocumentType.Scratch,
+            content: staleContent,
+            topic: "review",
+            author: "reviewer",
+            ct: TestContext.Current.CancellationToken);
+        goal.Documents.Add(docId);
+
+        // Block inside the agent call so the document state can be observed after the reset
+        // but before the new verdict is written over it. The reset runs before the knowledge
+        // context loop and before the agent is invoked, so once the agent is entered the
+        // document must already hold the placeholder.
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockingEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var captured = new List<string>();
+        var service = CreateServiceWithFactory(
+            _ => new BlockingCapturingStubChatClient(tcs.Task, blockingEntered, captured),
+            knowledgeGraph: kg);
+
+        var reviewTask = service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        // Wait until the agent call is entered (the reset has already completed by this point).
+        await blockingEntered.Task;
+
+        // The stale content must have been reset to the placeholder BEFORE the new verdict is
+        // written: old issues/verified text gone, status back to Draft.
+        var midReviewDoc = kg.GetDocument(docId);
+        Assert.NotNull(midReviewDoc);
+        Assert.DoesNotContain("File does not exist", midReviewDoc!.Content);
+        Assert.DoesNotContain("src/Foo.cs does not exist", midReviewDoc.Content);
+        Assert.Contains("(Review in progress...)", midReviewDoc.Content);
+        Assert.Equal(DocumentStatus.Draft, midReviewDoc.Status);
+
+        // The stale content must never have reached the review prompt (root cause of the bug).
+        var combinedPrompt = string.Join("\n", captured);
+        Assert.DoesNotContain("File does not exist", combinedPrompt);
+        Assert.DoesNotContain("src/Foo.cs does not exist", combinedPrompt);
+
+        // Release the agent; the new verdict is then written into the reset document.
+        tcs.SetResult("""{"verdict":"Approved","issues":[],"verified":[],"recommendation":"All good now"}""");
+        await reviewTask;
+
+        var finalDoc = kg.GetDocument(docId);
+        Assert.NotNull(finalDoc);
+        Assert.DoesNotContain("File does not exist", finalDoc!.Content);
+        Assert.Contains("Verdict: Approved", finalDoc.Content);
+        Assert.Contains("All good now", finalDoc.Content);
+    }
+
+    [Fact]
     public async Task ReviewGoalAsync_CallerCancellation_ResetsPendingAndRethrows()
     {
         // A chat client that throws OperationCanceledException when the token is cancelled.
@@ -578,6 +640,59 @@ file sealed class BlockingStubChatClient(Task<string> release, TaskCompletionSou
             FinishReason = ChatFinishReason.Stop,
             Role = ChatRole.Assistant,
         };
+    }
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// A stub <see cref="IChatClient"/> that signals when it is entered, blocks until a supplied
+/// task completes, and records the prompts it receives. Used to observe intermediate state
+/// (e.g. a review document reset) while the agent call is in flight.
+/// </summary>
+file sealed class BlockingCapturingStubChatClient(
+    Task<string> release,
+    TaskCompletionSource<bool> entered,
+    List<string> capturedPrompts) : IChatClient
+{
+    public ChatClientMetadata Metadata => new("stub", null, "stub-model");
+
+    public async Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        Capture(messages);
+        entered.TrySetResult(true);
+        var reply = await release.WaitAsync(cancellationToken);
+        return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply))
+        {
+            FinishReason = ChatFinishReason.Stop,
+        };
+    }
+
+    public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        Capture(messages);
+        entered.TrySetResult(true);
+        var reply = await release.WaitAsync(cancellationToken);
+        yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent(reply)]);
+        yield return new ChatResponseUpdate
+        {
+            FinishReason = ChatFinishReason.Stop,
+            Role = ChatRole.Assistant,
+        };
+    }
+
+    private void Capture(IEnumerable<ChatMessage> messages)
+    {
+        foreach (var m in messages)
+            capturedPrompts.Add(m.Text);
     }
 
     public object? GetService(Type serviceType, object? serviceKey = null) => null;
