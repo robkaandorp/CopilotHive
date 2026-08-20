@@ -849,21 +849,54 @@ internal sealed class PipelineDriver
 
         try
         {
-            var repos = _resolveRepositories(pipeline.Goal);
+            // Resolve the effective target repositories: all repositories when
+            // TargetRepositoryNames is null/empty (backward compat), or only the explicitly
+            // listed targets (canonical spelling, target input order).
+            var targetNames = Goal.ResolveTargetRepositoryNames(
+                pipeline.Goal.TargetRepositoryNames, pipeline.Goal.RepositoryNames);
+
+            // Zero targets → retryable failure: throw so the existing catch block transitions
+            // to NewIteration via HandleMergeFailureAsync. Do NOT call MarkGoalFailedAsync here.
+            if (targetNames.Count == 0)
+                throw new InvalidOperationException(
+                    $"Goal '{pipeline.GoalId}' has no target repositories to merge into.");
+
+            // Map the resolved target names to the TargetRepository objects returned by
+            // _resolveRepositories (which carry Name/Url/DefaultBranch), preserving target order.
+            var allRepos = _resolveRepositories(pipeline.Goal);
+            var targetRepos = targetNames
+                .Select(name => allRepos.First(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
             var commitMessage = await _generateMergeCommitMessage(pipeline, ct);
-            foreach (var repo in repos)
+
+            // Merge each target and collect (repoName, hash) pairs into a LOCAL list.
+            // pipeline.MergeCommitHash is only assigned once ALL targets succeed; a partial
+            // failure leaves it null so the retry can re-merge already-merged targets
+            // (which return the default-branch HEAD — a valid hash — as a no-op).
+            var mergeHashes = new List<string>(targetRepos.Count);
+            foreach (var repo in targetRepos)
             {
                 // Use the persistent brain clone — no temp dirs needed.
                 // After merge, the clone is already on the base branch with the latest code.
                 var mergeCommitHash = await _repoManager.MergeFeatureBranchAsync(
                     repo.Name, pipeline.CoderBranch, repo.DefaultBranch, commitMessage, ct);
-                pipeline.MergeCommitHash = pipeline.MergeCommitHash is null
-                    ? mergeCommitHash
-                    : $"{pipeline.MergeCommitHash},{mergeCommitHash}";
+
+                // An empty/whitespace hash is a retryable failure: the exception propagates
+                // to the catch block, pipeline.MergeCommitHash stays null, and already-merged
+                // targets are not rolled back (re-merging them returns a valid hash on retry).
+                if (string.IsNullOrWhiteSpace(mergeCommitHash))
+                    throw new InvalidOperationException(
+                        $"Merge of '{pipeline.CoderBranch}' into '{repo.DefaultBranch}' for repo '{repo.Name}' returned an empty commit hash.");
+
+                mergeHashes.Add(mergeCommitHash);
 
                 _logger.LogInformation("Squash-merged {Branch} into {Base} for {Repo} (commit={Hash})",
                     pipeline.CoderBranch, repo.DefaultBranch, repo.Name, mergeCommitHash);
             }
+
+            // Only when ALL targets succeed, assign the comma-separated hashes in target order.
+            pipeline.MergeCommitHash = string.Join(",", mergeHashes);
 
             // Summarize and merge goal session into master
             string? brainSummary = null;

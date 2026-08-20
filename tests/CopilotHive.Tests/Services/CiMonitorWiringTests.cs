@@ -164,6 +164,38 @@ public sealed class CiMonitorWiringTests
     }
 
     /// <summary>
+    /// <see cref="GoalLifecycleService.FinalizeGoalAsync"/> must resolve TARGET repositories
+    /// before calling <see cref="CiMonitorService.MonitorGoalAsync"/>: only target repos were
+    /// merged, so the hash list must be zipped against targets — not all RepositoryNames.
+    /// </summary>
+    [Fact]
+    public async Task FinalizeGoalAsync_ResolvesTargets_BeforeMonitoring()
+    {
+        var monitor = new RecordingCiMonitor();
+        var goal = new Goal
+        {
+            Id = "goal-targets",
+            Description = "Wiring test goal with targets",
+            RepositoryNames = ["repo-a", "repo-b", "repo-c"],
+            TargetRepositoryNames = "repo-c, repo-a",
+        };
+        var pipeline = new GoalPipeline(goal);
+        var service = CreateLifecycleService(monitor, pipeline);
+
+        await service.FinalizeGoalAsync(
+            pipeline, GoalStatus.Completed, failureReason: null,
+            mergeCommitHash: "sha-c,sha-a", TestContext.Current.CancellationToken);
+
+        await monitor.Invoked.WaitAsync(WaitTimeout, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, monitor.InvocationCount);
+        Assert.Equal("goal-targets", monitor.GoalId);
+        Assert.Equal("sha-c,sha-a", monitor.Hashes);
+        // Target order preserved: repo-c first, then repo-a. Source-only repo-b excluded.
+        Assert.Equal(["repo-c", "repo-a"], monitor.RepoNames);
+    }
+
+    /// <summary>
     /// Fire-and-forget means the caller must not block on the monitor. The monitor here never
     /// completes; <c>FinalizeGoalAsync</c> must still return promptly.
     /// </summary>

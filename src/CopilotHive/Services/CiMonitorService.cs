@@ -595,7 +595,8 @@ public class CiMonitorService
         var hashes = (goal.MergeCommitHash ?? string.Empty)
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToList();
-        var repoNames = goal.RepositoryNames;
+        // Pair merge hashes with TARGET repositories (not all repos): only targets were merged.
+        var repoNames = Goal.ResolveTargetRepositoryNames(goal.TargetRepositoryNames, goal.RepositoryNames).ToList();
         var count = Math.Min(hashes.Count, repoNames.Count);
         if (hashes.Count != repoNames.Count)
         {

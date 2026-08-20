@@ -149,17 +149,23 @@ internal sealed class GoalLifecycleService
                 GoalId: pipeline.GoalId));
 
         // Fire-and-forget CI monitoring for completed goals with merge commits.
+        // Merge hashes are paired with TARGET repositories (not all repos): only targets
+        // were merged, so monitoring must zip hashes against the resolved target list.
         if (status == GoalStatus.Completed && !string.IsNullOrEmpty(mergeCommitHash)
             && _ciMonitor is not null && pipeline.Goal.RepositoryNames.Count > 0)
         {
-            var goalRepoNames = pipeline.Goal.RepositoryNames.ToList();
-            _ = Task.Run(async () =>
+            var targetRepoNames = Goal.ResolveTargetRepositoryNames(
+                pipeline.Goal.TargetRepositoryNames, pipeline.Goal.RepositoryNames).ToList();
+            if (targetRepoNames.Count > 0)
             {
-                // No outer timeout — each MonitorMergeAsync has its own CiTimeoutMinutes.
-                // The task runs until all repos are done or their individual timeouts expire.
-                try { await _ciMonitor.MonitorGoalAsync(pipeline.GoalId, mergeCommitHash, goalRepoNames, CancellationToken.None); }
-                catch (Exception ex) { _logger.LogWarning(ex, "CI monitoring failed for goal {GoalId}", pipeline.GoalId); }
-            }, CancellationToken.None);
+                _ = Task.Run(async () =>
+                {
+                    // No outer timeout — each MonitorMergeAsync has its own CiTimeoutMinutes.
+                    // The task runs until all repos are done or their individual timeouts expire.
+                    try { await _ciMonitor.MonitorGoalAsync(pipeline.GoalId, mergeCommitHash, targetRepoNames, CancellationToken.None); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "CI monitoring failed for goal {GoalId}", pipeline.GoalId); }
+                }, CancellationToken.None);
+            }
         }
 
         _dashboardNotifier?.NotifyStateChanged();

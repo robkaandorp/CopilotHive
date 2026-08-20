@@ -1360,6 +1360,48 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Equal("test-repo", evt.Repository);
     }
 
+    /// <summary>
+    /// <see cref="CiMonitorService.ScanGoalAsync"/> must pair merge hashes with TARGET
+    /// repositories (resolved via <see cref="Goal.ResolveTargetRepositoryNames"/>), not all
+    /// <see cref="Goal.RepositoryNames"/>. A goal with three repositories but two targets
+    /// must probe exactly the two target repos — the source-only repo must never be probed.
+    /// </summary>
+    [Fact]
+    public async Task ScanGoalAsync_HashesPairedWithTargets_NotAllRepositories()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ =>
+            OkResponse(CheckRunsJson(1, ("build", "completed", "success", null, null))));
+        var goal = new Goal
+        {
+            Id = "goal-target-scan",
+            Description = "target pairing test",
+            Status = GoalStatus.Completed,
+            MergeCommitHash = "sha-b,sha-a",
+            CompletedAt = DateTime.UtcNow,
+            // Three repositories, but only repo-b and repo-a are targets (in that order).
+            RepositoryNames = ["repo-a", "repo-b", "repo-c"],
+            TargetRepositoryNames = "repo-b, repo-a",
+        };
+        var config = CreateConfig(
+            CreateRepo("repo-a"),
+            CreateRepo("repo-b"),
+            CreateRepo("repo-c"));
+        var service = CreateService(handler, config: config, eventBus: eventBus,
+            goalStore: StoreWith(goal));
+
+        await service.ScanGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        // Exactly two probes — one per target repo. The source-only repo-c is never probed.
+        Assert.Equal(2, handler.Requests.Count);
+        var events = eventBus.Published;
+        Assert.Equal(2, events.Count);
+        Assert.All(events, e => Assert.Equal(EventType.CiSucceeded, e.Type));
+        Assert.Contains(events, e => e.Repository == "repo-a");
+        Assert.Contains(events, e => e.Repository == "repo-b");
+        Assert.DoesNotContain(events, e => e.Repository == "repo-c");
+    }
+
     [Fact]
     public async Task StartupScanAsync_CompletedGoalCiFailed_CreatesIssuesAndPublishesCiFailed()
     {
