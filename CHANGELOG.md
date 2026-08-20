@@ -1,3 +1,20 @@
+## [0.32.0] — 2026-08-20
+
+### Added
+
+- **TargetRepositoryNames** — Goals can now specify which repos are editable targets vs read-only reference repos. Composer `create_goal` and `update_goal` tools support `target_repositories`. The merge worker only merges target repos. Brain prompts label target/source repos.
+- **SharpCoder.Providers integration** — CopilotHive now uses the `SharpCoder.Providers` NuGet package (v0.17.0) instead of its own `ChatClientFactory`. Old `CopilotHive.Shared/AI/` code deleted. Provider tests migrated to SharpCoder.Providers.Tests.
+- **GitHub OAuth `workflow` scope** — OAuth token now includes the `workflow` scope, allowing workers to push changes to GitHub Actions workflow files.
+
+### Fixed
+
+- **Worker removal ABA bug** — `WorkerPool.RemoveWorker` is now instance-aware. `WorkStream` binds to one exact `ConnectedWorker` instance, so stale streams can't evict replacement workers.
+- **Issue store concurrency** — `IssueStore.UpdateIssueAsync` is serialized with a per-instance `SemaphoreSlim`, preventing overlapping database operations.
+- **Stale review document** — `review_goal` resets the review document before each review call, preventing stale `NeedsChanges` verdicts from influencing the reviewer.
+- **Progress document cleanup** — Progress document is reset when a goal is cancelled and re-dispatched, so no stale iteration content confuses the Brain.
+- **Flaky tests** — `ComposerActorTests.OverflowRecoveryThrows` and `SendMessage_StreamsText` fixed with deterministic TCS synchronization.
+- **ChatClient disposal** — Copilot `HttpClient`/handler chain is now owned by an `OwnedCopilotChatClient` decorator, with proper disposal and exception aggregation.
+
 ## [0.31.0] — 2026-08-19
 
 ### Added
