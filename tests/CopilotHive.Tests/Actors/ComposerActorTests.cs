@@ -1466,6 +1466,7 @@ public sealed class ComposerActorTests
         var registryStatuses = new List<string>();
         var errors = new List<string>();
         var saveSessionCalls = 0;
+        var lockObj = new object();
 
         // Gate completed by the onStreamingError callback, which only fires from the
         // mailbox's ComposerStreamingErrorMessage handler. This is more reliable than
@@ -1473,6 +1474,7 @@ public sealed class ComposerActorTests
         // _terminated and calls onStreamingFinished — under contention the shutdown path
         // can fire that gate before the error message is processed, leaving errors empty.
         var errorGate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var actor = CreateActor(
             service,
             _ =>
@@ -1480,7 +1482,14 @@ public sealed class ComposerActorTests
                 Interlocked.Increment(ref saveSessionCalls);
                 return Task.CompletedTask;
             },
-            status => registryStatuses.Add(status),
+            status =>
+            {
+                lock (lockObj)
+                {
+                    registryStatuses.Add(status);
+                    if (status == "idle") idleGate.TrySetResult(true);
+                }
+            },
             _ => { },
             () => { },
             (_, _) => { },
@@ -1501,8 +1510,13 @@ public sealed class ComposerActorTests
 
             Assert.Contains(errors, e => e.Contains("Something went wrong", StringComparison.Ordinal));
             Assert.True(saveSessionCalls == 0, "The error path must not save the session");
+
+            // The error callback fires before the terminal "idle" status, so wait for the
+            // idle gate to ensure the full terminal sequence completed before asserting.
+            await idleGate.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
             // Exactly one terminal handling — the error Tell succeeded, so the fallback must not run.
-            Assert.Equal(["streaming", "idle"], registryStatuses);
+            lock (lockObj) Assert.Equal(["streaming", "idle"], registryStatuses);
             Assert.False(GetIsStreaming(actor));
 
             // The accumulated streaming content carries the error marker.
