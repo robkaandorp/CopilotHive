@@ -896,6 +896,7 @@ public sealed class ComposerActorTests
         // ComposerStreamingCompleteMessage mailbox handler (not the finally or shutdown
         // path). This deterministically signals the completion handler ran to completion.
         var completedGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var actor = CreateActor(
             service,
             ct =>
@@ -904,7 +905,14 @@ public sealed class ComposerActorTests
                 if (n == 1) completedGate.TrySetResult(n);
                 return Task.CompletedTask;
             },
-            status => registryStatuses.Add(status),
+            status =>
+            {
+                lock (registryStatuses)
+                {
+                    registryStatuses.Add(status);
+                    if (status == "idle") idleGate.TrySetResult(true);
+                }
+            },
             content => streamContents.Add(content),
             () => { },
             (_, keepStreaming) => { if (!keepStreaming) Interlocked.Increment(ref finishedCalls); },
@@ -921,11 +929,15 @@ public sealed class ComposerActorTests
             await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.Equal(1, saveSessionCalls);
 
+            // The "idle" status is published by the same terminal sequence, so this gate
+            // deterministically signals the streaming state transition completed.
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
             // Exactly ONE terminal handling per stream: the mailbox completion handler owns
             // the terminal sequence, and the streaming task's finally fallback must NOT also
             // run (the terminal Tell succeeded). A duplicate "idle" here means the fallback
             // fired alongside the handler.
-            Assert.Equal(["streaming", "idle"], registryStatuses);
+            lock (registryStatuses) Assert.Equal(["streaming", "idle"], registryStatuses);
             Assert.Equal(1, finishedCalls);
 
             // Streaming content accumulated the text delta.
