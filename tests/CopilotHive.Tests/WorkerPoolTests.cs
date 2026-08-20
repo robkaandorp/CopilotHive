@@ -1261,4 +1261,126 @@ public sealed class WorkerPoolTests
     }
 
     #endregion
+
+    // ── RemoveWorker(ConnectedWorker) — instance-aware removal ────────────────
+
+    #region RemoveWorker(ConnectedWorker) — exact instance
+
+    [Fact]
+    public void RemoveWorkerInstance_ExactInstance_RemovesAndCompletesChannel()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+
+        var removed = pool.RemoveWorker(worker);
+
+        Assert.True(removed);
+        Assert.Null(pool.GetWorker("w1"));
+        Assert.Equal(0, pool.ConnectedWorkerCount);
+        // The message channel is completed so the worker's stream loop terminates.
+        Assert.False(worker.MessageChannel.Writer.TryWrite(new OrchestratorMessage()));
+    }
+
+    #endregion
+
+    #region RemoveWorker(ConnectedWorker) — different instance, same ID
+
+    [Fact]
+    public void RemoveWorkerInstance_DifferentInstanceSameId_ReturnsFalseAndKeepsRegistered()
+    {
+        var pool = CreatePool();
+        var registered = pool.RegisterWorker("w1", []);
+        // A stale reference to an old instance that is no longer registered.
+        var stale = new ConnectedWorker
+        {
+            Id = "w1",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+
+        var removed = pool.RemoveWorker(stale);
+
+        Assert.False(removed);
+        Assert.Same(registered, pool.GetWorker("w1"));
+        // The registered worker's channel must NOT be completed.
+        Assert.True(registered.MessageChannel.Writer.TryWrite(new OrchestratorMessage()));
+    }
+
+    #endregion
+
+    #region RemoveWorker(ConnectedWorker) — ABA: old instance must not evict replacement
+
+    /// <summary>
+    /// The ABA regression: register A, remove A, register B under the same ID, then attempt to
+    /// remove the old instance A. The removal must fail and B must remain registered with its
+    /// channel intact.
+    /// </summary>
+    [Fact]
+    public void RemoveWorkerInstance_AbaReplacement_OldInstanceRemovalDoesNotEvictNew()
+    {
+        var pool = CreatePool();
+
+        // Phase 1: register A and remove it.
+        var a = pool.RegisterWorker("ws-aba", []);
+        Assert.True(pool.RemoveWorker(a));
+
+        // Phase 2: register B under the same ID.
+        var b = pool.RegisterWorker("ws-aba", []);
+        Assert.Same(b, pool.GetWorker("ws-aba"));
+
+        // Phase 3: the stale stream's finally tries to remove A.
+        var removed = pool.RemoveWorker(a);
+
+        Assert.False(removed);
+        // B is still registered — the old instance's removal must not evict the replacement.
+        Assert.Same(b, pool.GetWorker("ws-aba"));
+        Assert.Equal(1, pool.ConnectedWorkerCount);
+        // B's channel must NOT be completed.
+        Assert.True(b.MessageChannel.Writer.TryWrite(new OrchestratorMessage()));
+    }
+
+    #endregion
+
+    #region RemoveWorker(ConnectedWorker) — unknown instance
+
+    [Fact]
+    public void RemoveWorkerInstance_UnknownInstance_ReturnsFalse()
+    {
+        var pool = CreatePool();
+        var ghost = new ConnectedWorker
+        {
+            Id = "ghost",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+
+        Assert.False(pool.RemoveWorker(ghost));
+    }
+
+    #endregion
+
+    #region RemoveWorker(string) — backward compatibility
+
+    [Fact]
+    public void RemoveWorkerById_RegisteredWorker_RemovesAndCompletesChannel()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w1", []);
+
+        var removed = pool.RemoveWorker("w1");
+
+        Assert.True(removed);
+        Assert.Null(pool.GetWorker("w1"));
+        Assert.False(worker.MessageChannel.Writer.TryWrite(new OrchestratorMessage()));
+    }
+
+    [Fact]
+    public void RemoveWorkerById_UnknownId_ReturnsFalse()
+    {
+        var pool = CreatePool();
+
+        Assert.False(pool.RemoveWorker("ghost"));
+    }
+
+    #endregion
 }

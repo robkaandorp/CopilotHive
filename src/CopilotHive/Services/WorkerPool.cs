@@ -69,13 +69,37 @@ public sealed class WorkerPool : IWorkerPool
     }
 
     /// <summary>
-    /// Removes a worker from the pool and closes its message channel.
+    /// Removes a worker from the pool by ID and closes its message channel.
     /// </summary>
+    /// <remarks>
+    /// NOT instance-safe: if a replacement worker has re-registered under the same ID (ABA),
+    /// this removes the replacement. Use <see cref="RemoveWorker(ConnectedWorker)"/> for
+    /// removal that may race with re-registration.
+    /// </remarks>
     /// <param name="id">Identifier of the worker to remove.</param>
-    /// <returns><c>true</c> if the worker was found and removed; <c>false</c> otherwise.</returns>
+    /// <returns><c>true</c> if a worker with the ID was found and removed; <c>false</c> otherwise.</returns>
     public bool RemoveWorker(string id)
     {
         if (!_workers.TryRemove(id, out var worker))
+            return false;
+
+        worker.MessageChannel.Writer.TryComplete();
+        return true;
+    }
+
+    /// <summary>
+    /// Removes the given worker instance from the pool, but only if that exact instance is
+    /// still registered under its ID. Instance-aware: a replacement instance registered
+    /// under the same ID (ABA) is never removed by this call.
+    /// </summary>
+    /// <param name="worker">The exact <see cref="ConnectedWorker"/> instance to remove.</param>
+    /// <returns>
+    /// <c>true</c> if the exact instance was found and removed (and its message channel
+    /// completed); <c>false</c> if a different instance — or nothing — is registered.
+    /// </returns>
+    public bool RemoveWorker(ConnectedWorker worker)
+    {
+        if (!_workers.TryRemove(new KeyValuePair<string, ConnectedWorker>(worker.Id, worker)))
             return false;
 
         worker.MessageChannel.Writer.TryComplete();

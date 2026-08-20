@@ -94,7 +94,10 @@ public sealed class HiveOrchestratorService(
         IServerStreamWriter<OrchestratorMessage> responseStream,
         ServerCallContext context)
     {
-        string? workerId = null;
+        // The exact ConnectedWorker instance this stream is pinned to. All handlers operate on
+        // this instance, and removal in the finally block is instance-aware, so a replacement
+        // worker that re-registers under the same ID (ABA) is never evicted by this stream.
+        ConnectedWorker? pinnedWorker = null;
 
         try
         {
@@ -126,36 +129,52 @@ public sealed class HiveOrchestratorService(
 
             await foreach (var message in requestStream.ReadAllAsync(ct))
             {
-                workerId ??= message.WorkerId;
-                var worker = workerPool.GetWorker(message.WorkerId);
-
-                if (worker is null)
+                if (pinnedWorker is null)
                 {
-                    logger.LogWarning("WorkStream message from unknown worker: {WorkerId}", message.WorkerId);
-                    continue;
-                }
+                    // First message: pin the exact instance registered for this worker ID.
+                    pinnedWorker = workerPool.GetWorker(message.WorkerId);
+                    if (pinnedWorker is null)
+                    {
+                        logger.LogWarning("WorkStream message from unknown worker: {WorkerId}", message.WorkerId);
+                        break;
+                    }
 
-                workerRef = worker;
+                    workerRef = pinnedWorker;
+                }
+                else
+                {
+                    // Every subsequent message must come from the exact pinned instance. A null or
+                    // different/replacement instance under the same ID means the worker re-registered
+                    // (ABA): this stream is stale and must end without processing anything further.
+                    var current = workerPool.GetWorker(message.WorkerId);
+                    if (!ReferenceEquals(current, pinnedWorker))
+                    {
+                        logger.LogWarning(
+                            "WorkStream message from worker {WorkerId} does not match pinned instance — ending stream",
+                            message.WorkerId);
+                        break;
+                    }
+                }
 
                 switch (message.PayloadCase)
                 {
                     case WorkerMessage.PayloadOneofCase.Ready:
-                        await HandleWorkerReady(worker, responseStream, ct);
+                        await HandleWorkerReady(pinnedWorker, responseStream, ct);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Progress:
-                        workerPool.TouchActivity(worker.Id);
-                        HandleTaskProgress(worker, message.Progress);
+                        workerPool.TouchActivity(pinnedWorker.Id);
+                        HandleTaskProgress(pinnedWorker, message.Progress);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Complete:
-                        workerPool.TouchActivity(worker.Id);
-                        HandleTaskComplete(worker, message.Complete);
+                        workerPool.TouchActivity(pinnedWorker.Id);
+                        HandleTaskComplete(pinnedWorker, message.Complete);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.ToolRequest:
-                        workerPool.TouchActivity(worker.Id);
-                        _ = HandleToolCallRequestAsync(worker, message.ToolRequest, ct);
+                        workerPool.TouchActivity(pinnedWorker.Id);
+                        _ = HandleToolCallRequestAsync(pinnedWorker, message.ToolRequest, ct);
                         break;
 
                     default:
@@ -174,15 +193,22 @@ public sealed class HiveOrchestratorService(
         }
         finally
         {
-            if (workerId is not null)
+            if (pinnedWorker is not null)
             {
-                var removed = workerPool.RemoveWorker(workerId);
-                lock (_heartbeatLock)
+                // Instance-aware removal: only succeeds if this exact instance is still registered.
+                // If a replacement registered under the same ID, removal returns false and we must
+                // NOT touch the pool or heartbeat state — the replacement owns them now.
+                var removed = workerPool.RemoveWorker(pinnedWorker);
+                if (removed)
                 {
-                    _heartbeatState.Remove(workerId);
+                    lock (_heartbeatLock)
+                    {
+                        _heartbeatState.Remove(pinnedWorker.Id);
+                    }
+                    _dashboardNotifier?.NotifyStateChanged();
                 }
-                logger.LogInformation("Worker disconnected from WorkStream: {WorkerId}", workerId);
-                if (removed) _dashboardNotifier?.NotifyStateChanged();
+
+                logger.LogInformation("Worker disconnected from WorkStream: {WorkerId}", pinnedWorker.Id);
             }
         }
     }

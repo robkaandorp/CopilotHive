@@ -447,36 +447,271 @@ public sealed class DashboardNotifierWorkerWiringTests
         Assert.Equal(1, count[0]);
     }
 
-    // ── WorkStream finally remove (false) → 0 + dict cleaned (criterion 15) ──
+    // ── WorkStream finally: ABA replacement (A→B) preserves B and B's heartbeat ──
 
     /// <summary>
-    /// Same real WorkStream path, but for a worker that is not in the pool: <c>RemoveWorker</c>
-    /// returns <c>false</c>, so production code must clean the heartbeat dict but must NOT notify.
+    /// Drives the real <see cref="HiveOrchestratorService.WorkStream"/> RPC through an A→B ABA
+    /// replacement: A opens a stream and is pinned as the stream's worker; A is then removed and
+    /// B re-registers under the same ID; B publishes a heartbeat; A's stream ends. The finally
+    /// block must NOT evict B (instance-aware removal of the stale A instance returns
+    /// <c>false</c>), must NOT clean B's heartbeat entry, and must NOT notify the dashboard.
     /// </summary>
     [Fact]
-    public async Task WorkStream_RemoveFalse_NoNotifyButDictCleaned()
+    public async Task WorkStream_AbaReplacement_OldStreamEnds_ReplacementAndHeartbeatPreserved()
     {
         var notifier = new DashboardNotifier();
         var (service, pool, _, count) = CreateService(notifier);
 
-        // Never registered → RemoveWorker will return false.
-        Assert.Null(pool.GetWorker("ws-false"));
+        // A registers and opens a stream. The first Ready message (idle branch) notifies; that
+        // notify is the rendezvous proving the first message was fully processed and A is pinned.
+        var a = pool.RegisterWorker("ws-aba", []);
+        var firstMessageHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        notifier.OnStateChanged += () => firstMessageHandled.TrySetResult();
+
+        var reader = new GatedStreamReader([
+            new WorkerMessage { WorkerId = "ws-aba", Ready = new WorkerReady() },
+            new WorkerMessage
+            {
+                WorkerId = "ws-aba",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "m",
+                },
+            },
+        ]);
+        var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        // Wait until A's first message has been processed (pinnedWorker bound); the stream is
+        // now parked on the gated second MoveNext.
+        await firstMessageHandled.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // A is removed (e.g. by cleanup) and B re-registers under the same ID.
+        Assert.True(pool.RemoveWorker(a));
+        var b = pool.RegisterWorker("ws-aba", []);
+        Assert.Same(b, pool.GetWorker("ws-aba"));
+
+        // B publishes a heartbeat → throttle entry created; that is the 2nd notify
+        // (1st was the Ready message's idle-branch notify).
+        await service.Heartbeat(Hb("ws-aba", false, 10), MockContext());
         var state = HeartbeatState(service);
-        state["ws-false"] = (DateTime.UtcNow, false, 10);
+        Assert.True(state.ContainsKey("ws-aba"));
+        Assert.Equal(2, count[0]);
+
+        // A's stream ends. The finally must NOT evict B, must NOT clean B's heartbeat entry,
+        // and must NOT notify (the stale A instance is no longer registered).
+        reader.Release();
+        await streamTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // Instance-aware removal of the stale A instance refuses: B is still registered.
+        Assert.False(pool.RemoveWorker(a));
+        Assert.Same(b, pool.GetWorker("ws-aba"));
+        Assert.Equal(1, pool.ConnectedWorkerCount);
+        // B's heartbeat entry survived A's stream end — the finally did not clean it.
+        Assert.True(state.ContainsKey("ws-aba"), "B's heartbeat entry must survive A's stream end");
+        // No extra notification from A's finally block.
+        Assert.Equal(2, count[0]);
+    }
+
+    // ── WorkStream instance pinning — first-message bind, subsequent-message break ──
+
+    /// <summary>
+    /// The first message from a worker that is NOT in the pool must fail to pin: <c>GetWorker</c>
+    /// returns null, the stream ends immediately (break), and the finally block must NOT remove
+    /// anything (pinnedWorker is still null) or clean any heartbeat state. This is the
+    /// "no instance captured" path — distinct from the ABA replacement where an instance was
+    /// captured but later became stale.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_FirstMessageFromUnknownWorker_NoPinningNoRemovalNoHeartbeatCleanup()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, count) = CreateService(notifier);
+
+        // No worker registered for "ws-unknown".
+        Assert.Null(pool.GetWorker("ws-unknown"));
+
+        // Pre-seed heartbeat state as if a previous (now-removed) worker left an entry.
+        var state = HeartbeatState(service);
+        state["ws-unknown"] = (DateTime.UtcNow, false, 10);
         count[0] = 0;
 
         var reader = new FakeStreamReader([
             new WorkerMessage
             {
-                WorkerId = "ws-false",
-                Progress = new TaskProgress { TaskId = "t", Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress, Message = "m" },
+                WorkerId = "ws-unknown",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "m",
+                },
             },
         ]);
 
         await service.WorkStream(reader, new MockStreamWriter(), MockContext());
 
-        Assert.False(state.ContainsKey("ws-false"));
+        // No instance was pinned, so the finally block must not have removed anything.
+        // The heartbeat entry must survive — it was never associated with a pinned instance.
+        Assert.True(state.ContainsKey("ws-unknown"),
+            "Heartbeat entry must survive when no instance was pinned");
+        // No notification from the finally block (nothing was removed).
         Assert.Equal(0, count[0]);
+    }
+
+    /// <summary>
+    /// After the first message pins a worker, a subsequent message whose <c>GetWorker</c>
+    /// resolves to null (the pinned instance was removed from the pool between messages, with no
+    /// replacement) must end the stream without processing — the <c>ReferenceEquals(null,
+    /// pinnedWorker)</c> check fails. The second message's Progress handler must NOT run.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_SubsequentMessageNullPoolEntry_BreaksWithoutProcessing()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+
+        var worker = pool.RegisterWorker("ws-null", []);
+        var oldActivity = DateTime.UtcNow.AddMinutes(-90);
+        worker.LastActivityAt = oldActivity;
+
+        // First message is Ready (pins the worker, idle branch → no task → notify).
+        // Second message is Progress. Before releasing the gate, we remove the worker so
+        // GetWorker returns null on the second message → ReferenceEquals fails → break.
+        var firstMessageHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        notifier.OnStateChanged += () => firstMessageHandled.TrySetResult();
+
+        var reader = new GatedStreamReader([
+            new WorkerMessage { WorkerId = "ws-null", Ready = new WorkerReady() },
+            new WorkerMessage
+            {
+                WorkerId = "ws-null",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "m",
+                },
+            },
+        ]);
+        var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        // Wait for the first message to be processed (worker pinned).
+        await firstMessageHandled.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // Remove the worker (no replacement). GetWorker("ws-null") will return null.
+        Assert.True(pool.RemoveWorker(worker));
+
+        // Release the gate → second message arrives. GetWorker returns null → break.
+        reader.Release();
+        await streamTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // The Progress handler must NOT have run — LastActivityAt must be unchanged.
+        Assert.True(worker.LastActivityAt == oldActivity,
+            "Second message must not be processed when the pinned instance is no longer in the pool");
+    }
+
+    /// <summary>
+    /// After the first message pins a worker, a subsequent message whose <c>GetWorker</c>
+    /// resolves to a DIFFERENT instance (ABA replacement) must end the stream without processing.
+    /// This is the same break path as the null case but driven by <c>ReferenceEquals</c> returning
+    /// false for a replacement instance. The second message's Progress handler must NOT run on
+    /// the replacement.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_SubsequentMessageReplacementInstance_BreaksWithoutProcessing()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+
+        var a = pool.RegisterWorker("ws-repl", []);
+        var oldActivityA = DateTime.UtcNow.AddMinutes(-90);
+        a.LastActivityAt = oldActivityA;
+
+        // First message is Ready (pins A, idle branch → notify).
+        var firstMessageHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        notifier.OnStateChanged += () => firstMessageHandled.TrySetResult();
+
+        var reader = new GatedStreamReader([
+            new WorkerMessage { WorkerId = "ws-repl", Ready = new WorkerReady() },
+            new WorkerMessage
+            {
+                WorkerId = "ws-repl",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "m",
+                },
+            },
+        ]);
+        var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        // Wait for the first message to be processed (A pinned).
+        await firstMessageHandled.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // Remove A and register B under the same ID (ABA replacement).
+        Assert.True(pool.RemoveWorker(a));
+        var b = pool.RegisterWorker("ws-repl", []);
+        var oldActivityB = DateTime.UtcNow.AddMinutes(-90);
+        b.LastActivityAt = oldActivityB;
+        Assert.Same(b, pool.GetWorker("ws-repl"));
+
+        // Release the gate → second message arrives. GetWorker returns B ≠ A → break.
+        reader.Release();
+        await streamTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        // The Progress handler must NOT have run on B — B's LastActivityAt is unchanged.
+        Assert.True(b.LastActivityAt == oldActivityB,
+            "Second message must not be processed when the pool has a replacement instance");
+        // A's LastActivityAt is also unchanged (the second message never touched it).
+        Assert.Equal(oldActivityA, a.LastActivityAt);
+    }
+
+    /// <summary>
+    /// After the first message pins a worker, a subsequent message from the SAME pinned instance
+    /// must pass the <c>ReferenceEquals</c> check and continue processing. This covers the
+    /// non-break (continue) branch of the instance-pinning guard. Two Progress messages from the
+    /// same worker: the second must reset <c>LastActivityAt</c>.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_SubsequentMessageSamePinnedInstance_ContinuesProcessing()
+    {
+        var notifier = new DashboardNotifier();
+        var (service, pool, _, _) = CreateService(notifier);
+
+        var worker = pool.RegisterWorker("ws-same", []);
+        worker.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+
+        var reader = new FakeStreamReader([
+            new WorkerMessage
+            {
+                WorkerId = "ws-same",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t1",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "first",
+                },
+            },
+            new WorkerMessage
+            {
+                WorkerId = "ws-same",
+                Progress = new TaskProgress
+                {
+                    TaskId = "t2",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = "second",
+                },
+            },
+        ]);
+
+        await service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        // Both messages were processed: LastActivityAt was reset by TouchActivity on each.
+        Assert.True(DateTime.UtcNow - worker.LastActivityAt < TimeSpan.FromSeconds(5),
+            "Both messages must have been processed (LastActivityAt reset to ~now)");
     }
 
     // ── WorkStream activity → LastActivityAt (activity-based stale detection) ──
@@ -846,5 +1081,44 @@ public sealed class DashboardNotifierWorkerWiringTests
             _index++;
             return Task.FromResult(_index < messages.Count);
         }
+    }
+
+    /// <summary>
+    /// In-memory <see cref="IAsyncStreamReader{T}"/> that yields the first message immediately,
+    /// then blocks the second <c>MoveNext</c> on a gate until <see cref="Release"/> is called,
+    /// after which it completes. Used to interleave external events (re-registration, heartbeats)
+    /// between the stream's messages.
+    /// </summary>
+    private sealed class GatedStreamReader(IReadOnlyList<WorkerMessage> messages)
+        : IAsyncStreamReader<WorkerMessage>
+    {
+        private readonly TaskCompletionSource _gate =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _index = -1;
+
+        public WorkerMessage Current => messages[_index];
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return Task.FromCanceled<bool>(cancellationToken);
+
+            _index++;
+            if (_index >= messages.Count)
+                return Task.FromResult(false);
+
+            // First message passes immediately; subsequent ones wait for the gate.
+            if (_index == 0)
+                return Task.FromResult(true);
+
+            return _gate.Task.ContinueWith(
+                _ => true,
+                cancellationToken,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        /// <summary>Releases the gate, letting the next <c>MoveNext</c> complete.</summary>
+        public void Release() => _gate.TrySetResult();
     }
 }
