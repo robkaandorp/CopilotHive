@@ -2470,6 +2470,7 @@ public sealed class ComposerActorTests
         var saveSessionCalls = 0;
         var overflowRecoveryCalls = 0;
         var errorGate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var actor = CreateActor(
             service,
@@ -2478,7 +2479,14 @@ public sealed class ComposerActorTests
                 Interlocked.Increment(ref saveSessionCalls);
                 return Task.CompletedTask;
             },
-            status => { lock (registryStatuses) registryStatuses.Add(status); },
+            status =>
+            {
+                lock (registryStatuses)
+                {
+                    registryStatuses.Add(status);
+                    if (status == "idle") idleGate.TrySetResult(true);
+                }
+            },
             _ => { },
             () => { },
             (_, _) => { },
@@ -2497,6 +2505,10 @@ public sealed class ComposerActorTests
             // The failure must surface as an error, not a silent finish.
             var error = await errorGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.Contains("recovery reset boom", error);
+
+            // The error callback fires before the terminal sequence publishes "idle", so wait
+            // for the idle status before asserting on the observed registry sequence.
+            await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             // The error callback can fire before ReleaseStreamingResources clears the streaming
             // fields, so poll until the state is fully cleared before asserting on it.
