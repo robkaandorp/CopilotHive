@@ -283,25 +283,204 @@ public static class ChatClientFactory
         if (string.IsNullOrEmpty(ghToken)) throw new InvalidOperationException("GH_TOKEN or GITHUB_TOKEN is required for copilot provider");
 
         var useResponsesApi = RequiresResponsesEndpoint(model);
+
+        // The OpenAIClient is built inside the factory closure so it can be handed the HttpClient
+        // created by the core. The core's wrapper owns that HttpClient's disposal: the OpenAI SDK
+        // does not dispose an injected transport (mirroring the Ollama ownership rationale), so
+        // without it the resilience/mapping handler chain and its sockets would leak.
+        return CreateCopilotClientCore(
+            useResponsesApi, CopilotExtraHighMapping, new HttpClientHandler(),
+            httpClient =>
+            {
+                var openAiClient = new OpenAIClient(
+                    new ApiKeyCredential(ghToken),
+                    new OpenAIClientOptions
+                    {
+                        Endpoint = new Uri("https://api.githubcopilot.com"),
+                        Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
+                        NetworkTimeout = TimeSpan.FromMinutes(30)
+                    }
+                );
+
+                return useResponsesApi
+                    ? openAiClient.GetResponsesClient().AsIChatClient(model)
+                    : openAiClient.GetChatClient(model).AsIChatClient();
+            });
+    }
+
+    /// <summary>
+    /// Shared construction core for the Copilot provider: builds the <see cref="HttpClient"/> over
+    /// the production handler chain, lets <paramref name="clientFactory"/> build the inner
+    /// <see cref="IChatClient"/> over it, and wraps the result in an
+    /// <see cref="OwnedCopilotChatClient"/> that takes ownership of the <see cref="HttpClient"/>'s
+    /// disposal.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="extraHighMapping">The provider value <c>extra_high</c> maps to.</param>
+    /// <param name="terminalHandler">The innermost handler that performs the actual transport.</param>
+    /// <param name="clientFactory">Builds the inner client over the constructed <see cref="HttpClient"/>.</param>
+    /// <remarks>
+    /// On any construction failure (factory throw or null result) the <see cref="HttpClient"/> is
+    /// disposed best-effort — without masking the original exception — before the failure rethrows,
+    /// so a partially built handler chain and its sockets never leak.
+    /// </remarks>
+    private static IChatClient CreateCopilotClientCore(
+        bool useResponsesApi, string extraHighMapping, HttpMessageHandler terminalHandler,
+        Func<HttpClient, IChatClient> clientFactory)
+    {
+        ArgumentNullException.ThrowIfNull(terminalHandler);
+        ArgumentNullException.ThrowIfNull(clientFactory);
+
         var httpClient = new HttpClient(CreateCopilotHandlerChain(
-            useResponsesApi, CopilotExtraHighMapping, new HttpClientHandler()))
+            useResponsesApi, extraHighMapping, terminalHandler))
         {
             Timeout = Timeout.InfiniteTimeSpan
         };
 
-        var openAiClient = new OpenAIClient(
-            new ApiKeyCredential(ghToken),
-            new OpenAIClientOptions
+        try
+        {
+            var inner = clientFactory(httpClient);
+            ArgumentNullException.ThrowIfNull(inner);
+            return new OwnedCopilotChatClient(inner, httpClient);
+        }
+        catch
+        {
+            // Best-effort cleanup of the transport on construction failure. A throwing disposal
+            // must not replace the original construction error.
+            try
             {
-                Endpoint = new Uri("https://api.githubcopilot.com"),
-                Transport = new System.ClientModel.Primitives.HttpClientPipelineTransport(httpClient),
-                NetworkTimeout = TimeSpan.FromMinutes(30)
+                httpClient.Dispose();
             }
-        );
+            catch
+            {
+                // Preserve the original exception.
+            }
 
-        return useResponsesApi
-            ? openAiClient.GetResponsesClient().AsIChatClient(model)
-            : openAiClient.GetChatClient(model).AsIChatClient();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Test seam: builds the FULL production Copilot client stack — the owned
+    /// <see cref="HttpClient"/> over the production handler chain (resilience → Copilot handler →
+    /// reasoning-effort mapping with <see cref="CopilotExtraHighMapping"/>) with an injectable
+    /// terminal handler and an injectable inner-client factory, exactly as the production
+    /// <see cref="CreateCopilotClient"/> does apart from the token/endpoint wiring. Has no token
+    /// dependency.
+    /// </summary>
+    /// <param name="useResponsesApi">Whether to use the /responses branch of the chain.</param>
+    /// <param name="terminalHandler">The innermost handler that replaces the real transport.</param>
+    /// <param name="clientFactory">Builds the inner client over the constructed <see cref="HttpClient"/>.</param>
+    internal static IChatClient CreateCopilotClientForTestFull(
+        bool useResponsesApi, HttpMessageHandler terminalHandler,
+        Func<HttpClient, IChatClient> clientFactory)
+        => CreateCopilotClientCore(useResponsesApi, CopilotExtraHighMapping, terminalHandler, clientFactory);
+
+    /// <summary>
+    /// An <see cref="IChatClient"/> decorator that wraps an inner client together with an
+    /// <see cref="HttpClient"/> this wrapper owns, and disposes both on <see cref="Dispose"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this class exists:</b> the OpenAI SDK does not dispose an <see cref="HttpClient"/>
+    /// transport injected via <c>HttpClientPipelineTransport</c> (it only disposes a client it
+    /// created itself), so the factory-built <see cref="HttpClient"/> — and with it the whole
+    /// resilience/mapping handler chain and its sockets — would otherwise leak. This wrapper is the
+    /// only object the factory hands back, so it takes ownership of the transport, mirroring the
+    /// <see cref="OllamaExtraHighReasoningClient"/> ownership model.
+    /// </para>
+    /// <para>
+    /// <b>Dispose semantics:</b> the inner client is disposed first, then the owned
+    /// <see cref="HttpClient"/>. Both cleanups are always attempted. A plain <c>try/finally</c>
+    /// would not do: if both throw, the transport's exception would replace — and thereby hide —
+    /// the inner client's. The failures are captured instead, so a single failure propagates as-is
+    /// (original stack preserved via <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/>) and a double failure
+    /// surfaces as an <see cref="AggregateException"/> that still carries the primary error first.
+    /// Disposal is idempotent: an <see cref="System.Threading.Interlocked.Exchange(ref int, int)"/> guard ensures concurrent or
+    /// repeated <see cref="Dispose"/> calls run the cleanup exactly once.
+    /// </para>
+    /// </remarks>
+    internal sealed class OwnedCopilotChatClient : IChatClient
+    {
+        private readonly IChatClient _inner;
+        private readonly HttpClient _ownedHttpClient;
+        private int _disposed;
+
+        /// <summary>
+        /// Creates a wrapper around <paramref name="inner"/> that owns
+        /// <paramref name="ownedHttpClient"/>'s disposal.
+        /// </summary>
+        /// <param name="inner">The inner client. This wrapper owns its disposal.</param>
+        /// <param name="ownedHttpClient">The <see cref="HttpClient"/> this wrapper owns.</param>
+        public OwnedCopilotChatClient(IChatClient inner, HttpClient ownedHttpClient)
+        {
+            ArgumentNullException.ThrowIfNull(inner);
+            ArgumentNullException.ThrowIfNull(ownedHttpClient);
+            _inner = inner;
+            _ownedHttpClient = ownedHttpClient;
+        }
+
+        /// <inheritdoc />
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => _inner.GetResponseAsync(messages, options, cancellationToken);
+
+        /// <inheritdoc />
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => _inner.GetStreamingResponseAsync(messages, options, cancellationToken);
+
+        /// <inheritdoc />
+        public object? GetService(Type serviceType, object? serviceKey = null)
+            => _inner.GetService(serviceType, serviceKey);
+
+        /// <summary>
+        /// Disposes the inner client first, then the owned <see cref="HttpClient"/>.
+        /// Idempotent: concurrent and repeated calls run the cleanup exactly once.
+        /// </summary>
+        /// <remarks>
+        /// Both cleanups are always attempted. A single failure propagates as-is (original stack
+        /// preserved via <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/>); if both throw, an
+        /// <see cref="AggregateException"/> carrying both is thrown, with the inner client's failure
+        /// first so the original/primary error is never hidden.
+        /// </remarks>
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            Exception? innerFailure = null;
+            Exception? httpClientFailure = null;
+
+            try
+            {
+                _inner.Dispose();
+            }
+            catch (Exception ex)
+            {
+                innerFailure = ex;
+            }
+
+            try
+            {
+                _ownedHttpClient.Dispose();
+            }
+            catch (Exception ex)
+            {
+                httpClientFailure = ex;
+            }
+
+            if (innerFailure is not null && httpClientFailure is not null)
+                throw new AggregateException(
+                    "Both the inner Copilot client and its owned HttpClient failed to dispose.",
+                    innerFailure, httpClientFailure);
+
+            if (innerFailure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(innerFailure).Throw();
+
+            if (httpClientFailure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(httpClientFailure).Throw();
+        }
     }
 
     /// <summary>
