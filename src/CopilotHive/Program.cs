@@ -249,6 +249,7 @@ public sealed class Program
                         options.CallbackPath = "/signin-github";
                         options.Scope.Add("read:user");
                         options.Scope.Add("copilot");
+                        options.Scope.Add("workflow");
                         options.SaveTokens = true;
 
                         options.Events.OnCreatingTicket = async context =>
