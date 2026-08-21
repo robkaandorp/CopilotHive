@@ -1005,6 +1005,11 @@ else
                                            @onchange='(e) => ToggleComposerNotifEvent("issue_raised", (bool)(e.Value ?? false))' />
                                     Issue Raised
                                 </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("package_published")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("package_published", (bool)(e.Value ?? false))' />
+                                    Package Published
+                                </label>
                                 @if (_composerNotifActiveEvents.Count == 0)
                                 {
                                     <span style="color:var(--red);font-size:0.8rem">At least one active event is required.</span>

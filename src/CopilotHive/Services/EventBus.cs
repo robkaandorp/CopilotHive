@@ -19,6 +19,10 @@ public enum EventType
     CiSucceeded,
     /// <summary>CI failed for a goal's repository.</summary>
     CiFailed,
+    /// <summary>A NuGet package was published for a monitored repository.</summary>
+    PackagePublished,
+    /// <summary>A monitored NuGet package publish timed out.</summary>
+    PackagePublishTimedOut,
 }
 
 /// <summary>A typed system event with a human-readable message and optional entity references.</summary>

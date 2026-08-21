@@ -238,7 +238,15 @@ public sealed class HiveConfigFile
                 DefaultBranch = r.DefaultBranch,
                 MonitorCi = r.MonitorCi,
                 CiTimeoutMinutes = r.CiTimeoutMinutes,
-                Release = r.Release is null ? null : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch }
+                Release = r.Release is null ? null : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch },
+                PublishNuGet = r.PublishNuGet is null
+                    ? null
+                    : new NuGetPublishConfig
+                    {
+                        Packages = r.PublishNuGet.Packages
+                            .Select(p => new NuGetPackageEntry { PackageId = p.PackageId })
+                            .ToList()
+                    }
             }));
 
         Workers = new Dictionary<string, WorkerConfig>(
