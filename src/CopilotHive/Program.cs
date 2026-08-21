@@ -438,6 +438,21 @@ public sealed class Program
                 httpClientFactory: sp.GetService<IHttpClientFactory>(),
                 logger: sp.GetService<ILogger<CiMonitorService>>()));
 
+            // HTTP client for NuGet publish monitoring (gzip decompression for the
+            // registration5-gz-semver2 endpoint).
+            builder.Services.AddHttpClient("nuget-api", client =>
+            {
+                client.Timeout = TimeSpan.FromSeconds(30);
+            }).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+            });
+
+            // NuGet publish monitoring: polls the NuGet registration API to verify packages
+            // have landed after a release. Service layer only — lifecycle integration is a
+            // separate follow-up goal.
+            builder.Services.AddSingleton<NuGetPublishMonitorService>();
+
             // Dashboard: Blazor Server + real-time state aggregation
             builder.Services.AddSingleton<DashboardNotifier>();
             builder.Services.AddSingleton<DashboardStateService>();
