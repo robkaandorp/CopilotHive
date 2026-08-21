@@ -1068,4 +1068,88 @@ public class ConfigEndpointsTests
             .EnumerateArray().Select(e => e.GetString()).ToList();
         Assert.Equal(["package_published"], activeEvents);
     }
+
+    // ── Additional integration coverage for validActiveEvents and default count ──
+
+    [Fact]
+    public async Task GetComposer_ConfiguredComposerNullNotifications_ActiveEventsDefaultFour()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        // Composer exists but EventNotifications is null → default path.
+        baseFactory.Config.Composer = new ComposerConfig { MaxSteps = 50 };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        // Default is exactly 4 — package_published must NOT appear.
+        Assert.Equal(4, activeEvents.Count);
+        Assert.Equal(["goal_completed", "goal_failed", "ci_failed", "issue_raised"], activeEvents);
+        Assert.DoesNotContain("package_published", activeEvents);
+
+        // validActiveEvents must still contain all 5 recognized names.
+        var validEvents = body.GetProperty("eventNotifications").GetProperty("validActiveEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Equal(AllValidActiveEvents, validEvents);
+    }
+
+    [Fact]
+    public async Task GetComposer_AllFiveEventsConfigured_AllReturnedInActiveEvents()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            MaxSteps = 50,
+            EventNotifications = new EventNotificationsConfig
+            {
+                Mode = "active",
+                ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published"],
+                ThrottleSeconds = 30
+            }
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        // All 5 events are returned in canonical order.
+        Assert.Equal(AllValidActiveEvents, activeEvents);
+    }
+
+    [Fact]
+    public async Task PatchComposer_PackagePublishedWithPascalCase_RoundTripsViaEndpoint()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new
+            {
+                eventNotificationsMode = "active",
+                eventNotificationsActiveEvents = new[] { "PackagePublished" },
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // PascalCase input must be canonicalized to snake_case.
+        Assert.Equal(["package_published"], baseFactory.Config.Composer!.EventNotifications!.ActiveEvents);
+    }
 }

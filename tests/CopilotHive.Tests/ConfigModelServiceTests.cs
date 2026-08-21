@@ -1705,6 +1705,25 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateComposerSettingsAsync_PackagePublishTimedOut_RejectedAsNotActiveEvent()
+    {
+        // PackagePublishTimedOut exists in EventType enum but is NOT a recognized active event.
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(
+                    EventNotificationsActiveEvents: ["package_publish_timed_out"]),
+                TestContext.Current.CancellationToken));
+
+        Assert.Contains("Invalid active event", ex.Message, StringComparison.Ordinal);
+        // Nothing was persisted — validation runs before mutation.
+        Assert.Null(config.Composer);
+    }
+
+    [Fact]
     public async Task UpdateComposerSettingsAsync_ThrottleClamped()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };

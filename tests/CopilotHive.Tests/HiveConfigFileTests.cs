@@ -2544,4 +2544,176 @@ public sealed class HiveConfigFileTests
         Assert.Single(types);
         Assert.Contains(EventType.PackagePublished, types);
     }
+
+    // ── Additional integration coverage for NuGet publish config ────────────────
+
+    [Fact]
+    public void ReloadFrom_PublishNuGet_MutatingReceiverDoesNotAffectSource()
+    {
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo",
+                    Url = "https://github.com/org/repo.git",
+                    DefaultBranch = "main",
+                    PublishNuGet = new NuGetPublishConfig
+                    {
+                        Packages = [new NuGetPackageEntry { PackageId = "Orig.Package" }]
+                    }
+                }
+            ]
+        };
+
+        var receiver = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        receiver.ReloadFrom(source);
+
+        // Mutate the receiver after reload.
+        var copied = Assert.Single(receiver.Repositories);
+        copied.PublishNuGet!.Packages[0].PackageId = "Changed.Package";
+        copied.PublishNuGet.Packages.Add(new NuGetPackageEntry { PackageId = "Extra.Package" });
+
+        // Source must be unaffected.
+        var sourceRepo = Assert.Single(source.Repositories);
+        var sourceEntry = Assert.Single(sourceRepo.PublishNuGet!.Packages);
+        Assert.Equal("Orig.Package", sourceEntry.PackageId);
+    }
+
+    [Fact]
+    public void ReloadFrom_PublishNuGet_EmptyPackagesList_CopiedAsEmpty()
+    {
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "repo",
+                    Url = "https://github.com/org/repo.git",
+                    DefaultBranch = "main",
+                    PublishNuGet = new NuGetPublishConfig { Packages = [] }
+                }
+            ]
+        };
+
+        var receiver = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        receiver.ReloadFrom(source);
+
+        var copied = Assert.Single(receiver.Repositories);
+        Assert.NotNull(copied.PublishNuGet);
+        Assert.Empty(copied.PublishNuGet!.Packages);
+        Assert.NotSame(source.Repositories[0].PublishNuGet, copied.PublishNuGet);
+        Assert.NotSame(source.Repositories[0].PublishNuGet!.Packages, copied.PublishNuGet.Packages);
+    }
+
+    [Fact]
+    public async Task RoundTrip_PublishNuGet_EmptyPackagesList_SurvivesSerializeDeserialize()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "nuget-repo",
+                    Url = "https://github.com/org/nuget-repo.git",
+                    DefaultBranch = "main",
+                    PublishNuGet = new NuGetPublishConfig { Packages = [] }
+                }
+            ]
+        };
+
+        var yaml = Serializer.Serialize(original);
+        Assert.Contains("publish_nuget:", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var repo = Assert.Single(reloaded.Repositories);
+        Assert.NotNull(repo.PublishNuGet);
+        Assert.Empty(repo.PublishNuGet!.Packages);
+    }
+
+    [Fact]
+    public async Task RoundTrip_PublishNuGet_NullPublishNuGet_NotSerialized()
+    {
+        var original = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "nuget-repo",
+                    Url = "https://github.com/org/nuget-repo.git",
+                    DefaultBranch = "main",
+                    PublishNuGet = null
+                }
+            ]
+        };
+
+        var yaml = Serializer.Serialize(original);
+        Assert.DoesNotContain("publish_nuget", yaml, StringComparison.Ordinal);
+
+        var reloaded = Deserializer.Deserialize<HiveConfigFile>(yaml);
+        var repo = Assert.Single(reloaded.Repositories);
+        Assert.Null(repo.PublishNuGet);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_PackagePublished_NotReportedAsInvalid()
+    {
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["package_published", "goal_completed"]
+        };
+
+        var invalid = config.GetInvalidEventNames();
+
+        Assert.Empty(invalid);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_PackagePublishTimedOut_NotInRecognizedActiveEvents()
+    {
+        // PackagePublishTimedOut is in the EventType enum but must NOT be a recognized active event.
+        // It should be treated as invalid if someone tries to use it as an active event.
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["package_publish_timed_out"]
+        };
+
+        var types = config.GetActiveEventTypes();
+
+        // Falls back to defaults because the only entry was not recognized.
+        Assert.Equal(4, types.Count);
+        Assert.DoesNotContain(EventType.PackagePublishTimedOut, types);
+
+        var invalid = config.GetInvalidEventNames();
+        Assert.Contains("package_publish_timed_out", invalid);
+    }
+
+    [Fact]
+    public void EventNotificationsConfig_AllFiveRecognized_AllAccepted()
+    {
+        var config = new EventNotificationsConfig
+        {
+            ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published"]
+        };
+
+        var types = config.GetActiveEventTypes();
+
+        Assert.Equal(5, types.Count);
+        Assert.Contains(EventType.GoalCompleted, types);
+        Assert.Contains(EventType.GoalFailed, types);
+        Assert.Contains(EventType.CiFailed, types);
+        Assert.Contains(EventType.IssueRaised, types);
+        Assert.Contains(EventType.PackagePublished, types);
+
+        // None should be reported as invalid.
+        Assert.Empty(config.GetInvalidEventNames());
+    }
 }
