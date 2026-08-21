@@ -339,6 +339,7 @@ public static class ConfigHub
                     {
                         mode = "passive",
                         activeEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised" },
+                        validActiveEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published" },
                         throttleSeconds = 30,
                     },
                 });
@@ -348,7 +349,7 @@ public static class ConfigHub
             var activeTypes = notif?.GetActiveEventTypes();
             // Map through the whitelist order so the response is always canonical and stable.
             var activeEvents = activeTypes is { Count: > 0 }
-                ? new[] { EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised }
+                ? new[] { EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised, EventType.PackagePublished }
                     .Where(activeTypes.Contains)
                     .Select(ToSnakeCase)
                     .ToArray()
@@ -364,6 +365,7 @@ public static class ConfigHub
                 {
                     mode = notif?.EffectiveMode ?? "passive",
                     activeEvents,
+                    validActiveEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published" },
                     throttleSeconds = notif?.EffectiveThrottleSeconds ?? 30,
                 },
             });

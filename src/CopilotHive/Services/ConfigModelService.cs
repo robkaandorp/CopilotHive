@@ -842,10 +842,11 @@ public sealed class ConfigModelService
     /// </summary>
     private static readonly (string Canonical, string Pascal)[] KnownActiveEvents =
     [
-        ("goal_completed", "GoalCompleted"),
-        ("goal_failed",    "GoalFailed"),
-        ("ci_failed",      "CiFailed"),
-        ("issue_raised",   "IssueRaised"),
+        ("goal_completed",     "GoalCompleted"),
+        ("goal_failed",        "GoalFailed"),
+        ("ci_failed",          "CiFailed"),
+        ("issue_raised",       "IssueRaised"),
+        ("package_published",  "PackagePublished"),
     ];
 
     /// <summary>
@@ -856,7 +857,7 @@ public sealed class ConfigModelService
 
     /// <summary>
     /// Resolves an active event name to its canonical snake_case form. The input must equal one
-    /// of the eight canonical spellings (four snake_case, four PascalCase) case-insensitively;
+    /// of the ten canonical spellings (five snake_case, five PascalCase) case-insensitively;
     /// anything else — including near-matches that differ only in underscore placement — returns
     /// <c>null</c> so the caller can reject it.
     /// </summary>

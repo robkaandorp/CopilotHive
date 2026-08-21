@@ -1669,6 +1669,42 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateComposerSettingsAsync_PackagePublished_AcceptedCanonicalizedAndPersisted()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsActiveEvents: ["PackagePublished"]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            ["package_published"],
+            config.Composer!.EventNotifications!.ActiveEvents);
+        Assert.Single(repo.Commits);
+    }
+
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_PackagePublishedWithOthers_CanonicalizesAll()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsActiveEvents: ["goal_completed", "PACKAGE_PUBLISHED", "issue_raised"]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            ["goal_completed", "package_published", "issue_raised"],
+            config.Composer!.EventNotifications!.ActiveEvents);
+        Assert.Single(repo.Commits);
+    }
+
+    [Fact]
     public async Task UpdateComposerSettingsAsync_ThrottleClamped()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };

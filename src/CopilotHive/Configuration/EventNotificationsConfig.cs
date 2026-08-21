@@ -12,8 +12,15 @@ namespace CopilotHive.Configuration;
 /// </summary>
 public sealed class EventNotificationsConfig
 {
-    /// <summary>Event types that qualify for active injection.</summary>
-    private static readonly HashSet<EventType> ValidActiveEvents = new()
+    /// <summary>All event types that qualify for active injection (recognized names).</summary>
+    private static readonly HashSet<EventType> RecognizedActiveEvents = new()
+    {
+        EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed,
+        EventType.IssueRaised, EventType.PackagePublished
+    };
+
+    /// <summary>Event types injected by default when no explicit list is configured.</summary>
+    private static readonly HashSet<EventType> DefaultActiveEvents = new()
     { EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised };
 
     /// <summary>Mode: "passive" (default), "active", "off". Invalid values fall back to "passive".</summary>
@@ -38,28 +45,28 @@ public sealed class EventNotificationsConfig
 
     /// <summary>
     /// Parses snake_case event names (e.g. <c>"goal_completed"</c> → <see cref="EventType.GoalCompleted"/>).
-    /// Null/empty/invalid-only input defaults to all four whitelisted types. Names that parse but are not
-    /// in the whitelist are skipped. Numeric strings and comma-combined values are rejected.
+    /// Null/empty/invalid-only input defaults to the four default types. Names that parse but are not
+    /// recognized are skipped. Numeric strings and comma-combined values are rejected.
     /// </summary>
     /// <returns>A new <see cref="HashSet{T}"/> of active event types; never a shared reference.</returns>
     public HashSet<EventType> GetActiveEventTypes()
     {
         if (ActiveEvents is null || ActiveEvents.Count == 0)
-            return new HashSet<EventType>(ValidActiveEvents);
+            return new HashSet<EventType>(DefaultActiveEvents);
 
         var result = new HashSet<EventType>();
         foreach (var name in ActiveEvents)
         {
             if (name is null) continue;
-            if (TryParseSnakeCase(name, out var t) && ValidActiveEvents.Contains(t))
+            if (TryParseSnakeCase(name, out var t) && RecognizedActiveEvents.Contains(t))
                 result.Add(t);
         }
 
-        return result.Count == 0 ? new HashSet<EventType>(ValidActiveEvents) : result;
+        return result.Count == 0 ? new HashSet<EventType>(DefaultActiveEvents) : result;
     }
 
     /// <summary>
-    /// Returns names from <see cref="ActiveEvents"/> that could not be parsed or are not in the whitelist.
+    /// Returns names from <see cref="ActiveEvents"/> that could not be parsed or are not recognized.
     /// Empty if <see cref="ActiveEvents"/> is null. Used by <c>ActiveEventInjector</c> for logging.
     /// </summary>
     public List<string> GetInvalidEventNames()
@@ -69,7 +76,7 @@ public sealed class EventNotificationsConfig
         foreach (var name in ActiveEvents)
         {
             if (name is null) continue;
-            if (!TryParseSnakeCase(name, out var t) || !ValidActiveEvents.Contains(t))
+            if (!TryParseSnakeCase(name, out var t) || !RecognizedActiveEvents.Contains(t))
                 invalid.Add(name);
         }
         return invalid;
