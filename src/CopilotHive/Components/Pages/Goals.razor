@@ -1,11 +1,13 @@
 @page "/goals"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@implements IDisposable
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject HttpClient HttpClient
 @inject PageHeaderState PageHeader
 @inject GoalsFilterState FilterState
+@inject DashboardStateService State
 
 <div class="goals-page">
 <!-- Filter Bar -->
@@ -209,7 +211,20 @@ else if (_loaded)
         _releaseStatusById = _allReleases.ToDictionary(r => r.Id, r => r.Status);
         _loaded = true;
         ApplyFilters();
+        State.OnStateChanged += RefreshState;
     }
+
+    private void RefreshState() => InvokeAsync(async () =>
+    {
+        _allGoals = (await GoalStore.GetAllGoalsAsync()).ToList();
+        _allReleases = (await GoalStore.GetReleasesAsync()).ToList();
+        _goalStatusById = _allGoals.ToDictionary(g => g.Id, g => g.Status);
+        _releaseStatusById = _allReleases.ToDictionary(r => r.Id, r => r.Status);
+        ApplyFilters();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.OnStateChanged -= RefreshState;
 
     private void ApplyFilters()
     {
