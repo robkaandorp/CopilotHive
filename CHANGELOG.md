@@ -1,3 +1,17 @@
+## [0.33.0] — 2026-08-22
+
+### Added
+
+- **NuGet publish monitoring** — `NuGetPublishMonitorService` polls the NuGet API after a release to verify packages have landed. Emits `PackagePublished`/`PackagePublishTimedOut` events. Per-repo `publish_nuget` config. Startup scan for releases completed while offline. `PackagePublished` is an opt-in active event.
+- **Autonomous composer mode** — all 9 supported active-event types are now available as opt-in active events, with "Autopilot" (select all 9) and "Normal" (select 4 defaults) preset buttons on the configuration page, enabling full autonomous operation where the Composer runs in a loop driven by events.
+
+### Fixed
+
+- **Goals overview page auto-refresh** — the Goals page now subscribes to `DashboardStateService.OnStateChanged` and auto-updates without manual refresh.
+- **CI monitor log extraction** — `ParseTestFailuresFromLogs` now strips GitHub Actions timestamp prefixes so structured issue creation works instead of falling back to the 500-char tail snippet.
+- **Flaky `GoalActorTests.DisposeAsync_RunningActor_CancelsQueuedReplies`** — replaced the 1000-message flood with a deterministic `OnBeforeReadAsync` test gate in `Actor.cs`.
+- **NuGet test CI failure** — `CreateNuGetApiHandler_HasGzipAndDeflateDecompression` now tests the handler factory directly instead of booting a full `WebApplicationFactory`.
+
 ## [0.32.0] — 2026-08-20
 
 ### Added
