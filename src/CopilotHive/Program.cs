@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
 
+using System.Net;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -79,6 +80,19 @@ public sealed class Program
             options.SerializerOptions.Converters.Add(new GlobalStringEnumConverter());
         });
     }
+
+    /// <summary>
+    /// Creates the primary HTTP handler for the <c>nuget-api</c> client. The NuGet
+    /// registration5-gz-semver2 endpoint serves gzip-compressed payloads, so both
+    /// GZip and Deflate decompression must be enabled. Kept as a named factory (rather
+    /// than an inline handler at the registration site) so tests can verify the
+    /// decompression configuration without booting the full host.
+    /// </summary>
+    internal static HttpMessageHandler CreateNuGetApiHandler() =>
+        new HttpClientHandler
+        {
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+        };
 
     private static async Task<int> Main(string[] args)
     {
@@ -443,10 +457,7 @@ public sealed class Program
             builder.Services.AddHttpClient("nuget-api", client =>
             {
                 client.Timeout = TimeSpan.FromSeconds(30);
-            }).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
-            {
-                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
-            });
+            }).ConfigurePrimaryHttpMessageHandler(CreateNuGetApiHandler);
 
             // NuGet publish monitoring: polls the NuGet registration API to verify packages
             // have landed after a release. Service layer only — lifecycle integration is a

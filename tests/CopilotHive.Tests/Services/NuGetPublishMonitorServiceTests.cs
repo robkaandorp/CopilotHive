@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Net;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 
@@ -8,9 +7,6 @@ using CopilotHive;
 using CopilotHive.Configuration;
 using CopilotHive.Services;
 
-using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using Moq;
@@ -1328,40 +1324,20 @@ public sealed class NuGetPublishMonitorServiceTests
         Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
     }
 
-    // ── DI registration: gzip handler ──────────────────────────────────────
+    // ── Handler factory: gzip decompression ────────────────────────────────
 
     /// <summary>
-    /// The <c>nuget-api</c> HTTP client registered in <c>Program.cs</c> must carry
-    /// <see cref="DecompressionMethods.GZip"/> | <see cref="DecompressionMethods.Deflate"/>
-    /// so the gzip-compressed registration5-gz-semver2 endpoint is transparently decompressed.
+    /// <see cref="Program.CreateNuGetApiHandler"/> must produce a handler with both
+    /// <see cref="DecompressionMethods.GZip"/> and <see cref="DecompressionMethods.Deflate"/>
+    /// enabled so the gzip-compressed registration5-gz-semver2 endpoint is transparently
+    /// decompressed.
     /// </summary>
     [Fact]
-    public void DiRegistration_NugetApiClient_HasGzipDecompression()
+    public void CreateNuGetApiHandler_HasGzipAndDeflateDecompression()
     {
-        using var factory = new WebApplicationFactory<Program>();
-        var httpClientFactory = factory.Services.GetRequiredService<IHttpClientFactory>();
-        var client = httpClientFactory.CreateClient("nuget-api");
-
-        var handler = GetPrimaryHandler(client);
-        var httpClientHandler = Assert.IsType<HttpClientHandler>(handler);
-        Assert.Equal(DecompressionMethods.GZip | DecompressionMethods.Deflate, httpClientHandler.AutomaticDecompression);
-    }
-
-    /// <summary>Walks the handler chain to the innermost (primary) handler.</summary>
-    private static HttpMessageHandler? GetPrimaryHandler(HttpClient client)
-    {
-        // _handler lives on HttpMessageInvoker, the base class of HttpClient.
-        var type = typeof(HttpClient);
-        FieldInfo? field = null;
-        while (type is not null && field is null)
-        {
-            field = type.GetField("_handler", BindingFlags.NonPublic | BindingFlags.Instance);
-            type = type.BaseType;
-        }
-
-        var handler = field?.GetValue(client) as HttpMessageHandler;
-        while (handler is DelegatingHandler dh)
-            handler = dh.InnerHandler;
-        return handler;
+        var handler = Program.CreateNuGetApiHandler();
+        var clientHandler = Assert.IsType<HttpClientHandler>(handler);
+        Assert.True(clientHandler.AutomaticDecompression.HasFlag(DecompressionMethods.GZip));
+        Assert.True(clientHandler.AutomaticDecompression.HasFlag(DecompressionMethods.Deflate));
     }
 }
