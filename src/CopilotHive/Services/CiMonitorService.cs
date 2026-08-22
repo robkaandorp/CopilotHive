@@ -170,6 +170,23 @@ public class CiMonitorService
         @"^\s*Stack Trace:\s*$",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
+    /// <summary>
+    /// Matches the <c>--- End of stack trace ---</c> marker that terminates a stack-trace
+    /// section in .NET/xUnit output.
+    /// </summary>
+    private static readonly Regex StackTraceEndMarkerRegex = new(
+        @"^\s*---\s*End of stack trace",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Matches the ISO-8601 timestamp prefix GitHub Actions prepends to every raw log line
+    /// (e.g. <c>2026-08-22T09:47:38.1197374Z </c>). Stripped before failure parsing so headers
+    /// and section markers anchor to the start of the line.
+    /// </summary>
+    private static readonly Regex GitHubActionsTimestampRegex = new(
+        @"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\s+",
+        RegexOptions.Compiled);
+
     private readonly IGoalStore? _goalStore;
     private readonly IIssueStore? _issueStore;
     private readonly IEventBus? _eventBus;
@@ -1814,8 +1831,11 @@ public class CiMonitorService
     /// <summary>
     /// Parses xUnit test failures out of a CI log. Each failure block has the shape
     /// <c>Failed {name} [duration]</c> followed by an <c>Error Message:</c> section and a
-    /// <c>Stack Trace:</c> section. All such blocks are parsed; logs with no failure headers
-    /// (including count-only summaries such as <c>Failed: 0</c>) yield an empty list.
+    /// <c>Stack Trace:</c> section. GitHub Actions timestamp prefixes are stripped from every
+    /// line before matching, so raw job logs parse the same as plain console output and the
+    /// captured error/stack-trace text is timestamp-free. All such blocks are parsed; logs with
+    /// no failure headers (including count-only summaries such as <c>Failed: 0</c>, or prose
+    /// such as <c>Failed to clone ...</c>) yield an empty list.
     /// </summary>
     /// <param name="logContent">The raw (unsanitized) log content to parse.</param>
     /// <returns>The parsed failures, or an empty list when none could be parsed.</returns>
@@ -1827,27 +1847,30 @@ public class CiMonitorService
             return failures;
 
         // Split into lines, preserving positions so sections can be sliced by line index.
+        // Timestamps are stripped up front so every downstream match (and every captured
+        // Error/StackTrace field) sees timestamp-free text.
         var lines = logContent.Split('\n');
         for (var i = 0; i < lines.Length; i++)
-        {
-            var header = XUnitFailedTestRegex.Match(lines[i]);
-            if (!header.Success)
-                continue;
+            lines[i] = StripActionsTimestamp(lines[i]);
 
-            var testName = header.Groups[1].Value.Trim();
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (!TryMatchFailureHeader(lines[i], out var testName))
+                continue;
 
             // The failure block ends at the next failure header (or the end of the log).
             var blockEnd = lines.Length;
             for (var j = i + 1; j < lines.Length; j++)
             {
-                if (XUnitFailedTestRegex.IsMatch(lines[j]))
+                if (TryMatchFailureHeader(lines[j], out _))
                 {
                     blockEnd = j;
                     break;
                 }
             }
 
-            // Locate the Error Message: and Stack Trace: headers inside the block.
+            // Locate the Error Message: and Stack Trace: headers inside the block. Blank lines
+            // between the two sections do not terminate the block.
             var errorHeaderIndex = -1;
             var stackHeaderIndex = -1;
             for (var j = i + 1; j < blockEnd; j++)
@@ -1872,12 +1895,52 @@ public class CiMonitorService
 
             var stackTrace = string.Empty;
             if (stackHeaderIndex >= 0)
-                stackTrace = string.Join("\n", lines[(stackHeaderIndex + 1)..blockEnd]).Trim();
+            {
+                // The stack trace runs until the end-of-stack-trace marker, a blank line, or the
+                // next failure header (whichever comes first).
+                var stackEnd = blockEnd;
+                for (var j = stackHeaderIndex + 1; j < blockEnd; j++)
+                {
+                    if (StackTraceEndMarkerRegex.IsMatch(lines[j]) || string.IsNullOrWhiteSpace(lines[j]))
+                    {
+                        stackEnd = j;
+                        break;
+                    }
+                }
+
+                stackTrace = string.Join("\n", lines[(stackHeaderIndex + 1)..stackEnd]).Trim();
+            }
 
             failures.Add((testName, error, stackTrace));
         }
 
         return failures;
+    }
+
+    /// <summary>Removes a GitHub Actions ISO-8601 timestamp prefix from a single log line.</summary>
+    private static string StripActionsTimestamp(string line) =>
+        GitHubActionsTimestampRegex.Replace(line, string.Empty);
+
+    /// <summary>
+    /// Matches an xUnit failure header line and validates that the captured test name is a
+    /// dotted <c>Class.Method</c> identifier. This rejects prose lines such as
+    /// <c>Failed to clone repository [attempt 1]</c> and <c>Failed: 3</c> that would otherwise
+    /// satisfy the header shape.
+    /// </summary>
+    private static bool TryMatchFailureHeader(string line, out string testName)
+    {
+        testName = string.Empty;
+
+        var header = XUnitFailedTestRegex.Match(line);
+        if (!header.Success)
+            return false;
+
+        var candidate = header.Groups[1].Value.Trim();
+        if (!candidate.Contains('.', StringComparison.Ordinal))
+            return false;
+
+        testName = candidate;
+        return true;
     }
 
     private static string CombineOutput(CheckRunData run)
