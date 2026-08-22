@@ -30,6 +30,12 @@ public abstract class Actor<TMessage> : IAsyncDisposable
     public bool Tell(TMessage message) => _mailbox.Writer.TryWrite(message);
     internal bool IsStarted { get { lock (_lifecycleLock) { return _loopTask is not null; } } }
 
+    /// <summary>
+    /// Optional hook invoked before each mailbox read, while all messages are still queued.
+    /// Awaiting it blocks the loop before the next dequeue. Null = no-op.
+    /// </summary>
+    internal Func<Task>? OnBeforeReadAsync { get; set; }
+
     /// <summary>Token cancelled when the actor is disposed.</summary>
     protected CancellationToken LoopToken => _loopToken;
     /// <summary>Closes the mailbox for writing so the loop drains and exits.</summary>
@@ -66,20 +72,41 @@ public abstract class Actor<TMessage> : IAsyncDisposable
         try
         {
             OnLoopStarted();
-            await foreach (var message in _mailbox.Reader.ReadAllAsync(ct))
+            var enumerator = _mailbox.Reader.ReadAllAsync(ct).GetAsyncEnumerator(ct);
+            try
             {
-                if (ct.IsCancellationRequested)
+                while (true)
                 {
-                    CancelReply(message);
-                    break;
+                    // Optional hook runs before every read so a test can park the loop
+                    // while messages are still queued. Default null = no-op.
+                    if (OnBeforeReadAsync is { } beforeRead)
+                    {
+                        await beforeRead();
+                    }
+
+                    if (!await enumerator.MoveNextAsync())
+                    {
+                        break;
+                    }
+
+                    var message = enumerator.Current;
+                    if (ct.IsCancellationRequested)
+                    {
+                        CancelReply(message);
+                        break;
+                    }
+                    try { await HandleAsync(message, ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        CancelReply(message);
+                        break;
+                    }
+                    catch (Exception ex) { OnUnhandledException(message, ex); }
                 }
-                try { await HandleAsync(message, ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    CancelReply(message);
-                    break;
-                }
-                catch (Exception ex) { OnUnhandledException(message, ex); }
+            }
+            finally
+            {
+                await enumerator.DisposeAsync();
             }
         }
         catch (OperationCanceledException) { }

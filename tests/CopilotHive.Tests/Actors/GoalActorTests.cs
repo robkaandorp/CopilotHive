@@ -162,18 +162,29 @@ public class GoalActorTests
     public async Task DisposeAsync_RunningActor_CancelsQueuedReplies()
     {
         var actor = new GoalActor("goal-11");
-        actor.Start();
 
-        // Flood the mailbox so the reply message is far from the front of the queue.
-        for (var i = 0; i < 1000; i++)
+        // Park the loop at a gate BEFORE it dequeues anything, so the queued reply
+        // message is provably still in the mailbox when disposal begins.
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        actor.OnBeforeReadAsync = async () =>
         {
-            actor.Tell(new SetIterationMessage(1));
-        }
+            entered.TrySetResult();
+            await gate.Task;
+        };
+
+        actor.Start();
+        await entered.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
         var query = GoalActorMessages.CreateGetStateMessage();
         Assert.True(actor.Tell(query));
 
-        await actor.DisposeAsync();
+        // Do NOT await before releasing the gate: DisposeAsync waits for loop
+        // completion while the loop waits on the gate — that would deadlock.
+        var disposeTask = actor.DisposeAsync().AsTask();
+        gate.TrySetResult(true);
+
+        await disposeTask;
 
         Assert.True(query.Reply.Task.IsCanceled);
     }
