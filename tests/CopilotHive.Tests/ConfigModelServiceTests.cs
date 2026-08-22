@@ -1541,7 +1541,7 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Contains("ci_failed", config.Composer.EventNotifications.ActiveEvents);
     }
 
-    // ── Strict whitelist: only the 8 canonical spellings, case-insensitively ──
+    // ── Strict whitelist: only the 18 canonical spellings, case-insensitively ──
 
     /// <summary>
     /// Each whitelisted event has exactly two canonical spellings — snake_case and PascalCase —
@@ -1564,6 +1564,19 @@ public sealed class ConfigModelServiceTests : IDisposable
     [InlineData("issue_raised", "issue_raised")]
     [InlineData("IssueRaised", "issue_raised")]
     [InlineData("issueraised", "issue_raised")]
+    [InlineData("ci_succeeded", "ci_succeeded")]
+    [InlineData("CI_SUCCEEDED", "ci_succeeded")]
+    [InlineData("CiSucceeded", "ci_succeeded")]
+    [InlineData("cisucceeded", "ci_succeeded")]
+    [InlineData("release_completed", "release_completed")]
+    [InlineData("ReleaseCompleted", "release_completed")]
+    [InlineData("releasecompleted", "release_completed")]
+    [InlineData("goal_dispatched", "goal_dispatched")]
+    [InlineData("GoalDispatched", "goal_dispatched")]
+    [InlineData("goaldispatched", "goal_dispatched")]
+    [InlineData("issue_resolved", "issue_resolved")]
+    [InlineData("IssueResolved", "issue_resolved")]
+    [InlineData("issueresolved", "issue_resolved")]
     public async Task UpdateComposerSettingsAsync_CanonicalSpelling_IsAcceptedAndCanonicalized(
         string input, string expected)
     {
@@ -1594,7 +1607,6 @@ public sealed class ConfigModelServiceTests : IDisposable
     [InlineData("ci__failed")]
     [InlineData("issue_raised__")]
     [InlineData("not_an_event")]
-    [InlineData("goal_dispatched")]
     [InlineData("")]
     [InlineData("   ")]
     [InlineData(" goal_completed ")]
@@ -1666,6 +1678,33 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal(
             ["goal_completed", "goal_failed", "ci_failed", "issue_raised"],
             config.Composer!.EventNotifications!.ActiveEvents);
+    }
+
+    /// <summary>
+    /// All 9 recognized events, mixed between snake_case and PascalCase spellings, are accepted
+    /// and canonicalized to snake_case.
+    /// </summary>
+    [Fact]
+    public async Task UpdateComposerSettingsAsync_AllNineEvents_AreAcceptedAndCanonicalized()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await svc.UpdateComposerSettingsAsync(
+            new ComposerSettingsUpdate(
+                EventNotificationsActiveEvents:
+                [
+                    "GoalCompleted", "goal_failed", "CiFailed", "ISSUE_RAISED", "package_published",
+                    "ci_succeeded", "ReleaseCompleted", "GOAL_DISPATCHED", "issue_resolved",
+                ]),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+             "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
+            config.Composer!.EventNotifications!.ActiveEvents);
+        Assert.Single(repo.Commits);
     }
 
     [Fact]
