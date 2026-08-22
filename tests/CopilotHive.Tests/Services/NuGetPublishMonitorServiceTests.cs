@@ -1252,6 +1252,82 @@ public sealed class NuGetPublishMonitorServiceTests
         Assert.Equal(EventType.PackagePublished, evt.Type);
     }
 
+    // ── ProbePackageAsync: transport / timeout / malformed JSON ──────────────
+
+    [Fact]
+    public async Task ProbePackageAsync_TransportError_ReturnsRetry()
+    {
+        var eventBus = new RecordingEventBus();
+        Func<HttpRequestMessage, HttpResponseMessage> responder = _ => throw new HttpRequestException("Simulated transport failure");
+        var handler = new ScriptedHttpMessageHandler(responder);
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_HttpTimeout_ReturnsRetry()
+    {
+        var eventBus = new RecordingEventBus();
+        Func<HttpRequestMessage, HttpResponseMessage> responder = _ => throw new TaskCanceledException("HTTP timeout");
+        var handler = new ScriptedHttpMessageHandler(responder);
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_MalformedJson_ReturnsRetry()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("not valid json"));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+        Assert.Empty(eventBus.Published);
+    }
+
+    // ── MonitorPackageAsync: NotFound delay then find ───────────────────────
+
+    /// <summary>
+    /// A <see cref="NuGetPublishMonitorService.ProbeResult.NotFound"/> (empty items array)
+    /// must trigger a delay (not terminal) so the next iteration can find the package.
+    /// </summary>
+    [Fact]
+    public async Task MonitorPackageAsync_NotFound_DelayedThenFinds()
+    {
+        var eventBus = new RecordingEventBus();
+        var callCount = 0;
+        var handler = new ScriptedHttpMessageHandler(_ =>
+        {
+            callCount++;
+            if (callCount == 1)
+                return OkResponse("{\"items\": []}");
+            return OkResponse(IndexJsonWithInlineMatch("1.2.3"));
+        });
+        var service = CreateService(handler, eventBus: eventBus);
+
+        await service.MonitorPackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, callCount);
+        Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.PackagePublished, eventBus.Published[0].Type);
+    }
+
     // ── DI registration: gzip handler ──────────────────────────────────────
 
     /// <summary>

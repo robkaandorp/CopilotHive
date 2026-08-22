@@ -245,6 +245,55 @@ public sealed class NuGetPublishMonitorLifecycleTests
         Assert.Empty(eventBus.Published);
     }
 
+    /// <summary>
+    /// Only <see cref="ReleaseStatus.Released"/> releases are scanned: a release in
+    /// <see cref="ReleaseStatus.Planning"/> (or any non-Released status) with a recent
+    /// ReleasedAt must be skipped entirely.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_NonReleasedStatus_Skips()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var store = new ReleaseStore();
+        store.Releases.Add(new Release
+        {
+            Id = "v1.2.3",
+            Tag = "v1.2.3",
+            Status = ReleaseStatus.Planning,
+            ReleasedAt = DateTime.UtcNow.AddMinutes(-5),
+            RepositoryNames = ["pkg-repo"],
+        });
+        var config = CreateConfig(CreateRepo("pkg-repo",
+            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
+        var service = CreateService(handler, config: config, eventBus: new RecordingEventBus(), goalStore: store);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        Assert.Empty(handler.Urls);
+    }
+
+    /// <summary>
+    /// A <see cref="NuGetPublishMonitorService.ProbeResult.Retry"/> result (e.g. 404 on the
+    /// registration index) must launch a background monitor — the package may not be registered
+    /// yet but could land shortly.
+    /// </summary>
+    [Fact]
+    public async Task StartupScanAsync_Retry_LaunchesBackgroundMonitor()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.NotFound));
+        var eventBus = new RecordingEventBus();
+        var store = new ReleaseStore();
+        store.Releases.Add(ReleasedRelease("v1.2.3", repos: "pkg-repo"));
+        var config = CreateConfig(CreateRepo("pkg-repo",
+            publishNuGet: new NuGetPublishConfig { Packages = [new NuGetPackageEntry { PackageId = "My.Package" }] }));
+        var service = CreateService(handler, config: config, eventBus: eventBus, goalStore: store);
+
+        await service.StartupScanAsync(TestContext.Current.CancellationToken);
+
+        // The background monitor keeps polling the index (404 → Retry → delay → probe again).
+        await WaitUntilAsync(() => handler.Urls.Count >= 2, TestContext.Current.CancellationToken);
+    }
+
     [Fact]
     public async Task StartupScanAsync_TagStripping_ProbesStrippedVersion()
     {
