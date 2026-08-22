@@ -558,6 +558,8 @@ public sealed class Program
             var logger = app.Services.GetRequiredService<ILogger<Program>>();
             logger.LogInformation("Starting gRPC server on port {GrpcPort}, HTTP on port {HttpPort}", port, port + 1);
 
+            var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+
             try
             {
                 var dbContextFactory = app.Services.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>();
@@ -678,7 +680,6 @@ public sealed class Program
             var ciMonitor = app.Services.GetService<CiMonitorService>();
             if (ciMonitor is not null)
             {
-                var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
                 _ = Task.Run(async () =>
                 {
                     try { await ciMonitor.StartupScanAsync(appLifetime.ApplicationStopping); }
@@ -716,11 +717,23 @@ public sealed class Program
             var startupScanner = app.Services.GetService<EventBusStartupScanner>();
             if (startupScanner is not null && !app.Environment.IsEnvironment("Testing"))
             {
-                var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
                 _ = Task.Run(async () =>
                 {
                     try { await startupScanner.ScanAsync(appLifetime.ApplicationStopping); }
                     catch (Exception ex) { logger.LogWarning(ex, "Event bus startup scan failed"); }
+                }, appLifetime.ApplicationStopping);
+            }
+
+            // NuGet publish monitoring startup scan: resumes background monitors for releases
+            // marked Released while the orchestrator was down. Fire-and-forget so startup is
+            // never blocked, and bound to the application lifetime so shutdown stops it.
+            var nugetMonitor = app.Services.GetService<NuGetPublishMonitorService>();
+            if (nugetMonitor is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await nugetMonitor.StartupScanAsync(appLifetime.ApplicationStopping); }
+                    catch (Exception ex) { logger.LogWarning(ex, "NuGet publish monitor startup scan failed"); }
                 }, appLifetime.ApplicationStopping);
             }
 

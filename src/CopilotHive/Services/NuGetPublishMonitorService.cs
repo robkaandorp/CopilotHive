@@ -5,6 +5,7 @@ using System.Net;
 using System.Text.Json;
 
 using CopilotHive.Configuration;
+using CopilotHive.Goals;
 
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -24,6 +25,27 @@ namespace CopilotHive.Services;
 /// </remarks>
 public class NuGetPublishMonitorService
 {
+    /// <summary>Outcome of a single NuGet registration probe.</summary>
+    internal enum ProbeResult
+    {
+        /// <summary>The package version was found — monitoring can stop.</summary>
+        Found,
+        /// <summary>The package version is not registered yet — keep polling.</summary>
+        NotFound,
+        /// <summary>The probe was inconclusive (transient failure) — retry.</summary>
+        Retry,
+        /// <summary>The probe can never succeed — monitoring can stop.</summary>
+        Terminal,
+    }
+
+    /// <summary>
+    /// Result of one <see cref="ProbePackageAsync"/> iteration.
+    /// <see cref="RetryAfter"/> is only non-null and positive for HTTP 429 responses.
+    /// </summary>
+    /// <param name="Result">The probe outcome.</param>
+    /// <param name="RetryAfter">Optional delay hint; only set for 429 responses.</param>
+    internal sealed record ProbeOutcome(ProbeResult Result, TimeSpan? RetryAfter = null);
+
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(30);
 
@@ -31,6 +53,7 @@ public class NuGetPublishMonitorService
     private readonly IEventBus? _eventBus;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly ILogger<NuGetPublishMonitorService> _logger;
+    private readonly IGoalStore? _goalStore;
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _timeout;
 
@@ -48,6 +71,7 @@ public class NuGetPublishMonitorService
     /// <param name="eventBus">Optional event bus for publishing package events.</param>
     /// <param name="httpClientFactory">Optional HTTP client factory for NuGet API calls.</param>
     /// <param name="logger">Optional logger.</param>
+    /// <param name="goalStore">Optional goal store, used by the startup release scan.</param>
     /// <param name="pollInterval">Polling interval between probes; defaults to 30 seconds.</param>
     /// <param name="timeoutOverride">Optional overall monitoring timeout; defaults to 30 minutes.</param>
     public NuGetPublishMonitorService(
@@ -55,6 +79,7 @@ public class NuGetPublishMonitorService
         IEventBus? eventBus = null,
         IHttpClientFactory? httpClientFactory = null,
         ILogger<NuGetPublishMonitorService>? logger = null,
+        IGoalStore? goalStore = null,
         TimeSpan? pollInterval = null,
         TimeSpan? timeoutOverride = null)
     {
@@ -62,6 +87,7 @@ public class NuGetPublishMonitorService
         _eventBus = eventBus;
         _httpClientFactory = httpClientFactory;
         _logger = logger ?? NullLogger<NuGetPublishMonitorService>.Instance;
+        _goalStore = goalStore;
         _pollInterval = pollInterval is { } p && p > TimeSpan.Zero ? p : DefaultPollInterval;
         _timeout = timeoutOverride is { } t && t > TimeSpan.Zero ? t : DefaultTimeout;
     }
@@ -95,94 +121,13 @@ public class NuGetPublishMonitorService
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(_timeout);
             var sw = Stopwatch.StartNew();
-            var client = _httpClientFactory.CreateClient("nuget-api");
-            var registrationUrl =
-                $"https://api.nuget.org/v3/registration5-gz-semver2/{Uri.EscapeDataString(packageId.ToLowerInvariant())}/index.json";
 
             while (true)
             {
-                var delay = _pollInterval;
+                ProbeOutcome outcome;
                 try
                 {
-                    using var response = await client.GetAsync(registrationUrl, timeoutCts.Token);
-
-                    if (response.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        // Package not registered yet — delay and retry.
-                    }
-                    else if (response.StatusCode == HttpStatusCode.TooManyRequests)
-                    {
-                        var retryAfter = ParseRetryAfter(response);
-                        delay = retryAfter is { } r && r > TimeSpan.Zero ? r : _pollInterval;
-                    }
-                    else if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
-                    {
-                        // Other 4xx — terminal: no amount of retrying will help.
-                        return;
-                    }
-                    else if ((int)response.StatusCode >= 500)
-                    {
-                        // 5xx — delay and retry.
-                    }
-                    else if (!response.IsSuccessStatusCode)
-                    {
-                        // Unexpected status — delay and retry.
-                    }
-                    else
-                    {
-                        await using var stream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
-                        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: timeoutCts.Token);
-                        var root = doc.RootElement;
-
-                        // Inline-first: check items[].items[].catalogEntry.version before any page fetch.
-                        if (TryFindInlineMatch(root, parsedVersion))
-                        {
-                            PublishPublished(repoName, packageId, version, releaseTag);
-                            return;
-                        }
-
-                        // Collect @id from null-items entries and fetch each page.
-                        foreach (var pageId in CollectPageIds(root))
-                        {
-                            if (!IsValidPageUrl(pageId))
-                                continue;
-
-                            try
-                            {
-                                using var pageResponse = await client.GetAsync(pageId, timeoutCts.Token);
-                                if (!pageResponse.IsSuccessStatusCode)
-                                    continue; // page error — skip page
-
-                                await using var pageStream = await pageResponse.Content.ReadAsStreamAsync(timeoutCts.Token);
-                                using var pageDoc = await JsonDocument.ParseAsync(pageStream, cancellationToken: timeoutCts.Token);
-                                if (TryFindMatchInPage(pageDoc.RootElement, parsedVersion))
-                                {
-                                    PublishPublished(repoName, packageId, version, releaseTag);
-                                    return;
-                                }
-                            }
-                            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
-                            {
-                                throw; // linked token fired — outer handler decides
-                            }
-                            catch (Exception)
-                            {
-                                // Page error — skip page.
-                            }
-                        }
-                    }
-                }
-                catch (TaskCanceledException) when (!ct.IsCancellationRequested && !timeoutCts.IsCancellationRequested)
-                {
-                    // HTTP client timeout — delay and retry.
-                }
-                catch (HttpRequestException) when (!ct.IsCancellationRequested && !timeoutCts.IsCancellationRequested)
-                {
-                    // Transport error — delay and retry.
-                }
-                catch (JsonException) when (!ct.IsCancellationRequested && !timeoutCts.IsCancellationRequested)
-                {
-                    // Malformed response — delay and retry.
+                    outcome = await ProbePackageAsync(repoName, packageId, version, releaseTag, timeoutCts.Token);
                 }
                 catch (OperationCanceledException)
                 {
@@ -191,6 +136,22 @@ public class NuGetPublishMonitorService
                     PublishTimedOut(repoName, packageId, version, releaseTag, sw);
                     return;
                 }
+
+                switch (outcome.Result)
+                {
+                    case ProbeResult.Found:
+                    case ProbeResult.Terminal:
+                        return;
+                    case ProbeResult.NotFound:
+                    case ProbeResult.Retry:
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unhandled probe result: {outcome.Result}");
+                }
+
+                var delay = outcome.Result == ProbeResult.Retry && outcome.RetryAfter is { } r && r > TimeSpan.Zero
+                    ? r
+                    : _pollInterval;
 
                 try
                 {
@@ -246,6 +207,270 @@ public class NuGetPublishMonitorService
         await Task.WhenAll(tasks);
     }
 
+    /// <summary>
+    /// Performs one polling iteration for a single package: GETs the NuGet registration index,
+    /// resolves the version inline or via registration pages, and reports the outcome.
+    /// Emits <see cref="EventType.PackagePublished"/> when the version is found.
+    /// </summary>
+    /// <param name="repoName">The repository name as configured in hive-config.yaml.</param>
+    /// <param name="packageId">The NuGet package ID.</param>
+    /// <param name="version">The package version, already stripped of a leading <c>v</c>/<c>V</c>.</param>
+    /// <param name="releaseTag">The original release tag.</param>
+    /// <param name="ct">Cancellation token; cancellation propagates as
+    /// <see cref="OperationCanceledException"/>.</param>
+    /// <returns>The probe outcome; see <see cref="ProbeResult"/>.</returns>
+    internal virtual async Task<ProbeOutcome> ProbePackageAsync(
+        string repoName, string packageId, string version, string releaseTag, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            throw new OperationCanceledException(ct);
+        if (_httpClientFactory is null || _eventBus is null)
+            return new ProbeOutcome(ProbeResult.Terminal);
+        if (string.IsNullOrWhiteSpace(repoName) || string.IsNullOrWhiteSpace(packageId)
+            || string.IsNullOrWhiteSpace(version) || string.IsNullOrWhiteSpace(releaseTag))
+            return new ProbeOutcome(ProbeResult.Terminal);
+        if (!NuGetVersion.TryParse(version, out var parsedVersion))
+            return new ProbeOutcome(ProbeResult.Terminal);
+
+        var client = _httpClientFactory.CreateClient("nuget-api");
+        var registrationUrl =
+            $"https://api.nuget.org/v3/registration5-gz-semver2/{Uri.EscapeDataString(packageId.ToLowerInvariant())}/index.json";
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.GetAsync(registrationUrl, ct);
+        }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // HTTP client timeout — retry.
+            return new ProbeOutcome(ProbeResult.Retry);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (HttpRequestException) when (!ct.IsCancellationRequested)
+        {
+            // Transport error — retry.
+            return new ProbeOutcome(ProbeResult.Retry);
+        }
+
+        using (response)
+        {
+            if (response.StatusCode == HttpStatusCode.NotFound)
+                return new ProbeOutcome(ProbeResult.Retry);
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var retryAfter = ParseRetryAfter(response);
+                return new ProbeOutcome(
+                    ProbeResult.Retry,
+                    retryAfter is { } r && r > TimeSpan.Zero ? r : null);
+            }
+            if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
+                return new ProbeOutcome(ProbeResult.Terminal);
+            if ((int)response.StatusCode >= 500)
+                return new ProbeOutcome(ProbeResult.Retry);
+            if (!response.IsSuccessStatusCode)
+                return new ProbeOutcome(ProbeResult.Retry);
+
+            try
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(ct);
+                using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+                var root = doc.RootElement;
+
+                if (root.ValueKind != JsonValueKind.Object)
+                    return new ProbeOutcome(ProbeResult.Retry);
+                if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+                    return new ProbeOutcome(ProbeResult.Retry);
+                if (items.GetArrayLength() == 0)
+                    return new ProbeOutcome(ProbeResult.NotFound);
+
+                // Inline-first: check items[].items[].catalogEntry.version before any page fetch.
+                if (TryFindInlineMatch(root, parsedVersion))
+                {
+                    PublishPublished(repoName, packageId, version, releaseTag);
+                    return new ProbeOutcome(ProbeResult.Found);
+                }
+
+                // Collect @id from non-inline entries and fetch each page.
+                foreach (var pageId in CollectPageIds(root))
+                {
+                    if (!IsValidPageUrl(pageId))
+                        continue;
+
+                    try
+                    {
+                        using var pageResponse = await client.GetAsync(pageId, ct);
+                        if (!pageResponse.IsSuccessStatusCode)
+                            continue; // page error — skip page
+
+                        await using var pageStream = await pageResponse.Content.ReadAsStreamAsync(ct);
+                        using var pageDoc = await JsonDocument.ParseAsync(pageStream, cancellationToken: ct);
+                        if (TryFindMatchInPage(pageDoc.RootElement, parsedVersion))
+                        {
+                            PublishPublished(repoName, packageId, version, releaseTag);
+                            return new ProbeOutcome(ProbeResult.Found);
+                        }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw; // ct fired — propagate
+                    }
+                    catch (Exception)
+                    {
+                        // Page error (HTTP failure, client timeout, malformed JSON) — skip page.
+                    }
+                }
+
+                return new ProbeOutcome(ProbeResult.NotFound);
+            }
+            catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // HTTP client timeout — retry.
+                return new ProbeOutcome(ProbeResult.Retry);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (HttpRequestException) when (!ct.IsCancellationRequested)
+            {
+                // Transport error — retry.
+                return new ProbeOutcome(ProbeResult.Retry);
+            }
+            catch (JsonException) when (!ct.IsCancellationRequested)
+            {
+                // Malformed response — retry.
+                return new ProbeOutcome(ProbeResult.Retry);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scans releases marked Released while the orchestrator was down (within the last hour)
+    /// and resumes background monitoring for packages that are not on NuGet yet.
+    /// </summary>
+    /// <param name="ct">Application-lifetime token, also handed to any background monitors.</param>
+    public virtual async Task StartupScanAsync(CancellationToken ct)
+    {
+        if (_goalStore is null || _config is null)
+            return;
+
+        IReadOnlyList<Release> releases;
+        try
+        {
+            releases = await _goalStore.GetReleasesAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "NuGet publish monitor startup scan failed to load releases");
+            return;
+        }
+
+        var cutoff = DateTime.UtcNow.AddMinutes(-60);
+        var candidates = releases
+            .Where(r => r.Status == ReleaseStatus.Released
+                        && r.ReleasedAt.HasValue
+                        && r.ReleasedAt.Value > cutoff)
+            .ToList();
+
+        foreach (var release in candidates)
+        {
+            foreach (var repoName in release.RepositoryNames)
+            {
+                if (ct.IsCancellationRequested)
+                    return;
+
+                var repo = _config.Repositories.FirstOrDefault(
+                    r => string.Equals(r.Name, repoName, StringComparison.OrdinalIgnoreCase));
+                if (repo?.PublishNuGet?.Packages is not { Count: > 0 })
+                    continue;
+
+                var version = release.Tag;
+                if (version.StartsWith('v') || version.StartsWith('V'))
+                    version = version[1..];
+                if (string.IsNullOrWhiteSpace(version))
+                    continue;
+                if (!NuGetVersion.TryParse(version, out _))
+                    continue;
+
+                foreach (var pkg in repo.PublishNuGet.Packages)
+                {
+                    if (ct.IsCancellationRequested)
+                        return;
+
+                    try
+                    {
+                        using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        probeCts.CancelAfter(TimeSpan.FromSeconds(1));
+
+                        ProbeOutcome outcome;
+                        try
+                        {
+                            outcome = await ProbePackageAsync(repoName, pkg.PackageId, version, release.Tag, probeCts.Token);
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            // The 1-second probe timed out — the package may still be on its
+                            // way; resume monitoring in the background.
+                            LaunchBackgroundMonitor(repoName, pkg.PackageId, version, release.Tag, ct);
+                            continue;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Caller cancellation — stop the scan.
+                            return;
+                        }
+
+                        switch (outcome.Result)
+                        {
+                            case ProbeResult.Found:
+                            case ProbeResult.Terminal:
+                                // Already published (or can never succeed) — nothing to monitor.
+                                break;
+                            case ProbeResult.NotFound:
+                            case ProbeResult.Retry:
+                                LaunchBackgroundMonitor(repoName, pkg.PackageId, version, release.Tag, ct);
+                                break;
+                            default:
+                                throw new InvalidOperationException($"Unhandled probe result: {outcome.Result}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "NuGet startup scan probe failed for {PackageId}", pkg.PackageId);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Launches a fire-and-forget <see cref="MonitorPackageAsync"/> for a package, logging
+    /// any unexpected failure instead of letting it escape into the caller.
+    /// </summary>
+    /// <param name="repoName">The repository name as configured in hive-config.yaml.</param>
+    /// <param name="packageId">The NuGet package ID.</param>
+    /// <param name="version">The package version, already stripped of a leading <c>v</c>/<c>V</c>.</param>
+    /// <param name="releaseTag">The original release tag.</param>
+    /// <param name="ct">Cancellation token handed to the background monitor.</param>
+    internal virtual void LaunchBackgroundMonitor(
+        string repoName, string packageId, string version, string releaseTag, CancellationToken ct)
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await MonitorPackageAsync(repoName, packageId, version, releaseTag, ct); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { _logger.LogWarning(ex, "NuGet monitor failed for {PackageId}", packageId); }
+        });
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────
 
     private void PublishPublished(string repoName, string packageId, string version, string releaseTag)
@@ -297,7 +522,8 @@ public class NuGetPublishMonitorService
 
     /// <summary>
     /// Collects <c>@id</c> values from <c>items[]</c> entries that have no inline <c>items</c>
-    /// (i.e. page references).
+    /// (i.e. page references). Non-object items, non-array nested <c>items</c>, and non-string
+    /// <c>@id</c> entries are skipped.
     /// </summary>
     private static List<string> CollectPageIds(JsonElement root)
     {
@@ -310,8 +536,9 @@ public class NuGetPublishMonitorService
         {
             if (item.ValueKind != JsonValueKind.Object)
                 continue;
-            // Entries with inline items were already checked inline-first.
-            if (item.TryGetProperty("items", out var inline) && inline.ValueKind == JsonValueKind.Array)
+            // Entries with inline items were already checked inline-first. A nested "items"
+            // that is not an array is malformed — skip the whole entry.
+            if (item.TryGetProperty("items", out var inline))
                 continue;
             if (item.TryGetProperty("@id", out var id) && id.ValueKind == JsonValueKind.String)
             {
