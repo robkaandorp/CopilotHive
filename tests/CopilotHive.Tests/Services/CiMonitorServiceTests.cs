@@ -2630,7 +2630,216 @@ public sealed class CiMonitorServiceTests : IDisposable
         Assert.Empty(failures);
     }
 
+    [Fact]
+    public void ParseTestFailuresFromLogs_TimestampPrefixedFailure_ParsesAndStripsTimestamps()
+    {
+        // Raw GitHub Actions job logs prefix every line with an ISO-8601 timestamp. Without
+        // stripping them the "Failed {name} [duration]" header never matches and the caller
+        // degrades to the 500-char FallbackSnippet.
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed CopilotHive.Tests.MyTests.TestOne [582 ms]",
+            "2026-08-22T09:47:38.1198000Z   Error Message:",
+            "2026-08-22T09:47:38.1199000Z    Assert.Equal() Failure",
+            "2026-08-22T09:47:38.1200000Z   Stack Trace:",
+            "2026-08-22T09:47:38.1201000Z    at MyTests.TestOne() in /src/MyTests.cs:line 10");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("CopilotHive.Tests.MyTests.TestOne", failure.TestName);
+        Assert.Equal("Assert.Equal() Failure", failure.Error);
+        Assert.Equal("at MyTests.TestOne() in /src/MyTests.cs:line 10", failure.StackTrace);
+        Assert.DoesNotContain("2026-08-22T", failure.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("2026-08-22T", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("Z ", failure.TestName, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_TimestampWithoutFraction_ParsesFailure()
+    {
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38Z Failed Tests.Alpha.First [1 ms]",
+            "2026-08-22T09:47:38Z   Error Message:",
+            "2026-08-22T09:47:38Z    boom");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("Tests.Alpha.First", failure.TestName);
+        Assert.Equal("boom", failure.Error);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_MultipleTimestampedFailures_FindsAll()
+    {
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed Tests.Alpha.First [2 ms]",
+            "2026-08-22T09:47:38.1197375Z   Error Message:",
+            "2026-08-22T09:47:38.1197376Z    alpha failure",
+            "2026-08-22T09:47:38.1197377Z   Stack Trace:",
+            "2026-08-22T09:47:38.1197378Z    at Alpha.First()",
+            "2026-08-22T09:47:38.1197379Z ",
+            "2026-08-22T09:47:38.1197380Z Failed Tests.Beta.Second [3 ms]",
+            "2026-08-22T09:47:38.1197381Z   Error Message:",
+            "2026-08-22T09:47:38.1197382Z    beta failure",
+            "2026-08-22T09:47:38.1197383Z   Stack Trace:",
+            "2026-08-22T09:47:38.1197384Z    at Beta.Second()");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Equal(2, failures.Count);
+        Assert.Equal("Tests.Alpha.First", failures[0].TestName);
+        Assert.Equal("alpha failure", failures[0].Error);
+        Assert.Equal("at Alpha.First()", failures[0].StackTrace);
+        Assert.Equal("Tests.Beta.Second", failures[1].TestName);
+        Assert.Equal("beta failure", failures[1].Error);
+        Assert.Equal("at Beta.Second()", failures[1].StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_FailedToProse_NotMatchedAsFailure()
+    {
+        // "Failed to ..." prose can satisfy the header shape when it ends in a digit-leading
+        // bracket, but it has no dotted Class.Method name, so it must not be reported.
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed to clone repository [3 attempts]",
+            "2026-08-22T09:47:38.1197375Z   Error Message:",
+            "2026-08-22T09:47:38.1197376Z    network unreachable");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_FailedColonProse_NotMatchedAsFailure()
+    {
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed: the build step exited [1 time]",
+            "2026-08-22T09:47:38.1197375Z   Error Message:",
+            "2026-08-22T09:47:38.1197376Z    exit code 1");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_BlankLineBetweenErrorAndStackTrace_BlockContinues()
+    {
+        var log = string.Join("\n",
+            "Failed Tests.Alpha.First [5 ms]",
+            "  Error Message:",
+            "   expected 1 actual 2",
+            "",
+            "  Stack Trace:",
+            "   at Alpha.First()");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("expected 1 actual 2", failure.Error);
+        Assert.Equal("at Alpha.First()", failure.StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_EndOfStackTraceMarker_EndsStackTraceSection()
+    {
+        var log = string.Join("\n",
+            "Failed Tests.Alpha.First [5 ms]",
+            "  Error Message:",
+            "   boom",
+            "  Stack Trace:",
+            "   at Alpha.First()",
+            "   --- End of stack trace from previous location ---",
+            "   at Xunit.Sdk.TestInvoker.Invoke()");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("at Alpha.First()", failure.StackTrace);
+        Assert.DoesNotContain("End of stack trace", failure.StackTrace, StringComparison.Ordinal);
+        Assert.DoesNotContain("TestInvoker", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_BlankLineAfterStackTrace_EndsBlock()
+    {
+        var log = string.Join("\n",
+            "Failed Tests.Alpha.First [5 ms]",
+            "  Error Message:",
+            "   boom",
+            "  Stack Trace:",
+            "   at Alpha.First()",
+            "",
+            "Cleaning up orphaned containers...",
+            "Removed 3 containers.");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("at Alpha.First()", failure.StackTrace);
+        Assert.DoesNotContain("orphaned", failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_NextFailedHeaderAfterStackTrace_EndsPreviousBlock()
+    {
+        // No blank line separating the blocks: the next "Failed Class.Method [duration]" header
+        // must terminate the previous stack trace and open a new block.
+        var log = string.Join("\n",
+            "Failed Tests.Alpha.First [5 ms]",
+            "  Error Message:",
+            "   alpha boom",
+            "  Stack Trace:",
+            "   at Alpha.First()",
+            "Failed Tests.Beta.Second [6 ms]",
+            "  Error Message:",
+            "   beta boom",
+            "  Stack Trace:",
+            "   at Beta.Second()");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Equal(2, failures.Count);
+        Assert.Equal("at Alpha.First()", failures[0].StackTrace);
+        Assert.Equal("alpha boom", failures[0].Error);
+        Assert.Equal("Tests.Beta.Second", failures[1].TestName);
+        Assert.Equal("at Beta.Second()", failures[1].StackTrace);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_TheoryNameWithSpaces_StillParses()
+    {
+        // The existing header regex tolerates theory display names containing spaces; the
+        // additive dotted-name check must not regress that.
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Failed Tests.Alpha.Theory(value: \"a b\") [12 ms]",
+            "2026-08-22T09:47:38.1197375Z   Error Message:",
+            "2026-08-22T09:47:38.1197376Z    boom");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        var failure = Assert.Single(failures);
+        Assert.Equal("Tests.Alpha.Theory(value: \"a b\")", failure.TestName);
+    }
+
+    [Fact]
+    public void ParseTestFailuresFromLogs_TimestampedLogWithNoFailurePatterns_ReturnsEmptyList()
+    {
+        // When nothing parses, the caller falls back to FallbackSnippet — that path is preserved.
+        var log = string.Join("\n",
+            "2026-08-22T09:47:38.1197374Z Cleaning up orphaned containers...",
+            "2026-08-22T09:47:38.1197375Z Removed 3 containers.",
+            "2026-08-22T09:47:38.1197376Z Passed!  - Failed:     0, Passed:   10");
+
+        var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
+
+        Assert.Empty(failures);
+    }
+
     // ── FetchJobLogsAsync (internal) ───────────────────────────────────────
+
 
     /// <summary>
     /// Builds a JSON body for the <c>/actions/runs/{runId}/jobs</c> endpoint. Each job has an
