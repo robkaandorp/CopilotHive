@@ -16,7 +16,9 @@ public sealed class EventNotificationsConfig
     private static readonly HashSet<EventType> RecognizedActiveEvents = new()
     {
         EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed,
-        EventType.IssueRaised, EventType.PackagePublished
+        EventType.IssueRaised, EventType.PackagePublished,
+        EventType.CiSucceeded, EventType.ReleaseCompleted,
+        EventType.GoalDispatched, EventType.IssueResolved
     };
 
     /// <summary>Event types injected by default when no explicit list is configured.</summary>

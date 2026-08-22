@@ -2126,10 +2126,10 @@ public sealed class HiveConfigFileTests
     [Fact]
     public void EventNotificationsConfig_GetActiveEventTypes_IgnoresNonWhitelistedValidParses()
     {
-        // goal_dispatched and release_completed parse but are NOT in the whitelist.
+        // package_publish_timed_out parses but is NOT in the whitelist.
         var config = new EventNotificationsConfig
         {
-            ActiveEvents = ["goal_completed", "goal_dispatched", "release_completed"]
+            ActiveEvents = ["goal_completed", "package_publish_timed_out"]
         };
 
         var types = config.GetActiveEventTypes();
@@ -2143,14 +2143,14 @@ public sealed class HiveConfigFileTests
     {
         var config = new EventNotificationsConfig
         {
-            ActiveEvents = ["goal_completed", "not_an_event", "goal_dispatched", "123", "a,b"]
+            ActiveEvents = ["goal_completed", "not_an_event", "package_publish_timed_out", "123", "a,b"]
         };
 
         var invalid = config.GetInvalidEventNames();
 
         Assert.Equal(4, invalid.Count);
         Assert.Contains("not_an_event", invalid);
-        Assert.Contains("goal_dispatched", invalid);
+        Assert.Contains("package_publish_timed_out", invalid);
         Assert.Contains("123", invalid);
         Assert.Contains("a,b", invalid);
         Assert.DoesNotContain("goal_completed", invalid);
@@ -2545,6 +2545,43 @@ public sealed class HiveConfigFileTests
         Assert.Contains(EventType.PackagePublished, types);
     }
 
+    [Fact]
+    public void Deserialize_ActiveEventsWithRoutineEvents_AllNineAccepted()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+              event_notifications:
+                mode: active
+                active_events:
+                  - goal_completed
+                  - goal_failed
+                  - ci_failed
+                  - issue_raised
+                  - package_published
+                  - ci_succeeded
+                  - release_completed
+                  - goal_dispatched
+                  - issue_resolved
+            """;
+
+        var config = Deserializer.Deserialize<HiveConfigFile>(yaml);
+
+        Assert.NotNull(config.Composer!.EventNotifications);
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+             "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
+            config.Composer.EventNotifications.ActiveEvents);
+        var types = config.Composer.EventNotifications.GetActiveEventTypes();
+        Assert.Equal(9, types.Count);
+        Assert.Contains(EventType.CiSucceeded, types);
+        Assert.Contains(EventType.ReleaseCompleted, types);
+        Assert.Contains(EventType.GoalDispatched, types);
+        Assert.Contains(EventType.IssueResolved, types);
+        Assert.Empty(config.Composer.EventNotifications.GetInvalidEventNames());
+    }
+
     // ── Additional integration coverage for NuGet publish config ────────────────
 
     [Fact]
@@ -2697,21 +2734,25 @@ public sealed class HiveConfigFileTests
     }
 
     [Fact]
-    public void EventNotificationsConfig_AllFiveRecognized_AllAccepted()
+    public void EventNotificationsConfig_AllNineRecognized_AllAccepted()
     {
         var config = new EventNotificationsConfig
         {
-            ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published"]
+            ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published", "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"]
         };
 
         var types = config.GetActiveEventTypes();
 
-        Assert.Equal(5, types.Count);
+        Assert.Equal(9, types.Count);
         Assert.Contains(EventType.GoalCompleted, types);
         Assert.Contains(EventType.GoalFailed, types);
         Assert.Contains(EventType.CiFailed, types);
         Assert.Contains(EventType.IssueRaised, types);
         Assert.Contains(EventType.PackagePublished, types);
+        Assert.Contains(EventType.CiSucceeded, types);
+        Assert.Contains(EventType.ReleaseCompleted, types);
+        Assert.Contains(EventType.GoalDispatched, types);
+        Assert.Contains(EventType.IssueResolved, types);
 
         // None should be reported as invalid.
         Assert.Empty(config.GetInvalidEventNames());

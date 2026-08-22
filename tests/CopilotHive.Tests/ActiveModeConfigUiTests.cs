@@ -465,14 +465,89 @@ public sealed class ActiveModeConfigUiTests
     }
 
     [Fact]
-    public void Configuration_Markup_ContainsFourEventCheckboxes()
+    public void Configuration_Markup_ContainsNineEventCheckboxes()
     {
         var source = ReadConfigurationSource();
         Assert.Contains("goal_completed", source);
         Assert.Contains("goal_failed", source);
         Assert.Contains("ci_failed", source);
         Assert.Contains("issue_raised", source);
+        Assert.Contains("package_published", source);
+        Assert.Contains("ci_succeeded", source);
+        Assert.Contains("release_completed", source);
+        Assert.Contains("goal_dispatched", source);
+        Assert.Contains("issue_resolved", source);
         Assert.Contains("ToggleComposerNotifEvent", source);
+    }
+
+    // ── Configuration: active-event presets ─────────────────────────────────
+
+    /// <summary>
+    /// The Autopilot preset must select exactly the 9 recognized active events in canonical
+    /// snake_case order.
+    /// </summary>
+    [Fact]
+    public void ActiveEventPresets_Autopilot_SelectsExactlyAllNine()
+    {
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+             "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
+            CopilotHive.Components.Pages.Configuration.ActiveEventPresets.AutopilotEvents);
+    }
+
+    /// <summary>
+    /// The Normal preset must select exactly the 4 default events.
+    /// </summary>
+    [Fact]
+    public void ActiveEventPresets_Normal_SelectsExactlyTheFourDefaults()
+    {
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised"],
+            CopilotHive.Components.Pages.Configuration.ActiveEventPresets.NormalEvents);
+    }
+
+    /// <summary>
+    /// The preset buttons must call the internal helpers so the preset sets stay the single
+    /// source of truth (removal-proof): the markup must reference the helper members.
+    /// </summary>
+    [Fact]
+    public void Configuration_Markup_PresetButtonsCallHelpers()
+    {
+        var source = ReadConfigurationSource();
+        Assert.Contains("Autopilot", source);
+        Assert.Contains("Normal", source);
+        Assert.Contains("ActiveEventPresets.AutopilotEvents", source);
+        Assert.Contains("ActiveEventPresets.NormalEvents", source);
+        Assert.Contains("ApplyActiveEventPreset", source);
+    }
+
+    /// <summary>
+    /// Each new event checkbox must bind its checked state to the active-events set (so an
+    /// unselected event renders unchecked), and the not-configured default path must load only
+    /// the 4 defaults — leaving the 4 new events unchecked.
+    /// </summary>
+    [Fact]
+    public void Configuration_Markup_NewEventCheckboxesDefaultUnchecked()
+    {
+        var source = ReadConfigurationSource();
+        foreach (var name in new[] { "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved" })
+        {
+            var marker = $"checked=\"@_composerNotifActiveEvents.Contains(\"{name}\")\"";
+            Assert.Contains(marker, source);
+        }
+
+        // The not-configured default load must populate only the 4 defaults, never the new events.
+        var method = ExtractMethodSource(source, "private async Task LoadComposerAsync()");
+        var defaultsStart = method.IndexOf("_composerNotifActiveEvents.Add(\"goal_completed\")", StringComparison.Ordinal);
+        Assert.True(defaultsStart >= 0, "Default load must seed goal_completed");
+        var defaultsBody = method.Substring(defaultsStart);
+        Assert.Contains("_composerNotifActiveEvents.Add(\"goal_failed\")", defaultsBody);
+        Assert.Contains("_composerNotifActiveEvents.Add(\"ci_failed\")", defaultsBody);
+        Assert.Contains("_composerNotifActiveEvents.Add(\"issue_raised\")", defaultsBody);
+        Assert.DoesNotContain("_composerNotifActiveEvents.Add(\"ci_succeeded\")", defaultsBody);
+        Assert.DoesNotContain("_composerNotifActiveEvents.Add(\"release_completed\")", defaultsBody);
+        Assert.DoesNotContain("_composerNotifActiveEvents.Add(\"goal_dispatched\")", defaultsBody);
+        Assert.DoesNotContain("_composerNotifActiveEvents.Add(\"issue_resolved\")", defaultsBody);
     }
 
     [Fact]

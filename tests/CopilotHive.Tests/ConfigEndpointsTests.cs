@@ -955,13 +955,14 @@ public class ConfigEndpointsTests
         Assert.Equal(30, body.GetProperty("eventNotifications").GetProperty("throttleSeconds").GetInt32());
     }
 
-    // ── validActiveEvents: 5 recognized names in both response paths ───────────
+    // ── validActiveEvents: 9 recognized names in both response paths ───────────
 
     private static readonly string[] AllValidActiveEvents =
-        ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published"];
+        ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+         "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"];
 
     [Fact]
-    public async Task GetComposer_NullComposer_ValidActiveEventsHasFiveNames()
+    public async Task GetComposer_NullComposer_ValidActiveEventsHasNineNames()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -983,7 +984,7 @@ public class ConfigEndpointsTests
     }
 
     [Fact]
-    public async Task GetComposer_ConfiguredComposer_ValidActiveEvents_IncludesFiveNames()
+    public async Task GetComposer_ConfiguredComposer_ValidActiveEvents_IncludesNineNames()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1094,14 +1095,14 @@ public class ConfigEndpointsTests
         Assert.Equal(["goal_completed", "goal_failed", "ci_failed", "issue_raised"], activeEvents);
         Assert.DoesNotContain("package_published", activeEvents);
 
-        // validActiveEvents must still contain all 5 recognized names.
+        // validActiveEvents must still contain all 9 recognized names.
         var validEvents = body.GetProperty("eventNotifications").GetProperty("validActiveEvents")
             .EnumerateArray().Select(e => e.GetString()).ToList();
         Assert.Equal(AllValidActiveEvents, validEvents);
     }
 
     [Fact]
-    public async Task GetComposer_AllFiveEventsConfigured_AllReturnedInActiveEvents()
+    public async Task GetComposer_AllNineEventsConfigured_AllReturnedInActiveEvents()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1115,7 +1116,7 @@ public class ConfigEndpointsTests
             EventNotifications = new EventNotificationsConfig
             {
                 Mode = "active",
-                ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published"],
+                ActiveEvents = ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published", "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
                 ThrottleSeconds = 30
             }
         };
@@ -1126,8 +1127,39 @@ public class ConfigEndpointsTests
         var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
         var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
             .EnumerateArray().Select(e => e.GetString()).ToList();
-        // All 5 events are returned in canonical order.
+        // All 9 events are returned in canonical order.
         Assert.Equal(AllValidActiveEvents, activeEvents);
+    }
+
+    [Fact]
+    public async Task PatchComposer_RoutineEvents_RoundTripsViaEndpoint()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        var response = await client.PatchAsJsonAsync(
+            "/api/config/composer",
+            new
+            {
+                eventNotificationsMode = "active",
+                eventNotificationsActiveEvents = new[] { "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved" },
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(
+            ["ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
+            baseFactory.Config.Composer!.EventNotifications!.ActiveEvents);
+
+        // GET must reflect the persisted value.
+        var getResponse = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+        var body = await getResponse.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
+            .EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Equal(["ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"], activeEvents);
     }
 
     [Fact]

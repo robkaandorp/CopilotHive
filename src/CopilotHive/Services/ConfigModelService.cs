@@ -847,6 +847,10 @@ public sealed class ConfigModelService
         ("ci_failed",          "CiFailed"),
         ("issue_raised",       "IssueRaised"),
         ("package_published",  "PackagePublished"),
+        ("ci_succeeded",       "CiSucceeded"),
+        ("release_completed",  "ReleaseCompleted"),
+        ("goal_dispatched",    "GoalDispatched"),
+        ("issue_resolved",     "IssueResolved"),
     ];
 
     /// <summary>
@@ -857,7 +861,7 @@ public sealed class ConfigModelService
 
     /// <summary>
     /// Resolves an active event name to its canonical snake_case form. The input must equal one
-    /// of the ten canonical spellings (five snake_case, five PascalCase) case-insensitively;
+    /// of the eighteen canonical spellings (nine snake_case, nine PascalCase) case-insensitively;
     /// anything else — including near-matches that differ only in underscore placement — returns
     /// <c>null</c> so the caller can reject it.
     /// </summary>

@@ -1010,10 +1010,40 @@ else
                                            @onchange='(e) => ToggleComposerNotifEvent("package_published", (bool)(e.Value ?? false))' />
                                     Package Published
                                 </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("ci_succeeded")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("ci_succeeded", (bool)(e.Value ?? false))' />
+                                    CI Succeeded
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("release_completed")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("release_completed", (bool)(e.Value ?? false))' />
+                                    Release Completed
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("goal_dispatched")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("goal_dispatched", (bool)(e.Value ?? false))' />
+                                    Goal Dispatched
+                                </label>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;cursor:pointer">
+                                    <input type="checkbox" checked="@_composerNotifActiveEvents.Contains("issue_resolved")"
+                                           @onchange='(e) => ToggleComposerNotifEvent("issue_resolved", (bool)(e.Value ?? false))' />
+                                    Issue Resolved
+                                </label>
                                 @if (_composerNotifActiveEvents.Count == 0)
                                 {
                                     <span style="color:var(--red);font-size:0.8rem">At least one active event is required.</span>
                                 }
+                                <div style="display:flex;gap:0.75rem;margin-top:0.25rem">
+                                    <button class="approve-btn" style="padding:0.25rem 0.75rem;font-size:0.8rem"
+                                            @onclick="() => ApplyActiveEventPreset(ActiveEventPresets.AutopilotEvents)">
+                                        Autopilot
+                                    </button>
+                                    <button class="approve-btn" style="padding:0.25rem 0.75rem;font-size:0.8rem"
+                                            @onclick="() => ApplyActiveEventPreset(ActiveEventPresets.NormalEvents)">
+                                        Normal
+                                    </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1710,6 +1740,34 @@ else
             _composerNotifActiveEvents.Add(name);
         else
             _composerNotifActiveEvents.Remove(name);
+    }
+
+    /// <summary>
+    /// Canonical snake_case name sets for the active-event presets. Exposed as internal static
+    /// helpers (mirroring the <see cref="ComposerChat.NextActiveNotificationsMode"/> pattern) so
+    /// the preset behavior is removal-proof testable without a live Blazor circuit.
+    /// </summary>
+    internal static class ActiveEventPresets
+    {
+        /// <summary>All 9 recognized active events (autonomous composer mode).</summary>
+        public static readonly string[] AutopilotEvents =
+        [
+            "goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+            "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved",
+        ];
+
+        /// <summary>The 4 default active events (normal composer mode).</summary>
+        public static readonly string[] NormalEvents =
+        [
+            "goal_completed", "goal_failed", "ci_failed", "issue_raised",
+        ];
+    }
+
+    private void ApplyActiveEventPreset(IEnumerable<string> presetEvents)
+    {
+        _composerNotifActiveEvents.Clear();
+        foreach (var name in presetEvents)
+            _composerNotifActiveEvents.Add(name);
     }
 
     private async Task SaveComposerAsync()
