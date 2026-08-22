@@ -929,6 +929,329 @@ public sealed class NuGetPublishMonitorServiceTests
         Assert.Single(eventBus.Published);
     }
 
+    // ── ProbePackageAsync: single-iteration probe ─────────────────────────
+
+    [Fact]
+    public async Task ProbePackageAsync_2xxInlineMatch_ReturnsFoundAndPublishes()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Found, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.PackagePublished, evt.Type);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_NonObjectRoot_ReturnsRetry()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("[1, 2, 3]"));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Theory]
+    [InlineData("{}")] // items missing
+    [InlineData("{\"items\": 42}")] // items non-array
+    public async Task ProbePackageAsync_ItemsMissingOrNonArray_ReturnsRetry(string body)
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(body));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_EmptyItems_ReturnsNotFound()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("{\"items\": []}"));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.NotFound, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    /// <summary>
+    /// Malformed index entries must be skipped: non-object items, non-array nested
+    /// <c>items</c>, and non-string <c>@id</c> are all ignored. The probe completes with
+    /// <see cref="NuGetPublishMonitorService.ProbeResult.NotFound"/> — never faults and never fetches garbage pages.
+    /// </summary>
+    [Fact]
+    public async Task ProbePackageAsync_ShapeErrors_SkippedAndNotFound()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse("""
+            {
+              "items": [
+                42,
+                { "items": "not-an-array", "@id": "./relative.json" },
+                { "@id": 123 },
+                { "items": [ { "catalogEntry": { "version": "9.9.9" } } ] }
+              ]
+            }
+            """));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.NotFound, outcome.Result);
+        Assert.Empty(eventBus.Published);
+        Assert.All(handler.Urls, u => Assert.DoesNotContain("./relative.json", u));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    [InlineData(HttpStatusCode.ServiceUnavailable)]
+    [InlineData(HttpStatusCode.Continue)] // 1xx
+    [InlineData(HttpStatusCode.Redirect)] // 3xx
+    public async Task ProbePackageAsync_RetryStatuses_ReturnRetry(HttpStatusCode status)
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(status));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    [InlineData(HttpStatusCode.MethodNotAllowed)]
+    public async Task ProbePackageAsync_Other4xx_ReturnsTerminal(HttpStatusCode status)
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(status));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_429WithRetryAfter_ReturnsRetryWithPositiveRetryAfter()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "5"));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.NotNull(outcome.RetryAfter);
+        Assert.True(outcome.RetryAfter > TimeSpan.Zero);
+        Assert.Equal(TimeSpan.FromSeconds(5), outcome.RetryAfter);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_429WithoutRetryAfter_ReturnsRetryWithNullRetryAfter()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.TooManyRequests));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_429WithZeroRetryAfter_NullRetryAfter()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => ErrorResponse(HttpStatusCode.TooManyRequests, retryAfter: "0"));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Retry, outcome.Result);
+        Assert.Null(outcome.RetryAfter);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_NullDependencies_ReturnsTerminal()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+
+        var noBus = new NuGetPublishMonitorService(
+            httpClientFactory: CreateFactory(handler),
+            pollInterval: PollInterval,
+            timeoutOverride: Timeout);
+        var noBusOutcome = await noBus.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, noBusOutcome.Result);
+
+        var noFactory = new NuGetPublishMonitorService(
+            eventBus: new RecordingEventBus(),
+            pollInterval: PollInterval,
+            timeoutOverride: Timeout);
+        var noFactoryOutcome = await noFactory.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, noFactoryOutcome.Result);
+
+        Assert.Empty(handler.Urls);
+    }
+
+    [Theory]
+    [InlineData("", "My.Package", "1.2.3", "v1.2.3")]
+    [InlineData("test-repo", "", "1.2.3", "v1.2.3")]
+    [InlineData("test-repo", "My.Package", "", "v1.2.3")]
+    [InlineData("test-repo", "My.Package", "1.2.3", "")]
+    [InlineData("test-repo", "My.Package", "v1.2.3", "v1.2.3")]
+    [InlineData("test-repo", "My.Package", "not-a-version", "v1.2.3")]
+    public async Task ProbePackageAsync_BlankOrInvalidInputs_ReturnsTerminal(
+        string? repoName, string? packageId, string? version, string? releaseTag)
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            repoName!, packageId!, version!, releaseTag!, TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Terminal, outcome.Result);
+        Assert.Empty(eventBus.Published);
+        Assert.Empty(handler.Urls);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_CancellationRequested_Throws()
+    {
+        var eventBus = new RecordingEventBus();
+        var handler = new ScriptedHttpMessageHandler(_ => OkResponse(IndexJsonWithInlineMatch("1.2.3")));
+        var service = CreateService(handler, eventBus: eventBus);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.ProbePackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", cts.Token));
+
+        Assert.Empty(eventBus.Published);
+        Assert.Empty(handler.Urls);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_PageError_Skipped_NotFound()
+    {
+        var eventBus = new RecordingEventBus();
+        var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
+        var handler = new ScriptedHttpMessageHandler(req =>
+        {
+            if (req.RequestUri!.ToString() == pageUrl)
+                return ErrorResponse(HttpStatusCode.InternalServerError);
+            return OkResponse(IndexJsonWithPage(pageUrl));
+        });
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.NotFound, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_PageMalformedJson_Skipped_NotFound()
+    {
+        var eventBus = new RecordingEventBus();
+        var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
+        var handler = new ScriptedHttpMessageHandler(req =>
+        {
+            if (req.RequestUri!.ToString() == pageUrl)
+                return OkResponse("not json");
+            return OkResponse(IndexJsonWithPage(pageUrl));
+        });
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.NotFound, outcome.Result);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_PageCancellation_Propagates()
+    {
+        var eventBus = new RecordingEventBus();
+        var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new ScriptedHttpMessageHandler(async req =>
+        {
+            if (req.RequestUri!.ToString() == pageUrl)
+            {
+                await release.Task;
+                return OkResponse(PageJsonWithMatch("1.2.3"));
+            }
+            return OkResponse(IndexJsonWithPage(pageUrl));
+        });
+        var service = CreateService(handler, eventBus: eventBus);
+        using var cts = new CancellationTokenSource();
+
+        var probe = service.ProbePackageAsync("test-repo", "My.Package", "1.2.3", "v1.2.3", cts.Token);
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+        release.SetResult(true);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probe);
+        Assert.Empty(eventBus.Published);
+    }
+
+    [Fact]
+    public async Task ProbePackageAsync_PageMatch_ReturnsFoundAndPublishes()
+    {
+        var eventBus = new RecordingEventBus();
+        var pageUrl = "https://api.nuget.org/v3/registration5-gz-semver2/mypackage/page.json";
+        var handler = new ScriptedHttpMessageHandler(req =>
+        {
+            if (req.RequestUri!.ToString() == pageUrl)
+                return OkResponse(PageJsonWithMatch("1.2.3"));
+            return OkResponse(IndexJsonWithPage(pageUrl));
+        });
+        var service = CreateService(handler, eventBus: eventBus);
+
+        var outcome = await service.ProbePackageAsync(
+            "test-repo", "My.Package", "1.2.3", "v1.2.3", TestContext.Current.CancellationToken);
+
+        Assert.Equal(NuGetPublishMonitorService.ProbeResult.Found, outcome.Result);
+        var evt = Assert.Single(eventBus.Published);
+        Assert.Equal(EventType.PackagePublished, evt.Type);
+    }
+
     // ── DI registration: gzip handler ──────────────────────────────────────
 
     /// <summary>

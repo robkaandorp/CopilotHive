@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 
+using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
@@ -411,6 +412,18 @@ public static class ApiEndpoints
                     Type: EventType.ReleaseCompleted,
                     Message: $"Release '{updated.Tag}' marked as Released",
                     ReleaseId: updated.Id));
+
+                // NuGet publish monitoring: fire-and-forget monitors for every configured
+                // package of every PublishNuGet repository in this release. Both services are
+                // required; the application lifetime is optional (CancellationToken.None when
+                // absent so the monitor is not tied to a request). Failures are logged and
+                // must never fail the release.
+                LaunchNuGetMonitors(
+                    services.GetService<NuGetPublishMonitorService>(),
+                    services.GetService<HiveConfigFile>(),
+                    services.GetService<IHostApplicationLifetime>(),
+                    services.GetService<ILoggerFactory>()?.CreateLogger<NuGetPublishMonitorService>(),
+                    updated);
 
                 // Best-effort cleanup of transient progress/review knowledge documents for
                 // every goal in the release. Failures are logged and must never fail the release.
@@ -852,6 +865,52 @@ public static class ApiEndpoints
         // ── LLM Sessions REST API ────────────────────────────────────────────────
         app.MapGet("/api/sessions", (LlmSessionRegistry registry) =>
             Results.Ok(registry.GetAll()));
+    }
+
+    /// <summary>
+    /// Launches fire-and-forget NuGet publish monitors for every configured package of every
+    /// PublishNuGet repository named in the release. Both the monitor and the hive config are
+    /// required (either missing → no-op). The application lifetime is optional; when absent
+    /// the monitor is bound to <see cref="CancellationToken.None"/>. Failures are logged and
+    /// never propagate. Exposed as <c>internal</c> for unit testing via
+    /// <c>InternalsVisibleTo</c>.
+    /// </summary>
+    /// <param name="monitor">The NuGet publish monitor, or <c>null</c> to skip.</param>
+    /// <param name="config">The hive configuration, or <c>null</c> to skip.</param>
+    /// <param name="appLifetime">Optional application lifetime providing the shutdown token.</param>
+    /// <param name="logger">Optional logger for monitor failures.</param>
+    /// <param name="release">The freshly-released release to monitor.</param>
+    internal static void LaunchNuGetMonitors(
+        NuGetPublishMonitorService? monitor,
+        HiveConfigFile? config,
+        IHostApplicationLifetime? appLifetime,
+        ILogger? logger,
+        Release release)
+    {
+        if (monitor is null || config is null)
+            return;
+
+        var ct = appLifetime?.ApplicationStopping ?? CancellationToken.None;
+
+        foreach (var repo in release.RepositoryNames)
+        {
+            var repoConfig = config.Repositories.FirstOrDefault(
+                r => string.Equals(r.Name, repo, StringComparison.OrdinalIgnoreCase));
+            if (repoConfig?.PublishNuGet?.Packages is not { Count: > 0 })
+                continue;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await monitor.MonitorReleaseAsync(repo, release.Tag, ct);
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogWarning(ex, "NuGet publish monitor failed for release {Tag} repo {Repo}", release.Tag, repo);
+                }
+            }, ct);
+        }
     }
 
     /// <summary>Validates caller-supplied issue IDs: ASCII lowercase letters, digits, hyphens only.</summary>
