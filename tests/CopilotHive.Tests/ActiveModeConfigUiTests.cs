@@ -67,6 +67,75 @@ public sealed class ActiveModeConfigUiTests
         return string.Empty; // unreachable
     }
 
+    /// <summary>
+    /// Extracts the "Active Events" checkbox container markup from the Configuration.razor
+    /// source — the <c>&lt;div&gt;</c> that follows the "Active Events" label. Assertions
+    /// scoped to this block cannot be satisfied by the <c>ActiveEventPresets</c> arrays,
+    /// comments, or method declarations elsewhere in the file: deleting or miswiring
+    /// a checkbox or preset button removes its markup from this block.
+    /// </summary>
+    private static string ExtractActiveEventsBlock(string source)
+    {
+        const string labelMarker = "<label style=\"color:var(--text-muted);font-size:0.9rem\">Active Events</label>";
+        var labelIndex = source.IndexOf(labelMarker, StringComparison.Ordinal);
+        Assert.True(labelIndex >= 0, "'Active Events' label not found in Configuration.razor");
+
+        var blockStart = source.IndexOf("<div", labelIndex, StringComparison.Ordinal);
+        Assert.True(blockStart >= 0, "Active-events container <div> not found after the 'Active Events' label");
+
+        // Nesting scan: "<div" opens, "</div>" closes; "</div>" cannot be mistaken for an
+        // opening tag because the '/' follows '<'.
+        var depth = 0;
+        for (var i = blockStart; i < source.Length - 4; i++)
+        {
+            if (source[i] == '<' && source[i + 1] == 'd' && source[i + 2] == 'i' && source[i + 3] == 'v')
+            {
+                depth++;
+                i += 3;
+            }
+            else if (source[i] == '<' && source[i + 1] == '/' && source[i + 2] == 'd'
+                     && source[i + 3] == 'i' && source[i + 4] == 'v')
+            {
+                depth--;
+                if (depth == 0)
+                    return source.Substring(blockStart, i - blockStart + 6);
+                i += 4;
+            }
+        }
+
+        Assert.Fail("Could not find the matching </div> of the active-events container");
+        return string.Empty; // unreachable
+    }
+
+    /// <summary>
+    /// Extracts the <c>&lt;label&gt;</c> element containing the given checkbox marker, so
+    /// assertions can prove the checkbox input AND its visible label live in the same element.
+    /// </summary>
+    private static string ExtractCheckboxLabel(string block, string checkedMarker)
+    {
+        var markerIndex = block.IndexOf(checkedMarker, StringComparison.Ordinal);
+        Assert.True(markerIndex >= 0, $"Checkbox marker '{checkedMarker}' not found in the active-events markup block");
+
+        var labelStart = block.LastIndexOf("<label", markerIndex, StringComparison.Ordinal);
+        Assert.True(labelStart >= 0, "No <label> opening tag before the checkbox marker");
+        var labelEnd = block.IndexOf("</label>", markerIndex, StringComparison.Ordinal);
+        Assert.True(labelEnd >= 0, "No </label> closing tag after the checkbox marker");
+        return block.Substring(labelStart, labelEnd - labelStart + "</label>".Length);
+    }
+
+    /// <summary>
+    /// Extracts the <c>&lt;button&gt;</c> element containing the given <c>@onclick</c> index,
+    /// so assertions can prove the handler and the visible label live in the same element.
+    /// </summary>
+    private static string ExtractButtonElement(string block, int onclickIndex)
+    {
+        var start = block.LastIndexOf("<button", onclickIndex, StringComparison.Ordinal);
+        Assert.True(start >= 0, "No <button> opening tag before the @onclick handler");
+        var end = block.IndexOf("</button>", onclickIndex, StringComparison.Ordinal);
+        Assert.True(end >= 0, "No </button> closing tag after the @onclick handler");
+        return block.Substring(start, end - start + "</button>".Length);
+    }
+
     // ── ComposerChat: NextActiveNotificationsMode cycle ──────────────────────
 
     [Fact]
@@ -468,16 +537,37 @@ public sealed class ActiveModeConfigUiTests
     public void Configuration_Markup_ContainsNineEventCheckboxes()
     {
         var source = ReadConfigurationSource();
-        Assert.Contains("goal_completed", source);
-        Assert.Contains("goal_failed", source);
-        Assert.Contains("ci_failed", source);
-        Assert.Contains("issue_raised", source);
-        Assert.Contains("package_published", source);
-        Assert.Contains("ci_succeeded", source);
-        Assert.Contains("release_completed", source);
-        Assert.Contains("goal_dispatched", source);
-        Assert.Contains("issue_resolved", source);
-        Assert.Contains("ToggleComposerNotifEvent", source);
+        var block = ExtractActiveEventsBlock(source);
+
+        // Each event must have a REAL checkbox input in the active-events markup block:
+        // a type="checkbox" input whose @onchange handler calls
+        // ToggleComposerNotifEvent("<name>", ...) with the correct snake_case name,
+        // plus a visible label. The checked expression binds to the active-events set
+        // (not a hardcoded value).
+        var events = new (string Name, string Label)[]
+        {
+            ("goal_completed", "Goal Completed"),
+            ("goal_failed", "Goal Failed"),
+            ("ci_failed", "CI Failed"),
+            ("issue_raised", "Issue Raised"),
+            ("package_published", "Package Published"),
+            ("ci_succeeded", "CI Succeeded"),
+            ("release_completed", "Release Completed"),
+            ("goal_dispatched", "Goal Dispatched"),
+            ("issue_resolved", "Issue Resolved"),
+        };
+
+        foreach (var (name, label) in events)
+        {
+            var checkedMarker = $"checked=\"@_composerNotifActiveEvents.Contains(\"{name}\")\"";
+            var labelElement = ExtractCheckboxLabel(block, checkedMarker);
+
+            Assert.Contains("<input type=\"checkbox\"", labelElement);
+            Assert.Contains(
+                $"@onchange='(e) => ToggleComposerNotifEvent(\"{name}\", (bool)(e.Value ?? false))'",
+                labelElement);
+            Assert.Contains(label, labelElement);
+        }
     }
 
     // ── Configuration: active-event presets ─────────────────────────────────
@@ -507,18 +597,34 @@ public sealed class ActiveModeConfigUiTests
     }
 
     /// <summary>
-    /// The preset buttons must call the internal helpers so the preset sets stay the single
-    /// source of truth (removal-proof): the markup must reference the helper members.
+    /// The preset buttons must exist as REAL <c>&lt;button&gt;</c> elements in the active-events
+    /// markup block, each with an <c>@onclick</c> handler that invokes
+    /// <c>ApplyActiveEventPreset</c> with the correct preset member. Scoped to the
+    /// markup block so comments or the helper declarations alone cannot satisfy the assertions.
     /// </summary>
     [Fact]
     public void Configuration_Markup_PresetButtonsCallHelpers()
     {
         var source = ReadConfigurationSource();
-        Assert.Contains("Autopilot", source);
-        Assert.Contains("Normal", source);
-        Assert.Contains("ActiveEventPresets.AutopilotEvents", source);
-        Assert.Contains("ActiveEventPresets.NormalEvents", source);
-        Assert.Contains("ApplyActiveEventPreset", source);
+        var block = ExtractActiveEventsBlock(source);
+
+        var autopilotIndex = block.IndexOf(
+            "@onclick=\"() => ApplyActiveEventPreset(ActiveEventPresets.AutopilotEvents)\"",
+            StringComparison.Ordinal);
+        Assert.True(autopilotIndex >= 0,
+            "Autopilot button @onclick handler invoking ActiveEventPresets.AutopilotEvents not found in the active-events markup");
+        var autopilotButton = ExtractButtonElement(block, autopilotIndex);
+        Assert.Contains("<button", autopilotButton);
+        Assert.Contains("Autopilot", autopilotButton);
+
+        var normalIndex = block.IndexOf(
+            "@onclick=\"() => ApplyActiveEventPreset(ActiveEventPresets.NormalEvents)\"",
+            StringComparison.Ordinal);
+        Assert.True(normalIndex >= 0,
+            "Normal button @onclick handler invoking ActiveEventPresets.NormalEvents not found in the active-events markup");
+        var normalButton = ExtractButtonElement(block, normalIndex);
+        Assert.Contains("<button", normalButton);
+        Assert.Contains("Normal", normalButton);
     }
 
     /// <summary>
@@ -530,10 +636,16 @@ public sealed class ActiveModeConfigUiTests
     public void Configuration_Markup_NewEventCheckboxesDefaultUnchecked()
     {
         var source = ReadConfigurationSource();
+        var block = ExtractActiveEventsBlock(source);
+
+        // Each new checkbox's checked expression must consult the active-events set — never a
+        // hardcoded true. Scoped to the actual checkbox label elements.
         foreach (var name in new[] { "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved" })
         {
-            var marker = $"checked=\"@_composerNotifActiveEvents.Contains(\"{name}\")\"";
-            Assert.Contains(marker, source);
+            var checkedMarker = $"checked=\"@_composerNotifActiveEvents.Contains(\"{name}\")\"";
+            var labelElement = ExtractCheckboxLabel(block, checkedMarker);
+            Assert.Contains("<input type=\"checkbox\"", labelElement);
+            Assert.DoesNotContain("checked=\"true\"", labelElement);
         }
 
         // The not-configured default load must populate only the 4 defaults, never the new events.
