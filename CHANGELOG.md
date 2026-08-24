@@ -1,3 +1,9 @@
+## [0.33.1] — 2026-08-24
+
+### Fixed
+
+- **GitHub OAuth "Correlation failed" on plain-HTTP non-localhost hosts** — when the dashboard is served over `http://` on a hostname other than localhost (e.g. an internal docker swarm / LAN), Chromium-based browsers refuse to store the OAuth correlation cookie (it carries the `Secure` attribute), breaking the sign-in handshake. The correlation cookie's `SecurePolicy` can now be relaxed by setting the new `ALLOW_INSECURE_OAUTH=true` environment variable. Only enable this on trusted internal networks — OAuth cookies are otherwise sent in the clear. Documented in the README Authentication section. (`fix-oauth-correlation-insecure-http`)
+
 ## [0.33.0] — 2026-08-22
 
 ### Added
