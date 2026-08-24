@@ -132,10 +132,13 @@ public class ConfigRepoManager
 
     /// <summary>
     /// Parses a YAML string into a <see cref="HiveConfigFile"/>.
+    /// The returned instance is marked <see cref="HiveConfigFile.IsConfigured"/> = <c>true</c>
+    /// (it came from an actual config repo file, unlike the no-repo fallback singleton).
     /// </summary>
     internal static HiveConfigFile ParseConfig(string yaml)
     {
         var config = YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
+        config.IsConfigured = true;
         foreach (var repo in config.Repositories)
         {
             if (repo.Release is not null &&

@@ -152,6 +152,58 @@ public sealed class HiveConfigFileTests
         Assert.Null(config.Models.AvailableModels[0].ContextWindow);
     }
 
+    // ── IsConfigured marker ──────────────────────────────────────────────────
+
+    [Fact]
+    public void IsConfigured_DefaultsToFalse()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.False(config.IsConfigured);
+    }
+
+    [Fact]
+    public void IsConfigured_SetterIsNotPublic_OnlyConfigLayerCanSetIt()
+    {
+        // The provenance invariant: IsConfigured may only be set by the config layer
+        // (ConfigRepoManager) — external consumers must not be able to mark a config
+        // as repo-parsed. The setter must exist (internal, visible to this test assembly
+        // via InternalsVisibleTo) but must NOT be public.
+        var property = typeof(HiveConfigFile).GetProperty(nameof(HiveConfigFile.IsConfigured))
+            ?? throw new InvalidOperationException("IsConfigured property not found");
+
+        Assert.NotNull(property.SetMethod);
+        Assert.False(property.SetMethod!.IsPublic,
+            "IsConfigured setter must be non-public (internal) so external consumers cannot set it");
+        Assert.True(property.GetMethod!.IsPublic,
+            "IsConfigured getter must remain public for read access");
+    }
+
+    [Fact]
+    public void IsConfigured_NeverAppearsInSerializedYaml()
+    {
+        var config = new HiveConfigFile { IsConfigured = true };
+
+        var yaml = Serializer.Serialize(config);
+
+        Assert.DoesNotContain("is_configured", yaml, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("IsConfigured", yaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void IsConfigured_PreservedAcrossReloadFrom()
+    {
+        var receiver = new HiveConfigFile { IsConfigured = true };
+        var source = new HiveConfigFile { IsConfigured = false, Orchestrator = new OrchestratorConfig { Model = "new-model" } };
+
+        receiver.ReloadFrom(source);
+
+        // The marker reflects that a repo config was loaded onto the singleton: it must NOT
+        // be reset by ReloadFrom even though the source instance itself carries false.
+        Assert.True(receiver.IsConfigured);
+        Assert.Equal("new-model", receiver.Orchestrator.Model);
+    }
+
     // ── ReloadFrom tests ─────────────────────────────────────────────────────
 
     /// <summary>
@@ -578,11 +630,11 @@ public sealed class HiveConfigFileTests
         Assert.Equal("main", receiver.Repositories[0].Release!.MergeTo);
     }
 
-    // ── GetComposerAvailableModels tests ──────────────────────────────────────
+    // ── GetComposerAvailableModels tests (parameterless normalized catalog) ─────
 
     /// <summary>
     /// When Models.AvailableModels is populated, GetComposerAvailableModels returns
-    /// the names from that list.
+    /// the normalized global names.
     /// </summary>
     [Fact]
     public void GetComposerAvailableModels_GlobalAvailableModels_ReturnsGlobalNames()
@@ -600,7 +652,7 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        var result = config.GetComposerAvailableModels("fallback");
+        var result = config.GetComposerAvailableModels();
 
         Assert.Equal(3, result.Count);
         Assert.Equal("copilot/claude-sonnet-4.6", result[0]);
@@ -609,11 +661,11 @@ public sealed class HiveConfigFileTests
     }
 
     /// <summary>
-    /// When Models is null, GetComposerAvailableModels falls back to
-    /// ComposerConfig.GetAvailableModels(fallback).
+    /// When Models is null, GetComposerAvailableModels returns an EMPTY list — the
+    /// composer-local list is NOT a fall-through source for the selectable catalog.
     /// </summary>
     [Fact]
-    public void GetComposerAvailableModels_GlobalModelsNull_FallsBackToComposerConfig()
+    public void GetComposerAvailableModels_GlobalModelsNull_ReturnsEmptyList()
     {
         var config = new HiveConfigFile
         {
@@ -625,20 +677,18 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        var result = config.GetComposerAvailableModels("fallback");
+        var result = config.GetComposerAvailableModels();
 
-        // ComposerConfig.GetAvailableModels returns Model first, then Models
-        Assert.Equal(2, result.Count);
-        Assert.Equal("composer-model", result[0]);
-        Assert.Equal("alt-model", result[1]);
+        // NO composer-local fall-through: the catalog is the global list only.
+        Assert.Empty(result);
     }
 
     /// <summary>
     /// When Models.AvailableModels is an empty list, GetComposerAvailableModels
-    /// falls back to ComposerConfig.GetAvailableModels(fallback).
+    /// returns an empty list — no fabricated fallback.
     /// </summary>
     [Fact]
-    public void GetComposerAvailableModels_GlobalAvailableModelsEmpty_FallsBackToComposerConfig()
+    public void GetComposerAvailableModels_GlobalAvailableModelsEmpty_ReturnsEmptyList()
     {
         var config = new HiveConfigFile
         {
@@ -652,19 +702,18 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        var result = config.GetComposerAvailableModels("fallback");
+        var result = config.GetComposerAvailableModels();
 
-        // Empty AvailableModels triggers fallback to ComposerConfig
-        Assert.Single(result);
-        Assert.Equal("fallback-model", result[0]);
+        // Empty global list ⇒ empty catalog — no composer-local/fabricated fallback.
+        Assert.Empty(result);
     }
 
     /// <summary>
     /// When both Models and Composer are null, GetComposerAvailableModels
-    /// returns a list containing just the fallback parameter.
+    /// returns an empty list (no fabricated fallback model is ever invented).
     /// </summary>
     [Fact]
-    public void GetComposerAvailableModels_BothNull_ReturnsFallbackList()
+    public void GetComposerAvailableModels_BothNull_ReturnsEmptyList()
     {
         var config = new HiveConfigFile
         {
@@ -672,15 +721,14 @@ public sealed class HiveConfigFileTests
             Composer = null
         };
 
-        var result = config.GetComposerAvailableModels("my-fallback-model");
+        var result = config.GetComposerAvailableModels();
 
-        Assert.Single(result);
-        Assert.Equal("my-fallback-model", result[0]);
+        Assert.Empty(result);
     }
 
     /// <summary>
     /// When Models has AvailableModels but Composer is null, the global list
-    /// is still returned (global takes precedence).
+    /// is still returned (the catalog is global-only).
     /// </summary>
     [Fact]
     public void GetComposerAvailableModels_GlobalListPresent_ComposerNull_ReturnsGlobalList()
@@ -697,10 +745,268 @@ public sealed class HiveConfigFileTests
             Composer = null
         };
 
-        var result = config.GetComposerAvailableModels("fallback");
+        var result = config.GetComposerAvailableModels();
 
         Assert.Single(result);
         Assert.Equal("global-only-model", result[0]);
+    }
+
+    /// <summary>
+    /// The catalog is normalized: names are trimmed, whitespace-only/empty entries are dropped,
+    /// and ordinal-ignore-case duplicates collapse to the FIRST occurrence.
+    /// </summary>
+    [Fact]
+    public void GetComposerAvailableModels_NormalizesCatalog_TrimsDropsDuplicatesFirstWins()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  GPT-4  " },
+                    new ModelEntry { Name = "gpt-4" },
+                    new ModelEntry { Name = "   " },
+                    new ModelEntry { Name = "" },
+                    new ModelEntry { Name = "Claude-Opus" },
+                    new ModelEntry { Name = "claude-opus" }
+                ]
+            }
+        };
+
+        var result = config.GetComposerAvailableModels();
+
+        Assert.Equal(2, result.Count);
+        Assert.Equal("GPT-4", result[0]);
+        Assert.Equal("Claude-Opus", result[1]);
+    }
+
+    // ── ResolveAvailableModel tests (the shared matching primitive) ────────────
+
+    [Fact]
+    public void ResolveAvailableModel_TrimsBothSides_ReturnsTrimmedCanonical()
+    {
+        var config = new HiveConfigFile();
+
+        var result = config.ResolveAvailableModel(["  GPT-4  ", "claude-opus"], "  gpt-4  ");
+
+        Assert.Equal("GPT-4", result);
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_WhitespaceBearingEntry_ReturnsTrimmedCanonical()
+    {
+        var config = new HiveConfigFile();
+
+        var result = config.ResolveAvailableModel(["  GPT-4  "], "GPT-4");
+
+        Assert.Equal("GPT-4", result);
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_DropsWhitespaceOnlyAndEmptyEntries()
+    {
+        var config = new HiveConfigFile();
+
+        var result = config.ResolveAvailableModel(["   ", "", "GPT-4"], "gpt-4");
+
+        Assert.Equal("GPT-4", result);
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_OrdinalIgnoreCase_MatchIsCaseInsensitive()
+    {
+        var config = new HiveConfigFile();
+
+        var result = config.ResolveAvailableModel(["Copilot/Claude-Sonnet-4.6"], "copilot/claude-sonnet-4.6");
+
+        Assert.Equal("Copilot/Claude-Sonnet-4.6", result);
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_DuplicatesCollapseToFirst()
+    {
+        var config = new HiveConfigFile();
+
+        // The FIRST normalized duplicate wins — the canonical name is the first entry's trimmed form.
+        var result = config.ResolveAvailableModel(["  First-Model  ", "first-model"], "FIRST-MODEL");
+
+        Assert.Equal("First-Model", result);
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_NoMatch_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Null(config.ResolveAvailableModel(["model-a", "model-b"], "model-c"));
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_EmptyCatalog_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Null(config.ResolveAvailableModel([], "any-model"));
+        Assert.Null(config.ResolveAvailableModel(null, "any-model"));
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_NullCandidate_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Null(config.ResolveAvailableModel(["GPT-4"], null));
+        Assert.Null(config.ResolveAvailableModel(["GPT-4"], "   "));
+        Assert.Null(config.ResolveAvailableModel(["GPT-4"], ""));
+    }
+
+    [Fact]
+    public void ResolveAvailableModel_GlobalOverload_DelegatesToGlobalCatalog()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  copilot/gpt-5.4-mini  " },
+                    new ModelEntry { Name = "copilot/claude-sonnet-4.6" }
+                ]
+            }
+        };
+
+        var result = config.ResolveAvailableModel("COPILOT/GPT-5.4-MINI");
+
+        Assert.Equal("copilot/gpt-5.4-mini", result);
+        Assert.Null(config.ResolveAvailableModel("not-in-catalog"));
+    }
+
+    /// <summary>
+    /// Null entries in the catalog are silently skipped (not fatal): a valid match
+    /// AFTER a null entry is still resolved.
+    /// </summary>
+    [Fact]
+    public void ResolveAvailableModel_NullEntriesInCatalog_SkippedAndMatchStillFound()
+    {
+        var config = new HiveConfigFile();
+
+        // null string entries interspersed — the primitive must skip them, not throw.
+        var result = config.ResolveAvailableModel([null!, "  GPT-4  ", null!], "gpt-4");
+
+        Assert.Equal("GPT-4", result);
+    }
+
+    /// <summary>
+    /// A whitespace-bearing candidate resolves a cleanly-stored catalog entry, and
+    /// returns the entry's canonical (trimmed) form.
+    /// </summary>
+    [Fact]
+    public void ResolveAvailableModel_WhitespaceCandidate_ResolvesCleanEntry()
+    {
+        var config = new HiveConfigFile();
+
+        var result = config.ResolveAvailableModel(["copilot/claude-sonnet-4.6"], "  COPILOT/CLAUDE-SONNET-4.6  ");
+
+        Assert.Equal("copilot/claude-sonnet-4.6", result);
+    }
+
+    /// <summary>
+    /// When all catalog entries are whitespace-only/empty/null and the candidate is
+    /// valid, the result is null (no match survives normalization).
+    /// </summary>
+    [Fact]
+    public void ResolveAvailableModel_AllEntriesWhitespaceOnly_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Null(config.ResolveAvailableModel(["  ", "", null!], "any-model"));
+    }
+
+    // ── ResolveComposerDefaultModel tests ────────────────────────────────────
+
+    [Fact]
+    public void ResolveComposerDefaultModel_PresentAndInGlobalCatalog_ReturnsTrimmedCanonical()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  copilot/composer-model  " }
+                ]
+            },
+            Composer = new ComposerConfig { Model = "  COPILOT/COMPOSER-MODEL  " }
+        };
+
+        var result = config.ResolveComposerDefaultModel();
+
+        Assert.Equal("copilot/composer-model", result);
+    }
+
+    [Fact]
+    public void ResolveComposerDefaultModel_SetButAbsentFromCatalog_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "other-model" }]
+            },
+            Composer = new ComposerConfig { Model = "composer-model" }
+        };
+
+        Assert.Null(config.ResolveComposerDefaultModel());
+    }
+
+    [Fact]
+    public void ResolveComposerDefaultModel_Unset_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a" }]
+            },
+            Composer = new ComposerConfig { Model = null }
+        };
+
+        Assert.Null(config.ResolveComposerDefaultModel());
+    }
+
+    [Fact]
+    public void ResolveComposerDefaultModel_WhitespaceOnly_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "model-a" }]
+            },
+            Composer = new ComposerConfig { Model = "   " }
+        };
+
+        Assert.Null(config.ResolveComposerDefaultModel());
+    }
+
+    [Fact]
+    public void ResolveComposerDefaultModel_NoGlobalCatalog_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Composer = new ComposerConfig { Model = "composer-model" }
+        };
+
+        Assert.Null(config.ResolveComposerDefaultModel());
+    }
+
+    [Fact]
+    public void ResolveComposerDefaultModel_NoComposerSection_ReturnsNull()
+    {
+        var config = new HiveConfigFile();
+
+        Assert.Null(config.ResolveComposerDefaultModel());
     }
 
     // ── TryGetContextWindowForModel tests (Brain & Composer resolution) ─────────
@@ -799,6 +1105,65 @@ public sealed class HiveConfigFileTests
 
         Assert.Equal(200_000, config.TryGetContextWindowForModel("copilot/claude-sonnet-4.6"));
         Assert.Equal(200_000, config.TryGetContextWindowForModel("COPILOT/CLAUDE-SONNET-4.6"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_StoredNameWithSurroundingWhitespace_ResolvesTrimmedCanonical()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  copilot/trimmed-model  ", ContextWindow = 175_000 }
+                ]
+            }
+        };
+
+        // A trimmed canonical name resolves the entry whose stored name carries whitespace.
+        Assert.Equal(175_000, config.TryGetContextWindowForModel("copilot/trimmed-model"));
+    }
+
+    [Fact]
+    public void TryGetContextWindowForModel_NormalizedDuplicates_FirstWins()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  dup-model  ", ContextWindow = 111_000 },
+                    new ModelEntry { Name = "DUP-MODEL", ContextWindow = 222_000 }
+                ]
+            }
+        };
+
+        // FIRST normalized case-insensitive duplicate wins.
+        Assert.Equal(111_000, config.TryGetContextWindowForModel("dup-model"));
+    }
+
+    /// <summary>
+    /// A whitespace-bearing candidate resolves a cleanly-stored entry (reverse direction
+    /// of <see cref="TryGetContextWindowForModel_StoredNameWithSurroundingWhitespace_ResolvesTrimmedCanonical"/>).
+    /// </summary>
+    [Fact]
+    public void TryGetContextWindowForModel_WhitespaceCandidate_ResolvesCleanEntry()
+    {
+        var config = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "copilot/clean-model", ContextWindow = 99_000 }
+                ]
+            }
+        };
+
+        // Candidate carries surrounding whitespace; the stored entry is clean.
+        Assert.Equal(99_000, config.TryGetContextWindowForModel("  COPILOT/CLEAN-MODEL  "));
     }
 
     // ── YAML backward compatibility: removed fields still deserialize ───────────
@@ -1661,6 +2026,9 @@ public sealed class HiveConfigFileTests
         Composer = new ComposerConfig { Model = "composer-model", ReasoningEffort = "none" },
         Models = new ModelsConfig
         {
+            // composer-model must be in the global catalog for the composer's effective
+            // default to resolve (which makes composer.reasoning_effort required).
+            AvailableModels = [new ModelEntry { Name = "composer-model" }],
             SubAgentModels = [new ModelEntry { Name = "sub-a", ReasoningEffort = "high" }]
         }
     };
@@ -1835,7 +2203,92 @@ public sealed class HiveConfigFileTests
         // Must return a list rather than throwing, even when errors exist.
         var errors = config.ValidateReasoningEffort();
 
-        Assert.Equal(5, errors.Count);
+        // 4 errors: orchestrator + coder model + coder premium + sub-a.
+        // The composer does NOT contribute: its model is set but absent from the global
+        // catalog (no AvailableModels here), so no effective default ⇒ no required effort.
+        Assert.Equal(4, errors.Count);
+    }
+
+    // ── Composer reasoning conditioning (Slice 1A1) ───────────────────────────
+
+    /// <summary>
+    /// A set-but-absent composer.model (present in config but NOT in the global
+    /// available_models catalog) with no composer.reasoning_effort does NOT fail validation.
+    /// </summary>
+    [Fact]
+    public void ValidateReasoningEffort_ComposerModelSetButAbsentFromCatalog_NoReasoningRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Models!.AvailableModels = [new ModelEntry { Name = "other-model" }];
+        config.Composer!.ReasoningEffort = null;
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    /// <summary>
+    /// A set-but-absent composer.model with no composer.reasoning_effort and no global catalog
+    /// does NOT fail validation.
+    /// </summary>
+    [Fact]
+    public void ValidateReasoningEffort_ComposerModelSetButNoGlobalCatalog_NoReasoningRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Models!.AvailableModels = null;
+        config.Composer!.ReasoningEffort = null;
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
+    /// <summary>
+    /// When the composer model DOES resolve to a valid effective default in the global catalog,
+    /// composer.reasoning_effort is still required.
+    /// </summary>
+    [Fact]
+    public void ValidateReasoningEffort_ComposerEffectiveDefaultResolves_ReasoningStillRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Composer!.ReasoningEffort = null;
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("composer", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A whitespace-bearing composer model that normalizes into the catalog still requires
+    /// composer.reasoning_effort.
+    /// </summary>
+    [Fact]
+    public void ValidateReasoningEffort_ComposerModelTrimmedIntoCatalog_ReasoningRequired()
+    {
+        var config = ValidReasoningConfig();
+        config.Composer!.Model = "  COMPOSER-MODEL  ";
+        config.Composer!.ReasoningEffort = null;
+
+        var error = Assert.Single(config.ValidateReasoningEffort());
+        Assert.Contains("composer", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Orchestrator/role reasoning requirements are UNCHANGED: orchestrator.reasoning_effort is
+    /// still unconditionally required, and per-role model assignments still require their effort.
+    /// </summary>
+    [Fact]
+    public void ValidateReasoningEffort_OrchestratorAndRoleRequirements_Unchanged()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { ReasoningEffort = null },
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" }
+            }
+        };
+
+        var errors = config.ValidateReasoningEffort();
+
+        Assert.Equal(2, errors.Count);
+        Assert.Contains(errors, e => e.Contains("orchestrator", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(errors, e => e.Contains("workers.coder", StringComparison.Ordinal));
     }
 
     // ── GetSubAgentModels: duplicate available_models names ────────────────────

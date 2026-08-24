@@ -92,8 +92,9 @@ public class ConfigEndpointsTests
     {
         var response = await _client.GetAsync("/api/config/repositories", TestContext.Current.CancellationToken);
 
-        // Route exists; returns NotFound (404) when HiveConfigFile is not registered (no config repo).
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        // A fallback HiveConfigFile is always registered (Slice 1A1), so the endpoint
+        // returns 200 with the (empty) fallback repository list instead of 404.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ── POST /api/config/repositories ───────────────────────────────────────────
@@ -375,7 +376,9 @@ public class ConfigEndpointsTests
     {
         var response = await _client.GetAsync("/api/config/orchestrator", TestContext.Current.CancellationToken);
 
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        // A fallback HiveConfigFile is always registered (Slice 1A1), so the endpoint
+        // returns 200 with the fallback orchestrator config instead of 404.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ── PATCH /api/config/orchestrator ───────────────────────────────────────────
@@ -397,7 +400,9 @@ public class ConfigEndpointsTests
     {
         var response = await _client.GetAsync("/api/config/workers", TestContext.Current.CancellationToken);
 
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        // A fallback HiveConfigFile is always registered (Slice 1A1), so the endpoint
+        // returns 200 with the (empty) fallback workers dictionary instead of 404.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ── PATCH /api/config/workers ───────────────────────────────────────────────
@@ -595,7 +600,9 @@ public class ConfigEndpointsTests
     {
         var response = await _client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
 
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        // A fallback HiveConfigFile is always registered (Slice 1A1); with a null Composer
+        // section the endpoint returns 200 with effective defaults instead of 404.
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ── PATCH /api/config/composer ──────────────────────────────────────────────

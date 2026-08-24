@@ -112,6 +112,19 @@ public class ConfigRepoManagerTests : IDisposable
     }
 
     [Fact]
+    public void ParseConfig_MarksInstanceIsConfiguredTrue()
+    {
+        const string yaml = """
+            version: "1.0"
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        // A repo-parsed config is marked IsConfigured = true (vs. the no-repo fallback false).
+        Assert.True(config.IsConfigured);
+    }
+
+    [Fact]
     public void ParseConfig_UnknownFields_AreIgnored()
     {
         const string yaml = """

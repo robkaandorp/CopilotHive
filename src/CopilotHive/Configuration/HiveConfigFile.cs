@@ -1,5 +1,6 @@
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using YamlDotNet.Serialization;
 
 namespace CopilotHive.Configuration;
 
@@ -22,6 +23,16 @@ public sealed class HiveConfigFile
     public ComposerConfig? Composer { get; set; }
 
     /// <summary>
+    /// Marks whether this instance was actually parsed from a config repository
+    /// (set by <see cref="ConfigRepoManager"/>). <c>false</c> for the ordinary/fallback
+    /// construction used when no <c>--config-repo</c> is configured. Never YAML-serialized.
+    /// The setter is internal: only the config layer (and the test assembly via
+    /// <c>InternalsVisibleTo</c>) can set it — external consumers only read it.
+    /// </summary>
+    [YamlIgnore]
+    public bool IsConfigured { get; internal set; }
+
+    /// <summary>
     /// Resolves the model to use for a given role.
     /// Returns the per-role override if configured, otherwise the orchestrator's default model.
     /// </summary>
@@ -41,15 +52,73 @@ public sealed class HiveConfigFile
             : null;
 
     /// <summary>
+    /// The single normalization/matching primitive for model names. Trims whitespace on BOTH
+    /// <paramref name="candidate"/> and each catalog entry; drops whitespace-only/empty entries;
+    /// matches ordinal-ignore-case; ordinal-ignore-case duplicates collapse to the FIRST entry;
+    /// returns the TRIMMED canonical name, or <c>null</c> when there is no match, the catalog is
+    /// empty, or the candidate is null/whitespace-only.
+    /// </summary>
+    /// <param name="catalog">The catalog of model names to match against; may be null/empty.</param>
+    /// <param name="candidate">The model name to resolve; trimmed before matching.</param>
+    /// <returns>The trimmed canonical model name, or <c>null</c> on no match.</returns>
+    public string? ResolveAvailableModel(IEnumerable<string>? catalog, string? candidate)
+    {
+        if (catalog is null || string.IsNullOrWhiteSpace(candidate))
+            return null;
+
+        var trimmedCandidate = candidate.Trim();
+        if (trimmedCandidate.Length == 0)
+            return null;
+
+        foreach (var entry in catalog)
+        {
+            if (entry is null)
+                continue;
+            var trimmed = entry.Trim();
+            if (trimmed.Length == 0)
+                continue;
+            if (string.Equals(trimmed, trimmedCandidate, StringComparison.OrdinalIgnoreCase))
+                return trimmed;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="candidate"/> against the GLOBAL <see cref="ModelsConfig.AvailableModels"/>
+    /// entry names via <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/>.
+    /// </summary>
+    /// <param name="candidate">The model name to resolve.</param>
+    /// <returns>The trimmed canonical name from the global catalog, or <c>null</c>.</returns>
+    public string? ResolveAvailableModel(string? candidate) =>
+        ResolveAvailableModel(Models?.AvailableModels?.Select(m => m.Name), candidate);
+
+    /// <summary>
+    /// Resolves the Composer's default model: <see cref="ComposerConfig.Model"/> normalized against
+    /// the global <see cref="ModelsConfig.AvailableModels"/> catalog. Returns the trimmed canonical
+    /// name when the composer model is present (and normalized) in the global list; <c>null</c>
+    /// when unset, absent from the catalog, or no global catalog exists. Delegates to
+    /// <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/> — no duplicated matching logic.
+    /// </summary>
+    public string? ResolveComposerDefaultModel() => ResolveAvailableModel(Composer?.Model);
+
+    /// <summary>
     /// Looks up the model in <see cref="ModelsConfig.AvailableModels"/> and returns its
     /// <see cref="ModelEntry.ContextWindow"/> if set and greater than 0.
+    /// Name matching routes through <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/>:
+    /// trim + ordinal-ignore-case, FIRST-wins on normalized duplicates — so a trimmed canonical
+    /// model resolves a catalog entry whose stored name carries surrounding whitespace.
     /// </summary>
     /// <param name="modelName">Model identifier to look up.</param>
     /// <returns>The configured context window, or <c>null</c> if the model is not found or has no value set.</returns>
     public int? TryGetContextWindowForModel(string? modelName)
     {
+        var canonical = ResolveAvailableModel(modelName);
+        if (canonical is null)
+            return null;
+
         var entry = Models?.AvailableModels?.FirstOrDefault(
-            m => string.Equals(m.Name, modelName, StringComparison.OrdinalIgnoreCase));
+            m => string.Equals(m.Name?.Trim(), canonical, StringComparison.OrdinalIgnoreCase));
         return entry?.ContextWindow;
     }
 
@@ -75,19 +144,30 @@ public sealed class HiveConfigFile
     }
 
     /// <summary>
-    /// Returns the globally-configured available model names from <see cref="ModelsConfig.AvailableModels"/>,
-    /// or falls back to the composer-local list via <see cref="ComposerConfig.GetAvailableModels(string)"/>.
+    /// Returns the Composer's normalized selectable catalog: the GLOBAL
+    /// <see cref="ModelsConfig.AvailableModels"/> names ONLY — trimmed, whitespace-only/empty
+    /// dropped, ordinal-ignore-case duplicates collapsed to the FIRST. There is NO
+    /// composer-local fall-through and NO fabricated fallback: an empty global list yields an
+    /// empty catalog.
     /// </summary>
-    /// <param name="fallback">Model to return when no models are configured anywhere.</param>
-    /// <returns>A non-empty list of model identifiers.</returns>
-    public List<string> GetComposerAvailableModels(string fallback)
+    /// <returns>The normalized list of selectable model identifiers (possibly empty).</returns>
+    public List<string> GetComposerAvailableModels()
     {
-        if (Models?.AvailableModels is not null && Models.AvailableModels.Count > 0)
+        var result = new List<string>();
+        if (Models?.AvailableModels is null)
+            return result;
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in Models.AvailableModels)
         {
-            return Models.AvailableModels.Select(m => m.Name).ToList();
+            var name = entry.Name?.Trim();
+            if (string.IsNullOrEmpty(name))
+                continue;
+            if (seen.Add(name))
+                result.Add(name);
         }
 
-        return Composer?.GetAvailableModels(fallback) ?? [fallback];
+        return result;
     }
 
     /// <summary>
@@ -186,7 +266,10 @@ public sealed class HiveConfigFile
                 Check(worker.PremiumReasoningEffort, $"workers.{kv.Key}.premium_reasoning_effort");
         }
 
-        if (Composer is not null && IsSet(Composer.Model))
+        // composer.reasoning_effort is required ONLY when the composer's model resolves to a
+        // valid effective default in the global available_models catalog. A set-but-absent
+        // composer.model ⇒ no effective default ⇒ reasoning_effort NOT required.
+        if (Composer is not null && ResolveComposerDefaultModel() is not null)
             Check(Composer.ReasoningEffort, "composer.reasoning_effort");
 
         if (Models?.SubAgentModels is { Count: > 0 } subAgentModels)
@@ -225,6 +308,11 @@ public sealed class HiveConfigFile
     /// Deep-copies all top-level properties from <paramref name="source"/> onto this instance,
     /// replacing old collections with new instances so callers holding the singleton reference
     /// see the updated data immediately.
+    /// <para>
+    /// <see cref="IsConfigured"/> is deliberately NOT copied: it marks that a repo config was
+    /// loaded onto this singleton, so a configured instance that reloads stays
+    /// <c>IsConfigured = true</c>.
+    /// </para>
     /// </summary>
     public void ReloadFrom(HiveConfigFile source)
     {

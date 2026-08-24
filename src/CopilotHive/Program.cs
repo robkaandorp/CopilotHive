@@ -353,7 +353,7 @@ public sealed class Program
                 var maxCtx = config?.TryGetContextWindowForModel(model)
                     ?? Constants.DefaultBrainContextWindow;
                 var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
-                var availableModels = config?.GetComposerAvailableModels(model) ?? [model];
+                var availableModels = config?.GetComposerAvailableModels() ?? [];
 
                 return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
                     sp.GetRequiredService<IGoalStore>(),
@@ -490,6 +490,12 @@ public sealed class Program
             builder.Services.AddDataProtection()
                 .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(stateDir, "keys")));
 
+            // HiveConfigFile: ALWAYS registered so GetService<HiveConfigFile>() is never null —
+            // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>
+            // never exposes both a false- and true-provenance instance. When no config repo is
+            // configured, the fallback singleton has an EMPTY Orchestrator.Model (via
+            // OrchestratorConfig.CreateEmptyModelFallback) so it does NOT override BRAIN_MODEL for
+            // the Brain (line 199) nor alter the Composer's model chain (line 349).
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
                 var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
@@ -533,6 +539,14 @@ public sealed class Program
                     builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
                     builder.Logging.AddFilter("Grpc", LogLevel.Warning);
                 }
+            }
+            else
+            {
+                // No config repo: the single HiveConfigFile is the empty fallback.
+                builder.Services.AddSingleton(new HiveConfigFile
+                {
+                    Orchestrator = OrchestratorConfig.CreateEmptyModelFallback()
+                });
             }
 
             // Knowledge document cleanup: best-effort deletion of transient progress/review
