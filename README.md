@@ -88,7 +88,7 @@ By default, CopilotHive runs without authentication (open mode). To enable GitHu
 
 The first GitHub user to sign in becomes the admin. The OAuth access token replaces the need for `GH_TOKEN`.
 
-> **Plain-HTTP deployments**: When serving the dashboard over plain HTTP on a non-localhost hostname (internal LAN / docker swarm), you must set `ALLOW_INSECURE_OAUTH=true` or the OAuth handshake will fail with "Correlation failed" (browsers silently drop `Secure`-marked cookies over `http://` on non-localhost hosts). This is safe only on a trusted internal network, because OAuth cookies would otherwise be sent in the clear.
+> **Plain-HTTP deployments**: When serving the dashboard over plain HTTP on a non-localhost hostname (internal LAN / docker swarm), set `ALLOW_INSECURE_OAUTH=true`, or the OAuth handshake fails with "Correlation failed" (the OAuth correlation cookie carries the `Secure` attribute and browsers drop such cookies over `http://` on non-localhost hosts; Chromium also rejects the default `SameSite=None` without `Secure`). This relaxes only the correlation cookie's `Secure` requirement and sets `SameSite=Lax`. Use it only on a trusted internal network: over plain HTTP, OAuth tokens and session traffic can still be intercepted or modified by anyone with network access.
 
 ### Configuring Goals
 

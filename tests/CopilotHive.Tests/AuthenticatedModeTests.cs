@@ -141,6 +141,30 @@ public sealed class AuthenticatedModeTests : IDisposable
             .Get("GitHub");
 
         Assert.Equal(CookieSecurePolicy.None, options.CorrelationCookie.SecurePolicy);
+        Assert.Equal(SameSiteMode.Lax, options.CorrelationCookie.SameSite);
+    }
+
+    [Fact]
+    public async Task CorrelationCookie_Header_HasNoSecureAndSameSiteLax_WhenAllowInsecureOAuthIsTrue()
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false,
+        });
+
+        var response = await client.GetAsync("/api/goals", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        var setCookie = Assert.Single(response.Headers.NonValidated["Set-Cookie"]);
+
+        var cookie = setCookie.Split(';', StringSplitOptions.TrimEntries);
+        Assert.Contains(cookie, part => part.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal));
+
+        // Attributes are the semicolon-delimited parts after the name=value pair; each part is
+        // matched as a discrete token so a value merely containing "Secure" (e.g. a cookie
+        // value with "Secure" in it) can never satisfy the assertion.
+        Assert.DoesNotContain(cookie, part => string.Equals(part, "Secure", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(cookie, part => string.Equals(part, "SameSite=Lax", StringComparison.OrdinalIgnoreCase));
     }
 
     public void Dispose() => _factory.Dispose();

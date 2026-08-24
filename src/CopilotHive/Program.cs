@@ -268,10 +268,13 @@ public sealed class Program
 
                         if (Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH") == "true")
                         {
-                            // Plain-HTTP deployments on non-LAN-localhost hosts (internal docker swarm/compose):
-                            // browsers silently drop Secure-marked cookies over http://, breaking OAuth correlation.
+                            // Plain-HTTP deployments on non-localhost hosts (internal LAN / docker swarm):
+                            // browsers drop Secure-marked cookies over http://, and Chromium rejects
+                            // SameSite=None cookies that lack Secure, breaking OAuth correlation.
+                            // GitHub's callback is a top-level GET, so SameSite=Lax is sufficient and safer than None.
                             // Only enabled when the operator explicitly opts in via ALLOW_INSECURE_OAUTH.
                             options.CorrelationCookie.SecurePolicy = CookieSecurePolicy.None;
+                            options.CorrelationCookie.SameSite = SameSiteMode.Lax;
                         }
 
                         options.Events.OnCreatingTicket = async context =>
