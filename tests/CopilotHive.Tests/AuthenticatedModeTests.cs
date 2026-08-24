@@ -1,9 +1,14 @@
 using System.Net;
 
+using AspNet.Security.OAuth.GitHub;
+
 using CopilotHive.Git;
 
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace CopilotHive.Tests;
 
@@ -31,15 +36,18 @@ public sealed class AuthenticatedModeTests : IDisposable
         private readonly string? _previousStateDir;
         private readonly string? _previousOAuthClientId;
         private readonly string? _previousOAuthClientSecret;
+        private readonly string? _previousAllowInsecureOAuth;
 
         public AuthEnabledFactory()
         {
             _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
             _previousOAuthClientId = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID");
             _previousOAuthClientSecret = Environment.GetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET");
+            _previousAllowInsecureOAuth = Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH");
             Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID", "test-client-id");
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET", "test-secret");
+            Environment.SetEnvironmentVariable("ALLOW_INSECURE_OAUTH", "true");
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -54,6 +62,7 @@ public sealed class AuthenticatedModeTests : IDisposable
             Environment.SetEnvironmentVariable("STATE_DIR", _previousStateDir);
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_ID", _previousOAuthClientId);
             Environment.SetEnvironmentVariable("GITHUB_OAUTH_CLIENT_SECRET", _previousOAuthClientSecret);
+            Environment.SetEnvironmentVariable("ALLOW_INSECURE_OAUTH", _previousAllowInsecureOAuth);
 
             if (!disposing || !Directory.Exists(_stateDir))
                 return;
@@ -121,6 +130,17 @@ public sealed class AuthenticatedModeTests : IDisposable
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotEqual("/login", response.Headers.Location?.OriginalString);
+    }
+
+    [Fact]
+    public void CorrelationCookie_IsNotSecure_WhenAllowInsecureOAuthIsTrue()
+    {
+        using var client = _factory.CreateClient();
+
+        var options = _factory.Services.GetRequiredService<IOptionsMonitor<GitHubAuthenticationOptions>>()
+            .Get("GitHub");
+
+        Assert.Equal(CookieSecurePolicy.None, options.CorrelationCookie.SecurePolicy);
     }
 
     public void Dispose() => _factory.Dispose();

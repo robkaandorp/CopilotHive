@@ -88,6 +88,8 @@ By default, CopilotHive runs without authentication (open mode). To enable GitHu
 
 The first GitHub user to sign in becomes the admin. The OAuth access token replaces the need for `GH_TOKEN`.
 
+> **Plain-HTTP deployments**: When serving the dashboard over plain HTTP on a non-localhost hostname (internal LAN / docker swarm), you must set `ALLOW_INSECURE_OAUTH=true` or the OAuth handshake will fail with "Correlation failed" (browsers silently drop `Secure`-marked cookies over `http://` on non-localhost hosts). This is safe only on a trusted internal network, because OAuth cookies would otherwise be sent in the clear.
+
 ### Configuring Goals
 
 Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth. The recommended way to create goals is through the **Composer Chat UI** at `/composer`, which provides a conversational interface for decomposing high-level intent into well-scoped goals. Goals can also be created via the REST API (`POST /api/goals`).

@@ -266,6 +266,14 @@ public sealed class Program
                         options.Scope.Add("workflow");
                         options.SaveTokens = true;
 
+                        if (Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH") == "true")
+                        {
+                            // Plain-HTTP deployments on non-LAN-localhost hosts (internal docker swarm/compose):
+                            // browsers silently drop Secure-marked cookies over http://, breaking OAuth correlation.
+                            // Only enabled when the operator explicitly opts in via ALLOW_INSECURE_OAUTH.
+                            options.CorrelationCookie.SecurePolicy = CookieSecurePolicy.None;
+                        }
+
                         options.Events.OnCreatingTicket = async context =>
                         {
                             var userService = context.HttpContext.RequestServices.GetRequiredService<UserService>();
