@@ -236,12 +236,15 @@ public class CiMonitorService
     /// </summary>
     private readonly Queue<string> _logFetchCacheOrder = new();
 
-    /// <summary>Size (in bytes) of the UTF-8-aligned ring buffer used when reading a job log body.</summary>
-    private const int LogReadBufferSize = 200_000;
+    /// <summary>
+    /// Hard cap (in raw bytes) on how much of a job log body is read into memory. The retained
+    /// 4 MiB prefix is kept as-is — earlier bytes are never evicted.
+    /// </summary>
+    private const int LogReadMaxBytes = 4 * 1024 * 1024;
 
     /// <summary>
-    /// UTF-8 decoder with a replacement fallback: a truncated multi-byte sequence at the tail
-    /// of the ring buffer decodes to U+FFFD instead of throwing.
+    /// UTF-8 decoder with a replacement fallback: a truncated multi-byte sequence at the cap
+    /// boundary decodes to U+FFFD instead of throwing.
     /// </summary>
     private static readonly UTF8Encoding LenientUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
@@ -1331,8 +1334,8 @@ public class CiMonitorService
     /// <summary>
     /// Fetches one failed job's log: requests <c>/actions/jobs/{jobId}/logs</c> with bearer
     /// auth, manually follows the 302 redirect to the cross-host signed URL WITHOUT auth, and
-    /// reads the body through a bounded UTF-8-aligned ring buffer. The decoded tail is
-    /// sanitized before it is returned.
+    /// reads the body as a bounded in-memory full read (up to 4 MiB of raw bytes, keeping the
+    /// retained prefix as-is). The decoded text is sanitized before it is returned.
     /// </summary>
     /// <returns>The sanitized log text, or <c>null</c> when the job's log could not be fetched.</returns>
     private async Task<string?> FetchJobLogAsync(
@@ -1399,24 +1402,37 @@ public class CiMonitorService
     }
 
     /// <summary>
-    /// Streams the log body through a bounded ring buffer (retaining only the most recent
-    /// bytes), decodes it as UTF-8, and sanitizes the result. The ring keeps memory bounded
-    /// regardless of how large the raw log is.
+    /// Reads the log body as a bounded in-memory full read: up to <see cref="LogReadMaxBytes"/>
+    /// raw bytes are accumulated and the retained prefix is kept as-is (no tail-only slide).
+    /// The bytes are decoded as UTF-8 leniently — an incomplete multi-byte sequence at the cap
+    /// boundary decodes to the replacement character instead of throwing — and the result is
+    /// sanitized.
     /// </summary>
     private static async Task<string> ReadLogBodyAsync(HttpResponseMessage response, CancellationToken ct)
     {
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        var ring = new ByteRingBuffer(LogReadBufferSize);
+        var buffer = new byte[LogReadMaxBytes];
+        var total = 0;
         var chunk = new byte[8192];
         while (true)
         {
-            var read = await stream.ReadAsync(chunk.AsMemory(), ct);
+            // Hard cap: the read REQUEST itself is clamped to the remaining capacity, so no
+            // byte beyond the cap is ever pulled off the stream. Clamping only the copy after
+            // an unclamped read would still consume (and then discard) up to a full chunk past
+            // the boundary, which the "read up to the cap and stop" contract forbids.
+            var remaining = buffer.Length - total;
+            if (remaining == 0)
+                break;
+
+            var read = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), ct);
             if (read == 0)
                 break;
-            ring.Write(chunk.AsSpan(0, read));
+
+            chunk.AsSpan(0, read).CopyTo(buffer.AsSpan(total, read));
+            total += read;
         }
 
-        return SanitizeLogContent(ring.DecodeUtf8());
+        return SanitizeLogContent(LenientUtf8.GetString(buffer, 0, total));
     }
 
     /// <summary>Creates a request with the GitHub bearer token attached.</summary>
@@ -1471,92 +1487,6 @@ public class CiMonitorService
                 var oldest = _logFetchCacheOrder.Dequeue();
                 _logFetchCache.Remove(oldest);
             }
-        }
-    }
-
-    /// <summary>
-    /// A fixed-capacity ring buffer that retains only the most recent bytes written to it.
-    /// Used to bound the decoded footprint of arbitrarily large CI logs.
-    /// </summary>
-    private sealed class ByteRingBuffer
-    {
-        private readonly byte[] _buffer;
-        private int _start;
-        private int _length;
-
-        public ByteRingBuffer(int capacity)
-        {
-            if (capacity <= 0)
-                throw new ArgumentOutOfRangeException(nameof(capacity));
-            _buffer = new byte[capacity];
-        }
-
-        /// <summary>Number of currently retained bytes.</summary>
-        public int Length => _length;
-
-        /// <summary>Appends data, evicting the oldest bytes once the ring is full.</summary>
-        public void Write(ReadOnlySpan<byte> data)
-        {
-            if (data.IsEmpty)
-                return;
-
-            if (data.Length >= _buffer.Length)
-            {
-                // A single chunk that exceeds the whole ring: keep only its tail.
-                data = data[^_buffer.Length..];
-                _start = 0;
-                _length = 0;
-            }
-
-            var offset = 0;
-            while (offset < data.Length)
-            {
-                var writePos = (_start + _length) % _buffer.Length;
-                var chunk = Math.Min(data.Length - offset, _buffer.Length - writePos);
-                data.Slice(offset, chunk).CopyTo(_buffer.AsSpan(writePos, chunk));
-                offset += chunk;
-
-                var newLength = _length + chunk;
-                if (newLength <= _buffer.Length)
-                {
-                    _length = newLength;
-                }
-                else
-                {
-                    var excess = newLength - _buffer.Length;
-                    _start = (_start + excess) % _buffer.Length;
-                    _length = _buffer.Length;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Decodes the retained bytes as UTF-8. The window may begin mid-way through a
-        /// multi-byte character (its lead byte was evicted), so leading continuation bytes are
-        /// skipped to land on a character boundary; a truncated final sequence decodes to the
-        /// replacement character instead of throwing.
-        /// </summary>
-        public string DecodeUtf8()
-        {
-            if (_length == 0)
-                return string.Empty;
-
-            var start = _start;
-            var length = _length;
-            while (length > 0 && (_buffer[start] & 0b1100_0000) == 0b1000_0000)
-            {
-                start = (start + 1) % _buffer.Length;
-                length--;
-            }
-
-            if (length == 0)
-                return string.Empty;
-
-            var bytes = new byte[length];
-            for (var i = 0; i < length; i++)
-                bytes[i] = _buffer[(start + i) % _buffer.Length];
-
-            return LenientUtf8.GetString(bytes);
         }
     }
 

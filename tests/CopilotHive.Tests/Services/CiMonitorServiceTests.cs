@@ -3094,6 +3094,76 @@ public sealed class CiMonitorServiceTests : IDisposable
         Content = new ByteArrayContent(body)
     };
 
+    /// <summary>
+    /// A read-only stream that serves a fixed body but deliberately returns IRREGULAR PARTIAL
+    /// read lengths (never more than <see cref="PartialReadSize"/> bytes per call, regardless of
+    /// how many were asked for). Because the partial size does not divide the 4 MiB read cap,
+    /// the reader's running total lands on an unaligned offset just below the cap — so a read
+    /// loop that hands the full chunk to <c>ReadAsync</c> would pull bytes PAST the cap off the
+    /// stream before discarding them. <see cref="MaxRequestedEndOffset"/> and
+    /// <see cref="TotalBytesRead"/> record exactly how far the reader reached.
+    /// </summary>
+    private sealed class PartialReadRecordingStream : Stream
+    {
+        /// <summary>Maximum number of bytes returned from a single read, however many were requested.</summary>
+        public const int PartialReadSize = 8191;
+
+        private readonly byte[] _body;
+        private int _position;
+
+        public PartialReadRecordingStream(byte[] body) => _body = body;
+
+        /// <summary>Highest end offset (position + requested count) any read asked the stream for.</summary>
+        public int MaxRequestedEndOffset { get; private set; }
+
+        /// <summary>Total bytes actually handed to the reader (i.e. consumed from the stream).</summary>
+        public int TotalBytesRead => _position;
+
+        /// <summary>Number of <c>ReadAsync</c> calls the reader issued.</summary>
+        public int ReadCallCount { get; private set; }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            ReadCallCount++;
+            MaxRequestedEndOffset = Math.Max(MaxRequestedEndOffset, _position + destination.Length);
+
+            var available = _body.Length - _position;
+            var count = Math.Min(Math.Min(destination.Length, available), PartialReadSize);
+            if (count <= 0)
+                return ValueTask.FromResult(0);
+
+            _body.AsSpan(_position, count).CopyTo(destination.Span);
+            _position += count;
+            return ValueTask.FromResult(count);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => _body.Length;
+        public override long Position
+        {
+            get => _position;
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// A 200 log response whose body is served by the given stream (not a buffered byte array),
+    /// so the reader's actual read geometry against the stream is observable.
+    /// </summary>
+    private static HttpResponseMessage LogResponse(Stream body) => new(HttpStatusCode.OK)
+    {
+        Content = new StreamContent(body)
+    };
+
     private static HttpResponseMessage JobsNotFoundResponse() => new(HttpStatusCode.NotFound);
 
     private static HttpResponseMessage JobLogNotFoundResponse() => new(HttpStatusCode.NotFound);
@@ -3258,61 +3328,49 @@ public sealed class CiMonitorServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task FetchJobLogsAsync_LargeLog_BoundedTo200KBytes()
+    public async Task FetchJobLogsAsync_LargeLog_FailurePastOldCapWithin4MiB_IsRetained()
     {
-        // The ring buffer does NOT bound how many bytes are read — it reads the whole stream
-        // and retains only the final 200,000 bytes. So the observable contract is WHICH content
-        // survives, not how much was read.
+        // The read is a bounded FULL read: up to 4 MiB of raw bytes are retained as a prefix
+        // (no tail-only slide), so a parseable failure block anywhere in the first 4 MiB
+        // survives to ParseTestFailuresFromLogs. The old 200 KB ring buffer kept only the most
+        // recent 200,000 bytes and evicted everything before them.
         //
-        // The log below is exactly 300,000 ASCII bytes with a parseable xUnit failure in the
-        // dropped prefix (offset 0, well inside the first 100,000 bytes) and a DIFFERENT
-        // parseable failure in the retained tail (offset 250,000, inside the last 100,000
-        // bytes). The 200,000-byte ring retains bytes [100,000 .. 300,000).
+        // The log below is 5,242,902 bytes: a parseable xUnit failure block ends exactly at the
+        // 4 MiB cap boundary (past the old 200 KB cap, within the first 4 MiB), followed by a
+        // marker and filler beyond the cap. The block's stack trace runs to the end of the
+        // retained log (no blank line / end-of-stack-trace marker after it), so if the read
+        // went past the cap the marker would leak into the parsed stack trace.
         //
-        // Removal-proof: if the ring buffer were removed (or its capacity raised to cover the
-        // whole body), the PREFIX failure would also be parsed and the assertion that exactly
-        // one failure — the tail one — is returned would fail.
-        const string PrefixTestName = "Tests.PrefixDroppedByRingBuffer";
-        const string TailTestName = "Tests.TailRetainedByRingBuffer";
+        // Removal-proof: the old 200 KB tail ring would retain only the last 200,000 bytes
+        // (offsets [5,042,902 .. 5,242,902)) and evict the block at [4,194,202 .. 4,194,304),
+        // so the old code would parse NO failure. The new bounded full read retains the block.
+        const int CapBytes = 4 * 1024 * 1024;
+        const string BeyondCapMarker = "BEYOND_CAP_MARKER_XYZ";
+        const string TestName = "Tests.Mid.Failure";
 
-        var prefixBlock = $"""
-            Failed {PrefixTestName} [1 ms]
+        var block = $$"""
+            Failed {{TestName}} [1 ms]
               Error Message:
-                prefix failure lives in the dropped region
+                mid failure
               Stack Trace:
-                at {PrefixTestName}()
-
-            """;
-        var tailBlock = $"""
-            Failed {TailTestName} [2 ms]
-              Error Message:
-                tail failure lives in the retained region
-              Stack Trace:
-                at {TailTestName}()
-
-            """;
-        // Normalize to '\n' so the byte offsets below hold on every platform.
-        prefixBlock = prefixBlock.Replace("\r\n", "\n", StringComparison.Ordinal);
-        tailBlock = tailBlock.Replace("\r\n", "\n", StringComparison.Ordinal);
-
-        const int TotalBytes = 300_000;
-        const int RingCapacity = 200_000;
-        const int TailBlockOffset = 250_000;
-
-        // Filler is a run of 'y' terminated by a newline: it contains no failure header, no
-        // "Error Message:" and no "Stack Trace:" line, so it can never contribute a parsed
-        // failure of its own. The trailing newline puts the tail block's "Failed ..." header at
-        // the start of its own line, which the xUnit header regex requires.
-        var fillerBefore = new string('y', TailBlockOffset - prefixBlock.Length - 1) + "\n";
-        var fillerAfter = new string('y', TotalBytes - TailBlockOffset - tailBlock.Length);
-        var fullLog = prefixBlock + fillerBefore + tailBlock + fillerAfter;
+                at Mid.Failure()
+            """.Replace("\r\n", "\n", StringComparison.Ordinal);
+        // The block must end exactly at the cap boundary so its stack trace runs to the end of
+        // the retained log (no blank line / end marker after it).
+        var blockStart = CapBytes - block.Length;
+        var fillerBefore = new string('y', blockStart - 1) + "\n";
+        var beyondCap = BeyondCapMarker + "\n" + new string('z', 1_048_576);
+        var fullLog = fillerBefore + block + beyondCap;
 
         // Guard the geometry the assertions depend on (ASCII → 1 byte per char).
-        Assert.Equal(TotalBytes, fullLog.Length);
-        Assert.True(prefixBlock.Length < TotalBytes - RingCapacity,
-            "The prefix failure must lie entirely inside the region the ring buffer drops.");
-        Assert.True(TailBlockOffset >= TotalBytes - RingCapacity,
-            "The tail failure must lie entirely inside the region the ring buffer retains.");
+        Assert.True(blockStart >= 200_000,
+            "The failure block must lie past the old 200 KB ring cap.");
+        Assert.True(blockStart + block.Length <= CapBytes,
+            "The failure block must lie entirely within the first 4 MiB.");
+        Assert.True(fullLog.Length > CapBytes,
+            "The log must exceed the 4 MiB cap.");
+        Assert.True(blockStart < fullLog.Length - 200_000,
+            "The old 200 KB tail ring would have evicted the block (removal-proof).");
 
         var jobsBody = JobsJson(1, (111, "failure"));
         var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(fullLog));
@@ -3323,17 +3381,104 @@ public sealed class CiMonitorServiceTests : IDisposable
 
         Assert.NotNull(result);
 
-        var parsedNames = result!.Failures.Select(f => f.TestName).ToList();
+        // The failure past the old 200 KB cap survives the bounded full read.
+        var failure = Assert.Single(result!.Failures);
+        Assert.Equal(TestName, failure.TestName);
+        Assert.Equal("mid failure", failure.Error);
+        Assert.Equal("at Mid.Failure()", failure.StackTrace);
 
-        // The prefix failure was overwritten by the ring buffer → it must NOT be parsed.
-        Assert.DoesNotContain(PrefixTestName, parsedNames);
-        // The tail failure was retained by the ring buffer → it MUST be parsed.
-        Assert.Contains(TailTestName, parsedNames);
-        // Exactly one failure: dropping the ring buffer would add the prefix failure back.
-        var tailFailure = Assert.Single(result.Failures);
-        Assert.Equal(TailTestName, tailFailure.TestName);
-        Assert.Equal("tail failure lives in the retained region", tailFailure.Error);
-        Assert.StartsWith($"at {TailTestName}()", tailFailure.StackTrace, StringComparison.Ordinal);
+        // Content beyond the 4 MiB cap is NOT present: the stack trace ends at the cap
+        // boundary, so the beyond-cap marker must not appear anywhere in the result.
+        Assert.DoesNotContain(BeyondCapMarker, failure.TestName, StringComparison.Ordinal);
+        Assert.DoesNotContain(BeyondCapMarker, failure.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(BeyondCapMarker, failure.StackTrace, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_LargeLog_Utf8SequenceSplitAtCap_DecodesLeniently()
+    {
+        // The 4 MiB byte cap can land mid-way through a multi-byte UTF-8 character. The read
+        // must decode leniently: the truncated final sequence becomes U+FFFD (replacement) —
+        // never a throw. The body below is 4 MiB + 1 bytes: ASCII filler, then the first two
+        // bytes (0xE2 0x82) of a three-byte U+20AC (€) sequence. The read stops after 4 MiB
+        // bytes, i.e. with only the 0xE2 lead byte retained.
+        const int CapBytes = 4 * 1024 * 1024;
+        var bytes = new byte[CapBytes + 1];
+        Array.Fill(bytes, (byte)'a', 0, CapBytes - 1);
+        bytes[CapBytes - 1] = 0xE2; // lead byte of a 3-byte sequence
+        bytes[CapBytes] = 0x82;     // continuation byte — beyond the cap, never read
+
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(bytes));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        // Must not throw on the incomplete final sequence.
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Empty(result!.Failures); // filler only → no parseable failures
+
+        // Fallback snippet: last 500 chars of the sanitized log = 499 'a's + U+FFFD.
+        Assert.NotNull(result.FallbackSnippet);
+        Assert.Equal(500, result.FallbackSnippet!.Length);
+        Assert.EndsWith("\uFFFD", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u20AC", result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.All(result.FallbackSnippet[..^1], ch => Assert.Equal('a', ch));
+    }
+
+    [Fact]
+    public async Task FetchJobLogsAsync_PartialReads_NeverRequestsOrConsumesBeyond4MiBCap()
+    {
+        // HARD cap: the read loop must clamp each read REQUEST to the remaining capacity, not
+        // merely discard over-read bytes afterwards. This stream returns at most 8,191 bytes per
+        // call, and 8,191 does not divide 4 MiB (4,194,304 = 8,191 x 512 + 512), so after 512
+        // reads the running total sits at 4,193,792 with only 512 bytes of capacity left.
+        //
+        // Removal-proof: an unclamped loop would hand the full 8,192-byte chunk to ReadAsync at
+        // that point, requesting through offset 4,201,984 and consuming 8,191 bytes — i.e.
+        // 7,679 bytes PAST the 4 MiB boundary — before Math.Min discarded them. The clamped loop
+        // requests exactly the remaining 512 bytes and then stops. A ByteArrayContent body
+        // cannot catch this: its reads are 8 KiB-aligned, so the boundary always falls on a
+        // chunk edge.
+        const int CapBytes = 4 * 1024 * 1024;
+        const string BeyondCapMarker = "BEYOND_CAP_MARKER_PARTIAL_READ";
+
+        // Guard the geometry the removal-proof depends on: the partial size must NOT divide the
+        // cap, otherwise the final read would land exactly on the boundary either way.
+        Assert.NotEqual(0, CapBytes % PartialReadRecordingStream.PartialReadSize);
+
+        var beyondCapBytes = Encoding.UTF8.GetBytes("\n" + BeyondCapMarker + "\n");
+        var body = new byte[CapBytes + beyondCapBytes.Length + 4096];
+        Array.Fill(body, (byte)'y', 0, CapBytes);
+        beyondCapBytes.CopyTo(body, CapBytes);
+        Array.Fill(body, (byte)'q', CapBytes + beyondCapBytes.Length, body.Length - CapBytes - beyondCapBytes.Length);
+
+        var stream = new PartialReadRecordingStream(body);
+        var jobsBody = JobsJson(1, (111, "failure"));
+        var handler = new JobsAndLogsHandler(jobsBody, _ => LogResponse(stream));
+        using var client = new HttpClient(handler, disposeHandler: false);
+        var service = CreateServiceForLogFetch();
+
+        var result = await service.FetchJobLogsAsync("run-1", "org", "test-repo", "test-token", client, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+
+        // No byte beyond the cap was ever REQUESTED from the stream...
+        Assert.True(stream.MaxRequestedEndOffset <= CapBytes,
+            $"Read requested through offset {stream.MaxRequestedEndOffset}, past the {CapBytes}-byte cap.");
+        // ...and no byte beyond the cap was CONSUMED: the read stops exactly at the boundary.
+        Assert.Equal(CapBytes, stream.TotalBytesRead);
+        // The geometry really was partial/irregular (not one aligned pass).
+        Assert.True(stream.ReadCallCount > CapBytes / 8192,
+            "The stream must have served the body in irregular partial reads.");
+
+        // Beyond-cap content is absent from the retained log.
+        Assert.Empty(result!.Failures); // filler only → no parseable failures
+        Assert.NotNull(result.FallbackSnippet);
+        Assert.Equal(500, result.FallbackSnippet!.Length);
+        Assert.DoesNotContain(BeyondCapMarker, result.FallbackSnippet, StringComparison.Ordinal);
+        Assert.All(result.FallbackSnippet, ch => Assert.Equal('y', ch));
     }
 
     [Fact]
