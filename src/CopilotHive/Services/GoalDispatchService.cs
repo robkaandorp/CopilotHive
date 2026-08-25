@@ -5,6 +5,7 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
+using CopilotHive.Workers;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Services;
@@ -115,6 +116,15 @@ internal sealed class GoalDispatchService
         var activePipelines = _pipelineManager.GetActivePipelines();
         if (activePipelines.Count >= maxParallel)
             return;
+
+        // All-or-nothing readiness gate: if the Brain is absent or any broadcastable
+        // role's model is unconfigured, refuse to consume a goal — it stays Pending and
+        // no pipeline, Brain session, or task is created.
+        if (!IsReadyForDispatch(out var readinessDetail))
+        {
+            _logger.LogWarning("goal not dispatched — {Reason}", readinessDetail);
+            return;
+        }
 
         var goal = await _goalManager.GetNextGoalAsync(ct);
         if (goal is null)
@@ -276,6 +286,34 @@ internal sealed class GoalDispatchService
                 GoalId: pipeline.GoalId));
 
         _pipelineManager.PersistFull(pipeline);
+    }
+
+    /// <summary>
+    /// All-or-nothing readiness check for goal dispatch. Returns <c>false</c> (plus a
+    /// descriptive reason) when the Brain is absent OR any broadcastable role's model is
+    /// unconfigured. When not ready, no goal is consumed: the goal stays Pending and no
+    /// pipeline, Brain session, or task is created.
+    /// </summary>
+    /// <param name="detail">Why dispatch is not ready, or <c>null</c> when ready.</param>
+    private bool IsReadyForDispatch(out string? detail)
+    {
+        if (_brain is null)
+        {
+            detail = "brain not configured (Orchestrator.Model is not set)";
+            return false;
+        }
+
+        foreach (var role in WorkerRoles.BroadcastableRoles)
+        {
+            if (_config?.GetModelForRole(role) is null)
+            {
+                detail = $"model for role '{role.ToRoleName()}' not configured";
+                return false;
+            }
+        }
+
+        detail = null;
+        return true;
     }
 
     /// <summary>

@@ -212,6 +212,7 @@ public sealed class PlanRejectContractTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain: brain,
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         using var cts = new CancellationTokenSource();
@@ -465,6 +466,7 @@ public sealed class PlanRejectContractTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain: brain,
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         using var cts = new CancellationTokenSource();
@@ -518,6 +520,7 @@ public sealed class PlanRejectContractTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain: brain,
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         using var cts = new CancellationTokenSource();
@@ -567,6 +570,7 @@ public sealed class PlanRejectContractTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain: brain,
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         using var cts = new CancellationTokenSource();
@@ -1031,6 +1035,7 @@ public sealed class PlanRejectContractTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             brain: brain,
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(

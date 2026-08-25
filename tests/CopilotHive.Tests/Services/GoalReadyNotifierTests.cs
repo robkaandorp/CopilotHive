@@ -6,6 +6,7 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Tests;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests.Services;
@@ -129,7 +130,11 @@ public sealed class GoalReadyNotifierDispatcherIntegrationTests
     private static HiveConfigFile Config(int maxParallelGoals = 1) =>
         new()
         {
-            Orchestrator = new OrchestratorConfig { MaxParallelGoals = maxParallelGoals },
+            Orchestrator = new OrchestratorConfig
+            {
+                MaxParallelGoals = maxParallelGoals,
+                Model = "brain-model",
+            },
             Repositories =
             [
                 new RepositoryConfig
@@ -139,6 +144,8 @@ public sealed class GoalReadyNotifierDispatcherIntegrationTests
                     DefaultBranch = "main",
                 },
             ],
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
     private static Goal NewGoal(string id, GoalStatus status = GoalStatus.Pending) => new()

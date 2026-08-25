@@ -1,11 +1,40 @@
 namespace CopilotHive.Tests;
 
 using CopilotHive.Configuration;
+using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 
 /// <summary>Shared test utilities.</summary>
 internal static class TestHelpers
 {
+    /// <summary>
+    /// Returns a <see cref="HiveConfigFile.Workers"/> dictionary with a configured model
+    /// for EVERY broadcastable role (Coder, Tester, Reviewer, Improver, DocWriter) plus
+    /// the Brain (Orchestrator.Model). This satisfies the all-or-nothing readiness gate in
+    /// <see cref="CopilotHive.Services.GoalDispatchService"/> so dispatch proceeds as today.
+    /// MergeWorker is deliberately omitted — it is NOT broadcastable and must not block dispatch.
+    /// </summary>
+    internal static Dictionary<string, WorkerConfig> AllBroadcastableRoleModels(string modelPrefix = "test") =>
+        new()
+        {
+            ["coder"] = new WorkerConfig { Model = $"{modelPrefix}-coder-model" },
+            ["tester"] = new WorkerConfig { Model = $"{modelPrefix}-tester-model" },
+            ["reviewer"] = new WorkerConfig { Model = $"{modelPrefix}-reviewer-model" },
+            ["improver"] = new WorkerConfig { Model = $"{modelPrefix}-improver-model" },
+            ["docwriter"] = new WorkerConfig { Model = $"{modelPrefix}-docwriter-model" },
+        };
+
+    /// <summary>
+    /// Returns a <see cref="HiveConfigFile"/> with the Brain model
+    /// (<see cref="OrchestratorConfig.Model"/>) and all broadcastable role models configured,
+    /// so the readiness gate passes and dispatch proceeds as today.
+    /// </summary>
+    internal static HiveConfigFile FullReadyConfig(string modelPrefix = "test") =>
+        new()
+        {
+            Orchestrator = new OrchestratorConfig { Model = $"{modelPrefix}-brain-model" },
+            Workers = AllBroadcastableRoleModels(modelPrefix),
+        };
     /// <summary>
     /// Recursively deletes a directory, clearing read-only attributes first so that
     /// <c>.git</c> pack-files and other locked objects can be removed on Windows.

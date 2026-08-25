@@ -309,9 +309,16 @@ public sealed class GoalDispatcherCancelTests
     [Fact]
     public async Task DispatchNextGoalAsync_SkipsGoalThatAlreadyHasPipeline()
     {
-        // Arrange: pending goal that already has a pipeline. MaxParallelGoals is set high
-        // so the parallelism gate does NOT block, forcing the method to reach the
-        // GetByGoalId guard. Without that guard the goal would be dispatched.
+        // Arrange: a pending goal that already has a pipeline.
+        //
+        // Every gate BEFORE the GetByGoalId duplicate-pipeline guard must be open, otherwise
+        // this test is vacuous (it would pass even with the guard deleted):
+        //   1. Parallelism gate  — MaxParallelGoals = 5 (well above the single active pipeline).
+        //   2. Readiness gate    — a Brain AND a model for EVERY broadcastable role
+        //                          (coder/tester/reviewer/improver/docwriter). Without both,
+        //                          DispatchNextGoalAsync returns before consuming a goal.
+        // Only with all of those open does execution reach GetNextGoalAsync and then the
+        // GetByGoalId guard — the behaviour under test.
         var ct = TestContext.Current.CancellationToken;
         var logger = new RetryStateCollectingLogger<GoalDispatcher>();
         var goal = new Goal
@@ -332,6 +339,8 @@ public sealed class GoalDispatcherCancelTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" }
             ],
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         var pipelineManager = new GoalPipelineManager();
@@ -347,12 +356,29 @@ public sealed class GoalDispatcherCancelTests
             new TaskCompletionNotifier(),
             logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            // A Brain is required by the readiness gate; without one the dispatch would be
+            // refused before the GetByGoalId guard is ever reached.
+            brain: new RetryStateFakeBrain(),
             config: config,
             startupDelay: TimeSpan.Zero);
+
+        var queriesBefore = goalSource.PendingQueryCount;
 
         // Act: call DispatchNextGoalAsync directly — should skip because pipeline already exists.
         await InvokeDispatchNextGoalAsync(dispatcher, ct);
 
+        // ── Proof the run was NOT short-circuited by an earlier gate ──────────────
+        // The readiness gate logs "goal not dispatched — ..." when it refuses. Its absence
+        // proves the Brain/model gate did not block this run.
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("goal not dispatched"));
+        // Goal selection actually ran: the source was queried for pending goals, which only
+        // happens inside GetNextGoalAsync — i.e. execution passed the readiness gate and the
+        // goal was genuinely selected before the GetByGoalId guard rejected it.
+        Assert.True(goalSource.PendingQueryCount > queriesBefore,
+            "GetNextGoalAsync was never reached — an earlier gate short-circuited the dispatch, " +
+            "making this GetByGoalId regression test vacuous.");
+
+        // ── The guard under test ─────────────────────────────────────────────────
         // Assert: no dispatch log (the GetByGoalId guard prevented dispatch).
         Assert.DoesNotContain(logger.Logs, l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
         // Assert: goal still Pending (dispatch did not proceed).
@@ -569,6 +595,7 @@ public sealed class GoalDispatcherClearRetryStateTests
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             // A Brain is required to plan the goal — without one, dispatch fails the goal.
             brain: new RetryStateFakeBrain(),
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         // Act 1: Run the background service so DispatchNextGoalAsync executes and
@@ -627,8 +654,18 @@ internal sealed class CancelFakeGoalSource : IGoalSource, IGoalStore
     public GoalStatus? LastUpdatedStatus { get; private set; }
     public string? LastUpdatedReason { get; private set; }
 
+    /// <summary>
+    /// Number of times <see cref="GetPendingGoalsAsync"/> has been called. Tests use this as
+    /// an observable signal that goal SELECTION actually ran (it is only reached from inside
+    /// <c>GoalManager.GetNextGoalAsync</c>), proving no earlier dispatch gate short-circuited.
+    /// </summary>
+    public int PendingQueryCount => Volatile.Read(ref _pendingQueryCount);
+
+    private int _pendingQueryCount;
+
     public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default)
     {
+        Interlocked.Increment(ref _pendingQueryCount);
         if (_goal.Status == GoalStatus.Pending)
             return Task.FromResult<IReadOnlyList<Goal>>([_goal]);
         return Task.FromResult<IReadOnlyList<Goal>>([]);

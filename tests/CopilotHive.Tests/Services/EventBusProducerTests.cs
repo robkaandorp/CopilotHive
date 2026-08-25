@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 
+using CopilotHive.Tests;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
@@ -590,11 +591,8 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
         var goal = new Goal
         {
@@ -657,11 +655,8 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
         var goal = new Goal
         {
@@ -710,11 +705,8 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
         // Use a distinctive description so we can verify it propagates verbatim.
         var description = "Distinctive goal description for message matching " + Guid.NewGuid().ToString("N")[..8];

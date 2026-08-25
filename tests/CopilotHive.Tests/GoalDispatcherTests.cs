@@ -118,15 +118,8 @@ public sealed class GoalDispatcherReviewVerdictTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/repo.git", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-                ["tester"] = new WorkerConfig { Model = "tester-model" },
-                ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
-                ["docwriter"] = new WorkerConfig { Model = "docwriter-model" },
-                ["improver"] = new WorkerConfig { Model = "improver-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         var notifier = new TaskCompletionNotifier();
@@ -1102,6 +1095,9 @@ public sealed class GoalDispatcherDispatchLoggingTests
             new TaskCompletionNotifier(),
             logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            // A Brain and all broadcastable role models are required to pass the readiness gate.
+            brain: new FakeDispatcherBrain(),
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero);
 
         // Act - run the background service briefly so DispatchNextGoalAsync executes
@@ -1139,6 +1135,7 @@ public sealed class GoalDispatcherDispatchLoggingTests
             // A Brain is required to plan the goal — without one, dispatch fails the goal
             // and emits a second (failure) dashboard notification.
             brain: new FakeDispatcherBrain(),
+            config: TestHelpers.FullReadyConfig(),
             startupDelay: TimeSpan.Zero,
             dashboardNotifier: notifier);
 
@@ -2640,12 +2637,8 @@ public sealed class GoalDispatcherFirstPhaseDispatchTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-                ["docwriter"] = new WorkerConfig { Model = "docwriter-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         taskQueue = new TaskQueue();
@@ -2947,11 +2940,8 @@ public sealed class GoalDispatcherParallelDispatchTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         // Create two goals
@@ -3006,11 +2996,8 @@ public sealed class GoalDispatcherParallelDispatchTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         // Create two goals
@@ -3064,11 +3051,8 @@ public sealed class GoalDispatcherParallelDispatchTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
         var goalId = $"goal-fork-{Guid.NewGuid():N}";
@@ -4173,11 +4157,8 @@ public sealed class GoalDispatcherDiagnosticLoggingTests
             [
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
-            // Slice 3b: worker roles need configured models to dispatch.
-            Workers =
-            {
-                ["coder"] = new WorkerConfig { Model = "coder-model" },
-            },
+            // All broadcastable roles need configured models to pass the readiness gate.
+            Workers = TestHelpers.AllBroadcastableRoleModels(),
         };
 
     // ── Tests ─────────────────────────────────────────────────────────────────
