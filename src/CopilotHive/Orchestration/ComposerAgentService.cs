@@ -14,6 +14,22 @@ using System.Text.Json;
 namespace CopilotHive.Orchestration;
 
 /// <summary>
+/// Immutable normalized entry of the Composer's selectable model catalog: the trimmed model
+/// name plus the context window scalar copied from the config entry. For the null-config seam
+/// <see cref="ContextWindow"/> is always <c>null</c> (explicit rule — the startup catalog has
+/// no context windows).
+/// </summary>
+internal readonly record struct CatalogEntry(string Name, int? ContextWindow);
+
+/// <summary>
+/// Immutable result of validating a model switch candidate against ONE catalog snapshot:
+/// the caller's validated spelling, the caller-supplied reasoning effort, and the context
+/// window resolved from the same snapshot (may be <c>null</c>/non-positive — applying the
+/// conditional update rule is <see cref="ComposerAgentService.ApplyModelScalars"/>'s job).
+/// </summary>
+internal sealed record ValidatedModelSelection(string Model, ReasoningEffort ReasoningEffort, int? ContextWindow);
+
+/// <summary>
 /// Owns the Composer's LLM connection lifecycle: chat clients, the <see cref="CodingAgent"/>,
 /// the persistent <see cref="AgentSession"/>, and the <see cref="AgentOptions"/> used to build them.
 /// </summary>
@@ -182,6 +198,107 @@ internal sealed class ComposerAgentService(
         _hiveConfig is not null
             ? _hiveConfig.GetComposerAvailableModels()
             : _startupAvailableModels;
+
+    /// <summary>
+    /// Captures ONE immutable snapshot of the Composer's selectable catalog: when
+    /// <c>_hiveConfig</c> is non-null the RAW mutable <c>_hiveConfig.Models.AvailableModels</c>
+    /// list is enumerated (reference captured first, then enumerated); when <c>_hiveConfig</c>
+    /// is null the constructor-provided <c>_startupAvailableModels</c> is enumerated. Every
+    /// entry is normalized in the single pass: name trimmed, empty/whitespace names dropped,
+    /// ordinal-ignore-case duplicates collapsed to the FIRST, and the entry's
+    /// <c>ContextWindow</c> scalar copied INTO the immutable <see cref="CatalogEntry"/> (the
+    /// context window is never resolved via a second per-entry lookup afterwards). For the
+    /// null-config seam <see cref="CatalogEntry.ContextWindow"/> is <c>null</c> for every entry
+    /// (explicit rule).
+    /// </summary>
+    private IReadOnlyList<CatalogEntry> CaptureCatalogSnapshot()
+    {
+        if (_hiveConfig is not null)
+        {
+            // Capture the list REFERENCE first, then enumerate — a config reload replaces the
+            // Models instance wholesale, so the reference fixates the list being enumerated.
+            var raw = _hiveConfig.Models?.AvailableModels;
+            if (raw is null)
+                return [];
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var entries = new List<CatalogEntry>(raw.Count);
+            foreach (var entry in raw)
+            {
+                var name = entry?.Name?.Trim();
+                if (string.IsNullOrEmpty(name))
+                    continue;
+                if (seen.Add(name))
+                    entries.Add(new CatalogEntry(name, entry!.ContextWindow));
+            }
+
+            return entries;
+        }
+
+        // Null-config seam: startup catalog, normalized, ContextWindow = null for every entry.
+        var seenStartup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var startupEntries = new List<CatalogEntry>(_startupAvailableModels.Count);
+        foreach (var model in _startupAvailableModels)
+        {
+            var name = model?.Trim();
+            if (string.IsNullOrEmpty(name))
+                continue;
+            if (seenStartup.Add(name))
+                startupEntries.Add(new CatalogEntry(name, null));
+        }
+
+        return startupEntries;
+    }
+
+    /// <summary>
+    /// Validates <paramref name="newModel"/> against ONE catalog snapshot (membership is
+    /// ordinal-ignore-case with NO input trimming — a whitespace-only/blank candidate fails
+    /// membership exactly as today) and resolves the context window from the SAME snapshot.
+    /// Never mutates state. On failure throws <see cref="ArgumentException"/> with the exact
+    /// same type, message, and <see cref="ArgumentException.ParamName"/> as the switch did
+    /// before this refactor.
+    /// </summary>
+    internal ValidatedModelSelection ValidateAvailableModel(string newModel, ReasoningEffort reasoningEffort)
+    {
+        var snapshot = CaptureCatalogSnapshot();
+
+        var entry = snapshot.FirstOrDefault(
+            e => string.Equals(e.Name, newModel, StringComparison.OrdinalIgnoreCase));
+        if (entry.Name is null)
+        {
+            var available = string.Join(", ", snapshot.Select(e => e.Name));
+            throw new ArgumentException(
+                $"Model '{newModel}' is not available. Available models: {available}.",
+                nameof(newModel));
+        }
+
+        return new ValidatedModelSelection(newModel, reasoningEffort, entry.ContextWindow);
+    }
+
+    /// <summary>
+    /// Applies a validated model selection to the service state: assigns the model and the
+    /// reasoning fields from the selection. NON-validating — the caller must have validated.
+    /// The conditional <c>_maxContextTokens</c> update (only when the snapshot context window
+    /// is positive/non-null) and its existing context-window log are preserved exactly.
+    /// </summary>
+    internal void ApplyModelScalars(ValidatedModelSelection selection)
+    {
+        _model = selection.Model;
+
+        // The caller-supplied reasoning effort becomes the configured value — reasoning is
+        // never derived from the model name.
+        _configuredReasoningEffort = selection.ReasoningEffort;
+        _reasoningEffort = _configuredReasoningEffort;
+
+        var modelCtx = selection.ContextWindow;
+        if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
+        {
+            _logger.LogInformation(
+                "Updating Composer context window from {OldContextWindow} to {NewContextWindow} for model '{Model}'",
+                _maxContextTokens, modelCtx.Value, selection.Model);
+            _maxContextTokens = modelCtx.Value;
+        }
+    }
 
     private IChatClient CreateClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
 
@@ -460,8 +577,8 @@ internal sealed class ComposerAgentService(
     /// <exception cref="ArgumentException">Thrown when the model is not available.</exception>
     public async Task SwitchModelAsync(string newModel, ReasoningEffort reasoningEffort, CancellationToken ct = default)
     {
-        if (!AvailableModels.Contains(newModel, StringComparer.OrdinalIgnoreCase))
-            throw new ArgumentException($"Model '{newModel}' is not available. Available models: {string.Join(", ", AvailableModels)}.", nameof(newModel));
+        // Validate BEFORE any teardown — an invalid model throws with no state touched.
+        var selection = ValidateAvailableModel(newModel, reasoningEffort);
 
         ct.ThrowIfCancellationRequested();
 
@@ -472,21 +589,9 @@ internal sealed class ComposerAgentService(
         // Model switch: dispose old agent + clients before creating new ones.
         await DisposeClientsAndClearStateAsync();
 
-        _model = newModel;
-
-        // The caller-supplied reasoning effort becomes the configured value — reasoning is
-        // never derived from the model name.
-        _configuredReasoningEffort = reasoningEffort;
-        _reasoningEffort = _configuredReasoningEffort;
-
-        var modelCtx = _hiveConfig?.TryGetContextWindowForModel(newModel);
-        if (modelCtx.HasValue && modelCtx.Value > 0 && _maxContextTokens != modelCtx.Value)
-        {
-            _logger.LogInformation(
-                "Updating Composer context window from {OldContextWindow} to {NewContextWindow} for model '{Model}'",
-                _maxContextTokens, modelCtx.Value, newModel);
-            _maxContextTokens = modelCtx.Value;
-        }
+        // Apply the validated scalars AFTER teardown — model, reasoning, and the conditional
+        // context-window update (with its existing log) come from the ONE captured snapshot.
+        ApplyModelScalars(selection);
 
         try
         {

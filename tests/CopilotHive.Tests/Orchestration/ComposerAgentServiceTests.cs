@@ -928,6 +928,432 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── 8b. Catalog snapshot: ValidateAvailableModel / ApplyModelScalars (Slice 1A2b-2a) ──
+
+    /// <summary>
+    /// Membership is validated ordinal-ignore-case against ONE snapshot; the returned selection
+    /// carries the caller's validated spelling, the passed-in reasoning effort, and the context
+    /// window resolved from the SAME snapshot.
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_MembershipOrdinalIgnoreCase_CarriesSpellingEffortAndContextWindow()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "gpt-4", ContextWindow = 32768 },
+                        new ModelEntry { Name = "claude-opus" }
+                    ]
+                }
+            };
+
+            var service = CreateService(stateDir, hiveConfig: hiveConfig, model: "gpt-4");
+
+            // Case differs from the catalog spelling — membership is ordinal-ignore-case.
+            var selection = service.ValidateAvailableModel("GPT-4", ReasoningEffort.High);
+
+            Assert.Equal("GPT-4", selection.Model);          // caller's validated spelling
+            Assert.Equal(ReasoningEffort.High, selection.ReasoningEffort);
+            Assert.Equal(32768, selection.ContextWindow);    // from the same snapshot
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// An invalid candidate throws the SAME <see cref="ArgumentException"/> (type, message, and
+    /// <c>ParamName</c>) as the pre-refactor switch.
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_InvalidCandidate_ThrowsSameArgumentException()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                model: "model-a",
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            var ex = Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("unknown-model", ReasoningEffort.Medium));
+
+            Assert.Equal("newModel", ex.ParamName);
+            Assert.Equal(
+                "Model 'unknown-model' is not available. Available models: model-a, model-b.",
+                ex.Message.Replace(" (Parameter 'newModel')", ""));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A whitespace-only/blank candidate fails membership exactly as today — there is NO input
+    /// trimming (that is Slice 3).
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t ")]
+    public void ValidateAvailableModel_BlankOrWhitespaceCandidate_FailsMembership(string candidate)
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                model: "model-a",
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            var ex = Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel(candidate, ReasoningEffort.Medium));
+
+            Assert.Equal("newModel", ex.ParamName);
+            Assert.Contains($"Model '{candidate}' is not available", ex.Message);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ComposerAgentService.ValidateAvailableModel"/> never mutates state — not on
+    /// success, not on failure.
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_DoesNotMutateState()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "model-a", ContextWindow = 32768 },
+                        new ModelEntry { Name = "model-b" }
+                    ]
+                }
+            };
+
+            var service = CreateService(
+                stateDir,
+                hiveConfig: hiveConfig,
+                model: "model-a",
+                maxContextTokens: 64000,
+                configuredReasoningEffort: ReasoningEffort.Low);
+
+            // Success path: no mutation.
+            var selection = service.ValidateAvailableModel("model-b", ReasoningEffort.High);
+            Assert.Equal("model-b", selection.Model);
+            Assert.Equal(64000, service.MaxContextTokens);
+            Assert.Equal("model-a", service.Model);
+            Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+
+            // Failure path: no mutation either.
+            Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("unknown", ReasoningEffort.High));
+            Assert.Equal(64000, service.MaxContextTokens);
+            Assert.Equal("model-a", service.Model);
+            Assert.Equal(ReasoningEffort.Low, service.ReasoningEffort);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// ONE-snapshot stability: the snapshot is captured ONCE during validation; mutating
+    /// <c>HiveConfigFile.Models</c> between <c>ValidateAvailableModel</c> and
+    /// <c>ApplyModelScalars</c> cannot change the applied context window (mutation test, no
+    /// read-counting instrumentation).
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_ThenApplyModelScalars_UsesOriginalSnapshot_ConfigMutatedBetween()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels = [new ModelEntry { Name = "gpt-4", ContextWindow = 32768 }]
+                }
+            };
+
+            var service = CreateService(
+                stateDir,
+                hiveConfig: hiveConfig,
+                model: "gpt-4",
+                maxContextTokens: 64000);
+
+            var selection = service.ValidateAvailableModel("gpt-4", ReasoningEffort.Medium);
+            Assert.Equal(32768, selection.ContextWindow);
+
+            // MUTATE the live config between validation and application: a live re-read would
+            // now resolve 50000 — the applied value must come from the ORIGINAL snapshot.
+            hiveConfig.Models!.AvailableModels![0].ContextWindow = 50000;
+
+            service.ApplyModelScalars(selection);
+
+            Assert.Equal("gpt-4", service.Model);
+            Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+            Assert.Equal(32768, service.MaxContextTokens);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Snapshot normalization: catalog entries with surrounding whitespace normalize to their
+    /// trimmed name WITH the entry's context window; ordinal-ignore-case duplicates collapse to
+    /// the FIRST; empty/whitespace entries are dropped.
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_NormalizesCatalogEntries_TrimsDropsDuplicatesFirstWins()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "  GPT-4  ", ContextWindow = 32768 },
+                        new ModelEntry { Name = "gpt-4", ContextWindow = 99999 },   // duplicate — FIRST wins
+                        new ModelEntry { Name = "   " },                            // whitespace — dropped
+                        new ModelEntry { Name = "" },                               // empty — dropped
+                        new ModelEntry { Name = "claude-opus", ContextWindow = null }
+                    ]
+                }
+            };
+
+            var service = CreateService(stateDir, hiveConfig: hiveConfig, model: "GPT-4");
+
+            // The whitespace-wrapped catalog name resolves to its trimmed form with the FIRST
+            // entry's context window (32768, not the duplicate's 99999).
+            var selection = service.ValidateAvailableModel("gpt-4", ReasoningEffort.Medium);
+            Assert.Equal("gpt-4", selection.Model);
+            Assert.Equal(32768, selection.ContextWindow);
+
+            // An entry with no context window resolves to null.
+            var noCtx = service.ValidateAvailableModel("claude-opus", ReasoningEffort.Medium);
+            Assert.Equal("claude-opus", noCtx.Model);
+            Assert.Null(noCtx.ContextWindow);
+
+            // A candidate carrying whitespace does NOT match the trimmed catalog entry (no
+            // input trimming — that is Slice 3).
+            Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("  gpt-4  ", ReasoningEffort.Medium));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Null-config seam: when <c>_hiveConfig == null</c> the snapshot derives from
+    /// <c>_startupAvailableModels</c>, normalized (trimmed, deduped, blanks dropped), with
+    /// <c>ContextWindow = null</c> for every entry.
+    /// </summary>
+    [Fact]
+    public void ValidateAvailableModel_NullConfig_UsesStartupCatalog_NormalizedNullContextWindow()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                hiveConfig: null,
+                model: "model-a",
+                startupAvailableModels: ["  model-a  ", "MODEL-A", "model-b", "   "]);
+
+            // A non-normalized startup entry normalizes; membership is ordinal-ignore-case.
+            var selection = service.ValidateAvailableModel("model-a", ReasoningEffort.High);
+            Assert.Equal("model-a", selection.Model);
+            Assert.Null(selection.ContextWindow);   // explicit null-config rule
+
+            // The case-variant duplicate was collapsed by the snapshot normalization.
+            var upper = service.ValidateAvailableModel("MODEL-A", ReasoningEffort.High);
+            Assert.Equal("MODEL-A", upper.Model);
+            Assert.Null(upper.ContextWindow);
+
+            // The whitespace-only startup entry is dropped — it is not selectable.
+            Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("   ", ReasoningEffort.High));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// <c>ApplyModelScalars</c> assigns model + reasoning, and updates <c>_maxContextTokens</c>
+    /// only when the snapshot context is positive — emitting the existing context-window log
+    /// with the same condition/values/ordering.
+    /// </summary>
+    [Fact]
+    public void ApplyModelScalars_PositiveContextWindow_UpdatesMaxTokens_EmitsLog()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var logger = new TestLogger<ComposerAgentService>();
+            var service = CreateService(
+                stateDir,
+                model: "old-model",
+                maxContextTokens: 64000,
+                configuredReasoningEffort: ReasoningEffort.Low,
+                logger: logger);
+
+            service.ApplyModelScalars(new ValidatedModelSelection("new-model", ReasoningEffort.Medium, 32768));
+
+            Assert.Equal("new-model", service.Model);
+            Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+            Assert.Equal(ReasoningEffort.Medium, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            Assert.Equal(32768, service.MaxContextTokens);
+
+            var log = Assert.Single(logger.LogEntries);
+            Assert.Equal(LogLevel.Information, log.LogLevel);
+            Assert.Equal(
+                "Updating Composer context window from 64000 to 32768 for model 'new-model'",
+                log.Message);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// <c>ApplyModelScalars</c> keeps the current <c>_maxContextTokens</c> (and emits NO
+    /// context-window log) when the snapshot context is null, non-positive, or equal to the
+    /// current value — the conditional update rule is preserved exactly.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ApplyModelScalars_ContextNullOrNonPositive_KeepsMaxTokens_NoLog(int? contextWindow)
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var logger = new TestLogger<ComposerAgentService>();
+            var service = CreateService(
+                stateDir,
+                model: "old-model",
+                maxContextTokens: 64000,
+                configuredReasoningEffort: ReasoningEffort.Low,
+                logger: logger);
+
+            service.ApplyModelScalars(new ValidatedModelSelection("new-model", ReasoningEffort.Medium, contextWindow));
+
+            Assert.Equal("new-model", service.Model);
+            Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+            Assert.Equal(64000, service.MaxContextTokens);
+            Assert.Empty(logger.LogEntries);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public void ApplyModelScalars_ContextWindowEqualToCurrent_KeepsMaxTokens_NoLog()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var logger = new TestLogger<ComposerAgentService>();
+            var service = CreateService(
+                stateDir,
+                model: "old-model",
+                maxContextTokens: 32768,
+                logger: logger);
+
+            service.ApplyModelScalars(new ValidatedModelSelection("new-model", ReasoningEffort.Medium, 32768));
+
+            Assert.Equal(32768, service.MaxContextTokens);
+            Assert.Empty(logger.LogEntries);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Regression: an invalid candidate still throws BEFORE any teardown — the connected
+    /// client, agent, and session survive a rejected switch untouched (no disposal, no
+    /// scalar mutation).
+    /// </summary>
+    [Fact]
+    public async Task SwitchModelAsync_InvalidModel_ThrowsBeforeAnyTeardown()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var mockClient = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => mockClient.Object,
+                model: "model-a",
+                maxContextTokens: 64000,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            var oldClient = GetField<IChatClient>(service, "_chatClient");
+            var oldAgent = service.Agent;
+            var oldSession = service.Session;
+            Assert.NotNull(oldClient);
+            Assert.NotNull(oldAgent);
+
+            await Assert.ThrowsAsync<ArgumentException>(
+                () => service.SwitchModelAsync("unknown-model", ReasoningEffort.High, TestContext.Current.CancellationToken));
+
+            // No teardown: same client and agent instances, still connected.
+            Assert.Same(oldClient, GetField<IChatClient>(service, "_chatClient"));
+            Assert.Same(oldAgent, service.Agent);
+            Assert.True(service.IsConnected);
+            Assert.Same(oldSession, service.Session);
+
+            // No scalar mutation: model, reasoning, and context window are untouched.
+            Assert.Equal("model-a", service.Model);
+            Assert.Equal(64000, service.MaxContextTokens);
+            Assert.Null(service.ReasoningEffort);
+
+            // The client was never disposed.
+            mockClient.Verify(c => c.Dispose(), Times.Never);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── Exceptional disposal paths ──
 
     [Fact]
