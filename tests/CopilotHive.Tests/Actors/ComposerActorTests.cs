@@ -255,8 +255,16 @@ public sealed class ComposerActorTests
     private sealed class BlockingStreamingClient : IChatClient
     {
         private readonly SemaphoreSlim _releaseSignal = new(0, 1);
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _cancellationObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public bool WasCancelled { get; private set; }
+
+        /// <summary>Completes once the streaming method has been ENTERED and is about to block on the release signal.</summary>
+        internal Task Entered => _entered.Task;
+
+        /// <summary>Completes once the streaming method observed cancellation (before rethrowing).</summary>
+        internal Task CancellationObserved => _cancellationObserved.Task;
 
         public ChatClientMetadata Metadata => new("blocking", null, "blocking-model");
 
@@ -272,6 +280,7 @@ public sealed class ComposerActorTests
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.Yield();
+            _entered.TrySetResult();
             try
             {
                 await _releaseSignal.WaitAsync(cancellationToken);
@@ -279,6 +288,7 @@ public sealed class ComposerActorTests
             catch (OperationCanceledException)
             {
                 WasCancelled = true;
+                _cancellationObserved.TrySetResult();
                 throw;
             }
             yield return new ChatResponseUpdate(ChatRole.Assistant, "done")
@@ -1637,18 +1647,17 @@ public sealed class ComposerActorTests
             actor.Start();
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
-            // Wait until the stream is actually running and blocked.
-            await Task.WhenAny(
-                Task.Run(() =>
-                {
-                    while (!registryStatuses.Contains("streaming", StringComparer.Ordinal))
-                        Thread.Sleep(10);
-                }, TestContext.Current.CancellationToken),
-                Task.Delay(Timeout, TestContext.Current.CancellationToken));
+            // Wait until the streaming method has actually been ENTERED and is blocked on the
+            // release signal — not merely until the "streaming" status callback fired (which
+            // happens BEFORE the streaming task is scheduled).
+            await blockingClient.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.Contains("streaming", registryStatuses);
 
             // Disposal cancels the CTS, awaits the streaming task, and performs terminal cleanup.
             await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // The streaming client observed cancellation and rethrew before disposal completed.
+            await blockingClient.CancellationObserved.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             Assert.True(blockingClient.WasCancelled, "The streaming client must observe cancellation during disposal");
             Assert.False(GetIsStreaming(actor), "Streaming state must be reset after disposal");
