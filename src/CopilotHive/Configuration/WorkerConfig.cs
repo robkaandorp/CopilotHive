@@ -5,7 +5,9 @@ namespace CopilotHive.Configuration;
 /// </summary>
 public sealed class WorkerConfig
 {
-    /// <summary>Model override for this worker role; <c>null</c> means use the global default.</summary>
+    /// <summary>Model override for this worker role; <c>null</c> means unset (no model configured).
+    /// Blank/whitespace values are normalized to <c>null</c> at parse time (see
+    /// <see cref="ConfigRepoManager.ParseConfig"/>).</summary>
     public string? Model { get; set; }
 
     /// <summary>Premium model override for this worker role, selected when the Brain requests the 'premium' tier.</summary>

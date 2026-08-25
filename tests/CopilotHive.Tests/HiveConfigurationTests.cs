@@ -26,30 +26,31 @@ public class HiveConfigurationTests
     }
 
     [Fact]
-    public void GetModelForRole_NoPerRoleConfig_FallsBackToOrchestratorModel()
+    public void GetModelForRole_NoPerRoleConfig_ReturnsNull()
     {
         var config = new HiveConfigFile
         {
             Orchestrator = { Model = "custom-fallback-model" },
         };
 
-        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Coder));
-        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Reviewer));
-        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Tester));
-        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.Improver));
-        Assert.Equal("custom-fallback-model", config.GetModelForRole(WorkerRole.MergeWorker));
+        // No orchestrator fall-through: each role returns its OWN model or null.
+        Assert.Null(config.GetModelForRole(WorkerRole.Coder));
+        Assert.Null(config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Null(config.GetModelForRole(WorkerRole.Tester));
+        Assert.Null(config.GetModelForRole(WorkerRole.Improver));
+        Assert.Null(config.GetModelForRole(WorkerRole.MergeWorker));
     }
 
     [Fact]
-    public void GetModelForRole_NothingConfigured_ReturnsDefaultWorkerModel()
+    public void GetModelForRole_NothingConfigured_ReturnsNull()
     {
         var config = new HiveConfigFile();
 
-        // Orchestrator.Model defaults to Constants.DefaultWorkerModel
-        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Coder));
-        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Reviewer));
-        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.Tester));
-        Assert.Equal(Constants.DefaultWorkerModel, config.GetModelForRole(WorkerRole.DocWriter));
+        // Orchestrator.Model defaults to null; roles have no model either.
+        Assert.Null(config.GetModelForRole(WorkerRole.Coder));
+        Assert.Null(config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Null(config.GetModelForRole(WorkerRole.Tester));
+        Assert.Null(config.GetModelForRole(WorkerRole.DocWriter));
     }
 
     [Fact]
@@ -67,10 +68,41 @@ public class HiveConfigurationTests
 
         Assert.Equal("coder-specific-model", config.GetModelForRole(WorkerRole.Coder));
         Assert.Equal("docwriter-specific-model", config.GetModelForRole(WorkerRole.DocWriter));
-        // Unconfigured roles fall back to Orchestrator.Model
-        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Tester));
-        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Reviewer));
-        Assert.Equal("fallback-model", config.GetModelForRole(WorkerRole.Improver));
+        // Unconfigured roles return null — no orchestrator fall-through.
+        Assert.Null(config.GetModelForRole(WorkerRole.Tester));
+        Assert.Null(config.GetModelForRole(WorkerRole.Reviewer));
+        Assert.Null(config.GetModelForRole(WorkerRole.Improver));
+    }
+
+    [Fact]
+    public void GetModelForRole_BlankOrWhitespaceRoleModel_ReturnsNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "   " },
+                ["tester"] = new WorkerConfig { Model = "" },
+            },
+        };
+
+        Assert.Null(config.GetModelForRole(WorkerRole.Coder));
+        Assert.Null(config.GetModelForRole(WorkerRole.Tester));
+    }
+
+    [Fact]
+    public void GetModelForRole_StringOverload_ReturnsOwnModelOrNull()
+    {
+        var config = new HiveConfigFile
+        {
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+            },
+        };
+
+        Assert.Equal("coder-model", config.GetModelForRole("coder"));
+        Assert.Null(config.GetModelForRole("reviewer"));
     }
 
     [Fact]
@@ -94,7 +126,10 @@ public class HiveConfigurationTests
         const int modelWindow = 120_000;
         var config = new HiveConfigFile
         {
-            Orchestrator = { Model = "test-model" },
+            Workers =
+            {
+                ["tester"] = new WorkerConfig { Model = "test-model" },
+            },
             Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "test-model", ContextWindow = modelWindow }] }
         };
 

@@ -64,6 +64,23 @@ public sealed class HiveConfigFileTests
     }
 
     [Fact]
+    public void OrchestratorConfig_Model_DefaultIsNull()
+    {
+        var config = new OrchestratorConfig();
+
+        Assert.Null(config.Model);
+    }
+
+    [Fact]
+    public void CreateEmptyModelFallback_ModelIsNull()
+    {
+        var config = OrchestratorConfig.CreateEmptyModelFallback();
+
+        Assert.Null(config.Model);
+        Assert.NotEqual(Constants.DefaultWorkerModel, config.Model);
+    }
+
+    [Fact]
     public void Deserialize_OrchestratorSection_BranchCleanupDelayHoursNotSet_DefaultIs48()
     {
         const string yaml = """
@@ -248,7 +265,6 @@ public sealed class HiveConfigFileTests
             Composer = new ComposerConfig
             {
                 Model = "copilot/composer-model",
-                Models = ["copilot/composer-model", "copilot/alt-model"],
                 MaxSteps = 25
             }
         };
@@ -300,9 +316,6 @@ public sealed class HiveConfigFileTests
         // Assert — Composer
         Assert.NotNull(receiver.Composer);
         Assert.Equal("copilot/composer-model", receiver.Composer!.Model);
-        Assert.Equal(2, receiver.Composer.Models!.Count);
-        Assert.Equal("copilot/composer-model", receiver.Composer.Models[0]);
-        Assert.Equal("copilot/alt-model", receiver.Composer.Models[1]);
         Assert.Equal(25, receiver.Composer.MaxSteps);
     }
 
@@ -324,7 +337,6 @@ public sealed class HiveConfigFileTests
             Composer = new ComposerConfig
             {
                 Model = "old-composer",
-                Models = ["old-composer", "old-alt"],
                 MaxSteps = 10
             }
         };
@@ -381,7 +393,6 @@ public sealed class HiveConfigFileTests
             Composer = new ComposerConfig
             {
                 Model = "orig-composer",
-                Models = ["orig-composer", "orig-alt"],
                 MaxSteps = 15
             }
         };
@@ -394,28 +405,28 @@ public sealed class HiveConfigFileTests
         var receiverCoderModel = receiver.Workers["coder"].Model;
         var receiverOrchestratorModel = receiver.Orchestrator.Model;
         var receiverModelsAvailableCount = receiver.Models!.AvailableModels!.Count;
-        var receiverComposerModelsCount = receiver.Composer!.Models!.Count;
+        var receiverComposerModel = receiver.Composer!.Model;
 
         // Act — mutate source in every possible way
         source.Repositories.Add(new RepositoryConfig { Name = "new-repo", Url = "https://github.com/org/new", DefaultBranch = "dev" });
         source.Workers["coder"].Model = "mutated-model";
         source.Orchestrator.Model = "mutated-orchestrator";
         source.Models!.AvailableModels!.Add(new ModelEntry { Name = "new-model-entry", ContextWindow = 99999 });
-        source.Composer!.Models!.Add("mutated-composer-model");
+        source.Composer!.Model = "mutated-composer-model";
 
         // Assert — receiver is NOT affected by any source mutations
         Assert.Equal(receiverRepoCount, receiver.Repositories.Count);
         Assert.Equal(receiverCoderModel, receiver.Workers["coder"].Model);
         Assert.Equal(receiverOrchestratorModel, receiver.Orchestrator.Model);
         Assert.Equal(receiverModelsAvailableCount, receiver.Models!.AvailableModels!.Count);
-        Assert.Equal(receiverComposerModelsCount, receiver.Composer!.Models!.Count);
+        Assert.Equal(receiverComposerModel, receiver.Composer!.Model);
 
         // Also verify the receiver still has the original values
         Assert.Equal("orig-repo", receiver.Repositories[0].Name);
         Assert.Equal("orig-model", receiver.Workers["coder"].Model);
         Assert.Equal("orig-orchestrator", receiver.Orchestrator.Model);
         Assert.Equal("orig-model-entry", receiver.Models.AvailableModels[0].Name);
-        Assert.Equal("orig-composer", receiver.Composer.Models![0]);
+        Assert.Equal("orig-composer", receiver.Composer!.Model);
     }
 
     /// <summary>
@@ -451,7 +462,6 @@ public sealed class HiveConfigFileTests
             Composer = new ComposerConfig
             {
                 Model = "old-composer",
-                Models = ["old-composer"],
                 MaxSteps = 5
             }
         };
@@ -460,7 +470,7 @@ public sealed class HiveConfigFileTests
         var oldRepositories = receiver.Repositories;
         var oldWorkers = receiver.Workers;
         var oldAvailableModels = receiver.Models!.AvailableModels!;
-        var oldComposerModels = receiver.Composer!.Models!;
+        var oldComposerModel = receiver.Composer!.Model;
 
         // Build a new source with different data
         var source = new HiveConfigFile
@@ -498,7 +508,6 @@ public sealed class HiveConfigFileTests
             Composer = new ComposerConfig
             {
                 Model = "new-composer",
-                Models = ["new-composer", "new-alt"],
                 MaxSteps = 20
             }
         };
@@ -521,14 +530,13 @@ public sealed class HiveConfigFileTests
         Assert.Single(oldAvailableModels);
         Assert.Equal("old-model-entry", oldAvailableModels[0].Name);
 
-        Assert.Single(oldComposerModels);
-        Assert.Equal("old-composer", oldComposerModels[0]);
+        Assert.Equal("old-composer", oldComposerModel);
 
         // Assert — receiver now references entirely new collections
         Assert.NotSame(oldRepositories, receiver.Repositories);
         Assert.NotSame(oldWorkers, receiver.Workers);
         Assert.NotSame(oldAvailableModels, receiver.Models!.AvailableModels);
-        Assert.NotSame(oldComposerModels, receiver.Composer!.Models);
+        Assert.NotSame(oldComposerModel, receiver.Composer!.Model);
 
         // Assert — release config is also deep-copied (not the same reference)
         Assert.NotSame(source.Repositories[0].Release, receiver.Repositories[0].Release);
@@ -545,8 +553,7 @@ public sealed class HiveConfigFileTests
         Assert.Equal("new-compaction", receiver.Models.CompactionModel);
         Assert.Single(receiver.Models.AvailableModels!);
         Assert.Equal("new-model-entry", receiver.Models.AvailableModels[0].Name);
-        Assert.Equal(2, receiver.Composer!.Models!.Count);
-        Assert.Equal("new-composer", receiver.Composer.Models[0]);
+        Assert.Equal("new-composer", receiver.Composer!.Model);
     }
 
     // ── ReloadFrom Release deep-copy tests ───────────────────────────────────
@@ -672,8 +679,7 @@ public sealed class HiveConfigFileTests
             Models = null,
             Composer = new ComposerConfig
             {
-                Model = "composer-model",
-                Models = ["composer-model", "alt-model"]
+                Model = "composer-model"
             }
         };
 
@@ -2169,7 +2175,7 @@ public sealed class HiveConfigFileTests
     }
 
     [Fact]
-    public void ValidateReasoningEffort_DoesNotValidateCompactionOrAvailableOrComposerModelsList()
+    public void ValidateReasoningEffort_DoesNotValidateCompactionOrAvailableModelsList()
     {
         var config = ValidReasoningConfig();
         config.Models!.CompactionModel = "compaction-model";
@@ -2178,7 +2184,7 @@ public sealed class HiveConfigFileTests
             new ModelEntry { Name = "available-a", ReasoningEffort = null },
             new ModelEntry { Name = "available-b", ReasoningEffort = "bogus" }
         ];
-        config.Composer!.Models = ["composer-model", "other-model"];
+        config.Composer!.Model = "composer-model";
 
         Assert.Empty(config.ValidateReasoningEffort());
     }

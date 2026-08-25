@@ -171,12 +171,11 @@ public sealed class BrainRegistrationTests : IDisposable
 
     /// <summary>
     /// A parsed config that OMITS <c>orchestrator: model:</c> leaves <see cref="OrchestratorConfig.Model"/>
-    /// at its initializer value (<see cref="Constants.DefaultWorkerModel"/>) — non-blank, so a Brain IS
-    /// still registered on the default worker model. Pinned so Slice 3's parse-time change is isolated.
-    /// BRAIN_MODEL env (set) must NOT seed the model.
+    /// at <c>null</c> (UNCONFIGURED — Slice 3a parse-time normalization), so the Brain is NOT
+    /// registered. BRAIN_MODEL env (set) must NOT seed the model.
     /// </summary>
     [Fact]
-    public async Task ConfigRepo_ModelOmitted_RegistersBrainOnDefaultWorkerModel()
+    public async Task ConfigRepo_ModelOmitted_BrainNotRegistered_GetServiceNull()
     {
         const string yaml = """
             version: "1.0"
@@ -187,11 +186,11 @@ public sealed class BrainRegistrationTests : IDisposable
         await using var factory = await BootWithConfigRepoAsync(yaml);
         var brain = factory.Services.GetService<IDistributedBrain>();
 
-        Assert.NotNull(brain);
-        var stats = brain.GetStats();
-        Assert.NotNull(stats);
-        Assert.Equal(Constants.DefaultWorkerModel, stats.Model);
-        Assert.NotEqual("env-brain-model", stats.Model);
+        Assert.Null(brain);
+
+        var logs = StartupLogs(factory);
+        Assert.Contains(logs, m => m.Contains(BrainDisabledLog, StringComparison.Ordinal));
+        Assert.DoesNotContain(logs, m => m.Contains(BrainEnabledLog, StringComparison.Ordinal));
     }
 
     // ── Brain NOT registered when orchestrator.model is blank/whitespace ──────

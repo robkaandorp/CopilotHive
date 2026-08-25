@@ -13,9 +13,9 @@ namespace CopilotHive.Tests;
 
 /// <summary>
 /// Slice 1A1/2 Program.cs registration tests: a <see cref="HiveConfigFile"/> singleton is ALWAYS
-/// registered (even when <c>--config-repo</c> is empty), the no-repo fallback carries an EMPTY
+/// registered (even when <c>--config-repo</c> is empty), the no-repo fallback carries a NULL
 /// <see cref="OrchestratorConfig.Model"/> (never <see cref="Constants.DefaultWorkerModel"/>), and
-/// the Brain registration is config-driven (Slice 2): with the empty fallback model the Brain is
+/// the Brain registration is config-driven (Slice 2): with the null fallback model the Brain is
 /// NOT registered at all — <c>BRAIN_MODEL</c> no longer gates or seeds it. The Composer stays
 /// resolver-only and registers as a disconnected shell.
 /// </summary>
@@ -69,7 +69,7 @@ public sealed class ConfigRegistrationTests : IDisposable
 
         Assert.NotNull(config);
         Assert.False(config.IsConfigured, "The no-repo fallback must be IsConfigured=false");
-        Assert.Equal(string.Empty, config.Orchestrator.Model);
+        Assert.Null(config.Orchestrator.Model);
         Assert.NotEqual(Constants.DefaultWorkerModel, config.Orchestrator.Model);
     }
 
@@ -245,7 +245,7 @@ public sealed class ConfigRegistrationTests : IDisposable
 
     /// <summary>
     /// Simulates the Program.cs no-repo branch: the fallback <see cref="HiveConfigFile"/>
-    /// (empty Orchestrator.Model) is the SINGLE registered instance. Verifies the else-branch
+    /// (null Orchestrator.Model) is the SINGLE registered instance. Verifies the else-branch
     /// invariant — exactly one registration, IsConfigured=false — using a real DI container.
     /// </summary>
     [Fact]
@@ -264,7 +264,7 @@ public sealed class ConfigRegistrationTests : IDisposable
 
         Assert.Single(configs);
         Assert.False(configs[0].IsConfigured);
-        Assert.Equal(string.Empty, configs[0].Orchestrator.Model);
+        Assert.Null(configs[0].Orchestrator.Model);
     }
 
     /// <summary>

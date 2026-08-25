@@ -332,7 +332,6 @@ public static class ConfigHub
                 return Results.Ok(new
                 {
                     model = (string?)null,
-                    models = Array.Empty<string>(),
                     maxSteps = Constants.DefaultBrainMaxSteps,
                     reasoningEffort = (string?)null,
                     eventNotifications = new
@@ -358,7 +357,6 @@ public static class ConfigHub
             return Results.Ok(new
             {
                 model = config.Composer.Model,
-                models = (IEnumerable<string>?)config.Composer.Models ?? Array.Empty<string>(),
                 maxSteps = config.Composer.MaxSteps,
                 reasoningEffort = config.Composer.ReasoningEffort,
                 eventNotifications = new

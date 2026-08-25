@@ -34,12 +34,13 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Resolves the model to use for a given role.
-    /// Returns the per-role override if configured, otherwise the orchestrator's default model.
+    /// Returns the per-role override if configured, or <c>null</c> when the role has no
+    /// configured model (no orchestrator fall-through, no constant default).
     /// </summary>
-    public string GetModelForRole(string roleName) =>
-        Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrEmpty(wc.Model)
+    public string? GetModelForRole(string roleName) =>
+        Workers.TryGetValue(roleName.ToLowerInvariant(), out var wc) && !string.IsNullOrWhiteSpace(wc.Model)
             ? wc.Model
-            : Orchestrator.Model;
+            : null;
 
     /// <summary>
     /// Resolves the premium model configured for a given role, or <c>null</c> if none is set.
@@ -218,9 +219,8 @@ public sealed class HiveConfigFile
     /// in this config: the orchestrator model, each worker model and premium model, the Composer
     /// model, and every <c>sub_agent_models</c> entry.
     /// <para>
-    /// Not validated: <c>models.compaction_model</c> (summarization only),
-    /// <c>models.available_models</c> entries (transitional legacy field), and
-    /// <c>composer.models</c> (model name references, not assignments).
+    /// Not validated: <c>models.compaction_model</c> (summarization only) and
+    /// <c>models.available_models</c> entries (transitional legacy field).
     /// </para>
     /// </summary>
     /// <returns>All validation errors found; an empty list when the config is valid. Never throws.</returns>
@@ -250,7 +250,9 @@ public sealed class HiveConfigFile
             }
         }
 
-        // orchestrator.model always has a value, so reasoning effort is always required.
+        // orchestrator.reasoning_effort is required whenever orchestrator.model is set.
+        // (Conditional/non-fatal reasoning validation lands in a later slice; here the
+        // orchestrator effort remains unconditionally required.)
         Check(Orchestrator.ReasoningEffort, "orchestrator.reasoning_effort");
 
         foreach (var kv in Workers)
@@ -290,7 +292,7 @@ public sealed class HiveConfigFile
     /// Resolves the model to use for a given role (typed overload).
     /// Delegates to <see cref="GetModelForRole(string)"/> using the role's name.
     /// </summary>
-    public string GetModelForRole(WorkerRole role) => GetModelForRole(role.ToRoleName());
+    public string? GetModelForRole(WorkerRole role) => GetModelForRole(role.ToRoleName());
 
     /// <summary>
     /// Resolves the premium model configured for a given role, or <c>null</c> if none is set (typed overload).
@@ -395,7 +397,6 @@ public sealed class HiveConfigFile
             Composer = new ComposerConfig
             {
                 Model = source.Composer.Model,
-                Models = source.Composer.Models?.ToList(),
                 MaxSteps = source.Composer.MaxSteps,
                 ReasoningEffort = source.Composer.ReasoningEffort,
                 EventNotifications = source.Composer.EventNotifications is null

@@ -13,11 +13,11 @@ public sealed class OrchestratorInfo
     public string? SharpCoderVersion { get; init; }
     /// <summary>Current UTC server time.</summary>
     public DateTime ServerTime { get; init; }
-    /// <summary>Model configured for the Brain.</summary>
+    /// <summary>Model configured for the Brain. Renders "(not configured)" when unset (display-only).</summary>
     public string BrainModel { get; init; } = "";
-    /// <summary>Model configured for the Composer.</summary>
+    /// <summary>Model configured for the Composer. Renders "(not configured)" when unset (display-only).</summary>
     public string ComposerModel { get; init; } = "";
-    /// <summary>Model configured per worker role.</summary>
+    /// <summary>Model configured per worker role. Each role renders "(not configured)" when unset (display-only).</summary>
     public Dictionary<string, string> RoleModels { get; init; } = [];
     /// <summary>Model configured for context compaction summaries, or null if using the main model.</summary>
     public string? CompactionModel { get; init; }

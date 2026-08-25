@@ -264,6 +264,27 @@ public class AvailableModelsEndpointTests : IDisposable
 
     // ── GET /api/config/models — response includes subAgentModels + description ──
 
+    /// <summary>
+    /// An unconfigured orchestrator/composer model is JSON null on the wire (Slice 3a:
+    /// the API preserves null for "unset" — never a default/fallback string).
+    /// </summary>
+    [Fact]
+    public async Task GetModels_UnconfiguredModels_AreJsonNull()
+    {
+        _factory.Config.Orchestrator.Model = null;
+        _factory.Config.Composer = null;
+
+        var response = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        using var doc = await JsonDocument.ParseAsync(
+            await response.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("orchestrator").ValueKind);
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("composer").ValueKind);
+    }
+
     [Fact]
     public async Task GetModels_ResponseIncludesSubAgentModelsField()
     {

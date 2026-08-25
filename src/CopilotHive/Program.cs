@@ -188,10 +188,10 @@ public sealed class Program
             // HiveConfigFile: ALWAYS registered so GetService<HiveConfigFile>() is never null —
             // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>
             // never exposes both a false- and true-provenance instance. When no config repo is
-            // configured, the fallback singleton has an EMPTY Orchestrator.Model (via
+            // configured, the fallback singleton has a NULL Orchestrator.Model (via
             // OrchestratorConfig.CreateEmptyModelFallback) so the Brain is NOT registered (Slice 2:
             // the Brain gate below requires a non-blank orchestrator model) and the Composer
-            // registers as a disconnected shell (resolver-only — the fallback's empty orchestrator
+            // registers as a disconnected shell (resolver-only — the fallback's null orchestrator
             // model yields no Composer default).
             HiveConfigFile hiveConfigFile;
             if (!string.IsNullOrEmpty(configRepoUrl))
@@ -261,10 +261,11 @@ public sealed class Program
                 {
                     var config = sp.GetRequiredService<HiveConfigFile>();
                     // The Brain's model is the parsed config.Orchestrator.Model (effective value —
-                    // the registration gate above guarantees it is non-blank). The context window
+                    // the registration gate above guarantees it is non-blank; the null-forgiving
+                    // operator is a compile-safe assertion of that gate). The context window
                     // comes from the model catalog when the model has one, else the default; max
                     // steps come straight from orchestrator.brain_max_steps (a non-nullable int).
-                    var effectiveModel = config.Orchestrator.Model;
+                    var effectiveModel = config.Orchestrator.Model!;
                     var maxCtx = config.TryGetContextWindowForModel(effectiveModel)
                         ?? Constants.DefaultBrainContextWindow;
                     var maxSteps = config.Orchestrator.BrainMaxSteps;

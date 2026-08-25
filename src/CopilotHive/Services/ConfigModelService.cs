@@ -407,7 +407,11 @@ public sealed class ConfigModelService
 
                 try
                 {
-                    await _brain.UpdateModelAsync(finalModel, finalContextWindow, finalReasoning, ct);
+                    // The Brain is only registered when a model is configured (Slice 2 gate), so
+                    // finalModel is non-blank whenever _brain is non-null; the guard is a
+                    // compile-safe, behavior-preserving assertion of that invariant.
+                    if (!string.IsNullOrWhiteSpace(finalModel))
+                        await _brain.UpdateModelAsync(finalModel, finalContextWindow, finalReasoning, ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)

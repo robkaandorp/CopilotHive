@@ -76,7 +76,7 @@ public class ConfigRepoManagerTests : IDisposable
         Assert.Equal("1.0", config.Version);
         Assert.Empty(config.Repositories);
         Assert.Empty(config.Workers);
-        Assert.Equal("claude-sonnet-4.6", config.Orchestrator.Model);
+        Assert.Null(config.Orchestrator.Model);
         Assert.Equal(10, config.Orchestrator.MaxIterations);
         Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
     }
@@ -106,7 +106,7 @@ public class ConfigRepoManagerTests : IDisposable
 
         Assert.Single(config.Repositories);
         Assert.Equal("main", config.Repositories[0].DefaultBranch);
-        Assert.Equal("claude-sonnet-4.6", config.Orchestrator.Model);
+        Assert.Null(config.Orchestrator.Model);
         Assert.Equal(20, config.Orchestrator.MaxIterations);
         Assert.Equal(3, config.Orchestrator.MaxRetriesPerTask);
     }
@@ -138,6 +138,131 @@ public class ConfigRepoManagerTests : IDisposable
         var config = ConfigRepoManager.ParseConfig(yaml);
 
         Assert.Equal("gpt-5.4", config.Orchestrator.Model);
+    }
+
+    // ── Nullable models + blank→null normalization (Slice 3a) ────────────────
+
+    [Fact]
+    public void ParseConfig_OrchestratorModelOmitted_IsNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              max_iterations: 5
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.Null(config.Orchestrator.Model);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void ParseConfig_OrchestratorBlankModel_NormalizesToNull(string blank)
+    {
+        var yaml = $"""
+            version: "1.0"
+            orchestrator:
+              model: "{blank}"
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.Null(config.Orchestrator.Model);
+    }
+
+    [Fact]
+    public void ParseConfig_WorkerRoleModelOmitted_IsNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            workers:
+              coder:
+                context_window: 100000
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.Null(config.Workers["coder"].Model);
+    }
+
+    [Fact]
+    public void ParseConfig_WorkerRoleBlankModel_NormalizesToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            workers:
+              coder:
+                model: "   "
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.Null(config.Workers["coder"].Model);
+    }
+
+    [Fact]
+    public void ParseConfig_ComposerModelOmitted_IsNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              max_steps: 50
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.NotNull(config.Composer);
+        Assert.Null(config.Composer!.Model);
+    }
+
+    [Fact]
+    public void ParseConfig_ComposerBlankModel_NormalizesToNull()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: ""
+            """;
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.NotNull(config.Composer);
+        Assert.Null(config.Composer!.Model);
+    }
+
+    // ── Retired composer.models key (Slice 3a) ─────────────────────────────────
+
+    [Fact]
+    public void ParseConfig_ComposerModelsKey_ThrowsFatalNamingTheKey()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+              models:
+                - copilot/composer-model
+                - copilot/alt-model
+            """;
+
+        var ex = Assert.Throws<YamlDotNet.Core.YamlException>(() => ConfigRepoManager.ParseConfig(yaml));
+        Assert.Contains("composer.models", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseConfig_ComposerModelsKeyEmptyList_ThrowsFatalNamingTheKey()
+    {
+        const string yaml = """
+            version: "1.0"
+            composer:
+              model: copilot/composer-model
+              models: []
+            """;
+
+        var ex = Assert.Throws<YamlDotNet.Core.YamlException>(() => ConfigRepoManager.ParseConfig(yaml));
+        Assert.Contains("composer.models", ex.Message, StringComparison.Ordinal);
     }
 
     // ── IsRepositoryAllowed ──────────────────────────────────────────────────

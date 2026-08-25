@@ -1423,11 +1423,11 @@ public sealed class DashboardStateServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Verifies that <see cref="OrchestratorInfo.RoleModels"/> falls back to the
-    /// orchestrator model for all five roles when no per-role worker configs exist.
+    /// Verifies that <see cref="OrchestratorInfo.RoleModels"/> renders "(not configured)"
+    /// for all five roles when no per-role worker configs exist (no orchestrator fallback).
     /// </summary>
     [Fact]
-    public void GetOrchestratorInfo_RoleModels_FallbackWhenWorkersNull()
+    public void GetOrchestratorInfo_RoleModels_NotConfiguredWhenWorkersNull()
     {
         var config = new HiveConfigFile
         {
@@ -1442,19 +1442,19 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Equal(5, info.RoleModels.Count);
         foreach (var role in new[] { "coder", "tester", "reviewer", "docwriter", "improver" })
         {
-            Assert.Equal("fallback-model", info.RoleModels[role]);
+            Assert.Equal("(not configured)", info.RoleModels[role]);
         }
     }
 
     /// <summary>
     /// Removal-proof guard test: with <see cref="HiveConfigFile.Workers"/> explicitly
-    /// <c>null</c>, every role model must fall back to the orchestrator model and all
+    /// <c>null</c>, every role model must render "(not configured)" and all
     /// role-keyed dictionaries must be empty. If the <c>_config?.Workers is null</c>
     /// guard were removed, <c>GetModelForRole</c> would throw a
     /// <see cref="NullReferenceException"/> and this test would fail.
     /// </summary>
     [Fact]
-    public void GetOrchestratorInfo_RoleModels_FallbackWhenWorkersExplicitlyNull()
+    public void GetOrchestratorInfo_RoleModels_NotConfiguredWhenWorkersExplicitlyNull()
     {
         var config = new HiveConfigFile
         {
@@ -1469,12 +1469,40 @@ public sealed class DashboardStateServiceTests : IDisposable
         foreach (var role in new[] { "coder", "tester", "reviewer", "docwriter", "improver" })
         {
             Assert.True(info.RoleModels.ContainsKey(role));
-            Assert.Equal("explicit-fallback", info.RoleModels[role]);
+            Assert.Equal("(not configured)", info.RoleModels[role]);
         }
 
         Assert.Empty(info.RoleReasoningEfforts);
         Assert.Empty(info.RolePremiumReasoningEfforts);
         Assert.Empty(info.RolePremiumModels);
+    }
+
+    /// <summary>
+    /// A role with a configured model renders its OWN model; a role without one renders
+    /// "(not configured)" — no orchestrator/constant fallback.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_RoleModels_OwnModelOrNotConfigured()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "orchestrator-model" },
+            Repositories = [],
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+                ["tester"] = new WorkerConfig { Model = "   " },
+            },
+        };
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal("coder-model", info.RoleModels["coder"]);
+        Assert.Equal("(not configured)", info.RoleModels["tester"]);
+        Assert.Equal("(not configured)", info.RoleModels["reviewer"]);
+        Assert.Equal("(not configured)", info.RoleModels["docwriter"]);
+        Assert.Equal("(not configured)", info.RoleModels["improver"]);
     }
 
     /// <summary>
@@ -3370,6 +3398,132 @@ public sealed class DashboardStateServiceTests : IDisposable
 
         Assert.Equal(0, service.GetKnowledgeDocumentCount());
     }
+
+    // ── Brain/Composer model sentinel rendering (Slice 3a) ───────────────────
+
+    /// <summary>
+    /// With no Brain and no Composer, <see cref="OrchestratorInfo.BrainModel"/> and
+    /// <see cref="OrchestratorInfo.ComposerModel"/> render the display-only
+    /// "(not configured)" sentinel.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_NoBrainNoComposer_RendersNotConfigured()
+    {
+        using var service = BuildService(config: null);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal("(not configured)", info.BrainModel);
+        Assert.Equal("(not configured)", info.ComposerModel);
+    }
+
+    /// <summary>
+    /// A Brain whose stats carry a null/whitespace model renders "(not configured)".
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_BrainWhitespaceModel_RendersNotConfigured()
+    {
+        var brain = new SentinelBrain(new BrainStats { Model = "   " });
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, logSink, progressLog,
+            goalStore: _store, brain: brain);
+
+        var info = service.GetOrchestratorInfo();
+        Assert.Equal("(not configured)", info.BrainModel);
+    }
+
+    /// <summary>
+    /// A Brain with a configured model renders that model verbatim.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_BrainConfiguredModel_RendersModel()
+    {
+        var brain = new SentinelBrain(new BrainStats { Model = "copilot/brain-model" });
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, logSink, progressLog,
+            goalStore: _store, brain: brain);
+
+        var info = service.GetOrchestratorInfo();
+        Assert.Equal("copilot/brain-model", info.BrainModel);
+    }
+
+    /// <summary>
+    /// A disconnected Composer shell (no model) renders "(not configured)".
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_ComposerDisconnectedShell_RendersNotConfigured()
+    {
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Moq.Mock<IChatClient>().Object);
+
+        var workerPool = new WorkerPool();
+        var pipelineManager = new GoalPipelineManager();
+        var logSink = new DashboardLogSink();
+        var progressLog = new ProgressLog();
+
+        using var service = new DashboardStateService(
+            workerPool, pipelineManager, logSink, progressLog,
+            goalStore: _store, composer: composer);
+
+        var info = service.GetOrchestratorInfo();
+        Assert.Equal("(not configured)", info.ComposerModel);
+    }
+}
+
+/// <summary>
+/// Minimal <see cref="IDistributedBrain"/> stub whose <see cref="GetStats"/> returns a
+/// fixed <see cref="BrainStats"/> (used to verify dashboard sentinel rendering).
+/// </summary>
+file sealed class SentinelBrain : IDistributedBrain
+{
+    private readonly BrainStats _stats;
+
+    public SentinelBrain(BrainStats stats) => _stats = stats;
+
+    public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task<PlanResult> PlanIterationAsync(GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task<PromptResult> CraftPromptAsync(GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct)
+        => Task.CompletedTask;
+    public Task<BrainResponse> AskQuestionAsync(string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default)
+        => throw new NotSupportedException();
+    public Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct)
+        => Task.CompletedTask;
+    public BrainStats? GetStats() => _stats;
+    public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default)
+        => Task.CompletedTask;
+    public bool GoalSessionExists(string goalId) => false;
+    public Task ResetSessionAsync(CancellationToken ct = default)
+        => Task.CompletedTask;
 }
 
 /// <summary>

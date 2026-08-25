@@ -17,121 +17,6 @@ using System.Net.Http.Json;
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
-/// Tests for multi-model support in Composer configuration.
-/// </summary>
-public sealed class ComposerConfigTests
-{
-    // ── GetAvailableModels ──
-
-    [Fact]
-    public void GetAvailableModels_WithBothModelAndModels_ReturnsMergedList()
-    {
-        var config = new ComposerConfig
-        {
-            Model = "claude-sonnet-4",
-            Models = ["gpt-4", "claude-opus"]
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Equal(3, result.Count);
-        Assert.Equal("claude-sonnet-4", result[0]); // Model is first
-        Assert.Equal("gpt-4", result[1]);
-        Assert.Equal("claude-opus", result[2]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_WithOnlyModel_ReturnsSingleModelList()
-    {
-        var config = new ComposerConfig
-        {
-            Model = "claude-sonnet-4"
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Single(result);
-        Assert.Equal("claude-sonnet-4", result[0]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_WithOnlyModels_ReturnsModelsList()
-    {
-        var config = new ComposerConfig
-        {
-            Models = ["gpt-4", "claude-opus"]
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Equal(2, result.Count);
-        Assert.Equal("gpt-4", result[0]);
-        Assert.Equal("claude-opus", result[1]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_WithNeitherModelNorModels_ReturnsFallback()
-    {
-        var config = new ComposerConfig();
-
-        var result = config.GetAvailableModels("fallback-model");
-
-        Assert.Single(result);
-        Assert.Equal("fallback-model", result[0]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_DeduplicatesCaseInsensitively()
-    {
-        var config = new ComposerConfig
-        {
-            Model = "Claude-Sonnet-4",
-            Models = ["claude-sonnet-4", "CLAUDE-SONNET-4", "gpt-4"]
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Equal(2, result.Count);
-        Assert.Equal("Claude-Sonnet-4", result[0]); // Original casing preserved for first
-        Assert.Equal("gpt-4", result[1]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_SkipsNullOrEmptyInModelsList()
-    {
-        var config = new ComposerConfig
-        {
-            Model = "claude-sonnet-4",
-            Models = ["gpt-4", "", null!, "claude-opus"]
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Equal(3, result.Count);
-        Assert.Equal("claude-sonnet-4", result[0]);
-        Assert.Equal("gpt-4", result[1]);
-        Assert.Equal("claude-opus", result[2]);
-    }
-
-    [Fact]
-    public void GetAvailableModels_ModelAlwaysFirst_WhenPresentInModelsToo()
-    {
-        var config = new ComposerConfig
-        {
-            Model = "primary-model",
-            Models = ["secondary-model", "primary-model", "tertiary-model"]
-        };
-
-        var result = config.GetAvailableModels("fallback");
-
-        Assert.Equal(3, result.Count);
-        Assert.Equal("primary-model", result[0]); // Primary is always first
-        Assert.Equal("secondary-model", result[1]);
-        Assert.Equal("tertiary-model", result[2]);
-    }
-}
-
-/// <summary>
 /// Tests for Composer's multi-model runtime switching.
 /// </summary>
 public sealed class ComposerMultiModelTests : IDisposable
@@ -1239,8 +1124,7 @@ public sealed class ComposerHubTests : IAsyncLifetime
         {
             Composer = new ComposerConfig
             {
-                Model = "composer-primary",
-                Models = ["composer-primary", "composer-secondary"]
+                Model = "composer-primary"
             }
         };
 

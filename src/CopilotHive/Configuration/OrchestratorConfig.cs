@@ -6,11 +6,12 @@ namespace CopilotHive.Configuration;
 public sealed class OrchestratorConfig
 {
     /// <summary>
-    /// Model used by the orchestrator LLM. Defaults to <see cref="Constants.DefaultWorkerModel"/>.
-    /// An empty/blank string means "unset" (used by the no-config-repo fallback — see
-    /// <see cref="CreateEmptyModelFallback"/>); consumers treat blank as "no effective model".
+    /// Model used by the orchestrator LLM. <c>null</c> means "unset" (no model configured);
+    /// blank/whitespace values are normalized to <c>null</c> at parse time (see
+    /// <see cref="ConfigRepoManager.ParseConfig"/>). The no-config-repo fallback also uses
+    /// <c>null</c> (see <see cref="CreateEmptyModelFallback"/>).
     /// </summary>
-    public string Model { get; set; } = Constants.DefaultWorkerModel;
+    public string? Model { get; set; }
     /// <summary>Maximum number of goal iterations before giving up.</summary>
     public int MaxIterations { get; set; } = Constants.DefaultMaxIterations;
     /// <summary>Maximum number of retries per individual task.</summary>
@@ -40,18 +41,18 @@ public sealed class OrchestratorConfig
 
     /// <summary>
     /// Reasoning effort for the orchestrator <see cref="Model"/> (one of:
-    /// none, low, medium, high, extra_high). Always required because
-    /// <see cref="Model"/> always has a value. YAML key: <c>reasoning_effort</c>.
+    /// none, low, medium, high, extra_high). Required when <see cref="Model"/> is set.
+    /// YAML key: <c>reasoning_effort</c>.
     /// </summary>
     public string? ReasoningEffort { get; set; }
 
     /// <summary>
-    /// Creates an orchestrator config with an EMPTY <see cref="Model"/> (empty string,
+    /// Creates an orchestrator config with an UNSET <see cref="Model"/> (<c>null</c>,
     /// never <see cref="Constants.DefaultWorkerModel"/>). This is the fallback used by
     /// <c>Program.cs</c> for the no-config-repo <see cref="HiveConfigFile"/> singleton:
-    /// both the Brain factory and the Composer factory treat an empty/blank model as
+    /// both the Brain factory and the Composer factory treat a null model as
     /// "unset", so the fallback never overrides <c>BRAIN_MODEL</c> for the Brain nor
     /// alters the Composer's model chain.
     /// </summary>
-    public static OrchestratorConfig CreateEmptyModelFallback() => new() { Model = string.Empty };
+    public static OrchestratorConfig CreateEmptyModelFallback() => new() { Model = null };
 }

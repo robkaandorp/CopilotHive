@@ -273,21 +273,23 @@ public sealed class DashboardStateService : IDisposable
     /// <summary>Returns the CopilotHive assembly version string.</summary>
     public string GetVersion() => _version;
 
+    /// <summary>Display-only sentinel rendered for an unconfigured (null/whitespace) model.</summary>
+    private const string NotConfigured = "(not configured)";
+
     /// <summary>Returns orchestrator info including uptime, versions, and model configuration.</summary>
     public OrchestratorInfo GetOrchestratorInfo()
     {
         var uptime = DateTime.UtcNow - _startTime;
         var roles = new[] { "coder", "tester", "reviewer", "docwriter", "improver" };
 
-        // Null-safe role model population: when config or config.Workers is null,
-        // fall back to the orchestrator model (or the default when there is no config).
-        var fallbackModel = _config?.Orchestrator?.Model ?? Constants.DefaultModel;
+        // Role models come from each role's OWN configured model (GetModelForRole returns
+        // string? — no orchestrator/constant fallback). Null/whitespace renders the
+        // display-only "(not configured)" sentinel; the sentinel is never written back.
         var roleModels = new Dictionary<string, string>(roles.Length);
         foreach (var role in roles)
         {
-            roleModels[role] = _config?.Workers is null
-                ? fallbackModel
-                : _config.GetModelForRole(role);
+            var model = _config?.Workers is null ? null : _config.GetModelForRole(role);
+            roleModels[role] = string.IsNullOrWhiteSpace(model) ? NotConfigured : model!;
         }
 
         // Reasoning effort dictionaries (null-safe, lenient parse).
@@ -313,8 +315,8 @@ public sealed class DashboardStateService : IDisposable
             SharpCoderVersion = _sharpCoderVersion,
             ServerTime = DateTime.UtcNow,
             RoleModels = roleModels,
-            BrainModel = _brain?.GetStats()?.Model ?? "(not configured)",
-            ComposerModel = _composer?.GetStats()?.Model ?? "(not configured)",
+            BrainModel = RenderModel(_brain?.GetStats()?.Model),
+            ComposerModel = RenderModel(_composer?.GetStats()?.Model),
             CompactionModel = _config?.Models?.CompactionModel,
             BrainReasoningEffort = ParseLenient(_config?.Orchestrator?.ReasoningEffort),
             ComposerReasoningEffort = ParseLenient(
@@ -326,6 +328,13 @@ public sealed class DashboardStateService : IDisposable
             RolePremiumModels = rolePremiumModels,
         };
     }
+
+    /// <summary>
+    /// Renders a model identifier for display: null/whitespace renders the
+    /// "(not configured)" sentinel (display-only; never written back to the API/config).
+    /// </summary>
+    private static string RenderModel(string? model) =>
+        string.IsNullOrWhiteSpace(model) ? NotConfigured : model;
 
     private static ReasoningEffort? ParseLenient(string? value)
     {

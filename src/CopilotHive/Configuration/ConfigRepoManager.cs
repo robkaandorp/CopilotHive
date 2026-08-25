@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using CopilotHive.Workers;
+using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -134,11 +135,31 @@ public class ConfigRepoManager
     /// Parses a YAML string into a <see cref="HiveConfigFile"/>.
     /// The returned instance is marked <see cref="HiveConfigFile.IsConfigured"/> = <c>true</c>
     /// (it came from an actual config repo file, unlike the no-repo fallback singleton).
+    /// <para>
+    /// Blank/whitespace <c>model:</c> values (orchestrator, worker role, composer default)
+    /// are normalized to <c>null</c> — the canonical "unset" representation. The retired
+    /// <c>composer.models</c> key is a FATAL parse failure naming the key.
+    /// </para>
     /// </summary>
     internal static HiveConfigFile ParseConfig(string yaml)
     {
+        RejectRetiredComposerModels(yaml);
+
         var config = YamlDeserializer.Deserialize<HiveConfigFile>(yaml) ?? new HiveConfigFile();
         config.IsConfigured = true;
+
+        // Blank/whitespace model values normalize to null (UNCONFIGURED) — orchestrator,
+        // worker role, and composer default alike. This is the single normalization point.
+        if (string.IsNullOrWhiteSpace(config.Orchestrator.Model))
+            config.Orchestrator.Model = null;
+        foreach (var wc in config.Workers.Values)
+        {
+            if (wc is not null && string.IsNullOrWhiteSpace(wc.Model))
+                wc.Model = null;
+        }
+        if (config.Composer is not null && string.IsNullOrWhiteSpace(config.Composer.Model))
+            config.Composer.Model = null;
+
         foreach (var repo in config.Repositories)
         {
             if (repo.Release is not null &&
@@ -149,6 +170,37 @@ public class ConfigRepoManager
             }
         }
         return config;
+    }
+
+    /// <summary>
+    /// The <c>composer.models</c> YAML key is retired: its presence is a FATAL parse failure
+    /// naming the key. The deserializer's <c>IgnoreUnmatchedProperties</c> would silently drop
+    /// it, so the retired key is detected explicitly via the raw YAML representation model.
+    /// </summary>
+    private static void RejectRetiredComposerModels(string yaml)
+    {
+        if (string.IsNullOrWhiteSpace(yaml))
+            return;
+
+        using var reader = new StringReader(yaml);
+        var stream = new YamlStream();
+        stream.Load(reader);
+
+        foreach (var document in stream.Documents)
+        {
+            if (document.RootNode is not YamlMappingNode root)
+                continue;
+
+            if (root.Children.TryGetValue(new YamlScalarNode("composer"), out var composerNode)
+                && composerNode is YamlMappingNode composerMap
+                && composerMap.Children.ContainsKey(new YamlScalarNode("models")))
+            {
+                throw new YamlDotNet.Core.YamlException(
+                    "The 'composer.models' key is retired and no longer supported. " +
+                    "Remove 'composer.models' from hive-config.yaml; the global " +
+                    "'models.available_models' list is the sole model catalog.");
+            }
+        }
     }
 
     /// <summary>

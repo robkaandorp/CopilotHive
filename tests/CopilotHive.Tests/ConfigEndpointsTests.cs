@@ -838,7 +838,7 @@ public class ConfigEndpointsTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
         Assert.Equal(JsonValueKind.Null, body.GetProperty("model").ValueKind);
-        Assert.Equal(0, body.GetProperty("models").GetArrayLength());
+        Assert.False(body.TryGetProperty("models", out _), "The retired composer.models field must not be exposed");
         Assert.Equal(50, body.GetProperty("maxSteps").GetInt32());
         Assert.Equal(JsonValueKind.Null, body.GetProperty("reasoningEffort").ValueKind);
         Assert.Equal("passive", body.GetProperty("eventNotifications").GetProperty("mode").GetString());
@@ -988,6 +988,29 @@ public class ConfigEndpointsTests
         var activeEvents = body.GetProperty("eventNotifications").GetProperty("activeEvents")
             .EnumerateArray().Select(e => e.GetString()).ToList();
         Assert.Equal(["goal_completed", "goal_failed", "ci_failed", "issue_raised"], activeEvents);
+    }
+
+    [Fact]
+    public async Task GetComposer_ConfiguredComposer_DoesNotExposeRetiredModelsField()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"copilothive-composer-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        using var baseFactory = new CustomEndpointFactory(tempDir);
+        using var factory = baseFactory.WithWebHostBuilder(builder => { });
+        using var client = factory.CreateClient();
+
+        baseFactory.Config.Composer = new ComposerConfig
+        {
+            Model = "copilot/composer-model",
+            MaxSteps = 50,
+        };
+
+        var response = await client.GetAsync("/api/config/composer", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(TestContext.Current.CancellationToken);
+        Assert.Equal("copilot/composer-model", body.GetProperty("model").GetString());
+        Assert.False(body.TryGetProperty("models", out _), "The retired composer.models field must not be exposed");
     }
 
     [Fact]
