@@ -39,6 +39,14 @@ public sealed class BrainPlanningPromptTests
         return BrainPromptBuilder.BuildPlanningPrompt(pipeline);
     }
 
+    /// <summary>
+    /// Builds the planning prompt with every run of whitespace collapsed to a single space, so
+    /// assertions can match a full guidance sentence that the raw string literal wraps across
+    /// several indented source lines.
+    /// </summary>
+    private static string BuildPromptCollapsed() =>
+        System.Text.RegularExpressions.Regex.Replace(BuildPrompt(), @"\s+", " ");
+
     [Fact]
     public void BuildPlanningPrompt_ContainsR1OccupancyRule()
     {
@@ -331,5 +339,90 @@ public sealed class BrainPlanningPromptTests
         Assert.Contains("coding-2", prompt);
         Assert.Contains("normalized to the base name", prompt);
         Assert.Contains("input parsing", prompt);
+    }
+
+    // ── model_tiers guidance: Merging is a plan phase but NOT a tier key ─────
+
+    /// <summary>
+    /// Regression guard for the model_tiers guidance. This is the ONLY test that fails if the
+    /// "Merging is a plan phase but NOT a tier key" sentence is deleted from the prompt, so
+    /// reverting that guidance can no longer leave the suite green.
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_ModelTiersSectionStatesMergingIsNotTierable()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        // The exact guidance sentence, matched whole so deleting any part of it fails the test.
+        Assert.Contains(
+            "Merging is a plan phase but NOT a tier key: `merging` must NEVER appear in model_tiers.",
+            prompt);
+
+        // The tierable key list is stated as the ONLY keys model_tiers accepts.
+        Assert.Contains(
+            "Tierable keys — the ONLY keys allowed here — are: coding, testing, docwriting, review, improve.",
+            prompt);
+        Assert.Contains(
+            "only coding/testing/docwriting/review/improve may appear in model_tiers.",
+            prompt);
+    }
+
+    /// <summary>
+    /// The model_tiers guidance and R5 must COEXIST: excluding Merging from model_tiers must not
+    /// be read as demoting Merging from its required final-plan-phase status.
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_MergingExcludedFromTiersButStillRequiredFinalPhase()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        // R5 still declares Merging a required, final plan phase.
+        Assert.Contains(
+            "R5 (Merging): exactly one Merging is required, and it must be the final phase of the plan.",
+            prompt);
+
+        // Merging is still an available plan phase name.
+        Assert.Contains("Available phases: coding, testing, docwriting, review, improve, merging", prompt);
+
+        // …and the model_tiers bullet itself tells the Brain to KEEP Merging in `phases`
+        // while removing it from model_tiers — proving the two statements coexist.
+        Assert.Contains(
+            "Keep Merging in `phases` (R5 still requires it as the final phase);",
+            prompt);
+
+        // The tierable-key list must never include merging.
+        Assert.DoesNotContain(
+            "Tierable keys — the ONLY keys allowed here — are: coding, testing, docwriting, review, improve, merging",
+            prompt);
+    }
+
+    /// <summary>
+    /// The Merging-is-not-a-tier-key guidance must live in the model_tiers bullet (not somewhere
+    /// unrelated), and must come after the phase-name rules that govern the `phases` array.
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_MergingTierGuidanceLivesInModelTiersBullet()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        var modelTiersIndex = prompt.IndexOf("- model_tiers: (optional)", StringComparison.Ordinal);
+        var guidanceIndex = prompt.IndexOf(
+            "Merging is a plan phase but NOT a tier key", StringComparison.Ordinal);
+        var premiumIndex = prompt.IndexOf(
+            "Only use premium when previous iterations failed", StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, modelTiersIndex);
+        Assert.NotEqual(-1, guidanceIndex);
+        Assert.NotEqual(-1, premiumIndex);
+
+        // The guidance sits inside the model_tiers bullet body.
+        Assert.True(
+            guidanceIndex > modelTiersIndex && guidanceIndex < premiumIndex,
+            "The Merging-is-not-a-tier-key guidance must appear inside the model_tiers bullet.");
+
+        // Phase-NAME rules (which govern `phases`) explicitly distinguish themselves from
+        // the model_tiers KEY rules.
+        Assert.Contains("Phase-NAME rules (these govern the `phases` array", prompt);
+        Assert.Contains("`model_tiers` KEY rules", prompt);
     }
 }

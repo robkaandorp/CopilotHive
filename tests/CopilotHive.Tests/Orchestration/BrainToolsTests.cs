@@ -570,6 +570,142 @@ public class BrainToolsTests
         Assert.Contains("coding, testing, docwriting, review, improve", result.Error);
     }
 
+    // ── model_tiers key rejection templates ─────────────────────────────────
+
+    [Fact]
+    public void ValidateIterationPlan_ModelTiersMergingAlone_UsesMergingSpecificRejection()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, string> { ["merging"] = "premium" });
+        var result = BrainTools.ValidateIterationPlan(["coding", "testing", "review", "merging"], "{}", "reason", tiers);
+
+        Assert.False(result.Valid);
+        Assert.Contains(
+            "Merging is a valid plan phase but NOT a tierable worker phase — remove 'merging' from "
+            + "model_tiers and keep it in `phases`. Tierable keys are: coding, testing, docwriting, review, improve.",
+            result.Error);
+        // The generic "not tierable worker phases" listing must NOT be used for merging alone.
+        Assert.DoesNotContain("The following model_tiers keys are not tierable worker phases", result.Error);
+    }
+
+    [Theory]
+    [InlineData("merging")]
+    [InlineData("Merging")]
+    [InlineData("MERGING")]
+    [InlineData("merging-2")]
+    public void BuildInvalidTierKeyRejection_MergingAlone_IsMergingSpecific(string key)
+    {
+        var rejection = BrainTools.BuildInvalidTierKeyRejection([key]);
+
+        Assert.Equal(
+            "Merging is a valid plan phase but NOT a tierable worker phase — remove 'merging' from "
+            + "model_tiers and keep it in `phases`. Tierable keys are: coding, testing, docwriting, review, improve.",
+            rejection);
+    }
+
+    [Theory]
+    [InlineData("planning")]
+    [InlineData("done")]
+    [InlineData("GarbageName")]
+    [InlineData("codin")]
+    public void BuildInvalidTierKeyRejection_OtherKeys_UseGenericListing(string key)
+    {
+        var rejection = BrainTools.BuildInvalidTierKeyRejection([key]);
+
+        Assert.Equal(
+            $"The following model_tiers keys are not tierable worker phases: {key}. "
+            + "Tierable keys are: coding, testing, docwriting, review, improve.",
+            rejection);
+        // An unknown key must never be described as a valid plan phase.
+        Assert.DoesNotContain("valid plan phase", rejection);
+    }
+
+    [Fact]
+    public void BuildInvalidTierKeyRejection_MergingMixedWithOtherKeys_UsesGenericListing()
+    {
+        var rejection = BrainTools.BuildInvalidTierKeyRejection(["merging", "planning"]);
+
+        Assert.Equal(
+            "The following model_tiers keys are not tierable worker phases: merging, planning. "
+            + "Tierable keys are: coding, testing, docwriting, review, improve.",
+            rejection);
+        Assert.DoesNotContain("valid plan phase", rejection);
+    }
+
+    [Fact]
+    public void BuildInvalidTierKeyRejection_NoInvalidKeys_ReturnsNull() =>
+        Assert.Null(BrainTools.BuildInvalidTierKeyRejection([]));
+
+    [Fact]
+    public void CarveOutNonTierableKeys_MergingKey_CarvedOutWithRejection()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(
+            new Dictionary<string, string> { ["coding"] = "premium", ["merging"] = "standard" });
+
+        var (rejection, remaining) = BrainTools.CarveOutNonTierableKeys(tiers);
+
+        Assert.NotNull(rejection);
+        Assert.Contains("Merging is a valid plan phase but NOT a tierable worker phase", rejection);
+        Assert.NotNull(remaining);
+
+        // The carved-down tiers keep the tierable keys and still validate structurally.
+        var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(remaining!);
+        Assert.NotNull(parsed);
+        Assert.Equal(new Dictionary<string, string> { ["coding"] = "premium" }, parsed);
+
+        var result = BrainTools.ValidateIterationPlan(["coding", "testing", "review", "merging"], "{}", "reason", remaining);
+        Assert.True(result.Valid);
+    }
+
+    [Fact]
+    public void CarveOutNonTierableKeys_AllKeysTierable_NoRejectionAndTiersUnchanged()
+    {
+        var tiers = System.Text.Json.JsonSerializer.Serialize(
+            new Dictionary<string, string> { ["coding"] = "premium" });
+
+        var (rejection, remaining) = BrainTools.CarveOutNonTierableKeys(tiers);
+
+        Assert.Null(rejection);
+        Assert.Equal(tiers, remaining);
+    }
+
+    [Fact]
+    public void CarveOutNonTierableKeys_NullTiers_ReturnsNulls()
+    {
+        var (rejection, remaining) = BrainTools.CarveOutNonTierableKeys(null);
+
+        Assert.Null(rejection);
+        Assert.Null(remaining);
+    }
+
+    [Fact]
+    public void CarveOutNonTierableKeys_MalformedJson_LeavesStructuralErrorToValidator()
+    {
+        // Malformed JSON is NOT an invalid-key condition: it stays a structural error so
+        // MapPlan's early throw still covers it.
+        var (rejection, remaining) = BrainTools.CarveOutNonTierableKeys("{not json");
+
+        Assert.Null(rejection);
+        Assert.Equal("{not json", remaining);
+
+        var result = BrainTools.ValidateIterationPlan(["coding"], "", "reason", remaining);
+        Assert.False(result.Valid);
+        Assert.Contains("model_tiers must be valid JSON", result.Error);
+    }
+
+    [Fact]
+    public void ValidateIterationPlan_MergingInPhasesAndAbsentFromModelTiers_IsValid()
+    {
+        // Happy path: Merging is a required plan phase and must simply stay out of model_tiers.
+        var tiers = System.Text.Json.JsonSerializer.Serialize(
+            new Dictionary<string, string> { ["coding"] = "premium", ["review"] = "standard" });
+
+        var result = BrainTools.ValidateIterationPlan(
+            ["coding", "testing", "review", "merging"], "{}", "reason", tiers);
+
+        Assert.True(result.Valid);
+        Assert.Null(result.Error);
+    }
+
     [Fact]
     public void ValidateIterationPlan_NullPhases_IsInvalid()
     {

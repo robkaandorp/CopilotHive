@@ -381,7 +381,7 @@ public static class BrainPromptBuilder
 
             R6 (Allowed phases only): only the six phase values listed under "Available phases" may appear. No other phase values are allowed.
 
-            Phase-NAME rules (distinct from the allowed-phase-value rule above): each submitted phase name must be one of coding, testing, docwriting, review, improve, or merging. Occurrence suffixes like `coding-2` are fine and are normalized to the base name before validation. A name that is not one of the six — a typo/unknown word, lifecycle names like `Planning`/`Done`/`Failed`, or a bare numeric token like `"1"` — is REJECTED, not silently ignored, and not treated as an allowed-phase violation. The rejection message is exactly: `Unrecognized phase names: <names>. Valid phases: coding, testing, docwriting, review, improve, merging.` Fix this by replacing the unrecognized name with one of the six valid names and resubmitting.
+            Phase-NAME rules (these govern the `phases` array, and are distinct from both the allowed-phase-value rule above and from the `model_tiers` KEY rules below): each submitted phase name must be one of coding, testing, docwriting, review, improve, or merging. Occurrence suffixes like `coding-2` are fine and are normalized to the base name before validation. A name that is not one of the six — a typo/unknown word, lifecycle names like `Planning`/`Done`/`Failed`, or a bare numeric token like `"1"` — is REJECTED, not silently ignored, and not treated as an allowed-phase violation. The rejection message is exactly: `Unrecognized phase names: <names>. Valid phases: coding, testing, docwriting, review, improve, merging.` Fix this by replacing the unrecognized name with one of the six valid names and resubmitting.
 
             R7 (Ordering-dependency): when the submitted plan contains both Coding and DocWriting, and exactly one of their first occurrences comes after the first Testing, the plan is invalid because that Testing would inspect the not-yet-produced artifact. Preferred fix: put both content phases in a single block before that Testing, e.g. `Coding -> DocWriting -> Testing` if DocWriting is the late type, or `DocWriting -> Coding -> Testing` if Coding is the late type. This rule examines only the FIRST type-vs-Testing interleaving; it is NOT a blanket "never interleave" prohibition.
 
@@ -404,7 +404,11 @@ public static class BrainPromptBuilder
               Multi-round:  {"coding-1": "step 1: revert...", "coding-2": "step 2: restructure...", "review": "..."}
             - reason: why this plan
             - model_tiers: (optional) JSON object to escalate specific phases to premium tier
-              (e.g. {"coding": "premium"}). Valid phases: coding, testing, docwriting, review, improve.
+              (e.g. {"coding": "premium"}). Tierable keys — the ONLY keys allowed here — are:
+              coding, testing, docwriting, review, improve.
+              Merging is a plan phase but NOT a tier key: `merging` must NEVER appear in
+              model_tiers. Keep Merging in `phases` (R5 still requires it as the final phase);
+              only coding/testing/docwriting/review/improve may appear in model_tiers.
               Only use premium when previous iterations failed and you believe the task requires
               stronger reasoning. Omitted phases use the default tier.
 

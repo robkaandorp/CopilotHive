@@ -487,11 +487,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
         : BrainToolCallResult("escalate_to_composer");
 
     /// <summary>Result of a <c>report_iteration_plan</c> tool call.</summary>
+    /// <param name="Phases">The ordered phase names submitted by the Brain.</param>
+    /// <param name="PhaseInstructions">Raw per-phase instructions JSON.</param>
+    /// <param name="Reason">The Brain's reasoning for the plan.</param>
+    /// <param name="ModelTiers">The <c>model_tiers</c> JSON with any non-tierable keys removed.</param>
+    /// <param name="InvalidTierKeyRejection">
+    /// Actionable rejection text when the submitted <c>model_tiers</c> contained keys that are not
+    /// tierable worker phases (e.g. <c>merging</c>). Like unrecognized phase NAMES, this is not a
+    /// hard failure during mapping: it is carried here so <see cref="PlanIterationAsync"/>'s bounded
+    /// replan loop can reject the plan with a reason the Brain can act on. Null when all keys are tierable.
+    /// </param>
     internal sealed record IterationPlanResult(
         string[] Phases,
         string PhaseInstructions,
         string Reason,
-        string? ModelTiers)
+        string? ModelTiers,
+        string? InvalidTierKeyRejection = null)
         : BrainToolCallResult("report_iteration_plan");
 
     /// <summary>Forks the master session for a goal inside the brain actor.</summary>
@@ -642,6 +653,11 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
                             $"Unrecognized phase names: {string.Join(", ", plan.UnrecognizedPhases)}. "
                             + "Valid phases: coding, testing, docwriting, review, improve, merging.");
                     }
+
+                    // Non-tierable model_tiers keys (notably "merging") are rejected here too,
+                    // in-loop, instead of throwing out of plan mapping and escaping the budget.
+                    if (iterationPlanResult.InvalidTierKeyRejection is { } invalidTierKeyRejection)
+                        rejectionReasons.Add(invalidTierKeyRejection);
 
                     var validation = Services.IterationPlanValidator.ValidatePlanStrict(plan);
                     if (!validation.IsValid)
@@ -957,16 +973,22 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
 
         static IterationPlanResult MapPlan(PlanToolResult plan)
         {
-            // Only structural errors (model tiers, missing reason/phases) throw here.
-            // Unrecognized phase NAMES are intentionally NOT rejected at this point: they are
-            // carried through parsing as IterationPlan.UnrecognizedPhases and rejected inside
-            // PlanIterationAsync's bounded replan loop, so the Brain can fix and resubmit.
+            // Non-tierable model_tiers keys (e.g. "merging") are carved out BEFORE structural
+            // validation: they are a Brain-fixable mistake, not a hard failure. The carve-out
+            // yields an actionable rejection carried on the result and rejected inside
+            // PlanIterationAsync's bounded replan loop — exactly like unrecognized phase NAMES,
+            // which are carried through parsing as IterationPlan.UnrecognizedPhases.
+            // Every OTHER structural error (malformed model_tiers JSON, invalid tier values,
+            // missing reason/phases) still throws here.
+            var (tierKeyRejection, remainingTiers) = BrainTools.CarveOutNonTierableKeys(plan.ModelTiers);
+
             var (valid, error) = BrainTools.ValidateIterationPlan(
-                plan.Phases, plan.PhaseInstructions, plan.Reason, plan.ModelTiers);
+                plan.Phases, plan.PhaseInstructions, plan.Reason, remainingTiers);
             if (!valid)
                 throw new InvalidOperationException($"Invalid iteration plan from actor: {error}");
 
-            return new IterationPlanResult(plan.Phases, plan.PhaseInstructions, plan.Reason, plan.ModelTiers);
+            return new IterationPlanResult(
+                plan.Phases, plan.PhaseInstructions, plan.Reason, remainingTiers, tierKeyRejection);
         }
     }
 

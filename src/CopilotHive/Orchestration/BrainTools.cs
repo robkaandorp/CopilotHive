@@ -33,6 +33,79 @@ internal static class BrainTools
         return phase;
     }
 
+    /// <summary>The phases a worker can run, and therefore the only keys allowed in <c>model_tiers</c>.</summary>
+    private static readonly HashSet<string> TierablePhases =
+        new(StringComparer.OrdinalIgnoreCase) { "coding", "testing", "docwriting", "review", "improve" };
+
+    /// <summary>Human-readable, order-stable listing of the tierable keys used in rejection texts.</summary>
+    private const string TierableKeyList = "coding, testing, docwriting, review, improve";
+
+    /// <summary>
+    /// Builds the actionable rejection text for <c>model_tiers</c> keys that are not tierable
+    /// worker phases, or returns <c>null</c> when every key is tierable.
+    /// </summary>
+    /// <remarks>
+    /// <c>merging</c> gets its own message because — unlike a typo or a lifecycle name — it IS a
+    /// valid plan phase, just not a tierable one. Any other key (including a mixed set that also
+    /// contains <c>merging</c>) gets the generic listing, which never claims an unknown key is a
+    /// valid plan phase.
+    /// </remarks>
+    /// <param name="invalidKeys">The non-tierable keys, in submission order.</param>
+    internal static string? BuildInvalidTierKeyRejection(IReadOnlyList<string> invalidKeys)
+    {
+        if (invalidKeys.Count == 0)
+            return null;
+
+        var mergingOnly = invalidKeys.All(k =>
+            string.Equals(StripOccurrenceSuffix(k), "merging", StringComparison.OrdinalIgnoreCase));
+
+        return mergingOnly
+            ? "Merging is a valid plan phase but NOT a tierable worker phase — remove 'merging' from "
+              + $"model_tiers and keep it in `phases`. Tierable keys are: {TierableKeyList}."
+            : $"The following model_tiers keys are not tierable worker phases: {string.Join(", ", invalidKeys)}. "
+              + $"Tierable keys are: {TierableKeyList}.";
+    }
+
+    /// <summary>
+    /// Separates non-tierable <c>model_tiers</c> keys (e.g. <c>merging</c>) from the rest so the
+    /// caller can surface them as a bounded-replan-loop rejection reason instead of a hard failure.
+    /// </summary>
+    /// <param name="modelTiers">The raw <c>model_tiers</c> JSON, or null when omitted.</param>
+    /// <returns>
+    /// <c>Rejection</c> — the actionable rejection text when non-tierable keys are present, else null.
+    /// <c>RemainingTiers</c> — the <c>model_tiers</c> JSON with the non-tierable keys removed, so the
+    /// remaining structural checks (e.g. tier values) still apply. Malformed JSON is returned
+    /// unchanged with no rejection: that is a separate structural error owned by
+    /// <see cref="ValidateIterationPlan"/>.
+    /// </returns>
+    internal static (string? Rejection, string? RemainingTiers) CarveOutNonTierableKeys(string? modelTiers)
+    {
+        if (modelTiers is null)
+            return (null, null);
+
+        Dictionary<string, string>? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(modelTiers, ProtocolJson.Options);
+        }
+        catch (JsonException)
+        {
+            return (null, modelTiers);
+        }
+
+        if (parsed is null)
+            return (null, modelTiers);
+
+        var invalidKeys = parsed.Keys.Where(k => !TierablePhases.Contains(StripOccurrenceSuffix(k))).ToList();
+        if (invalidKeys.Count == 0)
+            return (null, modelTiers);
+
+        var remaining = parsed.Where(kv => !invalidKeys.Contains(kv.Key))
+            .ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        return (BuildInvalidTierKeyRejection(invalidKeys), JsonSerializer.Serialize(remaining, ProtocolJson.Options));
+    }
+
     /// <summary>
     /// Validates the structural parts of an iteration plan reported by the Brain LLM
     /// (non-empty phases array, reason and optional model tiers).
@@ -45,8 +118,6 @@ internal static class BrainTools
     internal static (bool Valid, string? Error) ValidateIterationPlan(
         string[] phases, string phaseInstructions, string reason, string? modelTiers)
     {
-        var tierablePhases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "coding", "testing", "docwriting", "review", "improve" };
         var validTiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "standard", "premium" };
 
@@ -66,9 +137,9 @@ internal static class BrainTools
 
             if (parsedTiers is not null)
             {
-                var invalidTierPhases = parsedTiers.Keys.Where(k => !tierablePhases.Contains(StripOccurrenceSuffix(k))).ToList();
-                if (invalidTierPhases.Count > 0)
-                    tierErrors.Add($"invalid phase names in model_tiers: {string.Join(", ", invalidTierPhases)}. Valid: {string.Join(", ", tierablePhases)}");
+                var invalidTierPhases = parsedTiers.Keys.Where(k => !TierablePhases.Contains(StripOccurrenceSuffix(k))).ToList();
+                if (BuildInvalidTierKeyRejection(invalidTierPhases) is { } tierKeyRejection)
+                    tierErrors.Add(tierKeyRejection);
 
                 var invalidTierValues = parsedTiers.Values.Where(v => !validTiers.Contains(v)).ToList();
                 if (invalidTierValues.Count > 0)

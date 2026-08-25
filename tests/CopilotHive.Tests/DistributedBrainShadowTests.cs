@@ -7,6 +7,7 @@ using CopilotHive.Goals;
 using CopilotHive.Git;
 using CopilotHive.Orchestration;
 using CopilotHive.Services;
+using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -172,6 +173,73 @@ public class DistributedBrainShadowTests
                         ["phase_instructions"] = "{}",
                         ["reason"] = "sequenced plan",
                         ["model_tiers"] = null,
+                    });
+                return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
+                {
+                    FinishReason = ChatFinishReason.ToolCalls,
+                });
+            }
+
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, "Plan reported."))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            });
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Chat client that reports a sequence of iteration plans WITH per-attempt <c>model_tiers</c>
+    /// payloads, so model_tiers rejection/replan behaviour can be exercised end-to-end.
+    /// Every attempt uses two calls: the first returns the <c>report_iteration_plan</c> tool call,
+    /// the second returns plain text so the agent loop terminates.
+    /// </summary>
+    private sealed class TieredPlanStubClient : IChatClient
+    {
+        private readonly (string[] Phases, string? ModelTiers)[] _planSequence;
+        private int _callCount;
+
+        internal TieredPlanStubClient(params (string[] Phases, string? ModelTiers)[] planSequence)
+            => _planSequence = planSequence;
+
+        /// <summary>Number of <c>report_iteration_plan</c> tool calls emitted (one per planning attempt).</summary>
+        internal int ToolCallCount { get; private set; }
+
+        /// <summary>Every distinct user message text seen by this client, in order.</summary>
+        internal List<string> ObservedUserPrompts { get; } = [];
+
+        public ChatClientMetadata Metadata => new("tiered-plan", null, "stub-model");
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken ct = default)
+        {
+            foreach (var message in messages.Where(m => m.Role == ChatRole.User))
+            {
+                var text = message.Text;
+                if (!string.IsNullOrEmpty(text) && !ObservedUserPrompts.Contains(text))
+                    ObservedUserPrompts.Add(text);
+            }
+
+            var call = Interlocked.Increment(ref _callCount);
+            if (call % 2 == 1)
+            {
+                var index = Math.Min((call - 1) / 2, _planSequence.Length - 1);
+                var (phases, modelTiers) = _planSequence[index];
+                ToolCallCount++;
+                var toolCallContent = new FunctionCallContent(
+                    $"tiered-plan-call-{ToolCallCount}", "report_iteration_plan", new Dictionary<string, object?>
+                    {
+                        ["phases"] = phases,
+                        ["phase_instructions"] = "{}",
+                        ["reason"] = "tiered plan",
+                        ["model_tiers"] = modelTiers,
                     });
                 return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [toolCallContent]))
                 {
@@ -2309,6 +2377,174 @@ public class DistributedBrainShadowTests
                 var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
                 Assert.NotNull(nudge);
                 Assert.Contains(lifecyclePhase, nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ── model_tiers keys are rejected in-loop, never as a hard failure ──────
+
+    /// <summary>
+    /// A `merging` key in model_tiers does NOT throw out of the actor mapping — it is rejected
+    /// inside <c>PlanIterationAsync</c>'s bounded loop with the merging-specific actionable reason,
+    /// and the corrected resubmission (Merging in `phases`, absent from model_tiers) is accepted.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_MergingInModelTiers_RejectedInLoopThenCorrectedPlanAccepted()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            TieredPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new TieredPlanStubClient(
+                    // Structurally valid plan, but model_tiers carries the non-tierable "merging" key.
+                    (["coding", "testing", "review", "merging"], """{"coding":"premium","merging":"premium"}"""),
+                    // Corrected: Merging stays in phases and is gone from model_tiers.
+                    (["coding", "testing", "review", "merging"], """{"coding":"premium"}""")));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-tier-merging-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-tier-merging-1"), null, TestContext.Current.CancellationToken);
+
+                // No early throw, no hard failure: the corrected plan was accepted in-budget.
+                Assert.False(result.IsFailed);
+                Assert.False(result.IsEscalation);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+                Assert.Equal(ModelTier.Premium, result.Plan.PhaseTiers[GoalPhase.Coding]);
+                Assert.DoesNotContain(GoalPhase.Merging, result.Plan.PhaseTiers.Keys);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                // The nudge carried the merging-specific rejection back to the Brain.
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains(
+                    "Merging is a valid plan phase but NOT a tierable worker phase", nudge!);
+                Assert.Contains("Tierable keys are: coding, testing, docwriting, review, improve.", nudge!);
+                Assert.Contains("Submit a corrected plan by calling the report_iteration_plan tool now.", nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// When the Brain keeps putting `merging` in model_tiers, planning only hard-fails after the
+    /// bounded attempt budget — and the failure reason still carries the actionable rejection.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_AlwaysMergingInModelTiers_FailsOnlyAfterBudgetExhausted()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            TieredPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new TieredPlanStubClient(
+                    (["coding", "testing", "review", "merging"], """{"merging":"premium"}""")));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-tier-merging-2", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-tier-merging-2"), null, TestContext.Current.CancellationToken);
+
+                Assert.True(result.IsFailed);
+                Assert.Null(result.Plan);
+                Assert.StartsWith(
+                    "Brain failed to produce a valid iteration plan after 3 attempts. Last rejection: ",
+                    result.FailureReason);
+                Assert.Contains(
+                    "Merging is a valid plan phase but NOT a tierable worker phase", result.FailureReason);
+
+                // Bounded at 3 attempts — no unbounded retry storm.
+                Assert.NotNull(stub);
+                Assert.Equal(3, stub!.ToolCallCount);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// An unknown model_tiers key (not a phase name at all) is rejected in-loop too, using the
+    /// generic listing that never claims the key is a valid plan phase.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_UnknownModelTiersKey_RejectedInLoopWithGenericListing()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            TieredPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new TieredPlanStubClient(
+                    (["coding", "testing", "review", "merging"], """{"planning":"premium"}"""),
+                    (["coding", "testing", "review", "merging"], """{"coding":"premium"}""")));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-tier-unknown-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-tier-unknown-1"), null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsFailed);
+                Assert.NotNull(result.Plan);
+
+                Assert.NotNull(stub);
+                Assert.Equal(2, stub!.ToolCallCount);
+
+                var nudge = stub.ObservedUserPrompts.FirstOrDefault(p => p.Contains("rejected because"));
+                Assert.NotNull(nudge);
+                Assert.Contains(
+                    "The following model_tiers keys are not tierable worker phases: planning.", nudge!);
+                Assert.DoesNotContain("valid plan phase", nudge!);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// Happy path is unchanged: Merging in `phases` and absent from model_tiers validates on the
+    /// first attempt with no rejection nudge.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_MergingOnlyInPhases_AcceptedOnFirstAttempt()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            TieredPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new TieredPlanStubClient(
+                    (["coding", "testing", "review", "merging"], """{"coding":"premium","review":"standard"}""")));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-tier-happy-1", TestContext.Current.CancellationToken);
+
+                var result = await brain.PlanIterationAsync(
+                    CreatePipeline("goal-tier-happy-1"), null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsFailed);
+                Assert.NotNull(result.Plan);
+                Assert.Equal(
+                    [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+                    result.Plan!.Phases);
+                Assert.Equal(ModelTier.Premium, result.Plan.PhaseTiers[GoalPhase.Coding]);
+                Assert.Equal(ModelTier.Standard, result.Plan.PhaseTiers[GoalPhase.Review]);
+
+                Assert.NotNull(stub);
+                Assert.Equal(1, stub!.ToolCallCount);
+                Assert.DoesNotContain(stub.ObservedUserPrompts, p => p.Contains("rejected because"));
             }
         }
         finally { DeleteDir(dir); }
