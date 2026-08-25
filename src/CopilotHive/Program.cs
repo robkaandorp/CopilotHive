@@ -676,17 +676,18 @@ public sealed class Program
 
                 // Startup-only validation: every model assignment must carry an explicit,
                 // valid reasoning effort. Dynamic reloads (DispatcherMaintenance.ReloadFrom)
-                // intentionally do not re-validate.
+                // intentionally do not re-validate. Reasoning validation is NON-FATAL: errors
+                // are logged for the operator (and the Models tab) to fix, and startup always
+                // continues — an unconfigured reasoning effort must never abort the app.
                 var reasoningErrors = hiveConfigFile.ValidateReasoningEffort();
                 if (reasoningErrors.Count > 0)
                 {
                     foreach (var error in reasoningErrors)
-                        await Console.Error.WriteLineAsync($"Config validation error — {error}");
+                        logger.LogError("Config validation error — {Error}", error);
 
-                    throw new InvalidOperationException(
-                        "Invalid hive configuration: reasoning effort validation failed:"
-                        + Environment.NewLine
-                        + string.Join(Environment.NewLine, reasoningErrors));
+                    logger.LogWarning(
+                        "Reasoning-effort validation found {ErrorCount} problem(s); continuing startup. Fix them in hive-config.yaml (or via the Models tab).",
+                        reasoningErrors.Count);
                 }
 
                 // Startup sweep: remove stale progress/review knowledge documents whose

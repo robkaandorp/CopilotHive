@@ -250,10 +250,11 @@ public sealed class HiveConfigFile
             }
         }
 
-        // orchestrator.reasoning_effort is required whenever orchestrator.model is set.
-        // (Conditional/non-fatal reasoning validation lands in a later slice; here the
-        // orchestrator effort remains unconditionally required.)
-        Check(Orchestrator.ReasoningEffort, "orchestrator.reasoning_effort");
+        // orchestrator.reasoning_effort is required ONLY when orchestrator.model is set.
+        // An unset orchestrator model (null after Slice 3a's blank→null normalization) is
+        // its own unconfigured state — not a reasoning error.
+        if (IsSet(Orchestrator.Model))
+            Check(Orchestrator.ReasoningEffort, "orchestrator.reasoning_effort");
 
         foreach (var kv in Workers)
         {

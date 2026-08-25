@@ -2059,7 +2059,7 @@ public sealed class HiveConfigFileTests
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { ReasoningEffort = level }
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = level }
         };
 
         Assert.Empty(config.ValidateReasoningEffort());
@@ -2075,7 +2075,7 @@ public sealed class HiveConfigFileTests
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { ReasoningEffort = value }
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = value }
         };
 
         var errors = config.ValidateReasoningEffort();
@@ -2084,12 +2084,31 @@ public sealed class HiveConfigFileTests
         Assert.Contains("orchestrator", error, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// An UNSET orchestrator model (null/blank — Slice 3a normalizes blank to null at parse
+    /// time) is its own unconfigured state: NO orchestrator reasoning error is produced, even
+    /// when reasoning_effort is also missing.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ValidateReasoningEffort_OrchestratorModelUnset_NoReasoningRequired(string? model)
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = model, ReasoningEffort = null }
+        };
+
+        Assert.Empty(config.ValidateReasoningEffort());
+    }
+
     [Fact]
     public void ValidateReasoningEffort_InvalidLevel_ReturnsError()
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { ReasoningEffort = "ultra" }
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = "ultra" }
         };
 
         var error = Assert.Single(config.ValidateReasoningEffort());
@@ -2194,7 +2213,7 @@ public sealed class HiveConfigFileTests
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { ReasoningEffort = null },
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = null },
             Workers =
             {
                 ["coder"] = new WorkerConfig { Model = "m", PremiumModel = "pm" }
@@ -2275,15 +2294,17 @@ public sealed class HiveConfigFileTests
     }
 
     /// <summary>
-    /// Orchestrator/role reasoning requirements are UNCHANGED: orchestrator.reasoning_effort is
-    /// still unconditionally required, and per-role model assignments still require their effort.
+    /// Orchestrator/role reasoning requirements: orchestrator.reasoning_effort is required
+    /// when orchestrator.model is SET, and per-role model assignments still require their
+    /// effort. (An unset orchestrator model produces NO orchestrator reasoning error — see
+    /// <see cref="ValidateReasoningEffort_OrchestratorModelUnset_NoReasoningRequired"/>.)
     /// </summary>
     [Fact]
     public void ValidateReasoningEffort_OrchestratorAndRoleRequirements_Unchanged()
     {
         var config = new HiveConfigFile
         {
-            Orchestrator = new OrchestratorConfig { ReasoningEffort = null },
+            Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = null },
             Workers =
             {
                 ["coder"] = new WorkerConfig { Model = "coder-model" }

@@ -224,6 +224,75 @@ public sealed class BrainRegistrationTests : IDisposable
         Assert.DoesNotContain(logs, m => m.Contains("BRAIN_MODEL", StringComparison.Ordinal));
     }
 
+    // ── Reasoning validation is NON-FATAL at startup (Slice 3c) ─────────────
+
+    /// <summary>
+    /// A config repo whose hive-config.yaml has reasoning-effort validation problems
+    /// (orchestrator model set without reasoning_effort, worker model set without
+    /// reasoning_effort) must NOT abort startup: the app starts, the errors are logged,
+    /// and <see cref="HiveConfigFile.ValidateReasoningEffort"/> still returns them.
+    /// </summary>
+    [Fact]
+    public async Task ConfigRepo_ReasoningInvalid_StartupContinues_ErrorsLogged()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-brain
+            workers:
+              coder:
+                model: copilot/coder-model
+            """;
+
+        await using var factory = await BootWithConfigRepoAsync(yaml);
+
+        // The app started: core singletons resolve (no startup abort).
+        Assert.NotNull(factory.Services.GetService<GoalDispatcher>());
+
+        // The validation method still returns the errors.
+        var config = factory.Services.GetRequiredService<HiveConfigFile>();
+        var errors = config.ValidateReasoningEffort();
+        Assert.Equal(2, errors.Count);
+        Assert.Contains(errors, e => e.Contains("orchestrator", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(errors, e => e.Contains("workers.coder", StringComparison.Ordinal));
+
+        // The errors are logged for the operator (and the Models tab) to fix.
+        var logs = StartupLogs(factory);
+        Assert.Contains(logs, m => m.Contains("Config validation error —", StringComparison.Ordinal));
+        Assert.Contains(logs, m => m.Contains("orchestrator.reasoning_effort", StringComparison.Ordinal));
+        Assert.Contains(logs, m => m.Contains("workers.coder.reasoning_effort", StringComparison.Ordinal));
+        Assert.Contains(logs, m => m.Contains(
+            "Reasoning-effort validation found 2 problem(s); continuing startup", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Stronger non-fatal proof: the host actually serves HTTP requests even when
+    /// reasoning-effort validation fails. The <c>/health</c> endpoint returns 200 OK,
+    /// proving the full ASP.NET pipeline (middleware + endpoint routing) started —
+    /// not just DI service resolution.
+    /// </summary>
+    [Fact]
+    public async Task ConfigRepo_ReasoningInvalid_HostServesHttpRequests()
+    {
+        const string yaml = """
+            version: "1.0"
+            orchestrator:
+              model: copilot/test-brain
+            workers:
+              coder:
+                model: copilot/coder-model
+            """;
+
+        await using var factory = await BootWithConfigRepoAsync(yaml);
+        using var client = factory.CreateClient();
+
+        // If startup had thrown (the old fatal behavior), CreateClient/GetAsync would
+        // propagate the InvalidOperationException. A 200 OK proves the host fully started.
+        var response = await client.GetAsync("/health", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+    }
+
     // ── Registration seam: startup connect uses the registered Brain ───────────
 
     /// <summary>

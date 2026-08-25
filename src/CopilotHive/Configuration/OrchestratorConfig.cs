@@ -41,8 +41,9 @@ public sealed class OrchestratorConfig
 
     /// <summary>
     /// Reasoning effort for the orchestrator <see cref="Model"/> (one of:
-    /// none, low, medium, high, extra_high). Required when <see cref="Model"/> is set.
-    /// YAML key: <c>reasoning_effort</c>.
+    /// none, low, medium, high, extra_high). Required only when <see cref="Model"/>
+    /// is set (non-null); an unset model is its own unconfigured state and does not
+    /// require a reasoning effort. YAML key: <c>reasoning_effort</c>.
     /// </summary>
     public string? ReasoningEffort { get; set; }
 
