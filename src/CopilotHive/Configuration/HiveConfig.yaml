@@ -28,6 +28,9 @@ workers:
   improver:
     model: claude-sonnet-4.6
     reasoning_effort: medium
+  docwriter:
+    model: claude-haiku-4.5
+    reasoning_effort: low
 
 # Orchestrator settings
 orchestrator:
