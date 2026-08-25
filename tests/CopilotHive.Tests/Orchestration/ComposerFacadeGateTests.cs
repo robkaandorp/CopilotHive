@@ -247,10 +247,88 @@ public sealed class ComposerFacadeGateTests
         }
     }
 
-    // ── 4. SwitchModelAsync "while streaming" facade-level rejection ──
+    // ── 4. SwitchModelAsync "while streaming" rejection — actor-side, BEFORE validation ──
 
+    /// <summary>
+    /// The facade no longer pre-checks streaming for selections: the actor is the SOLE
+    /// authority, and its guard runs BEFORE any validation.
+    /// <para>
+    /// Removal-proof by construction: the requested model is DELIBERATELY ABSENT from the
+    /// catalog. An implementation that validated first (or moved the streaming guard after
+    /// validation) would surface the <see cref="ArgumentException"/> "Model '…' is not
+    /// available" instead of the streaming <see cref="InvalidOperationException"/>. Asserting
+    /// the exact exception TYPE and message therefore uniquely proves validation was never
+    /// reached. The previous version submitted a VALID model, so validate-then-reject produced
+    /// the identical outcome and the test could not fail.
+    /// </para>
+    /// <para>
+    /// Determinism: the stream start is observed through a TCS gate driven by the facade's own
+    /// <c>OnStreamingUpdate</c> event (fired by the actor's <c>_onStreamingStarted</c> callback
+    /// inside <c>StartStream</c>), not by polling with delays.
+    /// </para>
+    /// </summary>
     [Fact]
-    public async Task SwitchModelAsync_WhileStreaming_FacadeRejects()
+    public async Task SwitchModelAsync_WhileStreaming_ActorRejectsBeforeValidation_UnavailableModelStillReportsStreamingError()
+    {
+        var tmpDir = CreateTempDir();
+        Composer? composer = null;
+        CopilotHiveDbContext? dbContext = null;
+        var blockingClient = new BlockingStreamingClient();
+        try
+        {
+            (composer, dbContext) = CreateComposer(tmpDir);
+            await InjectFakeChatClient(composer, blockingClient);
+
+            // Deterministic gate: OnStreamingUpdate fires from the actor's _onStreamingStarted
+            // callback inside StartStream, i.e. once _isStreaming is already true.
+            var streamingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var localComposer = composer;
+            composer.OnStreamingUpdate += () =>
+            {
+                if (localComposer.IsStreaming) streamingStarted.TrySetResult();
+            };
+
+            composer.SendMessage("first");
+            await streamingStarted.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.True(composer.IsStreaming, "First send should have started streaming");
+
+            // THE SELECTION: an UNAVAILABLE model. Validation-first would throw
+            // ArgumentException; the actor's streaming guard must win.
+            const string unavailableModel = "totally-unavailable-model";
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => composer.SwitchModelAsync(unavailableModel, ReasoningEffort.High, TestContext.Current.CancellationToken));
+
+            // Exact identity: the STREAMING error, never a validation error.
+            Assert.Equal("Cannot switch model while streaming.", ex.Message);
+            Assert.DoesNotContain("is not available", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(unavailableModel, ex.Message, StringComparison.Ordinal);
+
+            // No mutation happened: the model is unchanged.
+            Assert.Equal("test-model", composer.GetStats()?.Model);
+
+            // Cleanup: cancel the blocked stream. The single release happens in the finally —
+            // this client's semaphore has a maximum count of 1, so releasing twice throws.
+            composer.CancelStreaming();
+        }
+        finally
+        {
+            // Release at most once (max count 1); ignore if the stream already consumed it.
+            try { blockingClient.Release(); }
+            catch (SemaphoreFullException) { }
+            catch (ObjectDisposedException) { }
+            await CleanupAsync(composer, dbContext, tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Control test proving the assertion above is NOT vacuous: with the Composer IDLE, the very
+    /// same unavailable model DOES surface the validation <see cref="ArgumentException"/>. Without
+    /// this control, "a streaming error was returned" could be explained by the model never being
+    /// validated on any path.
+    /// </summary>
+    [Fact]
+    public async Task SwitchModelAsync_WhenIdle_UnavailableModel_ThrowsValidationError_ControlForStreamingGuard()
     {
         var tmpDir = CreateTempDir();
         Composer? composer = null;
@@ -258,19 +336,16 @@ public sealed class ComposerFacadeGateTests
         try
         {
             (composer, dbContext) = CreateComposer(tmpDir);
+            await InjectFakeChatClient(composer, CreateNoOpClient());
+            Assert.False(composer.IsStreaming);
 
-            // Simulate an active stream via reflection on the facade's volatile flag.
-            SetFacadeStreaming(composer, true);
-            try
-            {
-                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => composer.SwitchModelAsync("test-model", ReasoningEffort.High, TestContext.Current.CancellationToken));
-                Assert.Contains("Cannot switch model while streaming", ex.Message);
-            }
-            finally
-            {
-                SetFacadeStreaming(composer, false);
-            }
+            const string unavailableModel = "totally-unavailable-model";
+            var ex = await Assert.ThrowsAsync<ArgumentException>(
+                () => composer.SwitchModelAsync(unavailableModel, ReasoningEffort.High, TestContext.Current.CancellationToken));
+
+            // Idle ⇒ the guard passes and validation DOES run.
+            Assert.Contains(unavailableModel, ex.Message, StringComparison.Ordinal);
+            Assert.Contains("is not available", ex.Message, StringComparison.Ordinal);
         }
         finally
         {

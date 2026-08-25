@@ -100,6 +100,17 @@ internal sealed class ComposerAgentService(
     private bool _sessionLoadedFromDisk;
 
     /// <summary>
+    /// The actor-committed "ever connected" marker: set ONLY via <see cref="CommitConnectedOnce"/>
+    /// from the actor's marker-commit path, which classifies a connection as a successful,
+    /// non-late-cancelled connect (or first selection). NEVER reset — by reconnect, reset,
+    /// teardown, disposal, or failure. Drives the actor's first-selection vs switch decision
+    /// (the <c>ComposerSelectModelMessage</c> handler): marker-true
+    /// selections switch normally (no session disk-load, no re-publication); marker-false
+    /// selections run the full connect path.
+    /// </summary>
+    private bool _hasConnectedOnce;
+
+    /// <summary>
     /// Channel-fed consumer holding the current sub-agent status snapshot. Created lazily when the
     /// agent is (re)created and torn down with the rest of the connection state.
     /// </summary>
@@ -174,6 +185,22 @@ internal sealed class ComposerAgentService(
     /// and the connection succeeded. False for fresh sessions or failed connections.
     /// </summary>
     public bool SessionLoadedFromDisk => _sessionLoadedFromDisk;
+
+    /// <summary>
+    /// Whether the Composer has EVER connected successfully — an actor-classified
+    /// successful, non-late-cancelled connection. Never reset by reconnect, reset,
+    /// teardown, disposal, or failure. Read at message-handling time by the actor's
+    /// selection handler to decide between first-connect and switch.
+    /// </summary>
+    internal bool HasConnectedOnce => _hasConnectedOnce;
+
+    /// <summary>
+    /// NARROW idempotent marker-commit: called ONLY from the actor's marker-commit path
+    /// (the connect handler's success path and the first-selection success path) after an
+    /// actor-classified successful, non-late-cancelled connection. Idempotent — committing
+    /// twice is a no-op. NEVER resets the marker.
+    /// </summary>
+    internal void CommitConnectedOnce() => _hasConnectedOnce = true;
 
     /// <summary>The current model identifier, or <c>null</c> when no model is configured.</summary>
     public string? Model => _model;
@@ -544,19 +571,33 @@ internal sealed class ComposerAgentService(
             throw;
         }
 
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+        // POST-client/agent-creation steps: the registry publish and the final success log.
+        // A failure HERE (e.g. a throwing logger or registry) must dispose the just-created
+        // client/agent — consistent with the creation-failure cleanup above — so a failed
+        // ConnectAsync AFTER client/agent creation leaves the Composer DISCONNECTED
+        // (IsConnected false). Failures BEFORE client/agent creation are out of scope and
+        // leave the prior connection state as-is.
+        try
         {
-            SessionId = "composer",
-            SessionType = LlmSessionType.Composer,
-            Model = model,
-            Status = "idle",
-            CurrentTokens = _session.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-            ReasoningEffort = _reasoningEffort,
-        });
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = "composer",
+                SessionType = LlmSessionType.Composer,
+                Model = model,
+                Status = "idle",
+                CurrentTokens = _session.EstimatedContextTokens,
+                MaxTokens = _maxContextTokens,
+                ReasoningEffort = _reasoningEffort,
+            });
 
-        _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
-            model, _maxContextTokens);
+            _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
+                model, _maxContextTokens);
+        }
+        catch
+        {
+            await SafeDisposeClientsAndClearStateAsync();
+            throw;
+        }
 
         // Commit last: reaching this point means the session was loaded from disk AND the whole
         // connection succeeded. Every earlier exit path leaves the field at the `false` set at
@@ -580,11 +621,25 @@ internal sealed class ComposerAgentService(
         // Validate BEFORE any teardown — an invalid model throws with no state touched.
         var selection = ValidateAvailableModel(newModel, reasoningEffort);
 
+        await SwitchModelAsync(selection, ct);
+    }
+
+    /// <summary>
+    /// Snapshot-accepting switch overload: performs teardown → <see cref="ApplyModelScalars"/>
+    /// → create client/agent → registry publish — WITHOUT calling
+    /// <see cref="ValidateAvailableModel"/> (the snapshot is already validated). Used by the
+    /// actor's marker-true selection branch so exactly ONE validation happens per operation.
+    /// Behavior matches the public switch's teardown→apply→create→register order.
+    /// </summary>
+    /// <param name="selection">The already-validated model selection to apply.</param>
+    /// <param name="ct">Cancellation token.</param>
+    internal async Task SwitchModelAsync(ValidatedModelSelection selection, CancellationToken ct = default)
+    {
         ct.ThrowIfCancellationRequested();
 
         _logger.LogInformation(
             "Switching Composer model from '{OldModel}' to '{NewModel}' (reasoning={Reasoning})",
-            _model, newModel, ReasoningEffortConverter.Format(reasoningEffort));
+            _model, selection.Model, ReasoningEffortConverter.Format(selection.ReasoningEffort));
 
         // Model switch: dispose old agent + clients before creating new ones.
         await DisposeClientsAndClearStateAsync();
@@ -595,7 +650,7 @@ internal sealed class ComposerAgentService(
 
         try
         {
-            _chatClient = CreateClient(newModel);
+            _chatClient = CreateClient(selection.Model);
             if (!string.IsNullOrEmpty(_compactionModel))
                 _compactionChatClient = CreateClient(_compactionModel);
 
@@ -614,7 +669,7 @@ internal sealed class ComposerAgentService(
         {
             SessionId = "composer",
             SessionType = LlmSessionType.Composer,
-            Model = newModel,
+            Model = selection.Model,
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
@@ -622,6 +677,47 @@ internal sealed class ComposerAgentService(
         });
 
         _logger.LogInformation("Composer switched to model '{Model}'", _model);
+    }
+
+    /// <summary>
+    /// First-selection connect on a disconnected shell: validates the selection ONCE, applies
+    /// the caller-spelled scalars, fires <paramref name="onValidatedAboutToConnect"/> (the
+    /// actor's publication boundary), then runs the FULL <see cref="ConnectAsync"/> — including
+    /// the persisted-session disk-load — for the applied model. Ordered steps:
+    /// <list type="number">
+    /// <item><see cref="ValidateAvailableModel"/> ONCE (one snapshot) → a
+    /// <see cref="ValidatedModelSelection"/>.</item>
+    /// <item>Cancellation checkpoint AFTER validation and BEFORE any scalar mutation/callback —
+    /// a pre-cancelled request neither mutates nor publishes.</item>
+    /// <item><see cref="ApplyModelScalars"/> (caller-spelled). A failure here is PRE-CONNECT
+    /// partial scalar mutation with NO publication — accepted as-is (the shell stays
+    /// disconnected; no client exists).</item>
+    /// <item>Invoke <paramref name="onValidatedAboutToConnect"/>.</item>
+    /// <item>Run <see cref="ConnectAsync"/> for the applied caller-spelled model.</item>
+    /// </list>
+    /// </summary>
+    internal async Task ConnectFirstSelectionAsync(
+        string newModel,
+        ReasoningEffort reasoningEffort,
+        Action onValidatedAboutToConnect,
+        CancellationToken ct = default)
+    {
+        // 1. Validate ONCE (one snapshot) → a ValidatedModelSelection.
+        var selection = ValidateAvailableModel(newModel, reasoningEffort);
+
+        // 2. Cancellation checkpoint AFTER validation and BEFORE any scalar mutation/callback.
+        ct.ThrowIfCancellationRequested();
+
+        // 3. Apply the caller-spelled scalars. A failure here is PRE-CONNECT partial scalar
+        //    mutation with NO publication — accepted as-is (the shell stays disconnected).
+        ApplyModelScalars(selection);
+
+        // 4. Invoke the callback — the publication boundary: AT/AFTER this point the actor
+        //    follows the connect publication protocol (preliminary false, then final state).
+        onValidatedAboutToConnect();
+
+        // 5. Run the full connect path for the applied caller-spelled model (incl. disk-load).
+        await ConnectAsync(ct);
     }
 
     /// <summary>Rebuilds <see cref="AgentOptions"/> and the <see cref="CodingAgent"/>. Preserves the session.</summary>

@@ -2889,6 +2889,607 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── Slice 1A2b-1: first-selection connect + ever-connected marker ──
+
+    /// <summary>Logger that throws when the formatted message contains a fragment.</summary>
+    private sealed class FragmentThrowingLogger(string messageFragment, Exception failure) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (formatter(state, exception).Contains(messageFragment, StringComparison.Ordinal))
+                throw failure;
+        }
+    }
+
+    [Fact]
+    public async Task ConnectFirstSelectionAsync_ValidModel_RunsFullConnectWithDiskLoad()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // Write a valid session file so the full connect disk-loads it.
+            var sessionFile = Path.Combine(stateDir, "composer-session.json");
+            var persisted = AgentSession.Create("composer");
+            persisted.MessageHistory.Add(new ChatMessage(Microsoft.Extensions.AI.ChatRole.User, "persisted message"));
+            await persisted.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            Assert.False(service.HasConnectedOnce);
+            Assert.False(service.IsConnected);
+
+            var callbackFired = false;
+            await service.ConnectFirstSelectionAsync(
+                "model-b",
+                ReasoningEffort.High,
+                onValidatedAboutToConnect: () => callbackFired = true,
+                TestContext.Current.CancellationToken);
+
+            Assert.True(callbackFired);
+            Assert.True(service.IsConnected);
+            Assert.Equal("model-b", service.Model);
+            Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
+            Assert.True(service.SessionLoadedFromDisk, "The full connect path must disk-load");
+            Assert.Equal(["persisted message"], service.Session.MessageHistory.Select(m => m.Text));
+
+            // Exactly one client created for the selected model.
+            Assert.Equal(1, factory.Invocations);
+            Assert.Equal(["model-b"], factory.RequestedModels);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// The <c>onValidatedAboutToConnect</c> callback — the publication BOUNDARY — must fire
+    /// STRICTLY BEFORE the connect path runs, and the scalars must ALREADY be applied when it
+    /// does.
+    /// <para>
+    /// Removal-proof by construction: client creation is GATED, so the connect parks inside it
+    /// and the assertions are made <b>while the connect is still in flight</b>. Moving the
+    /// callback into or after the connection would leave <c>callbackFired</c> false at that
+    /// moment and FAIL. The previous version only checked the flag after the whole call
+    /// returned, which any callback placement satisfies.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ConnectFirstSelectionAsync_CallbackFiresBeforeConnectPath_AssertedWhileConnectIsParked()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var sessionFile = Path.Combine(stateDir, "composer-session.json");
+            var persisted = AgentSession.Create("composer");
+            persisted.MessageHistory.Add(new ChatMessage(Microsoft.Extensions.AI.ChatRole.User, "persisted message"));
+            await persisted.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+            // Client creation is the FIRST fallible step of ConnectAsync after the no-model
+            // guard, so parking there is a precise "the connect path has begun" signal.
+            var clientCreationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseClientCreation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var creationCount = 0;
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ =>
+                {
+                    Interlocked.Increment(ref creationCount);
+                    clientCreationEntered.TrySetResult();
+                    releaseClientCreation.Task.GetAwaiter().GetResult();
+                    return new Mock<IChatClient>().Object;
+                },
+                model: null!,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            var callbackFired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            string? modelAtCallback = null;
+            ReasoningEffort? effortAtCallback = null;
+            var clientCreationsAtCallback = -1;
+
+            // Captured OUTSIDE the background task: TestContext.Current is async-local and is
+            // not guaranteed to flow into the Task.Run continuation.
+            var testCt = TestContext.Current.CancellationToken;
+
+            var connectTask = Task.Run(() => service.ConnectFirstSelectionAsync(
+                "model-b",
+                ReasoningEffort.High,
+                onValidatedAboutToConnect: () =>
+                {
+                    // Captured AT the boundary: the scalars must already be applied, and the
+                    // connect path must not have created any client yet.
+                    modelAtCallback = service.Model;
+                    effortAtCallback = service.ReasoningEffort;
+                    clientCreationsAtCallback = Volatile.Read(ref creationCount);
+                    callbackFired.TrySetResult();
+                },
+                testCt),
+                testCt);
+
+            try
+            {
+                // Wait until the connect is PARKED inside client creation.
+                await clientCreationEntered.Task.WaitAsync(
+                    TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // ── THE ORDERING ASSERTION, made while the connect is still in flight ──
+                Assert.True(callbackFired.Task.IsCompleted,
+                    "onValidatedAboutToConnect must fire BEFORE the connect path runs");
+                Assert.False(connectTask.IsCompleted, "The connect must still be parked");
+
+                // At the boundary the scalars were already applied (apply precedes the callback)…
+                Assert.Equal("model-b", modelAtCallback);
+                Assert.Equal(ReasoningEffort.High, effortAtCallback);
+
+                // …and no client had been created yet (the callback precedes the connect).
+                Assert.Equal(0, clientCreationsAtCallback);
+
+                // Let the connect finish and verify the full path still ran (incl. disk-load).
+                releaseClientCreation.TrySetResult();
+                await connectTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                Assert.True(service.IsConnected);
+                Assert.True(service.SessionLoadedFromDisk, "The full connect path must disk-load");
+                Assert.Equal(["persisted message"], service.Session.MessageHistory.Select(m => m.Text));
+            }
+            finally
+            {
+                releaseClientCreation.TrySetResult();
+                try { await connectTask; } catch (Exception) { /* asserted above */ }
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectFirstSelectionAsync_PreCancelledToken_CancelsAtCheckpoint_NoMutation_NoCallback()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var callbackFired = false;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                service.ConnectFirstSelectionAsync(
+                    "model-b",
+                    ReasoningEffort.High,
+                    onValidatedAboutToConnect: () => callbackFired = true,
+                    cts.Token));
+
+            // NO mutation (model/scalars untouched), NO callback, NO client creation.
+            Assert.False(callbackFired, "The callback must NOT fire for a pre-cancelled request");
+            Assert.Null(service.Model);
+            Assert.False(service.IsConnected);
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectFirstSelectionAsync_ApplyFailure_PublishesNothing_ShellStaysDisconnected()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // The context-window log fires inside ApplyModelScalars; a throwing logger on that
+            // exact message makes ApplyModelScalars fail — pre-connect partial scalar mutation.
+            var logger = new FragmentThrowingLogger(
+                "Updating Composer context window",
+                new InvalidOperationException("apply boom"));
+
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "model-a" },
+                        new ModelEntry { Name = "model-b", ContextWindow = 128_000 }
+                    ]
+                }
+            };
+
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                hiveConfig: hiveConfig,
+                logger: logger,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            // Seed a different context window so the update log fires.
+            var ctxField = service.GetType().GetField("_maxContextTokens",
+                BindingFlags.Instance | BindingFlags.NonPublic)!;
+            ctxField.SetValue(service, 64000);
+
+            var callbackFired = false;
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.ConnectFirstSelectionAsync(
+                    "model-b",
+                    ReasoningEffort.High,
+                    onValidatedAboutToConnect: () => callbackFired = true,
+                    TestContext.Current.CancellationToken));
+            Assert.Equal("apply boom", ex.Message);
+
+            // PRE-CONNECT failure: the callback (publication boundary) never fired, the shell
+            // stays disconnected, no client was created. Partial scalar mutation (model/reasoning
+            // applied, context window not) is accepted as-is.
+            Assert.False(callbackFired, "The callback (publication boundary) must NOT fire on apply failure");
+            Assert.False(service.IsConnected);
+            Assert.Equal(0, factory.Invocations);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Test seam making CATALOG VALIDATION observable without touching production code.
+    /// <see cref="ComposerAgentService.ValidateAvailableModel"/> captures exactly ONE catalog
+    /// snapshot per invocation, and the startup catalog is injected as an
+    /// <see cref="IReadOnlyList{T}"/> INTERFACE — so counting enumerations counts validations.
+    /// </summary>
+    private sealed class CountingCatalog(IReadOnlyList<string> models) : IReadOnlyList<string>
+    {
+        private int _enumerations;
+
+        /// <summary>Number of full enumerations = catalog snapshots = validations.</summary>
+        internal int EnumerationCount => Volatile.Read(ref _enumerations);
+
+        public string this[int index] => models[index];
+
+        public int Count => models.Count;
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            Interlocked.Increment(ref _enumerations);
+            return models.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// The snapshot overload performs teardown → apply → create → register and performs NO
+    /// validation of its own.
+    /// <para>
+    /// Removal-proof by construction:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>Zero validations inside the overload.</b> The counting catalog is sampled
+    /// immediately after the caller's single explicit <c>ValidateAvailableModel</c>, and the
+    /// overload must add ZERO further snapshots. If the overload ever re-validated (or were
+    /// implemented by delegating to the public string overload), the delta would be 1 and this
+    /// FAILS. The previous version never observed validation at all.</item>
+    /// <item><b>Ordering.</b> Each step records the state observable AT THAT MOMENT: teardown
+    /// sees the OLD model (apply has not run), create sees the NEW model (apply already ran),
+    /// and the terminal log reads the registry to prove the publish already happened. The exact
+    /// sequence is asserted, so any reordering FAILS. The previous version only asserted that a
+    /// disposal occurred somewhere.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task SwitchModelAsync_SnapshotOverload_PerformsZeroValidations_AndPreservesStepOrder()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var order = new List<string>();
+            void Record(string step) { lock (order) order.Add(step); }
+
+            var catalog = new CountingCatalog(["model-a", "model-b"]);
+            var registry = new LlmSessionRegistry();
+
+            ComposerAgentService? serviceRef = null;
+            var recording = false;
+
+            // The switch's terminal log runs AFTER the registry publish, so reading the registry
+            // from inside it proves the publish had already happened by then.
+            var stepLogger = new MessageObservingLogger(message =>
+            {
+                if (!recording) return;
+                if (!message.Contains("Composer switched to model", StringComparison.Ordinal)) return;
+                var published = registry.GetAll().FirstOrDefault(s => s.SessionId == "composer")?.Model ?? "<none>";
+                Record($"register:{published}");
+            });
+
+            var service = new ComposerAgentService(
+                "model-a",
+                64_000,
+                50,
+                null,
+                null,
+                "system prompt",
+                [],
+                null,
+                stateDir,
+                null,
+                stepLogger,
+                _ =>
+                {
+                    if (recording) Record($"create:{serviceRef!.Model}");
+                    return new Mock<IChatClient>().Object;
+                },
+                registry,
+                catalog,
+                null,
+                null,
+                false,
+                []);
+            serviceRef = service;
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Validate ONCE externally — this is the ONLY validation the operation may perform.
+            var selection = service.ValidateAvailableModel("model-b", ReasoningEffort.Medium);
+
+            // Sample AFTER the explicit validation: the overload must add ZERO snapshots.
+            var snapshotsAfterExplicitValidation = catalog.EnumerationCount;
+
+            lock (order) order.Clear();
+            registry.Unregister("composer");
+            service.OnAgentDisposing = _ => Record($"teardown:{service.Model}");
+            recording = true;
+
+            await service.SwitchModelAsync(selection, TestContext.Current.CancellationToken);
+
+            recording = false;
+            service.OnAgentDisposing = null;
+
+            // ── THE ZERO-REVALIDATION ASSERTION ──
+            Assert.Equal(snapshotsAfterExplicitValidation, catalog.EnumerationCount);
+
+            // ── THE ORDERING ASSERTION ──
+            List<string> recorded;
+            lock (order) recorded = [.. order];
+            Assert.Equal(["teardown:model-a", "create:model-b", "register:model-b"], recorded);
+
+            Assert.Equal("model-b", service.Model);
+            Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+            Assert.True(service.IsConnected);
+
+            var entry = Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+            Assert.Equal("model-b", entry.Model);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Control test proving the counting seam above is NOT vacuous: the PUBLIC string overload
+    /// DOES take a catalog snapshot (it validates), so the delta is exactly 1. Without this, a
+    /// broken seam that never counted anything would make the zero-revalidation assertion pass
+    /// trivially.
+    /// </summary>
+    [Fact]
+    public async Task SwitchModelAsync_PublicStringOverload_TakesExactlyOneCatalogSnapshot_ControlForCountingSeam()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var catalog = new CountingCatalog(["model-a", "model-b"]);
+            var service = new ComposerAgentService(
+                "model-a",
+                64_000,
+                50,
+                null,
+                null,
+                "system prompt",
+                [],
+                null,
+                stateDir,
+                null,
+                NullLogger<ComposerAgentService>.Instance,
+                _ => new Mock<IChatClient>().Object,
+                null,
+                catalog,
+                null,
+                null,
+                false,
+                []);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            var before = catalog.EnumerationCount;
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
+
+            // The public overload validates exactly once.
+            Assert.Equal(1, catalog.EnumerationCount - before);
+            Assert.Equal("model-b", service.Model);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>Logger that hands every formatted message to an observer.</summary>
+    private sealed class MessageObservingLogger(Action<string> onMessage) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => onMessage(formatter(state, exception));
+    }
+
+    [Fact]
+    public async Task CommitConnectedOnce_SetsMarker_Idempotent_NeverResetByDisposal()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(stateDir, chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+            Assert.False(service.HasConnectedOnce);
+            service.CommitConnectedOnce();
+            Assert.True(service.HasConnectedOnce);
+
+            // Idempotent.
+            service.CommitConnectedOnce();
+            Assert.True(service.HasConnectedOnce);
+
+            // Connect (a normal service-level connect) does NOT reset it.
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.HasConnectedOnce, "ConnectAsync must never reset the marker");
+
+            await service.DisposeAsync();
+            Assert.True(service.HasConnectedOnce, "Disposal must never reset the marker");
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A failure AFTER client/agent creation must dispose the just-created client/agent, leaving
+    /// <c>IsConnected</c> false.
+    /// <para>
+    /// Removal-proof: the test proves the failure really is POST-creation (the client factory
+    /// ran, and an agent existed) AND that the cleanup actually DISPOSED it (the
+    /// <c>OnAgentDisposing</c> hook fired for the newly created agent). Asserting only
+    /// <c>IsConnected == false</c> would also hold for a failure that never created anything,
+    /// so those two observations are what make the cleanup itself the subject under test.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_PostCreationFailure_DisposesClientAndAgent_IsConnectedFalse()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // The final success log runs AFTER client+agent creation. A logger that throws on
+            // "Composer connected" forces the POST-creation failure path.
+            var logger = new FragmentThrowingLogger(
+                "Composer connected",
+                new InvalidOperationException("final log boom"));
+
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: "model-a",
+                logger: logger,
+                startupAvailableModels: ["model-a"]);
+
+            // Observation point: the cleanup disposes the agent it just created.
+            var agentDisposals = 0;
+            service.OnAgentDisposing = _ => Interlocked.Increment(ref agentDisposals);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("final log boom", ex.Message);
+
+            // The failure really was POST-creation: the client factory ran…
+            Assert.Equal(1, factory.Invocations);
+            Assert.Equal(["model-a"], factory.RequestedModels);
+
+            // …and the cleanup DISPOSED the just-created agent (this is the new behavior; a
+            // pre-creation failure would leave this at 0).
+            Assert.Equal(1, Volatile.Read(ref agentDisposals));
+
+            // POST-creation cleanup: the just-created client/agent were disposed, leaving the
+            // Composer DISCONNECTED.
+            Assert.False(service.IsConnected);
+            Assert.Null(GetField<IChatClient>(service, "_chatClient"));
+            Assert.Null(GetField<CodingAgent>(service, "_agent"));
+            Assert.False(service.SessionLoadedFromDisk);
+
+            service.OnAgentDisposing = null;
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectFirstSelectionAsync_InvalidSelection_PropagatesValidationError_NoCallback_NoConnect()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                startupAvailableModels: ["model-a"]);
+
+            var callbackFired = false;
+            var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+                service.ConnectFirstSelectionAsync(
+                    "no-such-model",
+                    ReasoningEffort.High,
+                    onValidatedAboutToConnect: () => callbackFired = true,
+                    TestContext.Current.CancellationToken));
+
+            Assert.Contains("no-such-model", ex.Message);
+            Assert.False(callbackFired, "The callback must NOT fire for an invalid selection");
+            Assert.False(service.IsConnected);
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── Utility ──
 
     /// <summary>

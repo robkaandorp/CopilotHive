@@ -603,6 +603,13 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     internal bool SessionLoadedFromDisk => _sessionLoadedFromDisk;
 
     /// <summary>
+    /// Read-through of the agent service's ever-connected marker: set by the actor on a
+    /// successful non-late-cancelled connection, never reset. Facade tests use it to assert
+    /// the marker's lifecycle without reaching into the agent service.
+    /// </summary>
+    internal bool HasConnectedOnce => _agentService.HasConnectedOnce;
+
+    /// <summary>
     /// Returns the last session activity timestamp when the Composer is connected,
     /// or <c>null</c> when disconnected.
     /// </summary>
@@ -647,6 +654,12 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>
     /// Switches to a different model and reasoning effort, disposing the old chat client and
     /// recreating the agent. The session history is preserved.
+    /// <para>
+    /// Routes ALL selections to <see cref="ComposerSelectModelMessage"/>: the actor is the
+    /// SOLE authority for ordering guards (streaming rejection, marker read at handling time,
+    /// first-selection connect vs switch). There is NO facade pre-enqueue streaming check and
+    /// NO marker inspection here.
+    /// </para>
     /// </summary>
     /// <param name="model">The model identifier to switch to.</param>
     /// <param name="reasoningEffort">The reasoning effort to run with (required).</param>
@@ -654,13 +667,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <exception cref="ArgumentException">Thrown when <paramref name="model"/> is not in <see cref="AvailableModels"/>.</exception>
     public async Task SwitchModelAsync(string model, ReasoningEffort reasoningEffort, CancellationToken ct = default)
     {
-        if (_isStreaming)
-            throw new InvalidOperationException("Cannot switch model while streaming.");
         var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_actor.Tell(new ComposerSwitchModelMessage(model, reasoningEffort, reply, ct)))
+        if (!_actor.Tell(new ComposerSelectModelMessage(model, reasoningEffort, reply, ct)))
             throw new InvalidOperationException("Composer not available.");
 
-        // The reply is the AUTHORITATIVE completion signal: the actor owns the switch and
+        // The reply is the AUTHORITATIVE completion signal: the actor owns the selection and
         // classifies caller cancellation itself (cancelled reply). Using WaitAsync(ct) here
         // would abandon the wait while the actor keeps mutating the agent service, leaving
         // the caller with no way to observe the real outcome.

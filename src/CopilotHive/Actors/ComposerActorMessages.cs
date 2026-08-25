@@ -36,6 +36,20 @@ internal sealed record ComposerSwitchModelMessage(
     TaskCompletionSource Reply,
     CancellationToken Ct) : IComposerMessage;
 
+/// <summary>
+/// Selects a model for the Composer: on the actor's marker-true path behaves like a switch
+/// (validate ONCE + <c>SwitchModelAsync(selection, ct)</c> — no re-validation, no session
+/// disk-load, no re-publication); on the marker-false path runs the FIRST-selection connect
+/// (<c>ConnectFirstSelectionAsync</c> — validate → cancel-check → apply → callback → full
+/// ConnectAsync incl. disk-load). The actor owns the streaming rejection and reads
+/// <c>_hasConnectedOnce</c> at handling time.
+/// </summary>
+internal sealed record ComposerSelectModelMessage(
+    string Model,
+    ReasoningEffort ReasoningEffort,
+    TaskCompletionSource Reply,
+    CancellationToken Ct) : IComposerMessage;
+
 /// <summary>Force-compacts the composer session, replying with whether compaction occurred.</summary>
 internal sealed record ComposerCompactMessage(TaskCompletionSource<bool> Reply, CancellationToken Ct) : IComposerMessage;
 

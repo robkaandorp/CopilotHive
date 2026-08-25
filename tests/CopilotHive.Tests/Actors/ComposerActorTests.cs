@@ -3,6 +3,8 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 
 using CopilotHive.Actors;
+using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
 
 using Microsoft.Extensions.AI;
@@ -56,19 +58,21 @@ public sealed class ComposerActorTests
         IReadOnlyList<string>? availableModels = null,
         Action? onCompacting = null,
         Action<CompactionResult>? onCompacted = null,
-        List<AITool>? tools = null) =>
+        List<AITool>? tools = null,
+        ILogger? logger = null,
+        HiveConfigFile? hiveConfig = null) =>
         new(
             model,
             64000,
             50,
             null,
-            null,
+            hiveConfig,
             "system prompt",
             tools ?? new List<AITool>(),
             null,
             stateDir,
             null,
-            NullLogger<ComposerAgentService>.Instance,
+            logger ?? NullLogger<ComposerAgentService>.Instance,
             chatClientFactory,
             null,
             availableModels ?? [model],
@@ -1719,6 +1723,7 @@ public sealed class ComposerActorTests
             var connectReply = NewReply<bool>();
             var resetReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var switchReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var selectReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var compactReply = NewReply<bool>();
             var compactPartialReply = NewReply<bool>();
 
@@ -1726,6 +1731,7 @@ public sealed class ComposerActorTests
             Assert.True(actor.Tell(new ComposerConnectMessage(connectReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerResetSessionMessage(resetReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerSwitchModelMessage("model-b", ReasoningEffort.Medium, switchReply, CancellationToken.None)));
+            Assert.True(actor.Tell(new ComposerSelectModelMessage("model-b", ReasoningEffort.Medium, selectReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerCompactMessage(compactReply, CancellationToken.None)));
             Assert.True(actor.Tell(new ComposerCompactPartialMessage(50, compactPartialReply, CancellationToken.None)));
 
@@ -1735,6 +1741,7 @@ public sealed class ComposerActorTests
             Assert.True(connectReply.Task.IsCanceled);
             Assert.True(resetReply.Task.IsCanceled);
             Assert.True(switchReply.Task.IsCanceled);
+            Assert.True(selectReply.Task.IsCanceled);
             Assert.True(compactReply.Task.IsCanceled);
             Assert.True(compactPartialReply.Task.IsCanceled);
         }
@@ -1958,6 +1965,7 @@ public sealed class ComposerActorTests
     [InlineData("Connect")]
     [InlineData("Reset")]
     [InlineData("Switch")]
+    [InlineData("Select")]
     [InlineData("Compact")]
     [InlineData("CompactPartial")]
     public async Task OnUnhandledException_FaultsAllReplyBearingMessages_WithOriginalException(string messageType)
@@ -2004,6 +2012,13 @@ public sealed class ComposerActorTests
                     {
                         var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                         method.Invoke(actor, [new ComposerSwitchModelMessage("m", ReasoningEffort.Low, reply, CancellationToken.None), ex]);
+                        replyTask = reply.Task;
+                        break;
+                    }
+                case "Select":
+                    {
+                        var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                        method.Invoke(actor, [new ComposerSelectModelMessage("m", ReasoningEffort.Low, reply, CancellationToken.None), ex]);
                         replyTask = reply.Task;
                         break;
                     }
@@ -5693,6 +5708,1097 @@ public sealed class ComposerActorTests
             blockingClient.Release();
             await actor.DisposeAsync();
             await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Slice 1A2b-1: ComposerSelectModelMessage lifecycle ──
+
+    /// <summary>
+    /// Test seam that makes CATALOG VALIDATION observable without touching production code.
+    /// <para>
+    /// <see cref="ComposerAgentService.ValidateAvailableModel"/> captures exactly ONE catalog
+    /// snapshot per invocation (<c>CaptureCatalogSnapshot</c> enumerates the startup catalog
+    /// once). Because the startup catalog is injected as an <see cref="IReadOnlyList{T}"/>
+    /// INTERFACE, this counting implementation observes every snapshot — so
+    /// <see cref="EnumerationCount"/> IS the number of validations performed. That turns
+    /// "validated exactly once" and "never validated" into direct, failing assertions instead
+    /// of end-state guesses.
+    /// </para>
+    /// </summary>
+    private sealed class CountingCatalog(IReadOnlyList<string> models) : IReadOnlyList<string>
+    {
+        private int _enumerations;
+
+        /// <summary>Number of full enumerations = number of catalog snapshots = validations.</summary>
+        internal int EnumerationCount => Volatile.Read(ref _enumerations);
+
+        public string this[int index] => models[index];
+
+        public int Count => models.Count;
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            Interlocked.Increment(ref _enumerations);
+            return models.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// Chat-client factory that BLOCKS on first use, giving a test a deterministic
+    /// "connect has entered client creation" rendezvous. Used to prove the
+    /// <c>onValidatedAboutToConnect</c> callback fires strictly BEFORE the connect path runs:
+    /// the assertion is made while the connect is still parked inside client creation.
+    /// </summary>
+    private sealed class GatedChatClientFactory(Func<string, IChatClient> inner)
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _invocations;
+
+        /// <summary>Completes once client creation has been ENTERED (connect path reached).</summary>
+        internal Task Entered => _entered.Task;
+
+        /// <summary>Number of client-creation calls.</summary>
+        internal int Invocations => Volatile.Read(ref _invocations);
+
+        /// <summary>Lets the parked connect proceed.</summary>
+        internal void Release() => _release.TrySetResult();
+
+        internal Func<string, IChatClient> Delegate => modelId =>
+        {
+            Interlocked.Increment(ref _invocations);
+            _entered.TrySetResult();
+            _release.Task.GetAwaiter().GetResult();
+            return inner(modelId);
+        };
+    }
+
+    /// <summary>Logger that throws when the formatted message contains a fragment.</summary>
+    private sealed class FragmentThrowingLogger(string messageFragment, Exception failure) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (formatter(state, exception).Contains(messageFragment, StringComparison.Ordinal))
+                throw failure;
+        }
+    }
+
+    /// <summary>
+    /// First selection on a disconnected shell: validate (one snapshot) → cancel-check → apply
+    /// (caller-spelled) → callback (preliminary false) → full ConnectAsync disk-load; marker
+    /// committed; preliminary-false-then-final publication; facade+backend agree.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_FirstSelectionOnDisconnectedShell_ConnectsWithDiskLoad_CommitsMarker()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // Write a valid session file so the full connect disk-loads it.
+            var sessionFile = Path.Combine(stateDir, "composer-session.json");
+            var persisted = AgentSession.Create("composer");
+            persisted.MessageHistory.Add(new ChatMessage(ChatRole.User, "persisted message"));
+            await persisted.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                availableModels: ["model-a", "model-b"]);
+
+            Assert.False(service.HasConnectedOnce);
+            Assert.False(service.IsConnected);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsCompletedSuccessfully, "First selection must succeed");
+
+                // Backend state: connected, caller-spelled model + effort applied, disk-loaded.
+                Assert.True(service.IsConnected);
+                Assert.Equal("model-b", service.Model);
+                Assert.Equal(ReasoningEffort.High, service.ReasoningEffort);
+                Assert.True(service.SessionLoadedFromDisk, "First selection must disk-load");
+                Assert.Equal(["persisted message"], service.Session.MessageHistory.Select(m => m.Text));
+
+                // Marker committed.
+                Assert.True(service.HasConnectedOnce, "A non-late-cancelled success must commit the marker");
+
+                // Publication: preliminary false (the callback) then final true (disk-loaded).
+                lock (loadedFlags)
+                {
+                    Assert.NotEmpty(loadedFlags);
+                    Assert.Contains(false, loadedFlags);
+                    Assert.True(loadedFlags[^1], "Final publication must be true (disk-loaded)");
+                }
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Marker-true branch: validates EXACTLY ONCE and calls
+    /// <c>SwitchModelAsync(ValidatedModelSelection, ct)</c> — never the re-validating public
+    /// overload — and preserves the teardown → apply → create → register order.
+    /// <para>
+    /// Removal-proof by construction:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>Exactly one validation.</b> The injected <see cref="CountingCatalog"/> counts
+    /// catalog snapshots, and <c>ValidateAvailableModel</c> takes exactly one per call. The
+    /// assertion is <c>== 1</c>, so routing to the public (re-validating) overload — which
+    /// would make it 2 — FAILS. The previous version asserted nothing about validation and
+    /// therefore could not detect a double-validating implementation.</item>
+    /// <item><b>Ordering.</b> Each transition is RECORDED as it happens, together with the state
+    /// observable AT THAT MOMENT. Teardown must observe the OLD model (apply has not run yet)
+    /// and client creation must observe the NEW one (apply already ran) — which is exactly what
+    /// pins <c>apply</c> BETWEEN teardown and create. The terminal "switched" log records
+    /// whether the registry entry ALREADY carries the new model, pinning <c>register</c> after
+    /// create. Reordering any step FAILS the sequence assertion.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_MarkerTrue_ValidatesExactlyOnce_AndPreservesTeardownApplyCreateRegisterOrder()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var order = new List<string>();
+            void Record(string step) { lock (order) order.Add(step); }
+
+            // The counting catalog is the validation observation point (null-config seam:
+            // the service snapshots the injected IReadOnlyList<string> startup catalog).
+            var catalog = new CountingCatalog(["model-a", "model-b"]);
+
+            // The registry is the "register" observation point.
+            var registry = new LlmSessionRegistry();
+
+            ComposerAgentService? serviceRef = null;
+            var recording = false;
+
+            // The switch's terminal log runs AFTER the registry publish, so reading the registry
+            // from inside it proves the publish had already happened by then.
+            var stepLogger = new StepRecordingLogger(message =>
+            {
+                if (!recording) return;
+                if (!message.Contains("Composer switched to model", StringComparison.Ordinal)) return;
+                var published = registry.GetAll().FirstOrDefault(s => s.SessionId == "composer")?.Model ?? "<none>";
+                Record($"register:{published}");
+            });
+
+            var service = new ComposerAgentService(
+                "model-a",
+                64_000,
+                50,
+                null,
+                null,
+                "system prompt",
+                [],
+                null,
+                stateDir,
+                null,
+                stepLogger,
+                // "create": records the model VISIBLE AT CREATION TIME. Apply must already
+                // have run, so this must observe the NEW model.
+                _ =>
+                {
+                    if (recording) Record($"create:{serviceRef!.Model}");
+                    return new TextStreamingClient("hi");
+                },
+                registry,
+                catalog,
+                null,
+                null,
+                false,
+                []);
+            serviceRef = service;
+
+            // Marker-true: an already-connected Composer.
+            service.CommitConnectedOnce();
+
+            // Seed the session so a disk-load would be observable (it must NOT happen).
+            service.Session.MessageHistory.Add(new ChatMessage(ChatRole.User, "existing history"));
+            var sessionBefore = service.Session;
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Write a disk file so a (buggy) reload would be observable.
+            var sessionFile = Path.Combine(stateDir, "composer-session.json");
+            await service.Session.SaveAsync(sessionFile, TestContext.Current.CancellationToken);
+
+            // Start recording ONLY the switch: reset everything captured during setup.
+            lock (order) order.Clear();
+            registry.Unregister("composer");
+            var snapshotsBefore = catalog.EnumerationCount;
+
+            // "teardown": records the model VISIBLE AT DISPOSAL TIME. Apply must NOT have run
+            // yet, so this must observe the OLD model.
+            service.OnAgentDisposing = _ => Record($"teardown:{service.Model}");
+            recording = true;
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.Medium, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsCompletedSuccessfully, "Marker-true selection must succeed");
+
+                // ── THE EXACTLY-ONCE VALIDATION ASSERTION ──
+                // ValidateAvailableModel takes exactly one catalog snapshot. The marker-true
+                // branch validates once and hands the SNAPSHOT to the non-validating overload.
+                // Routing to the public overload instead would validate a second time ⇒ 2.
+                Assert.Equal(1, catalog.EnumerationCount - snapshotsBefore);
+
+                // ── THE ORDERING ASSERTION ──
+                // Recorded live, in the order the transitions actually occurred. The embedded
+                // values pin `apply` strictly between teardown and create, and `register`
+                // strictly after create.
+                List<string> recorded;
+                lock (order) recorded = [.. order];
+                Assert.Equal(
+                    ["teardown:model-a", "create:model-b", "register:model-b"],
+                    recorded);
+
+                // Identical switch behavior: model+effort applied, still connected, session
+                // PRESERVED (same reference, no disk-load).
+                Assert.Equal("model-b", service.Model);
+                Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+                Assert.True(service.IsConnected);
+                Assert.Same(sessionBefore, service.Session);
+                Assert.Equal("existing history", service.Session.MessageHistory[^1].Text);
+
+                // The register step published the NEW model.
+                var entry = Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+                Assert.Equal("model-b", entry.Model);
+
+                // NO re-publication: the marker-true path publishes NOTHING via _onSessionLoaded.
+                lock (loadedFlags) Assert.Empty(loadedFlags);
+
+                // Marker still true (never reset, never reclassified).
+                Assert.True(service.HasConnectedOnce);
+            }
+            finally
+            {
+                recording = false;
+                service.OnAgentDisposing = null;
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>Logger that hands every formatted message to a recorder.</summary>
+    private sealed class StepRecordingLogger(Action<string> onMessage) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => onMessage(formatter(state, exception));
+    }
+
+    /// <summary>
+    /// Marker-true-but-disconnected still switches (no re-load): the marker is driven by
+    /// _hasConnectedOnce, NOT IsConnected.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_MarkerTrueButDisconnected_SwitchesWithoutReload()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                availableModels: ["model-a", "model-b"]);
+
+            // Commit the marker WITHOUT connecting — marker-true-but-disconnected.
+            service.CommitConnectedOnce();
+            Assert.False(service.IsConnected);
+
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.Low, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsCompletedSuccessfully,
+                    "Marker-true-but-disconnected must still switch (never re-load)");
+
+                // The switch path connects (client+agent created) but does NOT disk-load.
+                Assert.True(service.IsConnected);
+                Assert.Equal("model-b", service.Model);
+                Assert.False(service.SessionLoadedFromDisk, "A switch must never disk-load");
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Pre-cancelled first selection: cancels at the checkpoint with NO mutation and NO
+    /// publication.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_PreCancelledFirstSelection_NoMutation_NoPublication()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                availableModels: ["model-a", "model-b"]);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                using var cts = new CancellationTokenSource();
+                cts.Cancel();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.High, reply, cts.Token)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsCanceled, "Pre-cancelled selection must cancel the reply");
+
+                // NO mutation, NO publication, still disconnected.
+                Assert.Null(service.Model);
+                Assert.False(service.IsConnected);
+                Assert.False(service.HasConnectedOnce);
+                lock (loadedFlags) Assert.Empty(loadedFlags);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Invalid selection → same validation error, publishes NOTHING.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_InvalidSelection_PropagatesError_PublishesNothing()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                availableModels: ["model-a"]);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "no-such-model", ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsFaulted, "Invalid selection must fault the reply");
+                Assert.IsType<ArgumentException>(reply.Task.Exception!.InnerException);
+                Assert.Contains("no-such-model", reply.Task.Exception!.InnerException!.Message);
+
+                // NO publication, no mutation, no connection.
+                lock (loadedFlags) Assert.Empty(loadedFlags);
+                Assert.False(service.IsConnected);
+                Assert.False(service.HasConnectedOnce);
+                Assert.Null(service.Model);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Apply-failure boundary: an ApplyModelScalars failure (pre-connect) publishes NOTHING and
+    /// leaves the shell disconnected (partial scalars accepted).
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_ApplyFailure_PublishesNothing_ShellStaysDisconnected()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // The context-window log fires inside ApplyModelScalars; a throwing logger on that
+            // exact message makes ApplyModelScalars fail — pre-connect partial scalar mutation.
+            var logger = new FragmentThrowingLogger(
+                "Updating Composer context window",
+                new InvalidOperationException("apply boom"));
+
+            var hiveConfig = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "model-a" },
+                        new ModelEntry { Name = "model-b", ContextWindow = 128_000 }
+                    ]
+                }
+            };
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                hiveConfig: hiveConfig,
+                logger: logger,
+                availableModels: ["model-a", "model-b"]);
+
+            // Seed a different context window so the update log fires.
+            var ctxField = typeof(ComposerAgentService).GetField("_maxContextTokens", PrivateFlags)!;
+            ctxField.SetValue(service, 64000);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsFaulted, "Apply failure must fault the reply");
+                Assert.Equal("apply boom", reply.Task.Exception!.InnerException!.Message);
+
+                // PRE-CONNECT failure: NO publication, shell stays disconnected.
+                lock (loadedFlags) Assert.Empty(loadedFlags);
+                Assert.False(service.IsConnected);
+                Assert.False(service.HasConnectedOnce);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Streaming rejection (actor-side, FIRST): a selection while <c>_isStreaming</c> is
+    /// rejected BEFORE any validation.
+    /// <para>
+    /// Removal-proof by construction: the requested model is DELIBERATELY ABSENT from the
+    /// catalog. If the handler validated first (or reordered the guard after validation), the
+    /// reply would carry the <see cref="ArgumentException"/> "Model '…' is not available",
+    /// NOT the streaming <see cref="InvalidOperationException"/>. Asserting the exact exception
+    /// TYPE and message therefore uniquely proves validation was never reached. The previous
+    /// version submitted a VALID model, so a validate-then-reject implementation produced the
+    /// identical outcome and the test could not fail.
+    /// </para>
+    /// <para>
+    /// Additionally the catalog counts its own enumerations, so "no validation" is asserted
+    /// directly: <see cref="ComposerAgentService.ValidateAvailableModel"/> captures exactly one
+    /// catalog snapshot per call, and zero snapshots means zero validations.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_WhileStreaming_RejectedBeforeValidation_UnavailableModelStillReportsStreamingError()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var blockingClient = new BlockingStreamingClient();
+            var catalog = new CountingCatalog(["model-a", "model-b"]);
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => blockingClient,
+                model: "model-a",
+                availableModels: catalog);
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            // Deterministic gate: the send handler fires _onStreamingStarted synchronously
+            // inside StartStream, on the mailbox thread, BEFORE its reply completes — so
+            // awaiting the send reply guarantees _isStreaming is already true. No polling.
+            var streamingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => streamingStarted.TrySetResult(),
+                (_, _) => { },
+                _ => { },
+                () => { });
+
+            try
+            {
+                actor.Start();
+
+                var sendReply = NewReply<bool>();
+                Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", sendReply)));
+                Assert.True(await AwaitReplyAsync(sendReply), "The send must be admitted");
+                await streamingStarted.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+                Assert.True(GetIsStreaming(actor), "The actor must be streaming before the selection");
+
+                // Snapshot the validation count at the moment the stream is live.
+                var snapshotsBeforeSelection = catalog.EnumerationCount;
+
+                // THE SELECTION: an UNAVAILABLE model. Validation-first would throw
+                // ArgumentException; the streaming guard must win.
+                const string unavailableModel = "totally-unavailable-model";
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    unavailableModel, ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsFaulted, "Selection while streaming must fault");
+
+                var thrown = reply.Task.Exception!.InnerException!;
+
+                // THE ASSERTION: the STREAMING error, not a validation error. An implementation
+                // that validated first would fault with ArgumentException here.
+                Assert.IsType<InvalidOperationException>(thrown);
+                Assert.Equal("Cannot switch model while streaming.", thrown.Message);
+                Assert.DoesNotContain("is not available", thrown.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(unavailableModel, thrown.Message, StringComparison.Ordinal);
+
+                // Direct proof that validation never ran: no new catalog snapshot was taken.
+                Assert.Equal(snapshotsBeforeSelection, catalog.EnumerationCount);
+
+                // No mutation happened.
+                Assert.Equal("model-a", service.Model);
+                Assert.Null(service.ReasoningEffort);
+
+                // Cleanup: cancel and release the blocked stream, gated on the terminal
+                // transition rather than polling.
+                actor.Tell(new ComposerCancelStreamingMessage());
+                blockingClient.Release();
+            }
+            finally
+            {
+                blockingClient.Release();
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Companion control test proving the assertion above is NOT vacuous: with the actor IDLE,
+    /// the very same unavailable model DOES produce the validation <see cref="ArgumentException"/>.
+    /// Without this control, "the streaming error was returned" could be explained by the model
+    /// simply never being validated on any path.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_WhenIdle_UnavailableModel_ProducesValidationError_ControlForStreamingGuard()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var catalog = new CountingCatalog(["model-a", "model-b"]);
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: "model-a",
+                availableModels: catalog);
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            service.CommitConnectedOnce();
+
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { });
+
+            try
+            {
+                actor.Start();
+
+                const string unavailableModel = "totally-unavailable-model";
+                var before = catalog.EnumerationCount;
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    unavailableModel, ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsFaulted);
+
+                // Idle ⇒ the guard passes and validation DOES run, faulting with ArgumentException.
+                var thrown = reply.Task.Exception!.InnerException!;
+                Assert.IsType<ArgumentException>(thrown);
+                Assert.Contains(unavailableModel, thrown.Message, StringComparison.Ordinal);
+                Assert.Contains("is not available", thrown.Message, StringComparison.Ordinal);
+
+                // And exactly ONE catalog snapshot was taken (validation ran once).
+                Assert.Equal(before + 1, catalog.EnumerationCount);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Marker: committed on non-late-cancelled success (NOT on a late-cancelled one); never
+    /// reset; marker-true not reclassified.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_LateCancelledSuccess_NoCommit_NoTruePublication()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // Gate the final success log: cancel AFTER the service has fully succeeded but
+            // BEFORE the actor classifies the outcome — a late cancellation.
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var gatedLogger = new GatedLogger("Composer connected", gate, releaseGate);
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                logger: gatedLogger,
+                availableModels: ["model-a", "model-b"]);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                using var cts = new CancellationTokenSource();
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.High, reply, cts.Token)));
+
+                // Wait until the connect has reached the gated final log — the service has
+                // fully succeeded by then.
+                await gate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+                Assert.True(service.IsConnected, "The service succeeded (connected) before the late cancel");
+
+                // Cancel AFTER service success, BEFORE actor classification.
+                cts.Cancel();
+                releaseGate.TrySetResult();
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsCanceled, "Late-cancelled selection must cancel the reply");
+
+                // A late-cancelled service-success neither commits the marker nor publishes true.
+                Assert.False(service.HasConnectedOnce,
+                    "A late-cancelled success must NOT commit the marker");
+                lock (loadedFlags)
+                {
+                    // The preliminary false fired (callback), the final must be false (cancel).
+                    Assert.Contains(false, loadedFlags);
+                    Assert.DoesNotContain(true, loadedFlags);
+                }
+            }
+            finally
+            {
+                releaseGate.TrySetResult();
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>Logger that gates (blocks) on a message fragment.</summary>
+    private sealed class GatedLogger(
+        string messageFragment,
+        TaskCompletionSource entered,
+        TaskCompletionSource release) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (formatter(state, exception).Contains(messageFragment, StringComparison.Ordinal))
+            {
+                entered.TrySetResult();
+                release.Task.GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Failed-connect connectivity: a forced post-client/agent-creation ConnectAsync failure
+    /// (via a selectively-throwing logger) leaves IsConnected false AND the marker false.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_PostCreationConnectFailure_LeavesDisconnected_MarkerFalse()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // The final success log runs AFTER client+agent creation. A logger that throws on
+            // "Composer connected" forces the POST-creation failure path.
+            var logger = new FragmentThrowingLogger(
+                "Composer connected",
+                new InvalidOperationException("final log boom"));
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: null!,
+                logger: logger,
+                availableModels: ["model-a"]);
+
+            // Observation point: the cleanup must dispose the agent it just created. Without
+            // this, "IsConnected == false" would also hold for a PRE-creation failure, so the
+            // new post-creation cleanup would not actually be the subject under test.
+            var agentDisposals = 0;
+            service.OnAgentDisposing = _ => Interlocked.Increment(ref agentDisposals);
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                actor.Start();
+
+                var reply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-a", ReasoningEffort.High, reply, CancellationToken.None)));
+
+                await AwaitSettledAsync(reply);
+                Assert.True(reply.Task.IsFaulted, "Post-creation failure must fault the reply");
+                Assert.Equal("final log boom", reply.Task.Exception!.InnerException!.Message);
+
+                // The new cleanup: a post-client/agent-creation failure leaves the Composer
+                // DISCONNECTED, and the marker stays false.
+                Assert.False(service.IsConnected,
+                    "A post-creation ConnectAsync failure must leave the Composer disconnected");
+                Assert.False(service.HasConnectedOnce, "A failed connect must NOT commit the marker");
+
+                // The failure really was POST-creation: the cleanup disposed the just-created
+                // agent (a pre-creation failure would leave this at 0).
+                Assert.Equal(1, Volatile.Read(ref agentDisposals));
+
+                // The failure happened AFTER the callback fired, so the publication protocol
+                // ran: preliminary false (callback), final false (failure).
+                lock (loadedFlags)
+                {
+                    Assert.NotEmpty(loadedFlags);
+                    Assert.False(loadedFlags[^1]);
+                }
+            }
+            finally
+            {
+                service.OnAgentDisposing = null;
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Mailbox ordering: a ComposerConnectMessage queued BEFORE a ComposerSelectModelMessage
+    /// runs the connect first — the selection then sees a TRUE marker (no second disk-load).
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_AfterQueuedConnect_SeesMarkerTrue_SwitchesWithoutReload()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: "model-a",
+                availableModels: ["model-a", "model-b"]);
+
+            var sessionBefore = service.Session;
+            sessionBefore.MessageHistory.Add(new ChatMessage(ChatRole.User, "original"));
+
+            var loadedFlags = new List<bool>();
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { },
+                onSessionLoaded: loaded => { lock (loadedFlags) loadedFlags.Add(loaded); });
+
+            try
+            {
+                // Enqueue BOTH before Start(): FIFO guarantees the connect runs first.
+                var connectReply = NewReply<bool>();
+                var selectReply = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerConnectMessage(connectReply, CancellationToken.None)));
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.Medium, selectReply, CancellationToken.None)));
+
+                actor.Start();
+
+                Assert.True(await AwaitReplyAsync(connectReply), "Connect must succeed");
+                Assert.True(service.HasConnectedOnce, "The connect handler must commit the marker");
+
+                await AwaitSettledAsync(selectReply);
+                Assert.True(selectReply.Task.IsCompletedSuccessfully, "Selection must succeed");
+
+                // The selection saw marker-true → switched (no second disk-load, session kept).
+                Assert.Equal("model-b", service.Model);
+                Assert.Same(sessionBefore, service.Session);
+                Assert.Equal("original", service.Session.MessageHistory[^1].Text);
+                Assert.True(service.IsConnected);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Marker never reset by a failed/rejected selection.
+    /// </summary>
+    [Fact]
+    public async Task SelectModel_MarkerNotReset_ByInvalidOrRejectedSelection()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new TextStreamingClient("hi"),
+                model: "model-a",
+                availableModels: ["model-a", "model-b"]);
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            service.CommitConnectedOnce(); // the actor's connect handler commits the marker
+            Assert.True(service.HasConnectedOnce, "A successful connect commits the marker");
+
+            var actor = CreateActor(
+                service,
+                _ => Task.CompletedTask,
+                _ => { },
+                _ => { },
+                () => { },
+                (_, _) => { },
+                _ => { },
+                () => { });
+
+            try
+            {
+                actor.Start();
+
+                // Invalid selection (marker-true path): validation error, marker still true.
+                var reply1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "no-such-model", ReasoningEffort.High, reply1, CancellationToken.None)));
+                await AwaitSettledAsync(reply1);
+                Assert.True(reply1.Task.IsFaulted);
+                Assert.True(service.HasConnectedOnce, "An invalid selection must not reset the marker");
+                Assert.Equal("model-a", service.Model);
+
+                // Pre-cancelled marker-true selection: reply cancelled, marker still true.
+                using var cts = new CancellationTokenSource();
+                cts.Cancel();
+                var reply2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Assert.True(actor.Tell(new ComposerSelectModelMessage(
+                    "model-b", ReasoningEffort.High, reply2, cts.Token)));
+                await AwaitSettledAsync(reply2);
+                Assert.True(reply2.Task.IsCanceled);
+                Assert.True(service.HasConnectedOnce, "A cancelled selection must not reset the marker");
+                Assert.Equal("model-a", service.Model);
+            }
+            finally
+            {
+                await actor.DisposeAsync();
+                await service.DisposeAsync();
+            }
+        }
+        finally
+        {
             TryDeleteDir(stateDir);
         }
     }

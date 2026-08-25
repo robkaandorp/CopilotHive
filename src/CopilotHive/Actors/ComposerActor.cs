@@ -131,7 +131,11 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                         // The service's flag is only true when a session was actually loaded
                         // from disk AND the whole connection succeeded — mirror it into the
                         // facade, before the reply so the caller observes it in actor order.
+                        // This non-late-cancelled success also commits the ever-connected
+                        // marker: a later in-session model switch must NOT re-run the
+                        // session-load/publication.
                         TryInvoke(() => _onSessionLoaded(_agentService.SessionLoadedFromDisk), nameof(_onSessionLoaded));
+                        _agentService.CommitConnectedOnce();
                         m.Reply.TrySetResult(true);
                     }
                 }
@@ -252,6 +256,101 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 catch (Exception ex)
                 {
                     m.Reply.TrySetException(ex);
+                }
+                break;
+
+            case ComposerSelectModelMessage m:
+                // 1. Streaming rejection FIRST — before any validation/mutation. The facade
+                //    no longer pre-checks; the actor is the SOLE authority.
+                if (_isStreaming)
+                {
+                    m.Reply.TrySetException(new InvalidOperationException("Cannot switch model while streaming."));
+                    break;
+                }
+
+                // 2. Read the ever-connected marker AT HANDLING TIME (mailbox-ordered).
+                if (_agentService.HasConnectedOnce)
+                {
+                    // 3. Marker TRUE → validate ONCE → SwitchModelAsync(selection, ct)
+                    //    (no re-validation; identical switch behavior: teardown→apply→create→
+                    //    register; an invalid selection propagates the validation error with
+                    //    NO _onSessionLoaded publication).
+                    try
+                    {
+                        var selection = _agentService.ValidateAvailableModel(m.Model, m.ReasoningEffort);
+                        await _agentService.SwitchModelAsync(selection, m.Ct);
+                        m.Reply.TrySetResult();
+                    }
+                    catch (OperationCanceledException) when (m.Ct.IsCancellationRequested)
+                    {
+                        m.Reply.TrySetCanceled(m.Ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        m.Reply.TrySetException(ex);
+                    }
+                }
+                else
+                {
+                    // 4. Marker FALSE → first-selection connect. Publication mirrors the
+                    //    connect handler: invalid selection or a pre-cancelled request →
+                    //    propagate, publish NOTHING; the connect attempt begins (the callback
+                    //    fired) → preliminary _onSessionLoaded(false), then the connect runs,
+                    //    then read SessionLoadedFromDisk and publish the final state
+                    //    (false fresh / true disk-loaded) + CommitConnectedOnce() on a
+                    //    non-late-cancelled success; failure/cancel → publish false, no commit.
+                    //
+                    // The publication BOUNDARY is the onValidatedAboutToConnect callback:
+                    // BEFORE it (validation / checkpoint-cancel / apply-failure) ⇒ publish
+                    // NOTHING; AT/AFTER it ⇒ follow the connect publication protocol.
+                    // The callback runs synchronously on this (mailbox) thread, so the local
+                    // flag is race-free.
+                    var callbackFired = false;
+                    try
+                    {
+                        await _agentService.ConnectFirstSelectionAsync(
+                            m.Model,
+                            m.ReasoningEffort,
+                            onValidatedAboutToConnect: () =>
+                            {
+                                callbackFired = true;
+                                TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                            },
+                            m.Ct);
+
+                        if (m.Ct.IsCancellationRequested)
+                        {
+                            // Late cancellation: the service succeeded but the caller asked to
+                            // abandon this connection — neither commits the marker nor
+                            // publishes true.
+                            TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                            m.Reply.TrySetCanceled(m.Ct);
+                        }
+                        else
+                        {
+                            // Non-late-cancelled success: publish the final session-load state
+                            // (mirroring the connect handler) and commit the marker.
+                            TryInvoke(() => _onSessionLoaded(_agentService.SessionLoadedFromDisk), nameof(_onSessionLoaded));
+                            _agentService.CommitConnectedOnce();
+                            m.Reply.TrySetResult();
+                        }
+                    }
+                    catch (OperationCanceledException) when (m.Ct.IsCancellationRequested)
+                    {
+                        // Checkpoint cancel (pre-callback) ⇒ publish NOTHING; a cancellation
+                        // observed during the connect attempt (post-callback) ⇒ publish false.
+                        if (callbackFired)
+                            TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                        m.Reply.TrySetCanceled(m.Ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Apply-failure (pre-callback) ⇒ publish NOTHING; a connect failure
+                        // (post-callback) ⇒ publish false.
+                        if (callbackFired)
+                            TryInvoke(() => _onSessionLoaded(false), nameof(_onSessionLoaded));
+                        m.Reply.TrySetException(ex);
+                    }
                 }
                 break;
 
@@ -685,6 +784,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerConnectMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerResetSessionMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerSwitchModelMessage m: m.Reply.TrySetCanceled(); break;
+            case ComposerSelectModelMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerCompactMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerCompactPartialMessage m: m.Reply.TrySetCanceled(); break;
             case ComposerSubmitAnswerMessage: break; // fire-and-forget — no reply to cancel
@@ -702,6 +802,7 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
             case ComposerConnectMessage m: m.Reply.TrySetException(ex); break;
             case ComposerResetSessionMessage m: m.Reply.TrySetException(ex); break;
             case ComposerSwitchModelMessage m: m.Reply.TrySetException(ex); break;
+            case ComposerSelectModelMessage m: m.Reply.TrySetException(ex); break;
             case ComposerCompactMessage m: m.Reply.TrySetException(ex); break;
             case ComposerCompactPartialMessage m: m.Reply.TrySetException(ex); break;
             case ComposerSubmitAnswerMessage:
