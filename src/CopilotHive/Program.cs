@@ -185,27 +185,89 @@ public sealed class Program
             builder.Services.AddSingleton(sp =>
                 new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
 
-            // Brain: direct LLM connection via SharpCoder
-            var brainModel = Environment.GetEnvironmentVariable("BRAIN_MODEL");
-            var brainContextWindowEnv = Environment.GetEnvironmentVariable("BRAIN_CONTEXT_WINDOW");
-            var brainMaxStepsEnv = Environment.GetEnvironmentVariable("BRAIN_MAX_STEPS");
+            // HiveConfigFile: ALWAYS registered so GetService<HiveConfigFile>() is never null —
+            // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>
+            // never exposes both a false- and true-provenance instance. When no config repo is
+            // configured, the fallback singleton has an EMPTY Orchestrator.Model (via
+            // OrchestratorConfig.CreateEmptyModelFallback) so the Brain is NOT registered (Slice 2:
+            // the Brain gate below requires a non-blank orchestrator model) and the Composer
+            // registers as a disconnected shell (resolver-only — the fallback's empty orchestrator
+            // model yields no Composer default).
+            HiveConfigFile hiveConfigFile;
+            if (!string.IsNullOrEmpty(configRepoUrl))
+            {
+                var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
+                await configRepo.SyncRepoAsync();
+                hiveConfigFile = await configRepo.LoadConfigAsync();
+
+                builder.Services.AddSingleton(configRepo);
+                builder.Services.AddSingleton(hiveConfigFile);
+
+                // Knowledge graph: load from config repo on startup
+                var knowledgeGraph = new KnowledgeGraph(configRepo, null /* logger resolved later */);
+                try
+                {
+                    await knowledgeGraph.ReloadFromConfigRepoAsync(configRepo.LocalPath);
+                }
+                catch (Exception)
+                {
+                    // Best-effort: graph starts empty if knowledge/ directory doesn't exist yet
+                }
+                builder.Services.AddSingleton(knowledgeGraph);
+                builder.Services.AddSingleton<KnowledgeDocumentCleanupService>();
+
+                builder.Services.AddSingleton<ConfigModelService>();
+                builder.Services.AddSingleton<ModelDiscoveryService>();
+                builder.Services.AddSingleton(sp => new ReleaseExecutionService(
+                    sp.GetRequiredService<IGoalStore>(), hiveConfigFile,
+                    sp.GetRequiredService<IBrainRepoManager>(),
+                    sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
+
+                // Startup sweep of stale progress/review knowledge documents.
+                // Registered even when knowledgeGraph is null — the service handles
+                // a null graph gracefully by returning 0 from all methods.
+                builder.Services.AddSingleton(sp => new KnowledgeDocumentCleanupService(
+                    knowledgeGraph, sp.GetRequiredService<ILogger<KnowledgeDocumentCleanupService>>()));
+
+                // Enable debug logging if verbose_logging is set in config
+                if (hiveConfigFile.Orchestrator.VerboseLogging)
+                {
+                    builder.Logging.SetMinimumLevel(LogLevel.Debug);
+                    // Keep framework noise suppressed even in verbose mode
+                    builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
+                    builder.Logging.AddFilter("Grpc", LogLevel.Warning);
+                }
+            }
+            else
+            {
+                // No config repo: the single HiveConfigFile is the empty fallback.
+                hiveConfigFile = new HiveConfigFile
+                {
+                    Orchestrator = OrchestratorConfig.CreateEmptyModelFallback()
+                };
+                builder.Services.AddSingleton(hiveConfigFile);
+            }
+
+            // Brain: direct LLM connection via SharpCoder. Registered ONLY when the parsed config
+            // declares an orchestrator model (Slice 2 — config-driven registration; BRAIN_MODEL no
+            // longer gates or seeds the Brain, and BRAIN_CONTEXT_WINDOW/BRAIN_MAX_STEPS no longer
+            // override the config). When unconfigured, IDistributedBrain is NOT registered at all:
+            // GetService<IDistributedBrain>() returns null and consumers (GoalDispatcher, dashboard,
+            // etc.) degrade gracefully.
             var ollamaApiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
-            if (!string.IsNullOrEmpty(brainModel))
+            if (!string.IsNullOrWhiteSpace(hiveConfigFile.Orchestrator.Model))
             {
                 builder.Services.AddSingleton<IDistributedBrain>(sp =>
                 {
-                    var config = sp.GetService<HiveConfigFile>();
-                    // Config file model takes precedence over env var default
-                    var effectiveModel = !string.IsNullOrEmpty(config?.Orchestrator.Model)
-                        ? config.Orchestrator.Model
-                        : brainModel;
-                    var maxCtx = int.TryParse(brainContextWindowEnv, out var envCtx)
-                        ? envCtx
-                        : config?.TryGetContextWindowForModel(effectiveModel)
+                    var config = sp.GetRequiredService<HiveConfigFile>();
+                    // The Brain's model is the parsed config.Orchestrator.Model (effective value —
+                    // the registration gate above guarantees it is non-blank). The context window
+                    // comes from the model catalog when the model has one, else the default; max
+                    // steps come straight from orchestrator.brain_max_steps (a non-nullable int).
+                    var effectiveModel = config.Orchestrator.Model;
+                    var maxCtx = config.TryGetContextWindowForModel(effectiveModel)
                         ?? Constants.DefaultBrainContextWindow;
-                    var maxSteps = int.TryParse(brainMaxStepsEnv, out var envSteps)
-                        ? envSteps
-                        : config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
+                    var maxSteps = config.Orchestrator.BrainMaxSteps;
 
                     return new DistributedBrain(effectiveModel, sp.GetRequiredService<ILogger<DistributedBrain>>(),
                         sp.GetRequiredService<MetricsTracker>(),
@@ -215,13 +277,13 @@ public sealed class Program
                         sp.GetService<IBrainRepoManager>(),
                         stateDir,
                         sp.GetRequiredService<IGoalStore>(),
-                        compactionModel: config?.Models?.CompactionModel,
+                        compactionModel: config.Models?.CompactionModel,
                         knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                         hiveConfig: config,
                         sessionRegistry: sp.GetService<LlmSessionRegistry>(),
                         configRepo: sp.GetService<ConfigRepoManager>(),
                         reasoningEffort: ParseConfiguredReasoningEffort(
-                            config?.Orchestrator?.ReasoningEffort,
+                            config.Orchestrator.ReasoningEffort,
                             "orchestrator.reasoning_effort",
                             sp.GetService<ILogger<DistributedBrain>>()),
                         issueStore: sp.GetService<IIssueStore>(),
@@ -345,7 +407,7 @@ public sealed class Program
                 // ONE resolution of the Composer's default model (Slice 1A1 resolver): the
                 // resolved value is used BOTH for construction and (via Composer.StartupDefaultModel)
                 // for the startup-connect gate. No fall-through to orchestrator.model /
-                // BRAIN_MODEL / Constants.DefaultWorkerModel — resolver-only construction.
+                // Constants.DefaultWorkerModel — resolver-only construction.
                 var resolvedDefault = config.ResolveComposerDefaultModel();
 
                 var maxCtx = resolvedDefault is not null
@@ -489,67 +551,6 @@ public sealed class Program
             builder.Services.AddDataProtection()
                 .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(stateDir, "keys")));
 
-            // HiveConfigFile: ALWAYS registered so GetService<HiveConfigFile>() is never null —
-            // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>
-            // never exposes both a false- and true-provenance instance. When no config repo is
-            // configured, the fallback singleton has an EMPTY Orchestrator.Model (via
-            // OrchestratorConfig.CreateEmptyModelFallback) so it does NOT override BRAIN_MODEL for
-            // the Brain (line 199). The Composer's model is resolver-only (ResolveComposerDefaultModel
-            // against the global catalog) — the fallback's empty orchestrator model yields no
-            // Composer default, so the Composer registers as a disconnected shell.
-            if (!string.IsNullOrEmpty(configRepoUrl))
-            {
-                var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
-                await configRepo.SyncRepoAsync();
-                var hiveConfigFile = await configRepo.LoadConfigAsync();
-
-                builder.Services.AddSingleton(configRepo);
-                builder.Services.AddSingleton(hiveConfigFile);
-
-                // Knowledge graph: load from config repo on startup
-                var knowledgeGraph = new KnowledgeGraph(configRepo, null /* logger resolved later */);
-                try
-                {
-                    await knowledgeGraph.ReloadFromConfigRepoAsync(configRepo.LocalPath);
-                }
-                catch (Exception)
-                {
-                    // Best-effort: graph starts empty if knowledge/ directory doesn't exist yet
-                }
-                builder.Services.AddSingleton(knowledgeGraph);
-                builder.Services.AddSingleton<KnowledgeDocumentCleanupService>();
-
-                builder.Services.AddSingleton<ConfigModelService>();
-                builder.Services.AddSingleton<ModelDiscoveryService>();
-                builder.Services.AddSingleton(sp => new ReleaseExecutionService(
-                    sp.GetRequiredService<IGoalStore>(), hiveConfigFile,
-                    sp.GetRequiredService<IBrainRepoManager>(),
-                    sp.GetRequiredService<ILogger<ReleaseExecutionService>>()));
-
-                // Startup sweep of stale progress/review knowledge documents.
-                // Registered even when knowledgeGraph is null — the service handles
-                // a null graph gracefully by returning 0 from all methods.
-                builder.Services.AddSingleton(sp => new KnowledgeDocumentCleanupService(
-                    knowledgeGraph, sp.GetRequiredService<ILogger<KnowledgeDocumentCleanupService>>()));
-
-                // Enable debug logging if verbose_logging is set in config
-                if (hiveConfigFile.Orchestrator.VerboseLogging)
-                {
-                    builder.Logging.SetMinimumLevel(LogLevel.Debug);
-                    // Keep framework noise suppressed even in verbose mode
-                    builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
-                    builder.Logging.AddFilter("Grpc", LogLevel.Warning);
-                }
-            }
-            else
-            {
-                // No config repo: the single HiveConfigFile is the empty fallback.
-                builder.Services.AddSingleton(new HiveConfigFile
-                {
-                    Orchestrator = OrchestratorConfig.CreateEmptyModelFallback()
-                });
-            }
-
             // Knowledge document cleanup: best-effort deletion of transient progress/review
             // docs for released goals. Registered unconditionally — the KnowledgeGraph is
             // resolved lazily and may be null when no config repo is configured.
@@ -656,38 +657,35 @@ public sealed class Program
             SharpCoder.Providers.ChatClientFactory.SetTokenProvider(() =>
                 userService.GetActiveAccessTokenAsync(CancellationToken.None).GetAwaiter().GetResult());
 
-            if (!string.IsNullOrEmpty(brainModel))
-                logger.LogInformation("Brain enabled — model: {BrainModel}", brainModel);
+            // Brain registration is config-driven (Slice 2): enabled exactly when the parsed
+            // hive-config declares a non-blank orchestrator.model.
+            if (!string.IsNullOrWhiteSpace(hiveConfigFile.Orchestrator.Model))
+                logger.LogInformation("Brain enabled — model: {BrainModel}", hiveConfigFile.Orchestrator.Model);
             else
-                logger.LogWarning("Brain disabled — running in mechanical mode (no BRAIN_MODEL set)");
+                logger.LogWarning("Brain disabled — no brain model configured in hive-config.yaml");
 
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
-                var configRepo = app.Services.GetService<ConfigRepoManager>();
-                var hiveConfigFile = app.Services.GetService<HiveConfigFile>();
                 logger.LogInformation("Synced config repo from {ConfigRepoUrl}", configRepoUrl);
-                if (hiveConfigFile is not null)
+                logger.LogInformation(
+                    "Config loaded: {RepoCount} repo(s), {WorkerConfigCount} worker config(s)",
+                    hiveConfigFile.Repositories.Count, hiveConfigFile.Workers.Count);
+                if (hiveConfigFile.Orchestrator.VerboseLogging)
+                    logger.LogDebug("Verbose logging enabled (Debug level)");
+
+                // Startup-only validation: every model assignment must carry an explicit,
+                // valid reasoning effort. Dynamic reloads (DispatcherMaintenance.ReloadFrom)
+                // intentionally do not re-validate.
+                var reasoningErrors = hiveConfigFile.ValidateReasoningEffort();
+                if (reasoningErrors.Count > 0)
                 {
-                    logger.LogInformation(
-                        "Config loaded: {RepoCount} repo(s), {WorkerConfigCount} worker config(s)",
-                        hiveConfigFile.Repositories.Count, hiveConfigFile.Workers.Count);
-                    if (hiveConfigFile.Orchestrator.VerboseLogging)
-                        logger.LogDebug("Verbose logging enabled (Debug level)");
+                    foreach (var error in reasoningErrors)
+                        await Console.Error.WriteLineAsync($"Config validation error — {error}");
 
-                    // Startup-only validation: every model assignment must carry an explicit,
-                    // valid reasoning effort. Dynamic reloads (DispatcherMaintenance.ReloadFrom)
-                    // intentionally do not re-validate.
-                    var reasoningErrors = hiveConfigFile.ValidateReasoningEffort();
-                    if (reasoningErrors.Count > 0)
-                    {
-                        foreach (var error in reasoningErrors)
-                            await Console.Error.WriteLineAsync($"Config validation error — {error}");
-
-                        throw new InvalidOperationException(
-                            "Invalid hive configuration: reasoning effort validation failed:"
-                            + Environment.NewLine
-                            + string.Join(Environment.NewLine, reasoningErrors));
-                    }
+                    throw new InvalidOperationException(
+                        "Invalid hive configuration: reasoning effort validation failed:"
+                        + Environment.NewLine
+                        + string.Join(Environment.NewLine, reasoningErrors));
                 }
 
                 // Startup sweep: remove stale progress/review knowledge documents whose

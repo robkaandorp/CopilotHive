@@ -1,7 +1,9 @@
 using System.Reflection;
 
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Orchestration;
+using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -10,10 +12,12 @@ using Microsoft.Extensions.DependencyInjection;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Slice 1A1 Program.cs registration tests: a <see cref="HiveConfigFile"/> singleton is ALWAYS
+/// Slice 1A1/2 Program.cs registration tests: a <see cref="HiveConfigFile"/> singleton is ALWAYS
 /// registered (even when <c>--config-repo</c> is empty), the no-repo fallback carries an EMPTY
 /// <see cref="OrchestratorConfig.Model"/> (never <see cref="Constants.DefaultWorkerModel"/>), and
-/// the Brain/Composer model chains behave exactly as before the always-registration change.
+/// the Brain registration is config-driven (Slice 2): with the empty fallback model the Brain is
+/// NOT registered at all — <c>BRAIN_MODEL</c> no longer gates or seeds it. The Composer stays
+/// resolver-only and registers as a disconnected shell.
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ConfigRegistrationTests : IDisposable
@@ -81,19 +85,43 @@ public sealed class ConfigRegistrationTests : IDisposable
     }
 
     [Fact]
-    public void NoConfigRepo_BrainEffectiveModel_IsEnvBrainModel_NotDefaultWorkerModel()
+    public void NoConfigRepo_BrainNotRegistered_GetServiceReturnsNull_EnvHasNoEffect()
     {
-        var brain = _factory.Services.GetRequiredService<IDistributedBrain>();
+        // BRAIN_MODEL is set (class ctor) — Slice 2: the env var no longer gates or seeds the
+        // Brain. With the no-config-repo fallback's EMPTY Orchestrator.Model the Brain must NOT
+        // be registered at all, so GetService<IDistributedBrain>() returns null.
+        var brain = _factory.Services.GetService<IDistributedBrain>();
 
-        var modelField = typeof(DistributedBrain).GetField(
-                "_modelOverride", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("_modelOverride field not found on DistributedBrain");
-        var model = (string)modelField.GetValue(brain)!;
+        Assert.Null(brain);
+    }
 
-        // With the fallback's Orchestrator.Model empty, the Brain factory falls through
-        // to the env BRAIN_MODEL — exactly as before the always-registered fallback.
-        Assert.Equal(EnvBrainModel, model);
-        Assert.NotEqual(Constants.DefaultWorkerModel, model);
+    [Fact]
+    public void NoConfigRepo_NoBrain_ConsumersDegradeGracefully()
+    {
+        // With no Brain registered, consumers that take IDistributedBrain as an OPTIONAL
+        // constructor parameter resolve normally with a null Brain (no crash, no DI failure).
+        var dispatcher = _factory.Services.GetService<GoalDispatcher>();
+
+        Assert.NotNull(dispatcher);
+
+        var brainField = typeof(GoalDispatcher).GetField("_brain", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_brain field not found on GoalDispatcher");
+        Assert.Null(brainField.GetValue(dispatcher));
+    }
+
+    [Fact]
+    public void NoConfigRepo_StartupLog_BrainDisabled_NoModelConfigured()
+    {
+        // Startup logging: with no config repo (empty model fallback) the Brain is disabled and
+        // Program.cs must log the config-driven disable message (no BRAIN_MODEL-based message).
+        var logs = _factory.Services.GetRequiredService<DashboardLogSink>()
+            .GetRecent(int.MaxValue)
+            .Select(e => e.Message)
+            .ToList();
+
+        Assert.Contains(logs, m => m.Contains(
+            "Brain disabled — no brain model configured in hive-config.yaml", StringComparison.Ordinal));
+        Assert.DoesNotContain(logs, m => m.Contains("BRAIN_MODEL", StringComparison.Ordinal));
     }
 
     [Fact]
