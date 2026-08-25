@@ -26,14 +26,12 @@ public static class ComposerHub
 
         routes.MapGet("/api/composer/models", () =>
         {
-            var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
-                ? available.Select(m => m.Name).ToList()
-                : null;
-            // The reasoning effort is serialized snake_case by the global JSON enum converter
-            // (e.g. ReasoningEffort.ExtraHigh → "extra_high").
+            // The Composer's normalised catalog is the sole authority for listing: it reads
+            // GetComposerAvailableModels() (trimmed, deduplicated) when a config is present,
+            // so listed models are IDENTICAL to what SwitchModelAsync validates.
             return Results.Ok(new
             {
-                models = globalModelNames ?? composer.AvailableModels,
+                models = composer.AvailableModels,
                 reasoningEffort = composer.ReasoningEffort,
             });
         });
@@ -61,10 +59,9 @@ public static class ComposerHub
 
             try
             {
-                var globalModelNames = config?.Models?.AvailableModels is { Count: > 0 } available
-                    ? available.Select(m => m.Name).ToList()
-                    : null;
-                var validModels = globalModelNames ?? composer.AvailableModels.ToList();
+                // The Composer's normalised catalog is the sole authority for switch
+                // validation — identical to what backend SwitchModelAsync validates.
+                var validModels = composer.AvailableModels.ToList();
                 if (!validModels.Contains(model, StringComparer.OrdinalIgnoreCase))
                 {
                     throw new ArgumentException(

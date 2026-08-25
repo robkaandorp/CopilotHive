@@ -387,11 +387,19 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         """;
 
     /// <summary>
+    /// The single resolved default model for this Composer, computed ONCE by the DI factory
+    /// (Slice 1A1 resolver) and shared between construction and the startup-connect gate.
+    /// <c>null</c> when no valid default exists (composer.model unset, set-but-absent from the
+    /// global catalog, or whitespace-only) — the Composer then registers as a disconnected shell.
+    /// </summary>
+    public string? StartupDefaultModel { get; }
+
+    /// <summary>
     /// Initialises a new <see cref="Composer"/> that connects to an LLM provider
     /// and uses the given goal store for CRUD operations.
     /// </summary>
     public Composer(
-        string model,
+        string? model,
         ILogger<Composer> logger,
         IGoalStore goalStore,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
@@ -416,6 +424,11 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         ComposerEventSubscriber? eventSubscriber = null,
         IEventBus? eventBus = null)
     {
+        // Constructor normalization: null/whitespace model ⇒ null (no model configured).
+        // The Composer then registers as a disconnected shell — no client, IsConnected false.
+        var effectiveModel = string.IsNullOrWhiteSpace(model) ? null : model;
+        StartupDefaultModel = effectiveModel;
+
         _logger = logger;
         _goalStore = goalStore;
         _repoManager = repoManager;
@@ -477,13 +490,15 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         _composerTools = BuildComposerTools();
 
         _agentService = new ComposerAgentService(
-            model, maxContextTokens, maxSteps, _configuredReasoningEffort,
+            effectiveModel, maxContextTokens, maxSteps, _configuredReasoningEffort,
             _hiveConfig, _systemPrompt, _composerTools,
             _repoManager, _stateDir,
             compactionModel, _logger,
             chatClientFactory,
             _sessionRegistry,
-            (availableModels?.ToList() ?? [model]).AsReadOnly(),
+            // Startup catalog: when no model is configured, never fabricate a [null] entry —
+            // the catalog is EMPTY unless the caller supplied one.
+            (availableModels?.ToList() ?? (effectiveModel is null ? [] : [effectiveModel])).AsReadOnly(),
             () =>
             {
                 IsCompacting = true;
@@ -609,9 +624,15 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             : session.EstimatedContextTokens;
         var usagePct = maxContextTokens > 0 ? (int)(contextTokens * 100.0 / maxContextTokens) : 0;
 
+        // The agent exists only in the connected state, where the model is guaranteed
+        // non-null (a no-model Composer never creates an agent). Guard explicitly so the
+        // nullable model never feeds the non-null BrainStats.Model — no null-forgiving.
+        var model = _agentService.Model
+            ?? throw new InvalidOperationException("Composer connected without a model.");
+
         return new BrainStats
         {
-            Model = _agentService.Model,
+            Model = model,
             MessageCount = session.MessageHistory.Count,
             ContextTokens = contextTokens,
             MaxContextTokens = maxContextTokens,
@@ -882,11 +903,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Refreshes the <c>composer</c> registry entry with the current session tokens and status.</summary>
     private void RefreshComposerRegistry(string status = "idle", long? currentTokens = null)
     {
+        // With no active model the Composer is a disconnected shell: do NOT write a registry
+        // entry carrying a null model — LlmSessionInfo.Model is non-null by contract.
+        var model = _agentService.Model;
+        if (model is null)
+            return;
+
         _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
         {
             SessionId = "composer",
             SessionType = LlmSessionType.Composer,
-            Model = _agentService.Model,
+            Model = model,
             Status = status,
             CurrentTokens = currentTokens ?? _agentService.Session.EstimatedContextTokens,
             MaxTokens = _agentService.MaxContextTokens,

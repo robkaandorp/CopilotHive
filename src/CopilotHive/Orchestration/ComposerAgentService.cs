@@ -18,7 +18,7 @@ namespace CopilotHive.Orchestration;
 /// the persistent <see cref="AgentSession"/>, and the <see cref="AgentOptions"/> used to build them.
 /// </summary>
 internal sealed class ComposerAgentService(
-    string model,
+    string? model,
     int maxContextTokens,
     int maxSteps,
     ReasoningEffort? configuredReasoningEffort,
@@ -38,7 +38,7 @@ internal sealed class ComposerAgentService(
     IReadOnlyList<ModelEntry> subAgentModels,
     string? additionalImagesRoot = null) : IAsyncDisposable
 {
-    private string _model = model;
+    private string? _model = string.IsNullOrWhiteSpace(model) ? null : model;
     private int _maxContextTokens = maxContextTokens;
     private readonly int _maxSteps = maxSteps;
     /// <summary>
@@ -159,8 +159,8 @@ internal sealed class ComposerAgentService(
     /// </summary>
     public bool SessionLoadedFromDisk => _sessionLoadedFromDisk;
 
-    /// <summary>The current model identifier.</summary>
-    public string Model => _model;
+    /// <summary>The current model identifier, or <c>null</c> when no model is configured.</summary>
+    public string? Model => _model;
 
     /// <summary>The current maximum context window in tokens.</summary>
     public int MaxContextTokens => _maxContextTokens;
@@ -171,10 +171,16 @@ internal sealed class ComposerAgentService(
     /// <summary>The current reasoning effort, if any.</summary>
     public ReasoningEffort? ReasoningEffort => _reasoningEffort;
 
-    /// <summary>Models the Composer can switch between at runtime.</summary>
+    /// <summary>
+    /// Models the Composer can switch between at runtime. Reads the normalized catalog from
+    /// <see cref="HiveConfigFile.GetComposerAvailableModels"/> when a config is present (sole
+    /// authority — an empty global list yields an EMPTY catalog, never a fallback). When no
+    /// config is present (direct test construction only), the constructor-provided startup
+    /// catalog is used.
+    /// </summary>
     public IReadOnlyList<string> AvailableModels =>
-        _hiveConfig?.Models?.AvailableModels is { Count: > 0 } available
-            ? available.Select(m => m.Name).ToList().AsReadOnly()
+        _hiveConfig is not null
+            ? _hiveConfig.GetComposerAvailableModels()
             : _startupAvailableModels;
 
     private IChatClient CreateClient(string modelId) => (_chatClientFactory ?? ChatClientFactory.Create)(modelId);
@@ -340,7 +346,17 @@ internal sealed class ComposerAgentService(
         // succeeded", so every invocation starts from `false` with nothing able to run first.
         _sessionLoadedFromDisk = false;
 
-        _logger.LogInformation("Composer connecting with model '{Model}'…", _model);
+        // No-model guard: a Composer constructed without a configured model is a disconnected
+        // shell. Connecting without a model is a configuration error, not a runtime fallback.
+        if (_model is null)
+            throw new InvalidOperationException("no model configured");
+
+        // Non-null local established by the guard above — used for every downstream feed
+        // (client creation, registry assignment) so the nullable field never reaches a
+        // non-null DTO.
+        var model = _model;
+
+        _logger.LogInformation("Composer connecting with model '{Model}'…", model);
 
         // Reconnect: dispose old agent + clients. Operation-failure cleanup via SafeDispose in
         // catch blocks logs failures.
@@ -348,7 +364,7 @@ internal sealed class ComposerAgentService(
 
         try
         {
-            _chatClient = CreateClient(_model);
+            _chatClient = CreateClient(model);
             if (!string.IsNullOrEmpty(_compactionModel))
                 _compactionChatClient = CreateClient(_compactionModel);
         }
@@ -415,7 +431,7 @@ internal sealed class ComposerAgentService(
         {
             SessionId = "composer",
             SessionType = LlmSessionType.Composer,
-            Model = _model,
+            Model = model,
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,
@@ -423,7 +439,7 @@ internal sealed class ComposerAgentService(
         });
 
         _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
-            _model, _maxContextTokens);
+            model, _maxContextTokens);
 
         // Commit last: reaching this point means the session was loaded from disk AND the whole
         // connection succeeded. Every earlier exit path leaves the field at the `false` set at
@@ -493,7 +509,7 @@ internal sealed class ComposerAgentService(
         {
             SessionId = "composer",
             SessionType = LlmSessionType.Composer,
-            Model = _model,
+            Model = newModel,
             Status = "idle",
             CurrentTokens = _session.EstimatedContextTokens,
             MaxTokens = _maxContextTokens,

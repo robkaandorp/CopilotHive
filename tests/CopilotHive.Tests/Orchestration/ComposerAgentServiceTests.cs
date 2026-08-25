@@ -140,6 +140,303 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── Disconnected shell: nullable model, no-model connect guard (Slice 1A2a) ──
+
+    /// <summary>
+    /// A <see cref="Func{T, TResult}"/> chat-client factory that COUNTS its invocations, so a
+    /// test can prove no LLM client was ever created — not merely that the final field is null.
+    /// A regression that calls the factory and discards the client would still be caught.
+    /// </summary>
+    private sealed class CountingChatClientFactory
+    {
+        private int _invocations;
+        private readonly List<string> _requestedModels = [];
+        private readonly object _lock = new();
+
+        /// <summary>Number of times the factory delegate was invoked.</summary>
+        public int Invocations => Volatile.Read(ref _invocations);
+
+        /// <summary>The model identifiers the factory was asked to create clients for.</summary>
+        public IReadOnlyList<string> RequestedModels
+        {
+            get { lock (_lock) { return _requestedModels.ToList(); } }
+        }
+
+        /// <summary>The delegate to hand to the service under test.</summary>
+        public Func<string, IChatClient> Delegate => modelId =>
+        {
+            Interlocked.Increment(ref _invocations);
+            lock (_lock) { _requestedModels.Add(modelId); }
+            return new Mock<IChatClient>().Object;
+        };
+    }
+
+    [Fact]
+    public async Task ConnectAsync_NoModel_ThrowsNoModelConfigured_ClientFactoryNeverInvoked()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!);
+
+            // Construction alone must never create a client.
+            Assert.Equal(0, factory.Invocations);
+
+            // No model configured → connect throws a clear error.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("no model configured", ex.Message);
+
+            // The authoritative no-client assertion: the factory was NEVER invoked, so no LLM
+            // client was created (and then discarded) anywhere along the path.
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+
+            Assert.False(service.IsConnected);
+            Assert.Null(GetField<IChatClient>(service, "_chatClient"));
+            Assert.Null(GetField<IChatClient>(service, "_compactionChatClient"));
+            Assert.Null(GetField<CodingAgent>(service, "_agent"));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WhitespaceModel_ThrowsNoModelConfigured_ClientFactoryNeverInvoked()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: "   ");
+
+            Assert.Equal(0, factory.Invocations);
+
+            // Whitespace model normalizes to null → connect throws a clear error.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("no model configured", ex.Message);
+
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+
+            Assert.False(service.IsConnected);
+            Assert.Null(GetField<IChatClient>(service, "_chatClient"));
+            Assert.Null(GetField<IChatClient>(service, "_compactionChatClient"));
+            Assert.Null(GetField<CodingAgent>(service, "_agent"));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Even with a compaction model configured, the no-model guard runs BEFORE any client
+    /// creation — neither the main nor the compaction client is ever built.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_NoModel_WithCompactionModel_ClientFactoryNeverInvoked()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                compactionModel: "compaction-model");
+
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+
+            // NEITHER the main nor the compaction client may be created.
+            Assert.Equal(0, factory.Invocations);
+            Assert.DoesNotContain("compaction-model", factory.RequestedModels);
+            Assert.Null(GetField<IChatClient>(service, "_compactionChatClient"));
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Control test proving the counting factory actually observes client creation: with a
+    /// configured model, <c>ConnectAsync</c> DOES invoke the factory. Without this, a factory
+    /// that is never wired up would make the zero-invocation assertions vacuous.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_WithModel_ClientFactoryInvokedForThatModel()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: "configured-model");
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+            Assert.True(service.IsConnected);
+            Assert.Equal(1, factory.Invocations);
+            Assert.Equal(["configured-model"], factory.RequestedModels);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public void Model_WithNullModel_IsNull()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(stateDir, model: null!);
+            Assert.Null(service.Model);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public void Model_WithWhitespaceModel_IsNull()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var service = CreateService(stateDir, model: " \t ");
+            Assert.Null(service.Model);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public void AvailableModels_NoModel_StartupCatalogEmpty_NoNullEntry()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // No model and no startup catalog → EMPTY catalog, never a [null] entry.
+            var service = CreateService(
+                stateDir,
+                model: null!,
+                startupAvailableModels: []);
+
+            Assert.Empty(service.AvailableModels);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_NoModel_RegistryNotWritten()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var service = CreateService(
+                stateDir,
+                model: null!,
+                sessionRegistry: registry);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+
+            // No registry entry may carry a null model.
+            Assert.Empty(registry.GetAll());
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_FromDisconnectedShell_ConnectsWithoutSessionLoad()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: null!,
+                startupAvailableModels: ["model-a", "model-b"]);
+
+            // Disconnected shell: no client, no agent, factory untouched.
+            Assert.False(service.IsConnected);
+            Assert.Null(GetField<IChatClient>(service, "_chatClient"));
+            Assert.Equal(0, factory.Invocations);
+
+            // Interim connect-on-select: SwitchModelAsync validates against the catalog and
+            // creates client+agent WITHOUT a session disk-load.
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
+
+            Assert.True(service.IsConnected);
+            Assert.Equal("model-b", service.Model);
+            Assert.NotNull(GetField<IChatClient>(service, "_chatClient"));
+            Assert.NotNull(GetField<CodingAgent>(service, "_agent"));
+
+            // The client was created for the switch target only.
+            Assert.Equal(1, factory.Invocations);
+            Assert.Equal(["model-b"], factory.RequestedModels);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_RegistryUsesNewModel_NotNullableField()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new Mock<IChatClient>().Object,
+                model: null!,
+                startupAvailableModels: ["model-a", "model-b"],
+                sessionRegistry: registry);
+
+            await service.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
+
+            var sessions = registry.GetAll();
+            var session = Assert.Single(sessions);
+            Assert.Equal("model-b", session.Model);
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
     // ── 4. ConnectAsync session-load corruption recovery ──
 
     [Fact]
@@ -598,12 +895,14 @@ public sealed class ComposerAgentServiceTests
     }
 
     [Fact]
-    public void AvailableModels_WithEmptyHiveConfigModels_FallsBackToStartupModels()
+    public void AvailableModels_WithEmptyHiveConfigModels_ReturnsEmptyNoFallback()
     {
         var stateDir = CreateTempDir();
         try
         {
-            // HiveConfigFile present but Models.AvailableModels is null/empty.
+            // HiveConfigFile present but Models.AvailableModels is null/empty: the config's
+            // GetComposerAvailableModels() is the SOLE authority — an empty global list yields
+            // an EMPTY catalog, never a fallback to the startup models.
             var hiveConfig = new HiveConfigFile
             {
                 Models = new ModelsConfig
@@ -621,8 +920,7 @@ public sealed class ComposerAgentServiceTests
 
             var models = service.AvailableModels;
 
-            Assert.Single(models);
-            Assert.Equal("fallback-model", models[0]);
+            Assert.Empty(models);
         }
         finally
         {

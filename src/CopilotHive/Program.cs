@@ -336,26 +336,26 @@ public sealed class Program
                 builder.Services.AddCascadingAuthenticationState();
             }
 
-            // Composer agent (optional — enabled when config has a composer section or BRAIN_MODEL is set)
+            // Composer agent (always registered — with no valid default it is a disconnected shell)
             // Registered BEFORE GoalDispatcher so the IClarificationRouter forwarding is available.
             builder.Services.AddSingleton(sp =>
             {
-                var config = sp.GetService<HiveConfigFile>();
-                var composerConfig = config?.Composer;
+                var config = sp.GetRequiredService<HiveConfigFile>();
 
-                // Model: composer-specific override → orchestrator model → env var
-                var model = composerConfig?.Model;
-                if (string.IsNullOrEmpty(model))
-                    model = config?.Orchestrator.Model;
-                if (string.IsNullOrEmpty(model))
-                    model = brainModel ?? Constants.DefaultWorkerModel;
+                // ONE resolution of the Composer's default model (Slice 1A1 resolver): the
+                // resolved value is used BOTH for construction and (via Composer.StartupDefaultModel)
+                // for the startup-connect gate. No fall-through to orchestrator.model /
+                // BRAIN_MODEL / Constants.DefaultWorkerModel — resolver-only construction.
+                var resolvedDefault = config.ResolveComposerDefaultModel();
 
-                var maxCtx = config?.TryGetContextWindowForModel(model)
-                    ?? Constants.DefaultBrainContextWindow;
-                var maxSteps = composerConfig?.MaxSteps ?? config?.Orchestrator.BrainMaxSteps ?? Constants.DefaultBrainMaxSteps;
-                var availableModels = config?.GetComposerAvailableModels() ?? [];
+                var maxCtx = resolvedDefault is not null
+                    ? config.TryGetContextWindowForModel(resolvedDefault)
+                        ?? Constants.DefaultBrainContextWindow
+                    : Constants.DefaultBrainContextWindow;
+                var maxSteps = config.Composer?.MaxSteps ?? config.Orchestrator.BrainMaxSteps;
+                var availableModels = config.GetComposerAvailableModels();
 
-                return new Composer(model, sp.GetRequiredService<ILogger<Composer>>(),
+                return new Composer(resolvedDefault, sp.GetRequiredService<ILogger<Composer>>(),
                     sp.GetRequiredService<IGoalStore>(),
                     maxCtx, maxSteps,
                     sp.GetService<IBrainRepoManager>(),
@@ -363,21 +363,20 @@ public sealed class Program
                     sp, // IServiceProvider — lazy resolution of GoalDispatcher to avoid circular DI
                     !string.IsNullOrWhiteSpace(ollamaApiKey) ? sp.GetRequiredService<IHttpClientFactory>() : null,
                     ollamaApiKey,
-                    sp.GetService<HiveConfigFile>(),
+                    config,
                     sp.GetService<ConfigRepoManager>(),
                     availableModels,
-                    compactionModel: config?.Models?.CompactionModel,
+                    compactionModel: config.Models?.CompactionModel,
                     knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                     goalReviewService: sp.GetService<GoalReviewService>(),
                     sessionRegistry: sp.GetService<LlmSessionRegistry>(),
                     goalReadyNotifier: sp.GetService<GoalReadyNotifier>(),
                     attachmentService: sp.GetService<ComposerAttachmentService>(),
                     reasoningEffort: ParseConfiguredReasoningEffort(
-                        // Composer-specific override → orchestrator reasoning effort, mirroring
-                        // the model fallback chain above.
-                        !string.IsNullOrWhiteSpace(composerConfig?.ReasoningEffort)
-                            ? composerConfig.ReasoningEffort
-                            : config?.Orchestrator?.ReasoningEffort,
+                        // Composer-specific override → orchestrator reasoning effort.
+                        !string.IsNullOrWhiteSpace(config.Composer?.ReasoningEffort)
+                            ? config.Composer.ReasoningEffort
+                            : config.Orchestrator?.ReasoningEffort,
                         "composer.reasoning_effort",
                         sp.GetService<ILogger<Composer>>()),
                     issueStore: sp.GetService<IIssueStore>(),
@@ -495,7 +494,9 @@ public sealed class Program
             // never exposes both a false- and true-provenance instance. When no config repo is
             // configured, the fallback singleton has an EMPTY Orchestrator.Model (via
             // OrchestratorConfig.CreateEmptyModelFallback) so it does NOT override BRAIN_MODEL for
-            // the Brain (line 199) nor alter the Composer's model chain (line 349).
+            // the Brain (line 199). The Composer's model is resolver-only (ResolveComposerDefaultModel
+            // against the global catalog) — the fallback's empty orchestrator model yields no
+            // Composer default, so the Composer registers as a disconnected shell.
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
                 var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
@@ -726,15 +727,26 @@ public sealed class Program
             var composer = app.Services.GetService<Composer>();
             if (composer is not null)
             {
-                try
+                // Startup connect is attempted ONLY when a valid default model was resolved
+                // (the SAME single resolution used for construction — Composer.StartupDefaultModel).
+                // With no valid default the Composer registers as a disconnected shell and the
+                // process still starts; the user can connect later by selecting a model.
+                if (composer.StartupDefaultModel is not null)
                 {
-                    logger.LogInformation("Connecting Composer…");
-                    await composer.ConnectAsync();
-                    logger.LogInformation("Composer connected.");
+                    try
+                    {
+                        logger.LogInformation("Connecting Composer…");
+                        await composer.ConnectAsync();
+                        logger.LogInformation("Composer connected.");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
-                    logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
+                    logger.LogWarning("Composer has no configured model — registered as a disconnected shell");
                 }
             }
 

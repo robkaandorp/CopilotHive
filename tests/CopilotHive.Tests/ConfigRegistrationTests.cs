@@ -97,7 +97,7 @@ public sealed class ConfigRegistrationTests : IDisposable
     }
 
     [Fact]
-    public void NoConfigRepo_ComposerModelChain_Unchanged()
+    public void NoConfigRepo_ComposerModel_IsNull_DisconnectedShell()
     {
         var composer = _factory.Services.GetRequiredService<Composer>();
 
@@ -108,12 +108,41 @@ public sealed class ConfigRegistrationTests : IDisposable
             ?? throw new InvalidOperationException("_agentService was null");
         var modelProperty = agentService.GetType().GetProperty("Model")
             ?? throw new InvalidOperationException("Model property not found on ComposerAgentService");
-        var model = (string)modelProperty.GetValue(agentService)!;
+        var model = (string?)modelProperty.GetValue(agentService);
 
-        // composer.model → (empty) orchestrator.model → BRAIN_MODEL: the chain
-        // still lands on the env BRAIN_MODEL, exactly as before this slice.
-        Assert.Equal(EnvBrainModel, model);
-        Assert.NotEqual(Constants.DefaultWorkerModel, model);
+        // Resolver-only construction: with no config repo there is no global catalog, so
+        // ResolveComposerDefaultModel() returns null — the Composer registers as a
+        // disconnected shell (no fall-through to orchestrator.model / BRAIN_MODEL).
+        Assert.Null(model);
+        Assert.False(composer.IsConnected);
+        Assert.Null(composer.StartupDefaultModel);
+    }
+
+    /// <summary>
+    /// One-resolution contract: the startup-connect gate reads the SAME Composer-provided
+    /// resolved default used for construction. With no valid default the shell stays
+    /// disconnected (the gate does not connect); with a configured default the gate connects.
+    /// </summary>
+    [Fact]
+    public void NoConfigRepo_StartupGate_ReadsComposerStartupDefaultModel_NotSecondResolution()
+    {
+        var composer = _factory.Services.GetRequiredService<Composer>();
+
+        // Structural: the gate must read composer.StartupDefaultModel (the single resolution
+        // result) — with no config repo this is null, so the gate must NOT connect.
+        Assert.Null(composer.StartupDefaultModel);
+        Assert.False(composer.IsConnected);
+
+        // Behavioral: the gate's decision matches the configured default — null default ⇒
+        // shell stays disconnected (no client, no agent).
+        var agentServiceField = typeof(Composer).GetField(
+                "_agentService", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_agentService field not found on Composer");
+        var agentService = agentServiceField.GetValue(composer)
+            ?? throw new InvalidOperationException("_agentService was null");
+        var chatClientField = agentService.GetType().GetField("_chatClient", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("_chatClient field not found on ComposerAgentService");
+        Assert.Null(chatClientField.GetValue(agentService));
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using System.Reflection;
 using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -156,6 +157,303 @@ public sealed class ComposerMultiModelTests : IDisposable
     public void Dispose()
     {
         _dbContext.Dispose();
+    }
+
+    // ── Disconnected-shell construction (no valid default) ──
+
+    /// <summary>
+    /// A chat-client factory that COUNTS its invocations so a test can prove no LLM client was
+    /// ever created — not merely that the final field reads null. A regression that creates a
+    /// client and discards it would still be caught.
+    /// </summary>
+    private sealed class CountingChatClientFactory
+    {
+        private int _invocations;
+        private readonly List<string> _requestedModels = [];
+        private readonly object _lock = new();
+
+        /// <summary>Number of times the factory delegate was invoked.</summary>
+        public int Invocations => Volatile.Read(ref _invocations);
+
+        /// <summary>The model identifiers the factory was asked to create clients for.</summary>
+        public IReadOnlyList<string> RequestedModels
+        {
+            get { lock (_lock) { return _requestedModels.ToList(); } }
+        }
+
+        /// <summary>The delegate handed to the Composer under test.</summary>
+        public Func<string, IChatClient> Delegate => modelId =>
+        {
+            Interlocked.Increment(ref _invocations);
+            lock (_lock) { _requestedModels.Add(modelId); }
+            return new Mock<IChatClient>().Object;
+        };
+    }
+
+    [Fact]
+    public async Task Constructor_NoModel_ConstructsDisconnectedShell_ClientFactoryNeverInvoked()
+    {
+        var factory = new CountingChatClientFactory();
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: factory.Delegate);
+
+        await using (composer)
+        {
+            Assert.False(composer.IsConnected);
+            Assert.Null(composer.StartupDefaultModel);
+            Assert.Null(AgentServiceOf(composer).Model);
+            Assert.Null(AgentServiceOf(composer).ChatClient);
+            Assert.Null(AgentServiceOf(composer).Agent);
+
+            // Authoritative no-client proof: the factory was NEVER invoked.
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_WhitespaceModel_NormalizesToNull_ClientFactoryNeverInvoked()
+    {
+        var factory = new CountingChatClientFactory();
+        var composer = new Composer(
+            "   ",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: factory.Delegate);
+
+        await using (composer)
+        {
+            Assert.False(composer.IsConnected);
+            Assert.Null(composer.StartupDefaultModel);
+            Assert.Null(AgentServiceOf(composer).Model);
+
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+        }
+    }
+
+    /// <summary>
+    /// Control test: the counting factory really does observe client creation, so the
+    /// zero-invocation assertions above are not vacuous. With a configured model,
+    /// <c>ConnectAsync</c> invokes the factory exactly once for that model.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_WithModel_ClientFactoryInvokedForThatModel()
+    {
+        var factory = new CountingChatClientFactory();
+        var composer = new Composer(
+            "claude-sonnet-4",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4"],
+            chatClientFactory: factory.Delegate);
+
+        await using (composer)
+        {
+            // Construction alone creates nothing.
+            Assert.Equal(0, factory.Invocations);
+
+            await composer.ConnectAsync(TestContext.Current.CancellationToken);
+
+            Assert.True(composer.IsConnected);
+            Assert.Equal(1, factory.Invocations);
+            Assert.Equal(["claude-sonnet-4"], factory.RequestedModels);
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_NoModel_StartupCatalogEmpty_NoNullEntry()
+    {
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            // No model → startup catalog is EMPTY (no [null] entry, no fabricated fallback).
+            Assert.Empty(AgentServiceOf(composer).AvailableModels);
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_NoModel_WithStartupCatalog_KeepsCatalog()
+    {
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["model-a", "model-b"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            Assert.Equal(2, AgentServiceOf(composer).AvailableModels.Count);
+            Assert.Equal("model-a", AgentServiceOf(composer).AvailableModels[0]);
+            Assert.Equal("model-b", AgentServiceOf(composer).AvailableModels[1]);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_NoModel_ThrowsNoModelConfigured_ClientFactoryNeverInvoked()
+    {
+        var factory = new CountingChatClientFactory();
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: factory.Delegate);
+
+        await using (composer)
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => composer.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("no model configured", ex.Message);
+
+            Assert.False(composer.IsConnected);
+            Assert.Null(AgentServiceOf(composer).ChatClient);
+            Assert.Null(AgentServiceOf(composer).Agent);
+
+            // No LLM client was created anywhere on the connect path.
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WhitespaceModel_ThrowsNoModelConfigured_ClientFactoryNeverInvoked()
+    {
+        var factory = new CountingChatClientFactory();
+        var composer = new Composer(
+            " \t ",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: factory.Delegate);
+
+        await using (composer)
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => composer.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("no model configured", ex.Message);
+            Assert.False(composer.IsConnected);
+
+            Assert.Equal(0, factory.Invocations);
+            Assert.Empty(factory.RequestedModels);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchModelAsync_FromDisconnectedShell_Connects()
+    {
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["model-a", "model-b"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            Assert.False(composer.IsConnected);
+
+            // Interim connect-on-select: valid model in catalog → client+agent created,
+            // CONNECTS (no session disk-load this slice).
+            await composer.SwitchModelAsync("model-b", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
+
+            Assert.True(composer.IsConnected);
+            var stats = composer.GetStats();
+            Assert.NotNull(stats);
+            Assert.Equal("model-b", stats!.Model);
+        }
+    }
+
+    [Fact]
+    public async Task GetStats_NoModel_ReturnsNull()
+    {
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            // Disconnected shell: no agent → GetStats returns null (never a null Model in BrainStats).
+            Assert.Null(composer.GetStats());
+        }
+    }
+
+    [Fact]
+    public async Task RefreshComposerRegistry_NoModel_DoesNotWriteNullModelEntry()
+    {
+        var registry = new LlmSessionRegistry();
+        var composer = new Composer(
+            null,
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            sessionRegistry: registry,
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            // Trigger the registry refresh path (e.g. via ResetSessionAsync which calls
+            // RefreshComposerRegistry) — with no model, NO entry may be written.
+            // ResetSessionAsync requires connection, so invoke the private method via
+            // reflection to exercise the guard directly.
+            var method = typeof(Composer).GetMethod("RefreshComposerRegistry",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("RefreshComposerRegistry not found");
+            method.Invoke(composer, ["idle", null]);
+
+            Assert.Empty(registry.GetAll());
+        }
+    }
+
+    [Fact]
+    public async Task StartupDefaultModel_WithValidModel_IsResolvedModel()
+    {
+        var composer = new Composer(
+            "claude-sonnet-4",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            availableModels: ["claude-sonnet-4", "claude-opus"],
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            Assert.Equal("claude-sonnet-4", composer.StartupDefaultModel);
+        }
+    }
+
+    [Fact]
+    public async Task StartupDefaultModel_WithWhitespaceModel_IsNull()
+    {
+        var composer = new Composer(
+            "   ",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            chatClientFactory: _ => new Mock<IChatClient>().Object);
+
+        await using (composer)
+        {
+            Assert.Null(composer.StartupDefaultModel);
+        }
     }
 
     // ── AvailableModels Property ──
@@ -932,9 +1230,11 @@ public sealed class ComposerHubTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task GetModels_WithoutGlobalList_FallsBackToComposerAvailableModels()
+    public async Task GetModels_WithoutGlobalList_ReturnsEmptyCatalog()
     {
-        // Arrange: config with no global Models.AvailableModels, only Composer models
+        // Arrange: config with no global Models.AvailableModels — the Composer's normalised
+        // catalog (GetComposerAvailableModels) is the SOLE authority and yields EMPTY, with
+        // no fallback to the startup models.
         var globalConfig = new HiveConfigFile
         {
             Composer = new ComposerConfig
@@ -955,10 +1255,8 @@ public sealed class ComposerHubTests : IAsyncLifetime
         var json = JsonDocument.Parse(content);
         var models = json.RootElement.GetProperty("models");
 
-        // Should return the composer.AvailableModels list since no global list is present
-        var modelsList = models.EnumerateArray().Select(m => m.GetString()!).ToList();
-        Assert.Contains("claude-sonnet-4", modelsList);
-        Assert.Contains("claude-opus", modelsList);
+        // No global list → the normalised catalog is empty (no fabricated fallback).
+        Assert.Equal(0, models.GetArrayLength());
 
         await fixture.DisposeAsync();
     }
@@ -1106,6 +1404,121 @@ public sealed class ComposerHubTests : IAsyncLifetime
         var json = await response2.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         var doc = JsonDocument.Parse(json);
         Assert.Equal("gpt-4", doc.RootElement.GetProperty("model").GetString());
+
+        await fixture.DisposeAsync();
+    }
+
+    // ── Normalised-catalog endpoint wiring (Slice 1A2a) ──
+
+    /// <summary>
+    /// Whitespace-bearing/duplicate raw entries in the global list must NOT leak into the
+    /// endpoint listing: the Composer's normalised catalog (GetComposerAvailableModels) is
+    /// the sole authority, so the list is trimmed/deduplicated exactly like the backend.
+    /// </summary>
+    [Fact]
+    public async Task GetModels_WhitespaceAndDuplicateRawEntries_ReturnsNormalisedCatalog()
+    {
+        var globalConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  model-a  " },
+                    new ModelEntry { Name = "model-a" },
+                    new ModelEntry { Name = "model-b" },
+                    new ModelEntry { Name = "   " },
+                    new ModelEntry { Name = "model-b" },
+                ]
+            }
+        };
+
+        await using var fixture = new ComposerHubWithConfigFixture(globalConfig);
+        await fixture.InitializeAsync();
+
+        var response = await fixture.Client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        var json = JsonDocument.Parse(content);
+        var models = json.RootElement.GetProperty("models");
+
+        // Normalised: trimmed, whitespace-only dropped, duplicates collapsed (first wins).
+        var modelsList = models.EnumerateArray().Select(m => m.GetString()!).ToList();
+        Assert.Equal(["model-a", "model-b"], modelsList);
+
+        await fixture.DisposeAsync();
+    }
+
+    /// <summary>
+    /// The switch endpoint's membership check must match the backend SwitchModelAsync
+    /// validation exactly: a whitespace-padded raw entry is NOT selectable (the normalised
+    /// catalog holds the trimmed name), and the trimmed name IS selectable.
+    /// </summary>
+    [Fact]
+    public async Task SwitchModel_WhitespaceRawEntry_NotSelectable_TrimmedNameIs()
+    {
+        var globalConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "  model-a  " },
+                    new ModelEntry { Name = "model-b" }
+                ]
+            }
+        };
+
+        await using var fixture = new ComposerHubWithConfigFixture(globalConfig);
+        await fixture.InitializeAsync();
+
+        // The whitespace-padded raw name is NOT in the normalised catalog → rejected.
+        var response1 = await fixture.Client.PostAsync(
+            "/api/composer/models/switch?model=%20%20model-a%20%20&reasoning=medium",
+            null, TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.BadRequest, response1.StatusCode);
+
+        // The trimmed canonical name IS in the normalised catalog → accepted.
+        var response2 = await fixture.Client.PostAsync(
+            "/api/composer/models/switch?model=model-a&reasoning=medium",
+            null, TestContext.Current.CancellationToken);
+        response2.EnsureSuccessStatusCode();
+
+        await fixture.DisposeAsync();
+    }
+
+    /// <summary>
+    /// current-model for a disconnected shell with a non-empty catalog MAY return the first
+    /// entry (accepted interim inconsistency, fixed in Slice 1B).
+    /// </summary>
+    [Fact]
+    public async Task CurrentModel_DisconnectedShell_WithCatalog_ReturnsFirstEntry()
+    {
+        var globalConfig = new HiveConfigFile
+        {
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "model-a" },
+                    new ModelEntry { Name = "model-b" }
+                ]
+            }
+        };
+
+        await using var fixture = new ComposerHubWithConfigFixture(globalConfig);
+        await fixture.InitializeAsync();
+
+        var response = await fixture.Client.GetAsync("/api/composer/current-model", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        var json = JsonDocument.Parse(content);
+        var model = json.RootElement.GetProperty("model").GetString();
+
+        // Accepted interim: the FirstOrDefault() fallback returns the first catalog entry.
+        Assert.Equal("model-a", model);
 
         await fixture.DisposeAsync();
     }
