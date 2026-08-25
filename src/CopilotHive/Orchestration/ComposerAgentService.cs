@@ -500,85 +500,62 @@ internal sealed class ComposerAgentService(
         // non-null DTO.
         var model = _model;
 
+        // PRE-TEARDOWN failure boundary: this log is the last fallible operation before the
+        // old connection is torn down. If it throws, ConnectAsync exits with the prior
+        // connection AND its registry entry PRESERVED — no rollback runs.
         _logger.LogInformation("Composer connecting with model '{Model}'…", model);
-
-        // Reconnect: dispose old agent + clients. Operation-failure cleanup via SafeDispose in
-        // catch blocks logs failures.
-        await DisposeClientsAndClearStateAsync();
 
         try
         {
+            // Reconnect: dispose old agent + clients. From this point on the prior connection
+            // (if any) is GONE — every failure below must roll back the stale composer entry
+            // so the registry matches the now-disconnected state.
+            await DisposeClientsAndClearStateAsync();
+
             _chatClient = CreateClient(model);
             if (!string.IsNullOrEmpty(_compactionModel))
                 _compactionChatClient = CreateClient(_compactionModel);
-        }
-        catch
-        {
-            // Failed client creation: safe cleanup logs failures so the original exception
-            // propagates. The hook fires only if an old agent exists.
-            await SafeDisposeClientsAndClearStateAsync();
-            throw;
-        }
 
-        var sessionFile = GetSessionFilePath();
+            var sessionFile = GetSessionFilePath();
 
-        // Tracked locally and committed to the field only after EVERY step of ConnectAsync has
-        // succeeded (see the end of this method). Assigning the field here instead would let a
-        // later failure — RecreateAgentAsync, the registry update, or any step added in future —
-        // return/throw with a `true` flag that no longer means "connection succeeded".
-        var loadedFromDisk = false;
+            // Tracked locally and committed to the field only after EVERY step of ConnectAsync
+            // has succeeded (see the end of this method). Assigning the field here instead
+            // would let a later failure — RecreateAgentAsync, the registry update, or any step
+            // added in future — return/throw with a `true` flag that no longer means
+            // "connection succeeded".
+            var loadedFromDisk = false;
 
-        if (File.Exists(sessionFile))
-        {
-            try
+            if (File.Exists(sessionFile))
             {
-                _session = await AgentSession.LoadAsync(sessionFile, ct);
-                loadedFromDisk = true;
-                _logger.LogInformation("Loaded Composer session with {Count} messages from {File}",
-                    _session.MessageHistory.Count, sessionFile);
+                try
+                {
+                    _session = await AgentSession.LoadAsync(sessionFile, ct);
+                    loadedFromDisk = true;
+                    _logger.LogInformation("Loaded Composer session with {Count} messages from {File}",
+                        _session.MessageHistory.Count, sessionFile);
+                }
+                catch (Exception ex) when (ex is JsonException or FormatException or InvalidDataException)
+                {
+                    _logger.LogWarning(ex, "Composer session file {File} is corrupt — starting fresh", sessionFile);
+                    _session = AgentSession.Create("composer");
+                    loadedFromDisk = false;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                    or DirectoryNotFoundException or FileNotFoundException)
+                {
+                    _logger.LogWarning(ex, "Failed to read Composer session from {File} — keeping current session", sessionFile);
+                    loadedFromDisk = false;
+                }
             }
-            catch (OperationCanceledException)
-            {
-                await SafeDisposeClientsAndClearStateAsync();
-                throw;
-            }
-            catch (Exception ex) when (ex is JsonException or FormatException or InvalidDataException)
-            {
-                _logger.LogWarning(ex, "Composer session file {File} is corrupt — starting fresh", sessionFile);
-                _session = AgentSession.Create("composer");
-                loadedFromDisk = false;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-                or DirectoryNotFoundException or FileNotFoundException)
-            {
-                _logger.LogWarning(ex, "Failed to read Composer session from {File} — keeping current session", sessionFile);
-                loadedFromDisk = false;
-            }
-            catch
-            {
-                await SafeDisposeClientsAndClearStateAsync();
-                throw;
-            }
-        }
 
-        try
-        {
             await RecreateAgentAsync();
-        }
-        catch
-        {
-            await SafeDisposeClientsAndClearStateAsync();
-            throw;
-        }
 
-        // POST-client/agent-creation steps: the registry publish and the final success log.
-        // A failure HERE (e.g. a throwing logger or registry) must dispose the just-created
-        // client/agent — consistent with the creation-failure cleanup above — so a failed
-        // ConnectAsync AFTER client/agent creation leaves the Composer DISCONNECTED
-        // (IsConnected false). Failures BEFORE client/agent creation are out of scope and
-        // leave the prior connection state as-is.
-        try
-        {
+            // Final success log FIRST, then the registry publish: the entry is written only
+            // once the connect truly succeeds. A throwing final log (or any earlier failure)
+            // leaves NO entry — the publish-then-fail window is gone.
+            _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
+                model, _maxContextTokens);
+
             _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
             {
                 SessionId = "composer",
@@ -590,19 +567,33 @@ internal sealed class ComposerAgentService(
                 ReasoningEffort = _reasoningEffort,
             });
 
-            _logger.LogInformation("Composer connected (model={Model}, contextWindow={ContextWindow})",
-                model, _maxContextTokens);
+            // Commit last: reaching this point means the session was loaded from disk AND the
+            // whole connection succeeded. Every earlier exit path leaves the field at the
+            // `false` set at the top of the method.
+            _sessionLoadedFromDisk = loadedFromDisk;
         }
         catch
         {
-            await SafeDisposeClientsAndClearStateAsync();
+            // TEARDOWN-OR-LATER failure: the old connection is gone (teardown ran, or the
+            // failure happened after it). Roll back the stale composer entry BEFORE any
+            // fallible cleanup logging — a throwing logger must not skip the rollback, and
+            // the original connection exception must not be masked.
+            _sessionRegistry?.Unregister("composer");
+
+            try
+            {
+                await SafeDisposeClientsAndClearStateAsync();
+            }
+            catch
+            {
+                // SafeDisposeClientsAndClearStateAsync only throws when its own cleanup log
+                // throws (disposal failures are already logged and swallowed inside). The
+                // rollback already ran above — never let a cleanup-log failure mask the
+                // original connection exception.
+            }
+
             throw;
         }
-
-        // Commit last: reaching this point means the session was loaded from disk AND the whole
-        // connection succeeded. Every earlier exit path leaves the field at the `false` set at
-        // the top of the method.
-        _sessionLoadedFromDisk = loadedFromDisk;
     }
 
     /// <summary>

@@ -3455,6 +3455,355 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
+    // ── Registry rollback on failed connect (Slice 1A2b-2a follow-up) ──
+
+    /// <summary>
+    /// One throw spec for <see cref="ArmableFragmentThrowingLogger"/>: when a formatted message
+    /// contains <see cref="Fragment"/>, the logger throws <see cref="Failure"/>. When
+    /// <see cref="Count"/> is true, the throw is also counted in
+    /// <see cref="ArmableFragmentThrowingLogger.CountedThrows"/> — proving that specific log
+    /// call was genuinely reached.
+    /// </summary>
+    private sealed record ThrowSpec(string Fragment, Exception Failure, bool Count = false);
+
+    /// <summary>
+    /// Logger that throws per-fragment exceptions when the formatted message contains the
+    /// fragment, but only while <see cref="Armed"/> is true — so the FIRST connect completes
+    /// normally and the failure is forced on a LATER connect. Each fragment throws its OWN
+    /// exception instance, so a test can distinguish which log call failed.
+    /// </summary>
+    private sealed class ArmableFragmentThrowingLogger(IReadOnlyList<ThrowSpec> throwSpecs) : ILogger
+    {
+        private volatile bool _armed;
+        private int _countedThrows;
+
+        internal bool Armed
+        {
+            get => _armed;
+            set => _armed = value;
+        }
+
+        /// <summary>Number of times a <see cref="ThrowSpec.Count"/>-marked fragment threw.</summary>
+        internal int CountedThrows => Volatile.Read(ref _countedThrows);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!_armed)
+                return;
+
+            var message = formatter(state, exception);
+            foreach (var spec in throwSpecs)
+            {
+                if (message.Contains(spec.Fragment, StringComparison.Ordinal))
+                {
+                    if (spec.Count)
+                        Interlocked.Increment(ref _countedThrows);
+                    throw spec.Failure;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A forced POST-creation failure (the final success log throws) on a FRESH connect must
+    /// leave NO <c>composer</c> registry entry AND <c>IsConnected</c> false. The publish now
+    /// runs AFTER the final log, so the publish-then-fail window is gone.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_FreshConnectPostCreationFailure_NoRegistryEntry_IsConnectedFalse()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var logger = new FragmentThrowingLogger(
+                "Composer connected",
+                new InvalidOperationException("final log boom"));
+
+            var registry = new LlmSessionRegistry();
+            var factory = new CountingChatClientFactory();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: factory.Delegate,
+                model: "model-a",
+                logger: logger,
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("final log boom", ex.Message);
+
+            // The failure really was POST-creation (the factory ran)…
+            Assert.Equal(1, factory.Invocations);
+
+            // …but the publish never happened: the final log throws BEFORE the registry
+            // publish, so NO entry exists and the Composer is disconnected.
+            Assert.False(service.IsConnected);
+            Assert.Empty(registry.GetAll());
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A forced PRE-creation failure (client creation throws) on a FRESH connect leaves NO
+    /// registry entry — unchanged behavior.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_FreshConnectPreCreationFailure_NoRegistryEntry()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => throw new InvalidOperationException("creation boom"),
+                model: "model-a",
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("creation boom", ex.Message);
+
+            Assert.False(service.IsConnected);
+            Assert.Empty(registry.GetAll());
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A failed reconnect with a PRE-teardown failure (the opening log throws) preserves the
+    /// prior connection AND its registry entry — no rollback runs.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_ReconnectPreTeardownFailure_PreservesPriorConnectionAndEntry()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var logger = new ArmableFragmentThrowingLogger(
+                [new ThrowSpec("Composer connecting with model", new InvalidOperationException("opening log boom"))]);
+
+            var client = new Mock<IChatClient>();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => client.Object,
+                model: "model-a",
+                logger: logger,
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            // First connect succeeds and publishes the entry.
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.IsConnected);
+            var entry = Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+            Assert.Equal("model-a", entry.Model);
+
+            // Arm the logger: the reconnect's opening log throws BEFORE teardown.
+            logger.Armed = true;
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("opening log boom", ex.Message);
+
+            // PRE-teardown failure: the prior connection AND its registry entry are preserved.
+            Assert.True(service.IsConnected);
+            Assert.Same(client.Object, service.ChatClient);
+            Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+
+            logger.Armed = false;
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A failed reconnect with a TEARDOWN-or-later failure (client creation throws after the
+    /// old connection is gone) leaves <c>IsConnected</c> false AND NO stale <c>composer</c>
+    /// entry — the prior entry is unregistered.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_ReconnectTeardownOrLaterFailure_RollsBackStaleEntry_IsConnectedFalse()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var firstClient = new Mock<IChatClient>();
+            var callCount = 0;
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => ++callCount == 1
+                    ? firstClient.Object
+                    : throw new InvalidOperationException("creation boom"),
+                model: "model-a",
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            // First connect succeeds and publishes the entry.
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.IsConnected);
+            Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+
+            // Reconnect: teardown disposes the old connection, then client creation throws.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+            Assert.Equal("creation boom", ex.Message);
+
+            // Teardown-or-later failure: the stale entry is rolled back, Composer disconnected.
+            Assert.False(service.IsConnected);
+            Assert.Empty(registry.GetAll());
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A failed reconnect with a teardown-or-later failure rolls back the stale entry EVEN IF
+    /// the cleanup logging itself throws: the unregister runs BEFORE
+    /// <see cref="ComposerAgentService"/>'s fallible cleanup log, so a throwing logger cannot
+    /// skip the rollback and the original connection exception is not masked.
+    /// <para>
+    /// Removal-proof: the final-success log and the cleanup warning throw DISTINCT exception
+    /// instances. If the nested cleanup-swallowing try/catch in <c>ConnectAsync</c> were
+    /// removed, the cleanup-log exception would propagate instead of the original — and the
+    /// <see cref="Assert.Same(object?, object?)"/> on the original instance would FAIL. The
+    /// counted cleanup throw additionally proves the cleanup warning was genuinely reached.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_ReconnectTeardownOrLaterFailure_CleanupLogThrows_RollbackStillRuns_OriginalExceptionPropagates()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            // DISTINCT exceptions: the final success log throws the ORIGINAL connection
+            // failure, and the SafeDispose cleanup warning throws a DIFFERENT exception. A
+            // regression that lets the cleanup exception mask the original would propagate
+            // "cleanup log boom" and FAIL the Assert.Same below.
+            var originalFailure = new InvalidOperationException("final log boom");
+            var logger = new ArmableFragmentThrowingLogger(
+            [
+                new ThrowSpec("Composer connected", originalFailure),
+                new ThrowSpec("Failed to dispose Composer chat clients during cleanup",
+                    new InvalidOperationException("cleanup log boom"), Count: true),
+            ]);
+
+            var registry = new LlmSessionRegistry();
+            var firstClient = new Mock<IChatClient>();
+            var throwingDisposeClient = new Mock<IChatClient>();
+            throwingDisposeClient.Setup(c => c.Dispose())
+                .Throws(new InvalidOperationException("cleanup boom"));
+            var callCount = 0;
+
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => ++callCount == 1
+                    ? firstClient.Object
+                    : throwingDisposeClient.Object,
+                model: "model-a",
+                logger: logger,
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            // First connect succeeds and publishes the entry.
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.IsConnected);
+            Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+
+            // Arm the logger: the reconnect's final log throws, and the cleanup log throws too.
+            logger.Armed = true;
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ConnectAsync(TestContext.Current.CancellationToken));
+
+            // The cleanup warning was GENUINELY reached: the disposal failure ("cleanup boom")
+            // forced SafeDispose's log, which threw the DISTINCT cleanup-log exception. If the
+            // cleanup path never ran, this counter stays 0 and the test FAILS.
+            Assert.True(logger.CountedThrows > 0,
+                "The cleanup warning must have been reached (disposal failure logged)");
+
+            // The propagated exception is the ORIGINAL instance — NOT the cleanup-log
+            // exception. Removing the nested cleanup-swallowing try/catch would propagate
+            // "cleanup log boom" instead and FAIL this assertion.
+            Assert.Same(originalFailure, ex);
+
+            // The rollback ran BEFORE the throwing cleanup log: no stale entry, disconnected.
+            Assert.False(service.IsConnected);
+            Assert.Empty(registry.GetAll());
+
+            logger.Armed = false;
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// A successful reconnect publishes the entry as today (unchanged).
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_SuccessfulReconnect_PublishesEntry()
+    {
+        var stateDir = CreateTempDir();
+        try
+        {
+            var registry = new LlmSessionRegistry();
+            var service = CreateService(
+                stateDir,
+                chatClientFactory: _ => new Mock<IChatClient>().Object,
+                model: "model-a",
+                sessionRegistry: registry,
+                startupAvailableModels: ["model-a"]);
+
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.IsConnected);
+            Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+
+            // Reconnect succeeds: the entry is re-published (still exactly one).
+            await service.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.True(service.IsConnected);
+            var entry = Assert.Single(registry.GetAll(), s => s.SessionId == "composer");
+            Assert.Equal("model-a", entry.Model);
+
+            await service.DisposeAsync();
+        }
+        finally
+        {
+            TryDeleteDir(stateDir);
+        }
+    }
+
     [Fact]
     public async Task ConnectFirstSelectionAsync_InvalidSelection_PropagatesValidationError_NoCallback_NoConnect()
     {
