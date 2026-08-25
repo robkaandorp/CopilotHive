@@ -1008,6 +1008,15 @@ public sealed class ProgressDocumentTests
                 new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
             ],
             Orchestrator = new OrchestratorConfig { MaxRetriesPerTask = maxRetries },
+            // Slice 3b: worker roles need configured models to dispatch.
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+                ["tester"] = new WorkerConfig { Model = "tester-model" },
+                ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+                ["docwriter"] = new WorkerConfig { Model = "docwriter-model" },
+                ["improver"] = new WorkerConfig { Model = "improver-model" },
+            },
         };
 
         return new GoalDispatcher(

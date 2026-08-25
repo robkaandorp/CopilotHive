@@ -108,7 +108,11 @@ public class GoalReviewService
             }
 
             // Resolve the reviewer model and context window before registering the review session.
-            var reviewerModel = _config?.GetModelForRole(WorkerRole.Reviewer) ?? Constants.DefaultWorkerModel;
+            // Slice 3b: an unconfigured Reviewer role model REFUSES the review — no LLM session is
+            // registered, no review document is persisted, and ReviewStatus is left unchanged.
+            var reviewerModel = _config?.GetModelForRole(WorkerRole.Reviewer);
+            if (reviewerModel is null)
+                throw new InvalidOperationException("reviewer model not configured");
             var maxContextTokens = _config?.TryGetContextWindowForModel(reviewerModel) ?? Constants.DefaultBrainContextWindow;
 
             // Resolve the reviewer reasoning effort (lenient: invalid values fall back to unset).

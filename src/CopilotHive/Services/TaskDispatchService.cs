@@ -51,6 +51,27 @@ internal sealed class TaskDispatchService
 
     internal async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
+        // Slice 3b refusal gate — compute the FINAL effective model FIRST and refuse when it is
+        // null, BEFORE any task registration with the pipeline manager, any enqueue, or any
+        // worker/LLM session creation. For a premium phase: premium_model if set, else the
+        // standard role model. For a non-premium phase: the standard role model. A premium
+        // phase with premium_model set and NO standard role model dispatches on the premium
+        // model (NOT refused); a premium phase with no premium_model falls back to the standard
+        // role model (preserved exemption — NOT refused).
+        var roleName = role.ToRoleName();
+        var currentPhase = pipeline.StateMachine.Phase;
+        var phaseTier = pipeline.Plan?.PhaseTiers.GetValueOrDefault(currentPhase, ModelTier.Default) ?? ModelTier.Default;
+        var model = _config?.GetModelForRole(roleName);
+        if (phaseTier == ModelTier.Premium && _config is not null)
+        {
+            var premiumModel = _config.GetPremiumModelForRole(roleName);
+            if (!string.IsNullOrWhiteSpace(premiumModel))
+                model = premiumModel;
+        }
+
+        if (model is null)
+            throw new InvalidOperationException($"role '{roleName}' has no configured model");
+
         prompt ??= $"Work on: {pipeline.Description}";
 
         // Log the prompt being sent to the worker
@@ -72,18 +93,6 @@ internal sealed class TaskDispatchService
             _logger.LogError(ex, "Repository configuration error for goal {GoalId}", pipeline.GoalId);
             await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
             return;
-        }
-
-        // Resolve per-role model from config; upgrade to premium when the Brain requested it for this phase
-        var roleName = role.ToRoleName();
-        var model = _config?.GetModelForRole(roleName);
-        var currentPhase = pipeline.StateMachine.Phase;
-        var phaseTier = pipeline.Plan?.PhaseTiers.GetValueOrDefault(currentPhase, ModelTier.Default) ?? ModelTier.Default;
-        if (phaseTier == ModelTier.Premium && _config is not null)
-        {
-            var premiumModel = _config.GetPremiumModelForRole(roleName);
-            if (!string.IsNullOrWhiteSpace(premiumModel))
-                model = premiumModel;
         }
 
         // Resolve the effective reasoning effort for this task.

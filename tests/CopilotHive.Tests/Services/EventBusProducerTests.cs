@@ -590,6 +590,11 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
+            // Slice 3b: worker roles need configured models to dispatch.
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+            },
         };
         var goal = new Goal
         {
@@ -652,6 +657,11 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
+            // Slice 3b: worker roles need configured models to dispatch.
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+            },
         };
         var goal = new Goal
         {
@@ -700,6 +710,11 @@ public sealed class EventBusProducerTests
                     DefaultBranch = "main",
                 },
             ],
+            // Slice 3b: worker roles need configured models to dispatch.
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+            },
         };
         // Use a distinctive description so we can verify it propagates verbatim.
         var description = "Distinctive goal description for message matching " + Guid.NewGuid().ToString("N")[..8];

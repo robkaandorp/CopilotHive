@@ -140,6 +140,113 @@ public sealed class TaskDispatchServiceTests
         Assert.Equal("standard-coder-model", capturedTask!.Model);
     }
 
+    // ── DispatchToRole: Slice 3b refusal (effective-model-first) ─────────
+
+    /// <summary>
+    /// A null/unconfigured role model REFUSES the dispatch at the TOP of DispatchToRole with the
+    /// exact lowercase role-name message. No task is registered with the pipeline manager, no
+    /// task is enqueued/delivered to a worker, and no worker/LLM session is created.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenEffectiveModelNull_RefusesWithoutAnyRegistrationOrDelivery()
+    {
+        var config = CreateConfig();
+        // No Workers["coder"] entry → GetModelForRole returns null → effective model is null.
+
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-1", []);
+        var gateway = new GrpcWorkerGateway(workerPool);
+
+        var pipelineManager = new GoalPipelineManager();
+        var taskQueue = new TaskQueue();
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway);
+
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        Assert.Equal("role 'coder' has no configured model", ex.Message);
+
+        // No task registration with the pipeline manager (SetActiveTask/RegisterTask never ran).
+        Assert.Null(pipeline.ActiveTaskId);
+        // No task enqueued.
+        Assert.Null(capturedTask);
+        Assert.Null(taskQueue.TryDequeueAny());
+        // No worker delivery / session: the idle worker was never touched.
+        Assert.False(idleWorker.IsBusy);
+        Assert.Null(idleWorker.CurrentTaskId);
+        Assert.Null(idleWorker.CurrentModel);
+        Assert.Equal(WorkerRole.Unspecified, idleWorker.Role);
+    }
+
+    /// <summary>
+    /// A premium phase with <c>premium_model</c> set and NO standard role model dispatches on the
+    /// premium model — it is NOT refused (the effective model is the premium model).
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumTierPremiumModelSetButNoStandardModel_DispatchesOnPremiumModel()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            // No standard Model configured — only the premium model.
+            PremiumModel = "premium-coder-model",
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal("premium-coder-model", capturedTask!.Model);
+    }
+
+    /// <summary>
+    /// A premium phase with no <c>premium_model</c> falls back to the standard role model
+    /// (preserved exemption — NOT refused). Pins the existing behavior.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenPremiumTierNoPremiumModel_UsesStandardRoleModel()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig
+        {
+            Model = "standard-coder-model",
+            // No PremiumModel configured.
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Premium);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.Equal("standard-coder-model", capturedTask!.Model);
+    }
+
     // ── DispatchToRole: model names are always plain ──────────────────────
 
     /// <summary>
@@ -474,12 +581,12 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
-    /// With no config loaded, repository resolution fails before any model or reasoning effort is
-    /// derived. The new reasoning block must not run (and must not NRE) — the goal simply fails
-    /// and nothing is enqueued.
+    /// With no config loaded, no model can be resolved for the role — the Slice 3b refusal
+    /// fires at the TOP of DispatchToRole, BEFORE repository resolution, so nothing is
+    /// enqueued and the goal is not marked failed (the refusal propagates to the caller).
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenNoConfig_DoesNotDispatchAndDoesNotThrow()
+    public async Task DispatchToRole_WhenNoConfig_RefusesWithNoConfiguredModel()
     {
         var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
             GoalPhase.Coding, config: null, ModelTier.Default);
@@ -487,19 +594,21 @@ public sealed class TaskDispatchServiceTests
         WorkTask? capturedTask = null;
         taskQueue.OnEnqueue = t => capturedTask = t;
 
-        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken));
 
-        // Repository resolution failed → no task was ever built, so no reasoning effort was derived.
+        Assert.Equal("role 'coder' has no configured model", ex.Message);
         Assert.Null(capturedTask);
-        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Null(pipeline.ActiveTaskId);
     }
 
     /// <summary>
-    /// When no model is resolved for the role, the effort-derivation block is skipped entirely and
-    /// the WorkTask carries <c>null</c>.
+    /// When no model is resolved for the role, the Slice 3b refusal fires at the TOP of
+    /// DispatchToRole — the dispatch is refused with the exact lowercase role-name message
+    /// and no task is built or enqueued.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenNoModelForRole_TransportsNullReasoningEffort()
+    public async Task DispatchToRole_WhenNoModelForRole_RefusesWithExactMessage()
     {
         var config = CreateConfig();
         // No Workers["coder"] entry → GetModelForRole returns null.
@@ -514,18 +623,20 @@ public sealed class TaskDispatchServiceTests
         WorkTask? capturedTask = null;
         taskQueue.OnEnqueue = t => capturedTask = t;
 
-        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken));
 
-        Assert.NotNull(capturedTask);
-        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("role 'coder' has no configured model", ex.Message);
+        Assert.Null(capturedTask);
+        Assert.Null(pipeline.ActiveTaskId);
     }
 
     /// <summary>
-    /// A role with no WorkerConfig entry at all must not throw — both effort fields are treated
-    /// as unset and nothing is transported.
+    /// A role with no WorkerConfig entry at all is refused (Slice 3b) — the effective model is
+    /// null, so the dispatch throws with the exact lowercase role-name message.
     /// </summary>
     [Fact]
-    public async Task DispatchToRole_WhenRoleMissingFromWorkersConfig_TransportsNullReasoningEffort()
+    public async Task DispatchToRole_WhenRoleMissingFromWorkersConfig_RefusesWithExactMessage()
     {
         var config = CreateConfig();
         // Deliberately no config.Workers["coder"] entry.
@@ -536,10 +647,12 @@ public sealed class TaskDispatchServiceTests
         WorkTask? capturedTask = null;
         taskQueue.OnEnqueue = t => capturedTask = t;
 
-        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken));
 
-        Assert.NotNull(capturedTask);
-        Assert.Null(capturedTask!.ReasoningEffort);
+        Assert.Equal("role 'coder' has no configured model", ex.Message);
+        Assert.Null(capturedTask);
+        Assert.Null(pipeline.ActiveTaskId);
     }
 
     /// <summary>
@@ -1002,10 +1115,16 @@ public sealed class TaskDispatchServiceTests
     [Fact]
     public async Task DispatchToRole_WhenRepositoryResolutionFails_CallsMarkGoalFailedAsync()
     {
-        // Config with no repositories — the goal references a repo that doesn't exist
+        // Config with no repositories — the goal references a repo that doesn't exist.
+        // A coder model IS configured so the Slice 3b refusal does not fire and the
+        // repository-resolution failure path is exercised.
         var config = new HiveConfigFile
         {
             Repositories = [], // empty — no repos defined
+            Workers =
+            {
+                ["coder"] = new WorkerConfig { Model = "coder-model" },
+            },
         };
 
         var pipelineManager = new GoalPipelineManager();

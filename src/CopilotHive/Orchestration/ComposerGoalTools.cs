@@ -279,7 +279,18 @@ public sealed partial class Composer
         if (goal.ReviewStatus == ReviewStatus.Pending)
             return $"❌ A review is already in progress for goal '{goal_id}'. Wait for it to complete.";
 
-        var result = await _goalReviewService.ReviewGoalAsync(goal, CancellationToken.None);
+        ReviewResult result;
+        try
+        {
+            result = await _goalReviewService.ReviewGoalAsync(goal, CancellationToken.None);
+        }
+        catch (InvalidOperationException ex) when (ex.Message == "reviewer model not configured")
+        {
+            // Slice 3b: the reviewer role has no configured model — the review is refused.
+            // Filter on the EXACT message so a concurrent-review InvalidOperationException
+            // (a different error) is never misreported as an unconfigured reviewer model.
+            return "Review cannot start — no reviewer model is configured. Configure a reviewer model in the configuration page, then retry.";
+        }
 
         _logger.LogInformation("Composer reviewed goal '{GoalId}' — verdict: {Verdict}", goal_id, result.Verdict);
 

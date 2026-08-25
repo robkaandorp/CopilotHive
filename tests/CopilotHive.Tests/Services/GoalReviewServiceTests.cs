@@ -1,4 +1,6 @@
 using System.Runtime.CompilerServices;
+using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Knowledge;
 using CopilotHive.Orchestration;
@@ -27,23 +29,35 @@ public sealed class GoalReviewServiceTests
         ReviewStatus = ReviewStatus.None,
     };
 
+    /// <summary>Config with a configured reviewer model (Slice 3b: unconfigured ⇒ refused).</summary>
+    private static HiveConfigFile ConfigWithReviewerModel() => new()
+    {
+        Workers =
+        {
+            ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+        },
+    };
+
     private static GoalReviewService CreateService(
         string reply,
         KnowledgeGraph? knowledgeGraph = null,
         IGoalStore? goalStore = null,
         string? workDir = null,
-        List<string>? capturedPrompts = null)
+        List<string>? capturedPrompts = null,
+        HiveConfigFile? config = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         workDir ??= CreateWorkDir();
         return new GoalReviewService(
             knowledgeGraph,
             configRepo: null,
-            config: null,
+            config: config ?? ConfigWithReviewerModel(),
             goalStore,
             brainRepoManager: null,
             stateDir: workDir,
             logger: NullLogger<GoalReviewService>.Instance,
-            chatClientFactory: _ => new CapturingStubChatClient(reply, capturedPrompts));
+            chatClientFactory: _ => new CapturingStubChatClient(reply, capturedPrompts),
+            sessionRegistry: sessionRegistry);
     }
 
     /// <summary>Creates a service whose chat client is produced by the supplied factory.</summary>
@@ -51,18 +65,21 @@ public sealed class GoalReviewServiceTests
         Func<string, IChatClient> chatClientFactory,
         KnowledgeGraph? knowledgeGraph = null,
         IGoalStore? goalStore = null,
-        string? workDir = null)
+        string? workDir = null,
+        HiveConfigFile? config = null,
+        LlmSessionRegistry? sessionRegistry = null)
     {
         workDir ??= CreateWorkDir();
         return new GoalReviewService(
             knowledgeGraph,
             configRepo: null,
-            config: null,
+            config: config ?? ConfigWithReviewerModel(),
             goalStore,
             brainRepoManager: null,
             stateDir: workDir,
             logger: NullLogger<GoalReviewService>.Instance,
-            chatClientFactory: chatClientFactory);
+            chatClientFactory: chatClientFactory,
+            sessionRegistry: sessionRegistry);
     }
 
     [Fact]
@@ -463,6 +480,47 @@ public sealed class GoalReviewServiceTests
         // Release the first call so it can complete cleanly.
         tcs.SetResult("""{"verdict":"Approved","issues":[],"verified":[],"recommendation":"ok"}""");
         await first;
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_ReviewerModelUnconfigured_ThrowsAndDoesNotMutate()
+    {
+        // Slice 3b: an unconfigured Reviewer role model REFUSES the review — no LLM session is
+        // registered, no review document is persisted, and ReviewStatus is left unchanged.
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var registry = new LlmSessionRegistry();
+        var service = CreateService(
+            """{"verdict":"Approved","issues":[],"verified":[],"recommendation":"ok"}""",
+            knowledgeGraph: kg,
+            config: new HiveConfigFile(), // no reviewer model configured
+            sessionRegistry: registry);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken));
+
+        Assert.Equal("reviewer model not configured", ex.Message);
+
+        // No LLM session registered, no review document persisted, ReviewStatus unchanged.
+        Assert.DoesNotContain(registry.GetAll(), s => s.SessionType == LlmSessionType.GoalReview);
+        Assert.Null(kg.GetDocument($"review-{goal.Id}"));
+        Assert.Equal(ReviewStatus.None, goal.ReviewStatus);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_ReviewerModelUnconfigured_DoesNotInvokeChatClient()
+    {
+        // The chat client factory must never be invoked when the reviewer model is unconfigured.
+        var goal = NewGoal();
+        var invoked = false;
+        var service = CreateServiceWithFactory(
+            _ => { invoked = true; throw new InvalidOperationException("must not be called"); },
+            config: new HiveConfigFile());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken));
+
+        Assert.False(invoked);
     }
 
     [Fact]

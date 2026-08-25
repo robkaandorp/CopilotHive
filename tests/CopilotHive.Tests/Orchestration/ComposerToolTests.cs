@@ -5983,6 +5983,38 @@ public sealed class ComposerToolTests : IDisposable
         public object? GetService(Type serviceType, object? serviceKey = null) => null;
     }
 
+    /// <summary>
+    /// A stub <see cref="IChatClient"/> that signals when it is entered and then blocks until a
+    /// supplied task completes, returning that task's result as the assistant reply.
+    /// </summary>
+    private sealed class BlockingReviewChatClient(Task<string> release, TaskCompletionSource<bool> entered) : IChatClient
+    {
+        public ChatClientMetadata Metadata => new("block", null, "block-model");
+
+        public async Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+        {
+            entered.TrySetResult(true);
+            var reply = await release.WaitAsync(cancellationToken);
+            return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply))
+            {
+                FinishReason = ChatFinishReason.Stop,
+            };
+        }
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            CancellationToken cancellationToken = default)
+            => throw new NotSupportedException("Streaming not used in this fake client.");
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
     /// <summary>Stub GoalReviewService that returns a fixed result via the chat-client factory seam.</summary>
     private sealed class StubGoalReviewService : GoalReviewService
     {
@@ -5990,7 +6022,13 @@ public sealed class ComposerToolTests : IDisposable
             : base(
                 null,
                 null,
-                null,
+                new HiveConfigFile
+                {
+                    Workers =
+                    {
+                        ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+                    },
+                },
                 null,
                 null,
                 Path.GetTempPath(),
@@ -6116,6 +6154,105 @@ public sealed class ComposerToolTests : IDisposable
 
         Assert.Contains("❌", result);
         Assert.Contains("not available", result);
+    }
+
+    /// <summary>
+    /// Slice 3b: when the reviewer model is unconfigured, <see cref="GoalReviewService"/>
+    /// throws "reviewer model not configured" and <c>Composer.ReviewGoalAsync</c> catches it
+    /// via the exact-message filter, returning the frozen tool response.
+    /// </summary>
+    [Fact]
+    public async Task ReviewGoal_ReviewerModelUnconfigured_ReturnsFrozenResponse()
+    {
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: new UnconfiguredReviewerGoalReviewService());
+
+        await composer.CreateGoalAsync("review-unconfigured", "Test goal");
+
+        var result = await composer.ReviewGoalAsync("review-unconfigured");
+
+        Assert.Equal(
+            "Review cannot start — no reviewer model is configured. Configure a reviewer model in the configuration page, then retry.",
+            result);
+    }
+
+    /// <summary>
+    /// Slice 3b: a concurrent-review <see cref="InvalidOperationException"/> (a DIFFERENT
+    /// error) must NOT be misreported as an unconfigured reviewer model — it propagates
+    /// unchanged out of <c>Composer.ReviewGoalAsync</c>.
+    /// </summary>
+    [Fact]
+    public async Task ReviewGoal_ConcurrentReviewInvalidOperationException_IsNotMisreported()
+    {
+        // A real GoalReviewService whose first review blocks in the agent call (TCS gate) and
+        // whose goalStore is null (so Pending is never persisted — the Composer's own
+        // ReviewStatus check passes and the service-level in-memory concurrency guard fires).
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reviewService = new GoalReviewService(
+            knowledgeGraph: null,
+            configRepo: null,
+            config: new HiveConfigFile
+            {
+                Workers =
+                {
+                    ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+                },
+            },
+            goalStore: null,
+            brainRepoManager: null,
+            stateDir: Path.GetTempPath(),
+            logger: NullLogger<GoalReviewService>.Instance,
+            chatClientFactory: _ => new BlockingReviewChatClient(tcs.Task, entered));
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            goalReviewService: reviewService);
+
+        await composer.CreateGoalAsync("review-concurrent-ioe", "Test goal");
+
+        // Start the first review directly on the service — it blocks inside the agent call.
+        var goal = await _store.GetGoalAsync("review-concurrent-ioe", TestContext.Current.CancellationToken);
+        Assert.NotNull(goal);
+        var firstReview = reviewService.ReviewGoalAsync(goal!, TestContext.Current.CancellationToken);
+        await entered.Task;
+
+        // The Composer's second review hits the service-level in-memory concurrency guard.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => composer.ReviewGoalAsync("review-concurrent-ioe"));
+
+        Assert.Equal("A review is already in progress for goal review-concurrent-ioe", ex.Message);
+
+        // Release the first review so it completes cleanly.
+        tcs.SetResult("""{"verdict":"Approved","issues":[],"verified":[],"recommendation":"ok"}""");
+        await firstReview;
+    }
+
+    /// <summary>
+    /// A <see cref="GoalReviewService"/> whose reviewer model is unconfigured — the review is
+    /// refused with "reviewer model not configured".
+    /// </summary>
+    private sealed class UnconfiguredReviewerGoalReviewService : GoalReviewService
+    {
+        public UnconfiguredReviewerGoalReviewService()
+            : base(
+                null,
+                null,
+                new HiveConfigFile(), // no reviewer model configured
+                null,
+                null,
+                Path.GetTempPath(),
+                NullLogger<GoalReviewService>.Instance,
+                _ => throw new InvalidOperationException("must not be called"))
+        {
+        }
     }
 
     [Fact]

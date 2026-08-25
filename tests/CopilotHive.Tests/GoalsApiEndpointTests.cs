@@ -1368,6 +1368,17 @@ public class GoalsApiEndpointTests
                 if (existing is not null)
                     services.Remove(existing);
 
+                // Slice 3b: an unconfigured Reviewer model refuses the review, so supply a
+                // configured reviewer model for the review-path endpoint tests. Registered
+                // after Program's own registration so GetService<HiveConfigFile> resolves it.
+                services.AddSingleton(new HiveConfigFile
+                {
+                    Workers =
+                    {
+                        ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+                    },
+                });
+
                 services.AddSingleton(sp => new GoalReviewService(
                     sp.GetService<CopilotHive.Knowledge.KnowledgeGraph>(),
                     sp.GetService<CopilotHive.Configuration.ConfigRepoManager>(),

@@ -33,6 +33,15 @@ public sealed class LlmSessionRegistryIntegrationTests
         return dir;
     }
 
+    /// <summary>Config with a configured reviewer model (Slice 3b: unconfigured ⇒ refused).</summary>
+    private static HiveConfigFile ReviewerConfig() => new()
+    {
+        Workers =
+        {
+            ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+        },
+    };
+
     private static LlmSessionInfo? FindSession(LlmSessionRegistry registry, string sessionId) =>
         registry.GetAll().FirstOrDefault(s => s.SessionId == sessionId);
 
@@ -1234,7 +1243,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var goal = new Goal { Id = "goal-review-ok", Description = "Review OK goal", ReviewStatus = ReviewStatus.None };
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new ReviewCapturingChatClient(
@@ -1270,7 +1279,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var goal = new Goal { Id = "goal-review-fail", Description = "Review fail goal", ReviewStatus = ReviewStatus.None };
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new ThrowingReviewChatClient(),
@@ -1302,7 +1311,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new BlockingReviewChatClient(tcs.Task, entered),
@@ -1344,7 +1353,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new BlockingReviewChatClient(tcs.Task, entered),
@@ -1359,7 +1368,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             Assert.StartsWith("goal-review-goal-review-payload-", captured.SessionId);
             Assert.Equal(LlmSessionType.GoalReview, captured.SessionType);
             Assert.Equal("goal-review-payload", captured.GoalId);
-            Assert.Equal(Constants.DefaultWorkerModel, captured.Model);
+            Assert.Equal("reviewer-model", captured.Model);
             Assert.Equal(0, captured.CurrentTokens);
             Assert.True(captured.MaxTokens > 0, "MaxTokens should be positive");
             Assert.Equal("reviewing", captured.Status);
@@ -1391,7 +1400,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             using var cts = new CancellationTokenSource();
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new BlockingReviewChatClient(tcs.Task, entered),
@@ -1423,7 +1432,7 @@ public sealed class LlmSessionRegistryIntegrationTests
             var goal = new Goal { Id = "goal-review-null", Description = "Null registry review goal", ReviewStatus = ReviewStatus.None };
 
             var service = new GoalReviewService(
-                knowledgeGraph: null, configRepo: null, config: null, goalStore: null,
+                knowledgeGraph: null, configRepo: null, config: ReviewerConfig(), goalStore: null,
                 brainRepoManager: null, stateDir: tempDir,
                 logger: NullLogger<GoalReviewService>.Instance,
                 chatClientFactory: _ => new ReviewCapturingChatClient(
