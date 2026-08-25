@@ -900,6 +900,44 @@ public sealed class ComposerHubTests : IAsyncLifetime
         _dbContext.Dispose();
     }
 
+    // ── GET /api/composer/current-model (frozen contract) ──
+
+    [Fact]
+    public async Task CurrentModel_NotConnected_ReturnsHttp200WithNullModel()
+    {
+        // The fixture's Composer is constructed with a model but never connected — a
+        // disconnected shell. The frozen contract: HTTP 200 with {"model":null}, never a
+        // fabricated catalog entry (no FirstOrDefault fallback).
+        var response = await _client.GetAsync("/api/composer/current-model", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        var json = JsonDocument.Parse(content);
+        var model = json.RootElement.GetProperty("model");
+
+        Assert.Equal(JsonValueKind.Null, model.ValueKind);
+    }
+
+    [Fact]
+    public async Task CurrentModel_Connected_ReturnsActiveModel()
+    {
+        // Connect by switching to a valid model (Slice 1A2b-1 first-selection connect).
+        var switchResponse = await _client.PostAsync(
+            "/api/composer/models/switch?model=claude-opus&reasoning=medium",
+            null, TestContext.Current.CancellationToken);
+        switchResponse.EnsureSuccessStatusCode();
+
+        var response = await _client.GetAsync("/api/composer/current-model", TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        var json = JsonDocument.Parse(content);
+        var model = json.RootElement.GetProperty("model");
+
+        Assert.Equal(JsonValueKind.String, model.ValueKind);
+        Assert.Equal("claude-opus", model.GetString());
+    }
+
     // ── GET /api/composer/models ──
 
     [Fact]
@@ -1373,11 +1411,12 @@ public sealed class ComposerHubTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// current-model for a disconnected shell with a non-empty catalog MAY return the first
-    /// entry (accepted interim inconsistency, fixed in Slice 1B).
+    /// Frozen contract (Slice 1B): current-model for a disconnected shell with a non-empty
+    /// catalog returns HTTP 200 with {"model":null} — the endpoint NEVER fabricates a value
+    /// from the catalog (no FirstOrDefault fallback).
     /// </summary>
     [Fact]
-    public async Task CurrentModel_DisconnectedShell_WithCatalog_ReturnsFirstEntry()
+    public async Task CurrentModel_DisconnectedShell_WithCatalog_ReturnsNull()
     {
         var globalConfig = new HiveConfigFile
         {
@@ -1399,10 +1438,10 @@ public sealed class ComposerHubTests : IAsyncLifetime
 
         var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
         var json = JsonDocument.Parse(content);
-        var model = json.RootElement.GetProperty("model").GetString();
+        var model = json.RootElement.GetProperty("model");
 
-        // Accepted interim: the FirstOrDefault() fallback returns the first catalog entry.
-        Assert.Equal("model-a", model);
+        // Frozen contract: null, never the first catalog entry.
+        Assert.Equal(JsonValueKind.Null, model.ValueKind);
 
         await fixture.DisposeAsync();
     }

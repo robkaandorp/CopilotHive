@@ -16,13 +16,30 @@
 @inject PageHeaderState PageHeader
 @inject HttpClient HttpClient
 
-@if (!Composer.IsConnected)
+@if (ViewState.ShowNotConfiguredNotice)
 {
     <div class="chat-status chat-status-error">
-        Composer is not connected. Check orchestrator logs.
+        No model configured — select a model to start
     </div>
 }
-else
+
+@if (ViewState.ShowModelPicker && !ViewState.ShowConnectedControls)
+{
+    <div class="chat-actions">
+        <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
+            @if (ViewState.Placeholder is { } placeholder)
+            {
+                <option value="" selected="@(string.IsNullOrEmpty(_selectedModel))">@placeholder</option>
+            }
+            @foreach (var model in _availableModels)
+            {
+                <option value="@model" selected="@(_selectedModel == model)">@model</option>
+            }
+        </select>
+    </div>
+}
+
+@if (ViewState.ShowConnectedControls)
 {
     <div class="composer-layout">
         <div class="chat-container">
@@ -230,6 +247,10 @@ else
 
             <div class="chat-actions">
                 <select disabled="@Composer.IsStreaming" class="chat-model-select" @onchange="HandleModelChange">
+                    @if (ViewState.Placeholder is { } placeholder)
+                    {
+                        <option value="" selected="@(string.IsNullOrEmpty(_selectedModel))">@placeholder</option>
+                    }
                     @foreach (var model in _availableModels)
                     {
                         <option value="@model" selected="@(_selectedModel == model)">@model</option>
@@ -308,6 +329,44 @@ else
 }
 
 @code {
+    /// <summary>
+    /// Internal immutable view-state record the Razor markup reads DIRECTLY. The page computes
+    /// its render state from this record; tests construct it from mock Composer state and assert
+    /// its flags — never markup tokens or an HTML string. This is the production seam.
+    /// </summary>
+    /// <param name="IsConnected">Whether the Composer is connected (has an active model).</param>
+    /// <param name="ShowModelPicker">Whether the model picker is rendered (always true — reachable even while disconnected).</param>
+    /// <param name="ShowConnectedControls">Whether the connected-only controls (thread, Send, Compact, Reset, reasoning select) are rendered.</param>
+    /// <param name="ShowNotConfiguredNotice">Whether the "No model configured" notice is shown.</param>
+    /// <param name="Placeholder">The no-selection placeholder label for the model select, or <c>null</c> when none.</param>
+    internal sealed record ComposerChatViewState(
+        bool IsConnected,
+        bool ShowModelPicker,
+        bool ShowConnectedControls,
+        bool ShowNotConfiguredNotice,
+        string? Placeholder);
+
+    /// <summary>
+    /// The placeholder label for the model select's no-selection option. A non-empty list with
+    /// no valid default must NOT visually auto-select the first option without firing a change
+    /// event — the placeholder is the explicit no-selection state.
+    /// </summary>
+    internal const string ModelSelectPlaceholder = "— select a model —";
+
+    /// <summary>
+    /// Computes the page's render state from the Composer's connection state. The markup reads
+    /// this record directly; tests assert its flags.
+    /// </summary>
+    /// <param name="isConnected">Whether the Composer is connected.</param>
+    internal static ComposerChatViewState ComputeViewState(bool isConnected) => new(
+        IsConnected: isConnected,
+        ShowModelPicker: true,
+        ShowConnectedControls: isConnected,
+        ShowNotConfiguredNotice: !isConnected,
+        Placeholder: ModelSelectPlaceholder);
+
+    private ComposerChatViewState ViewState => ComputeViewState(Composer.IsConnected);
+
     private sealed class ChatMessage
     {
         public required string Role { get; init; }
@@ -328,6 +387,10 @@ else
     private string? _sendError;
     private IJSObjectReference? _pasteModule;
     private DotNetObjectReference<ComposerChat>? _pasteDotNetRef;
+    // Whether the paste module has been installed on the composer-input textarea. Set exactly
+    // once, when the textarea first appears (post-connect on a disconnected-first page); never
+    // reset — the module is uninstalled/disposed only in DisposeAsync.
+    private bool _pasteInstalled;
     // Authoritative event-notification mode. Null until GET /api/config/composer reports it —
     // a fabricated default would let the toggle PATCH a transition the server never implied.
     private string? _activeNotifMode;
@@ -338,10 +401,15 @@ else
     protected override async Task OnInitializedAsync()
     {
         PageHeader.SetTitle("💬 Composer");
+
+        // The available-models picker is ALWAYS loaded — even while disconnected the picker is
+        // reachable and enabled so the user can select a model to start. The current-model
+        // endpoint returns {"model":null} while disconnected (frozen contract), so loading it
+        // is harmless and keeps the select in its placeholder state.
+        await LoadAvailableModelsAsync();
         if (Composer.IsConnected)
         {
             LoadHistory();
-            await LoadAvailableModelsAsync();
             await LoadCurrentModelAsync();
         }
 
@@ -359,13 +427,30 @@ else
         Composer.OnActiveInjection += HandleActiveInjection;
     }
 
+    /// <summary>
+    /// Whether the paste module should be installed on the current render. The module is
+    /// installed when the composer-input textarea FIRST appears — on a connected-first page
+    /// that is the first render; on a disconnected-first page it is the render after a
+    /// successful first-connect. Installed EXACTLY ONCE (tracked by the caller's install
+    /// state); never installed while disconnected (no textarea exists).
+    /// </summary>
+    /// <param name="alreadyInstalled">Whether the module has already been installed.</param>
+    /// <param name="showConnectedControls">Whether the connected layout (with the textarea) is rendered.</param>
+    internal static bool ShouldInstallPasteModule(bool alreadyInstalled, bool showConnectedControls)
+        => !alreadyInstalled && showConnectedControls;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         await JS.InvokeVoidAsync("eval",
             "document.getElementById('chat-anchor')?.scrollIntoView()");
 
-        if (firstRender)
+        // The paste module is installed when the composer-input textarea FIRST appears — on a
+        // connected-first page that is the first render; on a disconnected-first page it is the
+        // render after a successful first-connect. Installed EXACTLY ONCE (tracked by
+        // _pasteInstalled); never installed while disconnected (no textarea exists).
+        if (ShouldInstallPasteModule(_pasteInstalled, ViewState.ShowConnectedControls))
         {
+            _pasteInstalled = true;
             _pasteModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/composer-paste.js");
             _pasteDotNetRef = DotNetObjectReference.Create(this);
             await _pasteModule.InvokeVoidAsync("install", "composer-input", _pasteDotNetRef);
@@ -1153,6 +1238,9 @@ else
     /// <summary>
     /// Fetches the Composer's actual current model and sets it as the initial
     /// dropdown selection, ensuring correctness after a runtime model switch.
+    /// A <c>null</c> model (disconnected shell — frozen contract) leaves the select
+    /// on its placeholder/no-selection option: the first catalog entry is NEVER
+    /// auto-selected without a change event.
     /// </summary>
     private async Task LoadCurrentModelAsync()
     {
@@ -1163,20 +1251,19 @@ else
             {
                 _selectedModel = response.Model;
             }
-            else if (_availableModels.Count > 0)
+            else
             {
-                // Fallback: Composer model not in list or API returned empty, use first available
-                _selectedModel = _availableModels[0];
+                // No valid current model: keep the placeholder/no-selection state. Never
+                // auto-select the first catalog entry — a real selection must fire a change
+                // event so the switch endpoint (and first-connect) is actually invoked.
+                _selectedModel = "";
             }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ComposerChat] Failed to load current model: {ex.Message}");
-            // Fallback to first available model on error
-            if (_availableModels.Count > 0)
-            {
-                _selectedModel = _availableModels[0];
-            }
+            // No valid current model: keep the placeholder/no-selection state (see above).
+            _selectedModel = "";
         }
     }
 
@@ -1212,20 +1299,99 @@ else
         ReasoningEffort previous, ReasoningEffort attempted, bool succeeded)
         => succeeded ? attempted : previous;
 
-    private async Task HandleModelChange(ChangeEventArgs e)
+    /// <summary>
+    /// Narrow seam over the component state the model-selection flow touches, so the PRODUCTION
+    /// handler body (<see cref="HandleModelChangeCoreAsync"/>) can be exercised by tests without
+    /// a live Blazor circuit. The component itself is the only production implementation.
+    /// </summary>
+    internal interface IModelSwitchHost
     {
-        if (e.Value is not string model || string.IsNullOrWhiteSpace(model)) return;
-        if (!_availableModels.Contains(model)) return;
+        /// <summary>Whether the Composer is connected BEFORE the switch attempt.</summary>
+        bool IsConnected { get; }
+
+        /// <summary>Sends the model switch to the switch endpoint.</summary>
+        /// <param name="model">Model identifier to switch to.</param>
+        /// <param name="reasoning">Reasoning effort to switch to.</param>
+        Task<HttpResponseMessage> SwitchAsync(string model, ReasoningEffort reasoning);
+
+        /// <summary>Reloads the message thread from the Composer session history.</summary>
+        void LoadHistory();
+
+        /// <summary>Refreshes the current model from the current-model endpoint.</summary>
+        Task LoadCurrentModelAsync();
+
+        /// <summary>Records the successfully applied model as the select's selection.</summary>
+        void SetSelectedModel(string model);
+
+        /// <summary>Requests a re-render (the component's <c>StateHasChanged</c>).</summary>
+        void Notify();
+    }
+
+    /// <summary>Binds <see cref="IModelSwitchHost"/> to this component's own fields and services.</summary>
+    private sealed class ComponentModelSwitchHost(ComposerChat owner) : IModelSwitchHost
+    {
+        /// <inheritdoc />
+        public bool IsConnected => owner.Composer.IsConnected;
+
+        /// <inheritdoc />
+        public Task<HttpResponseMessage> SwitchAsync(string model, ReasoningEffort reasoning)
+            => owner.HttpClient.PostAsJsonAsync(
+                BuildSwitchUri(model, reasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
+
+        /// <inheritdoc />
+        public void LoadHistory() => owner.LoadHistory();
+
+        /// <inheritdoc />
+        public Task LoadCurrentModelAsync() => owner.LoadCurrentModelAsync();
+
+        /// <inheritdoc />
+        public void SetSelectedModel(string model) => owner._selectedModel = model;
+
+        /// <inheritdoc />
+        public void Notify() => owner.StateHasChanged();
+    }
+
+    private IModelSwitchHost? _modelSwitchHost;
+
+    private IModelSwitchHost ModelSwitchHost => _modelSwitchHost ??= new ComponentModelSwitchHost(this);
+
+    /// <summary>
+    /// The PRODUCTION model-selection body, written against <see cref="IModelSwitchHost"/> so
+    /// tests exercise this exact code rather than a re-implementation. A successful selection
+    /// on a disconnected shell (first-connect) triggers history + current-model refresh so the
+    /// restored thread shows immediately — no navigation.
+    /// </summary>
+    /// <param name="host">State seam the outcome is written to.</param>
+    /// <param name="model">Model identifier to switch to.</param>
+    /// <param name="reasoning">Reasoning effort to switch to.</param>
+    internal static async Task HandleModelChangeCoreAsync(IModelSwitchHost host, string model, ReasoningEffort reasoning)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+
+        // Captured BEFORE the request: a successful first-selection connect (disconnected shell)
+        // must refresh history + current model so the restored thread shows immediately.
+        var wasDisconnected = !host.IsConnected;
 
         try
         {
             // The current reasoning selection travels with the new model — the server requires
             // both and never infers reasoning from the model name.
-            var response = await HttpClient.PostAsJsonAsync(
-                BuildSwitchUri(model, _selectedReasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
+            var response = await host.SwitchAsync(model, reasoning);
             if (response.IsSuccessStatusCode)
             {
-                _selectedModel = model;
+                host.SetSelectedModel(model);
+                if (wasDisconnected)
+                {
+                    // First-connect: the switch endpoint connected the Composer (Slice 1A2b-1)
+                    // and restored the session from disk. Load and display the restored history
+                    // and refresh the current model so the thread shows immediately — no
+                    // navigation required.
+                    host.LoadHistory();
+                    await host.LoadCurrentModelAsync();
+                    // The view state flips to the connected layout (thread + controls) — the
+                    // re-render also triggers the paste-module install (OnAfterRenderAsync).
+                    host.Notify();
+                }
             }
             else
             {
@@ -1237,6 +1403,15 @@ else
         {
             Console.Error.WriteLine($"[ComposerChat] Model switch failed: {ex.Message}");
         }
+    }
+
+    /// <summary>Runs the shared model-selection body against this component's own state.</summary>
+    private Task HandleModelChange(ChangeEventArgs e)
+    {
+        if (e.Value is not string model || string.IsNullOrWhiteSpace(model)) return Task.CompletedTask;
+        if (!_availableModels.Contains(model)) return Task.CompletedTask;
+
+        return HandleModelChangeCoreAsync(ModelSwitchHost, model, _selectedReasoning);
     }
 
     private async Task HandleReasoningChange(ChangeEventArgs e)
@@ -1476,6 +1651,9 @@ else
     }
 
     private sealed record ModelsResponse(List<string> Models, ReasoningEffort? ReasoningEffort);
-    private sealed record CurrentModelResponse(string Model);
+    // Nullable Model: the frozen current-model contract returns {"model":null} when the
+    // Composer is not connected / has no active model — never a fabricated catalog entry.
+    // Internal so tests can verify the nullable DTO deserializes both shapes.
+    internal sealed record CurrentModelResponse(string? Model);
     private sealed record ErrorResponse(string Error);
 }

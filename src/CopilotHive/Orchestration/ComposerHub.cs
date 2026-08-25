@@ -21,8 +21,12 @@ public static class ComposerHub
     {
         if (composer is null) return;
 
+        // Frozen contract: when the Composer is not connected / has no active model, the
+        // endpoint returns HTTP 200 with {"model":null} — it NEVER fabricates a value from
+        // the catalog (no FirstOrDefault fallback). The anonymous nullable projection keeps
+        // the wire shape identical to the connected case, with a null model.
         routes.MapGet("/api/composer/current-model", () =>
-            Results.Ok(new { model = composer.GetStats()?.Model ?? composer.AvailableModels.FirstOrDefault() ?? "" }));
+            Results.Ok(new { model = composer.GetStats()?.Model ?? (string?)null }));
 
         routes.MapGet("/api/composer/models", () =>
         {
