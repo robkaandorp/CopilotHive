@@ -621,6 +621,22 @@ internal sealed class ComposerAgentService(
     /// <see cref="ValidateAvailableModel"/> (the snapshot is already validated). Used by the
     /// actor's marker-true selection branch so exactly ONE validation happens per operation.
     /// Behavior matches the public switch's teardown→apply→create→register order.
+    /// <para>
+    /// Failure model. The COMMIT BOUNDARY is a successful client/agent creation:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>Pre-teardown</b> (opening log, <see cref="DisposeClientsAndClearStateAsync"/>):
+    /// propagates with NO rollback — the scalars were never mutated.</item>
+    /// <item><b>Pre-commit</b> (<see cref="ApplyModelScalars"/> or client/agent creation): the
+    /// four mutated scalars (<c>_model</c>, <c>_configuredReasoningEffort</c>,
+    /// <c>_reasoningEffort</c>, <c>_maxContextTokens</c>) are reverted to the pre-call snapshot
+    /// FIRST, then the safe disposal runs (its disposal AND logging failures are swallowed), and
+    /// finally the ORIGINAL apply/creation exception is rethrown — a cleanup or logging failure
+    /// must never mask it nor skip the revert. The session instance is preserved.</item>
+    /// <item><b>Post-commit</b> (registry publish, final success log): each is INDEPENDENTLY
+    /// best-effort — a publish fault does not skip the final log, and neither surfaces as a
+    /// switch failure.</item>
+    /// </list>
     /// </summary>
     /// <param name="selection">The already-validated model selection to apply.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -628,6 +644,18 @@ internal sealed class ComposerAgentService(
     {
         ct.ThrowIfCancellationRequested();
 
+        // PRE-CALL SCALAR SNAPSHOT: the four scalars the switch mutates, captured BEFORE the
+        // opening log and the teardown so a PRE-COMMIT failure (apply or client/agent creation)
+        // can restore them exactly. _session is deliberately NOT captured — a failed switch
+        // never replaces the session instance, so there is nothing to restore.
+        var previousModel = _model;
+        var previousConfiguredReasoningEffort = _configuredReasoningEffort;
+        var previousReasoningEffort = _reasoningEffort;
+        var previousMaxContextTokens = _maxContextTokens;
+
+        // PRE-TEARDOWN failure boundary: if this log (or the teardown below) throws, the switch
+        // exits with NO rollback — the old scalars were never mutated, so restoring them would
+        // be meaningless work on values that already hold.
         _logger.LogInformation(
             "Switching Composer model from '{OldModel}' to '{NewModel}' (reasoning={Reasoning})",
             _model, selection.Model, ReasoningEffortConverter.Format(selection.ReasoningEffort));
@@ -635,12 +663,14 @@ internal sealed class ComposerAgentService(
         // Model switch: dispose old agent + clients before creating new ones.
         await DisposeClientsAndClearStateAsync();
 
-        // Apply the validated scalars AFTER teardown — model, reasoning, and the conditional
-        // context-window update (with its existing log) come from the ONE captured snapshot.
-        ApplyModelScalars(selection);
-
         try
         {
+            // Apply the validated scalars AFTER teardown — model, reasoning, and the conditional
+            // context-window update (with its existing log) come from the ONE captured snapshot.
+            // A failure here (e.g. the context-window log throws) leaves PARTIALLY mutated
+            // scalars, which the catch below reverts wholesale.
+            ApplyModelScalars(selection);
+
             _chatClient = CreateClient(selection.Model);
             if (!string.IsNullOrEmpty(_compactionModel))
                 _compactionChatClient = CreateClient(_compactionModel);
@@ -650,24 +680,61 @@ internal sealed class ComposerAgentService(
         }
         catch
         {
-            // Failed new client creation: safe cleanup logs failures so the original
-            // exception propagates.
-            await SafeDisposeClientsAndClearStateAsync();
+            // PRE-COMMIT failure (apply OR client/agent creation). The commit boundary is a
+            // successful client/agent creation, so nothing here is committed: restore the four
+            // scalars FIRST — before any fallible cleanup — so neither a disposal failure nor a
+            // throwing cleanup logger can skip the rollback.
+            _model = previousModel;
+            _configuredReasoningEffort = previousConfiguredReasoningEffort;
+            _reasoningEffort = previousReasoningEffort;
+            _maxContextTokens = previousMaxContextTokens;
+
+            try
+            {
+                // Safe cleanup swallows (and logs) disposal failures.
+                await SafeDisposeClientsAndClearStateAsync();
+            }
+            catch
+            {
+                // SafeDisposeClientsAndClearStateAsync only throws when its OWN cleanup log
+                // throws. The rollback already ran above — a cleanup/logging failure must NEVER
+                // mask the original pre-commit exception, which is the authoritative one.
+            }
+
             throw;
         }
 
-        _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
-        {
-            SessionId = "composer",
-            SessionType = LlmSessionType.Composer,
-            Model = selection.Model,
-            Status = "idle",
-            CurrentTokens = _session.EstimatedContextTokens,
-            MaxTokens = _maxContextTokens,
-            ReasoningEffort = _reasoningEffort,
-        });
+        // ── POST-COMMIT: the switch has succeeded. Everything below is INDEPENDENTLY
+        // best-effort — a failure in one step must neither skip the other nor turn a committed
+        // switch into a reported failure. ──
 
-        _logger.LogInformation("Composer switched to model '{Model}'", _model);
+        try
+        {
+            _sessionRegistry?.RegisterOrUpdate(new LlmSessionInfo
+            {
+                SessionId = "composer",
+                SessionType = LlmSessionType.Composer,
+                Model = selection.Model,
+                Status = "idle",
+                CurrentTokens = _session.EstimatedContextTokens,
+                MaxTokens = _maxContextTokens,
+                ReasoningEffort = _reasoningEffort,
+            });
+        }
+        catch
+        {
+            // Publish failure is swallowed: the connection is live and committed. The final log
+            // below still runs.
+        }
+
+        try
+        {
+            _logger.LogInformation("Composer switched to model '{Model}'", _model);
+        }
+        catch
+        {
+            // A throwing logger must never surface as a switch failure.
+        }
     }
 
     /// <summary>
