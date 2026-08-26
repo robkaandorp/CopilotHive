@@ -448,6 +448,26 @@ public sealed class Program
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
+            // Composer LLM connection coordinator: owns the startup connect (gating, deferral
+            // until a GitHub Copilot token exists, wake-up on token commit, dedup, shutdown).
+            // It invokes the Composer's own ConnectAsync — it never runs its own retry loop.
+            // Gating reads ONLY the Composer's effective primary model (StartupDefaultModel) and
+            // the configured compaction model; the Brain is deliberately not involved.
+            builder.Services.AddSingleton(sp =>
+            {
+                var config = sp.GetRequiredService<HiveConfigFile>();
+                var composerInstance = sp.GetService<Composer>();
+
+                return new LlmConnectionCoordinator(
+                    composerInstance?.StartupDefaultModel,
+                    config.Models?.CompactionModel,
+                    authEnabled,
+                    composerInstance is null ? null : composerInstance.ConnectAsync,
+                    SharpCoder.Providers.ChatClientFactory.IsTokenAvailable,
+                    static model => SharpCoder.Providers.ChatClientFactory.ParseProviderAndModel(model).Item1,
+                    sp.GetService<ILogger<LlmConnectionCoordinator>>());
+            });
+
             // Active event injector: registered via a factory with GetService so a missing
             // Composer, event bus, or config produces a disabled (no-op) instance instead of
             // crashing DI resolution. Resolved after the Composer connection block below.
@@ -725,30 +745,21 @@ public sealed class Program
             }
 
             var composer = app.Services.GetService<Composer>();
-            if (composer is not null)
-            {
-                // Startup connect is attempted ONLY when a valid default model was resolved
-                // (the SAME single resolution used for construction — Composer.StartupDefaultModel).
-                // With no valid default the Composer registers as a disconnected shell and the
-                // process still starts; the user can connect later by selecting a model.
-                if (composer.StartupDefaultModel is not null)
-                {
-                    try
-                    {
-                        logger.LogInformation("Connecting Composer…");
-                        await composer.ConnectAsync();
-                        logger.LogInformation("Composer connected.");
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(ex, "Composer failed to connect — chat will be unavailable");
-                    }
-                }
-                else
-                {
-                    logger.LogWarning("Composer has no configured model — registered as a disconnected shell");
-                }
-            }
+            var llmCoordinator = app.Services.GetRequiredService<LlmConnectionCoordinator>();
+
+            // The coordinator owns the startup connect end to end:
+            //  • no resolved default model → Absent (disconnected shell), host still starts;
+            //  • OAuth on + a Copilot-backed Composer with no token yet → PendingConnect, and the
+            //    connect happens the moment a non-whitespace token is committed at sign-in
+            //    (fresh-OAuth-install fix — the old code connected once, failed and never retried);
+            //  • otherwise → an eager connect that settles as Connected or Faulted.
+            // Signal delivery is fire-and-forget: a failed deferred connect surfaces as Faulted and
+            // is never thrown into the sign-in request.
+            llmCoordinator.SubscribeTokenSignal(
+                handler => userService.TokenAvailable += handler,
+                handler => userService.TokenAvailable -= handler);
+            llmCoordinator.BindToApplicationStopping(appLifetime.ApplicationStopping);
+            await llmCoordinator.StartAsync();
 
             // Active event injector: resolved after the Composer connection block so the
             // Composer's actor is ready to accept injected notifications. The factory uses

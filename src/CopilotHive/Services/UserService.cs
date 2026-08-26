@@ -52,9 +52,44 @@ public sealed class UserService
     }
 
     /// <summary>
+    /// Raised after a GitHub OAuth access token has been committed to the database, and ONLY when
+    /// the committed token is non-whitespace — a whitespace commit never signals availability.
+    /// <para>
+    /// Delivery is fire-and-forget: <see cref="CreateOrUpdateUserAsync"/> swallows every handler
+    /// exception, so its behaviour never changes based on signal delivery (in particular a failed
+    /// deferred Composer connect is never thrown into the sign-in request).
+    /// </para>
+    /// </summary>
+    public event Action? TokenAvailable;
+
+    /// <summary>
+    /// Publishes <see cref="TokenAvailable"/> when the committed token is non-whitespace.
+    /// Every subscriber exception is caught and logged — signal delivery must not change the
+    /// outcome of the sign-in request.
+    /// </summary>
+    private void RaiseTokenAvailable(string accessToken)
+    {
+        if (string.IsNullOrWhiteSpace(accessToken))
+            return;
+
+        try
+        {
+            TokenAvailable?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Token-available signal subscriber threw; sign-in is unaffected");
+        }
+    }
+
+    /// <summary>
     /// Creates a new user or updates the existing user with the same GitHub ID.
     /// On update, the profile fields, tokens and <see cref="UserEntity.LastLoginAt"/> are refreshed.
     /// On create, <see cref="UserEntity.CreatedAt"/> and <see cref="UserEntity.LastLoginAt"/> are set to now.
+    /// <para>
+    /// After the token is committed, <see cref="TokenAvailable"/> is raised when (and only when)
+    /// the token is non-whitespace.
+    /// </para>
     /// </summary>
     public async Task<UserEntity> CreateOrUpdateUserAsync(
         string githubId,
@@ -85,6 +120,7 @@ public sealed class UserService
 
             await db.SaveChangesAsync(ct);
             _logger.LogInformation("Updated admin user '{Username}' (GitHub ID {GitHubId})", username, githubId);
+            RaiseTokenAvailable(accessToken);
             return existing;
         }
 
@@ -106,6 +142,7 @@ public sealed class UserService
         db.Users.Add(user);
         await db.SaveChangesAsync(ct);
         _logger.LogInformation("Created admin user '{Username}' (GitHub ID {GitHubId})", username, githubId);
+        RaiseTokenAvailable(accessToken);
         return user;
     }
 
