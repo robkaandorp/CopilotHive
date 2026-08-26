@@ -205,19 +205,17 @@ public sealed class WorkerServiceReasoningForwardingTests
     }
 
     /// <summary>Collects anything the worker writes back to the orchestrator.</summary>
-    private sealed class FakeRequestStream : IClientStreamWriter<WorkerMessage>
+    private sealed class FakeRequestStream : FakeClientStreamWriter<WorkerMessage>
     {
         private readonly Channel<WorkerMessage> _written = Channel.CreateUnbounded<WorkerMessage>();
 
-        public WriteOptions? WriteOptions { get; set; }
-
-        public Task WriteAsync(WorkerMessage message)
+        public override Task WriteAsync(WorkerMessage message)
         {
             _written.Writer.TryWrite(message);
             return Task.CompletedTask;
         }
 
-        public Task CompleteAsync()
+        public override Task CompleteAsync()
         {
             _written.Writer.TryComplete();
             return Task.CompletedTask;

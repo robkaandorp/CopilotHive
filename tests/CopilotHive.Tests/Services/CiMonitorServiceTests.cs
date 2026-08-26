@@ -2553,6 +2553,8 @@ public sealed class CiMonitorServiceTests : IDisposable
     [Fact]
     public void ParseTestFailuresFromLogs_SingleFailure_ReturnsOneEntryWithCorrectFields()
     {
+        // Normalize line endings: on Windows the raw string literal contains \r\n, but the
+        // parser splits/joins on \n, so \r would leak into interior lines of Error/StackTrace.
         var log = """
             Starting test execution...
 
@@ -2564,7 +2566,7 @@ public sealed class CiMonitorServiceTests : IDisposable
               Stack Trace:
                 at MyTests.TestOne() in /src/MyTests.cs:line 10
                 at Xunit.TestRunner.Run()
-            """;
+            """.Replace("\r\n", "\n", StringComparison.Ordinal);
 
         var failures = CiMonitorService.ParseTestFailuresFromLogs(log);
 

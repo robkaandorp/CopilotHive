@@ -3,6 +3,8 @@ using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
 using Moq;
 
+using System.Globalization;
+
 namespace CopilotHive.Tests;
 
 /// <summary>Unit tests for <see cref="StaleWorkerCleanupService"/>.</summary>
@@ -320,14 +322,15 @@ public sealed class StaleWorkerCleanupServiceTests
         await svc.RunCleanupCycleAsync();
 
         // The reclaim warning must mention "inactive" and the LastActivityAt timestamp —
-        // NOT "exceeded" or the CurrentTaskStartedAt value.
+        // NOT "exceeded" or the CurrentTaskStartedAt value. ILogger's FormattedLogValues
+        // formats DateTime with the invariant culture, so the predicate must match that.
         loggerMock.Verify(
             l => l.Log(
                 LogLevel.Warning,
                 It.IsAny<EventId>(),
                 It.Is<It.IsAnyType>((v, _) =>
                     v.ToString()!.Contains("inactive since") &&
-                    v.ToString()!.Contains(inactiveSince.ToString("MM/dd/yyyy HH:mm:ss"))),
+                    v.ToString()!.Contains(inactiveSince.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture))),
                 It.IsAny<Exception?>(),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.Once);

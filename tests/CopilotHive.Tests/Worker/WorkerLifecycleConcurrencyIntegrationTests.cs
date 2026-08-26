@@ -373,7 +373,7 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
         }
     }
 
-    private sealed class CapturingRequestStream : IClientStreamWriter<WorkerMessage>
+    private sealed class CapturingRequestStream : FakeClientStreamWriter<WorkerMessage>
     {
         private readonly object _gate = new();
         private readonly Dictionary<int, TaskCompletionSource<bool>> _readyWaiters = [];
@@ -383,9 +383,7 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
 
         internal int ReadyCount { get { lock (_gate) return _readyCount; } }
 
-        public WriteOptions? WriteOptions { get; set; }
-
-        public Task WriteAsync(WorkerMessage message)
+        public override Task WriteAsync(WorkerMessage message)
         {
             TaskCompletionSource<bool>? readyWaiter = null;
             TaskCompletionSource<WorkerMessage>? toolWaiter = null;
@@ -439,13 +437,7 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
             }
         }
 
-        public Task WriteAsync(WorkerMessage message, CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return WriteAsync(message);
-        }
-
-        public Task CompleteAsync() => Task.CompletedTask;
+        public override Task CompleteAsync() => Task.CompletedTask;
     }
 
     private sealed class ToolRoundTripRunner : IAgentRunner
