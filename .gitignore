@@ -19,6 +19,9 @@ agents/history/
 .env
 copilothive-smoketest.db
 
+## Local Docker Compose overrides (machine-specific, never committed)
+docker/docker-compose.override.yml
+
 # Coverage artifacts
 coverage.cobertura.xml
 TestResults/
