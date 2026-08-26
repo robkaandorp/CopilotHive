@@ -1,3 +1,9 @@
+## [0.34.0] — 2026-08-26
+
+### Added
+
+- **Worker-side config-repo URL provisioning surface** — `ConfigRepoUrlSanitizer` is now a shared public type in `CopilotHive.Shared` (namespace `CopilotHive.Configuration` unchanged), so both the orchestrator and the worker use the same sanitizer. `WorkerConfigProvisioner` exposes `ProvisionedConfigRepoUrl` (the most recently provisioned non-whitespace `config_repo_url`, cleared on RPC failure with the provisioned env), `ResolvedConfigRepoUrl` (operator `CONFIG_REPO_URL` wins over the provisioned value), and `ResolveConfigRepoCredential()` (operator `GH_TOKEN` → operator `GITHUB_TOKEN` → currently-provisioned token). `CONFIG_REPO_URL` is registered in the operator snapshot for operator-vs-provisioned tracking and is never written back to the environment.
+
 ## [0.33.1] — 2026-08-24
 
 ### Fixed

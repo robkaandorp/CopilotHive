@@ -6,18 +6,17 @@ namespace CopilotHive.Configuration;
 /// Sanitizes the operator-supplied <c>--config-repo=&lt;value&gt;</c> command-line argument.
 /// <para>
 /// The raw operator value can carry a credential (e.g. <c>https://ghp_token@github.com/org/repo.git</c>).
-/// Such a value must NEVER reach a log, an exception message, the
-/// <see cref="Microsoft.AspNetCore.Builder.WebApplicationBuilder"/> args, or
-/// <see cref="ConfigRepoManager"/>. Every rejection therefore reports a REDACTED reason only —
-/// the raw input is never echoed.
+/// Such a value must NEVER reach a log, an exception message, the web application builder's
+/// argument array, or the config repository manager. Every rejection therefore reports a
+/// REDACTED reason only — the raw input is never echoed.
 /// </para>
 /// <para>
-/// This type is distinct from <c>ConfigRepoManager.InjectTokenIntoUrl</c>, which is the
-/// internal git-ops credential path (it builds credential-bearing clone URLs from
-/// <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c>) and is deliberately untouched by this sanitizer.
+/// This type is distinct from the config repository manager's internal token-injection path,
+/// which builds credential-bearing clone URLs from <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> and is
+/// deliberately untouched by this sanitizer.
 /// </para>
 /// </summary>
-internal static class ConfigRepoUrlSanitizer
+public static class ConfigRepoUrlSanitizer
 {
     /// <summary>The exact command-line prefix recognised for the config repo argument.</summary>
     internal const string ArgPrefix = "--config-repo=";
@@ -50,7 +49,7 @@ internal static class ConfigRepoUrlSanitizer
     /// The value is present but not acceptable. The message states a redacted reason and NEVER
     /// contains any part of <paramref name="raw"/>.
     /// </exception>
-    internal static string? Sanitize(string? raw)
+    public static string? Sanitize(string? raw)
     {
         // Redaction boundary: every exception that escapes this method is a RejectedException
         // whose message is reason-only. Framework exceptions (Path.GetFullPath, Uri component
@@ -122,7 +121,7 @@ internal static class ConfigRepoUrlSanitizer
     /// The arguments contain a duplicate, unrecognized, or unacceptable config repo argument.
     /// The message never echoes any raw value.
     /// </exception>
-    internal static (string? Value, string[] SanitizedArgs) SanitizeArgs(string[] args)
+    public static (string? Value, string[] SanitizedArgs) SanitizeArgs(string[] args)
     {
         ArgumentNullException.ThrowIfNull(args);
 
@@ -372,10 +371,10 @@ internal static class ConfigRepoUrlSanitizer
 
     /// <summary>
     /// Normalizes an scp-style remote (<c>user@host:org/repo.git</c>) to
-    /// <c>ssh://user@host/org/repo.git</c>. Internal so the normalization step can be asserted
+    /// <c>ssh://user@host/org/repo.git</c>. Exposed so the normalization step can be asserted
     /// in isolation from the host/username rules that follow it.
     /// </summary>
-    internal static string NormalizeScpStyle(string value)
+    public static string NormalizeScpStyle(string value)
     {
         var colon = value.IndexOf(':');
         var userHost = value[..colon];
@@ -417,5 +416,5 @@ internal static class ConfigRepoUrlSanitizer
     /// sanitizer's own redaction boundary a way to tell "already redacted" apart from a raw
     /// framework exception.
     /// </summary>
-    internal sealed class RejectedException(string message) : ArgumentException(message);
+    public sealed class RejectedException(string message) : ArgumentException(message);
 }

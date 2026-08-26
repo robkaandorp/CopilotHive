@@ -59,6 +59,13 @@ public sealed class WorkerConfigProvisioner
     /// <summary>Environment variable holding the GitHub Models model.</summary>
     public const string GitHubModelVar = "GITHUB_MODEL";
 
+    /// <summary>
+    /// Environment variable holding the operator-set config repository URL. The provisioner
+    /// tracks it in the operator snapshot but NEVER writes a provisioned value back to it —
+    /// the environment only ever carries the operator value.
+    /// </summary>
+    public const string ConfigRepoUrlVar = "CONFIG_REPO_URL";
+
     /// <summary>Provider token produced by <c>ChatClientFactory.ParseProviderAndModel</c> for GitHub Copilot.</summary>
     public const string CopilotProvider = "copilot";
 
@@ -96,6 +103,13 @@ public sealed class WorkerConfigProvisioner
     private readonly HashSet<string> _provisionedVars = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// The most recently provisioned non-whitespace <c>config_repo_url</c> from the response, or
+    /// <c>null</c> when the latest successful response carried none. Cleared on RPC failure
+    /// together with the provisioned environment variables.
+    /// </summary>
+    private string? _provisionedConfigRepoUrl;
+
+    /// <summary>
     /// Creates a provisioner.
     /// </summary>
     /// <param name="workerId">The worker's identifier, sent with the request for orchestrator-side logging.</param>
@@ -112,6 +126,80 @@ public sealed class WorkerConfigProvisioner
         _fetch = fetch ?? throw new ArgumentNullException(nameof(fetch));
         _readEnv = readEnv ?? Environment.GetEnvironmentVariable;
         _writeEnv = writeEnv ?? ((name, value) => Environment.SetEnvironmentVariable(name, value));
+    }
+
+    /// <summary>
+    /// The most recently provisioned non-whitespace <c>config_repo_url</c> from the response,
+    /// or <c>null</c> when the latest successful response carried none. Cleared to <c>null</c>
+    /// when a subsequent successful response has no URL, and on RPC failure together with the
+    /// provisioned environment variables.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The environment snapshot has not been taken yet — call <see cref="EnsureProvisionedAsync"/>
+    /// first.
+    /// </exception>
+    public string? ProvisionedConfigRepoUrl
+    {
+        get
+        {
+            EnsureSnapshotTaken();
+            return _provisionedConfigRepoUrl;
+        }
+    }
+
+    /// <summary>
+    /// The config repo URL to use for config-repo operations: the operator-set
+    /// <c>CONFIG_REPO_URL</c> (first non-whitespace value, tracked by the snapshot mechanism;
+    /// whitespace is absence) wins; otherwise the provisioned value.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The environment snapshot has not been taken yet — call <see cref="EnsureProvisionedAsync"/>
+    /// first.
+    /// </exception>
+    public string? ResolvedConfigRepoUrl
+    {
+        get
+        {
+            EnsureSnapshotTaken();
+            var operatorUrl = _operatorSnapshot!.TryGetValue(ConfigRepoUrlVar, out var op) ? op : null;
+            return operatorUrl ?? _provisionedConfigRepoUrl;
+        }
+    }
+
+    /// <summary>
+    /// Resolves the token for config-repo operations in the existing precedence: operator
+    /// <c>GH_TOKEN</c>, then operator <c>GITHUB_TOKEN</c>, then the currently-provisioned token
+    /// in the environment (whitespace is absence). The provisioned token is written to
+    /// <c>GH_TOKEN</c> by <see cref="EnsureProvisionedAsync"/>; there is no separately stored
+    /// token field.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The environment snapshot has not been taken yet — call <see cref="EnsureProvisionedAsync"/>
+    /// first.
+    /// </exception>
+    public string? ResolveConfigRepoCredential()
+    {
+        EnsureSnapshotTaken();
+
+        // Operator values win outright; only when neither alias was operator-set does the
+        // currently-provisioned token (written to GH_TOKEN) apply. Whitespace-as-absent
+        // applies at EACH step: a live value that normalizes to null falls through to the
+        // next candidate.
+        if (IsOperatorProvided(GhTokenVar))
+        {
+            var ghToken = Normalize(_readEnv(GhTokenVar));
+            if (ghToken is not null)
+                return ghToken;
+        }
+
+        if (IsOperatorProvided(GitHubTokenVar))
+        {
+            var githubToken = Normalize(_readEnv(GitHubTokenVar));
+            if (githubToken is not null)
+                return githubToken;
+        }
+
+        return Normalize(_readEnv(GhTokenVar));
     }
 
     /// <summary>
@@ -229,6 +317,11 @@ public sealed class WorkerConfigProvisioner
             // Rethrow before touching provisioned state so the caller unwinds normally.
             ct.ThrowIfCancellationRequested();
 
+            // The provisioned config repo URL is part of the provisioned state: a stale-but-known
+            // URL must NOT survive an RPC failure. Cleared BEFORE the fallible env revert so the
+            // URL is dropped even if an environment write throws.
+            _provisionedConfigRepoUrl = null;
+
             // Drop every provisioned value BEFORE reporting the fallback, so the subsequent
             // credential check and any later client creation see only operator-provided state.
             var reverted = RevertProvisionedToOperatorSnapshot();
@@ -293,6 +386,10 @@ public sealed class WorkerConfigProvisioner
         ApplyVar(OllamaModelVar, Normalize(response.HasOllamaModel ? response.OllamaModel : null), applied, cleared);
         ApplyVar(GitHubModelVar, Normalize(response.HasGithubModel ? response.GithubModel : null), applied, cleared);
 
+        // The config repo URL is tracked in memory only — it is NEVER written to the
+        // environment (the env only ever carries the operator value). Whitespace is absence.
+        _provisionedConfigRepoUrl = Normalize(response.HasConfigRepoUrl ? response.ConfigRepoUrl : null);
+
         // Names only — a provisioned VALUE is never written to a log.
         _log.Info($"Applied provisioning: set=[{Render(applied)}], cleared=[{Render(cleared)}]");
     }
@@ -308,6 +405,9 @@ public sealed class WorkerConfigProvisioner
     /// <summary>
     /// Captures the operator-provided environment exactly once, BEFORE the first provisioning
     /// call, so no retry can mistake a previously-provisioned value for an operator override.
+    /// <c>CONFIG_REPO_URL</c> is registered as a tracked variable so operator-vs-provisioned
+    /// tracking works for the config repo URL; a provisioned <c>CONFIG_REPO_URL</c> is NEVER
+    /// written back to the environment (the env only ever carries the operator value).
     /// </summary>
     private void EnsureSnapshot()
     {
@@ -317,9 +417,22 @@ public sealed class WorkerConfigProvisioner
         {
             [GhTokenVar] = Normalize(_readEnv(GhTokenVar)),
             [GitHubTokenVar] = Normalize(_readEnv(GitHubTokenVar)),
+            [ConfigRepoUrlVar] = Normalize(_readEnv(ConfigRepoUrlVar)),
         };
         foreach (var name in SettingVars)
             _operatorSnapshot[name] = Normalize(_readEnv(name));
+    }
+
+    /// <summary>
+    /// Guards the config-repo accessors: the operator snapshot must exist before any accessor
+    /// use. Callers always run <see cref="EnsureProvisionedAsync"/> first, which takes the
+    /// snapshot exactly once.
+    /// </summary>
+    private void EnsureSnapshotTaken()
+    {
+        if (_operatorSnapshot is null)
+            throw new InvalidOperationException(
+                "The environment snapshot has not been taken yet — call EnsureProvisionedAsync before using the config-repo accessors.");
     }
 
     /// <summary>
