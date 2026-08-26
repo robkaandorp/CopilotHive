@@ -538,32 +538,44 @@ public sealed class TaskExecutor(
         {
             // Not a real cancellation — likely an API timeout or HTTP failure.
             // Treat as a failure so the orchestrator can retry or fail the phase.
-            TryWriteError($"[Task] Failed (API timeout/error): {ex}");
+            //
+            // SANITIZED: this is the FIRST consuming boundary for a provisioning/client/LLM
+            // exception thrown out of IAgentRunner.SendPromptAsync. The raw message can echo a
+            // provisioned GH_TOKEN or OLLAMA_API_KEY, and the TaskResult below travels to the
+            // orchestrator where it is logged and persisted — so neither the log line nor the
+            // result may carry raw exception text.
+            var safe = SafeExceptionLog.Describe(ex);
+            TryWriteError($"[Task] Failed (API timeout/error) [{safe}]");
             return new TaskResult
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Failed,
-                Output = $"Error: API call failed or timed out: {ex.Message}",
+                Output = $"Error: API call failed or timed out [{safe}]",
                 Metrics = new TaskMetrics
                 {
                     Verdict = "FAIL",
-                    Issues = [$"API timeout/error: {ex.Message}"],
+                    Issues = [$"API timeout/error [{safe}]"],
                 },
             };
         }
         catch (Exception ex)
         {
-            TryWriteError($"[Task] Failed: {ex}");
+            // SANITIZED for the same reason as the OperationCanceledException catch above:
+            // this is the first boundary that consumes an exception originating at the
+            // provisioning / LLM-client / LLM-HTTP layer, and the TaskResult is transmitted to
+            // the orchestrator for logging and persistence.
+            var safe = SafeExceptionLog.Describe(ex);
+            TryWriteError($"[Task] Failed [{safe}]");
 
             return new TaskResult
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Failed,
-                Output = $"Error: {ex.Message}",
+                Output = $"Error [{safe}]",
                 Metrics = new TaskMetrics
                 {
                     Verdict = "FAIL",
-                    Issues = [ex.Message],
+                    Issues = [safe],
                 },
             };
         }

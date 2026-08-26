@@ -35,16 +35,37 @@ var maxDelay = TimeSpan.FromSeconds(60);
 
 while (!cts.IsCancellationRequested)
 {
-    // Fresh instance each attempt so no stale connection state leaks through retries
-    using var service = new WorkerService(
+    // Fresh instance each attempt so no stale connection state leaks through retries.
+    //
+    // The instance is deliberately NOT declared with `using` at loop scope: that would place
+    // the compiler-generated Dispose() AFTER the catch blocks below, so a throwing disposal —
+    // and runner disposal is deliberately fallible and propagating — would escape top level and
+    // be dumped by the runtime with its RAW message and stack, bypassing SafeExceptionLog.
+    // Instead the service is disposed inside the try, in a finally, so every disposal fault is
+    // routed through the sanitized catches below.
+    var service = new WorkerService(
         orchestratorUrl: orchestratorUrl,
         workerId: workerId,
         capabilities: capabilities);
 
+    var cleanExit = false;
+
     try
     {
-        await service.RunAsync(cts.Token);
-        break; // clean exit
+        try
+        {
+            await service.RunAsync(cts.Token);
+            cleanExit = true;
+        }
+        finally
+        {
+            // Disposal propagates (by design). Running it here means any fault it raises is
+            // caught and REDACTED by the handlers below instead of reaching the runtime.
+            service.Dispose();
+        }
+
+        if (cleanExit)
+            break; // clean exit
     }
     catch (OperationCanceledException)
     {
@@ -53,7 +74,10 @@ while (!cts.IsCancellationRequested)
     }
     catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)
     {
-        Console.Error.WriteLine($"[Worker] Connection failed: {ex.Message}. Retrying in {delay.TotalSeconds}s...");
+        // Sanitized: this retry path sits directly on the gRPC/HTTP boundary, whose error
+        // details can echo provisioned configuration (tokens, API keys) back to the worker.
+        Console.Error.WriteLine(
+            $"[Worker] Connection failed [{SafeExceptionLog.Describe(ex)}]. Retrying in {delay.TotalSeconds}s...");
         try
         {
             await Task.Delay(delay, cts.Token);
@@ -67,8 +91,11 @@ while (!cts.IsCancellationRequested)
     }
     catch (Exception ex)
     {
-        // All other exceptions are fatal — bad config, invalid credentials, etc.
-        Console.Error.WriteLine($"[Worker] Fatal error: {ex}");
+        // All other exceptions are fatal — bad config, invalid credentials, etc. This also
+        // covers a propagating teardown fault from the finally above.
+        // Sanitized for the same reason: a provider client that rejects a provisioned
+        // credential can quote that credential in its exception message.
+        Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
         return 1;
     }
 }

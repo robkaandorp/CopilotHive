@@ -120,6 +120,7 @@ public sealed class TaskExecutorSessionTests
 
         public int GetContextUsagePercent() => 0;
 
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
@@ -430,6 +431,7 @@ public sealed class TaskExecutorSessionTests
         public void SetSession(object? session) { }
         public object? GetSession() => null;
         public int GetContextUsagePercent() => 0;
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
@@ -472,7 +474,12 @@ public sealed class TaskExecutorSessionTests
             // Assert — should return a Failed TaskResult instead of throwing
             Assert.NotNull(result);
             Assert.Equal(TaskOutcome.Failed, result.Status);
-            Assert.Contains("Simulated failure", result.Output);
+
+            // The output is SANITIZED: the raw exception message may carry a provisioned secret
+            // (this catch is the first consumer of provisioning/LLM faults), so only the
+            // exception classification is surfaced — never the message text.
+            Assert.Contains(nameof(InvalidOperationException), result.Output);
+            Assert.DoesNotContain("Simulated failure", result.Output);
         }
         finally
         {

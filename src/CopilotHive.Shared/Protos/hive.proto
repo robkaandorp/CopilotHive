@@ -20,6 +20,32 @@ service HiveOrchestrator {
 
   // Worker persists a session by session_id ("goalId:roleName")
   rpc SaveSession (SaveSessionRequest) returns (SaveSessionResponse);
+
+  // Worker fetches its LLM configuration (credentials + provider settings) from the
+  // orchestrator so worker containers need no LLM credentials of their own.
+  rpc GetWorkerConfig (GetWorkerConfigRequest) returns (GetWorkerConfigResponse);
+}
+
+// === Worker Configuration Provisioning ===
+
+message GetWorkerConfigRequest {
+  string worker_id = 1;           // Requesting worker's identifier (for logging only)
+}
+
+// Every field uses proto3 `optional` so absence is distinguishable from an empty
+// string. An OMITTED field means "the orchestrator has nothing to provision for this
+// setting"; the worker must then fall back to its own operator-provided environment.
+//
+// IMPORTANT: `github_token` is NOT read from the orchestrator environment. It comes
+// from the STORED ADMIN OAuth RECORD (UserService.GetActiveAccessTokenAsync). Every
+// other field is read from the orchestrator's process environment.
+message GetWorkerConfigResponse {
+  optional string github_token = 1;    // From the stored admin OAuth record (never env)
+  optional string llm_provider = 2;    // Orchestrator env LLM_PROVIDER
+  optional string ollama_url = 3;      // Orchestrator env OLLAMA_URL
+  optional string ollama_api_key = 4;  // Orchestrator env OLLAMA_API_KEY
+  optional string ollama_model = 5;    // Orchestrator env OLLAMA_MODEL
+  optional string github_model = 6;    // Orchestrator env GITHUB_MODEL
 }
 
 // === Registration ===

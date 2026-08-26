@@ -90,6 +90,54 @@ The first GitHub user to sign in becomes the admin. The OAuth access token repla
 
 > **Plain-HTTP deployments**: When serving the dashboard over plain HTTP on a non-localhost hostname (internal LAN / docker swarm), set `ALLOW_INSECURE_OAUTH=true`, or the OAuth handshake fails with "Correlation failed" (the OAuth correlation cookie carries the `Secure` attribute and browsers drop such cookies over `http://` on non-localhost hosts; Chromium also rejects the default `SameSite=None` without `Secure`). This relaxes only the correlation cookie's `Secure` requirement and sets `SameSite=Lax`. Use it only on a trusted internal network: over plain HTTP, OAuth tokens and session traffic can still be intercepted or modified by anyone with network access.
 
+### Credential-Free Workers
+
+Worker containers hold **no LLM credentials of their own**. They do not need `GH_TOKEN`,
+`GITHUB_TOKEN`, `OLLAMA_API_KEY`, `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL` or
+`GITHUB_MODEL` set. Instead, each worker fetches its LLM configuration from the orchestrator
+over the unary gRPC call `GetWorkerConfig` on the `HiveOrchestrator` service.
+
+**Where each value comes from — the two sources are different:**
+
+| Provisioned field | Source |
+|-------------------|--------|
+| `github_token` | The **stored admin OAuth record** (`UserService.GetActiveAccessTokenAsync`) — created when the admin signs in with GitHub. **Never** read from an environment variable. |
+| `llm_provider` | Orchestrator process env `LLM_PROVIDER` |
+| `ollama_url` | Orchestrator process env `OLLAMA_URL` |
+| `ollama_api_key` | Orchestrator process env `OLLAMA_API_KEY` |
+| `ollama_model` | Orchestrator process env `OLLAMA_MODEL` |
+| `github_model` | Orchestrator process env `GITHUB_MODEL` |
+
+Every field uses proto3 optional presence. A field is **omitted** when its source value is
+null or whitespace, which tells the worker "nothing to provision — keep using your own
+environment". The orchestrator logs the requesting `worker_id` and which field **names** were
+provisioned; provisioned **values** are never logged.
+
+**Provisioning timing.** Workers register with the orchestrator *before* the admin has
+necessarily completed OAuth sign-in, so no fetch happens at registration. Instead the fetch
+runs **unconditionally immediately before every first LLM client creation** — not only when a
+credential looks missing — so a token that was committed after sign-in is picked up on the very
+next task. The LLM client itself is created lazily on the first prompt.
+
+**Operator overrides always win.** The worker snapshots its own environment exactly once,
+before the first provisioning call. Any variable that held a non-whitespace value in that
+snapshot is an operator value and is never replaced or cleared. Whitespace counts as absent.
+For the GitHub token, setting **either** `GH_TOKEN` or `GITHUB_TOKEN` in the worker
+environment suppresses provisioning entirely; when both are absent, the token is provisioned
+as `GH_TOKEN` only — an operator who set only `GITHUB_TOKEN` never gets a competing `GH_TOKEN`.
+
+**RPC failure is non-fatal.** If `GetWorkerConfig` fails, the worker logs a sanitized message
+(gRPC status code only — never the exception message, which can echo provisioned values), falls
+back to operator-provided environment variables, and continues. The next first-client-creation
+retries the fetch.
+
+> **Transport caveat**: `GetWorkerConfig` transmits a live GitHub OAuth token over gRPC. In the
+> bundled `docker-compose.yml` the gRPC port (5000) is deliberately **not published to the
+> host** — workers reach the orchestrator over the internal `hive` Docker network only, and the
+> channel runs as plaintext HTTP/2. Do **not** expose the gRPC port beyond a trusted network
+> without terminating it behind TLS: anyone who can reach that port can request a worker
+> configuration and receive the admin's token.
+
 ### Configuring Goals
 
 Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth. The recommended way to create goals is through the **Composer Chat UI** at `/composer`, which provides a conversational interface for decomposing high-level intent into well-scoped goals. Goals can also be created via the REST API (`POST /api/goals`).

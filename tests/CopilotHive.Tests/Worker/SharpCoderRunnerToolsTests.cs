@@ -21,7 +21,7 @@ public sealed class SharpCoderRunnerToolsTests
         var runner = new SharpCoderRunner();
         runner.SetToolBridge(new FakeToolBridge());
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
 
         var narrativeTool = Assert.Single(tools, t => t.Name == "report_narrative");
         Assert.Contains("narrative summary", narrativeTool.Description, StringComparison.OrdinalIgnoreCase);
@@ -37,7 +37,7 @@ public sealed class SharpCoderRunnerToolsTests
         var runner = new SharpCoderRunner();
         runner.SetToolBridge(new FakeToolBridge());
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
         var narrativeTool = Assert.Single(tools, t => t.Name == "report_narrative");
 
         var descriptor = narrativeTool.GetType().GetProperty("FunctionDescriptor")?.GetValue(narrativeTool);
@@ -58,7 +58,7 @@ public sealed class SharpCoderRunnerToolsTests
         var runner = new SharpCoderRunner();
         runner.SetToolBridge(new FakeToolBridge());
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
 
         var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
         Assert.Contains("code quality", raiseIssueTool.Description, StringComparison.OrdinalIgnoreCase);
@@ -74,7 +74,7 @@ public sealed class SharpCoderRunnerToolsTests
         var runner = new SharpCoderRunner();
         runner.SetToolBridge(new FakeToolBridge());
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
         var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
 
         var descriptor = raiseIssueTool.GetType().GetProperty("FunctionDescriptor")?.GetValue(raiseIssueTool);
@@ -100,7 +100,7 @@ public sealed class SharpCoderRunnerToolsTests
         runner.SetToolBridge(bridge);
         runner.SetCurrentTaskId("task-42");
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
         var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
         var raiseIssueFunction = Assert.IsAssignableFrom<AIFunction>(raiseIssueTool);
 
@@ -136,7 +136,7 @@ public sealed class SharpCoderRunnerToolsTests
         runner.SetToolBridge(bridge);
         runner.SetCurrentTaskId("task-42");
 
-        var tools = InvokeBuildCustomTools(runner);
+        var tools = InvokeBuildCustomTools(runner, TestContext.Current.CancellationToken);
         var raiseIssueTool = Assert.Single(tools, t => t.Name == "raise_issue");
         var raiseIssueFunction = Assert.IsAssignableFrom<AIFunction>(raiseIssueTool);
 
@@ -196,10 +196,15 @@ public sealed class SharpCoderRunnerToolsTests
         }
     }
 
-    private static IList<AITool> InvokeBuildCustomTools(SharpCoderRunner runner)
+    /// <summary>
+    /// Invokes the private <c>BuildCustomTools(CancellationToken)</c>. The token is the
+    /// ASSIGNMENT'S token in production and is forwarded to every bridge call, so tests that care
+    /// about cancellation pass a real one.
+    /// </summary>
+    private static IList<AITool> InvokeBuildCustomTools(SharpCoderRunner runner, CancellationToken ct)
     {
         var method = typeof(SharpCoderRunner).GetMethod("BuildCustomTools", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        return (IList<AITool>)method.Invoke(runner, [])!;
+        return (IList<AITool>)method.Invoke(runner, [ct])!;
     }
 
     private sealed class FakeToolBridge : IToolCallBridge

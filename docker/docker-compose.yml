@@ -4,14 +4,21 @@ services:
       context: ..
       dockerfile: docker/orchestrator/Dockerfile
     ports:
-      - "5000:5000"
+      # gRPC (5000) is deliberately NOT published to the host: workers reach it over the
+      # internal `hive` network only. Only the dashboard (5001) is host-published.
       - "5001:5001"
     environment:
       - GH_TOKEN
       - BRAIN_MODEL=${BRAIN_MODEL:-copilot/claude-sonnet-4.6}
       - GRPC_PORT=5000
+      # Provider settings live on the ORCHESTRATOR and are provisioned to workers via
+      # GetWorkerConfig. The worker GitHub token is NOT sourced from here — it comes from
+      # the stored admin OAuth record.
+      - LLM_PROVIDER=${LLM_PROVIDER:-copilot}
       - OLLAMA_API_KEY
       - OLLAMA_URL
+      - OLLAMA_MODEL
+      - GITHUB_MODEL
     command: ["--config-repo=https://github.com/robkaandorp/CopilotHive-Config.git"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
@@ -28,17 +35,13 @@ services:
     build:
       context: ..
       dockerfile: docker/worker/Dockerfile
+    # The worker is credential-free by design: no GH_TOKEN, no GITHUB_TOKEN, no LLM_PROVIDER
+    # and no Ollama/GitHub model settings. All of them are provisioned by the orchestrator
+    # over the internal-network-only GetWorkerConfig gRPC call.
     environment:
       - ORCHESTRATOR_URL=http://orchestrator:5000
-      - GH_TOKEN
       - VERBOSE_LOGGING
-      - LLM_PROVIDER=${LLM_PROVIDER:-copilot}
       - CONFIG_REPO_URL=https://github.com/robkaandorp/CopilotHive-Config.git
-      - GITHUB_TOKEN
-      - OLLAMA_API_KEY
-      - OLLAMA_URL
-      - OLLAMA_MODEL
-      - GITHUB_MODEL
     depends_on:
       orchestrator:
         condition: service_healthy

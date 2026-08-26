@@ -170,6 +170,7 @@ public sealed class WorkerServiceReasoningForwardingTests
         public void SetCompactionModel(string? model) { }
         public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)

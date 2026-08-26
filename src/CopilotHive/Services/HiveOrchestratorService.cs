@@ -23,11 +23,19 @@ public sealed class HiveOrchestratorService(
     IGoalStore? goalStore = null,
     DashboardNotifier? dashboardNotifier = null,
     IIssueStore? issueStore = null,
-    IEventBus? eventBus = null) : HiveOrchestrator.HiveOrchestratorBase
+    IEventBus? eventBus = null,
+    UserService? userService = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
     private readonly IEventBus? _eventBus = eventBus;
+    private readonly UserService? _userService = userService;
+
+    /// <summary>
+    /// Reads an orchestrator process environment variable. Overridable for tests so
+    /// provisioning can be verified without mutating the real process environment.
+    /// </summary>
+    internal Func<string, string?> _readEnv = Environment.GetEnvironmentVariable;
 
     private readonly Dictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)> _heartbeatState = new();
     private readonly object _heartbeatLock = new();
@@ -319,6 +327,63 @@ public sealed class HiveOrchestratorService(
         if (idx < 0)
             throw new ArgumentException($"Invalid session_id format '{sessionId}': expected 'goalId:roleName'.", nameof(sessionId));
         return (sessionId[..idx], sessionId[(idx + 1)..]);
+    }
+
+    /// <summary>
+    /// Provisions a worker's LLM configuration so worker containers need no LLM credentials
+    /// of their own.
+    /// <para>
+    /// The <c>github_token</c> comes from the STORED ADMIN OAuth RECORD via
+    /// <see cref="UserService.GetActiveAccessTokenAsync"/> — it is NEVER read from the
+    /// orchestrator environment. Every other field (provider settings) comes from the
+    /// orchestrator's own process environment.
+    /// </para>
+    /// <para>
+    /// Each field is OMITTED (proto3 optional presence unset) when its source value is null
+    /// or whitespace, which tells the worker "nothing provisioned — keep using your own env".
+    /// The response is logged by field NAME only; provisioned VALUES are never logged.
+    /// </para>
+    /// </summary>
+    /// <param name="request">Request carrying the requesting worker's ID (used for logging).</param>
+    /// <param name="context">Server call context.</param>
+    /// <returns>A <see cref="GetWorkerConfigResponse"/> with only the available fields set.</returns>
+    public override async Task<GetWorkerConfigResponse> GetWorkerConfig(
+        GetWorkerConfigRequest request, ServerCallContext context)
+    {
+        var response = new GetWorkerConfigResponse();
+        var provisioned = new List<string>();
+
+        // The token comes from the stored admin OAuth record — never from the environment.
+        var token = _userService is null
+            ? null
+            : await _userService.GetActiveAccessTokenAsync(context.CancellationToken);
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            response.GithubToken = token;
+            provisioned.Add(WorkerConfigFields.GithubToken);
+        }
+
+        // Provider settings come from the orchestrator's own environment.
+        SetIfPresent("LLM_PROVIDER", WorkerConfigFields.LlmProvider, v => response.LlmProvider = v);
+        SetIfPresent("OLLAMA_URL", WorkerConfigFields.OllamaUrl, v => response.OllamaUrl = v);
+        SetIfPresent("OLLAMA_API_KEY", WorkerConfigFields.OllamaApiKey, v => response.OllamaApiKey = v);
+        SetIfPresent("OLLAMA_MODEL", WorkerConfigFields.OllamaModel, v => response.OllamaModel = v);
+        SetIfPresent("GITHUB_MODEL", WorkerConfigFields.GithubModel, v => response.GithubModel = v);
+
+        logger.LogInformation(
+            "GetWorkerConfig for worker_id={WorkerId} provisioned fields: [{Fields}]",
+            request.WorkerId,
+            provisioned.Count == 0 ? "(none)" : string.Join(", ", provisioned));
+
+        return response;
+
+        void SetIfPresent(string envName, string fieldName, Action<string> assign)
+        {
+            var value = _readEnv(envName);
+            if (string.IsNullOrWhiteSpace(value)) return;
+            assign(value);
+            provisioned.Add(fieldName);
+        }
     }
 
     /// <summary>
@@ -718,4 +783,33 @@ internal static class VersionHelper
             ?.InformationalVersion
         ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
         ?? "unknown";
+}
+
+/// <summary>
+/// Canonical field NAMES of the <c>GetWorkerConfigResponse</c> provisioning message.
+/// <para>
+/// These names — and only these names — are safe to write to a log. The orchestrator logs
+/// which fields it provisioned; it must never log the provisioned VALUES, which are secrets
+/// (a GitHub OAuth token, an Ollama API key) or operator configuration.
+/// </para>
+/// </summary>
+internal static class WorkerConfigFields
+{
+    /// <summary>The admin OAuth access token, sourced from the stored user record (never env).</summary>
+    public const string GithubToken = "github_token";
+
+    /// <summary>The provider selector, sourced from the orchestrator env <c>LLM_PROVIDER</c>.</summary>
+    public const string LlmProvider = "llm_provider";
+
+    /// <summary>The Ollama endpoint, sourced from the orchestrator env <c>OLLAMA_URL</c>.</summary>
+    public const string OllamaUrl = "ollama_url";
+
+    /// <summary>The Ollama Cloud API key, sourced from the orchestrator env <c>OLLAMA_API_KEY</c>.</summary>
+    public const string OllamaApiKey = "ollama_api_key";
+
+    /// <summary>The Ollama model, sourced from the orchestrator env <c>OLLAMA_MODEL</c>.</summary>
+    public const string OllamaModel = "ollama_model";
+
+    /// <summary>The GitHub Models model, sourced from the orchestrator env <c>GITHUB_MODEL</c>.</summary>
+    public const string GithubModel = "github_model";
 }

@@ -92,10 +92,27 @@ public interface IAgentRunner : IAsyncDisposable
     /// <param name="models">Available models for sub-agent delegation.</param>
     void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models);
 
-    /// <summary>Connects to the underlying AI agent engine.</summary>
+    /// <summary>
+    /// Installs the callback that provisions LLM configuration from the orchestrator. It is
+    /// invoked UNCONDITIONALLY immediately before every FIRST LLM client creation — not only
+    /// when a credential appears to be missing — and receives the task's model so the callback
+    /// can resolve which credentials that model's provider requires.
+    /// </summary>
+    /// <param name="provisioner">The provisioning callback, or <c>null</c> to disable provisioning.</param>
+    void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner);
+
+    /// <summary>
+    /// Prepares the runner. It deliberately creates NO LLM client: the client is created lazily
+    /// on the first <see cref="SendPromptAsync"/>, after credentials have been provisioned.
+    /// </summary>
     Task ConnectAsync(CancellationToken ct = default);
 
-    /// <summary>Resets the current session, optionally switching model and setting reasoning effort.</summary>
+    /// <summary>
+    /// Resets the current session, optionally switching model and setting reasoning effort.
+    /// Implementations must dispose and detach any prior client deterministically, so that a
+    /// throwing disposal never leaves a half-disposed client behind, and must PROPAGATE a
+    /// disposal exception rather than swallow it.
+    /// </summary>
     Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default);
 
     /// <summary>Sends a prompt to the AI agent and returns its response.</summary>

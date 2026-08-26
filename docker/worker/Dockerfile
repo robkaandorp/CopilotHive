@@ -70,7 +70,10 @@ COPY docker/worker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Environment variables
-ENV LLM_PROVIDER=copilot
+# NOTE: LLM_PROVIDER is deliberately NOT set here. The worker is credential-free: the
+# orchestrator provisions LLM_PROVIDER (and the other provider settings, plus the GitHub
+# token) over the GetWorkerConfig gRPC call. Baking a default here would masquerade as an
+# operator override and permanently suppress the provisioned value.
 
 WORKDIR /copilot-home
 

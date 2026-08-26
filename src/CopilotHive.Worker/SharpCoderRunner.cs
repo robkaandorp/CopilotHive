@@ -25,6 +25,34 @@ public sealed class SharpCoderRunner : IAgentRunner
     private string _currentModel = "(default)";
     private ReasoningEffort? _currentReasoning;
 
+    /// <summary>
+    /// The model the next lazily-created client must use, recorded by <see cref="ResetSessionAsync"/>.
+    /// </summary>
+    private string? _pendingModel;
+
+    /// <summary>
+    /// Runs orchestrator provisioning before a client is created. Invoked UNCONDITIONALLY before
+    /// every first client creation. <c>null</c> disables provisioning (unit tests, and any
+    /// deployment where the worker is configured entirely by the operator).
+    /// </summary>
+    private Func<string?, CancellationToken, Task>? _configProvisioner;
+
+    /// <summary>
+    /// Serializes the ENTIRE LLM client lifecycle — lazy creation, reset/dispose and final
+    /// disposal — so two overlapping task assignments can never race it.
+    /// <para>
+    /// The race this closes: <c>WorkerService</c> sends <c>WorkerReady</c> from a completing
+    /// task's <c>finally</c> and the cancel handler sends a second one, so the orchestrator can
+    /// deliver a new assignment while the previous task is still unwinding. Without this gate,
+    /// two tasks could both observe a null <c>_chatClient</c> and each construct one (leaking a
+    /// client), or one could dispose the client while the other was still using it.
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _clientLifecycleGate = new(1, 1);
+
+    /// <summary>Set to 1 by the first <see cref="DisposeAsync"/>, making repeat calls no-ops.</summary>
+    private int _disposed;
+
     private readonly string _configRepoDir;
 
     /// <summary>
@@ -105,6 +133,10 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     /// <inheritdoc/>
     public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) => _subAgentModels = models ?? [];
+
+    /// <inheritdoc/>
+    public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
+        _configProvisioner = provisioner;
 
     /// <summary>
     /// Builds the <see cref="SubAgentOptions"/> for the configured model catalog, or
@@ -351,29 +383,134 @@ public sealed class SharpCoderRunner : IAgentRunner
 
     public Task ConnectAsync(CancellationToken ct = default)
     {
-        _log.Info("Initializing SharpCoderRunner IChatClient...");
-        _chatClient = _clientFactory?.Invoke(null) ?? ClientCreationSeam?.Invoke(null) ?? CreateChatClient();
+        // Deliberately creates NO client. Worker containers hold no LLM credentials of their
+        // own: the credentials are provisioned by the orchestrator, and that provisioning
+        // fetch runs immediately before the FIRST client creation, which happens lazily in
+        // SendPromptAsync. Creating a client here would run before provisioning and before the
+        // operator has necessarily signed in.
+        _log.Info("SharpCoderRunner ready — the LLM client is created lazily on first prompt.");
         return Task.CompletedTask;
     }
 
-    public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
+    /// <summary>
+    /// Tears down the current LLM client and session so the next <see cref="SendPromptAsync"/>
+    /// creates a fresh client for <paramref name="model"/>.
+    /// <para>
+    /// The client field is set to <c>null</c> BEFORE <see cref="IDisposable.Dispose"/> is called,
+    /// so a throwing disposal can never leave the field pointing at a half-disposed client that a
+    /// later task would inherit. Disposal is therefore idempotent: a second call has nothing left
+    /// to dispose. A disposal exception PROPAGATES — this is a hard teardown and a failure here is
+    /// a fault, not something to swallow.
+    /// </para>
+    /// <para>
+    /// The whole detach-and-dispose runs under <see cref="_clientLifecycleGate"/>, which also
+    /// guards lazy creation in <see cref="SendPromptAsync"/>. That makes it impossible for a
+    /// second task to observe or create a client while this task's dispose is in flight.
+    /// The gate is released in a <c>finally</c> so a propagating disposal never strands it.
+    /// </para>
+    /// </summary>
+    /// <param name="model">The model for the next client, or <c>null</c> for the SDK default.</param>
+    /// <param name="reasoningEffort">The explicitly transported reasoning effort, or <c>null</c>.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
     {
-        // Reasoning effort is transported explicitly by the orchestrator; it is never derived
-        // from the model name.
-        _currentReasoning = reasoningEffort;
+        await _clientLifecycleGate.WaitAsync(ct);
+        try
+        {
+            // Reasoning effort is transported explicitly by the orchestrator; it is never derived
+            // from the model name.
+            _currentReasoning = reasoningEffort;
+            _pendingModel = model;
 
-        _log.Info($"Resetting session. Requested model: {model ?? "default"}" +
-            (_currentReasoning.HasValue ? $", reasoning={_currentReasoning.Value}" : ", reasoning=(none)"));
-        _chatClient?.Dispose();
-        _chatClient = _clientFactory?.Invoke(model) ?? ClientCreationSeam?.Invoke(model) ?? CreateChatClient(model);
-        _session = null;
-        return Task.CompletedTask;
+            _log.Info($"Resetting session. Requested model: {model ?? "default"}" +
+                (_currentReasoning.HasValue ? $", reasoning={_currentReasoning.Value}" : ", reasoning=(none)"));
+
+            _session = null;
+
+            // Null the field FIRST, then dispose the detached reference.
+            var previous = _chatClient;
+            _chatClient = null;
+            previous?.Dispose();
+        }
+        finally
+        {
+            _clientLifecycleGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Creates the LLM client lazily, running orchestrator provisioning UNCONDITIONALLY
+    /// immediately beforehand (never only when a credential looks absent), so a token that
+    /// became available after the worker registered is picked up.
+    /// <para>
+    /// The caller MUST hold <see cref="_clientLifecycleGate"/>. <paramref name="model"/> is read
+    /// once by the caller under that gate and passed in, so provisioning and construction can
+    /// never straddle an intervening reset and provision model A while constructing model B.
+    /// </para>
+    /// </summary>
+    private async Task<IChatClient> CreateClientLazilyAsync(string? model, CancellationToken ct)
+    {
+        if (_configProvisioner is not null)
+            await _configProvisioner(model, ct);
+
+        return _clientFactory?.Invoke(model)
+            ?? ClientCreationSeam?.Invoke(model)
+            ?? CreateChatClient(model);
+    }
+
+    /// <summary>
+    /// Acquires the client for this prompt under <see cref="_clientLifecycleGate"/>, creating it
+    /// lazily on first use.
+    /// <para>
+    /// The gate is deliberately NOT released here. It is held for the ENTIRE duration of the
+    /// turn and released by the caller's <c>finally</c>, so <see cref="ResetSessionAsync"/> and
+    /// <see cref="DisposeAsync"/> cannot null and dispose the client while a turn still holds
+    /// the returned reference. Releasing at acquisition time (as an earlier revision did) left
+    /// the returned reference unprotected for the whole of the agent run.
+    /// </para>
+    /// </summary>
+    /// <returns>The client to use for this turn. The caller owns the gate until it releases it.</returns>
+    private async Task<IChatClient> AcquireClientLeaseAsync(CancellationToken ct)
+    {
+        await _clientLifecycleGate.WaitAsync(ct);
+        try
+        {
+            // Read the pending model under the gate, so provisioning and construction agree.
+            _chatClient ??= await CreateClientLazilyAsync(_pendingModel, ct);
+            return _chatClient;
+        }
+        catch
+        {
+            // Creation failed: release the lease here, because the caller never receives a
+            // reference and therefore has no finally to run.
+            _clientLifecycleGate.Release();
+            throw;
+        }
     }
 
     public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
     {
-        if (_chatClient == null) throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
+        // Lazy first creation, serialized: a fresh task never inherits another task's disposed
+        // client, and two overlapping assignments can never both construct one. The lease is
+        // held until the result has left the runner, so reset/dispose cannot overlap actual use.
+        var chatClient = await AcquireClientLeaseAsync(ct);
+        try
+        {
+            return await RunPromptTurnAsync(chatClient, prompt, workDir, ct);
+        }
+        finally
+        {
+            _clientLifecycleGate.Release();
+        }
+    }
 
+    /// <summary>
+    /// Runs one full agent turn against <paramref name="chatClient"/>. The caller holds the
+    /// client lifecycle lease for the whole call, so the client cannot be disposed underneath it.
+    /// </summary>
+    private async Task<string> RunPromptTurnAsync(
+        IChatClient chatClient, string prompt, string workDir, CancellationToken ct)
+    {
         var stopwatch = Stopwatch.StartNew();
         _log.Info($"Executing task as {_currentRole} with model {_currentModel}. WorkDir: {workDir}");
 
@@ -383,7 +520,7 @@ public sealed class SharpCoderRunner : IAgentRunner
             MaxSteps = 500,
             MaxContextTokens = _maxContextTokens,
             SystemPrompt = BuildRoleSystemPrompt(_currentRole, _customAgentSystemPrompt),
-            CustomTools = BuildCustomTools(),
+            CustomTools = BuildCustomTools(ct),
             EnableBash = _currentRole != WorkerRole.Improver,
             EnableFileWrites = _currentRole != WorkerRole.Reviewer,
             ReasoningEffort = _currentReasoning,
@@ -405,7 +542,10 @@ public sealed class SharpCoderRunner : IAgentRunner
         // Write pre-execution diagnostics so we can inspect inputs even if the LLM call hangs or is killed
         WriteDiagnosticsFile(null, prompt, TimeSpan.Zero, options, "pre");
 
-        await using var agent = new CodingAgent(_chatClient, options);
+        // Use the leased reference. The caller holds _clientLifecycleGate for this whole turn,
+        // so ResetSessionAsync/DisposeAsync cannot null and dispose this client underneath us.
+        await using var agent = new CodingAgent(chatClient, options);
+
         OnAgentCreated?.Invoke(agent);
 
         // Ensure session exists before streaming
@@ -475,10 +615,35 @@ public sealed class SharpCoderRunner : IAgentRunner
         return result;
     }
 
-    public ValueTask DisposeAsync()
+    /// <summary>
+    /// Disposes the owned LLM client. The field is nulled BEFORE disposal so a throwing
+    /// <see cref="IDisposable.Dispose"/> can never leave a reference to a half-disposed client
+    /// behind, which also makes repeated disposal safe.
+    /// <para>
+    /// Runs under <see cref="_clientLifecycleGate"/> so final teardown cannot overlap a task's
+    /// lazy creation or a reset. The client disposal PROPAGATES (callers rely on that), so the
+    /// gate is released in a <c>finally</c>. Repeat calls are no-ops: the gate itself is only
+    /// disposed once, after the client disposal has been attempted.
+    /// </para>
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
-        _chatClient?.Dispose();
-        return ValueTask.CompletedTask;
+        // Idempotent: a second call must not fault on the already-disposed gate.
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
+        await _clientLifecycleGate.WaitAsync();
+        try
+        {
+            var previous = _chatClient;
+            _chatClient = null;
+            previous?.Dispose();
+        }
+        finally
+        {
+            _clientLifecycleGate.Release();
+            _clientLifecycleGate.Dispose();
+        }
     }
 
     private static string SummarizeMessage(ChatMessage msg)
@@ -599,7 +764,10 @@ public sealed class SharpCoderRunner : IAgentRunner
         }
         catch (Exception ex)
         {
-            _log.Error($"Failed to write diagnostics file: {ex.Message}");
+            // Sanitized: the diagnostics document embeds the assembled prompt and the agent
+            // result, so a serialization failure can quote provisioned content back in its
+            // message. Only the exception classification is logged.
+            _log.Error($"Failed to write diagnostics file [{SafeExceptionLog.Describe(ex)}]");
         }
     }
 
@@ -612,7 +780,21 @@ public sealed class SharpCoderRunner : IAgentRunner
         return ChatClientFactory.Create(modelOverride);
     }
 
-    private IList<AITool> BuildCustomTools()
+    /// <summary>
+    /// Builds the custom tool set for this turn.
+    /// <para>
+    /// <paramref name="ct"/> is the ASSIGNMENT'S token and MUST be forwarded to every bridge
+    /// call. The bridge registers <c>ct.Register(() =&gt; tcs.TrySetCanceled())</c> on each pending
+    /// tool request, so a tool that is waiting for a <c>ToolResponse</c> is only released when a
+    /// live token is cancelled. Passing <see cref="CancellationToken.None"/> here (as an earlier
+    /// revision did) permanently detached those waits: cancelling the assignment could not
+    /// release a pending <c>request_clarification</c> / <c>get_goal</c> / <c>raise_issue</c>, so
+    /// the drain in <c>WorkerService.ProcessMessagesAsync</c> blocked forever while this runner
+    /// still held the full-turn client lease — deadlocking teardown and preventing disposal.
+    /// </para>
+    /// </summary>
+    /// <param name="ct">The assignment's cancellation token, forwarded to every bridge call.</param>
+    private IList<AITool> BuildCustomTools(CancellationToken ct)
     {
         var tools = new List<AITool>();
 
@@ -624,7 +806,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: report_progress({status})");
-                    await _toolBridge.ReportProgressAsync(_currentTaskId, status, details, CancellationToken.None);
+                    await _toolBridge.ReportProgressAsync(_currentTaskId, status, details, ct);
                     return "Progress reported.";
                 },
                 "report_progress",
@@ -636,7 +818,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
                     _log.Info("Tool call: report_narrative()");
-                    await _toolBridge.ReportNarrativeAsync(_currentTaskId, narrative, CancellationToken.None);
+                    await _toolBridge.ReportNarrativeAsync(_currentTaskId, narrative, ct);
                     return "Narrative recorded.";
                 },
                 "report_narrative",
@@ -648,7 +830,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: request_clarification({question})");
-                    var response = await _toolBridge.RequestClarificationAsync(_currentTaskId, question, CancellationToken.None);
+                    var response = await _toolBridge.RequestClarificationAsync(_currentTaskId, question, ct);
                     return response;
                 },
                 "request_clarification",
@@ -661,7 +843,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
                     if (string.IsNullOrEmpty(_currentGoalId)) return "Error: Goal ID not set.";
                     _log.Info($"Tool call: get_goal()");
-                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, _currentGoalId, CancellationToken.None);
+                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, _currentGoalId, ct);
                     return response;
                 },
                 "get_goal",
@@ -676,7 +858,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 {
                     if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: raise_issue({type}: {title})");
-                    var response = await _toolBridge.RaiseIssueAsync(_currentTaskId, type, title, description, severity ?? "low", CancellationToken.None);
+                    var response = await _toolBridge.RaiseIssueAsync(_currentTaskId, type, title, description, severity ?? "low", ct);
                     return response;
                 },
                 "raise_issue",
