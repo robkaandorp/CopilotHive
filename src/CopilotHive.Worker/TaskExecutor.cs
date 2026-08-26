@@ -19,7 +19,17 @@ public sealed class TaskExecutor(
     ISessionClient? sessionClient = null,
     string configRepoDir = "/config-repo")
 {
-    private const string WorkRoot = "/copilot-home";
+    /// <summary>
+    /// Fallback working directory used when a task has no repositories to clone (e.g. the
+    /// improver, or tasks that operate purely via tool calls). Overridable via the
+    /// <c>WORKER_WORK_ROOT</c> environment variable so tests can point it at a real directory
+    /// that exists on the host OS; the container always creates <c>/copilot-home</c>
+    /// (see docker/worker/Dockerfile), so no override is needed in production. Read live
+    /// (not cached) so per-test overrides take effect regardless of static-init ordering.
+    /// </summary>
+    private static string WorkRoot =>
+        Environment.GetEnvironmentVariable("WORKER_WORK_ROOT") ?? "/copilot-home";
+
     private readonly string _configRepoDir = configRepoDir;
     private readonly string _configAgentsDir = Path.Combine(configRepoDir, "agents");
 
