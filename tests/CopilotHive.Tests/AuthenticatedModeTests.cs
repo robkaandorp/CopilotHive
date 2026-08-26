@@ -167,5 +167,21 @@ public sealed class AuthenticatedModeTests : IDisposable
         Assert.Contains(cookie, part => string.Equals(part, "SameSite=Lax", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void GitHubOptions_Scope_ContainsRepoAlongsideTheOtherConfiguredScopes()
+    {
+        using var client = _factory.CreateClient();
+
+        var options = _factory.Services.GetRequiredService<IOptionsMonitor<GitHubAuthenticationOptions>>()
+            .Get("GitHub");
+
+        // The 'repo' scope is what lets the stored token clone/push PRIVATE config repos that
+        // are provisioned to workers via GetWorkerConfig.config_repo_url.
+        Assert.Contains("repo", options.Scope);
+        Assert.Contains("read:user", options.Scope);
+        Assert.Contains("copilot", options.Scope);
+        Assert.Contains("workflow", options.Scope);
+    }
+
     public void Dispose() => _factory.Dispose();
 }

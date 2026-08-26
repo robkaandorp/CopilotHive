@@ -60,6 +60,17 @@ public class ConfigRepoManager
     public string LocalPath => _localPath;
 
     /// <summary>
+    /// The remote configuration repository URL this manager was constructed with.
+    /// <para>
+    /// This is the SANITIZED operator value (see <see cref="ConfigRepoUrlSanitizer"/>) and is
+    /// therefore safe to provision to workers — it never carries credentials. It is distinct
+    /// from <see cref="LocalPath"/> (the local clone directory) and from the credential-bearing
+    /// clone URL built internally for git operations.
+    /// </para>
+    /// </summary>
+    public string ConfigRepoUrl => _configRepoUrl;
+
+    /// <summary>
     /// Clones the config repo, or pulls latest if already cloned.
     /// </summary>
     public async Task SyncRepoAsync(CancellationToken ct = default)

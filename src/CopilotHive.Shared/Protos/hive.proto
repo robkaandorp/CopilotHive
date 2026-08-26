@@ -46,6 +46,7 @@ message GetWorkerConfigResponse {
   optional string ollama_api_key = 4;  // Orchestrator env OLLAMA_API_KEY
   optional string ollama_model = 5;    // Orchestrator env OLLAMA_MODEL
   optional string github_model = 6;    // Orchestrator env GITHUB_MODEL
+  optional string config_repo_url = 7; // Sanitized orchestrator --config-repo value (never credential-bearing)
 }
 
 // === Registration ===

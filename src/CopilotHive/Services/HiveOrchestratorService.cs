@@ -2,6 +2,7 @@ using System.Reflection;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using CopilotHive.Agents;
+using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Shared.Grpc;
@@ -24,12 +25,14 @@ public sealed class HiveOrchestratorService(
     DashboardNotifier? dashboardNotifier = null,
     IIssueStore? issueStore = null,
     IEventBus? eventBus = null,
-    UserService? userService = null) : HiveOrchestrator.HiveOrchestratorBase
+    UserService? userService = null,
+    ConfigRepoManager? configRepoManager = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
     private readonly IEventBus? _eventBus = eventBus;
     private readonly UserService? _userService = userService;
+    private readonly ConfigRepoManager? _configRepoManager = configRepoManager;
 
     /// <summary>
     /// Reads an orchestrator process environment variable. Overridable for tests so
@@ -369,6 +372,15 @@ public sealed class HiveOrchestratorService(
         SetIfPresent("OLLAMA_API_KEY", WorkerConfigFields.OllamaApiKey, v => response.OllamaApiKey = v);
         SetIfPresent("OLLAMA_MODEL", WorkerConfigFields.OllamaModel, v => response.OllamaModel = v);
         SetIfPresent("GITHUB_MODEL", WorkerConfigFields.GithubModel, v => response.GithubModel = v);
+
+        // The config repo URL is the SANITIZED operator value (ConfigRepoUrlSanitizer) held by
+        // the ConfigRepoManager — never a credential-bearing clone URL. It is omitted entirely
+        // when no config repo is configured.
+        if (_configRepoManager?.ConfigRepoUrl is not null)
+        {
+            response.ConfigRepoUrl = _configRepoManager.ConfigRepoUrl;
+            provisioned.Add(WorkerConfigFields.ConfigRepoUrl);
+        }
 
         logger.LogInformation(
             "GetWorkerConfig for worker_id={WorkerId} provisioned fields: [{Fields}]",
@@ -812,4 +824,10 @@ internal static class WorkerConfigFields
 
     /// <summary>The GitHub Models model, sourced from the orchestrator env <c>GITHUB_MODEL</c>.</summary>
     public const string GithubModel = "github_model";
+
+    /// <summary>
+    /// The config repository URL, sourced from the orchestrator's <c>ConfigRepoManager</c>
+    /// (the sanitized <c>--config-repo</c> operator value — never credential-bearing).
+    /// </summary>
+    public const string ConfigRepoUrl = "config_repo_url";
 }

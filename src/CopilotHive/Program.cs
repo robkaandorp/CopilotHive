@@ -108,7 +108,27 @@ public sealed class Program
             if (portArg is not null && int.TryParse(portArg["--port=".Length..], out var p))
                 port = p;
 
-            var configRepoUrl = args.FirstOrDefault(a => a.StartsWith("--config-repo="))?["--config-repo=".Length..];
+            // The operator-supplied --config-repo value can carry a credential, so it is
+            // sanitized BEFORE the banner, the WebApplicationBuilder, and any logging: only
+            // the sanitized value ever reaches downstream code. A rejected value fails startup
+            // with a REDACTED error — the raw input is never echoed.
+            //
+            // The catch is narrowed to ConfigRepoUrlSanitizer.RejectedException, the ONLY
+            // exception type the sanitizer lets escape and the only one whose message is
+            // redacted BY CONSTRUCTION (it carries a reason-only message and never an inner
+            // exception). A framework exception — whose message would embed the raw value — is
+            // deliberately NOT caught here, so it can never be printed as a startup error.
+            string? configRepoUrl;
+            try
+            {
+                (configRepoUrl, args) = ConfigRepoUrlSanitizer.SanitizeArgs(args);
+            }
+            catch (ConfigRepoUrlSanitizer.RejectedException ex)
+            {
+                Console.Error.WriteLine($"Startup failed: {ex.Message}");
+                return 1;
+            }
+
             var configRepoPath = args.FirstOrDefault(a => a.StartsWith("--config-repo-path="))?["--config-repo-path=".Length..]
                 ?? "./config-repo";
 
@@ -327,6 +347,9 @@ public sealed class Program
                         options.Scope.Add("read:user");
                         options.Scope.Add("copilot");
                         options.Scope.Add("workflow");
+                        // Lets the stored token clone/push private config repositories that
+                        // are provisioned to workers.
+                        options.Scope.Add("repo");
                         options.SaveTokens = true;
 
                         if (Environment.GetEnvironmentVariable("ALLOW_INSECURE_OAUTH") == "true")

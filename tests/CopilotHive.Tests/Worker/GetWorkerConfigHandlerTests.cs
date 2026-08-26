@@ -1,3 +1,4 @@
+using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
@@ -5,6 +6,8 @@ using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
+
+using Google.Protobuf;
 
 using Grpc.Core;
 
@@ -79,7 +82,8 @@ public sealed class GetWorkerConfigHandlerTests
     private static HiveOrchestratorService CreateService(
         UserService? userService,
         Func<string, string?>? readEnv = null,
-        ILogger<HiveOrchestratorService>? logger = null)
+        ILogger<HiveOrchestratorService>? logger = null,
+        ConfigRepoManager? configRepoManager = null)
     {
         var pool = new WorkerPool();
         var taskQueue = new TaskQueue();
@@ -102,7 +106,8 @@ public sealed class GetWorkerConfigHandlerTests
             completionNotifier,
             dispatcher,
             logger ?? NullLogger<HiveOrchestratorService>.Instance,
-            userService: userService);
+            userService: userService,
+            configRepoManager: configRepoManager);
 
         if (readEnv is not null)
             service._readEnv = readEnv;
@@ -305,6 +310,92 @@ public sealed class GetWorkerConfigHandlerTests
         var logLine = captured.SingleOrDefault(s => s.Contains("GetWorkerConfig"));
         Assert.NotNull(logLine);
         Assert.Contains("(none)", logLine);
+    }
+
+    // ── Config repo URL provisioning ───────────────────────────────────────────
+
+    [Fact]
+    public async Task GetWorkerConfig_ConfigRepoManagerProvided_ConfigRepoUrlIsPresentInResponse()
+    {
+        const string url = "https://github.com/org/config-repo.git";
+        var manager = new ConfigRepoManager(url, Path.Combine(Path.GetTempPath(), "cfg-repo-test"));
+        var service = CreateService(null, readEnv: _ => null, configRepoManager: manager);
+
+        var response = await service.GetWorkerConfig(
+            new GetWorkerConfigRequest { WorkerId = TestWorkerId }, MockContext());
+
+        Assert.True(response.HasConfigRepoUrl);
+        Assert.Equal(url, response.ConfigRepoUrl);
+    }
+
+    [Fact]
+    public async Task GetWorkerConfig_NoConfigRepoManager_ConfigRepoUrlOmitted()
+    {
+        var service = CreateService(null, readEnv: _ => null);
+
+        var response = await service.GetWorkerConfig(
+            new GetWorkerConfigRequest { WorkerId = TestWorkerId }, MockContext());
+
+        Assert.False(response.HasConfigRepoUrl);
+    }
+
+    [Fact]
+    public async Task GetWorkerConfig_ConfigRepoManagerProvided_LogsFieldNameOnly()
+    {
+        var captured = new List<string>();
+        var loggerFactory = new LoggerFactory(new[] { new StringCapturingLoggerProvider(captured) });
+        var logger = loggerFactory.CreateLogger<HiveOrchestratorService>();
+
+        const string url = "https://github.com/org/config-repo.git";
+        var manager = new ConfigRepoManager(url, Path.Combine(Path.GetTempPath(), "cfg-repo-test"));
+        var service = CreateService(null, readEnv: _ => null, logger: logger, configRepoManager: manager);
+
+        await service.GetWorkerConfig(
+            new GetWorkerConfigRequest { WorkerId = TestWorkerId }, MockContext());
+
+        var logLine = captured.SingleOrDefault(s => s.Contains("GetWorkerConfig"));
+        Assert.NotNull(logLine);
+        Assert.Contains("config_repo_url", logLine);
+        Assert.DoesNotContain(url, logLine);
+    }
+
+    // ── Proto presence round-trip ──────────────────────────────────────────────
+
+    [Fact]
+    public void GetWorkerConfigResponse_ConfigRepoUrl_PresenceRoundTrips()
+    {
+        var unset = new GetWorkerConfigResponse();
+        Assert.False(unset.HasConfigRepoUrl);
+
+        var set = new GetWorkerConfigResponse { ConfigRepoUrl = "https://github.com/org/repo.git" };
+        Assert.True(set.HasConfigRepoUrl);
+
+        var roundTripped = GetWorkerConfigResponse.Parser.ParseFrom(set.ToByteArray());
+        Assert.True(roundTripped.HasConfigRepoUrl);
+        Assert.Equal("https://github.com/org/repo.git", roundTripped.ConfigRepoUrl);
+
+        var roundTrippedUnset = GetWorkerConfigResponse.Parser.ParseFrom(unset.ToByteArray());
+        Assert.False(roundTrippedUnset.HasConfigRepoUrl);
+    }
+
+    [Fact]
+    public void GetWorkerConfigResponse_ConfigRepoUrl_UsesWireFieldNumberSeven()
+    {
+        // The wire number is part of the cross-process contract with the worker (slice 2):
+        // renumbering it silently breaks every already-deployed worker.
+        Assert.Equal(7, GetWorkerConfigResponse.ConfigRepoUrlFieldNumber);
+
+        // …and it must not collide with any existing field.
+        int[] existing =
+        [
+            GetWorkerConfigResponse.GithubTokenFieldNumber,
+            GetWorkerConfigResponse.LlmProviderFieldNumber,
+            GetWorkerConfigResponse.OllamaUrlFieldNumber,
+            GetWorkerConfigResponse.OllamaApiKeyFieldNumber,
+            GetWorkerConfigResponse.OllamaModelFieldNumber,
+            GetWorkerConfigResponse.GithubModelFieldNumber,
+        ];
+        Assert.DoesNotContain(GetWorkerConfigResponse.ConfigRepoUrlFieldNumber, existing);
     }
 
     // ── Capturing logger helper ────────────────────────────────────────────────

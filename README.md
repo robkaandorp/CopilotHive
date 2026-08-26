@@ -86,6 +86,10 @@ By default, CopilotHive runs without authentication (open mode). To enable GitHu
    - `GITHUB_OAUTH_CLIENT_SECRET` — your OAuth App Client Secret
 3. Restart CopilotHive — the dashboard will require authentication
 
+The OAuth App requests the scopes `read:user`, `copilot`, `workflow` and `repo`. The `repo`
+scope lets the stored token clone/push **private config repositories** that are provisioned to
+workers via the `config_repo_url` field of `GetWorkerConfig`.
+
 The first GitHub user to sign in becomes the admin. The OAuth access token replaces the need for `GH_TOKEN`.
 
 > **Plain-HTTP deployments**: When serving the dashboard over plain HTTP on a non-localhost hostname (internal LAN / docker swarm), set `ALLOW_INSECURE_OAUTH=true`, or the OAuth handshake fails with "Correlation failed" (the OAuth correlation cookie carries the `Secure` attribute and browsers drop such cookies over `http://` on non-localhost hosts; Chromium also rejects the default `SameSite=None` without `Secure`). This relaxes only the correlation cookie's `Secure` requirement and sets `SameSite=Lax`. Use it only on a trusted internal network: over plain HTTP, OAuth tokens and session traffic can still be intercepted or modified by anyone with network access.
@@ -107,6 +111,7 @@ over the unary gRPC call `GetWorkerConfig` on the `HiveOrchestrator` service.
 | `ollama_api_key` | Orchestrator process env `OLLAMA_API_KEY` |
 | `ollama_model` | Orchestrator process env `OLLAMA_MODEL` |
 | `github_model` | Orchestrator process env `GITHUB_MODEL` |
+| `config_repo_url` | The orchestrator's `ConfigRepoManager` — the **sanitized** `--config-repo` operator value (never credential-bearing) |
 
 Every field uses proto3 optional presence. A field is **omitted** when its source value is
 null or whitespace, which tells the worker "nothing to provision — keep using your own
