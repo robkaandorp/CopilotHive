@@ -187,6 +187,47 @@ public sealed record ConfigSubAgentModelDto(string Name, int? ContextWindow, Mic
 public sealed record WorkerModelsDto(string? Model, string? PremiumModel);
 
 /// <summary>
+/// Response DTO for GET /api/config/models — the complete model configuration surface.
+/// Reasoning efforts are projected entry-by-entry through
+/// <see cref="ConfigModelService.ParseLenient"/> so an unrecognised stored value degrades
+/// to <c>null</c> rather than leaking a raw string onto the enum-typed wire.
+/// </summary>
+/// <param name="Orchestrator">Orchestrator model identifier, or <c>null</c> when unset.</param>
+/// <param name="Composer">Composer model identifier, or <c>null</c> when unset.</param>
+/// <param name="Compaction">Compaction model identifier, or <c>null</c> when unset.</param>
+/// <param name="Workers">Per-role worker model configuration (standard + premium model).</param>
+/// <param name="OrchestratorReasoningEffort">Orchestrator reasoning effort, or <c>null</c> when unset/invalid.</param>
+/// <param name="ComposerReasoningEffort">Composer reasoning effort, or <c>null</c> when unset/invalid.</param>
+/// <param name="WorkerReasoningEffort">Per-role worker reasoning effort, or <c>null</c> per role when unset/invalid.</param>
+/// <param name="WorkerPremiumReasoningEffort">Per-role worker premium reasoning effort, or <c>null</c> per role when unset/invalid.</param>
+/// <param name="SubAgentModelReasoning">Per-model sub-agent reasoning effort keyed by model name, or <c>null</c> when no sub-agent models are configured.</param>
+/// <param name="AvailableModels">The global available-models catalog, or <c>null</c> when not configured.</param>
+/// <param name="SubAgentModels">The curated sub-agent model list, or <c>null</c> when not configured.</param>
+public sealed record ModelsConfigDto(
+    string? Orchestrator,
+    string? Composer,
+    string? Compaction,
+    IReadOnlyDictionary<string, WorkerModelsDto> Workers,
+    ReasoningEffort? OrchestratorReasoningEffort,
+    ReasoningEffort? ComposerReasoningEffort,
+    IReadOnlyDictionary<string, ReasoningEffort?> WorkerReasoningEffort,
+    IReadOnlyDictionary<string, ReasoningEffort?> WorkerPremiumReasoningEffort,
+    IReadOnlyDictionary<string, ReasoningEffort?>? SubAgentModelReasoning,
+    IReadOnlyList<AvailableModelDto>? AvailableModels,
+    IReadOnlyList<ConfigSubAgentModelDto>? SubAgentModels);
+
+/// <summary>
+/// Response DTO for a model discovered from a provider API
+/// (GET /api/config/models/discover). Mirrors <see cref="DiscoveredModel"/> field-for-field.
+/// </summary>
+/// <param name="Id">Provider-prefixed identifier (e.g. "copilot/claude-sonnet-4.6").</param>
+/// <param name="Name">Human-readable display name.</param>
+/// <param name="Vendor">Vendor name, or <c>null</c> if not reported.</param>
+/// <param name="ContextWindow">Maximum context window in tokens, or <c>null</c> if not reported.</param>
+/// <param name="Enabled">Whether the model is enabled by provider policy.</param>
+public sealed record DiscoveredModelDto(string Id, string Name, string? Vendor, int? ContextWindow, bool Enabled);
+
+/// <summary>
 /// Response DTO for a configured repository.
 /// </summary>
 /// <param name="Name">Short name used to identify the repository.</param>

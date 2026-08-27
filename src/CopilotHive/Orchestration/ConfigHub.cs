@@ -14,169 +14,97 @@ public static class ConfigHub
     /// Registers the model-configuration endpoints on the given <see cref="WebApplication"/>.
     /// </summary>
     /// <param name="app">The web application to register routes on.</param>
-    public static void MapConfigEndpoints(this WebApplication app)
+    /// <param name="facade">The model-catalog facade backing the model endpoints.</param>
+    public static void MapConfigEndpoints(this WebApplication app, IConfigFacade facade)
     {
-        app.MapGet("/api/config/models", ([FromServices] HiveConfigFile? config) =>
+        app.MapGet("/api/config/models", () =>
         {
-            if (config is null)
-                return Results.NotFound(new { error = "Config repo not configured." });
+            var result = facade.GetModels();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
 
-            // Reasoning effort is stored as string? in the YAML-bound config classes but is
-            // projected here as the ReasoningEffort enum. The global JsonStringEnumConverter
-            // renders it snake_case (e.g. "extra_high"). A value a dynamic reload left
-            // unrecognised degrades to null rather than failing the whole response.
-            return Results.Ok(new
-            {
-                orchestrator   = config.Orchestrator.Model,
-                composer       = config.Composer?.Model,
-                compaction     = config.Models?.CompactionModel,
-                workers        = config.Workers.ToDictionary(
-                    kv => kv.Key,
-                    kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel }),
-                orchestratorReasoningEffort = ConfigModelService.ParseLenient(config.Orchestrator.ReasoningEffort),
-                composerReasoningEffort     = ConfigModelService.ParseLenient(config.Composer?.ReasoningEffort),
-                workerReasoningEffort       = config.Workers.ToDictionary(
-                    kv => kv.Key,
-                    kv => ConfigModelService.ParseLenient(kv.Value.ReasoningEffort)),
-                workerPremiumReasoningEffort = config.Workers.ToDictionary(
-                    kv => kv.Key,
-                    kv => ConfigModelService.ParseLenient(kv.Value.PremiumReasoningEffort)),
-                subAgentModelReasoning = config.Models?.SubAgentModels?
-                    .Where(m => !string.IsNullOrEmpty(m.Name))
-                    .GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
-                    .ToDictionary(
-                        g => g.Key,
-                        g => ConfigModelService.ParseLenient(g.First().ReasoningEffort)),
-                availableModels = config.Models?.AvailableModels?
-                    .Select(m => new { m.Name, m.ContextWindow, m.Description, m.SupportsVision }),
-                // Projected entry-by-entry rather than returned as raw ModelEntry objects:
-                // ModelEntry.ReasoningEffort is deliberately string? at the YAML boundary, so
-                // serializing the entity directly would leak a raw string (and an unrecognised
-                // stored value such as "turbo" verbatim) into an otherwise enum-typed response.
-                subAgentModels = config.Models?.SubAgentModels?
-                    .Select(m => new
-                    {
-                        m.Name,
-                        m.ContextWindow,
-                        reasoningEffort = ConfigModelService.ParseLenient(m.ReasoningEffort),
-                        m.Description,
-                        m.SupportsVision
-                    }),
-            });
+            // Reasoning effort is projected entry-by-entry through ParseLenient by the facade
+            // (never leaked as a raw string); the global JsonStringEnumConverter renders the
+            // enum snake_case (e.g. "extra_high") on the wire.
+            var dto = result.Value!;
+            return Results.Ok(dto);
         });
 
         app.MapMethods("/api/config/models", ["PATCH"], async (
             ModelConfigUpdate update,
-            [FromServices] ConfigModelService? svc,
             CancellationToken ct) =>
         {
-            if (svc is null)
-                return Results.Problem("Config repo is not configured — model changes cannot be persisted.");
-
-            try
-            {
-                await svc.SaveModelConfigAsync(update, ct);
-                return Results.Ok(new { saved = true, description = update.Description });
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
+            var result = await facade.SaveModelsAsync(update, ct);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Discover available models from providers
-        app.MapGet("/api/config/models/discover", async ([FromServices] ModelDiscoveryService? svc) =>
+        app.MapGet("/api/config/models/discover", async () =>
         {
-            if (svc is null)
-                return Results.Problem("Model discovery service is not configured.");
-            var models = await svc.DiscoverAllAsync();
-            return Results.Ok(models);
+            var result = await facade.DiscoverModelsAsync();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Add a model to available_models
-        app.MapPost("/api/config/available-models", async (AvailableModelRequest req, [FromServices] ConfigModelService? svc) =>
+        app.MapPost("/api/config/available-models", async (AvailableModelRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            try
-            {
-                await svc.AddAvailableModelAsync(req.Name, req.ContextWindow, req.Description, req.SupportsVision);
-                return Results.Ok(new { saved = true });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
+            var result = await facade.AddAvailableModelAsync(req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update a model
-        app.MapPut("/api/config/available-models/{name}", async (string name, AvailableModelRequest req, [FromServices] ConfigModelService? svc) =>
+        app.MapPut("/api/config/available-models/{name}", async (string name, AvailableModelRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
             name = Uri.UnescapeDataString(name);
-            try
-            {
-                await svc.UpdateAvailableModelAsync(name, req.ContextWindow, req.Description, req.SupportsVision);
-                return Results.Ok(new { saved = true });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.NotFound(new { error = ex.Message });
-            }
+            var result = await facade.UpdateAvailableModelAsync(name, req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Remove a model
-        app.MapDelete("/api/config/available-models/{name}", async (string name, [FromServices] ConfigModelService? svc) =>
+        app.MapDelete("/api/config/available-models/{name}", async (string name) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
             name = Uri.UnescapeDataString(name);
-            var removed = await svc.RemoveAvailableModelAsync(name);
-            return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
+            var result = await facade.RemoveAvailableModelAsync(name);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Add a model to sub_agent_models
-        app.MapPost("/api/config/sub-agent-models", async (SubAgentModelRequest req, [FromServices] ConfigModelService? svc) =>
+        app.MapPost("/api/config/sub-agent-models", async (SubAgentModelRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            try
-            {
-                await svc.AddSubAgentModelAsync(req.Name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
-                return Results.Ok(new { saved = true });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
+            var result = await facade.AddSubAgentModelAsync(req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update a sub-agent model
-        app.MapPut("/api/config/sub-agent-models/{name}", async (string name, SubAgentModelRequest req, [FromServices] ConfigModelService? svc) =>
+        app.MapPut("/api/config/sub-agent-models/{name}", async (string name, SubAgentModelRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
             name = Uri.UnescapeDataString(name);
-            try
-            {
-                await svc.UpdateSubAgentModelAsync(name, req.ContextWindow, req.ReasoningEffort, req.Description, req.SupportsVision);
-                return Results.Ok(new { saved = true });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.NotFound(new { error = ex.Message });
-            }
+            var result = await facade.UpdateSubAgentModelAsync(name, req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Remove a sub-agent model
-        app.MapDelete("/api/config/sub-agent-models/{name}", async (string name, [FromServices] ConfigModelService? svc) =>
+        app.MapDelete("/api/config/sub-agent-models/{name}", async (string name) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
             name = Uri.UnescapeDataString(name);
-            var removed = await svc.RemoveSubAgentModelAsync(name);
-            return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Model '{name}' not found." });
+            var result = await facade.RemoveSubAgentModelAsync(name);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // ── Repositories ────────────────────────────────────────────────────
@@ -411,5 +339,27 @@ public static class ConfigHub
             }
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Maps a <see cref="FacadeErrorKind"/> from the model-catalog facade to the exact HTTP
+    /// response the pre-facade handlers produced: <c>NotFound</c>/<c>Conflict</c>/<c>BadRequest</c>
+    /// return a JSON <c>{error}</c> body; <c>NotConfigured</c> and <c>Internal</c> return a
+    /// problem-details body. <see cref="FacadeErrorKind.None"/> is a programming error and throws.
+    /// </summary>
+    /// <param name="kind">The failure category reported by the facade.</param>
+    /// <param name="error">The human-readable error message.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapModelFacadeError(FacadeErrorKind kind, string? error)
+    {
+        return kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error }),
+            FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.NotConfigured => Results.Problem(error),
+            FacadeErrorKind.Internal => Results.Problem(error, statusCode: 500),
+            _ => throw new InvalidOperationException($"Unexpected facade error kind: {kind}."),
+        };
     }
 }

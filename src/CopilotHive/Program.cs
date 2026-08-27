@@ -268,6 +268,16 @@ public sealed class Program
                 builder.Services.AddSingleton(hiveConfigFile);
             }
 
+            // Model-catalog facade: ALWAYS registered so the model endpoints resolve it
+            // unconditionally. Reads fall back to the HiveConfigFile singleton (which is always
+            // registered above); persistence/discovery report NotConfigured when
+            // ConfigModelService/ModelDiscoveryService are absent (no config repo configured).
+            builder.Services.AddSingleton<IConfigFacade>(sp => new ConfigFacade(
+                sp.GetService<HiveConfigFile>(),
+                sp.GetService<ConfigModelService>(),
+                sp.GetService<ModelDiscoveryService>(),
+                sp.GetRequiredService<ILogger<ConfigFacade>>()));
+
             // Brain: direct LLM connection via SharpCoder. Registered ONLY when the parsed config
             // declares an orchestrator model (Slice 2 — config-driven registration; BRAIN_MODEL no
             // longer gates or seeds the Brain, and BRAIN_CONTEXT_WINDOW/BRAIN_MAX_STEPS no longer
@@ -823,7 +833,7 @@ public sealed class Program
             app.MapComposerEndpoints(composer, app.Services.GetService<HiveConfigFile>());
 
             // Model configuration REST API
-            app.MapConfigEndpoints();
+            app.MapConfigEndpoints(app.Services.GetRequiredService<IConfigFacade>());
 
             // Eager clone all configured repos at startup
             var repoManager = app.Services.GetService<IBrainRepoManager>();
