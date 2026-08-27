@@ -312,8 +312,7 @@ public sealed class ActiveModeConfigUiTests
         var host = new RecordingNotificationToggleHost
         {
             Mode = "passive",
-            ResponseStatus = System.Net.HttpStatusCode.BadRequest,
-            ResponseBody = "{\"error\":\"nope\"}",
+            SaveResult = new FacadeResult<SavedResult>(false, null, "nope", FacadeErrorKind.BadRequest),
         };
 
         await ComposerChat.ToggleActiveNotificationsCoreAsync(host);
@@ -321,7 +320,8 @@ public sealed class ActiveModeConfigUiTests
         Assert.Equal("passive", host.Mode);
         Assert.False(host.RestartRequired);
         Assert.NotNull(host.ToggleError);
-        Assert.Contains("400", host.ToggleError!, StringComparison.Ordinal);
+        // The facade's error text is surfaced verbatim — no HTTP status prefix any more.
+        Assert.Contains("nope", host.ToggleError!, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -330,7 +330,7 @@ public sealed class ActiveModeConfigUiTests
         var host = new RecordingNotificationToggleHost
         {
             Mode = "active",
-            PatchFailure = new HttpRequestException("network down"),
+            SaveFailure = new InvalidOperationException("network down"),
         };
 
         await ComposerChat.ToggleActiveNotificationsCoreAsync(host);
@@ -351,14 +351,15 @@ public sealed class ActiveModeConfigUiTests
         var host = new RecordingNotificationToggleHost
         {
             Mode = "passive",
-            ResponseStatus = System.Net.HttpStatusCode.InternalServerError,
+            SaveResult = new FacadeResult<SavedResult>(
+                false, null, "config service unavailable", FacadeErrorKind.NotConfigured),
         };
 
         await ComposerChat.ToggleActiveNotificationsCoreAsync(host);
         Assert.False(host.TogglePending);
         Assert.Equal("passive", host.Mode);
 
-        host.ResponseStatus = System.Net.HttpStatusCode.OK;
+        host.SaveResult = RecordingNotificationToggleHost.Saved;
         await ComposerChat.ToggleActiveNotificationsCoreAsync(host);
 
         Assert.Equal("active", host.Mode);
@@ -377,7 +378,7 @@ public sealed class ActiveModeConfigUiTests
         await ComposerChat.ToggleActiveNotificationsCoreAsync(host);
 
         Assert.True(host.TogglePendingWhenPatched,
-            "The in-flight claim must be set before the PATCH is issued.");
+            "The in-flight claim must be set before the save is issued.");
         Assert.False(host.TogglePending, "The claim must be released once the toggle completes.");
     }
 
@@ -488,17 +489,65 @@ public sealed class ActiveModeConfigUiTests
             "LoadActiveNotificationsModeAsync must run outside the Composer.IsConnected block");
     }
 
+    /// <summary>
+    /// The mode load goes through <c>IConfigFacade.GetComposer()</c> — NOT an HTTP GET. Both
+    /// failure paths (an unsuccessful result and a thrown exception) must clear the mode rather
+    /// than leave a fabricated default in place, and both surface the error text. Reverting to
+    /// <c>HttpClient.GetFromJsonAsync("/api/config/composer", …)</c> fails this test.
+    /// </summary>
     [Fact]
     public void ComposerChat_LoadMode_FailureLeavesModeUnloaded()
     {
         var source = ReadComposerChatSource();
-        var method = ExtractMethodSource(source, "private async Task LoadActiveNotificationsModeAsync()");
+        var method = ExtractMethodSource(source, "private Task LoadActiveNotificationsModeAsync()");
         Assert.Contains("NormalizeLoadedNotificationsMode", method);
-        Assert.Contains("/api/config/composer", method);
-        // The catch must clear the mode rather than leave a fabricated default in place.
+        Assert.Contains("ConfigFacade.GetComposer()", method);
+        Assert.DoesNotContain("/api/config/composer", method);
+        Assert.DoesNotContain("HttpClient", method);
+
+        // An unsuccessful result clears the mode and surfaces the facade's error text.
+        var resultFailureIndex = method.IndexOf("if (!result.Success)", StringComparison.Ordinal);
+        Assert.True(resultFailureIndex >= 0, "Load must handle an unsuccessful facade result");
+        var resultFailureBody = method.Substring(resultFailureIndex);
+        Assert.Contains("_activeNotifMode = null", resultFailureBody);
+        Assert.Contains("{result.Error}", resultFailureBody, StringComparison.Ordinal);
+
+        // The catch must clear the mode too — a thrown exception surfaces through the same path.
         var catchIndex = method.IndexOf("catch", StringComparison.Ordinal);
-        Assert.True(catchIndex >= 0, "Load must handle a failing GET");
+        Assert.True(catchIndex >= 0, "Load must handle a throwing facade call");
         Assert.Contains("_activeNotifMode = null", method.Substring(catchIndex));
+    }
+
+    /// <summary>
+    /// The page must not talk HTTP at all any more: no <c>HttpClient</c> injection and no
+    /// Composer/config endpoint URLs anywhere in the source. This is the removal-proof guard for
+    /// the whole migration.
+    /// </summary>
+    [Fact]
+    public void ComposerChat_HasNoHttpClientDependency()
+    {
+        var source = ReadComposerChatSource();
+
+        Assert.DoesNotContain("@inject HttpClient", source);
+        Assert.DoesNotContain("HttpClient.", source);
+        Assert.DoesNotContain("/api/composer/", source);
+        Assert.Contains("@inject IComposerFacade ComposerFacade", source);
+        Assert.Contains("@inject IConfigFacade ConfigFacade", source);
+    }
+
+    /// <summary>
+    /// The toggle persists through <c>IConfigFacade.SaveComposerAsync</c> with the shared
+    /// <see cref="ComposerSettingsUpdate"/> and no cancellation token of its own.
+    /// </summary>
+    [Fact]
+    public void ComposerChat_ToggleSave_UsesConfigFacade()
+    {
+        var source = ReadComposerChatSource();
+
+        Assert.Contains("ConfigFacade.SaveComposerAsync(", source);
+        Assert.Contains("new ComposerSettingsUpdate(EventNotificationsMode: mode)", source);
+        Assert.Contains("CancellationToken.None", source);
+        Assert.DoesNotContain("PatchAsync", source);
     }
 
     // ── Configuration: event notifications section markup ───────────────────
@@ -789,8 +838,9 @@ public sealed class ActiveModeConfigUiTests
 /// <summary>
 /// Recording <see cref="ComposerChat.INotificationToggleHost"/> that drives the PRODUCTION toggle
 /// body (<see cref="ComposerChat.ToggleActiveNotificationsCoreAsync"/>) without a Blazor circuit.
-/// It captures every mode actually PATCHed, the in-flight claim observed at request time, and can
-/// hold the response open so an overlapping click can be issued deterministically.
+/// It captures every mode actually persisted through the facade seam, the in-flight claim observed
+/// at request time, and can hold the save open so an overlapping click can be issued
+/// deterministically.
 /// </summary>
 internal sealed class RecordingNotificationToggleHost : ComposerChat.INotificationToggleHost
 {
@@ -815,38 +865,39 @@ internal sealed class RecordingNotificationToggleHost : ComposerChat.INotificati
     /// <inheritdoc />
     public bool IsStreaming => IsStreamingValue;
 
-    /// <summary>Status code the fake PATCH responds with.</summary>
-    public System.Net.HttpStatusCode ResponseStatus { get; set; } = System.Net.HttpStatusCode.OK;
+    /// <summary>A successful save result (the default the fake returns).</summary>
+    public static FacadeResult<SavedResult> Saved { get; } =
+        new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
 
-    /// <summary>Body the fake PATCH responds with.</summary>
-    public string ResponseBody { get; set; } = "{\"saved\":true}";
+    /// <summary>Result the fake facade save returns; defaults to a success.</summary>
+    public FacadeResult<SavedResult> SaveResult { get; set; } = Saved;
 
-    /// <summary>When set, <see cref="PatchModeAsync"/> throws it instead of responding.</summary>
-    public Exception? PatchFailure { get; set; }
+    /// <summary>When set, <see cref="SaveModeAsync"/> throws it instead of returning a result.</summary>
+    public Exception? SaveFailure { get; set; }
 
     /// <summary>
-    /// When true, the FIRST PATCH parks until <see cref="ReleasePatch"/> is called. Off by
+    /// When true, the FIRST save parks until <see cref="ReleasePatch"/> is called. Off by
     /// default so ordinary tests complete synchronously; the overlapping-click test turns it on.
     /// </summary>
     public bool HoldFirstResponse { get; set; }
 
-    /// <summary>Completes as soon as the first PATCH has been entered.</summary>
+    /// <summary>Completes as soon as the first save has been entered.</summary>
     public TaskCompletionSource PatchEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Every mode handed to the PATCH, in order.</summary>
+    /// <summary>Every mode handed to the facade save, in order.</summary>
     public IReadOnlyList<string> PatchedModes => _patchedModes;
 
-    /// <summary>The in-flight claim observed at the moment the first PATCH was issued.</summary>
+    /// <summary>The in-flight claim observed at the moment the first save was issued.</summary>
     public bool TogglePendingWhenPatched { get; private set; }
 
     /// <summary>How many re-renders the toggle requested.</summary>
     public int NotifyCount { get; private set; }
 
-    /// <summary>Unblocks a parked PATCH.</summary>
+    /// <summary>Unblocks a parked save.</summary>
     public void ReleasePatch() => _gate.TrySetResult();
 
     /// <inheritdoc />
-    public async Task<HttpResponseMessage> PatchModeAsync(string mode)
+    public async Task<FacadeResult<SavedResult>> SaveModeAsync(string mode)
     {
         var isFirst = _patchedModes.Count == 0;
 
@@ -857,17 +908,14 @@ internal sealed class RecordingNotificationToggleHost : ComposerChat.INotificati
         _patchedModes.Add(mode);
         PatchEntered.TrySetResult();
 
-        if (PatchFailure is not null)
-            throw PatchFailure;
+        if (SaveFailure is not null)
+            throw SaveFailure;
 
         // Only the first call parks, and only when a test explicitly asked to hold it.
         if (isFirst && HoldFirstResponse)
             await _gate.Task;
 
-        return new HttpResponseMessage(ResponseStatus)
-        {
-            Content = new StringContent(ResponseBody, System.Text.Encoding.UTF8, "application/json"),
-        };
+        return SaveResult;
     }
 
     /// <inheritdoc />

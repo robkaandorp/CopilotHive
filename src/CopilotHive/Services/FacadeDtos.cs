@@ -349,3 +349,34 @@ public sealed record ComposerEventNotificationsDto(
 /// <param name="SizeBytes">The archive size in bytes.</param>
 /// <param name="CreatedAt">The UTC creation time of the archive.</param>
 public sealed record BackupInfoDto(string FileName, long SizeBytes, DateTime CreatedAt);
+
+/// <summary>
+/// Response DTO for <c>GET /api/composer/current-model</c>. The model is NULLABLE by contract:
+/// a Composer that is not connected / has no active model reports <c>{"model":null}</c> on a
+/// SUCCESSFUL read — a catalog entry is never fabricated in its place.
+/// </summary>
+/// <param name="Model">The Composer's active model, or <c>null</c> when it has none.</param>
+public sealed record CurrentModelDto(string? Model);
+
+/// <summary>
+/// Response DTO for <c>GET /api/composer/models</c>: the Composer's normalised model catalog
+/// (<c>Composer.AvailableModels</c> — trimmed and deduplicated) plus its current reasoning effort.
+/// </summary>
+/// <param name="Models">The available models, in catalog order.</param>
+/// <param name="ReasoningEffort">The Composer's current reasoning effort, or <c>null</c> when unset.</param>
+public sealed record ComposerModelsDto(IReadOnlyList<string> Models, ReasoningEffort? ReasoningEffort);
+
+/// <summary>
+/// Response DTO for <c>POST /api/composer/models/switch</c> — the model and reasoning effort
+/// actually applied to the running Composer.
+/// </summary>
+/// <param name="Model">The model now active.</param>
+/// <param name="ReasoningEffort">The reasoning effort now active, or <c>null</c> when unset.</param>
+public sealed record SwitchResultDto(string Model, ReasoningEffort? ReasoningEffort);
+
+/// <summary>
+/// Response DTO for <c>POST /api/composer/compact</c> and <c>POST /api/composer/compact-partial</c>.
+/// </summary>
+/// <param name="Compacted">Whether compaction actually ran.</param>
+/// <param name="MessageCount">The session message count after the attempt (0 when unknown).</param>
+public sealed record CompactResultDto(bool Compacted, int MessageCount);

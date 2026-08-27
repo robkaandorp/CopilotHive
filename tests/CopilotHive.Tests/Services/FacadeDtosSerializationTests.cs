@@ -802,4 +802,123 @@ public sealed class FacadeDtosSerializationTests
 
         Assert.Equal(dto, roundTripped);
     }
+
+    // ── Composer runtime DTOs (step 5b) ──────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="CurrentModelDto"/> serializes as <c>{"model":…}</c>; the model is NULLABLE
+    /// by contract — an unconfigured Composer reports <c>{"model":null}</c> on a SUCCESSFUL
+    /// read, so the null must be explicit in the JSON (not omitted).
+    /// </summary>
+    [Fact]
+    public void CurrentModelDto_SerializesAsNullableModelProperty()
+    {
+        var json = JsonSerializer.Serialize(new CurrentModelDto("claude-opus"), JsonOpts);
+        Assert.Equal("""{"model":"claude-opus"}""", json);
+
+        var nullJson = JsonSerializer.Serialize(new CurrentModelDto(null), JsonOpts);
+        Assert.Equal("""{"model":null}""", nullJson);
+
+        var roundTripped = JsonSerializer.Deserialize<CurrentModelDto>(nullJson, JsonOpts);
+        Assert.NotNull(roundTripped);
+        Assert.Null(roundTripped.Model);
+
+        var value = JsonSerializer.Deserialize<CurrentModelDto>(json, JsonOpts);
+        Assert.Equal("claude-opus", value!.Model);
+    }
+
+    /// <summary>
+    /// <see cref="ComposerModelsDto"/> serializes with camelCase <c>models</c> and the
+    /// reasoning effort through the global snake_case enum converter (<c>"extra_high"</c>,
+    /// never the numeric value). A null effort serializes as an explicit null.
+    /// </summary>
+    [Fact]
+    public void ComposerModelsDto_ReasoningEffort_SerializesAsSnakeCaseAndRoundTrips()
+    {
+        var dto = new ComposerModelsDto(["claude-sonnet-4", "claude-opus"], ReasoningEffort.ExtraHigh);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal(
+            """{"models":["claude-sonnet-4","claude-opus"],"reasoningEffort":"extra_high"}""",
+            json);
+
+        var roundTripped = JsonSerializer.Deserialize<ComposerModelsDto>(json, JsonOpts);
+        Assert.NotNull(roundTripped);
+        Assert.Equal(dto.Models, roundTripped.Models);
+        Assert.Equal(dto.ReasoningEffort, roundTripped.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ComposerModelsDto_NullReasoningEffort_SerializesAsExplicitNull()
+    {
+        var dto = new ComposerModelsDto(["claude-sonnet-4"], null);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal("""{"models":["claude-sonnet-4"],"reasoningEffort":null}""", json);
+
+        var roundTripped = JsonSerializer.Deserialize<ComposerModelsDto>(json, JsonOpts);
+        Assert.NotNull(roundTripped);
+        Assert.Equal(dto.Models, roundTripped.Models);
+        Assert.Null(roundTripped.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// <see cref="SwitchResultDto"/> carries the applied model and effort; the effort
+    /// serializes through the global snake_case enum converter and rejects numeric values
+    /// on read (allowIntegerValues=false, matching the server).
+    /// </summary>
+    [Fact]
+    public void SwitchResultDto_ReasoningEffort_SerializesAsSnakeCaseAndRoundTrips()
+    {
+        var dto = new SwitchResultDto("claude-opus", ReasoningEffort.Medium);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal("""{"model":"claude-opus","reasoningEffort":"medium"}""", json);
+
+        var roundTripped = JsonSerializer.Deserialize<SwitchResultDto>(json, JsonOpts);
+        Assert.Equal(dto, roundTripped);
+    }
+
+    [Fact]
+    public void SwitchResultDto_NullReasoningEffort_SerializesAsExplicitNull()
+    {
+        var dto = new SwitchResultDto("claude-opus", null);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal("""{"model":"claude-opus","reasoningEffort":null}""", json);
+
+        var roundTripped = JsonSerializer.Deserialize<SwitchResultDto>(json, JsonOpts);
+        Assert.Equal(dto, roundTripped);
+    }
+
+    /// <summary>
+    /// <see cref="CompactResultDto"/> serializes with camelCase <c>compacted</c>/<c>messageCount</c>.
+    /// </summary>
+    [Fact]
+    public void CompactResultDto_SerializesAsCamelCaseWireShape()
+    {
+        var dto = new CompactResultDto(true, 7);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal("""{"compacted":true,"messageCount":7}""", json);
+
+        var roundTripped = JsonSerializer.Deserialize<CompactResultDto>(json, JsonOpts);
+        Assert.Equal(dto, roundTripped);
+    }
+
+    [Fact]
+    public void CompactResultDto_FalseCompacted_ZeroCount_SerializesBothProperties()
+    {
+        var dto = new CompactResultDto(false, 0);
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        // Both members are non-nullable and always present — nothing is omitted.
+        Assert.Equal("""{"compacted":false,"messageCount":0}""", json);
+    }
 }

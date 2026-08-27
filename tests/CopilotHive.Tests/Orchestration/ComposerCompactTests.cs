@@ -6,6 +6,7 @@ using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -544,7 +545,10 @@ public sealed class ComposerCompactTests
         var builder = WebApplication.CreateBuilder();
         builder.Services.AddSingleton(composer);
         var app = builder.Build();
-        app.MapComposerEndpoints(composer, null);
+        app.MapComposerEndpoints(
+            composer,
+            new ComposerFacade(composer, NullLogger<ComposerFacade>.Instance),
+            null);
         await app.StartAsync(TestContext.Current.CancellationToken);
 
         try

@@ -7,14 +7,14 @@
 @using SharpCoder.SubAgents
 @using System.IO
 @using System.Text.Json
-@using System.Text.Json.Serialization
 @using Microsoft.Extensions.AI
 @implements IAsyncDisposable
 @inject Composer Composer
 @inject ComposerAttachmentService AttachmentService
 @inject IJSRuntime JS
 @inject PageHeaderState PageHeader
-@inject HttpClient HttpClient
+@inject IComposerFacade ComposerFacade
+@inject IConfigFacade ConfigFacade
 
 @if (ViewState.ShowNotConfiguredNotice)
 {
@@ -391,8 +391,8 @@
     // once, when the textarea first appears (post-connect on a disconnected-first page); never
     // reset — the module is uninstalled/disposed only in DisposeAsync.
     private bool _pasteInstalled;
-    // Authoritative event-notification mode. Null until GET /api/config/composer reports it —
-    // a fabricated default would let the toggle PATCH a transition the server never implied.
+    // Authoritative event-notification mode. Null until IConfigFacade.GetComposer() reports it —
+    // a fabricated default would let the toggle persist a transition the server never implied.
     private string? _activeNotifMode;
     private bool _notifTogglePending;
     private bool _restartRequiredForNotifications;
@@ -961,11 +961,13 @@
         if (Composer.IsStreaming || Composer.IsCompacting) return;
         try
         {
-            var response = await HttpClient.PostAsync("/api/composer/compact", null);
-            if (response.IsSuccessStatusCode)
+            var result = await ComposerFacade.CompactAsync();
+            if (result.Success)
             {
                 LoadHistory();
             }
+            // A failed compaction leaves the thread exactly as it was — the history is NOT
+            // reloaded — but the view is still refreshed so the compacting indicator clears.
             StateHasChanged();
         }
         catch (Exception ex)
@@ -979,8 +981,8 @@
         if (Composer.IsStreaming || Composer.IsCompacting) return;
         try
         {
-            var response = await HttpClient.PostAsync("/api/composer/compact-partial?percent=50", null);
-            if (response.IsSuccessStatusCode)
+            var result = await ComposerFacade.CompactPartialAsync(50);
+            if (result.Success)
             {
                 LoadHistory();
             }
@@ -1022,12 +1024,12 @@
     };
 
     /// <summary>
-    /// Normalizes a mode reported by <c>GET /api/config/composer</c>. The endpoint already
-    /// returns the effective (normalized) mode, so anything outside the three known values is
-    /// treated as "not loaded" (<c>null</c>) rather than being coerced into a default that
-    /// would let the toggle PATCH a transition derived from a value the server never sent.
+    /// Normalizes a mode reported by <see cref="IConfigFacade.GetComposer"/>. The projection
+    /// already returns the effective (normalized) mode, so anything outside the three known
+    /// values is treated as "not loaded" (<c>null</c>) rather than being coerced into a default
+    /// that would let the toggle persist a transition derived from a value never reported.
     /// </summary>
-    /// <param name="mode">The raw mode from the response.</param>
+    /// <param name="mode">The raw mode from the projection.</param>
     internal static string? NormalizeLoadedNotificationsMode(string? mode) => mode switch
     {
         "passive" or "active" or "off" => mode,
@@ -1056,7 +1058,7 @@
         /// <summary>The authoritative mode, or <c>null</c> until the config GET has loaded it.</summary>
         string? Mode { get; set; }
 
-        /// <summary>Whether a toggle PATCH is currently in flight.</summary>
+        /// <summary>Whether a toggle save is currently in flight.</summary>
         bool TogglePending { get; set; }
 
         /// <summary>Whether a mode change has been persisted and needs a restart to take effect.</summary>
@@ -1068,9 +1070,9 @@
         /// <summary>Whether the Composer is currently streaming a response.</summary>
         bool IsStreaming { get; }
 
-        /// <summary>Sends the mode change to <c>PATCH /api/config/composer</c>.</summary>
+        /// <summary>Persists the mode change through <see cref="IConfigFacade.SaveComposerAsync"/>.</summary>
         /// <param name="mode">The mode to persist.</param>
-        Task<HttpResponseMessage> PatchModeAsync(string mode);
+        Task<FacadeResult<SavedResult>> SaveModeAsync(string mode);
 
         /// <summary>Requests a re-render (the component's <c>StateHasChanged</c>).</summary>
         void Notify();
@@ -1111,15 +1113,9 @@
         public bool IsStreaming => owner.Composer.IsStreaming;
 
         /// <inheritdoc />
-        public Task<HttpResponseMessage> PatchModeAsync(string mode)
-        {
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(
-                    new { eventNotificationsMode = mode }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-            return owner.HttpClient.PatchAsync("/api/config/composer", body);
-        }
+        public Task<FacadeResult<SavedResult>> SaveModeAsync(string mode)
+            => owner.ConfigFacade.SaveComposerAsync(
+                new ComposerSettingsUpdate(EventNotificationsMode: mode), CancellationToken.None);
 
         /// <inheritdoc />
         public void Notify() => owner.StateHasChanged();
@@ -1131,18 +1127,26 @@
         _notificationToggleHost ??= new ComponentNotificationToggleHost(this);
 
     /// <summary>
-    /// Loads the effective event-notification mode from <c>GET /api/config/composer</c>.
-    /// This runs regardless of whether the Composer agent is connected — the config endpoint is
+    /// Loads the effective event-notification mode through <see cref="IConfigFacade.GetComposer"/>.
+    /// This runs regardless of whether the Composer agent is connected — the config projection is
     /// independent of that connection. A failed load leaves the mode <c>null</c> (not loaded),
-    /// which keeps the toggle disabled instead of letting it PATCH a transition computed from a
+    /// which keeps the toggle disabled instead of letting it persist a transition computed from a
     /// fabricated <c>passive</c> default that could overwrite a stored <c>active</c>/<c>off</c>.
     /// </summary>
-    private async Task LoadActiveNotificationsModeAsync()
+    private Task LoadActiveNotificationsModeAsync()
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ReasoningEffortOptions.JsonOptions);
-            _activeNotifMode = NormalizeLoadedNotificationsMode(response?.EventNotifications?.Mode);
+            var result = ConfigFacade.GetComposer();
+            if (!result.Success)
+            {
+                // Left unloaded on purpose: the toggle stays disabled rather than guessing.
+                _activeNotifMode = null;
+                _notifToggleError = $"Failed to load notification mode: {result.Error}";
+                return Task.CompletedTask;
+            }
+
+            _activeNotifMode = NormalizeLoadedNotificationsMode(result.Value?.EventNotifications?.Mode);
             if (_activeNotifMode is null)
                 _notifToggleError = "Could not determine the current notification mode.";
         }
@@ -1152,6 +1156,8 @@
             _activeNotifMode = null;
             _notifToggleError = $"Failed to load notification mode: {ex.Message}";
         }
+
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -1161,7 +1167,7 @@
     /// <remarks>
     /// The next mode is derived from the authoritative loaded mode, and the in-flight claim is
     /// taken BEFORE the first await so a second click cannot compute its transition from the same
-    /// pre-PATCH value. The <c>finally</c> always releases the claim, so a failed toggle never
+    /// pre-save value. The <c>finally</c> always releases the claim, so a failed toggle never
     /// leaves the button permanently disabled.
     /// </remarks>
     /// <param name="host">State seam the outcome is written to.</param>
@@ -1183,16 +1189,15 @@
 
         try
         {
-            var response = await host.PatchModeAsync(nextMode);
-            if (response.IsSuccessStatusCode)
+            var result = await host.SaveModeAsync(nextMode);
+            if (result.Success)
             {
                 host.Mode = nextMode;
                 host.RestartRequired = true;
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                host.ToggleError = $"Notification mode toggle failed ({(int)response.StatusCode}): {error}";
+                host.ToggleError = $"Notification mode toggle failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1210,73 +1215,155 @@
     /// <summary>Runs the shared toggle body against this component's own state.</summary>
     private Task ToggleActiveNotifications() => ToggleActiveNotificationsCoreAsync(NotificationToggleHost);
 
-    private sealed record ComposerConfigResponse(
-        [property: JsonPropertyName("eventNotifications")] EventNotificationsDto? EventNotifications);
-
-    private sealed record EventNotificationsDto(
-        [property: JsonPropertyName("mode")] string Mode);
-
-    private async Task LoadAvailableModelsAsync()
+    private Task LoadAvailableModelsAsync()
     {
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<ModelsResponse>("/api/composer/models", ReasoningEffortOptions.JsonOptions);
-            if (response?.Models is { Count: > 0 })
+            var result = ComposerFacade.GetModels();
+            if (!result.Success)
             {
-                _availableModels = response.Models;
+                Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {result.Error}");
+                return Task.CompletedTask;
+            }
+
+            if (result.Value?.Models is { Count: > 0 } models)
+            {
+                _availableModels = models.ToList();
             }
             // A Composer with no configured reasoning effort presents as "None" in the dropdown,
             // so the value shown always matches what a subsequent switch would send.
-            _selectedReasoning = InitialReasoning(response?.ReasoningEffort);
+            _selectedReasoning = InitialReasoning(result.Value?.ReasoningEffort);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ComposerChat] Failed to load available models: {ex.Message}");
         }
+
+        return Task.CompletedTask;
     }
 
     /// <summary>
     /// Fetches the Composer's actual current model and sets it as the initial
     /// dropdown selection, ensuring correctness after a runtime model switch.
-    /// A <c>null</c> model (disconnected shell — frozen contract) leaves the select
-    /// on its placeholder/no-selection option: the first catalog entry is NEVER
-    /// auto-selected without a change event.
+    /// The production body lives in <see cref="LoadCurrentModelCoreAsync"/> so the
+    /// thrown-exception handling is exercised by tests through the same code path.
     /// </summary>
-    private async Task LoadCurrentModelAsync()
+    private Task LoadCurrentModelAsync()
     {
+        return LoadCurrentModelCoreAsync(CurrentModelHost);
+    }
+
+    /// <summary>
+    /// Narrow seam over the component state the current-model load touches, so the PRODUCTION
+    /// body (<see cref="LoadCurrentModelCoreAsync"/>) can be exercised by tests without a live
+    /// Blazor circuit — including the thrown-exception path, which a source-level test cannot
+    /// execute. The component itself is the only production implementation.
+    /// </summary>
+    internal interface ICurrentModelHost
+    {
+        /// <summary>The models loaded from the catalog picker.</summary>
+        IReadOnlyList<string> AvailableModels { get; }
+
+        /// <summary>The current dropdown selection; cleared on every no-valid-model path.</summary>
+        string SelectedModel { get; set; }
+
+        /// <summary>Logs a current-model failure (console).</summary>
+        /// <param name="error">The error text from the result or the thrown exception.</param>
+        void LogCurrentModelFailure(string error);
+
+        /// <summary>Reads the current model through the facade.</summary>
+        Task<FacadeResult<CurrentModelDto>> GetCurrentModelAsync();
+    }
+
+    /// <summary>Binds <see cref="ICurrentModelHost"/> to this component's own fields and services.</summary>
+    private sealed class ComponentCurrentModelHost(ComposerChat owner) : ICurrentModelHost
+    {
+        /// <inheritdoc />
+        public IReadOnlyList<string> AvailableModels => owner._availableModels;
+
+        /// <inheritdoc />
+        public string SelectedModel
+        {
+            get => owner._selectedModel;
+            set => owner._selectedModel = value;
+        }
+
+        /// <inheritdoc />
+        public void LogCurrentModelFailure(string error)
+            => Console.Error.WriteLine($"[ComposerChat] Failed to load current model: {error}");
+
+        /// <inheritdoc />
+        public Task<FacadeResult<CurrentModelDto>> GetCurrentModelAsync()
+            => owner.ComposerFacade.GetCurrentModelAsync();
+    }
+
+    private ICurrentModelHost? _currentModelHost;
+
+    private ICurrentModelHost CurrentModelHost => _currentModelHost ??= new ComponentCurrentModelHost(this);
+
+    /// <summary>
+    /// The PRODUCTION current-model body, written against <see cref="ICurrentModelHost"/> so
+    /// tests exercise this exact code rather than a re-implementation.
+    /// </summary>
+    /// <remarks>
+    /// The try/catch is scoped to the facade READ ONLY: the facade rethrows read failures by
+    /// design, and this catch converts them into the same log-and-clear the unsuccessful-result
+    /// path uses. Nothing outside this method's own read is caught, so surrounding
+    /// switch/notification logic keeps its own handling.
+    /// </remarks>
+    /// <param name="host">State seam the outcome is written to.</param>
+    internal static async Task LoadCurrentModelCoreAsync(ICurrentModelHost host)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+
+        FacadeResult<CurrentModelDto> result;
         try
         {
-            var response = await HttpClient.GetFromJsonAsync<CurrentModelResponse>("/api/composer/current-model", ReasoningEffortOptions.JsonOptions);
-            if (!string.IsNullOrWhiteSpace(response?.Model) && _availableModels.Contains(response.Model))
-            {
-                _selectedModel = response.Model;
-            }
-            else
-            {
-                // No valid current model: keep the placeholder/no-selection state. Never
-                // auto-select the first catalog entry — a real selection must fire a change
-                // event so the switch endpoint (and first-connect) is actually invoked.
-                _selectedModel = "";
-            }
+            // Scoped to the read call only — a fault here must never escape into the
+            // component's init flow or the first-connect switch handler.
+            result = await host.GetCurrentModelAsync();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ComposerChat] Failed to load current model: {ex.Message}");
-            // No valid current model: keep the placeholder/no-selection state (see above).
-            _selectedModel = "";
+            // The facade rethrows read failures; restore the pre-migration behavior of
+            // logging + clearing instead of faulting the circuit.
+            host.LogCurrentModelFailure(ex.Message);
+            host.SelectedModel = "";
+            return;
+        }
+
+        if (!result.Success)
+        {
+            // Real failure: surface it (this replaces the previous exception path) and keep the
+            // placeholder/no-selection state.
+            host.LogCurrentModelFailure(result.Error ?? "Unknown error.");
+            host.SelectedModel = "";
+            return;
+        }
+
+        var model = result.Value?.Model;
+        if (!string.IsNullOrWhiteSpace(model) && host.AvailableModels.Contains(model))
+        {
+            host.SelectedModel = model;
+        }
+        else
+        {
+            // No valid current model (unconfigured shell, or a model absent from the catalog):
+            // keep the placeholder/no-selection state WITHOUT logging a failure — this is the
+            // normal contract, not an error. Never auto-select the first catalog entry: a real
+            // selection must fire a change event so the switch is actually invoked.
+            host.SelectedModel = "";
         }
     }
 
     /// <summary>
-    /// Builds the switch request URI. Both parameters are always sent: the reasoning effort uses
-    /// its canonical wire form (<c>extra_high</c>, never <c>ExtraHigh</c>) so it round-trips
-    /// through <see cref="ReasoningEffortConverter.Parse(string?)"/> on the server.
+    /// The reasoning effort value handed to <see cref="IComposerFacade.SwitchModelAsync"/>. The
+    /// facade parses the CANONICAL wire form (<c>extra_high</c>, never <c>ExtraHigh</c>), so the
+    /// conversion happens here rather than at each call site.
     /// </summary>
-    /// <param name="model">Model identifier to switch to.</param>
     /// <param name="reasoning">Reasoning effort to switch to.</param>
-    internal static string BuildSwitchUri(string model, ReasoningEffort reasoning)
-        => $"/api/composer/models/switch?model={Uri.EscapeDataString(model)}" +
-           $"&reasoning={Uri.EscapeDataString(ReasoningEffortConverter.Format(reasoning)!)}";
+    internal static string SwitchReasoningWireValue(ReasoningEffort reasoning)
+        => ReasoningEffortConverter.Format(reasoning)!;
 
     /// <summary>
     /// The reasoning level the dropdown starts on. A Composer with no configured effort reports
@@ -1309,10 +1396,10 @@
         /// <summary>Whether the Composer is connected BEFORE the switch attempt.</summary>
         bool IsConnected { get; }
 
-        /// <summary>Sends the model switch to the switch endpoint.</summary>
+        /// <summary>Switches the running Composer through <see cref="IComposerFacade.SwitchModelAsync"/>.</summary>
         /// <param name="model">Model identifier to switch to.</param>
         /// <param name="reasoning">Reasoning effort to switch to.</param>
-        Task<HttpResponseMessage> SwitchAsync(string model, ReasoningEffort reasoning);
+        Task<FacadeResult<SwitchResultDto>> SwitchAsync(string model, ReasoningEffort reasoning);
 
         /// <summary>Reloads the message thread from the Composer session history.</summary>
         void LoadHistory();
@@ -1334,9 +1421,8 @@
         public bool IsConnected => owner.Composer.IsConnected;
 
         /// <inheritdoc />
-        public Task<HttpResponseMessage> SwitchAsync(string model, ReasoningEffort reasoning)
-            => owner.HttpClient.PostAsJsonAsync(
-                BuildSwitchUri(model, reasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
+        public Task<FacadeResult<SwitchResultDto>> SwitchAsync(string model, ReasoningEffort reasoning)
+            => owner.ComposerFacade.SwitchModelAsync(model, SwitchReasoningWireValue(reasoning));
 
         /// <inheritdoc />
         public void LoadHistory() => owner.LoadHistory();
@@ -1374,16 +1460,16 @@
 
         try
         {
-            // The current reasoning selection travels with the new model — the server requires
+            // The current reasoning selection travels with the new model — the facade requires
             // both and never infers reasoning from the model name.
-            var response = await host.SwitchAsync(model, reasoning);
-            if (response.IsSuccessStatusCode)
+            var result = await host.SwitchAsync(model, reasoning);
+            if (result.Success)
             {
                 host.SetSelectedModel(model);
                 if (wasDisconnected)
                 {
-                    // First-connect: the switch endpoint connected the Composer (Slice 1A2b-1)
-                    // and restored the session from disk. Load and display the restored history
+                    // First-connect: the switch connected the Composer (Slice 1A2b-1) and
+                    // restored the session from disk. Load and display the restored history
                     // and refresh the current model so the thread shows immediately — no
                     // navigation required.
                     host.LoadHistory();
@@ -1395,8 +1481,7 @@
             }
             else
             {
-                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ReasoningEffortOptions.JsonOptions);
-                Console.Error.WriteLine($"[ComposerChat] Model switch failed: {error?.Error ?? response.ReasonPhrase}");
+                Console.Error.WriteLine($"[ComposerChat] Model switch failed: {result.Error}");
             }
         }
         catch (Exception ex)
@@ -1434,14 +1519,13 @@
 
         try
         {
-            var response = await HttpClient.PostAsJsonAsync(
-                BuildSwitchUri(_selectedModel, newReasoning), (object?)null, ReasoningEffortOptions.JsonOptions);
-            _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, response.IsSuccessStatusCode);
+            var result = await ComposerFacade.SwitchModelAsync(
+                _selectedModel, SwitchReasoningWireValue(newReasoning));
+            _selectedReasoning = ResolveReasoningAfterSwitch(previous, newReasoning, result.Success);
 
-            if (!response.IsSuccessStatusCode)
+            if (!result.Success)
             {
-                var error = await response.Content.ReadFromJsonAsync<ErrorResponse>(ReasoningEffortOptions.JsonOptions);
-                Console.Error.WriteLine($"[ComposerChat] Reasoning switch failed: {error?.Error ?? response.ReasonPhrase}");
+                Console.Error.WriteLine($"[ComposerChat] Reasoning switch failed: {result.Error}");
             }
         }
         catch (Exception ex)
@@ -1650,10 +1734,7 @@
         StateHasChanged();
     }
 
-    private sealed record ModelsResponse(List<string> Models, ReasoningEffort? ReasoningEffort);
-    // Nullable Model: the frozen current-model contract returns {"model":null} when the
-    // Composer is not connected / has no active model — never a fabricated catalog entry.
-    // Internal so tests can verify the nullable DTO deserializes both shapes.
-    internal sealed record CurrentModelResponse(string? Model);
-    private sealed record ErrorResponse(string Error);
+    // The page consumes the SHARED facade DTOs from CopilotHive.Services (FacadeDtos.cs) —
+    // ComposerModelsDto, CurrentModelDto, SwitchResultDto and CompactResultDto — instead of
+    // private JSON-deserialization records: nothing here talks HTTP any more.
 }

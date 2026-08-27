@@ -4,6 +4,7 @@ using CopilotHive.Dashboard;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
@@ -887,7 +888,10 @@ public sealed class ComposerHubTests : IAsyncLifetime
         // serialized exactly as the real host does, rather than with framework defaults.
         Program.AddHiveJsonOptions(builder.Services);
         _app = builder.Build();
-        _app.MapComposerEndpoints(_composer, config: null);
+        _app.MapComposerEndpoints(
+            _composer,
+            new ComposerFacade(_composer, NullLogger<ComposerFacade>.Instance),
+            config: null);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
     }
@@ -1461,7 +1465,10 @@ public sealed class ComposerHubNullTests : IAsyncLifetime
         ((IWebHostBuilder)builder.WebHost).UseUrls("http://127.0.0.1:0");
         _app = builder.Build();
         // Map endpoints with null composer - should not throw
-        _app.MapComposerEndpoints(null!, config: null);
+        _app.MapComposerEndpoints(
+            null!,
+            new ComposerFacade(null, NullLogger<ComposerFacade>.Instance),
+            config: null);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
     }
@@ -1887,7 +1894,10 @@ public sealed class ComposerHubWithConfigFixture : IAsyncDisposable
         // serialized exactly as the real host does, rather than with framework defaults.
         Program.AddHiveJsonOptions(builder.Services);
         _app = builder.Build();
-        _app.MapComposerEndpoints(_composer, Config);
+        _app.MapComposerEndpoints(
+            _composer,
+            new ComposerFacade(_composer, NullLogger<ComposerFacade>.Instance),
+            Config);
         await _app.StartAsync(TestContext.Current.CancellationToken);
         _client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
     }

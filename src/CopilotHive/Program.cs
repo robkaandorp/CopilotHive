@@ -489,6 +489,14 @@ public sealed class Program
             });
             builder.Services.AddSingleton<IClarificationRouter>(sp => sp.GetRequiredService<Composer>());
 
+            // Composer runtime facade: ALWAYS registered so the Composer endpoints and the
+            // ComposerChat component resolve it unconditionally. The Composer itself may be
+            // absent — it is passed through as-is and the facade reports NotConfigured on every
+            // operation in that case (it never throws on a null Composer).
+            builder.Services.AddSingleton<IComposerFacade>(sp => new ComposerFacade(
+                sp.GetService<Composer>(),
+                sp.GetRequiredService<ILogger<ComposerFacade>>()));
+
             // Composer LLM connection coordinator: owns the startup connect (gating, deferral
             // until a GitHub Copilot token exists, wake-up on token commit, dedup, shutdown).
             // It invokes the Composer's own ConnectAsync — it never runs its own retry loop.
@@ -838,7 +846,10 @@ public sealed class Program
             }
 
             // Composer model-management REST API
-            app.MapComposerEndpoints(composer, app.Services.GetService<HiveConfigFile>());
+            app.MapComposerEndpoints(
+                composer,
+                app.Services.GetRequiredService<IComposerFacade>(),
+                app.Services.GetService<HiveConfigFile>());
 
             // Model configuration REST API
             app.MapConfigEndpoints(app.Services.GetRequiredService<IConfigFacade>());

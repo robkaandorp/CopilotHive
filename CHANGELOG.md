@@ -1,3 +1,11 @@
+## [0.35.0] — 2026-08-27
+
+### Changed
+
+- **Composer chat facade migration** — `ComposerChat.razor` now uses `IComposerFacade` and `IConfigFacade` instead of `HttpClient`, fixing OAuth-mode failures caused by `'<' is an invalid start of a value` deserialization errors on the Composer chat page.
+- **Composer facade** — Added `ComposerFacade` with an explicit null-Composer contract (`"Composer is not available."` / `NotConfigured`) across the five runtime operations: current model, models list, switch model, compact, and compact-partial.
+- **Wire-compatible composer endpoints** — Refactored `MapComposerEndpoints` through `IComposerFacade` while preserving the external REST contract, including null-Composer no-routes behavior and `BadRequest` mapping to HTTP 400 `{"error": ...}`.
+
 ## [0.34.0] — 2026-08-26
 
 ### Added

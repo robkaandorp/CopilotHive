@@ -18,29 +18,19 @@ namespace CopilotHive.Tests;
 /// </summary>
 public sealed class ComposerChatReasoningTests
 {
-    // ── BuildSwitchUri: both params, canonical wire form ─────────────────────
-
-    [Fact]
-    public void BuildSwitchUri_SendsBothModelAndReasoning()
-    {
-        var uri = ComposerChat.BuildSwitchUri("claude-opus", ReasoningEffort.Medium);
-
-        Assert.Contains("model=claude-opus", uri, StringComparison.Ordinal);
-        Assert.Contains("reasoning=medium", uri, StringComparison.Ordinal);
-        Assert.StartsWith("/api/composer/models/switch?", uri, StringComparison.Ordinal);
-    }
+    // ── Switch reasoning wire value: canonical form ─────────────────────────
 
     /// <summary>
-    /// The multi-word level must travel as <c>extra_high</c>, never as the C# name
-    /// <c>ExtraHigh</c> — the server parses the canonical wire form only.
+    /// The facade parses the CANONICAL wire form, so the page must hand it that form — the
+    /// multi-word level travels as <c>extra_high</c>, never as the C# name <c>ExtraHigh</c>.
     /// </summary>
     [Fact]
-    public void BuildSwitchUri_ExtraHigh_UsesSnakeCaseWireForm()
+    public void SwitchReasoningWireValue_ExtraHigh_UsesSnakeCaseWireForm()
     {
-        var uri = ComposerChat.BuildSwitchUri("gpt-5", ReasoningEffort.ExtraHigh);
+        var value = ComposerChat.SwitchReasoningWireValue(ReasoningEffort.ExtraHigh);
 
-        Assert.Contains("reasoning=extra_high", uri, StringComparison.Ordinal);
-        Assert.DoesNotContain("ExtraHigh", uri, StringComparison.Ordinal);
+        Assert.Equal("extra_high", value);
+        Assert.DoesNotContain("ExtraHigh", value, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -49,21 +39,27 @@ public sealed class ComposerChatReasoningTests
     [InlineData(ReasoningEffort.Medium, "medium")]
     [InlineData(ReasoningEffort.High, "high")]
     [InlineData(ReasoningEffort.ExtraHigh, "extra_high")]
-    public void BuildSwitchUri_EveryLevel_MatchesConverterFormat(ReasoningEffort effort, string expected)
+    public void SwitchReasoningWireValue_EveryLevel_MatchesConverterFormat(ReasoningEffort effort, string expected)
     {
-        var uri = ComposerChat.BuildSwitchUri("m", effort);
-
-        Assert.Contains($"reasoning={expected}", uri, StringComparison.Ordinal);
+        Assert.Equal(expected, ComposerChat.SwitchReasoningWireValue(effort));
         Assert.Equal(expected, ReasoningEffortConverter.Format(effort));
     }
 
-    [Fact]
-    public void BuildSwitchUri_ModelWithSlash_IsUrlEncoded()
+    /// <summary>
+    /// The value the page produces must round-trip through the converter the facade parses with,
+    /// so a switch is never rejected for an unparsable reasoning effort.
+    /// </summary>
+    [Theory]
+    [InlineData(ReasoningEffort.None)]
+    [InlineData(ReasoningEffort.Low)]
+    [InlineData(ReasoningEffort.Medium)]
+    [InlineData(ReasoningEffort.High)]
+    [InlineData(ReasoningEffort.ExtraHigh)]
+    public void SwitchReasoningWireValue_RoundTripsThroughTheParserTheFacadeUses(ReasoningEffort effort)
     {
-        var uri = ComposerChat.BuildSwitchUri("copilot/claude-sonnet-4.6", ReasoningEffort.High);
+        var value = ComposerChat.SwitchReasoningWireValue(effort);
 
-        Assert.Contains("model=copilot%2Fclaude-sonnet-4.6", uri, StringComparison.Ordinal);
-        Assert.Contains("reasoning=high", uri, StringComparison.Ordinal);
+        Assert.Equal(effort, ReasoningEffortConverter.Parse(value));
     }
 
     // ── InitialReasoning: null → None ────────────────────────────────────────
