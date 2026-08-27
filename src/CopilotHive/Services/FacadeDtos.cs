@@ -474,7 +474,7 @@ public sealed record GoalDto(
 
 /// <summary>
 /// Response DTO for an issue linked to a goal (via <c>SourceGoalId</c> or <c>LinkedGoalId</c>).
-/// Mirrors the FULL <c>IssueResponse</c> shape the <c>GET /api/issues</c> route produces —
+/// Mirrors the FULL issue shape the <c>GET /api/issues</c> route produces —
 /// field for field, in the same order — so a component consuming the facade sees exactly what
 /// the HTTP route returns.
 /// </summary>
@@ -529,6 +529,27 @@ public sealed record LinkedIssueDto(
         issue.ResolvedAt,
         issue.LinkedGoalId);
 }
+
+/// <summary>
+/// Filter criteria for listing issues via <see cref="IIssueFacade.GetIssuesAsync"/>. The status,
+/// type and severity values are RAW strings — the facade reproduces the endpoint's parsing and
+/// its exact error messages. The snake_case query parameter names (<c>source_goal_id</c>,
+/// <c>linked_goal_id</c>) are the ENDPOINT's concern and stay unchanged; the facade receives the
+/// already-bound values.
+/// </summary>
+/// <param name="Status">Raw status filter value, or <c>null</c> for no filter.</param>
+/// <param name="Type">Raw type filter value, or <c>null</c> for no filter.</param>
+/// <param name="Severity">Raw severity filter value, or <c>null</c> for no filter.</param>
+/// <param name="Repository">Repository name filter (case-insensitive), or <c>null</c> for no filter.</param>
+/// <param name="SourceGoalId">Source goal ID filter, or <c>null</c> for no filter.</param>
+/// <param name="LinkedGoalId">Linked goal ID filter, or <c>null</c> for no filter.</param>
+public sealed record IssueFilter(
+    string? Status = null,
+    string? Type = null,
+    string? Severity = null,
+    string? Repository = null,
+    string? SourceGoalId = null,
+    string? LinkedGoalId = null);
 
 /// <summary>
 /// Response DTO for <c>POST /api/goals/{goalId}/review</c>. Mirrors

@@ -1,5 +1,3 @@
-using System.Text.RegularExpressions;
-
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
@@ -467,188 +465,72 @@ public static class ApiEndpoints
         var issuesApi = app.MapGroup("/api/issues");
 
         issuesApi.MapGet("/", async (string? status, string? type, string? severity, string? repository,
-            string? source_goal_id, string? linked_goal_id, IIssueStore issueStore, CancellationToken ct) =>
+            string? source_goal_id, string? linked_goal_id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            // Query params use explicit snake_case parsing: reject numeric strings and
-            // comma-combined values that Enum.TryParse may otherwise accept via bitwise OR.
-            // Enum.TryParse does not strip underscores, so snake_case inputs ("in_progress")
-            // are normalized before the standard parse.
-            IssueStatus? statusFilter = null;
-            if (!string.IsNullOrEmpty(status))
-            {
-                var normalizedStatus = status.Replace("_", "", StringComparison.Ordinal);
-                if (int.TryParse(status, out _) || status.Contains(',')
-                    || !Enum.TryParse<IssueStatus>(normalizedStatus, ignoreCase: true, out var parsedStatus)
-                    || !Enum.IsDefined(parsedStatus))
-                {
-                    return Results.BadRequest(new { error = $"Invalid status '{status}'. Valid values: open, triaged, acknowledged, in_progress, resolved, closed." });
-                }
-                statusFilter = parsedStatus;
-            }
-
-            IssueType? typeFilter = null;
-            if (!string.IsNullOrEmpty(type))
-            {
-                // Explicit alias: "codequality" maps to IssueType.CodeQuality.
-                IssueType parsedType;
-                if (string.Equals(type, "codequality", StringComparison.OrdinalIgnoreCase))
-                {
-                    parsedType = IssueType.CodeQuality;
-                }
-                else
-                {
-                    var normalizedType = type.Replace("_", "", StringComparison.Ordinal);
-                    if (int.TryParse(type, out _) || type.Contains(',')
-                        || !Enum.TryParse<IssueType>(normalizedType, ignoreCase: true, out parsedType)
-                        || !Enum.IsDefined(parsedType))
-                    {
-                        return Results.BadRequest(new { error = $"Invalid type '{type}'. Valid values: code_quality, bug, suggestion, concern, workflow." });
-                    }
-                }
-                typeFilter = parsedType;
-            }
-
-            IssueSeverity? severityFilter = null;
-            if (!string.IsNullOrEmpty(severity))
-            {
-                var normalizedSeverity = severity.Replace("_", "", StringComparison.Ordinal);
-                if (int.TryParse(severity, out _) || severity.Contains(',')
-                    || !Enum.TryParse<IssueSeverity>(normalizedSeverity, ignoreCase: true, out var parsedSeverity)
-                    || !Enum.IsDefined(parsedSeverity))
-                {
-                    return Results.BadRequest(new { error = $"Invalid severity '{severity}'. Valid values: low, medium, high." });
-                }
-                severityFilter = parsedSeverity;
-            }
-
-            var issues = await issueStore.GetIssuesAsync(
-                statusFilter, typeFilter, severityFilter, repository, source_goal_id, linked_goal_id, ct);
-            return Results.Ok(issues.Select(ToResponse).ToList());
+            var result = await facade.GetIssuesAsync(new IssueFilter(
+                Status: status,
+                Type: type,
+                Severity: severity,
+                Repository: repository,
+                SourceGoalId: source_goal_id,
+                LinkedGoalId: linked_goal_id), ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapGet("/{id}", async (string id, IIssueStore issueStore, CancellationToken ct) =>
+        issuesApi.MapGet("/{id}", async (string id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var issue = await issueStore.GetIssueAsync(id, ct);
-            return issue is null
-                ? Results.NotFound(new { error = $"Issue '{id}' not found." })
-                : Results.Ok(ToResponse(issue));
+            var result = await facade.GetIssueAsync(id, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapPost("/", async (CreateIssueRequest request, IIssueStore issueStore, CancellationToken ct, [FromServices] IEventBus? eventBus = null) =>
+        issuesApi.MapPost("/", async (CreateIssueRequest request, [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            if (request.Type is null)
-                return Results.BadRequest(new { error = "Type is required." });
-
-            if (string.IsNullOrWhiteSpace(request.Title))
-                return Results.BadRequest(new { error = "Title is required." });
-
-            if (string.IsNullOrWhiteSpace(request.Description))
-                return Results.BadRequest(new { error = "Description is required." });
-
-            // ID resolution: null/empty/whitespace → generate; non-empty → validate kebab-case.
-            string id;
-            if (request.Id is null)
-            {
-                id = await IssueIdGenerator.GenerateAsync(request.Title, issueStore, ct);
-            }
-            else
-            {
-                var trimmed = request.Id.Trim();
-                if (string.IsNullOrWhiteSpace(trimmed))
-                {
-                    id = await IssueIdGenerator.GenerateAsync(request.Title, issueStore, ct);
-                }
-                else if (!IssueIdPattern.IsMatch(trimmed))
-                {
-                    return Results.BadRequest(new { error = $"Invalid issue ID '{request.Id}'. IDs must be lowercase kebab-case (letters, digits, hyphens)." });
-                }
-                else
-                {
-                    id = trimmed;
-                }
-            }
-
-            var issue = new Issue
-            {
-                Id = id,
-                Type = request.Type.Value,
-                Title = request.Title,
-                Description = request.Description,
-                Severity = request.Severity ?? IssueSeverity.Low,
-                RepositoryNames = request.RepositoryNames ?? [],
-                SourceGoalId = request.SourceGoalId,
-                SourceRole = request.SourceRole,
-                SourceIteration = request.SourceIteration,
-            };
-
-            try
-            {
-                var created = await issueStore.CreateIssueAsync(issue, ct);
-                eventBus?.Publish(new SystemEvent(
-                    Type: EventType.IssueRaised,
-                    Message: created.Title,
-                    IssueId: created.Id));
-                return Results.Created($"/api/issues/{Uri.EscapeDataString(created.Id)}", ToResponse(created));
-            }
-            catch (InvalidOperationException)
-            {
-                return Results.Conflict(new { error = $"Issue '{id}' already exists." });
-            }
+            var result = await facade.CreateIssueAsync(request, ct);
+            if (result.Success)
+                return Results.Created($"/api/issues/{Uri.EscapeDataString(result.Value!.Id)}", result.Value);
+            return MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, IIssueStore issueStore, CancellationToken ct, [FromServices] IEventBus? eventBus = null) =>
+        issuesApi.MapPatch("/{id}", async (string id, UpdateIssueRequest request, [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var existing = await issueStore.GetIssueAsync(id, ct);
-            if (existing is null)
-                return Results.NotFound(new { error = $"Issue '{id}' not found." });
-
-            // Capture original status before mutation so we can detect a transition to terminal.
-            var previousStatus = existing.Status;
-
-            // Title/Description, when provided, must be non-empty/whitespace.
-            if (request.Title is not null && string.IsNullOrWhiteSpace(request.Title))
-                return Results.BadRequest(new { error = "Title is required." });
-
-            if (request.Description is not null && string.IsNullOrWhiteSpace(request.Description))
-                return Results.BadRequest(new { error = "Description is required." });
-
-            if (request.Type is not null) existing.Type = request.Type.Value;
-            if (request.Title is not null) existing.Title = request.Title;
-            if (request.Description is not null) existing.Description = request.Description;
-            if (request.Severity is not null) existing.Severity = request.Severity.Value;
-            if (request.Status is not null) existing.Status = request.Status.Value;
-            if (request.RepositoryNames is not null) existing.RepositoryNames = request.RepositoryNames;
-
-            // LinkedGoalId tri-state: null = no change, "" = clear, non-empty = set.
-            if (request.LinkedGoalId is not null)
-                existing.LinkedGoalId = request.LinkedGoalId.Length == 0 ? null : request.LinkedGoalId;
-
-            await issueStore.UpdateIssueAsync(existing, ct);
-
-            // Publish IssueResolved only on transition from non-terminal to terminal.
-            if (request.Status is not null
-                && request.Status.Value is IssueStatus.Resolved or IssueStatus.Closed
-                && previousStatus is not IssueStatus.Resolved and not IssueStatus.Closed)
-            {
-                eventBus?.Publish(new SystemEvent(
-                    Type: EventType.IssueResolved,
-                    Message: $"Issue '{id}' marked as {request.Status.Value}",
-                    IssueId: id,
-                    GoalId: existing.LinkedGoalId));
-            }
-
-            // Re-fetch for accurate timestamps (UpdatedAt / ResolvedAt are store-managed).
-            var updated = await issueStore.GetIssueAsync(id, ct);
-            return Results.Ok(ToResponse(updated!));
+            var result = await facade.UpdateIssueAsync(id, request, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapIssueFacadeError(result.Kind, result.Error);
         });
 
-        issuesApi.MapDelete("/{id}", async (string id, IIssueStore issueStore, CancellationToken ct) =>
+        issuesApi.MapDelete("/{id}", async (string id, [FromServices] IIssueFacade facade, CancellationToken ct) =>
         {
-            var deleted = await issueStore.DeleteIssueAsync(id, ct);
-            return deleted
+            var result = await facade.DeleteIssueAsync(id, ct);
+            return result.Success
                 ? Results.NoContent()
-                : Results.NotFound(new { error = $"Issue '{id}' not found." });
+                : MapIssueFacadeError(result.Kind, result.Error);
         });
+    }
+
+    /// <summary>
+    /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IIssueFacade"/> to the exact HTTP
+    /// response the pre-facade issue handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
+    /// is a programming error (a success result must not be mapped here) and throws, as does any
+    /// kind these five routes never produce.
+    /// </summary>
+    /// <param name="kind">The failure category reported by the facade.</param>
+    /// <param name="error">The human-readable error message.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapIssueFacadeError(FacadeErrorKind kind, string? error)
+    {
+        return kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            _ => throw new InvalidOperationException($"Unexpected issue facade error kind: {kind}."),
+        };
     }
 
     /// <summary>
@@ -842,32 +724,7 @@ public static class ApiEndpoints
         }
     }
 
-    /// <summary>Validates caller-supplied issue IDs: ASCII lowercase letters, digits, hyphens only.</summary>
-    private static readonly Regex IssueIdPattern = new(
-        "^[a-z0-9]+(-[a-z0-9]+)*$",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    /// <summary>
-    /// Maps an <see cref="Issue"/> entity to its wire representation <see cref="IssueResponse"/>.
-    /// </summary>
-    /// <param name="issue">The issue entity to convert.</param>
-    /// <returns>The DTO returned by the API.</returns>
-    private static IssueResponse ToResponse(Issue issue) => new(
-        issue.Id,
-        issue.Type,
-        issue.Title,
-        issue.Description,
-        issue.Severity,
-        issue.Status,
-        issue.RepositoryNames,
-        issue.SourceGoalId,
-        issue.SourceRole,
-        issue.SourceIteration,
-        issue.CreatedAt,
-        issue.UpdatedAt,
-        issue.ResolvedAt,
-        issue.LinkedGoalId);
-}
+    }
 
 /// <summary>Request body for updating the status of a goal via the HTTP API.</summary>
 /// <param name="Status">New status string (e.g. "completed", "failed").</param>
@@ -913,26 +770,6 @@ public record SubmitClarificationRequest(string Answer);
 /// <summary>Request body for restoring a backup archive via the HTTP API.</summary>
 /// <param name="FileName">The backup archive file name to restore.</param>
 public record RestoreRequest(string FileName);
-
-/// <summary>Wire representation of an issue returned by the issues REST API.</summary>
-/// <param name="Id">Unique kebab-case identifier for the issue.</param>
-/// <param name="Type">Category of the issue.</param>
-/// <param name="Title">Short summary of the issue.</param>
-/// <param name="Description">Detailed markdown description of the issue.</param>
-/// <param name="Severity">Severity of the issue.</param>
-/// <param name="Status">Current lifecycle status of the issue.</param>
-/// <param name="RepositoryNames">Names of repositories this issue applies to.</param>
-/// <param name="SourceGoalId">ID of the goal that produced this issue, or <c>null</c> if user-reported.</param>
-/// <param name="SourceRole">Role that produced this issue, or <c>null</c> if user-reported.</param>
-/// <param name="SourceIteration">Iteration number in which the issue was produced, or <c>null</c>.</param>
-/// <param name="CreatedAt">UTC timestamp when the issue was created.</param>
-/// <param name="UpdatedAt">UTC timestamp of the last update, or <c>null</c> if never updated.</param>
-/// <param name="ResolvedAt">UTC timestamp when the issue was resolved or closed, or <c>null</c>.</param>
-/// <param name="LinkedGoalId">ID of a goal linked to this issue, or <c>null</c> if none.</param>
-public record IssueResponse(string Id, IssueType Type, string Title, string Description,
-    IssueSeverity Severity, IssueStatus Status, List<string> RepositoryNames,
-    string? SourceGoalId, string? SourceRole, int? SourceIteration,
-    DateTime CreatedAt, DateTime? UpdatedAt, DateTime? ResolvedAt, string? LinkedGoalId);
 
 /// <summary>Request body for creating a new issue via the HTTP API.</summary>
 /// <param name="Id">Optional caller-supplied kebab-case ID. When null/empty/whitespace, an ID is generated from the title.</param>

@@ -661,6 +661,15 @@ public sealed class Program
                 sp.GetService<GoalDispatcher>(),
                 sp.GetRequiredService<ILogger<GoalFacade>>()));
 
+            // Issue facade: ALWAYS registered so the issue endpoints and the Issues component
+            // resolve it unconditionally. The event bus is resolved with GetService exactly where
+            // the endpoints resolved it optionally ([FromServices] nullable parameter): in open
+            // mode (no composer) it is null and event publication is skipped silently.
+            builder.Services.AddSingleton<IIssueFacade>(sp => new IssueFacade(
+                sp.GetRequiredService<IIssueStore>(),
+                sp.GetService<IEventBus>(),
+                sp.GetRequiredService<ILogger<IssueFacade>>()));
+
             builder.Services.AddSingleton(sp =>
             {
                 var manager = new GoalManager();

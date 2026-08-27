@@ -1,9 +1,10 @@
 @page "/issues"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@using CopilotHive.Services
 @using Markdig
 @using System.Text.Json
-@inject HttpClient HttpClient
+@inject IIssueFacade IssueFacade
 @inject NavigationManager Nav
 @inject PageHeaderState PageHeader
 
@@ -242,14 +243,7 @@ else if (_loaded)
 }
 
 @code {
-    private record IssueResponse(
-        string Id, IssueType Type, string Title, string Description,
-        IssueSeverity Severity, IssueStatus Status, List<string> RepositoryNames,
-        string? SourceGoalId, string? SourceRole, int? SourceIteration,
-        DateTime CreatedAt, DateTime? UpdatedAt, DateTime? ResolvedAt,
-        string? LinkedGoalId);
-
-    private List<IssueResponse> _issues = [];
+    private List<LinkedIssueDto> _issues = [];
     private string _typeFilter = "";
     private string _severityFilter = "";
     private string _statusFilter = "";
@@ -279,19 +273,14 @@ else if (_loaded)
     private async Task LoadIssues()
     {
         var generation = Interlocked.Increment(ref _loadGeneration);
-        var query = new Dictionary<string, string>();
-        if (!string.IsNullOrEmpty(_typeFilter)) query["type"] = _typeFilter;
-        if (!string.IsNullOrEmpty(_severityFilter)) query["severity"] = _severityFilter;
-        if (!string.IsNullOrEmpty(_statusFilter)) query["status"] = _statusFilter;
-        if (!string.IsNullOrEmpty(_repoFilter)) query["repository"] = _repoFilter;
-
-        var queryString = string.Join("&", query.Select(kv => $"{kv.Key}={Uri.EscapeDataString(kv.Value)}"));
-        var url = $"/api/issues{(string.IsNullOrEmpty(queryString) ? "" : "?" + queryString)}";
-
-        var response = await HttpClient.GetAsync(url);
-        if (response.IsSuccessStatusCode)
+        var result = await IssueFacade.GetIssuesAsync(new IssueFilter(
+            Status: string.IsNullOrEmpty(_statusFilter) ? null : _statusFilter,
+            Type: string.IsNullOrEmpty(_typeFilter) ? null : _typeFilter,
+            Severity: string.IsNullOrEmpty(_severityFilter) ? null : _severityFilter,
+            Repository: string.IsNullOrEmpty(_repoFilter) ? null : _repoFilter), CancellationToken.None);
+        if (result.Success)
         {
-            var issues = await response.Content.ReadFromJsonAsync<List<IssueResponse>>(ReasoningEffortOptions.JsonOptions) ?? [];
+            var issues = result.Value!.ToList();
             if (generation != _loadGeneration)
                 return; // stale — discard
             if (string.IsNullOrEmpty(_statusFilter))
@@ -311,7 +300,7 @@ else if (_loaded)
         }
     }
 
-    private void ToggleDetail(string id, IssueResponse issue)
+    private void ToggleDetail(string id, LinkedIssueDto issue)
     {
         _expandedIssueId = _expandedIssueId == id ? null : id;
         if (_expandedIssueId is not null)
@@ -322,30 +311,29 @@ else if (_loaded)
         }
     }
 
-    private async Task UpdateStatus(IssueResponse issue)
+    private async Task UpdateStatus(LinkedIssueDto issue)
         => await UpdateField(issue, "status", _editStatus);
 
-    private async Task UpdateSeverity(IssueResponse issue)
+    private async Task UpdateSeverity(LinkedIssueDto issue)
         => await UpdateField(issue, "severity", _editSeverity);
 
-    private async Task UpdateType(IssueResponse issue)
+    private async Task UpdateType(LinkedIssueDto issue)
         => await UpdateField(issue, "type", _editType);
 
-    private async Task UpdateField(IssueResponse issue, string field, string newValue)
+    private async Task UpdateField(LinkedIssueDto issue, string field, string newValue)
     {
         _errors.Remove(issue.Id);
 
-        object payload;
+        UpdateIssueRequest request;
         try
         {
-            if (field == "status")
-                payload = new { status = ParseSnakeCase<IssueStatus>(newValue) };
-            else if (field == "severity")
-                payload = new { severity = ParseSnakeCase<IssueSeverity>(newValue) };
-            else if (field == "type")
-                payload = new { type = ParseSnakeCase<IssueType>(newValue) };
-            else
-                throw new InvalidOperationException($"Unknown field: {field}");
+            request = field switch
+            {
+                "status" => new UpdateIssueRequest(Status: ParseSnakeCase<IssueStatus>(newValue)),
+                "severity" => new UpdateIssueRequest(Severity: ParseSnakeCase<IssueSeverity>(newValue)),
+                "type" => new UpdateIssueRequest(Type: ParseSnakeCase<IssueType>(newValue)),
+                _ => throw new InvalidOperationException($"Unknown field: {field}"),
+            };
         }
         catch (ArgumentException)
         {
@@ -353,10 +341,8 @@ else if (_loaded)
             return;
         }
 
-        var body = JsonSerializer.Serialize(payload, ReasoningEffortOptions.JsonOptions);
-        var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-        var response = await HttpClient.PatchAsync($"/api/issues/{Uri.EscapeDataString(issue.Id)}", content);
-        if (response.IsSuccessStatusCode)
+        var result = await IssueFacade.UpdateIssueAsync(issue.Id, request, CancellationToken.None);
+        if (result.Success)
         {
             // Re-query with the active filters so the list only shows issues
             // that still match (e.g. triaging an open issue to resolved while
@@ -376,8 +362,7 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
+            _errors[issue.Id] = result.Error ?? "";
 
             if (_expandedIssueId == issue.Id)
             {
@@ -392,11 +377,11 @@ else if (_loaded)
         }
     }
 
-    private async Task DeleteIssue(IssueResponse issue)
+    private async Task DeleteIssue(LinkedIssueDto issue)
     {
         _errors.Remove(issue.Id);
-        var response = await HttpClient.DeleteAsync($"/api/issues/{Uri.EscapeDataString(issue.Id)}");
-        if (response.IsSuccessStatusCode)
+        var result = await IssueFacade.DeleteIssueAsync(issue.Id, CancellationToken.None);
+        if (result.Success)
         {
             _issues.RemoveAll(i => i.Id == issue.Id);
             if (_expandedIssueId == issue.Id)
@@ -404,8 +389,7 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _errors[issue.Id] = $"Error {(int)response.StatusCode}: {errorContent}";
+            _errors[issue.Id] = result.Error ?? "";
         }
     }
 
@@ -423,20 +407,16 @@ else if (_loaded)
             return;
         }
 
-        var requestBody = JsonSerializer.Serialize(new
-        {
-            type = _createType,
-            title = _createTitle.Trim(),
-            description = _createDescription,
-            severity = _createSeverity,
-            repositoryNames = _createRepos
+        var result = await IssueFacade.CreateIssueAsync(new CreateIssueRequest(
+            Id: null,
+            Type: _createType,
+            Title: _createTitle.Trim(),
+            Description: _createDescription,
+            Severity: _createSeverity,
+            RepositoryNames: _createRepos
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .ToList()
-        }, ReasoningEffortOptions.JsonOptions);
-
-        var content = new StringContent(requestBody, System.Text.Encoding.UTF8, "application/json");
-        var response = await HttpClient.PostAsync("/api/issues", content);
-        if (response.IsSuccessStatusCode)
+                .ToList()), CancellationToken.None);
+        if (result.Success)
         {
             // Re-query with the active filters so the created issue only appears
             // if it matches the current filter state (e.g. creating a low/suggestion
@@ -451,12 +431,11 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _createError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _createError = result.Error ?? "";
         }
     }
 
-    private static string FormatSource(IssueResponse issue)
+    private static string FormatSource(LinkedIssueDto issue)
     {
         if (issue.SourceGoalId is null) return "—";
         var parts = new List<string> { issue.SourceGoalId };
