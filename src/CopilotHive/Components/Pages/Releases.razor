@@ -4,7 +4,7 @@
 @using CopilotHive.Services
 @inject IGoalStore GoalStore
 @inject NavigationManager Nav
-@inject HttpClient HttpClient
+@inject IReleaseFacade ReleaseFacade
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 @inject PageHeaderState PageHeader
 
@@ -278,21 +278,13 @@ else if (_loaded)
             return;
         }
 
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { version = _createVersion, repository = _createRepo }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-
-        var response = await HttpClient.PostAsync("/api/releases/", body);
-        if (response.IsSuccessStatusCode)
+        var result = await ReleaseFacade.CreateReleaseAsync(new CreateReleaseRequest(_createVersion, _createRepo));
+        if (result.Success && result.Value is not null)
         {
-            var created = await response.Content.ReadFromJsonAsync<Release>(ReasoningEffortOptions.JsonOptions);
-            if (created is not null)
-            {
-                _allReleases.Insert(0, created);
-                _goalsByRelease[created.Id] = [];
-                _goalCountsByRelease[created.Id] = (0, 0, 0);
-            }
+            var created = ToDomainRelease(result.Value);
+            _allReleases.Insert(0, created);
+            _goalsByRelease[created.Id] = [];
+            _goalCountsByRelease[created.Id] = (0, 0, 0);
             _createVersion = "";
             _createRepo = "";
             _showCreateForm = false;
@@ -300,8 +292,23 @@ else if (_loaded)
         }
         else
         {
-            var error = await response.Content.ReadAsStringAsync();
-            _createError = $"Error {(int)response.StatusCode}: {error}";
+            _createError = result.Error ?? "";
         }
     }
+
+    /// <summary>
+    /// Maps a <see cref="ReleaseDto"/> back to the domain <see cref="Release"/> the page's
+    /// in-memory list and <see cref="ReleaseVisibilityService.PartitionGroup"/> consume.
+    /// </summary>
+    private static Release ToDomainRelease(ReleaseDto dto) => new()
+    {
+        Id = dto.Id,
+        Tag = dto.Tag,
+        Status = dto.Status,
+        Notes = dto.Notes,
+        CreatedAt = dto.CreatedAt,
+        ReleasedAt = dto.ReleasedAt,
+        RepositoryNames = dto.RepositoryNames.ToList(),
+        ExecutionState = dto.ExecutionState,
+    };
 }

@@ -5,13 +5,10 @@
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject NavigationManager Nav
-@inject HttpClient HttpClient
+@inject IReleaseFacade ReleaseFacade
 @inject CopilotHive.Configuration.HiveConfigFile? HiveConfig
 @inject PageHeaderState PageHeader
 @using CopilotHive.Services
-@using System.Text.Json
-@using System.Text
-@using System.Net
 
 @if (_release is not null)
 {
@@ -299,7 +296,7 @@ else if (_loaded)
 @code {
     [Parameter] public string ReleaseId { get; set; } = "";
 
-    private Release? _release;
+    private ReleaseDto? _release;
     private List<Goal> _goals = [];
     private bool _loaded;
     private string _editNotes = "";
@@ -310,7 +307,7 @@ else if (_loaded)
     private bool _isValid;
     private bool _isValidating;
     private List<string> _validationErrors = [];
-    private ReleaseExecutionResult? _releaseResult;
+    private ReleaseExecutionResultDto? _releaseResult;
     private string? _releaseError;
     private bool _isReleasing;
     private bool _executionFailed; // set only for 500 execution failures
@@ -332,9 +329,10 @@ else if (_loaded)
     protected override async Task OnInitializedAsync()
     {
         var decoded = Uri.UnescapeDataString(ReleaseId);
-        _release = await GoalStore.GetReleaseAsync(decoded);
-        if (_release is not null)
+        var release = await GoalStore.GetReleaseAsync(decoded);
+        if (release is not null)
         {
+            _release = ReleaseDto.From(release);
             PageHeader.SetTitle($"📦 {_release.Tag}");
             PageHeader.SetBack("/releases");
             _editNotes = _release.Notes ?? "";
@@ -358,17 +356,11 @@ else if (_loaded)
         _releaseError = null;
         try
         {
-            var id = Uri.EscapeDataString(_release!.Id);
-            var response = await HttpClient.GetAsync($"/api/releases/{id}/validate");
-            if (response.IsSuccessStatusCode)
+            var result = await ReleaseFacade.ValidateReleaseAsync(_release!.Id, CancellationToken.None);
+            if (result.Success && result.Value is not null)
             {
-                var json = await response.Content.ReadAsStringAsync();
-                using var doc = JsonDocument.Parse(json);
-                _isValid = doc.RootElement.GetProperty("valid").GetBoolean();
-                _validationErrors = doc.RootElement.GetProperty("errors")
-                    .EnumerateArray()
-                    .Select(e => e.GetString() ?? "")
-                    .ToList();
+                _isValid = result.Value.Valid;
+                _validationErrors = result.Value.Errors.ToList();
             }
             else
             {
@@ -396,36 +388,47 @@ else if (_loaded)
         _validationErrors = [];
         try
         {
-            var id = Uri.EscapeDataString(_release!.Id);
-            var body = new StringContent(JsonSerializer.Serialize(new { status = "Released" }), Encoding.UTF8, "application/json");
-            var response = await HttpClient.PatchAsync($"/api/releases/{id}/status", body);
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (response.IsSuccessStatusCode)
+            var outcome = await ReleaseFacade.UpdateReleaseStatusAsync(
+                _release!.Id, new UpdateReleaseStatusRequest("Released"), CancellationToken.None);
+            switch (outcome)
             {
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("release", out var releaseEl))
-                    _release = JsonSerializer.Deserialize<Release>(releaseEl.GetRawText(), ReasoningEffortOptions.JsonOptions);
-                if (doc.RootElement.TryGetProperty("result", out var resultEl))
-                    _releaseResult = JsonSerializer.Deserialize<ReleaseExecutionResult>(resultEl.GetRawText(), ReasoningEffortOptions.JsonOptions);
-            }
-            else if (response.StatusCode == HttpStatusCode.BadRequest)
-            {
-                using var doc = JsonDocument.Parse(json);
-                _validationErrors = doc.RootElement.GetProperty("errors").EnumerateArray().Select(e => e.GetString() ?? "").ToList();
-                _isValid = false;
-            }
-            else if (response.StatusCode == HttpStatusCode.Conflict)
-            {
-                using var doc = JsonDocument.Parse(json);
-                _releaseError = doc.RootElement.GetProperty("error").GetString();
-            }
-            else
-            {
-                // 500/503 ProblemDetails
-                using var doc = JsonDocument.Parse(json);
-                _releaseError = doc.RootElement.TryGetProperty("detail", out var d) ? d.GetString() : "Release failed.";
-                _executionFailed = response.StatusCode == HttpStatusCode.InternalServerError;
+                case PlanningNoOpOutcome noOp:
+                    _release = noOp.Release;
+                    break;
+                case ExecutionSuccessOutcome success:
+                    _release = success.Release;
+                    _releaseResult = success.Result;
+                    break;
+                case StatusFailureOutcome failure:
+                    switch (failure.Kind)
+                    {
+                        case FacadeErrorKind.NotFound:
+                        case FacadeErrorKind.BadRequest when failure.Errors.Length == 0:
+                        case FacadeErrorKind.Conflict:
+                            _releaseError = failure.Error;
+                            break;
+                        case FacadeErrorKind.BadRequest:
+                            _validationErrors = failure.Errors.Select(e => e ?? "").ToList();
+                            _isValid = false;
+                            break;
+                        case FacadeErrorKind.Internal:
+                            _releaseResult = new ReleaseExecutionResultDto(
+                                Success: false,
+                                Results: failure.Results,
+                                Error: failure.Detail,
+                                Failure: ReleaseExecutionFailure.Execution);
+                            _releaseError = failure.Detail ?? "Release failed.";
+                            _executionFailed = true;
+                            break;
+                        case FacadeErrorKind.ServiceUnavailable:
+                            _releaseError = failure.Detail;
+                            break;
+                        default:
+                            throw new InvalidOperationException($"Unexpected release status failure kind: {failure.Kind}.");
+                    }
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unexpected release status outcome: {outcome.GetType().Name}.");
             }
         }
         catch (Exception ex) { _releaseError = ex.Message; }
@@ -452,16 +455,14 @@ else if (_loaded)
         _isDeleting = true;
         try
         {
-            var id = Uri.EscapeDataString(_release!.Id);
-            var response = await HttpClient.DeleteAsync($"/api/releases/{id}");
-            if (response.IsSuccessStatusCode)
+            var result = await ReleaseFacade.DeleteReleaseAsync(_release!.Id, CancellationToken.None);
+            if (result.Success)
             {
                 Nav.NavigateTo("/releases");
             }
             else
             {
-                var raw = await response.Content.ReadAsStringAsync();
-                _deleteError = ExtractErrorMessage(raw, response.StatusCode);
+                _deleteError = result.Error ?? "";
             }
         }
         catch (Exception ex)
@@ -474,51 +475,15 @@ else if (_loaded)
         }
     }
 
-    private static string ExtractErrorMessage(string raw, HttpStatusCode statusCode)
-    {
-        var generic = $"Failed to delete release (HTTP {(int)statusCode}).";
-        if (string.IsNullOrWhiteSpace(raw))
-            return generic;
-
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(raw);
-        }
-        catch (JsonException)
-        {
-            return raw;
-        }
-
-        using (doc)
-        {
-            if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                return generic;
-
-            if (!doc.RootElement.TryGetProperty("error", out var errEl))
-                return generic;
-
-            if (errEl.ValueKind != JsonValueKind.String)
-                return generic;
-
-            var msg = errEl.GetString();
-            return !string.IsNullOrWhiteSpace(msg) ? msg : generic;
-        }
-    }
-
     private async Task SaveNotes()
     {
         _notesError = null;
         _notesSaved = false;
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { notes = _editNotes }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var id = Uri.EscapeDataString(ReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{id}/notes", body);
-        if (response.IsSuccessStatusCode)
+        var result = await ReleaseFacade.UpdateReleaseNotesAsync(
+            ReleaseId, new UpdateReleaseNotesRequest(_editNotes));
+        if (result.Success && result.Value is not null)
         {
-            _release!.Notes = _editNotes;
+            _release = result.Value;
             _notesSaved = true;
             _isValid = false;
             _validationErrors = [];
@@ -526,8 +491,7 @@ else if (_loaded)
         }
         else
         {
-            var error = await response.Content.ReadAsStringAsync();
-            _notesError = $"Error {(int)response.StatusCode}: {error}";
+            _notesError = result.Error ?? "";
         }
     }
 
@@ -540,15 +504,11 @@ else if (_loaded)
             _tagError = "Tag cannot be empty.";
             return;
         }
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { tag = _editTag.Trim() }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var id = Uri.EscapeDataString(ReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{id}/tag", body);
-        if (response.IsSuccessStatusCode)
+        var result = await ReleaseFacade.UpdateReleaseTagAsync(
+            ReleaseId, new UpdateReleaseTagRequest(_editTag.Trim()));
+        if (result.Success && result.Value is not null)
         {
-            _release!.Tag = _editTag.Trim();
+            _release = result.Value;
             _tagSaved = true;
             _isValid = false;
             _validationErrors = [];
@@ -558,8 +518,7 @@ else if (_loaded)
         }
         else
         {
-            var error = await response.Content.ReadAsStringAsync();
-            _tagError = $"Error {(int)response.StatusCode}: {error}";
+            _tagError = result.Error ?? "";
         }
     }
 
@@ -586,16 +545,11 @@ else if (_loaded)
         _repositoriesError = null;
         _repositoriesSaved = false;
         var repos = _selectedRepos.ToList();
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { repositories = repos }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var id = Uri.EscapeDataString(ReleaseId);
-        var response = await HttpClient.PatchAsync($"/api/releases/{id}/repositories", body);
-        if (response.IsSuccessStatusCode)
+        var result = await ReleaseFacade.UpdateReleaseRepositoriesAsync(
+            ReleaseId, new UpdateReleaseRepositoriesRequest(repos));
+        if (result.Success && result.Value is not null)
         {
-            _release!.RepositoryNames.Clear();
-            _release.RepositoryNames.AddRange(repos);
+            _release = result.Value;
             _repositoriesSaved = true;
             _isValid = false;
             _validationErrors = [];
@@ -603,8 +557,7 @@ else if (_loaded)
         }
         else
         {
-            var error = await response.Content.ReadAsStringAsync();
-            _repositoriesError = $"Error {(int)response.StatusCode}: {error}";
+            _repositoriesError = result.Error ?? "";
         }
     }
 
