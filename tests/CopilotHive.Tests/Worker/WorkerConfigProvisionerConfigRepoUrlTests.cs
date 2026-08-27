@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Worker;
 
@@ -738,23 +740,25 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
     // ===========================================================================
 
     [Fact]
-    public void Changelog_HasVersionZeroThirtyFourHeadingAboveZeroThirtyThreeOne()
+    public void Changelog_TopHeading_Matches_DirectoryBuildProps_VersionPrefix()
     {
-        var text = File.ReadAllText(ChangelogPath());
-        var idx034 = text.IndexOf("## [0.34.0]", StringComparison.Ordinal);
-        var idx0331 = text.IndexOf("## [0.33.1]", StringComparison.Ordinal);
+        var propsText = File.ReadAllText(DirectoryBuildPropsPath());
+        var propsMatch = Regex.Match(propsText, @"<VersionPrefix>([^<]+)</VersionPrefix>");
+        Assert.True(propsMatch.Success,
+            $"{DirectoryBuildPropsPath()} must contain a non-empty <VersionPrefix> element.");
 
-        Assert.True(idx034 >= 0, "CHANGELOG.md must contain a '## [0.34.0]' heading.");
-        Assert.True(idx0331 >= 0, "CHANGELOG.md must contain a '## [0.33.1]' heading.");
-        Assert.True(idx034 < idx0331,
-            "The '## [0.34.0]' heading must appear ABOVE '## [0.33.1]'.");
-    }
+        var propsVersion = propsMatch.Groups[1].Value;
 
-    [Fact]
-    public void DirectoryBuildProps_HasVersionPrefixZeroThirtyFour()
-    {
-        var text = File.ReadAllText(DirectoryBuildPropsPath());
-        Assert.Contains("<VersionPrefix>0.34.0</VersionPrefix>", text);
+        var changelogText = File.ReadAllText(ChangelogPath());
+        var headingMatch = Regex.Match(changelogText, @"^## \[([^\]]+)\]", RegexOptions.Multiline);
+        Assert.True(headingMatch.Success,
+            $"{ChangelogPath()} must contain at least one '## [<version>]' heading.");
+
+        var headingVersion = headingMatch.Groups[1].Value;
+
+        Assert.True(
+            string.Equals(propsVersion, headingVersion, StringComparison.Ordinal),
+            $"Directory.Build.props <VersionPrefix> is '{propsVersion}' but the top CHANGELOG.md heading '## [...]' is '{headingVersion}'; they must match.");
     }
 
     /// <summary>
