@@ -229,7 +229,10 @@ public static class ApiEndpoints
     }
 
     /// <summary>
-    /// Registers the releases REST API endpoints under <c>/api/releases</c>.
+    /// Registers the releases REST API endpoints under <c>/api/releases</c>. All seven routes
+    /// (create, status, notes, tag, repositories, delete, validate) delegate to
+    /// <see cref="IReleaseFacade"/> so the validation order, the status orchestration side
+    /// effects and the failure mapping live in exactly one place and run exactly once.
     /// </summary>
     /// <param name="app">The web application to register routes on.</param>
     public static void MapReleaseEndpoints(this WebApplication app)
@@ -237,222 +240,134 @@ public static class ApiEndpoints
         // ── Releases REST API ────────────────────────────────────────────────────
         var releasesApi = app.MapGroup("/api/releases");
 
-        releasesApi.MapPost("/", async (CreateReleaseRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        releasesApi.MapPost("/", async (CreateReleaseRequest request, [FromServices] IReleaseFacade facade) =>
         {
-            if (string.IsNullOrWhiteSpace(request.Version))
-                return Results.BadRequest(new { error = "Version is required." });
-
-            var release = new Release
-            {
-                Id = request.Version,
-                Tag = request.Version,
-                RepositoryNames = string.IsNullOrEmpty(request.Repository) ? [] : [request.Repository],
-            };
-
-            try
-            {
-                var created = await store.CreateReleaseAsync(release);
-                var createdResult = Results.Created($"/api/releases/{created.Id}", created);
-                dashboardNotifier.NotifyStateChanged();
-                return createdResult;
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
+            var result = await facade.CreateReleaseAsync(request);
+            return result.Success
+                ? Results.Created($"/api/releases/{result.Value!.Id}", result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request, IGoalStore store, IServiceProvider services, HttpContext HttpContext, [FromServices] DashboardNotifier dashboardNotifier, [FromServices] IEventBus? eventBus = null) =>
+        releasesApi.MapPatch("/{id}/status", async (string id, UpdateReleaseStatusRequest request,
+            [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var existing = await store.GetReleaseAsync(id);
-            if (existing is null)
-                return Results.NotFound(new { error = $"Release '{id}' not found." });
-
-            if (string.IsNullOrEmpty(request.Status))
-                return Results.BadRequest(new { error = "Status is required." });
-
-            if (int.TryParse(request.Status, out _))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
-
-            if (!Enum.TryParse<ReleaseStatus>(request.Status, ignoreCase: true, out var newStatus) || !Enum.IsDefined(newStatus))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
-
-            // Reject comma-combined inputs (e.g. "Released,Planning") that Enum.TryParse may accept via bitwise OR.
-            if (request.Status.Contains(','))
-                return Results.BadRequest(new { error = $"Invalid status '{request.Status}'. Valid values: Planning, Released." });
-
-            if (existing.Status == ReleaseStatus.Released && newStatus == ReleaseStatus.Released)
-                return Results.Json(new { error = "Release is already in 'Released' status." }, statusCode: 409);
-
-            if (newStatus == ReleaseStatus.Planning && existing.Status == ReleaseStatus.Released)
-                return Results.Json(new { error = "Cannot revert a Released release back to Planning." }, statusCode: 409);
-
-            if (newStatus == ReleaseStatus.Planning && existing.Status == ReleaseStatus.Planning)
-                return Results.Ok(existing);
-
-            if (newStatus == ReleaseStatus.Released)
-            {
-                var execService = services.GetService<ReleaseExecutionService>();
-                if (execService is null)
-                    return Results.Json(new { detail = "Release execution service is not available." }, statusCode: 503);
-
-                var result = await execService.ExecuteReleaseAsync(existing, HttpContext.RequestAborted);
-                if (!result.Success)
-                {
-                    return result.Failure switch
-                    {
-                        ReleaseExecutionFailure.NotFound => Results.NotFound(new { error = result.Error }),
-                        ReleaseExecutionFailure.AlreadyReleased => Results.Json(new { error = result.Error }, statusCode: 409),
-                        ReleaseExecutionFailure.AlreadyExecuting => Results.Json(new { error = result.Error }, statusCode: 409),
-                        ReleaseExecutionFailure.Validation => Results.BadRequest(new { errors = new[] { result.Error ?? "Validation failed." } }),
-                        ReleaseExecutionFailure.Execution => Results.Json(new { detail = result.Error, results = result.Results }, statusCode: 500),
-                        _ => throw new InvalidOperationException($"Unhandled release execution failure: {result.Failure}"),
-                    };
-                }
-
-                // Re-read to avoid overwriting fields that changed during execution.
-                var updated = await store.GetReleaseAsync(id);
-                updated!.Status = ReleaseStatus.Released;
-                updated.ReleasedAt = DateTime.UtcNow;
-                await store.UpdateReleaseAsync(updated);
-
-                eventBus?.Publish(new SystemEvent(
-                    Type: EventType.ReleaseCompleted,
-                    Message: $"Release '{updated.Tag}' marked as Released",
-                    ReleaseId: updated.Id));
-
-                // NuGet publish monitoring: fire-and-forget monitors for every configured
-                // package of every PublishNuGet repository in this release. Both services are
-                // required; the application lifetime is optional (CancellationToken.None when
-                // absent so the monitor is not tied to a request). Failures are logged and
-                // must never fail the release.
-                LaunchNuGetMonitors(
-                    services.GetService<NuGetPublishMonitorService>(),
-                    services.GetService<HiveConfigFile>(),
-                    services.GetService<IHostApplicationLifetime>(),
-                    services.GetService<ILoggerFactory>()?.CreateLogger<NuGetPublishMonitorService>(),
-                    updated);
-
-                // Best-effort cleanup of transient progress/review knowledge documents for
-                // every goal in the release. Failures are logged and must never fail the release.
-                var docCleanup = services.GetService<KnowledgeDocumentCleanupService>();
-                if (docCleanup is not null)
-                {
-                    try
-                    {
-                        var goals = await store.GetGoalsByReleaseAsync(id);
-                        await docCleanup.CleanupGoalsDocumentsAsync(
-                            goals.Select(g => g.Id),
-                            $"Cleanup progress/review docs for release '{updated.Tag}'",
-                            HttpContext.RequestAborted);
-                    }
-                    catch (Exception ex)
-                    {
-                        services.GetRequiredService<ILogger<Program>>().LogWarning(
-                            ex, "Failed to clean up knowledge documents for release {Tag}", updated.Tag);
-                    }
-                }
-
-                dashboardNotifier.NotifyStateChanged();
-                return Results.Ok(new { release = updated, result = result });
-            }
-
-            existing.Status = newStatus;
-            await store.UpdateReleaseAsync(existing);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(existing);
+            var outcome = await facade.UpdateReleaseStatusAsync(id, request, ct);
+            return MapReleaseStatusOutcome(outcome);
         });
 
-        releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        releasesApi.MapPatch("/{id}/notes", async (string id, UpdateReleaseNotesRequest request,
+            [FromServices] IReleaseFacade facade) =>
         {
-            var existing = await store.GetReleaseAsync(id);
-            if (existing is null)
-                return Results.NotFound(new { error = $"Release '{id}' not found." });
-
-            existing.Notes = request.Notes;
-            await store.UpdateReleaseAsync(existing);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(existing);
+            var result = await facade.UpdateReleaseNotesAsync(id, request);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        releasesApi.MapPatch("/{id}/tag", async (string id, UpdateReleaseTagRequest request,
+            [FromServices] IReleaseFacade facade) =>
         {
-            if (string.IsNullOrWhiteSpace(request.Tag))
-                return Results.BadRequest(new { error = "Tag is required." });
-
-            try
-            {
-                await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Tag = request.Tag.Trim() });
-            }
-            catch (KeyNotFoundException)
-            {
-                return Results.NotFound(new { error = $"Release '{id}' not found." });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
-
-            var updated = await store.GetReleaseAsync(id);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(updated);
+            var result = await facade.UpdateReleaseTagAsync(id, request);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        releasesApi.MapPatch("/{id}/repositories", async (string id, UpdateReleaseRepositoriesRequest request,
+            [FromServices] IReleaseFacade facade) =>
         {
-            try
-            {
-                await store.UpdateReleaseAsync(id, new ReleaseUpdateData { Repositories = request.Repositories });
-            }
-            catch (KeyNotFoundException)
-            {
-                return Results.NotFound(new { error = $"Release '{id}' not found." });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
-
-            var updated = await store.GetReleaseAsync(id);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(updated);
+            var result = await facade.UpdateReleaseRepositoriesAsync(id, request);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier, CancellationToken ct) =>
+        releasesApi.MapDelete("/{id}", async (string id, [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var release = await store.GetReleaseAsync(id, ct);
-            if (release is null)
-                return Results.NotFound(new { error = $"Release '{id}' not found." });
-
-            if (release.Status != ReleaseStatus.Planning)
-                return Results.BadRequest(new { error = "Only Planning releases can be deleted." });
-
-            if (release.ExecutionState == ReleaseExecutionState.Executing)
-                return Results.Conflict(new { error = "Release is currently executing — cannot delete." });
-
-            var goals = await store.GetGoalsByReleaseAsync(id, ct);
-            if (goals.Count > 0)
-                return Results.BadRequest(new { error = $"Release has {goals.Count} goal(s) attached — remove or reassign them before deleting." });
-
-            // The store re-validates every precondition atomically. A false result here means a
-            // concurrent state change slipped between the pre-checks above and the delete.
-            var deleted = await store.DeleteReleaseAsync(id, ct);
-            if (!deleted)
-                return Results.Conflict(new { error = "Release could not be deleted due to a concurrent state change. Refresh and try again." });
-
-            dashboardNotifier.NotifyStateChanged();
-            return Results.NoContent();
+            var result = await facade.DeleteReleaseAsync(id, ct);
+            return result.Success
+                ? Results.NoContent()
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
 
-        releasesApi.MapGet("/{id}/validate", async (string id, IGoalStore store, IServiceProvider sp, CancellationToken ct) =>
+        releasesApi.MapGet("/{id}/validate", async (string id, [FromServices] IReleaseFacade facade, CancellationToken ct) =>
         {
-            var release = await store.GetReleaseAsync(id, ct);
-            if (release is null) return Results.NotFound(new { error = $"Release '{id}' not found." });
-            var execService = sp.GetService<ReleaseExecutionService>();
-            if (execService is null) return Results.Ok(new { valid = true, errors = Array.Empty<string>() });
-            var validation = await execService.ValidateReleaseAsync(release, ct);
-            return Results.Ok(new { valid = validation.IsValid, errors = validation.Errors });
+            var result = await facade.ValidateReleaseAsync(id, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapReleaseFacadeError(result.Kind, result.Error);
         });
+    }
+
+    /// <summary>
+    /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IReleaseFacade"/>'s simple operations
+    /// (create, notes, tag, repositories, delete, validate) to the exact HTTP response the
+    /// pre-facade release handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
+    /// is a programming error (a success result must not be mapped here) and throws, as does any
+    /// kind these six routes never produce.
+    /// </summary>
+    /// <param name="kind">The failure category reported by the facade.</param>
+    /// <param name="error">The human-readable error message.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapReleaseFacadeError(FacadeErrorKind kind, string? error)
+    {
+        return kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            _ => throw new InvalidOperationException($"Unexpected release facade error kind: {kind}."),
+        };
+    }
+
+    /// <summary>
+    /// Maps a <see cref="ReleaseStatusOutcome"/> to the exact HTTP response the pre-facade status
+    /// handler produced: <see cref="PlanningNoOpOutcome"/> → 200 with the bare Release JSON;
+    /// <see cref="ExecutionSuccessOutcome"/> → 200 with the <c>{release, result}</c> envelope; a
+    /// <see cref="StatusFailureOutcome"/> → the per-variant status and body from the frozen
+    /// contract (404/400/409 <c>{error}</c>, 400 <c>{errors:[...]}</c>, 500 <c>{detail, results}</c>,
+    /// 503 <c>{detail}</c>).
+    /// </summary>
+    /// <param name="outcome">The outcome reported by the facade.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapReleaseStatusOutcome(ReleaseStatusOutcome outcome)
+    {
+        return outcome switch
+        {
+            PlanningNoOpOutcome noOp => Results.Ok(noOp.Release),
+            ExecutionSuccessOutcome success => Results.Ok(new { release = success.Release, result = success.Result }),
+            StatusFailureOutcome failure => MapReleaseStatusFailure(failure),
+            _ => throw new InvalidOperationException($"Unexpected release status outcome: {outcome.GetType().Name}."),
+        };
+    }
+
+    /// <summary>
+    /// Maps a <see cref="StatusFailureOutcome"/> to its exact HTTP response. Only the fields the
+    /// variant's body carries are serialized: <c>{error}</c> bodies use <see cref="StatusFailureOutcome.Error"/>,
+    /// the <c>{errors:[...]}</c> body uses <see cref="StatusFailureOutcome.Errors"/>, the 500 body
+    /// uses <see cref="StatusFailureOutcome.Detail"/> + <see cref="StatusFailureOutcome.Results"/>,
+    /// and the 503 body uses <see cref="StatusFailureOutcome.Detail"/> alone.
+    /// </summary>
+    /// <param name="failure">The failure outcome to map.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapReleaseStatusFailure(StatusFailureOutcome failure)
+    {
+        return failure.Kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error = failure.Error }),
+            FacadeErrorKind.BadRequest when failure.Errors.Length > 0
+                => Results.BadRequest(new { errors = failure.Errors }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error = failure.Error }),
+            FacadeErrorKind.Conflict => Results.Json(new { error = failure.Error }, statusCode: StatusCodes.Status409Conflict),
+            FacadeErrorKind.Internal => Results.Json(
+                new { detail = failure.Detail, results = failure.Results },
+                statusCode: StatusCodes.Status500InternalServerError),
+            FacadeErrorKind.ServiceUnavailable => Results.Json(
+                new { detail = failure.Detail },
+                statusCode: StatusCodes.Status503ServiceUnavailable),
+            _ => throw new InvalidOperationException($"Unexpected release status failure kind: {failure.Kind}."),
+        };
     }
 
     /// <summary>

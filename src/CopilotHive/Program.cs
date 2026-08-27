@@ -670,6 +670,25 @@ public sealed class Program
                 sp.GetService<IEventBus>(),
                 sp.GetRequiredService<ILogger<IssueFacade>>()));
 
+            // Release facade: ALWAYS registered so the release endpoints (and, in a follow-up
+            // step, the Releases / ReleaseDetail components) resolve it unconditionally. The
+            // optional dependencies are resolved with GetService exactly where the endpoints
+            // resolved them optionally (GetService in the handlers): the release execution
+            // service (the 503 case), the event bus (null skips publication), the NuGet publish
+            // monitor, the hive config (needed for LaunchNuGetMonitors), the application
+            // lifetime and the knowledge-document cleanup service. The goal store and the
+            // dashboard notifier are required — the endpoints bound them as required services.
+            builder.Services.AddSingleton<IReleaseFacade>(sp => new ReleaseFacade(
+                sp.GetRequiredService<IGoalStore>(),
+                sp.GetRequiredService<DashboardNotifier>(),
+                sp.GetRequiredService<ILogger<ReleaseFacade>>(),
+                sp.GetService<ReleaseExecutionService>(),
+                sp.GetService<IEventBus>(),
+                sp.GetService<NuGetPublishMonitorService>(),
+                sp.GetService<HiveConfigFile>(),
+                sp.GetService<IHostApplicationLifetime>(),
+                sp.GetService<KnowledgeDocumentCleanupService>()));
+
             builder.Services.AddSingleton(sp =>
             {
                 var manager = new GoalManager();

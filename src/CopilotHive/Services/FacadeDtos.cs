@@ -573,3 +573,153 @@ public sealed record CancelledResult(string Message);
 /// </summary>
 /// <param name="Message">Confirmation message (e.g. <c>Extended iteration budget by 5.</c>).</param>
 public sealed record ExtendedResult(string Message);
+
+/// <summary>
+/// Response DTO for a release, mirroring the wire shape of the <see cref="Release"/> entity the
+/// pre-facade release endpoints serialized directly — property for property, in the same order.
+/// <see cref="ReleaseStatus"/> and <see cref="ReleaseExecutionState"/> are the ENUM types; the
+/// global snake_case enum converter renders them on the wire exactly as before
+/// (e.g. <c>"planning"</c>, <c>"executing"</c>).
+/// </summary>
+/// <param name="Id">Unique identifier for this release (e.g. "v1.2.0").</param>
+/// <param name="Tag">Human-readable tag or version label.</param>
+/// <param name="Status">Current lifecycle status of the release.</param>
+/// <param name="Notes">Optional notes or changelog summary for this release.</param>
+/// <param name="CreatedAt">UTC timestamp when the release was created.</param>
+/// <param name="ReleasedAt">UTC timestamp when the release was published, or <c>null</c>.</param>
+/// <param name="RepositoryNames">Names of repositories this release applies to.</param>
+/// <param name="ExecutionState">Execution status for release automation.</param>
+public sealed record ReleaseDto(
+    string Id,
+    string Tag,
+    ReleaseStatus Status,
+    string? Notes,
+    DateTime CreatedAt,
+    DateTime? ReleasedAt,
+    IReadOnlyList<string> RepositoryNames,
+    ReleaseExecutionState ExecutionState)
+{
+    /// <summary>Projects a <see cref="Release"/> entity onto its wire representation.</summary>
+    /// <param name="release">The release entity to project.</param>
+    /// <returns>The DTO the release routes serialize.</returns>
+    public static ReleaseDto From(Release release) => new(
+        release.Id,
+        release.Tag,
+        release.Status,
+        release.Notes,
+        release.CreatedAt,
+        release.ReleasedAt,
+        release.RepositoryNames,
+        release.ExecutionState);
+}
+
+/// <summary>
+/// Response DTO for a single repository's release execution result, mirroring
+/// <see cref="RepoReleaseResult"/> field for field so the 500 <c>{detail, results}</c> body and
+/// the 200 <c>{release, result}</c> body keep their exact wire shape.
+/// </summary>
+/// <param name="RepoName">The repository name.</param>
+/// <param name="Skipped">Whether the repository was skipped (no release config).</param>
+/// <param name="Success">Whether the merge and tag operations succeeded.</param>
+/// <param name="MergedTo">The branch that was merged into, or <c>null</c>.</param>
+/// <param name="MergeSha">The resulting merge commit SHA, or <c>null</c> for a no-op merge.</param>
+/// <param name="TaggedBranch">The branch that was tagged, or <c>null</c>.</param>
+/// <param name="TagCreated">Whether a new tag was created (false = tag already existed).</param>
+/// <param name="Error">An error message when the repository failed, or <c>null</c>.</param>
+public sealed record RepoReleaseResultDto(
+    string RepoName,
+    bool Skipped,
+    bool Success,
+    string? MergedTo,
+    string? MergeSha,
+    string? TaggedBranch,
+    bool TagCreated,
+    string? Error)
+{
+    /// <summary>Projects a <see cref="RepoReleaseResult"/> onto its wire representation.</summary>
+    /// <param name="result">The execution result to project.</param>
+    /// <returns>The DTO the release routes serialize.</returns>
+    public static RepoReleaseResultDto From(RepoReleaseResult result) => new(
+        result.RepoName,
+        result.Skipped,
+        result.Success,
+        result.MergedTo,
+        result.MergeSha,
+        result.TaggedBranch,
+        result.TagCreated,
+        result.Error);
+}
+
+/// <summary>
+/// Response DTO for a full release execution, mirroring <see cref="ReleaseExecutionResult"/>.
+/// <see cref="Failure"/> is the <see cref="ReleaseExecutionFailure"/> ENUM (non-nullable) — the
+/// global snake_case converter preserves its <c>"none"</c> wire form on success exactly as the
+/// pre-facade endpoint serialized it.
+/// </summary>
+/// <param name="Success">Whether the whole release executed successfully.</param>
+/// <param name="Results">Per-repository execution results.</param>
+/// <param name="Error">A human-readable error message, or <c>null</c> on success.</param>
+/// <param name="Failure">The typed failure category (<c>none</c> on success).</param>
+public sealed record ReleaseExecutionResultDto(
+    bool Success,
+    IReadOnlyList<RepoReleaseResultDto> Results,
+    string? Error,
+    ReleaseExecutionFailure Failure)
+{
+    /// <summary>Projects a <see cref="ReleaseExecutionResult"/> onto its wire representation.</summary>
+    /// <param name="result">The execution result to project.</param>
+    /// <returns>The DTO the release routes serialize.</returns>
+    public static ReleaseExecutionResultDto From(ReleaseExecutionResult result) => new(
+        result.Success,
+        result.Results.Select(RepoReleaseResultDto.From).ToList(),
+        result.Error,
+        result.Failure);
+}
+
+/// <summary>
+/// Response DTO for <c>GET /api/releases/{id}/validate</c>, reproducing the pre-facade anonymous
+/// body <c>{ valid, errors }</c>. A missing execution service yields <c>{valid:true, errors:[]}</c>
+/// exactly as today.
+/// </summary>
+/// <param name="Valid">Whether the release passed all validation checks.</param>
+/// <param name="Errors">The list of validation errors (empty when valid).</param>
+public sealed record ValidationDto(bool Valid, IReadOnlyList<string> Errors);
+
+/// <summary>
+/// Discriminated outcome of <see cref="IReleaseFacade.UpdateReleaseStatusAsync"/>. The outcome
+/// record IS the complete result — success and failure alike — so the status endpoint maps each
+/// variant to its exact HTTP response without a success-only-value wrapper.
+/// </summary>
+public abstract record ReleaseStatusOutcome;
+
+/// <summary>
+/// Outcome for a Planning→Planning status change (the no-op branch): the bare Release JSON,
+/// exactly as the pre-facade handler's <c>Results.Ok(existing)</c> produced.
+/// </summary>
+/// <param name="Release">The unchanged release.</param>
+public sealed record PlanningNoOpOutcome(ReleaseDto Release) : ReleaseStatusOutcome;
+
+/// <summary>
+/// Outcome for a successful Planning→Released execution: the <c>{ release, result }</c> envelope
+/// the pre-facade handler returned.
+/// </summary>
+/// <param name="Release">The re-read release marked Released.</param>
+/// <param name="Result">The execution result.</param>
+public sealed record ExecutionSuccessOutcome(ReleaseDto Release, ReleaseExecutionResultDto Result) : ReleaseStatusOutcome;
+
+/// <summary>
+/// Failure outcome of a status change. Only the fields that carry the response shape for the
+/// given <see cref="FacadeErrorKind"/> are populated — the endpoint serializes per-variant bodies
+/// so no null helper fields leak into existing response payloads.
+/// </summary>
+/// <param name="Kind">The failure category mirroring the HTTP status.</param>
+/// <param name="Error">Message for <c>{error}</c> bodies, or <c>null</c>.</param>
+/// <param name="Detail">Message for the 500 <c>{detail}</c> / 503 <c>{detail}</c> bodies, or <c>null</c>.</param>
+/// <param name="Errors">Validation errors for the 400 <c>{errors:[...]}</c> body, or empty.</param>
+/// <param name="Results">Per-repo results for the 500 <c>{results}</c> body, or empty.</param>
+public sealed record StatusFailureOutcome(
+    FacadeErrorKind Kind,
+    string? Error,
+    string? Detail,
+    string?[] Errors,
+    IReadOnlyList<RepoReleaseResultDto> Results) : ReleaseStatusOutcome;
