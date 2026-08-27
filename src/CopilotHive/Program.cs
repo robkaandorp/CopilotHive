@@ -643,6 +643,24 @@ public sealed class Program
                     sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
                     sp.GetRequiredService<ILogger<IssueStore>>()));
 
+            // Goal facade: ALWAYS registered so the goal endpoints (and the Goals / Goal Detail
+            // components) resolve it unconditionally. The optional dependencies are resolved
+            // with GetService exactly where the endpoints resolved them optionally
+            // ([FromServices] nullable parameters): the Brain repo manager, the knowledge
+            // document cleanup service, the goal-ready notifier and the dispatcher. The goal
+            // store, issue store, review service and dashboard notifier are required — the
+            // endpoints bound them as required services too.
+            builder.Services.AddSingleton<IGoalFacade>(sp => new GoalFacade(
+                sp.GetRequiredService<IGoalStore>(),
+                sp.GetRequiredService<IIssueStore>(),
+                sp.GetRequiredService<GoalReviewService>(),
+                sp.GetRequiredService<DashboardNotifier>(),
+                sp.GetService<IBrainRepoManager>(),
+                sp.GetService<KnowledgeDocumentCleanupService>(),
+                sp.GetService<GoalReadyNotifier>(),
+                sp.GetService<GoalDispatcher>(),
+                sp.GetRequiredService<ILogger<GoalFacade>>()));
+
             builder.Services.AddSingleton(sp =>
             {
                 var manager = new GoalManager();

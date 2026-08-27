@@ -4,14 +4,13 @@
 @using CopilotHive.Orchestration
 @using CopilotHive.Services
 @using Markdig
-@using System.Net.Http.Json
 @implements IDisposable
 @inject DashboardStateService State
 @inject ProgressReportService ProgressReports
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
 @inject NavigationManager Nav
-@inject HttpClient HttpClient
+@inject IGoalFacade GoalFacade
 @inject PageHeaderState PageHeader
 
 @if (_detail is not null || _storedGoal is not null)
@@ -877,8 +876,9 @@ else
     private string _selectedReleaseId = "";
     private string? _releaseAssignError;
     private string? _goalReleaseId;
-    private record LinkedIssueInfo(string Id, string Title, IssueType Type, IssueSeverity Severity, IssueStatus Status);
-    private List<LinkedIssueInfo> _linkedIssues = [];
+    // Issues referencing this goal, read through IGoalFacade.GetLinkedIssuesAsync as the
+    // shared LinkedIssueDto — the page no longer models its own issue shape.
+    private List<LinkedIssueDto> _linkedIssues = [];
 
     protected override Task OnInitializedAsync()
     {
@@ -955,13 +955,13 @@ else
             _dependencyStatuses = new();
         }
 
-        // Fetch issues related to this goal (linked or source)
-        var sourceIssues = await HttpClient.GetFromJsonAsync<List<LinkedIssueInfo>>(
-            $"/api/issues?source_goal_id={Uri.EscapeDataString(GoalId)}", ReasoningEffortOptions.JsonOptions) ?? [];
-        var linkedIssues = await HttpClient.GetFromJsonAsync<List<LinkedIssueInfo>>(
-            $"/api/issues?linked_goal_id={Uri.EscapeDataString(GoalId)}", ReasoningEffortOptions.JsonOptions) ?? [];
-        // Merge and deduplicate by Id
-        _linkedIssues = sourceIssues.Concat(linkedIssues).DistinctBy(i => i.Id).ToList();
+        // Fetch issues related to this goal (linked or source). The facade performs BOTH
+        // queries (source-goal and linked-goal) and deduplicates by ID, exactly as the two
+        // separate HTTP reads plus the local merge used to.
+        var linkedIssuesResult = await GoalFacade.GetLinkedIssuesAsync(GoalId, CancellationToken.None);
+        _linkedIssues = linkedIssuesResult.Success
+            ? linkedIssuesResult.Value?.ToList() ?? []
+            : [];
 
         // Load Planning releases for release-assignment dropdown (shown when goal is Completed and unassigned)
         var goalStatus = _detail?.Status ?? _storedGoal?.Status;
@@ -1191,12 +1191,8 @@ else
     private async Task ApproveGoal()
     {
         _approveError = null;
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { status = "Pending" }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Pending");
+        if (result.Success)
         {
             await RefreshAsync();
             // Update local state if loaded from SQLite (no active pipeline)
@@ -1206,8 +1202,7 @@ else
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _approveError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _approveError = result.Error ?? "";
         }
     }
 
@@ -1216,8 +1211,8 @@ else
         _reviewError = null;
         try
         {
-            var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/review", null);
-            if (response.IsSuccessStatusCode)
+            var result = await GoalFacade.RequestReviewAsync(GoalId, CancellationToken.None);
+            if (result.Success)
             {
                 _reviewError = null;
                 await RefreshAsync();
@@ -1225,8 +1220,7 @@ else
             }
             else
             {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _reviewError = $"Error {(int)response.StatusCode}: {errorContent}";
+                _reviewError = result.Error ?? "";
                 StateHasChanged();
             }
         }
@@ -1240,12 +1234,8 @@ else
     private async Task RevertToDraft()
     {
         _revertError = null;
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/status", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.UpdateGoalStatusAsync(GoalId, "Draft");
+        if (result.Success)
         {
             await RefreshAsync();
             // Update local state if loaded from SQLite (no active pipeline)
@@ -1255,8 +1245,7 @@ else
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _revertError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _revertError = result.Error ?? "";
         }
     }
 
@@ -1266,16 +1255,15 @@ else
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to cancel goal '{GoalId}'?");
         if (!confirmed) return;
 
-        var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/cancel", null);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.CancelGoalAsync(GoalId);
+        if (result.Success)
         {
             await RefreshAsync();
             StateHasChanged();
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _cancelError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _cancelError = result.Error ?? "";
             StateHasChanged();
         }
     }
@@ -1286,15 +1274,14 @@ else
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Are you sure you want to delete goal '{GoalId}'?");
         if (!confirmed) return;
 
-        var response = await HttpClient.DeleteAsync($"/api/goals/{GoalId}");
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.DeleteGoalAsync(GoalId);
+        if (result.Success)
         {
             Nav.NavigateTo("/goals");
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _deleteError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _deleteError = result.Error ?? "";
             StateHasChanged();
         }
     }
@@ -1305,25 +1292,20 @@ else
         _extendingIterations = true;
         try
         {
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { additionalIterations = 5 }),
-                System.Text.Encoding.UTF8,
-                "application/json");
-            var response = await HttpClient.PostAsync($"/api/goals/{GoalId}/extend-iterations", body);
-            if (response.IsSuccessStatusCode)
+            var result = await GoalFacade.ExtendIterationsAsync(GoalId, 5, CancellationToken.None);
+            if (result.Success)
             {
                 await RefreshAsync();
                 StateHasChanged();
             }
-            else if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            else if (result.Kind == FacadeErrorKind.NotFound)
             {
                 _extendError = "Goal or pipeline not found";
                 StateHasChanged();
             }
             else
             {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _extendError = $"Error {(int)response.StatusCode}: {errorContent}";
+                _extendError = result.Error ?? "";
                 StateHasChanged();
             }
         }
@@ -1397,12 +1379,8 @@ else
         _releaseAssignError = null;
         if (string.IsNullOrEmpty(_selectedReleaseId)) return;
 
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { releaseId = _selectedReleaseId }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{GoalId}/release", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.AttachReleaseAsync(GoalId, _selectedReleaseId);
+        if (result.Success)
         {
             // Update local state
             if (_storedGoal is not null)
@@ -1414,8 +1392,7 @@ else
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _releaseAssignError = $"Error {(int)response.StatusCode}: {errorContent}";
+            _releaseAssignError = result.Error ?? "";
         }
     }
 }

@@ -1,10 +1,11 @@
 @page "/goals"
 @using CopilotHive.Dashboard
 @using CopilotHive.Goals
+@using CopilotHive.Services
 @implements IDisposable
 @inject IGoalStore GoalStore
 @inject IJSRuntime JS
-@inject HttpClient HttpClient
+@inject IGoalFacade GoalFacade
 @inject PageHeaderState PageHeader
 @inject GoalsFilterState FilterState
 @inject DashboardStateService State
@@ -347,8 +348,8 @@ else if (_loaded)
 
     private async Task DeleteGoal(string goalId)
     {
-        var response = await HttpClient.DeleteAsync($"/api/goals/{goalId}");
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.DeleteGoalAsync(goalId);
+        if (result.Success)
         {
             _allGoals.RemoveAll(g => g.Id == goalId);
             ApplyFilters();
@@ -358,12 +359,8 @@ else if (_loaded)
     private async Task ApproveGoal(string goalId)
     {
         _approveErrors.Remove(goalId);
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { status = "Pending" }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.UpdateGoalStatusAsync(goalId, "Pending");
+        if (result.Success)
         {
             var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
             if (goal is not null)
@@ -372,20 +369,15 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _approveErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
+            _approveErrors[goalId] = result.Error ?? "";
         }
     }
 
     private async Task RevertToDraft(string goalId)
     {
         _revertErrors.Remove(goalId);
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.UpdateGoalStatusAsync(goalId, "Draft");
+        if (result.Success)
         {
             var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
             if (goal is not null)
@@ -394,20 +386,15 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _revertErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
+            _revertErrors[goalId] = result.Error ?? "";
         }
     }
 
     private async Task RetryFailedGoal(string goalId)
     {
         _retryErrors.Remove(goalId);
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new { status = "Draft" }),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        var response = await HttpClient.PatchAsync($"/api/goals/{goalId}/status", body);
-        if (response.IsSuccessStatusCode)
+        var result = await GoalFacade.UpdateGoalStatusAsync(goalId, "Draft");
+        if (result.Success)
         {
             var goal = _allGoals.FirstOrDefault(g => g.Id == goalId);
             if (goal is not null)
@@ -423,8 +410,7 @@ else if (_loaded)
         }
         else
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            _retryErrors[goalId] = $"Error {(int)response.StatusCode}: {errorContent}";
+            _retryErrors[goalId] = result.Error ?? "";
         }
     }
 }

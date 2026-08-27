@@ -116,134 +116,43 @@ public static class ApiEndpoints
             }
         });
 
-        goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update, IGoalStore store,
-            [FromServices] IBrainRepoManager? repoManager, [FromServices] GoalDispatcher? dispatcher, ILogger<Program> endpointLogger,
-            [FromServices] DashboardNotifier dashboardNotifier,
-            [FromServices] GoalReadyNotifier? goalReadyNotifier) =>
+        goalsApi.MapPatch("/{id}/status", async (string id, GoalStatusUpdate update,
+            [FromServices] IGoalFacade facade) =>
         {
-            try
-            {
-                var status = Enum.Parse<GoalStatus>(update.Status, ignoreCase: true);
-
-                var existing = await store.GetGoalAsync(id);
-                if (existing is null)
-                    return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-                // Allowed transitions via the public API:
-                //   Draft ↔ Pending (approve / revert)
-                //   Failed → Draft (retry — resets iteration data and cleans up feature branch)
-                var validTransition =
-                    existing.Status == GoalStatus.Draft && status == GoalStatus.Pending ||
-                    existing.Status == GoalStatus.Pending && status == GoalStatus.Draft ||
-                    existing.Status == GoalStatus.Failed && status == GoalStatus.Draft;
-                if (!validTransition)
-                    return Results.BadRequest(new { error = $"Invalid transition from {existing.Status} to {status}. Only Draft→Pending, Pending→Draft, and Failed→Draft are allowed." });
-
-                // Failed→Draft: reset iteration data and delete the feature branch (best-effort)
-                if (existing.Status == GoalStatus.Failed && status == GoalStatus.Draft)
-                {
-                    await store.ResetGoalIterationDataAsync(id);
-
-                    // Clear GoalDispatcher runtime state so the goal can be re-dispatched fresh
-                    dispatcher?.ClearGoalRetryState(id);
-
-                    if (repoManager is not null)
-                    {
-                        var branchName = $"copilothive/{id}";
-                        foreach (var repoName in existing.RepositoryNames)
-                        {
-                            _ = await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                        }
-                    }
-                }
-
-                await store.UpdateGoalStatusAsync(id, status);
-                var goal = await store.GetGoalAsync(id);
-                dashboardNotifier.NotifyStateChanged();
-                if (status == GoalStatus.Pending) goalReadyNotifier?.NotifyGoalReady();
-                return Results.Ok(goal);
-            }
-            catch (KeyNotFoundException)
-            {
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-            }
-            catch (ArgumentException)
-            {
-                return Results.BadRequest(new { error = $"Invalid status '{update.Status}'." });
-            }
+            var result = await facade.UpdateGoalStatusAsync(id, update.Status);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapDelete("/{id}", async (string id, IGoalStore store, [FromServices] IBrainRepoManager? repoManager, ILogger<Program> logger, [FromServices] DashboardNotifier dashboardNotifier, [FromServices] KnowledgeDocumentCleanupService? docCleanup) =>
+        goalsApi.MapDelete("/{id}", async (string id, [FromServices] IGoalFacade facade) =>
         {
-            var goal = await store.GetGoalAsync(id);
-            if (goal is null)
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-            if (goal.Status is not (GoalStatus.Draft or GoalStatus.Failed))
-                return Results.BadRequest(new { error = "Only Draft or Failed goals can be deleted" });
-
-            var deleted = await store.DeleteGoalAsync(id);
-            if (!deleted)
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-            // Best-effort cleanup of knowledge documents
-            if (docCleanup is not null)
-            {
-                try
-                {
-                    await docCleanup.CleanupGoalDocumentsAsync(id, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "Failed to cleanup knowledge documents for deleted goal '{GoalId}'", id);
-                }
-            }
-
-            // Best-effort cleanup of remote feature branches for Failed goals
-            if (goal.Status == GoalStatus.Failed)
-            {
-                if (repoManager is not null)
-                {
-                    var branchName = $"copilothive/{id}";
-                    foreach (var repoName in goal.RepositoryNames)
-                    {
-                        _ = await repoManager.DeleteRemoteBranchAsync(repoName, branchName);
-                    }
-                }
-            }
-
-            dashboardNotifier.NotifyStateChanged();
-            return Results.NoContent();
+            var result = await facade.DeleteGoalAsync(id);
+            return result.Success
+                ? Results.NoContent()
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapPost("/{id}/cancel", async (string id, GoalDispatcher dispatcher, IGoalStore store) =>
+        goalsApi.MapPost("/{id}/cancel", async (string id, [FromServices] IGoalFacade facade) =>
         {
-            var goal = await store.GetGoalAsync(id);
-            if (goal is null)
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-            if (goal.Status is not (GoalStatus.InProgress or GoalStatus.Pending))
-                return Results.BadRequest(new { error = $"Goal '{id}' is {goal.Status} and cannot be cancelled. Only InProgress or Pending goals can be cancelled." });
-
-            var cancelled = await dispatcher.CancelGoalAsync(id);
-            return cancelled
-                ? Results.Ok(new { message = $"Goal '{id}' has been cancelled." })
-                : Results.BadRequest(new { error = $"Goal '{id}' could not be cancelled (it may have already completed or failed)." });
+            var result = await facade.CancelGoalAsync(id);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
-        goalsApi.MapPost("/{id}/extend-iterations", async (string id, ExtendIterationsRequest request, [FromServices] GoalDispatcher? dispatcher, CancellationToken ct) =>
+        goalsApi.MapPost("/{id}/extend-iterations", async (string id, ExtendIterationsRequest request,
+            [FromServices] IGoalFacade facade, CancellationToken ct) =>
         {
-            if (dispatcher is null)
-                return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            var result = await facade.ExtendIterationsAsync(id, request.AdditionalIterations, ct);
+            if (result.Success)
+                return Results.Ok(result.Value);
 
-            if (request.AdditionalIterations <= 0 || request.AdditionalIterations > 100)
-                return Results.BadRequest(new { error = "additionalIterations must be between 1 and 100." });
-
-            var success = await dispatcher.ResumeGoalAsync(id, request.AdditionalIterations, ct);
-            if (!success)
-                return Results.NotFound(new { error = $"Goal '{id}' or its pipeline not found." });
-
-            return Results.Ok(new { message = $"Extended iteration budget by {request.AdditionalIterations}." });
+            // This route answers an unavailable dispatcher with a BARE 503 (no body) — not the
+            // problem-details form the other facade routes use — so the contract is unchanged.
+            return result.Kind == FacadeErrorKind.ServiceUnavailable
+                ? Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
         goalsApi.MapGet("/search", async (string q, string? status, IGoalStore store) =>
@@ -255,20 +164,13 @@ public static class ApiEndpoints
             return Results.Ok(results);
         });
 
-        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
+        goalsApi.MapPatch("/{id}/release", async (string id, AssignGoalReleaseRequest request,
+            [FromServices] IGoalFacade facade) =>
         {
-            var release = await store.GetReleaseAsync(request.ReleaseId);
-            if (release is null)
-                return Results.NotFound(new { error = $"Release '{request.ReleaseId}' not found." });
-
-            var goal = await store.GetGoalAsync(id);
-            if (goal is null)
-                return Results.NotFound(new { error = $"Goal '{id}' not found." });
-
-            goal.ReleaseId = request.ReleaseId;
-            await store.UpdateGoalAsync(goal);
-            dashboardNotifier.NotifyStateChanged();
-            return Results.Ok(goal);
+            var result = await facade.AttachReleaseAsync(id, request.ReleaseId);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
 
         goalsApi.MapPatch("/{id}/review-status", async (string id, GoalReviewStatusUpdate update, IGoalStore store, [FromServices] DashboardNotifier dashboardNotifier) =>
@@ -296,28 +198,36 @@ public static class ApiEndpoints
             return Results.Ok(updated);
         });
 
-        goalsApi.MapPost("/{goalId}/review", async (string goalId, GoalReviewService reviewService, IGoalStore goalStore, CancellationToken ct) =>
+        goalsApi.MapPost("/{goalId}/review", async (string goalId, [FromServices] IGoalFacade facade, CancellationToken ct) =>
         {
-            var goal = await goalStore.GetGoalAsync(goalId, ct);
-            if (goal is null)
-                return Results.NotFound(new { error = $"Goal '{goalId}' not found." });
-
-            if (goal.Status != GoalStatus.Draft)
-                return Results.BadRequest(new { error = "Only Draft goals can be reviewed." });
-
-            if (goal.ReviewStatus == ReviewStatus.Pending)
-                return Results.Conflict(new { error = "A review is already in progress for this goal." });
-
-            try
-            {
-                var result = await reviewService.ReviewGoalAsync(goal, ct);
-                return Results.Ok(result);
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
+            var result = await facade.RequestReviewAsync(goalId, ct);
+            return result.Success
+                ? Results.Ok(result.Value)
+                : MapGoalFacadeError(result.Kind, result.Error);
         });
+    }
+
+    /// <summary>
+    /// Maps a <see cref="FacadeErrorKind"/> from <see cref="IGoalFacade"/> to the exact HTTP
+    /// response the pre-facade goal handlers produced: <c>NotFound</c>, <c>BadRequest</c> and
+    /// <c>Conflict</c> all return a JSON <c>{error}</c> body. <see cref="FacadeErrorKind.None"/>
+    /// is a programming error (a success result must not be mapped here) and throws, as does
+    /// any kind these six routes never produce — including
+    /// <see cref="FacadeErrorKind.ServiceUnavailable"/>, which only the extend-iterations route
+    /// produces and handles itself as a bare bodyless 503.
+    /// </summary>
+    /// <param name="kind">The failure category reported by the facade.</param>
+    /// <param name="error">The human-readable error message.</param>
+    /// <returns>The HTTP result matching the pre-facade handler behaviour.</returns>
+    private static IResult MapGoalFacadeError(FacadeErrorKind kind, string? error)
+    {
+        return kind switch
+        {
+            FacadeErrorKind.NotFound => Results.NotFound(new { error }),
+            FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
+            FacadeErrorKind.Conflict => Results.Conflict(new { error }),
+            _ => throw new InvalidOperationException($"Unexpected goal facade error kind: {kind}."),
+        };
     }
 
     /// <summary>

@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Goals;
 
 using Microsoft.Extensions.AI;
 
@@ -380,3 +381,174 @@ public sealed record SwitchResultDto(string Model, ReasoningEffort? ReasoningEff
 /// <param name="Compacted">Whether compaction actually ran.</param>
 /// <param name="MessageCount">The session message count after the attempt (0 when unknown).</param>
 public sealed record CompactResultDto(bool Compacted, int MessageCount);
+
+/// <summary>
+/// Response DTO for the goal routes that serialize a whole goal
+/// (<c>PATCH /api/goals/{id}/status</c> and <c>PATCH /api/goals/{id}/release</c>).
+/// </summary>
+/// <remarks>
+/// The pre-facade handlers returned the raw <see cref="Goal"/> entity, so EVERY property of
+/// <see cref="Goal"/> is reproduced here — in declaration order — and nothing is truncated or
+/// projected away. <see cref="IterationSummaries"/> deliberately reuses the domain
+/// <see cref="IterationSummary"/> type so the nested wire shape stays byte-identical rather
+/// than being re-modelled (and drifting) here.
+/// </remarks>
+/// <param name="Id">Unique identifier for this goal.</param>
+/// <param name="Description">Human-readable description of what the goal requires.</param>
+/// <param name="Priority">Scheduling priority; higher-priority goals are dispatched first.</param>
+/// <param name="Scope">Scope of change this goal introduces.</param>
+/// <param name="Status">Current lifecycle status of the goal.</param>
+/// <param name="RepositoryNames">Names of repositories this goal applies to.</param>
+/// <param name="TargetRepositoryNames">Comma-separated editable target repositories, or <c>null</c> for all.</param>
+/// <param name="DependsOn">IDs of goals that must complete before this goal can be dispatched.</param>
+/// <param name="Metadata">Arbitrary key/value metadata associated with the goal.</param>
+/// <param name="CreatedAt">UTC timestamp when the goal was created.</param>
+/// <param name="StartedAt">UTC timestamp when the goal was picked up, or <c>null</c>.</param>
+/// <param name="CompletedAt">UTC timestamp when the goal finished, or <c>null</c>.</param>
+/// <param name="Iterations">Number of iterations used, or <c>null</c> if not yet finished.</param>
+/// <param name="FailureReason">Reason the goal failed, or <c>null</c>.</param>
+/// <param name="Notes">Optional informational notes.</param>
+/// <param name="PhaseDurations">Per-phase wall-clock durations in seconds.</param>
+/// <param name="IterationSummaries">Structured summaries written after each iteration completes.</param>
+/// <param name="TotalDurationSeconds">Total wall-clock duration of the goal in seconds.</param>
+/// <param name="MergeCommitHash">SHA-1 of the merge commit that landed this goal, or <c>null</c>.</param>
+/// <param name="ReleaseId">Release this goal is grouped into, or <c>null</c> if unassigned.</param>
+/// <param name="Documents">IDs of knowledge documents related to this goal.</param>
+/// <param name="BranchCleanedUp">Whether the feature branch has been cleaned up after completion.</param>
+/// <param name="ReviewStatus">Pre-execution review status.</param>
+public sealed record GoalDto(
+    string Id,
+    string Description,
+    GoalPriority Priority,
+    GoalScope Scope,
+    GoalStatus Status,
+    List<string> RepositoryNames,
+    string? TargetRepositoryNames,
+    List<string> DependsOn,
+    Dictionary<string, string> Metadata,
+    DateTime CreatedAt,
+    DateTime? StartedAt,
+    DateTime? CompletedAt,
+    int? Iterations,
+    string? FailureReason,
+    List<string> Notes,
+    Dictionary<string, double>? PhaseDurations,
+    List<IterationSummary> IterationSummaries,
+    double? TotalDurationSeconds,
+    string? MergeCommitHash,
+    string? ReleaseId,
+    List<string> Documents,
+    bool BranchCleanedUp,
+    ReviewStatus ReviewStatus)
+{
+    /// <summary>
+    /// Projects a <see cref="Goal"/> entity onto its wire representation, property for property.
+    /// </summary>
+    /// <param name="goal">The goal entity to project.</param>
+    /// <returns>The DTO the goal routes serialize.</returns>
+    public static GoalDto From(Goal goal) => new(
+        goal.Id,
+        goal.Description,
+        goal.Priority,
+        goal.Scope,
+        goal.Status,
+        goal.RepositoryNames,
+        goal.TargetRepositoryNames,
+        goal.DependsOn,
+        goal.Metadata,
+        goal.CreatedAt,
+        goal.StartedAt,
+        goal.CompletedAt,
+        goal.Iterations,
+        goal.FailureReason,
+        goal.Notes,
+        goal.PhaseDurations,
+        goal.IterationSummaries,
+        goal.TotalDurationSeconds,
+        goal.MergeCommitHash,
+        goal.ReleaseId,
+        goal.Documents,
+        goal.BranchCleanedUp,
+        goal.ReviewStatus);
+}
+
+/// <summary>
+/// Response DTO for an issue linked to a goal (via <c>SourceGoalId</c> or <c>LinkedGoalId</c>).
+/// Mirrors the FULL <c>IssueResponse</c> shape the <c>GET /api/issues</c> route produces —
+/// field for field, in the same order — so a component consuming the facade sees exactly what
+/// the HTTP route returns.
+/// </summary>
+/// <param name="Id">Unique kebab-case identifier for the issue.</param>
+/// <param name="Type">Category of the issue.</param>
+/// <param name="Title">Short summary of the issue.</param>
+/// <param name="Description">Detailed markdown description of the issue.</param>
+/// <param name="Severity">Severity of the issue.</param>
+/// <param name="Status">Current lifecycle status of the issue.</param>
+/// <param name="RepositoryNames">Names of repositories this issue applies to.</param>
+/// <param name="SourceGoalId">ID of the goal that produced this issue, or <c>null</c> if user-reported.</param>
+/// <param name="SourceRole">Role that produced this issue, or <c>null</c> if user-reported.</param>
+/// <param name="SourceIteration">Iteration number in which the issue was produced, or <c>null</c>.</param>
+/// <param name="CreatedAt">UTC timestamp when the issue was created.</param>
+/// <param name="UpdatedAt">UTC timestamp of the last update, or <c>null</c> if never updated.</param>
+/// <param name="ResolvedAt">UTC timestamp when the issue was resolved or closed, or <c>null</c>.</param>
+/// <param name="LinkedGoalId">ID of a goal linked to this issue, or <c>null</c> if none.</param>
+public sealed record LinkedIssueDto(
+    string Id,
+    IssueType Type,
+    string Title,
+    string Description,
+    IssueSeverity Severity,
+    IssueStatus Status,
+    List<string> RepositoryNames,
+    string? SourceGoalId,
+    string? SourceRole,
+    int? SourceIteration,
+    DateTime CreatedAt,
+    DateTime? UpdatedAt,
+    DateTime? ResolvedAt,
+    string? LinkedGoalId)
+{
+    /// <summary>
+    /// Projects an <see cref="Issue"/> entity onto its wire representation.
+    /// </summary>
+    /// <param name="issue">The issue entity to project.</param>
+    /// <returns>The DTO mirroring the issues API response shape.</returns>
+    public static LinkedIssueDto From(Issue issue) => new(
+        issue.Id,
+        issue.Type,
+        issue.Title,
+        issue.Description,
+        issue.Severity,
+        issue.Status,
+        issue.RepositoryNames,
+        issue.SourceGoalId,
+        issue.SourceRole,
+        issue.SourceIteration,
+        issue.CreatedAt,
+        issue.UpdatedAt,
+        issue.ResolvedAt,
+        issue.LinkedGoalId);
+}
+
+/// <summary>
+/// Response DTO for <c>POST /api/goals/{goalId}/review</c>. Mirrors
+/// <see cref="ReviewResult"/> exactly — the pre-facade handler serialized that record directly.
+/// </summary>
+/// <param name="Verdict">Either "Approved" or "NeedsChanges".</param>
+/// <param name="Issues">Human-readable summary of issues found, or a "no issues" message.</param>
+/// <param name="Summary">Recommendation / summary of what should change.</param>
+public sealed record ReviewResultDto(string Verdict, string Issues, string Summary);
+
+/// <summary>
+/// Response DTO for <c>POST /api/goals/{id}/cancel</c>, reproducing the pre-facade anonymous
+/// body <c>{ message }</c>.
+/// </summary>
+/// <param name="Message">Confirmation message (e.g. <c>Goal 'x' has been cancelled.</c>).</param>
+public sealed record CancelledResult(string Message);
+
+/// <summary>
+/// Response DTO for <c>POST /api/goals/{id}/extend-iterations</c>, reproducing the pre-facade
+/// anonymous body <c>{ message }</c>.
+/// </summary>
+/// <param name="Message">Confirmation message (e.g. <c>Extended iteration budget by 5.</c>).</param>
+public sealed record ExtendedResult(string Message);
