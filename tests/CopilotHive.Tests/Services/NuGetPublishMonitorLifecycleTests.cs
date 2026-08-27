@@ -18,6 +18,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 using Moq;
 
+using Xunit;
+
 namespace CopilotHive.Tests.Services;
 
 /// <summary>
@@ -26,6 +28,7 @@ namespace CopilotHive.Tests.Services;
 /// (fire-and-forget monitoring), and <see cref="ApiEndpoints.LaunchNuGetMonitors"/>
 /// (release-completion trigger).
 /// </summary>
+[Collection("HiveIntegration")]
 public sealed class NuGetPublishMonitorLifecycleTests
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);

@@ -14,7 +14,7 @@ namespace CopilotHive.Tests;
 /// across all integration test classes annotated with <c>[Collection("HiveIntegration")]</c>.
 /// Sharing one factory prevents parallel SQLite write conflicts (Error 8: readonly database).
 /// </summary>
-[CollectionDefinition("HiveIntegration")]
+[CollectionDefinition("HiveIntegration", DisableParallelization = true)]
 public class HiveTestCollection : ICollectionFixture<HiveTestFactory>
 {
 }
