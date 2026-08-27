@@ -549,4 +549,200 @@ public sealed class FacadeDtosSerializationTests
 
         Assert.Null(dto.PublishNuGet);
     }
+
+    // ── Settings response DTOs (step 4) ─────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="WorkersConfigDto"/> serializes as a TOP-LEVEL role-keyed dictionary — the
+    /// exact wire shape the pre-facade GET /api/config/workers handler produced. A wrapper
+    /// object would change the contract, so this test locks the dictionary-derived shape.
+    /// </summary>
+    [Fact]
+
+    public void WorkersConfigDto_SerializesAsTopLevelRoleKeyedDictionary()
+    {
+        var dto = new WorkersConfigDto
+        {
+            ["coder"] = new WorkerEntryDto("copilot/coder", "copilot/coder-premium", 128000),
+            ["tester"] = new WorkerEntryDto("copilot/tester", null, 0),
+        };
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal(
+            """{"coder":{"model":"copilot/coder","premiumModel":"copilot/coder-premium","contextWindow":128000},"tester":{"model":"copilot/tester","premiumModel":null,"contextWindow":0}}""",
+            json);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(JsonValueKind.Object, root.ValueKind);
+        Assert.True(root.TryGetProperty("coder", out var coder));
+        Assert.Equal("copilot/coder", coder.GetProperty("model").GetString());
+        Assert.Equal("copilot/coder-premium", coder.GetProperty("premiumModel").GetString());
+        Assert.Equal(128000, coder.GetProperty("contextWindow").GetInt32());
+        Assert.True(root.TryGetProperty("tester", out var tester));
+        Assert.Equal(JsonValueKind.Null, tester.GetProperty("premiumModel").ValueKind);
+        Assert.Equal(0, tester.GetProperty("contextWindow").GetInt32());
+    }
+
+    /// <summary>
+    /// <see cref="WorkersConfigDto"/> with no roles serializes as an empty top-level object.
+    /// </summary>
+    [Fact]
+
+    public void WorkersConfigDto_Empty_SerializesAsEmptyObject()
+    {
+        var json = JsonSerializer.Serialize(new WorkersConfigDto(), JsonOpts);
+
+        Assert.Equal("{}", json);
+    }
+
+    /// <summary>
+    /// <see cref="OrchestratorConfigDto"/> asserts EVERY property the pre-facade GET
+    /// /api/config/orchestrator handler serialized (the raw <see cref="OrchestratorConfig"/>
+    /// object): model, maxIterations, maxRetriesPerTask, maxParallelGoals, verboseLogging,
+    /// brainMaxSteps, branchCleanupDelayHours, workerTaskTimeoutMinutes, reasoningEffort.
+    /// Removing any property from the DTO fails this test.
+    /// </summary>
+    [Fact]
+
+    public void OrchestratorConfigDto_SerializesEveryCurrentProperty()
+    {
+        var dto = new OrchestratorConfigDto(
+            Model: "copilot/gpt-5",
+            MaxIterations: 7,
+            MaxRetriesPerTask: 4,
+            MaxParallelGoals: 2,
+            VerboseLogging: true,
+            BrainMaxSteps: 60,
+            BranchCleanupDelayHours: 12,
+            WorkerTaskTimeoutMinutes: 25,
+            ReasoningEffort: "high");
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal(
+            """{"model":"copilot/gpt-5","maxIterations":7,"maxRetriesPerTask":4,"maxParallelGoals":2,"verboseLogging":true,"brainMaxSteps":60,"branchCleanupDelayHours":12,"workerTaskTimeoutMinutes":25,"reasoningEffort":"high"}""",
+            json);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(9, root.EnumerateObject().Count());
+        Assert.True(root.TryGetProperty("model", out _));
+        Assert.True(root.TryGetProperty("maxIterations", out _));
+        Assert.True(root.TryGetProperty("maxRetriesPerTask", out _));
+        Assert.True(root.TryGetProperty("maxParallelGoals", out _));
+        Assert.True(root.TryGetProperty("verboseLogging", out _));
+        Assert.True(root.TryGetProperty("brainMaxSteps", out _));
+        Assert.True(root.TryGetProperty("branchCleanupDelayHours", out _));
+        Assert.True(root.TryGetProperty("workerTaskTimeoutMinutes", out _));
+        Assert.True(root.TryGetProperty("reasoningEffort", out _));
+    }
+
+    /// <summary>
+    /// <see cref="OrchestratorConfigDto"/> null members serialize as explicit nulls — the
+    /// endpoint always projects the full shape.
+    /// </summary>
+    [Fact]
+
+    public void OrchestratorConfigDto_NullableMembers_SerializeAsExplicitNull()
+    {
+        var json = JsonSerializer.Serialize(
+            new OrchestratorConfigDto(null, 10, 3, 1, false, 50, 48, 10, null), JsonOpts);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("model").ValueKind);
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("reasoningEffort").ValueKind);
+    }
+
+    /// <summary>
+    /// <see cref="ComposerConfigDto"/> null/default case: null model and reasoning effort,
+    /// default max steps, passive mode, the four default active events, nine valid events,
+    /// throttle 30 — the exact shape the pre-facade GET /api/config/composer handler produced
+    /// for a null Composer section.
+    /// </summary>
+    [Fact]
+
+    public void ComposerConfigDto_NullComposerDefaults_SerializeAsWireShape()
+    {
+        var dto = new ComposerConfigDto(
+            Model: null,
+            MaxSteps: 50,
+            ReasoningEffort: null,
+            EventNotifications: new ComposerEventNotificationsDto(
+                Mode: "passive",
+                ActiveEvents: ["goal_completed", "goal_failed", "ci_failed", "issue_raised"],
+                ValidActiveEvents:
+                [
+                    "goal_completed", "goal_failed", "ci_failed", "issue_raised",
+                    "package_published", "ci_succeeded", "release_completed",
+                    "goal_dispatched", "issue_resolved",
+                ],
+                ThrottleSeconds: 30));
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("model").ValueKind);
+        Assert.Equal(50, root.GetProperty("maxSteps").GetInt32());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("reasoningEffort").ValueKind);
+        var notif = root.GetProperty("eventNotifications");
+        Assert.Equal("passive", notif.GetProperty("mode").GetString());
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised"],
+            notif.GetProperty("activeEvents").EnumerateArray().Select(e => e.GetString()).ToList());
+        Assert.Equal(
+            ["goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published",
+             "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved"],
+            notif.GetProperty("validActiveEvents").EnumerateArray().Select(e => e.GetString()).ToList());
+        Assert.Equal(30, notif.GetProperty("throttleSeconds").GetInt32());
+    }
+
+    /// <summary>
+    /// <see cref="ComposerConfigDto"/> serializes the fully-populated shape verbatim: the DTO is
+    /// a pure carrier, so <c>activeEvents</c> is emitted in exactly the order the list holds.
+    /// <para>
+    /// The input here is the facade's already-canonicalized whitelist order, matching what
+    /// <c>ConfigFacade.GetComposer</c> produces. This test locks SERIALIZATION ONLY — the
+    /// canonical REORDERING contract lives in the facade and is covered by
+    /// <c>ConfigFacadeSettingsTests.GetComposer_NoncanonicalStoredEventOrder_ProjectsCanonicalWhitelistOrder</c>,
+    /// which feeds a noncanonical stored list and asserts the reordered projection.
+    /// </para>
+    /// </summary>
+    [Fact]
+
+    public void ComposerConfigDto_PopulatedShape_SerializesListOrderVerbatim()
+    {
+        var dto = new ComposerConfigDto(
+            Model: "copilot/composer",
+            MaxSteps: 80,
+            ReasoningEffort: "medium",
+            EventNotifications: new ComposerEventNotificationsDto(
+                Mode: "active",
+                // Canonical whitelist order — the shape the facade hands to the serializer.
+                ActiveEvents: ["goal_completed", "ci_failed", "package_published"],
+                ValidActiveEvents:
+                [
+                    "goal_completed", "goal_failed", "ci_failed", "issue_raised",
+                    "package_published", "ci_succeeded", "release_completed",
+                    "goal_dispatched", "issue_resolved",
+                ],
+                ThrottleSeconds: 60));
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal("copilot/composer", root.GetProperty("model").GetString());
+        Assert.Equal(80, root.GetProperty("maxSteps").GetInt32());
+        Assert.Equal("medium", root.GetProperty("reasoningEffort").GetString());
+        var notif = root.GetProperty("eventNotifications");
+        Assert.Equal("active", notif.GetProperty("mode").GetString());
+        Assert.Equal(
+            ["goal_completed", "ci_failed", "package_published"],
+            notif.GetProperty("activeEvents").EnumerateArray().Select(e => e.GetString()).ToList());
+        Assert.Equal(60, notif.GetProperty("throttleSeconds").GetInt32());
+    }
 }

@@ -264,3 +264,77 @@ public sealed record RepositoryPublishNuGetDto(IReadOnlyList<RepositoryPackageDt
 /// </summary>
 /// <param name="PackageId">NuGet package ID (e.g. "My.Library").</param>
 public sealed record RepositoryPackageDto(string PackageId);
+
+/// <summary>
+/// Response DTO for GET /api/config/workers — a TOP-LEVEL dictionary keyed by worker role.
+/// Derives from <see cref="Dictionary{TKey,TValue}"/> so the JSON output is the same
+/// role-keyed object the pre-facade endpoint produced; a conventional wrapper record would
+/// change the wire shape.
+/// </summary>
+public sealed class WorkersConfigDto : Dictionary<string, WorkerEntryDto>
+{
+    /// <summary>Creates an empty workers dictionary.</summary>
+    public WorkersConfigDto()
+    {
+    }
+}
+
+/// <summary>
+/// Response DTO for a single worker role's settings in GET /api/config/workers.
+/// </summary>
+/// <param name="Model">Standard model for the role, or <c>null</c> when unset.</param>
+/// <param name="PremiumModel">Premium model for the role, or <c>null</c> when unset.</param>
+/// <param name="ContextWindow">Context window in tokens (0 when unset).</param>
+public sealed record WorkerEntryDto(string? Model, string? PremiumModel, int? ContextWindow);
+
+/// <summary>
+/// Response DTO for GET /api/config/orchestrator. Mirrors the pre-facade projection — the
+/// endpoint serialized the raw <see cref="OrchestratorConfig"/> object, so every property is
+/// present with the same name and order.
+/// </summary>
+/// <param name="Model">Orchestrator model identifier, or <c>null</c> when unset.</param>
+/// <param name="MaxIterations">Maximum number of goal iterations before giving up.</param>
+/// <param name="MaxRetriesPerTask">Maximum number of retries per individual task.</param>
+/// <param name="MaxParallelGoals">Maximum number of goals to execute in parallel.</param>
+/// <param name="VerboseLogging">Whether verbose logging is enabled.</param>
+/// <param name="BrainMaxSteps">Maximum tool-call steps the Brain agent may take per request.</param>
+/// <param name="BranchCleanupDelayHours">Delay in hours before deleting feature branches for completed goals.</param>
+/// <param name="WorkerTaskTimeoutMinutes">Maximum wall-clock minutes a single worker task may run.</param>
+/// <param name="ReasoningEffort">Orchestrator reasoning effort, or <c>null</c> when unset.</param>
+public sealed record OrchestratorConfigDto(
+    string? Model,
+    int MaxIterations,
+    int MaxRetriesPerTask,
+    int MaxParallelGoals,
+    bool VerboseLogging,
+    int BrainMaxSteps,
+    int BranchCleanupDelayHours,
+    int WorkerTaskTimeoutMinutes,
+    string? ReasoningEffort);
+
+/// <summary>
+/// Response DTO for GET /api/config/composer — the runtime-effective Composer settings
+/// projection (model, max steps, reasoning effort, and the typed event-notifications shape).
+/// </summary>
+/// <param name="Model">Composer model identifier, or <c>null</c> when unset.</param>
+/// <param name="MaxSteps">Maximum tool-call steps per Composer request.</param>
+/// <param name="ReasoningEffort">Composer reasoning effort, or <c>null</c> when unset.</param>
+/// <param name="EventNotifications">The effective event-notification configuration.</param>
+public sealed record ComposerConfigDto(
+    string? Model,
+    int MaxSteps,
+    string? ReasoningEffort,
+    ComposerEventNotificationsDto EventNotifications);
+
+/// <summary>
+/// Response DTO for the <c>eventNotifications</c> sub-object of GET /api/config/composer.
+/// </summary>
+/// <param name="Mode">Effective notification mode ("passive", "active", "off").</param>
+/// <param name="ActiveEvents">Active event names in canonical whitelist order.</param>
+/// <param name="ValidActiveEvents">All recognized active event names in canonical order.</param>
+/// <param name="ThrottleSeconds">Effective minimum seconds between active injection attempts.</param>
+public sealed record ComposerEventNotificationsDto(
+    string Mode,
+    IReadOnlyList<string> ActiveEvents,
+    IReadOnlyList<string> ValidActiveEvents,
+    int ThrottleSeconds);

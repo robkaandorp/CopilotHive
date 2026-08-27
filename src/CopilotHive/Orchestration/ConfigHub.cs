@@ -1,6 +1,4 @@
-using CopilotHive.Configuration;
 using CopilotHive.Services;
-using Microsoft.AspNetCore.Mvc;
 
 namespace CopilotHive.Orchestration;
 
@@ -156,140 +154,66 @@ public static class ConfigHub
         // ── Orchestrator settings ───────────────────────────────────────────
 
         // Get orchestrator settings
-        app.MapGet("/api/config/orchestrator", ([FromServices] HiveConfigFile? config) =>
+        app.MapGet("/api/config/orchestrator", () =>
         {
-            if (config is null)
-                return Results.NotFound(new { error = "Config repo not configured." });
-            return Results.Ok(config.Orchestrator);
+            var result = facade.GetOrchestrator();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update orchestrator settings
         app.MapMethods("/api/config/orchestrator", ["PATCH"], async (
-            OrchestratorSettingsUpdate update,
-            [FromServices] ConfigModelService? svc) =>
+            OrchestratorSettingsUpdate update) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            await svc.UpdateOrchestratorSettingsAsync(update);
-            return Results.Ok(new { saved = true });
+            var result = await facade.SaveOrchestratorAsync(update);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // ── Worker settings ─────────────────────────────────────────────────
 
         // Get workers
-        app.MapGet("/api/config/workers", ([FromServices] HiveConfigFile? config) =>
+        app.MapGet("/api/config/workers", () =>
         {
-            if (config is null)
-                return Results.NotFound(new { error = "Config repo not configured." });
-            return Results.Ok(config.Workers.ToDictionary(
-                kv => kv.Key,
-                kv => new { model = kv.Value.Model, premiumModel = kv.Value.PremiumModel, contextWindow = kv.Value.ContextWindow }));
+            var result = facade.GetWorkers();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update worker context windows
         app.MapMethods("/api/config/workers", ["PATCH"], async (
-            Dictionary<string, int> contextWindows,
-            [FromServices] ConfigModelService? svc) =>
+            Dictionary<string, int> contextWindows) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            await svc.UpdateWorkerContextWindowsAsync(contextWindows);
-            return Results.Ok(new { saved = true });
+            var result = await facade.SaveWorkersAsync(contextWindows);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // ── Composer settings ───────────────────────────────────────────────
 
         // Get composer settings (runtime-effective values, not raw storage)
-        app.MapGet("/api/config/composer", ([FromServices] HiveConfigFile? config) =>
+        app.MapGet("/api/config/composer", () =>
         {
-            if (config is null)
-                return Results.NotFound(new { error = "Config repo not configured." });
-
-            if (config.Composer is null)
-            {
-                return Results.Ok(new
-                {
-                    model = (string?)null,
-                    maxSteps = Constants.DefaultBrainMaxSteps,
-                    reasoningEffort = (string?)null,
-                    eventNotifications = new
-                    {
-                        mode = "passive",
-                        activeEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised" },
-                        validActiveEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published", "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved" },
-                        throttleSeconds = 30,
-                    },
-                });
-            }
-
-            var notif = config.Composer.EventNotifications;
-            var activeTypes = notif?.GetActiveEventTypes();
-            // Map through the whitelist order so the response is always canonical and stable.
-            var activeEvents = activeTypes is { Count: > 0 }
-                ? new[] { EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised, EventType.PackagePublished, EventType.CiSucceeded, EventType.ReleaseCompleted, EventType.GoalDispatched, EventType.IssueResolved }
-                    .Where(activeTypes.Contains)
-                    .Select(ToSnakeCase)
-                    .ToArray()
-                : new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised" };
-
-            return Results.Ok(new
-            {
-                model = config.Composer.Model,
-                maxSteps = config.Composer.MaxSteps,
-                reasoningEffort = config.Composer.ReasoningEffort,
-                eventNotifications = new
-                {
-                    mode = notif?.EffectiveMode ?? "passive",
-                    activeEvents,
-                    validActiveEvents = new[] { "goal_completed", "goal_failed", "ci_failed", "issue_raised", "package_published", "ci_succeeded", "release_completed", "goal_dispatched", "issue_resolved" },
-                    throttleSeconds = notif?.EffectiveThrottleSeconds ?? 30,
-                },
-            });
+            var result = facade.GetComposer();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update composer settings
         app.MapMethods("/api/config/composer", ["PATCH"], async (
             ComposerSettingsUpdate update,
-            [FromServices] ConfigModelService? svc,
             CancellationToken ct) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            try
-            {
-                await svc.UpdateComposerSettingsAsync(update, ct);
-                return Results.Ok(new { saved = true });
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
+            var result = await facade.SaveComposerAsync(update, ct);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
-    }
-
-    /// <summary>
-    /// Converts an <see cref="EventType"/> to its canonical snake_case wire form
-    /// (e.g. <c>GoalCompleted</c> → <c>"goal_completed"</c>).
-    /// </summary>
-    private static string ToSnakeCase(EventType type)
-    {
-        var name = type.ToString();
-        var sb = new System.Text.StringBuilder(name.Length + 4);
-        for (var i = 0; i < name.Length; i++)
-        {
-            var c = name[i];
-            if (char.IsUpper(c))
-            {
-                if (i > 0)
-                    sb.Append('_');
-                sb.Append(char.ToLowerInvariant(c));
-            }
-            else
-            {
-                sb.Append(c);
-            }
-        }
-        return sb.ToString();
     }
 
     /// <summary>

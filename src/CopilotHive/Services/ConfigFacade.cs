@@ -175,6 +175,61 @@ public interface IConfigFacade
     /// when the repository does not exist.
     /// </returns>
     Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(string name);
+
+    /// <summary>
+    /// Reads the orchestrator-level settings (model, iteration limits, logging, timeouts).
+    /// </summary>
+    /// <returns>The orchestrator settings, or <see cref="FacadeErrorKind.NotFound"/> when no
+    /// <see cref="HiveConfigFile"/> is registered.</returns>
+    FacadeResult<OrchestratorConfigDto> GetOrchestrator();
+
+    /// <summary>
+    /// Persists orchestrator-level setting changes (validate → mutate → write → commit).
+    /// </summary>
+    /// <param name="update">The orchestrator settings to apply.</param>
+    /// <returns>
+    /// Success with the saved result, or <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered. Any other exception propagates to the caller.
+    /// </returns>
+    Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(OrchestratorSettingsUpdate update);
+
+    /// <summary>
+    /// Reads the per-role worker settings (model, premium model, context window) keyed by role.
+    /// </summary>
+    /// <returns>The workers dictionary, or <see cref="FacadeErrorKind.NotFound"/> when no
+    /// <see cref="HiveConfigFile"/> is registered.</returns>
+    FacadeResult<WorkersConfigDto> GetWorkers();
+
+    /// <summary>
+    /// Persists per-role worker context windows (validate → mutate → write → commit).
+    /// </summary>
+    /// <param name="contextWindows">Role → context window size mapping.</param>
+    /// <returns>
+    /// Success with the saved result, or <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered. Any other exception propagates to the caller.
+    /// </returns>
+    Task<FacadeResult<SavedResult>> SaveWorkersAsync(Dictionary<string, int> contextWindows);
+
+    /// <summary>
+    /// Reads the runtime-effective Composer settings (model, max steps, reasoning effort, and
+    /// the typed event-notifications shape).
+    /// </summary>
+    /// <returns>The Composer settings, or <see cref="FacadeErrorKind.NotFound"/> when no
+    /// <see cref="HiveConfigFile"/> is registered.</returns>
+    FacadeResult<ComposerConfigDto> GetComposer();
+
+    /// <summary>
+    /// Persists Composer setting changes (validate → mutate → write → commit).
+    /// </summary>
+    /// <param name="update">The Composer settings to apply.</param>
+    /// <param name="ct">Cancellation token forwarded to the persistence layer.</param>
+    /// <returns>
+    /// Success with the saved result, <see cref="FacadeErrorKind.BadRequest"/> when the update
+    /// is invalid (e.g. an unknown notification mode or event name), or
+    /// <see cref="FacadeErrorKind.NotConfigured"/> when no <see cref="ConfigModelService"/> is
+    /// registered. Cancellation and any other exception propagate to the caller.
+    /// </returns>
+    Task<FacadeResult<SavedResult>> SaveComposerAsync(ComposerSettingsUpdate update, CancellationToken ct);
 }
 
 /// <summary>
@@ -547,5 +602,184 @@ public sealed class ConfigFacade : IConfigFacade
         return removed
             ? new(true, new RemovedResult(true), null, FacadeErrorKind.None)
             : new(false, null, $"Repository '{name}' not found.", FacadeErrorKind.NotFound);
+    }
+
+    /// <inheritdoc />
+    public FacadeResult<OrchestratorConfigDto> GetOrchestrator()
+    {
+        var config = _hiveConfig;
+        if (config is null)
+        {
+            _log.LogWarning("Config repo is not configured.");
+            return new(false, null, "Config repo not configured.", FacadeErrorKind.NotFound);
+        }
+
+        // The pre-facade handler serialized the raw OrchestratorConfig object, so every
+        // property is projected with the same name and order.
+        var o = config.Orchestrator;
+        return new(true, new OrchestratorConfigDto(
+            o.Model,
+            o.MaxIterations,
+            o.MaxRetriesPerTask,
+            o.MaxParallelGoals,
+            o.VerboseLogging,
+            o.BrainMaxSteps,
+            o.BranchCleanupDelayHours,
+            o.WorkerTaskTimeoutMinutes,
+            o.ReasoningEffort), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<SavedResult>> SaveOrchestratorAsync(OrchestratorSettingsUpdate update)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        await svc.UpdateOrchestratorSettingsAsync(update);
+        return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
+        // Any other exception propagates to the caller — the endpoint never caught it either.
+    }
+
+    /// <inheritdoc />
+    public FacadeResult<WorkersConfigDto> GetWorkers()
+    {
+        var config = _hiveConfig;
+        if (config is null)
+        {
+            _log.LogWarning("Config repo is not configured.");
+            return new(false, null, "Config repo not configured.", FacadeErrorKind.NotFound);
+        }
+
+        // The pre-facade handler projected a TOP-LEVEL role-keyed dictionary; the DTO derives
+        // from Dictionary so the JSON shape is identical.
+        var workers = new WorkersConfigDto();
+        foreach (var kv in config.Workers)
+            workers[kv.Key] = new WorkerEntryDto(kv.Value.Model, kv.Value.PremiumModel, kv.Value.ContextWindow);
+        return new(true, workers, null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<SavedResult>> SaveWorkersAsync(Dictionary<string, int> contextWindows)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        await svc.UpdateWorkerContextWindowsAsync(contextWindows);
+        return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
+        // Any other exception propagates to the caller — the endpoint never caught it either.
+    }
+
+    /// <inheritdoc />
+    public FacadeResult<ComposerConfigDto> GetComposer()
+    {
+        var config = _hiveConfig;
+        if (config is null)
+        {
+            _log.LogWarning("Config repo is not configured.");
+            return new(false, null, "Config repo not configured.", FacadeErrorKind.NotFound);
+        }
+
+        if (config.Composer is null)
+        {
+            return new(true, new ComposerConfigDto(
+                null,
+                Constants.DefaultBrainMaxSteps,
+                null,
+                new ComposerEventNotificationsDto(
+                    "passive",
+                    DefaultActiveEvents,
+                    ValidActiveEvents,
+                    30)), null, FacadeErrorKind.None);
+        }
+
+        var composer = config.Composer;
+        var notif = composer.EventNotifications;
+        var activeTypes = notif?.GetActiveEventTypes();
+        // Map through the whitelist order so the response is always canonical and stable.
+        var activeEvents = activeTypes is { Count: > 0 }
+            ? CanonicalEventOrder.Where(activeTypes.Contains).Select(ToSnakeCase).ToArray()
+            : DefaultActiveEvents;
+
+        return new(true, new ComposerConfigDto(
+            composer.Model,
+            composer.MaxSteps,
+            composer.ReasoningEffort,
+            new ComposerEventNotificationsDto(
+                notif?.EffectiveMode ?? "passive",
+                activeEvents,
+                ValidActiveEvents,
+                notif?.EffectiveThrottleSeconds ?? 30)), null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<SavedResult>> SaveComposerAsync(ComposerSettingsUpdate update, CancellationToken ct)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        try
+        {
+            await svc.UpdateComposerSettingsAsync(update, ct);
+            return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
+        }
+        catch (ArgumentException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.BadRequest);
+        }
+        // OperationCanceledException and any other exception propagate to the caller —
+        // the endpoint never caught them either.
+    }
+
+    /// <summary>The canonical snake_case names of the four default active events.</summary>
+    private static readonly string[] DefaultActiveEvents =
+        ["goal_completed", "goal_failed", "ci_failed", "issue_raised"];
+
+    /// <summary>All recognized active event types in canonical whitelist order.</summary>
+    private static readonly EventType[] CanonicalEventOrder =
+    [
+        EventType.GoalCompleted, EventType.GoalFailed, EventType.CiFailed, EventType.IssueRaised,
+        EventType.PackagePublished, EventType.CiSucceeded, EventType.ReleaseCompleted,
+        EventType.GoalDispatched, EventType.IssueResolved,
+    ];
+
+    /// <summary>All recognized active event names in canonical whitelist order.</summary>
+    private static readonly string[] ValidActiveEvents =
+        CanonicalEventOrder.Select(ToSnakeCase).ToArray();
+
+    /// <summary>
+    /// Converts an <see cref="EventType"/> to its canonical snake_case wire form
+    /// (e.g. <c>GoalCompleted</c> → <c>"goal_completed"</c>).
+    /// </summary>
+    private static string ToSnakeCase(EventType type)
+    {
+        var name = type.ToString();
+        var sb = new System.Text.StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (char.IsUpper(c))
+            {
+                if (i > 0)
+                    sb.Append('_');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
     }
 }
