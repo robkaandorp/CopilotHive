@@ -1,5 +1,7 @@
 using CopilotHive.Configuration;
 
+using CopilotHive.Persistence;
+
 using CopilotHive.Services;
 
 using Microsoft.Extensions.AI;
@@ -744,5 +746,60 @@ public sealed class FacadeDtosSerializationTests
             ["goal_completed", "ci_failed", "package_published"],
             notif.GetProperty("activeEvents").EnumerateArray().Select(e => e.GetString()).ToList());
         Assert.Equal(60, notif.GetProperty("throttleSeconds").GetInt32());
+    }
+
+    // ── Backup DTO ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The single backup DTO must serialize to the exact wire shape the backup endpoints
+    /// produced before the facade existed — the property names of
+    /// <see cref="BackupService.BackupInfo"/> under Web (camelCase) naming.
+    /// </summary>
+    [Fact]
+
+    public void BackupInfoDto_SerializesToTheBackupInfoWireShape()
+    {
+        var dto = new BackupInfoDto(
+            "copilothive-backup-20240102T030405.tar.gz",
+            123_456L,
+            new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc));
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+
+        Assert.Equal(
+            """{"fileName":"copilothive-backup-20240102T030405.tar.gz","sizeBytes":123456,"createdAt":"2024-01-02T03:04:05Z"}""",
+            json);
+    }
+
+    /// <summary>
+    /// Serializing the DTO and the original <see cref="BackupService.BackupInfo"/> record must
+    /// produce byte-identical JSON, so the create/list responses are unchanged by the migration.
+    /// </summary>
+    [Fact]
+
+    public void BackupInfoDto_ProducesIdenticalJsonToBackupServiceBackupInfo()
+    {
+        var createdAt = new DateTime(2030, 6, 7, 8, 9, 10, DateTimeKind.Utc);
+        var info = new BackupService.BackupInfo("copilothive-backup-20300607T080910.tar.gz", 7L, createdAt);
+        var dto = new BackupInfoDto(info.FileName, info.SizeBytes, info.CreatedAt);
+
+        Assert.Equal(
+            JsonSerializer.Serialize(info, JsonOpts),
+            JsonSerializer.Serialize(dto, JsonOpts));
+    }
+
+    [Fact]
+
+    public void BackupInfoDto_RoundTripsAllProperties()
+    {
+        var dto = new BackupInfoDto(
+            "copilothive-backup-19991231T235959.tar.gz",
+            0L,
+            new DateTime(1999, 12, 31, 23, 59, 59, DateTimeKind.Utc));
+
+        var json = JsonSerializer.Serialize(dto, JsonOpts);
+        var roundTripped = JsonSerializer.Deserialize<BackupInfoDto>(json, JsonOpts);
+
+        Assert.Equal(dto, roundTripped);
     }
 }

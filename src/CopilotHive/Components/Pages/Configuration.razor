@@ -4,12 +4,11 @@
 @using CopilotHive.Services
 @using Markdig
 @using Microsoft.Extensions.AI
-@using System.Net.Http.Json
-@using System.Text.Json.Serialization
 @implements IDisposable
 @inject ConfigRepoManager ConfigRepo
 @inject PageHeaderState PageHeader
-@inject HttpClient HttpClient
+@inject IConfigFacade ConfigFacade
+@inject IBackupFacade BackupFacade
 @inject IJSRuntime JS
 
 <p style="color:var(--text-muted);margin-bottom:1.5rem">
@@ -1106,76 +1105,11 @@ else
     private static string WireOrNone(ReasoningEffort? effort) =>
         ReasoningEffortOptions.WireValue(effort ?? ReasoningEffort.None);
 
-    private sealed record ModelConfigResponse(
-        [property: JsonPropertyName("orchestrator")]    string? Orchestrator,
-        [property: JsonPropertyName("composer")]        string? Composer,
-        [property: JsonPropertyName("compaction")]      string? Compaction,
-        [property: JsonPropertyName("workers")]         Dictionary<string, WorkerConfigDto>? Workers,
-        [property: JsonPropertyName("availableModels")] List<ModelEntryDto>? AvailableModels,
-        [property: JsonPropertyName("subAgentModels")]  List<ModelEntryDto>? SubAgentModels,
-        [property: JsonPropertyName("orchestratorReasoningEffort")] ReasoningEffort? OrchestratorReasoningEffort,
-        [property: JsonPropertyName("composerReasoningEffort")] ReasoningEffort? ComposerReasoningEffort,
-        [property: JsonPropertyName("workerReasoningEffort")] Dictionary<string, ReasoningEffort?>? WorkerReasoningEffort,
-        [property: JsonPropertyName("workerPremiumReasoningEffort")] Dictionary<string, ReasoningEffort?>? WorkerPremiumReasoningEffort);
-
-    private sealed record WorkerConfigDto(
-        [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("premiumModel")] string? PremiumModel);
-
-    private sealed record ModelEntryDto(
-        [property: JsonPropertyName("name")] string Name,
-        [property: JsonPropertyName("contextWindow")] int? ContextWindow,
-        [property: JsonPropertyName("reasoningEffort")] ReasoningEffort? ReasoningEffort,
-        [property: JsonPropertyName("description")] string? Description,
-        [property: JsonPropertyName("supportsVision")] bool? SupportsVision = null);
-
-    private sealed record DiscoveredModelDto(
-        [property: JsonPropertyName("id")] string Id,
-        [property: JsonPropertyName("name")] string Name,
-        [property: JsonPropertyName("vendor")] string? Vendor,
-        [property: JsonPropertyName("contextWindow")] int? ContextWindow,
-        [property: JsonPropertyName("enabled")] bool Enabled);
-
-    private sealed record BackupInfoResponse(
-        [property: JsonPropertyName("fileName")] string FileName,
-        [property: JsonPropertyName("sizeBytes")] long SizeBytes,
-        [property: JsonPropertyName("createdAt")] DateTime CreatedAt);
-
-    private sealed record RepositoryDto(
-        [property: JsonPropertyName("name")] string Name,
-        [property: JsonPropertyName("url")] string Url,
-        [property: JsonPropertyName("defaultBranch")] string DefaultBranch,
-        [property: JsonPropertyName("release")] ReleaseDto? Release,
-        [property: JsonPropertyName("monitorCi")] bool MonitorCi,
-        [property: JsonPropertyName("ciTimeoutMinutes")] int CiTimeoutMinutes);
-
-    private sealed record ReleaseDto(
-        [property: JsonPropertyName("mergeTo")] string? MergeTo,
-        [property: JsonPropertyName("tagBranch")] string? TagBranch);
-
-    private sealed record OrchestratorConfigResponse(
-        [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("maxIterations")] int MaxIterations,
-        [property: JsonPropertyName("maxRetriesPerTask")] int MaxRetriesPerTask,
-        [property: JsonPropertyName("maxParallelGoals")] int MaxParallelGoals,
-        [property: JsonPropertyName("verboseLogging")] bool VerboseLogging,
-        [property: JsonPropertyName("brainMaxSteps")] int BrainMaxSteps,
-        [property: JsonPropertyName("branchCleanupDelayHours")] int BranchCleanupDelayHours);
-
-    private sealed record WorkerResponseDto(
-        [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("premiumModel")] string? PremiumModel,
-        [property: JsonPropertyName("contextWindow")] int ContextWindow);
-
-    private sealed record ComposerConfigResponse(
-        [property: JsonPropertyName("model")] string? Model,
-        [property: JsonPropertyName("maxSteps")] int MaxSteps,
-        [property: JsonPropertyName("eventNotifications")] EventNotificationsDto? EventNotifications);
-
-    private sealed record EventNotificationsDto(
-        [property: JsonPropertyName("mode")] string Mode,
-        [property: JsonPropertyName("activeEvents")] List<string> ActiveEvents,
-        [property: JsonPropertyName("throttleSeconds")] int ThrottleSeconds);
+    // The page consumes the shared facade DTOs from CopilotHive.Services (FacadeDtos.cs)
+    // directly — ModelsConfigDto, AvailableModelDto, ConfigSubAgentModelDto, DiscoveredModelDto,
+    // RepositoryDto, OrchestratorConfigDto, WorkersConfigDto, ComposerConfigDto and
+    // BackupInfoDto. They carry exactly the shapes this page used to deserialize from JSON,
+    // so no local response records are needed.
 
     private bool _loading = true;
     private string? _error;
@@ -1183,7 +1117,7 @@ else
     private readonly Dictionary<string, string> _files = [];
     private List<string> _tabs = [];
 
-    private ModelConfigResponse? _modelsData;
+    private ModelsConfigDto? _modelsData;
     private bool _modelsLoading;
     private bool _modelsSaving;
     private bool _saveSuccess;
@@ -1218,14 +1152,14 @@ else
     private string _docwriterPremiumReasoningEffort = "none";
     private string _improverPremiumReasoningEffort = "none";
 
-    private List<BackupInfoResponse> _backups = [];
+    private IReadOnlyList<BackupInfoDto> _backups = [];
     private bool _backupsLoading;
     private bool _backupCreating;
     private string? _backupError;
     private bool _backupSuccess;
 
     // Available Models tab state
-    private List<DiscoveredModelDto> _discoveredModels = [];
+    private IReadOnlyList<DiscoveredModelDto> _discoveredModels = [];
     private bool _discoveringModels;
     private bool _showDiscoveryModal;
     private HashSet<string> _selectedDiscoveredIds = [];
@@ -1257,7 +1191,7 @@ else
     private string? _subAgentModelsSuccess;
 
     // Repositories tab
-    private List<RepositoryDto> _repositories = [];
+    private IReadOnlyList<RepositoryDto> _repositories = [];
     private bool _reposLoading;
     private bool _repoSaving;
     private string? _repoError;
@@ -1284,7 +1218,7 @@ else
     private int _branchFetchGeneration;
 
     // Orchestrator tab
-    private OrchestratorConfigResponse? _orchestratorData;
+    private OrchestratorConfigDto? _orchestratorData;
     private bool _orchestratorLoading;
     private bool _orchestratorSaving;
     private string? _orchestratorSaveError;
@@ -1297,7 +1231,7 @@ else
     private int _orchBranchCleanupDelayHours;
 
     // Workers tab
-    private Dictionary<string, WorkerResponseDto>? _workersData;
+    private WorkersConfigDto? _workersData;
     private bool _workersLoading;
     private bool _workersSaving;
     private string? _workersSaveError;
@@ -1309,7 +1243,7 @@ else
     private int _improverContextWindow;
 
     // Composer tab
-    private ComposerConfigResponse? _composerData;
+    private ComposerConfigDto? _composerData;
     private bool _composerLoading;
     private bool _composerSaving;
     private string? _composerSaveError;
@@ -1373,45 +1307,59 @@ else
         _tabs.Insert(7, ComposerTabName);
     }
 
-    private async Task LoadModelsAsync()
+    // Load methods that only read through the synchronous facade projections return a completed
+    // Task rather than being `async`: they keep the awaited call-site shape the page already
+    // uses while carrying no await (which would be a CS1998 warning under TreatWarningsAsErrors).
+    // Reads go through the synchronous IConfigFacade projections, so this method carries no
+    // await. It stays Task-returning (rather than `async`) to keep the awaited call sites
+    // unchanged without tripping CS1998 under TreatWarningsAsErrors.
+    private Task LoadModelsAsync()
     {
         _modelsLoading = true;
         try
         {
-            _modelsData = await HttpClient.GetFromJsonAsync<ModelConfigResponse>("/api/config/models", ReasoningEffortOptions.JsonOptions);
+            var result = ConfigFacade.GetModels();
+            if (!result.Success)
+            {
+                // Same inner message the endpoint body carried, without an HTTP status prefix.
+                _saveError = $"Failed to load model config: {result.Error}";
+                return Task.CompletedTask;
+            }
+
+            _modelsData = result.Value;
             if (_modelsData is not null)
             {
                 _orchestratorModel = _modelsData.Orchestrator ?? "";
                 _composerModel     = _modelsData.Composer ?? _modelsData.Orchestrator ?? "";
                 _compactionModel   = _modelsData.Compaction ?? "";
-                _coderModel        = _modelsData.Workers?.GetValueOrDefault("coder")?.Model
+                _coderModel        = _modelsData.Workers.GetValueOrDefault("coder")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
-                _testerModel       = _modelsData.Workers?.GetValueOrDefault("tester")?.Model
+                _testerModel       = _modelsData.Workers.GetValueOrDefault("tester")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
-                _reviewerModel     = _modelsData.Workers?.GetValueOrDefault("reviewer")?.Model
+                _reviewerModel     = _modelsData.Workers.GetValueOrDefault("reviewer")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
-                _docwriterModel    = _modelsData.Workers?.GetValueOrDefault("docwriter")?.Model
+                _docwriterModel    = _modelsData.Workers.GetValueOrDefault("docwriter")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
-                _improverModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.Model
+                _improverModel     = _modelsData.Workers.GetValueOrDefault("improver")?.Model
                                      ?? _modelsData.Orchestrator ?? "";
-                _coderPremiumModel        = _modelsData.Workers?.GetValueOrDefault("coder")?.PremiumModel ?? "";
-                _testerPremiumModel       = _modelsData.Workers?.GetValueOrDefault("tester")?.PremiumModel ?? "";
-                _reviewerPremiumModel     = _modelsData.Workers?.GetValueOrDefault("reviewer")?.PremiumModel ?? "";
-                _docwriterPremiumModel    = _modelsData.Workers?.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
-                _improverPremiumModel     = _modelsData.Workers?.GetValueOrDefault("improver")?.PremiumModel ?? "";
+                _coderPremiumModel        = _modelsData.Workers.GetValueOrDefault("coder")?.PremiumModel ?? "";
+                _testerPremiumModel       = _modelsData.Workers.GetValueOrDefault("tester")?.PremiumModel ?? "";
+                _reviewerPremiumModel     = _modelsData.Workers.GetValueOrDefault("reviewer")?.PremiumModel ?? "";
+                _docwriterPremiumModel    = _modelsData.Workers.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
+                _improverPremiumModel     = _modelsData.Workers.GetValueOrDefault("improver")?.PremiumModel ?? "";
 
                 _orchestratorReasoningEffort = WireOrNone(_modelsData.OrchestratorReasoningEffort);
                 _composerReasoningEffort     = WireOrNone(_modelsData.ComposerReasoningEffort);
-                _coderReasoningEffort        = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("coder"));
-                _testerReasoningEffort       = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("tester"));
-                _reviewerReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("reviewer"));
-                _docwriterReasoningEffort    = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("docwriter"));
-                _improverReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort?.GetValueOrDefault("improver"));
-                _coderPremiumReasoningEffort     = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("coder"));
-                _testerPremiumReasoningEffort    = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("tester"));
-                _reviewerPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("reviewer"));
-                _docwriterPremiumReasoningEffort = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("docwriter"));
-                _improverPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort?.GetValueOrDefault("improver"));
+                _coderReasoningEffort        = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("coder"));
+                _testerReasoningEffort       = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("tester"));
+                _reviewerReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("reviewer"));
+                _docwriterReasoningEffort    = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("docwriter"));
+                _improverReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("improver"));
+                _coderPremiumReasoningEffort     = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("coder"));
+                _testerPremiumReasoningEffort    = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("tester"));
+                _reviewerPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("reviewer"));
+                _docwriterPremiumReasoningEffort = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("docwriter"));
+                _improverPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("improver"));
             }
         }
         catch (Exception ex)
@@ -1422,6 +1370,8 @@ else
         {
             _modelsLoading = false;
         }
+
+        return Task.CompletedTask;
     }
 
     private async Task SaveModelsAsync()
@@ -1431,52 +1381,47 @@ else
         _saveError    = null;
         try
         {
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new
+            var update = new ModelConfigUpdate(
+                OrchestratorModel: _orchestratorModel,
+                ComposerModel: _composerModel,
+                WorkerModels: new Dictionary<string, string>
                 {
-                    orchestratorModel = _orchestratorModel,
-                    composerModel      = _composerModel,
-                    workerModels       = new Dictionary<string, string>
-                    {
-                        ["coder"]      = _coderModel,
-                        ["tester"]     = _testerModel,
-                        ["reviewer"]   = _reviewerModel,
-                        ["docwriter"]  = _docwriterModel,
-                        ["improver"]   = _improverModel,
-                    },
-                    premiumWorkerModels = new Dictionary<string, string>
-                    {
-                        ["coder"]      = _coderPremiumModel,
-                        ["tester"]     = _testerPremiumModel,
-                        ["reviewer"]   = _reviewerPremiumModel,
-                        ["docwriter"]  = _docwriterPremiumModel,
-                        ["improver"]   = _improverPremiumModel,
-                    },
-                    compactionModel = _compactionModel,
-                    orchestratorReasoningEffort = ParseReasoning(_orchestratorReasoningEffort),
-                    composerReasoningEffort = ParseReasoning(_composerReasoningEffort),
-                    workerReasoningEffort = new Dictionary<string, ReasoningEffort?>
-                    {
-                        ["coder"]     = ParseReasoning(_coderReasoningEffort),
-                        ["tester"]    = ParseReasoning(_testerReasoningEffort),
-                        ["reviewer"]  = ParseReasoning(_reviewerReasoningEffort),
-                        ["docwriter"] = ParseReasoning(_docwriterReasoningEffort),
-                        ["improver"]  = ParseReasoning(_improverReasoningEffort),
-                    },
-                    workerPremiumReasoningEffort = new Dictionary<string, ReasoningEffort?>
-                    {
-                        ["coder"]     = ParseReasoning(_coderPremiumReasoningEffort),
-                        ["tester"]    = ParseReasoning(_testerPremiumReasoningEffort),
-                        ["reviewer"]  = ParseReasoning(_reviewerPremiumReasoningEffort),
-                        ["docwriter"] = ParseReasoning(_docwriterPremiumReasoningEffort),
-                        ["improver"]  = ParseReasoning(_improverPremiumReasoningEffort),
-                    },
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
+                    ["coder"]      = _coderModel,
+                    ["tester"]     = _testerModel,
+                    ["reviewer"]   = _reviewerModel,
+                    ["docwriter"]  = _docwriterModel,
+                    ["improver"]   = _improverModel,
+                },
+                PremiumWorkerModels: new Dictionary<string, string>
+                {
+                    ["coder"]      = _coderPremiumModel,
+                    ["tester"]     = _testerPremiumModel,
+                    ["reviewer"]   = _reviewerPremiumModel,
+                    ["docwriter"]  = _docwriterPremiumModel,
+                    ["improver"]   = _improverPremiumModel,
+                },
+                CompactionModel: _compactionModel,
+                OrchestratorReasoningEffort: ParseReasoning(_orchestratorReasoningEffort),
+                ComposerReasoningEffort: ParseReasoning(_composerReasoningEffort),
+                WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?>
+                {
+                    ["coder"]     = ParseReasoning(_coderReasoningEffort),
+                    ["tester"]    = ParseReasoning(_testerReasoningEffort),
+                    ["reviewer"]  = ParseReasoning(_reviewerReasoningEffort),
+                    ["docwriter"] = ParseReasoning(_docwriterReasoningEffort),
+                    ["improver"]  = ParseReasoning(_improverReasoningEffort),
+                },
+                WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?>
+                {
+                    ["coder"]     = ParseReasoning(_coderPremiumReasoningEffort),
+                    ["tester"]    = ParseReasoning(_testerPremiumReasoningEffort),
+                    ["reviewer"]  = ParseReasoning(_reviewerPremiumReasoningEffort),
+                    ["docwriter"] = ParseReasoning(_docwriterPremiumReasoningEffort),
+                    ["improver"]  = ParseReasoning(_improverPremiumReasoningEffort),
+                });
 
-            var response = await HttpClient.PatchAsync("/api/config/models", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.SaveModelsAsync(update, CancellationToken.None);
+            if (result.Success)
             {
                 await LoadModelsAsync();
                 _saveSuccess = true;
@@ -1485,8 +1430,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _saveError = $"Save failed ({(int)response.StatusCode}): {error}";
+                _saveError = $"Save failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1500,13 +1444,22 @@ else
         }
     }
 
-    private async Task LoadBackupsAsync()
+    private Task LoadBackupsAsync()
     {
         _backupsLoading = true;
         try
         {
-            _backups = await HttpClient.GetFromJsonAsync<List<BackupInfoResponse>>("/api/backup", ReasoningEffortOptions.JsonOptions) ?? [];
-            _backupError = null;
+            var result = BackupFacade.GetBackups();
+            if (result.Success)
+            {
+                _backups = result.Value ?? [];
+                _backupError = null;
+            }
+            else
+            {
+                _backupError = $"Failed to load backups: {result.Error}";
+                _backups = [];
+            }
         }
         catch (Exception ex)
         {
@@ -1517,6 +1470,8 @@ else
         {
             _backupsLoading = false;
         }
+
+        return Task.CompletedTask;
     }
 
     private async Task CreateBackupAsync()
@@ -1526,8 +1481,8 @@ else
         _backupError = null;
         try
         {
-            var response = await HttpClient.PostAsync("/api/backup", null);
-            if (response.IsSuccessStatusCode)
+            var result = await BackupFacade.CreateBackupAsync(CancellationToken.None);
+            if (result.Success)
             {
                 await LoadBackupsAsync();
                 if (_backupError is null)
@@ -1539,8 +1494,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _backupError = $"Backup failed ({(int)response.StatusCode}): {error}";
+                _backupError = $"Backup failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1556,13 +1510,22 @@ else
 
     // ===== Repositories / Orchestrator / Workers / Composer tab methods =====
 
-    private async Task LoadRepositoriesAsync()
+    private Task LoadRepositoriesAsync()
     {
         _reposLoading = true;
         try
         {
-            _repositories = await HttpClient.GetFromJsonAsync<List<RepositoryDto>>("/api/config/repositories", ReasoningEffortOptions.JsonOptions) ?? [];
-            _repoError = null;
+            var result = ConfigFacade.GetRepositories();
+            if (result.Success)
+            {
+                _repositories = result.Value ?? [];
+                _repoError = null;
+            }
+            else
+            {
+                _repoError = $"Failed to load repositories: {result.Error}";
+                _repositories = [];
+            }
         }
         catch (Exception ex)
         {
@@ -1570,22 +1533,32 @@ else
             _repositories = [];
         }
         finally { _reposLoading = false; }
+
+        return Task.CompletedTask;
     }
 
-    private async Task LoadOrchestratorAsync()
+    private Task LoadOrchestratorAsync()
     {
         _orchestratorLoading = true;
         try
         {
-            _orchestratorData = await HttpClient.GetFromJsonAsync<OrchestratorConfigResponse>("/api/config/orchestrator", ReasoningEffortOptions.JsonOptions);
-            if (_orchestratorData is not null)
+            var result = ConfigFacade.GetOrchestrator();
+            if (!result.Success)
             {
-                _orchMaxIterations = _orchestratorData.MaxIterations;
-                _orchMaxRetriesPerTask = _orchestratorData.MaxRetriesPerTask;
-                _orchMaxParallelGoals = _orchestratorData.MaxParallelGoals;
-                _orchVerboseLogging = _orchestratorData.VerboseLogging;
-                _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
-                _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
+                _orchestratorSaveError = $"Failed to load orchestrator settings: {result.Error}";
+            }
+            else
+            {
+                _orchestratorData = result.Value;
+                if (_orchestratorData is not null)
+                {
+                    _orchMaxIterations = _orchestratorData.MaxIterations;
+                    _orchMaxRetriesPerTask = _orchestratorData.MaxRetriesPerTask;
+                    _orchMaxParallelGoals = _orchestratorData.MaxParallelGoals;
+                    _orchVerboseLogging = _orchestratorData.VerboseLogging;
+                    _orchBrainMaxSteps = _orchestratorData.BrainMaxSteps;
+                    _orchBranchCleanupDelayHours = _orchestratorData.BranchCleanupDelayHours;
+                }
             }
         }
         catch (Exception ex)
@@ -1593,21 +1566,31 @@ else
             _orchestratorSaveError = $"Failed to load orchestrator settings: {ex.Message}";
         }
         finally { _orchestratorLoading = false; }
+
+        return Task.CompletedTask;
     }
 
-    private async Task LoadWorkersAsync()
+    private Task LoadWorkersAsync()
     {
         _workersLoading = true;
         try
         {
-            _workersData = await HttpClient.GetFromJsonAsync<Dictionary<string, WorkerResponseDto>>("/api/config/workers", ReasoningEffortOptions.JsonOptions);
-            if (_workersData is not null)
+            var result = ConfigFacade.GetWorkers();
+            if (!result.Success)
             {
-                _coderContextWindow = _workersData.GetValueOrDefault("coder")?.ContextWindow ?? 0;
-                _testerContextWindow = _workersData.GetValueOrDefault("tester")?.ContextWindow ?? 0;
-                _reviewerContextWindow = _workersData.GetValueOrDefault("reviewer")?.ContextWindow ?? 0;
-                _docwriterContextWindow = _workersData.GetValueOrDefault("docwriter")?.ContextWindow ?? 0;
-                _improverContextWindow = _workersData.GetValueOrDefault("improver")?.ContextWindow ?? 0;
+                _workersSaveError = $"Failed to load worker settings: {result.Error}";
+            }
+            else
+            {
+                _workersData = result.Value;
+                if (_workersData is not null)
+                {
+                    _coderContextWindow = _workersData.GetValueOrDefault("coder")?.ContextWindow ?? 0;
+                    _testerContextWindow = _workersData.GetValueOrDefault("tester")?.ContextWindow ?? 0;
+                    _reviewerContextWindow = _workersData.GetValueOrDefault("reviewer")?.ContextWindow ?? 0;
+                    _docwriterContextWindow = _workersData.GetValueOrDefault("docwriter")?.ContextWindow ?? 0;
+                    _improverContextWindow = _workersData.GetValueOrDefault("improver")?.ContextWindow ?? 0;
+                }
             }
         }
         catch (Exception ex)
@@ -1615,37 +1598,47 @@ else
             _workersSaveError = $"Failed to load worker settings: {ex.Message}";
         }
         finally { _workersLoading = false; }
+
+        return Task.CompletedTask;
     }
 
-    private async Task LoadComposerAsync()
+    private Task LoadComposerAsync()
     {
         _composerLoading = true;
         try
         {
-            _composerData = await HttpClient.GetFromJsonAsync<ComposerConfigResponse>("/api/config/composer", ReasoningEffortOptions.JsonOptions);
-            if (_composerData is not null)
+            var result = ConfigFacade.GetComposer();
+            if (!result.Success)
             {
-                _composerMaxSteps = _composerData.MaxSteps;
-                _composerNotifMode = _composerData.EventNotifications?.Mode ?? "passive";
-                _composerNotifThrottle = _composerData.EventNotifications?.ThrottleSeconds ?? 30;
-                _composerNotifActiveEvents.Clear();
-                if (_composerData.EventNotifications?.ActiveEvents is { Count: > 0 } active)
-                {
-                    foreach (var name in active)
-                        _composerNotifActiveEvents.Add(name);
-                }
+                _composerSaveError = $"Failed to load composer settings: {result.Error}";
             }
             else
             {
-                // Composer not configured yet — show defaults so the user can create it
-                _composerMaxSteps = CopilotHive.Constants.DefaultBrainMaxSteps;
-                _composerNotifMode = "passive";
-                _composerNotifThrottle = 30;
-                _composerNotifActiveEvents.Clear();
-                _composerNotifActiveEvents.Add("goal_completed");
-                _composerNotifActiveEvents.Add("goal_failed");
-                _composerNotifActiveEvents.Add("ci_failed");
-                _composerNotifActiveEvents.Add("issue_raised");
+                _composerData = result.Value;
+                if (_composerData is not null)
+                {
+                    _composerMaxSteps = _composerData.MaxSteps;
+                    _composerNotifMode = _composerData.EventNotifications?.Mode ?? "passive";
+                    _composerNotifThrottle = _composerData.EventNotifications?.ThrottleSeconds ?? 30;
+                    _composerNotifActiveEvents.Clear();
+                    if (_composerData.EventNotifications?.ActiveEvents is { Count: > 0 } active)
+                    {
+                        foreach (var name in active)
+                            _composerNotifActiveEvents.Add(name);
+                    }
+                }
+                else
+                {
+                    // Composer not configured yet — show defaults so the user can create it
+                    _composerMaxSteps = CopilotHive.Constants.DefaultBrainMaxSteps;
+                    _composerNotifMode = "passive";
+                    _composerNotifThrottle = 30;
+                    _composerNotifActiveEvents.Clear();
+                    _composerNotifActiveEvents.Add("goal_completed");
+                    _composerNotifActiveEvents.Add("goal_failed");
+                    _composerNotifActiveEvents.Add("ci_failed");
+                    _composerNotifActiveEvents.Add("issue_raised");
+                }
             }
         }
         catch (Exception ex)
@@ -1653,6 +1646,8 @@ else
             _composerSaveError = $"Failed to load composer settings: {ex.Message}";
         }
         finally { _composerLoading = false; }
+
+        return Task.CompletedTask;
     }
 
     private async Task SaveOrchestratorAsync()
@@ -1662,20 +1657,14 @@ else
         _orchestratorSaveError = null;
         try
         {
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    maxIterations = _orchMaxIterations,
-                    maxRetriesPerTask = _orchMaxRetriesPerTask,
-                    maxParallelGoals = _orchMaxParallelGoals,
-                    verboseLogging = _orchVerboseLogging,
-                    brainMaxSteps = _orchBrainMaxSteps,
-                    branchCleanupDelayHours = _orchBranchCleanupDelayHours,
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-            var response = await HttpClient.PatchAsync("/api/config/orchestrator", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.SaveOrchestratorAsync(new OrchestratorSettingsUpdate(
+                MaxIterations: _orchMaxIterations,
+                MaxRetriesPerTask: _orchMaxRetriesPerTask,
+                MaxParallelGoals: _orchMaxParallelGoals,
+                VerboseLogging: _orchVerboseLogging,
+                BrainMaxSteps: _orchBrainMaxSteps,
+                BranchCleanupDelayHours: _orchBranchCleanupDelayHours));
+            if (result.Success)
             {
                 await LoadOrchestratorAsync();
                 _orchestratorSaveSuccess = "✅ Saved successfully";
@@ -1684,8 +1673,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _orchestratorSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+                _orchestratorSaveError = $"Save failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1702,19 +1690,15 @@ else
         _workersSaveError = null;
         try
         {
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, int>
-                {
-                    ["coder"] = _coderContextWindow,
-                    ["tester"] = _testerContextWindow,
-                    ["reviewer"] = _reviewerContextWindow,
-                    ["docwriter"] = _docwriterContextWindow,
-                    ["improver"] = _improverContextWindow,
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-            var response = await HttpClient.PatchAsync("/api/config/workers", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.SaveWorkersAsync(new Dictionary<string, int>
+            {
+                ["coder"] = _coderContextWindow,
+                ["tester"] = _testerContextWindow,
+                ["reviewer"] = _reviewerContextWindow,
+                ["docwriter"] = _docwriterContextWindow,
+                ["improver"] = _improverContextWindow,
+            });
+            if (result.Success)
             {
                 await LoadWorkersAsync();
                 _workersSaveSuccess = "✅ Saved successfully";
@@ -1723,8 +1707,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _workersSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+                _workersSaveError = $"Save failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1783,18 +1766,12 @@ else
                 return;
             }
 
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    maxSteps = _composerMaxSteps,
-                    eventNotificationsMode = _composerNotifMode,
-                    eventNotificationsActiveEvents = _composerNotifActiveEvents.ToList(),
-                    eventNotificationsThrottleSeconds = _composerNotifThrottle,
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-            var response = await HttpClient.PatchAsync("/api/config/composer", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.SaveComposerAsync(new ComposerSettingsUpdate(
+                MaxSteps: _composerMaxSteps,
+                EventNotificationsMode: _composerNotifMode,
+                EventNotificationsActiveEvents: _composerNotifActiveEvents.ToList(),
+                EventNotificationsThrottleSeconds: _composerNotifThrottle), CancellationToken.None);
+            if (result.Success)
             {
                 await LoadComposerAsync();
                 _composerSaveSuccess = "✅ Saved successfully";
@@ -1803,8 +1780,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _composerSaveError = $"Save failed ({(int)response.StatusCode}): {error}";
+                _composerSaveError = $"Save failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1828,16 +1804,23 @@ else
         try
         {
             var branch = string.IsNullOrWhiteSpace(_newRepoDefaultBranch) ? "main" : _newRepoDefaultBranch;
-            object? release = null;
+            ReleaseRepoConfig? release = null;
             if (!string.IsNullOrWhiteSpace(_newRepoMergeTo) || !string.IsNullOrWhiteSpace(_newRepoTagBranch))
             {
-                release = new { mergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo, tagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch };
+                release = new ReleaseRepoConfig
+                {
+                    MergeTo = string.IsNullOrWhiteSpace(_newRepoMergeTo) ? null : _newRepoMergeTo,
+                    TagBranch = string.IsNullOrWhiteSpace(_newRepoTagBranch) ? null : _newRepoTagBranch,
+                };
             }
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _newRepoName, url = _newRepoUrl, defaultBranch = branch, release, monitorCi = _newRepoMonitorCi, ciTimeoutMinutes = _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8, "application/json");
-            var response = await HttpClient.PostAsync("/api/config/repositories", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.AddRepositoryAsync(new RepositoryRequest(
+                Name: _newRepoName,
+                Url: _newRepoUrl,
+                DefaultBranch: branch,
+                Release: release,
+                MonitorCi: _newRepoMonitorCi,
+                CiTimeoutMinutes: _newRepoMonitorCi ? _newRepoCiTimeout : (int?)null));
+            if (result.Success)
             {
                 _newRepoName = ""; _newRepoUrl = ""; _newRepoDefaultBranch = "main"; _newRepoMergeTo = ""; _newRepoTagBranch = "";
                 _newRepoMonitorCi = false; _newRepoCiTimeout = 30;
@@ -1849,8 +1832,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _repoError = $"Add failed ({(int)response.StatusCode}): {error}";
+                _repoError = $"Add failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1881,11 +1863,21 @@ else
         var generation = ++_branchFetchGeneration;
         try
         {
-            var branches = await HttpClient.GetFromJsonAsync<List<string>>(
-                $"/api/config/repositories/{Uri.EscapeDataString(repo.Name)}/branches", ReasoningEffortOptions.JsonOptions, token);
+            // The repository routes never unescaped the name, so the facade receives it raw.
+            var result = await ConfigFacade.GetBranchesAsync(repo.Name, token);
             if (generation == _branchFetchGeneration)
             {
-                _repoBranches = branches;
+                if (result.Success)
+                {
+                    _repoBranches = result.Value?.ToList();
+                }
+                else if (!token.IsCancellationRequested)
+                {
+                    // A cancelled fetch is a stale request and must stay silent — the facade
+                    // reports cancellation as a failed result instead of throwing, so the token
+                    // is what distinguishes "superseded" from a real failure.
+                    _branchLoadError = true;
+                }
             }
         }
         catch (OperationCanceledException) { /* stale request */ }
@@ -1918,19 +1910,22 @@ else
         try
         {
             var branch = string.IsNullOrWhiteSpace(_editRepoDefaultBranch) ? "main" : _editRepoDefaultBranch;
-            // Always send a non-null release object on the edit (PUT) path so clearing both
+            // Always send a non-null release object on the edit path so clearing both
             // fields replaces (and removes) any existing release config. UpdateRepositoryAsync
             // normalizes an empty object to null, effectively disabling release automation.
-            object release = new
+            var release = new ReleaseRepoConfig
             {
-                mergeTo = string.IsNullOrWhiteSpace(_editRepoMergeTo) ? null : _editRepoMergeTo,
-                tagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch
+                MergeTo = string.IsNullOrWhiteSpace(_editRepoMergeTo) ? null : _editRepoMergeTo,
+                TagBranch = string.IsNullOrWhiteSpace(_editRepoTagBranch) ? null : _editRepoTagBranch,
             };
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new { name = _editingRepoName, url = _editRepoUrl, defaultBranch = branch, release, monitorCi = _editRepoMonitorCi, ciTimeoutMinutes = _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8, "application/json");
-            var response = await HttpClient.PutAsync($"/api/config/repositories/{Uri.EscapeDataString(_editingRepoName)}", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.UpdateRepositoryAsync(_editingRepoName, new RepositoryRequest(
+                Name: _editingRepoName,
+                Url: _editRepoUrl,
+                DefaultBranch: branch,
+                Release: release,
+                MonitorCi: _editRepoMonitorCi,
+                CiTimeoutMinutes: _editRepoMonitorCi ? _editRepoCiTimeout : (int?)null));
+            if (result.Success)
             {
                 _editingRepoName = null;
                 await LoadRepositoriesAsync();
@@ -1940,8 +1935,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _repoError = $"Update failed ({(int)response.StatusCode}): {error}";
+                _repoError = $"Update failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1958,8 +1952,8 @@ else
         if (!confirmed) return;
         try
         {
-            var response = await HttpClient.DeleteAsync($"/api/config/repositories/{Uri.EscapeDataString(name)}");
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.RemoveRepositoryAsync(name);
+            if (result.Success)
             {
                 await LoadRepositoriesAsync();
                 _repoSuccess = "✅ Repository removed";
@@ -1968,8 +1962,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _repoError = $"Remove failed ({(int)response.StatusCode}): {error}";
+                _repoError = $"Remove failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -1996,8 +1989,15 @@ else
         _availableModelsSuccess = null;
         try
         {
-            _discoveredModels = await HttpClient.GetFromJsonAsync<List<DiscoveredModelDto>>("/api/config/models/discover", ReasoningEffortOptions.JsonOptions) ?? [];
-            _discoveredModels = _discoveredModels.OrderBy(m => m.Name ?? m.Id, StringComparer.OrdinalIgnoreCase).ToList();
+            var result = await ConfigFacade.DiscoverModelsAsync();
+            if (!result.Success)
+            {
+                _availableModelsError = $"Discovery failed: {result.Error}";
+                return;
+            }
+
+            _discoveredModels = (result.Value ?? [])
+                .OrderBy(m => m.Name ?? m.Id, StringComparer.OrdinalIgnoreCase).ToList();
             _selectedDiscoveredIds.Clear();
             _showDiscoveryModal = true;
         }
@@ -2020,11 +2020,10 @@ else
         {
             foreach (var dm in _discoveredModels.Where(m => _selectedDiscoveredIds.Contains(m.Id)))
             {
-                var response = await PostAvailableModelAsync(dm.Id, dm.ContextWindow, null);
-                if (!response.IsSuccessStatusCode)
+                var result = await AddAvailableModelEntryAsync(dm.Id, dm.ContextWindow, null);
+                if (!result.Success)
                 {
-                    var error = await response.Content.ReadAsStringAsync();
-                    _availableModelsError = $"Failed to add '{dm.Id}' ({(int)response.StatusCode}): {error}";
+                    _availableModelsError = $"Failed to add '{dm.Id}': {result.Error}";
                 }
             }
             _selectedDiscoveredIds.Clear();
@@ -2055,8 +2054,8 @@ else
         try
         {
             var newDescription = string.IsNullOrWhiteSpace(_newModelDescription) ? null : _newModelDescription;
-            var response = await PostAvailableModelAsync(_newModelName, _newModelContextWindow, newDescription, _newModelSupportsVision);
-            if (response.IsSuccessStatusCode)
+            var result = await AddAvailableModelEntryAsync(_newModelName, _newModelContextWindow, newDescription, _newModelSupportsVision);
+            if (result.Success)
             {
                 _newModelName = "";
                 _newModelContextWindow = null;
@@ -2068,8 +2067,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _availableModelsError = $"Add failed ({(int)response.StatusCode}): {error}";
+                _availableModelsError = $"Add failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -2082,7 +2080,7 @@ else
         }
     }
 
-    private void StartEditModel(ModelEntryDto model)
+    private void StartEditModel(AvailableModelDto model)
     {
         _editingModelName = model.Name;
         _editModelContextWindow = model.ContextWindow;
@@ -2106,19 +2104,14 @@ else
         try
         {
             var editDescription = string.IsNullOrWhiteSpace(_editModelDescription) ? null : _editModelDescription;
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    name = _editingModelName,
-                    contextWindow = _editModelContextWindow,
-                    description = editDescription,
-                    supportsVision = _editModelSupportsVision,
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-
-            var response = await HttpClient.PutAsync($"/api/config/available-models/{Uri.EscapeDataString(_editingModelName)}", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.UpdateAvailableModelAsync(
+                _editingModelName,
+                new AvailableModelRequest(
+                    Name: _editingModelName,
+                    ContextWindow: _editModelContextWindow,
+                    Description: editDescription,
+                    SupportsVision: _editModelSupportsVision));
+            if (result.Success)
             {
                 _editingModelName = null;
                 await LoadModelsAsync();
@@ -2126,8 +2119,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _availableModelsError = $"Update failed ({(int)response.StatusCode}): {error}";
+                _availableModelsError = $"Update failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -2151,16 +2143,15 @@ else
 
         try
         {
-            var response = await HttpClient.DeleteAsync($"/api/config/available-models/{Uri.EscapeDataString(name)}");
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.RemoveAvailableModelAsync(name);
+            if (result.Success)
             {
                 await LoadModelsAsync();
                 _availableModelsSuccess = "✅ Model removed";
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _availableModelsError = $"Remove failed ({(int)response.StatusCode}): {error}";
+                _availableModelsError = $"Remove failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -2188,36 +2179,12 @@ else
         _ => null,
     };
 
-    private Task<HttpResponseMessage> PostAvailableModelAsync(string name, int? contextWindow, string? description = null, bool? supportsVision = null)
-    {
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new
-            {
-                name,
-                contextWindow,
-                description,
-                supportsVision,
-            }, ReasoningEffortOptions.JsonOptions),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        return HttpClient.PostAsync("/api/config/available-models", body);
-    }
+    // Thin wrappers so both the single-add form and the bulk discovery path share one call shape.
+    private Task<FacadeResult<SavedResult>> AddAvailableModelEntryAsync(string name, int? contextWindow, string? description = null, bool? supportsVision = null) =>
+        ConfigFacade.AddAvailableModelAsync(new AvailableModelRequest(name, contextWindow, description, supportsVision));
 
-    private Task<HttpResponseMessage> PostSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision)
-    {
-        var body = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new
-            {
-                name,
-                contextWindow,
-                reasoningEffort,
-                description,
-                supportsVision,
-            }, ReasoningEffortOptions.JsonOptions),
-            System.Text.Encoding.UTF8,
-            "application/json");
-        return HttpClient.PostAsync("/api/config/sub-agent-models", body);
-    }
+    private Task<FacadeResult<SavedResult>> AddSubAgentModelEntryAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision) =>
+        ConfigFacade.AddSubAgentModelAsync(new SubAgentModelRequest(name, contextWindow, reasoningEffort, description, supportsVision));
 
     private async Task AddSubAgentModelAsync()
     {
@@ -2232,8 +2199,8 @@ else
         {
             var reasoning = ParseReasoning(_newSubAgentModelReasoningEffort);
             var description = string.IsNullOrWhiteSpace(_newSubAgentModelDescription) ? null : _newSubAgentModelDescription;
-            var response = await PostSubAgentModelAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
-            if (response.IsSuccessStatusCode)
+            var result = await AddSubAgentModelEntryAsync(_newSubAgentModelName, _newSubAgentModelContextWindow, reasoning, description, _newSubAgentModelSupportsVision);
+            if (result.Success)
             {
                 _newSubAgentModelName = "";
                 _newSubAgentModelContextWindow = null;
@@ -2246,8 +2213,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _subAgentModelsError = $"Add failed ({(int)response.StatusCode}): {error}";
+                _subAgentModelsError = $"Add failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -2260,7 +2226,7 @@ else
         }
     }
 
-    private void StartEditSubAgentModel(ModelEntryDto model)
+    private void StartEditSubAgentModel(ConfigSubAgentModelDto model)
     {
         _editingSubAgentModelName = model.Name;
         _editSubAgentModelContextWindow = model.ContextWindow;
@@ -2286,20 +2252,15 @@ else
         {
             var reasoning = ParseReasoning(_editSubAgentModelReasoningEffort);
             var description = string.IsNullOrWhiteSpace(_editSubAgentModelDescription) ? null : _editSubAgentModelDescription;
-            var body = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(new
-                {
-                    name = _editingSubAgentModelName,
-                    contextWindow = _editSubAgentModelContextWindow,
-                    reasoningEffort = reasoning,
-                    description,
-                    supportsVision = _editSubAgentModelSupportsVision,
-                }, ReasoningEffortOptions.JsonOptions),
-                System.Text.Encoding.UTF8,
-                "application/json");
-
-            var response = await HttpClient.PutAsync($"/api/config/sub-agent-models/{Uri.EscapeDataString(_editingSubAgentModelName)}", body);
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.UpdateSubAgentModelAsync(
+                _editingSubAgentModelName,
+                new SubAgentModelRequest(
+                    Name: _editingSubAgentModelName,
+                    ContextWindow: _editSubAgentModelContextWindow,
+                    ReasoningEffort: reasoning,
+                    Description: description,
+                    SupportsVision: _editSubAgentModelSupportsVision));
+            if (result.Success)
             {
                 _editingSubAgentModelName = null;
                 await LoadModelsAsync();
@@ -2307,8 +2268,7 @@ else
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _subAgentModelsError = $"Update failed ({(int)response.StatusCode}): {error}";
+                _subAgentModelsError = $"Update failed: {result.Error}";
             }
         }
         catch (Exception ex)
@@ -2332,16 +2292,15 @@ else
 
         try
         {
-            var response = await HttpClient.DeleteAsync($"/api/config/sub-agent-models/{Uri.EscapeDataString(name)}");
-            if (response.IsSuccessStatusCode)
+            var result = await ConfigFacade.RemoveSubAgentModelAsync(name);
+            if (result.Success)
             {
                 await LoadModelsAsync();
                 _subAgentModelsSuccess = "✅ Model removed";
             }
             else
             {
-                var error = await response.Content.ReadAsStringAsync();
-                _subAgentModelsError = $"Remove failed ({(int)response.StatusCode}): {error}";
+                _subAgentModelsError = $"Remove failed: {result.Error}";
             }
         }
         catch (Exception ex)

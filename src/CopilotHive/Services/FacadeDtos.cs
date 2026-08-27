@@ -338,3 +338,14 @@ public sealed record ComposerEventNotificationsDto(
     IReadOnlyList<string> ActiveEvents,
     IReadOnlyList<string> ValidActiveEvents,
     int ThrottleSeconds);
+/// <summary>
+/// Response DTO describing a single backup archive. Used by BOTH <c>GET /api/backup</c>
+/// (each list entry) and <c>POST /api/backup</c> (the newly created archive), because the
+/// create endpoint returns the same shape as a list entry. The property names mirror
+/// <c>BackupService.BackupInfo</c> exactly, so the wire shape is unchanged:
+/// <c>fileName</c>, <c>sizeBytes</c>, <c>createdAt</c>.
+/// </summary>
+/// <param name="FileName">The archive file name (e.g. <c>copilothive-backup-20240101T000000.tar.gz</c>).</param>
+/// <param name="SizeBytes">The archive size in bytes.</param>
+/// <param name="CreatedAt">The UTC creation time of the archive.</param>
+public sealed record BackupInfoDto(string FileName, long SizeBytes, DateTime CreatedAt);

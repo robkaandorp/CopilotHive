@@ -1,4 +1,5 @@
 using CopilotHive.Components.Pages;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests;
 
@@ -649,7 +650,7 @@ public sealed class ActiveModeConfigUiTests
         }
 
         // The not-configured default load must populate only the 4 defaults, never the new events.
-        var method = ExtractMethodSource(source, "private async Task LoadComposerAsync()");
+        var method = ExtractMethodSource(source, "private Task LoadComposerAsync()");
         var defaultsStart = method.IndexOf("_composerNotifActiveEvents.Add(\"goal_completed\")", StringComparison.Ordinal);
         Assert.True(defaultsStart >= 0, "Default load must seed goal_completed");
         var defaultsBody = method.Substring(defaultsStart);
@@ -670,37 +671,63 @@ public sealed class ActiveModeConfigUiTests
         Assert.Contains("_composerNotifActiveEvents.Count == 0", source);
     }
 
+    /// <summary>
+    /// The page consumes the SHARED facade DTOs (<c>ComposerConfigDto</c> and its nested
+    /// <c>EventNotifications</c> object) rather than local JSON-deserialization records, so the
+    /// notification shape is proven against the shared DTO type. The removed local
+    /// <c>EventNotificationsDto</c>/<c>JsonPropertyName</c> record must NOT come back — its
+    /// presence would mean the page is deserializing HTTP JSON again.
+    /// </summary>
     [Fact]
-    public void Configuration_Dto_ContainsEventNotificationsNestedRecord()
+    public void Configuration_Dto_UsesSharedComposerFacadeDto()
     {
         var source = ReadConfigurationSource();
-        Assert.Contains("record EventNotificationsDto", source);
-        Assert.Contains("JsonPropertyName(\"mode\")", source);
-        Assert.Contains("JsonPropertyName(\"activeEvents\")", source);
-        Assert.Contains("JsonPropertyName(\"throttleSeconds\")", source);
-        Assert.Contains("JsonPropertyName(\"eventNotifications\")", source);
+
+        Assert.Contains("ComposerConfigDto", source);
+        Assert.DoesNotContain("record EventNotificationsDto", source);
+        Assert.DoesNotContain("JsonPropertyName", source);
+
+        // The shared DTO carries the three notification fields the page binds to.
+        var notifications = typeof(ComposerEventNotificationsDto);
+        Assert.NotNull(notifications.GetProperty("Mode"));
+        Assert.NotNull(notifications.GetProperty("ActiveEvents"));
+        Assert.NotNull(notifications.GetProperty("ThrottleSeconds"));
+        Assert.NotNull(typeof(ComposerConfigDto).GetProperty("EventNotifications"));
     }
 
     [Fact]
     public void Configuration_LoadComposer_LoadsEffectiveValues()
     {
         var source = ReadConfigurationSource();
-        var method = ExtractMethodSource(source, "private async Task LoadComposerAsync()");
+        var method = ExtractMethodSource(source, "private Task LoadComposerAsync()");
         Assert.Contains("EventNotifications?.Mode", method);
         Assert.Contains("EventNotifications?.ThrottleSeconds", method);
         Assert.Contains("EventNotifications?.ActiveEvents", method);
     }
 
+    /// <summary>
+    /// The save must carry all three event-notification fields through the shared
+    /// <see cref="ComposerSettingsUpdate"/> and hand it to <c>IConfigFacade.SaveComposerAsync</c>
+    /// — not an HTTP PATCH. Asserting the facade call is removal-proof: reverting to
+    /// <c>HttpClient.PatchAsync("/api/config/composer", …)</c> fails this test.
+    /// </summary>
     [Fact]
     public void Configuration_SaveComposer_IncludesEventNotificationFields()
     {
         var source = ReadConfigurationSource();
         var method = ExtractMethodSource(source, "private async Task SaveComposerAsync()");
-        Assert.Contains("eventNotificationsMode", method);
-        Assert.Contains("eventNotificationsActiveEvents", method);
-        Assert.Contains("eventNotificationsThrottleSeconds", method);
-        Assert.Contains("PatchAsync", method);
-        Assert.Contains("/api/config/composer", method);
+        Assert.Contains("EventNotificationsMode", method);
+        Assert.Contains("EventNotificationsActiveEvents", method);
+        Assert.Contains("EventNotificationsThrottleSeconds", method);
+        Assert.Contains("ConfigFacade.SaveComposerAsync", method);
+        Assert.Contains("ComposerSettingsUpdate", method);
+        Assert.DoesNotContain("PatchAsync", method);
+        Assert.DoesNotContain("/api/config/composer", method);
+
+        // The update record really exposes the three fields the page sets.
+        Assert.NotNull(typeof(ComposerSettingsUpdate).GetProperty("EventNotificationsMode"));
+        Assert.NotNull(typeof(ComposerSettingsUpdate).GetProperty("EventNotificationsActiveEvents"));
+        Assert.NotNull(typeof(ComposerSettingsUpdate).GetProperty("EventNotificationsThrottleSeconds"));
     }
 
     [Fact]
@@ -712,13 +739,35 @@ public sealed class ActiveModeConfigUiTests
         Assert.Contains("At least one active event must be selected", method);
     }
 
+    /// <summary>
+    /// A successful save reloads the composer state. Success is now decided by the facade
+    /// result's <c>Success</c> flag rather than an HTTP status code.
+    /// </summary>
     [Fact]
     public void Configuration_SaveComposer_SuccessReloadsState()
     {
         var source = ReadConfigurationSource();
         var method = ExtractMethodSource(source, "private async Task SaveComposerAsync()");
         Assert.Contains("LoadComposerAsync()", method);
-        Assert.Contains("IsSuccessStatusCode", method);
+        Assert.Contains("result.Success", method);
+        Assert.DoesNotContain("IsSuccessStatusCode", method);
+    }
+
+    /// <summary>
+    /// The failure message is built from the facade result's inner error text WITHOUT an HTTP
+    /// status prefix — the documented behavior change of the facade migration. The inner
+    /// message content itself is preserved.
+    /// </summary>
+    [Fact]
+    public void Configuration_SaveComposer_FailureMessageHasNoHttpStatusPrefix()
+    {
+        var source = ReadConfigurationSource();
+        var method = ExtractMethodSource(source, "private async Task SaveComposerAsync()");
+
+        Assert.Contains("_composerSaveError = $\"Save failed: {result.Error}\";", method);
+        // The old shape embedded the numeric status code and the raw JSON envelope.
+        Assert.DoesNotContain("(int)response.StatusCode", method);
+        Assert.DoesNotContain("ReadAsStringAsync", method);
     }
 
     [Fact]

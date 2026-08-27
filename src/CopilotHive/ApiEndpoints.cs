@@ -781,16 +781,16 @@ public static class ApiEndpoints
         // ── Backup REST API ──────────────────────────────────────────────────────
         var backupApi = app.MapGroup("/api/backup");
 
-        backupApi.MapPost("/", async ([FromServices] BackupService svc) =>
+        backupApi.MapPost("/", async ([FromServices] IBackupFacade facade, CancellationToken ct) =>
         {
-            var path = await svc.CreateBackupAsync();
-            var fileName = Path.GetFileName(path);
-            var info = svc.ListBackups().First(b => b.FileName == fileName);
-            return Results.Ok(info);
+            // Failures (including cancellation) propagate out of the facade and become a 500,
+            // exactly as before the facade existed.
+            var result = await facade.CreateBackupAsync(ct);
+            return MapBackupFacadeResult(result);
         });
 
-        backupApi.MapGet("/", ([FromServices] BackupService svc) =>
-            Results.Ok(svc.ListBackups()));
+        backupApi.MapGet("/", ([FromServices] IBackupFacade facade) =>
+            MapBackupFacadeResult(facade.GetBackups()));
 
         backupApi.MapGet("/{fileName}", (string fileName, [FromServices] BackupService svc) =>
         {
@@ -854,6 +854,25 @@ public static class ApiEndpoints
                 result.SafetyBackupPath,
             });
         });
+    }
+
+    /// <summary>
+    /// Maps a backup facade result to the HTTP response the pre-facade handlers produced.
+    /// The backup facade only ever reports <see cref="FacadeErrorKind.None"/> (failures throw
+    /// and become ASP.NET's 500), so <see cref="FacadeErrorKind.None"/> → 200 with the value;
+    /// the switch exists for uniformity with the other facades and throws for any other kind
+    /// rather than silently falling back.
+    /// </summary>
+    /// <typeparam name="T">The facade value type.</typeparam>
+    /// <param name="result">The facade result to map.</param>
+    /// <returns>A 200 result carrying the facade value.</returns>
+    private static IResult MapBackupFacadeResult<T>(FacadeResult<T> result)
+    {
+        return result.Kind switch
+        {
+            FacadeErrorKind.None => Results.Ok(result.Value!),
+            _ => throw new InvalidOperationException($"Unexpected backup facade error kind: {result.Kind}."),
+        };
     }
 
     /// <summary>

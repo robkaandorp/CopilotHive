@@ -188,6 +188,13 @@ public sealed class Program
                     sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
                     sp.GetRequiredService<ILogger<BackupService>>()));
 
+            // Backup facade: ALWAYS registered (not gated on a config repo) so the backup
+            // endpoints and the Configuration component resolve it unconditionally. It only
+            // depends on the BackupService singleton registered directly above.
+            builder.Services.AddSingleton<IBackupFacade>(sp => new BackupFacade(
+                sp.GetRequiredService<BackupService>(),
+                sp.GetRequiredService<ILogger<BackupFacade>>()));
+
             // Metrics: per-iteration metrics persistence
             var metricsDir = Path.Combine(stateDir, "metrics");
             Directory.CreateDirectory(metricsDir);
