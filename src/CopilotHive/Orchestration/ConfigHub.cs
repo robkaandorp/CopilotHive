@@ -2,7 +2,6 @@ using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.AI;
 
 namespace CopilotHive.Orchestration;
 
@@ -414,26 +413,3 @@ public static class ConfigHub
         return sb.ToString();
     }
 }
-
-/// <summary>
-/// Request body for adding or updating an available model.
-/// </summary>
-/// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
-/// <param name="ContextWindow">Optional context window in tokens.</param>
-/// <param name="Description">Optional human-readable description.</param>
-/// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset.</param>
-public sealed record AvailableModelRequest(string Name, int? ContextWindow, string? Description = null, bool? SupportsVision = null);
-
-/// <summary>
-/// Request body for adding or updating a sub-agent model.
-/// </summary>
-/// <param name="Name">Model name (used for add; ignored for update where the route name is authoritative).</param>
-/// <param name="ContextWindow">Optional context window in tokens.</param>
-/// <param name="ReasoningEffort">
-/// Optional default reasoning effort. Wire values are snake_case (<c>none</c>, <c>low</c>,
-/// <c>medium</c>, <c>high</c>, <c>extra_high</c>); an unknown value is rejected with a 400 by
-/// the global JSON enum converter.
-/// </param>
-/// <param name="Description">Optional human-readable description.</param>
-/// <param name="SupportsVision">Informational vision flag: <c>true</c>, <c>false</c>, or <c>null</c> for unset (inherit).</param>
-public sealed record SubAgentModelRequest(string Name, int? ContextWindow, ReasoningEffort? ReasoningEffort, string? Description = null, bool? SupportsVision = null);
