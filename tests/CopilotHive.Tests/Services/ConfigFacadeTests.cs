@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Services;
 
 using Microsoft.AspNetCore.Hosting;
@@ -56,15 +57,18 @@ public class ConfigFacadeTests
         private readonly HiveConfigFile? _hiveConfig;
         private readonly ConfigModelService? _configModel;
         private readonly ModelDiscoveryService? _discovery;
+        private readonly IBrainRepoManager? _repoManager;
 
         public FacadeFactory(
             HiveConfigFile? hiveConfig,
             ConfigModelService? configModel = null,
-            ModelDiscoveryService? discovery = null)
+            ModelDiscoveryService? discovery = null,
+            IBrainRepoManager? repoManager = null)
         {
             _hiveConfig = hiveConfig;
             _configModel = configModel;
             _discovery = discovery;
+            _repoManager = repoManager;
             _stateDir = Path.Combine(Path.GetTempPath(), $"copilothive-facade-{Guid.NewGuid():N}");
             _previousStateDir = Environment.GetEnvironmentVariable("STATE_DIR");
             Environment.SetEnvironmentVariable("STATE_DIR", _stateDir);
@@ -91,7 +95,8 @@ public class ConfigFacadeTests
                     _hiveConfig,
                     _configModel,
                     _discovery,
-                    sp.GetRequiredService<ILogger<ConfigFacade>>()));
+                    sp.GetRequiredService<ILogger<ConfigFacade>>(),
+                    _repoManager));
 
                 if (_configModel is not null)
                 {

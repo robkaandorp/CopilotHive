@@ -1,4 +1,5 @@
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 
 namespace CopilotHive.Services;
 
@@ -115,6 +116,65 @@ public interface IConfigFacade
     /// <see cref="FacadeErrorKind.NotFound"/> when the model does not exist.
     /// </returns>
     Task<FacadeResult<RemovedResult>> RemoveSubAgentModelAsync(string name);
+
+    /// <summary>
+    /// Lists the configured repositories.
+    /// </summary>
+    /// <returns>
+    /// The configured repositories as DTOs, or <see cref="FacadeErrorKind.NotFound"/> when no
+    /// <see cref="HiveConfigFile"/> is registered.
+    /// </returns>
+    FacadeResult<IReadOnlyList<RepositoryDto>> GetRepositories();
+
+    /// <summary>
+    /// Adds a repository to the config (validate → mutate → write → commit → clone).
+    /// </summary>
+    /// <param name="request">The repository to add.</param>
+    /// <returns>
+    /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered, <see cref="FacadeErrorKind.BadRequest"/>
+    /// when the request is invalid, or <see cref="FacadeErrorKind.Conflict"/> when a repository
+    /// with the same name already exists. Any other exception propagates to the caller.
+    /// </returns>
+    Task<FacadeResult<SavedResult>> AddRepositoryAsync(RepositoryRequest request);
+
+    /// <summary>
+    /// Lists the remote branches of a repository via the brain repo manager.
+    /// </summary>
+    /// <param name="name">Repository name (NOT URL-unescaped — the repository routes do not unescape).</param>
+    /// <param name="ct">Cancellation token forwarded to the repo manager.</param>
+    /// <returns>
+    /// The branch names, <see cref="FacadeErrorKind.ServiceUnavailable"/> when no
+    /// <see cref="IBrainRepoManager"/> is registered, <see cref="FacadeErrorKind.NotFound"/>
+    /// when the repository is not cloned, <see cref="FacadeErrorKind.BadRequest"/> when the
+    /// name is invalid, or <see cref="FacadeErrorKind.Internal"/> for any other failure
+    /// (including cancellation, matching the pre-facade catch-all).
+    /// </returns>
+    Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(string name, CancellationToken ct);
+
+    /// <summary>
+    /// Updates an existing repository's URL, default branch, and optional release configuration.
+    /// </summary>
+    /// <param name="name">Repository name to update (NOT URL-unescaped — the repository routes do not unescape).</param>
+    /// <param name="request">The new values.</param>
+    /// <returns>
+    /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered, <see cref="FacadeErrorKind.BadRequest"/>
+    /// when the request is invalid, or <see cref="FacadeErrorKind.NotFound"/> when the
+    /// repository does not exist. Any other exception propagates to the caller.
+    /// </returns>
+    Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(string name, RepositoryRequest request);
+
+    /// <summary>
+    /// Removes a repository from the config.
+    /// </summary>
+    /// <param name="name">Repository name to remove (NOT URL-unescaped — the repository routes do not unescape).</param>
+    /// <returns>
+    /// Success, <see cref="FacadeErrorKind.NotConfigured"/> when no
+    /// <see cref="ConfigModelService"/> is registered, or <see cref="FacadeErrorKind.NotFound"/>
+    /// when the repository does not exist.
+    /// </returns>
+    Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(string name);
 }
 
 /// <summary>
@@ -129,6 +189,7 @@ public sealed class ConfigFacade : IConfigFacade
     private readonly HiveConfigFile? _hiveConfig;
     private readonly ConfigModelService? _configModel;
     private readonly ModelDiscoveryService? _discovery;
+    private readonly IBrainRepoManager? _repoManager;
     private readonly ILogger<ConfigFacade> _log;
 
     /// <summary>
@@ -138,16 +199,19 @@ public sealed class ConfigFacade : IConfigFacade
     /// <param name="configModel">The <see cref="ConfigModelService"/> (may be <c>null</c> when no config repo is configured).</param>
     /// <param name="discovery">The <see cref="ModelDiscoveryService"/> (may be <c>null</c> when no config repo is configured).</param>
     /// <param name="log">Logger instance.</param>
+    /// <param name="repoManager">The <see cref="IBrainRepoManager"/> (may be <c>null</c> when not registered).</param>
     public ConfigFacade(
         HiveConfigFile? hiveConfig,
         ConfigModelService? configModel,
         ModelDiscoveryService? discovery,
-        ILogger<ConfigFacade> log)
+        ILogger<ConfigFacade> log,
+        IBrainRepoManager? repoManager = null)
     {
         _hiveConfig = hiveConfig;
         _configModel = configModel;
         _discovery = discovery;
         _log = log;
+        _repoManager = repoManager;
     }
 
     /// <inheritdoc />
@@ -357,5 +421,131 @@ public sealed class ConfigFacade : IConfigFacade
         return removed
             ? new(true, new RemovedResult(true), null, FacadeErrorKind.None)
             : new(false, null, $"Model '{name}' not found.", FacadeErrorKind.NotFound);
+    }
+
+    /// <inheritdoc />
+    public FacadeResult<IReadOnlyList<RepositoryDto>> GetRepositories()
+    {
+        var config = _hiveConfig;
+        if (config is null)
+        {
+            _log.LogWarning("Config repo is not configured.");
+            return new(false, null, "Config repo not configured.", FacadeErrorKind.NotFound);
+        }
+
+        return new(
+            true,
+            config.Repositories.Select(r => new RepositoryDto(
+                r.Name,
+                r.Url,
+                r.DefaultBranch,
+                r.MonitorCi,
+                r.CiTimeoutMinutes,
+                r.Release is null ? null : new RepositoryReleaseDto(r.Release.MergeTo, r.Release.TagBranch),
+                r.PublishNuGet is null
+                    ? null
+                    : new RepositoryPublishNuGetDto(
+                        r.PublishNuGet.Packages.Select(p => new RepositoryPackageDto(p.PackageId)).ToList()))).ToList(),
+            null, FacadeErrorKind.None);
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<SavedResult>> AddRepositoryAsync(RepositoryRequest request)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        try
+        {
+            await svc.AddRepositoryAsync(request.Name, request.Url, request.DefaultBranch, request.Release, request.MonitorCi, request.CiTimeoutMinutes);
+            return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
+        }
+        catch (ArgumentException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.BadRequest);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.Conflict);
+        }
+        // Any other exception propagates to the caller — the endpoint never caught it either.
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<IReadOnlyList<string>>> GetBranchesAsync(string name, CancellationToken ct)
+    {
+        var repoManager = _repoManager;
+        if (repoManager is null)
+        {
+            _log.LogWarning("Repository manager is not available.");
+            return new(false, null, "Repository manager is not available.", FacadeErrorKind.ServiceUnavailable);
+        }
+
+        try
+        {
+            var branches = await repoManager.ListRemoteBranchesAsync(name, ct);
+            return new(true, branches, null, FacadeErrorKind.None);
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("is not cloned"))
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.NotFound);
+        }
+        catch (ArgumentException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.BadRequest);
+        }
+        catch (Exception ex)
+        {
+            // The pre-facade handler's catch-all: every other failure — including
+            // OperationCanceledException — becomes a 500 problem-details body.
+            _log.LogError(ex, "Failed to list branches for repository '{Name}'", name);
+            return new(false, null, "Failed to list branches for this repository.", FacadeErrorKind.Internal);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<SavedResult>> UpdateRepositoryAsync(string name, RepositoryRequest request)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        try
+        {
+            await svc.UpdateRepositoryAsync(name, request.Url, request.DefaultBranch, request.Release, request.MonitorCi, request.CiTimeoutMinutes);
+            return new(true, new SavedResult(true, null), null, FacadeErrorKind.None);
+        }
+        catch (ArgumentException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.BadRequest);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return new(false, null, ex.Message, FacadeErrorKind.NotFound);
+        }
+        // Any other exception propagates to the caller — the endpoint never caught it either.
+    }
+
+    /// <inheritdoc />
+    public async Task<FacadeResult<RemovedResult>> RemoveRepositoryAsync(string name)
+    {
+        var svc = _configModel;
+        if (svc is null)
+        {
+            _log.LogWarning("Config service is not configured.");
+            return new(false, null, "Config service is not configured.", FacadeErrorKind.NotConfigured);
+        }
+
+        var removed = await svc.RemoveRepositoryAsync(name);
+        return removed
+            ? new(true, new RemovedResult(true), null, FacadeErrorKind.None)
+            : new(false, null, $"Repository '{name}' not found.", FacadeErrorKind.NotFound);
     }
 }

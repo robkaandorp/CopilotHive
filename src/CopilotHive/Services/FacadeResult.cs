@@ -21,6 +21,9 @@ public enum FacadeErrorKind
     /// <summary>The operation requires configuration that is not present.</summary>
     NotConfigured,
 
+    /// <summary>The operation requires a dependency that is not available (HTTP 503).</summary>
+    ServiceUnavailable,
+
     /// <summary>An unexpected internal failure occurred (HTTP 500).</summary>
     Internal,
 }

@@ -1,5 +1,4 @@
 using CopilotHive.Configuration;
-using CopilotHive.Git;
 using CopilotHive.Services;
 using Microsoft.AspNetCore.Mvc;
 
@@ -110,96 +109,48 @@ public static class ConfigHub
         // ── Repositories ────────────────────────────────────────────────────
 
         // List repositories
-        app.MapGet("/api/config/repositories", ([FromServices] HiveConfigFile? config) =>
+        app.MapGet("/api/config/repositories", () =>
         {
-            if (config is null)
-                return Results.NotFound(new { error = "Config repo not configured." });
-            return Results.Ok(config.Repositories);
+            var result = facade.GetRepositories();
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Add a repository
-        app.MapPost("/api/config/repositories", async (
-            RepositoryRequest req,
-            [FromServices] ConfigModelService? svc,
-            [FromServices] IBrainRepoManager? repoManager) =>
+        app.MapPost("/api/config/repositories", async (RepositoryRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            try
-            {
-                await svc.AddRepositoryAsync(req.Name, req.Url, req.DefaultBranch, req.Release, req.MonitorCi, req.CiTimeoutMinutes);
-                return Results.Ok(new { saved = true });
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
+            var result = await facade.AddRepositoryAsync(req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Update a repository
-        app.MapPut("/api/config/repositories/{name}", async (
-            string name,
-            RepositoryRequest req,
-            [FromServices] ConfigModelService? svc,
-            [FromServices] IBrainRepoManager? repoManager) =>
+        app.MapPut("/api/config/repositories/{name}", async (string name, RepositoryRequest req) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            try
-            {
-                await svc.UpdateRepositoryAsync(name, req.Url, req.DefaultBranch, req.Release, req.MonitorCi, req.CiTimeoutMinutes);
-                return Results.Ok(new { saved = true });
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.NotFound(new { error = ex.Message });
-            }
+            var result = await facade.UpdateRepositoryAsync(name, req);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // Remove a repository
-        app.MapDelete("/api/config/repositories/{name}", async (string name, [FromServices] ConfigModelService? svc) =>
+        app.MapDelete("/api/config/repositories/{name}", async (string name) =>
         {
-            if (svc is null)
-                return Results.Problem("Config service is not configured.");
-            var removed = await svc.RemoveRepositoryAsync(name);
-            return removed ? Results.Ok(new { removed = true }) : Results.NotFound(new { error = $"Repository '{name}' not found." });
+            var result = await facade.RemoveRepositoryAsync(name);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // List remote branches for a repository
-        app.MapGet("/api/config/repositories/{name}/branches", async (
-            string name,
-            [FromServices] IBrainRepoManager? repoManager,
-            ILogger<Program> logger,
-            CancellationToken ct) =>
+        app.MapGet("/api/config/repositories/{name}/branches", async (string name, CancellationToken ct) =>
         {
-            if (repoManager is null)
-                return Results.Problem("Repository manager is not available.", statusCode: 503);
-            try
-            {
-                var branches = await repoManager.ListRemoteBranchesAsync(name, ct);
-                return Results.Ok(branches);
-            }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("is not cloned"))
-            {
-                return Results.NotFound(new { error = ex.Message });
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Failed to list branches for repository '{Name}'", name);
-                return Results.Problem("Failed to list branches for this repository.", statusCode: 500);
-            }
+            var result = await facade.GetBranchesAsync(name, ct);
+            if (!result.Success)
+                return MapModelFacadeError(result.Kind, result.Error);
+            return Results.Ok(result.Value!);
         });
 
         // ── Orchestrator settings ───────────────────────────────────────────
@@ -344,8 +295,9 @@ public static class ConfigHub
     /// <summary>
     /// Maps a <see cref="FacadeErrorKind"/> from the model-catalog facade to the exact HTTP
     /// response the pre-facade handlers produced: <c>NotFound</c>/<c>Conflict</c>/<c>BadRequest</c>
-    /// return a JSON <c>{error}</c> body; <c>NotConfigured</c> and <c>Internal</c> return a
-    /// problem-details body. <see cref="FacadeErrorKind.None"/> is a programming error and throws.
+    /// return a JSON <c>{error}</c> body; <c>NotConfigured</c>, <c>ServiceUnavailable</c> and
+    /// <c>Internal</c> return a problem-details body. <see cref="FacadeErrorKind.None"/> is a
+    /// programming error and throws.
     /// </summary>
     /// <param name="kind">The failure category reported by the facade.</param>
     /// <param name="error">The human-readable error message.</param>
@@ -358,6 +310,7 @@ public static class ConfigHub
             FacadeErrorKind.Conflict => Results.Conflict(new { error }),
             FacadeErrorKind.BadRequest => Results.BadRequest(new { error }),
             FacadeErrorKind.NotConfigured => Results.Problem(error),
+            FacadeErrorKind.ServiceUnavailable => Results.Problem(error, statusCode: 503),
             FacadeErrorKind.Internal => Results.Problem(error, statusCode: 500),
             _ => throw new InvalidOperationException($"Unexpected facade error kind: {kind}."),
         };

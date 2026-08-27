@@ -276,7 +276,8 @@ public sealed class Program
                 sp.GetService<HiveConfigFile>(),
                 sp.GetService<ConfigModelService>(),
                 sp.GetService<ModelDiscoveryService>(),
-                sp.GetRequiredService<ILogger<ConfigFacade>>()));
+                sp.GetRequiredService<ILogger<ConfigFacade>>(),
+                sp.GetService<IBrainRepoManager>()));
 
             // Brain: direct LLM connection via SharpCoder. Registered ONLY when the parsed config
             // declares an orchestrator model (Slice 2 — config-driven registration; BRAIN_MODEL no
