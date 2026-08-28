@@ -1,3 +1,6 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
 using CopilotHive.Worker;
 
 namespace CopilotHive.Tests.Worker;
@@ -828,6 +831,69 @@ public sealed class GitOperationsTests : IAsyncLifetime
     }
 
     [Fact]
+    public void CreateProcessStartInfo_TokenizedArgs_AddsRawTokensIgnoresLegacyArgsAndCopiesExactEnvironment()
+    {
+        const string UnquotedToken = "message with spaces and a \"quoted\" word";
+        string[] tokenizedArgs = ["commit", "-m", UnquotedToken, "--path=dir with spaces"];
+        var environment = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = "gh-secret-must-survive",
+            ["GITHUB_TOKEN"] = "github-secret-must-survive",
+            ["GIT_ASKPASS"] = "/custom/askpass-must-survive",
+            ["GITHUB_CONFIG_REPO_TOKEN"] = "config-secret-must-survive",
+            ["GIT_TERMINAL_PROMPT"] = "1",
+            ["KEEP_EXACT"] = "unchanged",
+            ["NULL_MARKER"] = null,
+        };
+        var request = new GitProcessRequest(
+            "git",
+            ["legacy opaque argument must be ignored", "a second legacy argument must also be ignored"],
+            "/work/repo",
+            environment,
+            tokenizedArgs);
+
+        var psi = GitOperations.CreateProcessStartInfo(request);
+
+        // Exact raw elements prove foreach/Add ordering and detect either whole-list or per-token quoting.
+        Assert.Equal(tokenizedArgs, psi.ArgumentList.ToArray());
+        Assert.Equal(UnquotedToken, psi.ArgumentList[2]);
+        Assert.DoesNotContain($"\"{UnquotedToken}\"", psi.ArgumentList);
+
+        // An invalid legacy count is accepted and its opaque values never reach either argument property.
+        Assert.Equal(string.Empty, psi.Arguments);
+        Assert.DoesNotContain("legacy opaque argument must be ignored", psi.ArgumentList);
+
+        // Exact key/value equality proves no scrub and no forced additions; null is omitted on repopulation.
+        Assert.Equal(
+            new[]
+            {
+                "GH_TOKEN",
+                "GITHUB_CONFIG_REPO_TOKEN",
+                "GITHUB_TOKEN",
+                "GIT_ASKPASS",
+                "GIT_TERMINAL_PROMPT",
+                "KEEP_EXACT",
+            },
+            psi.Environment.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("gh-secret-must-survive", psi.Environment["GH_TOKEN"]);
+        Assert.Equal("github-secret-must-survive", psi.Environment["GITHUB_TOKEN"]);
+        Assert.Equal("/custom/askpass-must-survive", psi.Environment["GIT_ASKPASS"]);
+        Assert.Equal("config-secret-must-survive", psi.Environment["GITHUB_CONFIG_REPO_TOKEN"]);
+        Assert.Equal("1", psi.Environment["GIT_TERMINAL_PROMPT"]);
+        Assert.Equal("unchanged", psi.Environment["KEEP_EXACT"]);
+        Assert.False(psi.Environment.ContainsKey("NULL_MARKER"));
+
+        Assert.Equal("git", psi.FileName);
+        Assert.Equal("/work/repo", psi.WorkingDirectory);
+        Assert.True(psi.RedirectStandardOutput);
+        Assert.True(psi.RedirectStandardError);
+        Assert.False(psi.UseShellExecute);
+        Assert.Equal(7, environment.Count);
+        Assert.True(environment.ContainsKey("NULL_MARKER"));
+        Assert.Null(environment["NULL_MARKER"]);
+    }
+
+    [Fact]
     public void CreateProcessStartInfo_AssignsArgumentsVerbatimAndSetsProcessProperties()
     {
         const string OpaqueArgs = "commit -m \"a message with spaces\"";
@@ -839,6 +905,7 @@ public sealed class GitOperationsTests : IAsyncLifetime
 
         var psi = GitOperations.CreateProcessStartInfo(request);
 
+        Assert.Null(request.TokenizedArgs);
         Assert.Equal("git", psi.FileName);
         Assert.Equal(OpaqueArgs, psi.Arguments);
         Assert.Empty(psi.ArgumentList);
@@ -871,7 +938,11 @@ public sealed class GitOperationsTests : IAsyncLifetime
         var request = new GitProcessRequest(
             "git", [], "/work/repo", new Dictionary<string, string?>());
 
-        Assert.Throws<ArgumentException>(() => GitOperations.CreateProcessStartInfo(request));
+        var exception = Assert.Throws<ArgumentException>(
+            () => GitOperations.CreateProcessStartInfo(request));
+
+        Assert.Equal("request", exception.ParamName);
+        Assert.Contains("Exactly one opaque argument string is required, got 0.", exception.Message);
     }
 
     [Fact]
@@ -880,7 +951,11 @@ public sealed class GitOperationsTests : IAsyncLifetime
         var request = new GitProcessRequest(
             "git", ["status", "--porcelain"], "/work/repo", new Dictionary<string, string?>());
 
-        Assert.Throws<ArgumentException>(() => GitOperations.CreateProcessStartInfo(request));
+        var exception = Assert.Throws<ArgumentException>(
+            () => GitOperations.CreateProcessStartInfo(request));
+
+        Assert.Equal("request", exception.ParamName);
+        Assert.Contains("Exactly one opaque argument string is required, got 2.", exception.Message);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -914,17 +989,402 @@ public sealed class GitOperationsProcessRunnerSeamTests
         Path.Combine(Path.GetTempPath(), $"GitOpsNoSuchDir_{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task ExecuteProcessAsync_WithSeam_DelegatesExactRequestAndTokenWithoutOwningCancellation()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        using var callerCts = new CancellationTokenSource();
+        var request = new GitProcessRequest(
+            $"definitely-not-an-executable-{Guid.NewGuid():N}",
+            [],
+            NonexistentWorkDir,
+            new Dictionary<string, string?> { ["RAW"] = "value" },
+            ["token with spaces"]);
+        var expectedResult = new GitProcessResult(73, "delegate stdout", "delegate stderr");
+        var delegateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delegateCompletion = new TaskCompletionSource<GitProcessResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        GitProcessRequest? capturedRequest = null;
+        CancellationToken capturedToken = default;
+
+        try
+        {
+            GitOperations.ProcessRunner = (actualRequest, actualToken) =>
+            {
+                capturedRequest = actualRequest;
+                capturedToken = actualToken;
+                delegateEntered.TrySetResult();
+                return delegateCompletion.Task;
+            };
+
+            var execution = GitOperations.ExecuteProcessAsync(request, callerCts.Token);
+            await delegateEntered.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Same(request, capturedRequest);
+            Assert.Equal(callerCts.Token, capturedToken);
+            Assert.False(Directory.Exists(NonexistentWorkDir));
+
+            // Cancelling the caller does not make ExecuteProcessAsync kill, drain, dispose, or
+            // otherwise complete a launch represented and owned entirely by the delegate.
+            callerCts.Cancel();
+            Assert.False(execution.IsCompleted);
+
+            delegateCompletion.SetResult(expectedResult);
+            var actualResult = await execution;
+            Assert.Same(expectedResult, actualResult);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            delegateCompletion.TrySetResult(expectedResult);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteProcessAsync_NonexistentExecutable_PropagatesOriginalStartException()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var executable = $"missing-executable-sensitive-marker-{Guid.NewGuid():N}";
+        var request = new GitProcessRequest(
+            executable,
+            [],
+            Path.GetTempPath(),
+            new Dictionary<string, string?>(),
+            []);
+
+        try
+        {
+            GitOperations.ProcessRunner = null;
+
+            var exception = await Assert.ThrowsAsync<Win32Exception>(
+                () => GitOperations.ExecuteProcessAsync(
+                    request, TestContext.Current.CancellationToken));
+
+            // The concrete native type and unsanitized executable marker detect wrapping or rewriting.
+            Assert.Contains(executable, exception.Message, StringComparison.Ordinal);
+            Assert.Null(exception.InnerException);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Proves the cancellation ORDER: kill REQUEST → root exit awaited → output drained → THEN
+    /// <see cref="OperationCanceledException"/> with the caller's token.
+    /// </summary>
+    /// <remarks>
+    /// The launched tree contains two extra processes:
+    /// <list type="bullet">
+    /// <item>an IN-TREE descendant (<c>sleep</c>) that <c>Kill(entireProcessTree: true)</c> must
+    /// terminate — the descendant-kill evidence;</item>
+    /// <item>an ESCAPED holder created by a double fork. Its intermediate parent exits
+    /// immediately, so the holder is reparented away from the root and is therefore NOT part of
+    /// the killed process tree. It inherits the redirected stdout/stderr write handles and blocks
+    /// on a FIFO, so the production output reads CANNOT complete until this test releases it.</item>
+    /// </list>
+    /// The escape is established as a PRECONDITION to cancellation by walking the holder's full
+    /// PPID ancestry and requiring that the root PID is no longer an ancestor. A weaker
+    /// "PPID != rootPid" check would be vacuous: the holder is created by the INTERMEDIATE, so
+    /// its PPID is never the root PID even in the pre-reparenting state root → intermediate →
+    /// holder, where <c>Kill(entireProcessTree: true)</c> would still reach and kill it.
+    /// That escaped holder is the deterministic ordering gate: after the root process has been
+    /// reaped (its <c>/proc</c> entry is gone, which only happens once the production code awaited
+    /// the root exit) the execution task MUST still be pending, because the drain is blocked. An
+    /// implementation reduced to <c>Kill(entireProcessTree: true); throw new
+    /// OperationCanceledException(ct);</c> completes at that point and FAILS the gate. Only after
+    /// the FIFO release closes the inherited handles — completing the reads — may the exception
+    /// surface. The bounded PID-absence polling afterwards is solely the declared OS-reaping
+    /// allowance for the in-tree descendant AFTER propagation.
+    /// </remarks>
+    [Fact]
+    public async Task ExecuteProcessAsync_Cancellation_KillsRootAndKnownDescendantBeforePropagation()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Skip("The known-PID process-tree evidence test requires Linux /proc semantics.");
+            return;
+        }
+
+        var originalRunner = GitOperations.ProcessRunner;
+        var tempDir = Path.Combine(Path.GetTempPath(), $"GitOpsTreeKill_{Guid.NewGuid():N}");
+        var rootScriptPath = Path.Combine(tempDir, "spawn-tree.sh");
+        var holderScriptPath = Path.Combine(tempDir, "spawn-holder.sh");
+        var rootPidPath = Path.Combine(tempDir, "root.pid");
+        var descendantPidPath = Path.Combine(tempDir, "descendant.pid");
+        var holderPidPath = Path.Combine(tempDir, "holder.pid");
+        var releaseFifoPath = Path.Combine(tempDir, "release.fifo");
+        var rootPidGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var descendantPidGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holderPidGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var callerCts = new CancellationTokenSource();
+        Task<GitProcessResult>? execution = null;
+        var rootPid = 0;
+        var descendantPid = 0;
+        var holderPid = 0;
+
+        Directory.CreateDirectory(tempDir);
+        await CreateFifoAsync(releaseFifoPath, TestContext.Current.CancellationToken);
+
+        // $1 root.pid  $2 descendant.pid  $3 holder.pid  $4 release.fifo  $5 spawn-holder.sh
+        await File.WriteAllTextAsync(
+            rootScriptPath,
+            """
+            #!/bin/sh
+            printf '%s\n' "$$" > "$1"
+            /bin/sh "$5" "$3" "$4" &
+            /bin/sh -c 'printf "%s\n" "$$" > "$1"; exec /bin/sleep 300' descendant "$2" &
+            descendant_pid=$!
+            wait "$descendant_pid"
+
+            """,
+            TestContext.Current.CancellationToken);
+
+        // Double fork: this intermediate exits at once so the holder is reparented off the root
+        // and escapes Kill(entireProcessTree: true) while still owning the redirected handles.
+        // $1 holder.pid  $2 release.fifo
+        await File.WriteAllTextAsync(
+            holderScriptPath,
+            """
+            #!/bin/sh
+            /bin/sh -c 'exec 3<>"$2"; printf "%s\n" "$$" > "$1"; IFS= read -r _ <&3' holder "$1" "$2" &
+            exit 0
+
+            """,
+            TestContext.Current.CancellationToken);
+
+        using var watcher = new FileSystemWatcher(tempDir, "*.pid")
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            EnableRaisingEvents = true,
+        };
+        FileSystemEventHandler capturePids = (_, _) =>
+        {
+            TryCapturePid(rootPidPath, rootPidGate);
+            TryCapturePid(descendantPidPath, descendantPidGate);
+            TryCapturePid(holderPidPath, holderPidGate);
+        };
+        watcher.Created += capturePids;
+        watcher.Changed += capturePids;
+
+        try
+        {
+            GitOperations.ProcessRunner = null;
+            var request = new GitProcessRequest(
+                "/bin/sh",
+                ["legacy arguments are ignored"],
+                tempDir,
+                new Dictionary<string, string?>(),
+                [rootScriptPath, rootPidPath, descendantPidPath, holderPidPath, releaseFifoPath, holderScriptPath]);
+
+            execution = GitOperations.ExecuteProcessAsync(request, callerCts.Token);
+            capturePids(this, null!);
+
+            rootPid = await rootPidGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            descendantPid = await descendantPidGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            holderPid = await holderPidGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.NotEqual(rootPid, descendantPid);
+            Assert.NotEqual(rootPid, holderPid);
+            Assert.NotEqual(descendantPid, holderPid);
+            Assert.True(IsLinuxPidPresent(rootPid));
+            Assert.True(IsLinuxPidPresent(descendantPid));
+
+            // PRECONDITION to cancellation: the holder must have fully ESCAPED the root's process
+            // tree — the intermediate has exited and the holder has been reparented, so rootPid is
+            // no longer anywhere in the holder's PPID ancestry. Checking only "PPID != rootPid"
+            // would be vacuous, because the holder's parent is the INTERMEDIATE, never the root.
+            // Without this gate a scheduler race could let Kill(entireProcessTree: true) reach the
+            // still-in-tree holder, destroying the drain gate below.
+            Assert.True(
+                await WaitForLinuxTreeEscapeAsync(
+                    holderPid, rootPid, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken),
+                $"Holder PID {holderPid} had not escaped the process tree of root PID {rootPid}.");
+            Assert.True(
+                IsLinuxPidPresent(holderPid),
+                $"Holder PID {holderPid} exited before it could gate the output drain.");
+
+            callerCts.Cancel();
+
+            // ORDERING GATE. The root's /proc entry only disappears once the production code has
+            // awaited (and thereby reaped) the root exit.
+            Assert.True(
+                await WaitForLinuxPidAbsenceAsync(
+                    rootPid, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken),
+                $"Root PID {rootPid} was never awaited to exit after the kill request.");
+
+            // The escaped holder still owns the redirected handles, so the output reads cannot
+            // have completed. A production path that propagates before draining fails HERE.
+            Assert.False(
+                execution.IsCompleted,
+                "Cancellation propagated before the redirected output reads were drained.");
+
+            // Release the holder: it closes the inherited handles, the reads complete, and only
+            // then may the OperationCanceledException surface.
+            await ReleaseFifoAsync(releaseFifoPath, TestContext.Current.CancellationToken);
+
+            var exception = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => execution.WaitAsync(
+                    TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken));
+            Assert.Equal(callerCts.Token, exception.CancellationToken);
+
+            // Bounded polling is ONLY the declared OS-reaping allowance after propagation.
+            await WaitForLinuxPidsAbsenceAsync(
+                [descendantPid],
+                TimeSpan.FromSeconds(5),
+                TestContext.Current.CancellationToken);
+            Assert.False(
+                IsLinuxPidPresent(rootPid),
+                $"Root PID {rootPid} remained present after cancellation propagated.");
+            Assert.False(
+                IsLinuxPidPresent(descendantPid),
+                $"Descendant PID {descendantPid} remained present after cancellation propagated.");
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            callerCts.Cancel();
+            capturePids(this, null!);
+            TryKillProcess(holderPid != 0 ? holderPid : GetCompletedPid(holderPidGate));
+            TryKillProcess(rootPid != 0 ? rootPid : GetCompletedPid(rootPidGate));
+            TryKillProcess(descendantPid != 0 ? descendantPid : GetCompletedPid(descendantPidGate));
+
+            if (execution is not null)
+            {
+                try
+                {
+                    await execution.WaitAsync(
+                        TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+                }
+                catch (Exception) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+                {
+                    // Expected cancellation/start failures are already asserted by the test body.
+                }
+            }
+
+            await GitOperations.ForceDeleteDirectoryAsync(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteProcessAsync_RootExitedBeforeCancellation_ReturnsAnyExitCodeWithoutKillingDescendant()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            Assert.Skip("The deterministic natural-exit gate uses Linux FIFOs and /proc.");
+            return;
+        }
+
+        var originalRunner = GitOperations.ProcessRunner;
+        var tempDir = Path.Combine(Path.GetTempPath(), $"GitOpsNaturalExit_{Guid.NewGuid():N}");
+        var scriptPath = Path.Combine(tempDir, "exit-with-open-output.sh");
+        var rootPidPath = Path.Combine(tempDir, "root.pid");
+        var descendantPidPath = Path.Combine(tempDir, "descendant.pid");
+        var releaseFifoPath = Path.Combine(tempDir, "release.fifo");
+        var rootPidGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var descendantPidGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var callerCts = new CancellationTokenSource();
+        Task<GitProcessResult>? execution = null;
+        var descendantPid = 0;
+
+        Directory.CreateDirectory(tempDir);
+        await CreateFifoAsync(releaseFifoPath, TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(
+            scriptPath,
+            "#!/bin/sh\n" +
+            "printf '%s\\n' \"$$\" > \"$1\"\n" +
+            "/bin/sh -c 'exec 3<>\"$2\"; printf \"%s\\n\" \"$$\" > \"$1\"; IFS= read -r _ <&3' descendant \"$2\" \"$3\" &\n" +
+            "exit 23\n",
+            TestContext.Current.CancellationToken);
+
+        using var watcher = new FileSystemWatcher(tempDir, "*.pid")
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            EnableRaisingEvents = true,
+        };
+        FileSystemEventHandler capturePids = (_, _) =>
+        {
+            TryCapturePid(rootPidPath, rootPidGate);
+            TryCapturePid(descendantPidPath, descendantPidGate);
+        };
+        watcher.Created += capturePids;
+        watcher.Changed += capturePids;
+
+        try
+        {
+            GitOperations.ProcessRunner = null;
+            var request = new GitProcessRequest(
+                "/bin/sh",
+                [],
+                tempDir,
+                new Dictionary<string, string?>(),
+                [scriptPath, rootPidPath, descendantPidPath, releaseFifoPath]);
+
+            execution = GitOperations.ExecuteProcessAsync(request, callerCts.Token);
+            TryCapturePid(rootPidPath, rootPidGate);
+            TryCapturePid(descendantPidPath, descendantPidGate);
+
+            var rootPid = await rootPidGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            descendantPid = await descendantPidGate.Task.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.True(await WaitForLinuxPidAbsenceAsync(
+                rootPid, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+            Assert.True(IsLinuxPidPresent(descendantPid));
+            Assert.False(execution.IsCompleted); // Descendant still owns the redirected output handles.
+
+            callerCts.Cancel();
+            Assert.True(IsLinuxPidPresent(descendantPid));
+
+            await ReleaseFifoAsync(releaseFifoPath, TestContext.Current.CancellationToken);
+
+            var result = await execution.WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(23, result.ExitCode);
+            Assert.Equal(string.Empty, result.Stdout);
+            Assert.Equal(string.Empty, result.Stderr);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            callerCts.Cancel();
+            TryKillProcess(descendantPid != 0 ? descendantPid : GetCompletedPid(descendantPidGate));
+
+            if (execution is not null)
+            {
+                try
+                {
+                    await execution.WaitAsync(
+                        TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                }
+                catch (Exception) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+                {
+                    // Cleanup is best-effort if an assertion interrupted the FIFO release.
+                }
+            }
+
+            await GitOperations.ForceDeleteDirectoryAsync(tempDir);
+        }
+    }
+
+    [Fact]
     public async Task RunGitCommandAsync_WithSeam_ReplacesEntireLaunchAndReceivesRawRequest()
     {
         const string OpaqueArgs = "commit -m \"seam message\"";
+        var originalRunner = GitOperations.ProcessRunner;
         GitProcessRequest? captured = null;
+        CancellationToken capturedToken = default;
         var gate = new TaskCompletionSource<GitProcessResult>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         try
         {
-            GitOperations.ProcessRunner = (request, _) =>
+            GitOperations.ProcessRunner = (request, token) =>
             {
                 captured = request;
+                capturedToken = token;
                 return gate.Task;
             };
 
@@ -945,16 +1405,20 @@ public sealed class GitOperationsProcessRunnerSeamTests
             Assert.Equal("git", captured!.Executable);
             Assert.Equal(NonexistentWorkDir, captured.WorkingDirectory);
             Assert.Equal(new[] { OpaqueArgs }, captured.Args.ToArray());
+            Assert.Null(captured.TokenizedArgs);
+            Assert.Equal(TestContext.Current.CancellationToken, capturedToken);
         }
         finally
         {
-            GitOperations.ProcessRunner = null;
+            GitOperations.ProcessRunner = originalRunner;
+            gate.TrySetResult(new GitProcessResult(42, "seam-stdout", "seam-stderr"));
         }
     }
 
     [Fact]
     public async Task RunGitCommandAsync_WithSeam_ReceivesRawUnsanitizedEnvironmentSnapshot()
     {
+        var originalRunner = GitOperations.ProcessRunner;
         var originalGhToken = Environment.GetEnvironmentVariable("GH_TOKEN");
         var originalAskpass = Environment.GetEnvironmentVariable("GIT_ASKPASS");
         GitProcessRequest? captured = null;
@@ -990,7 +1454,7 @@ public sealed class GitOperationsProcessRunnerSeamTests
         }
         finally
         {
-            GitOperations.ProcessRunner = null;
+            GitOperations.ProcessRunner = originalRunner;
             Environment.SetEnvironmentVariable("GH_TOKEN", originalGhToken);
             Environment.SetEnvironmentVariable("GIT_ASKPASS", originalAskpass);
         }
@@ -999,6 +1463,7 @@ public sealed class GitOperationsProcessRunnerSeamTests
     [Fact]
     public async Task RunGitCommandAsync_WithSeam_ForwardsCallerCancellationToken()
     {
+        var originalRunner = GitOperations.ProcessRunner;
         using var cts = new CancellationTokenSource();
         CancellationToken capturedToken = default;
 
@@ -1017,13 +1482,14 @@ public sealed class GitOperationsProcessRunnerSeamTests
         }
         finally
         {
-            GitOperations.ProcessRunner = null;
+            GitOperations.ProcessRunner = originalRunner;
         }
     }
 
     [Fact]
     public async Task RunGitCommandAsync_AfterSeamRestored_UsesRealGitProcessAgain()
     {
+        var originalRunner = GitOperations.ProcessRunner;
         var invoked = 0;
         var workDir = Path.Combine(Path.GetTempPath(), $"GitOpsSeamRestore_{Guid.NewGuid():N}");
         Directory.CreateDirectory(workDir);
@@ -1059,7 +1525,229 @@ public sealed class GitOperationsProcessRunnerSeamTests
         }
         finally
         {
+            GitOperations.ProcessRunner = originalRunner;
             await GitOperations.ForceDeleteDirectoryAsync(workDir);
         }
+    }
+
+    private static void TryCapturePid(string path, TaskCompletionSource<int> gate)
+    {
+        if (gate.Task.IsCompleted)
+            return;
+
+        try
+        {
+            if (File.Exists(path) &&
+                int.TryParse(File.ReadAllText(path).Trim(), out var pid) &&
+                pid > 1)
+            {
+                gate.TrySetResult(pid);
+            }
+        }
+        catch (IOException)
+        {
+            // A Created notification may run before the process has flushed the short PID file;
+            // the Changed notification or explicit post-launch probe retries the file gate.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Treat a transient file-access race exactly like a not-yet-open gate.
+        }
+    }
+
+    private static int GetCompletedPid(TaskCompletionSource<int> gate) =>
+        gate.Task.IsCompletedSuccessfully ? gate.Task.Result : 0;
+
+    private static bool IsLinuxPidPresent(int pid) =>
+        pid > 1 && Directory.Exists($"/proc/{pid}");
+
+    /// <summary>
+    /// Reads the parent PID of <paramref name="pid"/> from <c>/proc/{pid}/stat</c>, or null when
+    /// the process is absent or the record cannot be parsed.
+    /// </summary>
+    /// <remarks>
+    /// Field 4 of the record is the PPID, but field 2 (<c>comm</c>) is parenthesised and may
+    /// itself contain spaces or parentheses, so parsing starts after the LAST <c>')'</c>.
+    /// </remarks>
+    private static int? TryGetLinuxParentPid(int pid)
+    {
+        try
+        {
+            var stat = File.ReadAllText($"/proc/{pid}/stat");
+            var commEnd = stat.LastIndexOf(')');
+            if (commEnd < 0)
+                return null;
+
+            // After "(comm)" the remaining fields are: state ppid ...
+            var fields = stat[(commEnd + 1)..]
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            return fields.Length >= 2 && int.TryParse(fields[1], out var ppid) ? ppid : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="ancestorPid"/> is NOT reachable by walking the PPID chain
+    /// upwards from <paramref name="pid"/> — i.e. <paramref name="pid"/> has escaped that process
+    /// tree and <c>Kill(entireProcessTree: true)</c> on the ancestor can no longer reach it.
+    /// </summary>
+    /// <remarks>
+    /// Walks to PID 1 (or to a vanished/unreadable ancestor). The hop budget bounds the walk
+    /// against a pathological or racing chain; it never loops indefinitely.
+    /// </remarks>
+    private static bool HasEscapedLinuxProcessTree(int pid, int ancestorPid)
+    {
+        const int MaxHops = 64;
+
+        var current = pid;
+        for (var hop = 0; hop < MaxHops; hop++)
+        {
+            if (current == ancestorPid)
+                return false; // Still inside the ancestor's tree.
+
+            if (TryGetLinuxParentPid(current) is not { } parent || parent <= 1)
+                return true; // Reached init/kernel or an unreadable ancestor without meeting it.
+
+            current = parent;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Polls until <paramref name="pid"/> has escaped the process tree rooted at
+    /// <paramref name="ancestorPid"/> (the double-fork reparent completed), returning false if the
+    /// bounded deadline expires.
+    /// </summary>
+    private static async Task<bool> WaitForLinuxTreeEscapeAsync(
+        int pid,
+        int ancestorPid,
+        TimeSpan deadline,
+        CancellationToken testToken)
+    {
+        if (HasEscapedLinuxProcessTree(pid, ancestorPid))
+            return true;
+
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(testToken);
+        deadlineCts.CancelAfter(deadline);
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(deadlineCts.Token))
+            {
+                if (HasEscapedLinuxProcessTree(pid, ancestorPid))
+                    return true;
+            }
+        }
+        catch (OperationCanceledException) when (!testToken.IsCancellationRequested)
+        {
+            // Bounded deadline expired — the caller asserts the failure.
+        }
+
+        return false;
+    }
+
+    private static async Task<bool> WaitForLinuxPidAbsenceAsync(
+        int pid,
+        TimeSpan deadline,
+        CancellationToken testToken)
+    {
+        await WaitForLinuxPidsAbsenceAsync([pid], deadline, testToken);
+        return !IsLinuxPidPresent(pid);
+    }
+
+    private static async Task WaitForLinuxPidsAbsenceAsync(
+        IReadOnlyList<int> pids,
+        TimeSpan deadline,
+        CancellationToken testToken)
+    {
+        if (pids.All(pid => !IsLinuxPidPresent(pid)))
+            return;
+
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(testToken);
+        deadlineCts.CancelAfter(deadline);
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(deadlineCts.Token))
+            {
+                if (pids.All(pid => !IsLinuxPidPresent(pid)))
+                    return;
+            }
+        }
+        catch (OperationCanceledException) when (!testToken.IsCancellationRequested)
+        {
+            // The single bounded OS-reaping allowance expired.
+        }
+    }
+
+    private static void TryKillProcess(int pid)
+    {
+        if (pid <= 1)
+            return;
+
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            process.Kill(entireProcessTree: true);
+        }
+        catch (ArgumentException)
+        {
+            // Already absent.
+        }
+        catch (InvalidOperationException)
+        {
+            // Already exited.
+        }
+        catch (Win32Exception)
+        {
+            // Best-effort cleanup only; the assertions report any contract failure first.
+        }
+    }
+
+    private static async Task CreateFifoAsync(string path, CancellationToken testToken)
+    {
+        var startInfo = new ProcessStartInfo("/usr/bin/mkfifo")
+        {
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add(path);
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Failed to start mkfifo for the natural-exit test gate.");
+        var stderrTask = process.StandardError.ReadToEndAsync(testToken);
+        await process.WaitForExitAsync(testToken);
+        var stderr = await stderrTask;
+        Assert.Equal(0, process.ExitCode);
+        Assert.Equal(string.Empty, stderr);
+    }
+
+    /// <summary>
+    /// Writes one line into the FIFO, unblocking the reader that holds the redirected handles.
+    /// </summary>
+    private static async Task ReleaseFifoAsync(string path, CancellationToken testToken)
+    {
+        await using var release = new FileStream(
+            path,
+            new FileStreamOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Write,
+                Share = FileShare.ReadWrite,
+                Options = FileOptions.Asynchronous,
+            });
+        await using var writer = new StreamWriter(release);
+        await writer.WriteLineAsync("release".AsMemory(), testToken);
+        await writer.FlushAsync(testToken);
     }
 }

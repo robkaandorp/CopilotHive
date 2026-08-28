@@ -288,7 +288,7 @@ public static class GitOperations
 
     /// <summary>
     /// Test seam replacing the ENTIRE git process launch. When non-null,
-    /// <see cref="RunGitCommandAsync"/> hands the delegate the raw, PRE-factory
+    /// <see cref="ExecuteProcessAsync"/> hands the delegate the raw, PRE-factory
     /// <see cref="GitProcessRequest"/> (never a sanitized <see cref="ProcessStartInfo"/>) and
     /// returns the delegate's result. When null, the default real runner starts a git process.
     /// </summary>
@@ -339,11 +339,42 @@ public static class GitOperations
     /// </summary>
     /// <param name="request">The request describing the executable, argument, directory and environment.</param>
     /// <exception cref="ArgumentException">
-    /// Thrown when <see cref="GitProcessRequest.Args"/> does not contain exactly one element.
+    /// Thrown when <see cref="GitProcessRequest.Args"/> does not contain exactly one element and
+    /// <see cref="GitProcessRequest.TokenizedArgs"/> is null.
     /// </exception>
     internal static ProcessStartInfo CreateProcessStartInfo(GitProcessRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        var psi = new ProcessStartInfo(request.Executable)
+        {
+            WorkingDirectory = request.WorkingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        if (request.TokenizedArgs is not null)
+        {
+            // Tokenized form: each element is added in order to the get-only ArgumentList
+            // collection (no quoting — the OS receives the tokens verbatim).
+            foreach (var arg in request.TokenizedArgs)
+                psi.ArgumentList.Add(arg);
+
+            // Tokenized form: environment copied VERBATIM — no re-scrub, no forced additions.
+            // Null-valued entries are omitted at repopulation (an environment block cannot
+            // hold a null value).
+            psi.Environment.Clear();
+            foreach (var (key, value) in request.Env)
+            {
+                if (value is null)
+                    continue;
+
+                psi.Environment[key] = value;
+            }
+
+            return psi;
+        }
 
         if (request.Args.Count != 1)
         {
@@ -352,15 +383,8 @@ public static class GitOperations
                 nameof(request));
         }
 
-        var psi = new ProcessStartInfo(request.Executable)
-        {
-            WorkingDirectory = request.WorkingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            // Legacy opaque form: assigned VERBATIM, no splitting and no re-quoting.
-            Arguments = request.Args[0],
-        };
+        // Legacy opaque form: assigned VERBATIM, no splitting and no re-quoting.
+        psi.Arguments = request.Args[0];
 
         var sanitized = SanitizeChildEnv(new Dictionary<string, string?>(request.Env));
 
@@ -405,25 +429,128 @@ public static class GitOperations
         string workDir, string args, CancellationToken ct)
     {
         var request = new GitProcessRequest("git", [args], workDir, SnapshotCurrentProcessEnv());
+        var result = await ExecuteProcessAsync(request, ct);
+        return (result.ExitCode, result.Stdout, result.Stderr);
+    }
 
+    /// <summary>
+    /// The SINGLE launch implementation for git processes. Both the legacy opaque-argument path
+    /// (<see cref="RunGitCommandAsync"/>) and the tokenized path route through here.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When the static <see cref="ProcessRunner"/> seam is non-null, the ENTIRE launch is replaced
+    /// by the delegate: the request and token are passed through and no real process is started,
+    /// killed, drained, or cleaned up.
+    /// </para>
+    /// <para>
+    /// Cancellation semantics: on cancellation the process tree is killed (best-effort; a Kill
+    /// throw is swallowed). When the Kill REQUEST succeeds, the root exit is awaited under a
+    /// SINGLE absolute 10-second deadline shared by BOTH the exit wait AND the output draining
+    /// (one deadline, not two windows), and then <see cref="OperationCanceledException"/> is
+    /// thrown with the CALLER'S token attached. When Kill THROWS, neither the root exit nor the
+    /// output reads are awaited: the pending reads are ABANDONED and
+    /// <see cref="OperationCanceledException"/> propagates promptly.
+    /// A COMPLETED process result wins the natural-exit race REGARDLESS of its exit code: if the
+    /// process has already exited before cancellation is observed, the result is returned
+    /// normally. Descendant termination is deliberately NOT a production guarantee — arbitrary
+    /// descendants are not observable here (no handles/PIDs are exposed). If Kill throws or the
+    /// deadline expires, the pending output reads are abandoned and
+    /// <see cref="OperationCanceledException"/> is thrown even though the process tree may still
+    /// be running.
+    /// </para>
+    /// </remarks>
+    internal static async Task<GitProcessResult> ExecuteProcessAsync(
+        GitProcessRequest request, CancellationToken ct)
+    {
         var runner = ProcessRunner;
         if (runner is not null)
         {
-            var seamResult = await runner(request, ct);
-            return (seamResult.ExitCode, seamResult.Stdout, seamResult.Stderr);
+            // Entire launch replaced by the delegate — no real process launch and no
+            // kill/drain/cleanup of a delegate-owned launch.
+            return await runner(request, ct);
         }
 
+        // A Process.Start exception (e.g. nonexistent executable → Win32Exception) propagates
+        // AS-IS, un-wrapped and un-sanitized.
         using var process = Process.Start(CreateProcessStartInfo(request))
             ?? throw new InvalidOperationException("Failed to start git process.");
 
-        // Read stdout and stderr concurrently to avoid deadlock when buffers fill
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+        // Output reads are started WITHOUT a token: after a kill the streams close and the
+        // reads complete naturally.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
 
-        await Task.WhenAll(stdoutTask, stderrTask);
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            await process.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Natural-exit race: a COMPLETED process result wins regardless of its exit code.
+            // If the process has already exited before cancellation was observed, return the
+            // result normally; the kill path applies only when the process is still running.
+            if (process.HasExited)
+            {
+                return new GitProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
+            }
 
-        return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
+            // Best-effort kill of the entire process tree; a Kill throw is swallowed.
+            var killRequested = false;
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                killRequested = true;
+            }
+            catch
+            {
+                // Swallowed — best-effort only. The declared limitation applies: the process tree
+                // may still be running.
+            }
+
+            if (!killRequested)
+            {
+                // Kill FAILED: neither the root exit nor the output reads are awaited. The pending
+                // reads are ABANDONED and cancellation propagates PROMPTLY, even though the
+                // process tree may still be running.
+                throw new OperationCanceledException(ct);
+            }
+
+            // SINGLE absolute 10-second deadline shared by BOTH the exit wait AND the output
+            // draining (one deadline, not two windows).
+            using var deadlineCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var deadline = deadlineCts.Token;
+
+            // Await the root exit under the deadline.
+            try
+            {
+                await process.WaitForExitAsync(CancellationToken.None).WaitAsync(deadline);
+            }
+            catch (OperationCanceledException)
+            {
+                // Deadline expired — the process tree may still be running. The pending output
+                // reads are ABANDONED, not awaited.
+                throw new OperationCanceledException(ct);
+            }
+
+            // Await the output reads under the SAME deadline. The streams close after the kill
+            // so the reads complete naturally; if the deadline expires they are ABANDONED.
+            try
+            {
+                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(deadline);
+            }
+            catch (OperationCanceledException)
+            {
+                // Deadline expired — reads abandoned.
+                throw new OperationCanceledException(ct);
+            }
+
+            throw new OperationCanceledException(ct);
+        }
+
+        // Normal completion: the process exited (any exit code) before cancellation was
+        // observed — the completed result wins the race.
+        return new GitProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
     }
 
     /// <summary>
@@ -512,19 +639,31 @@ public static class GitOperations
 }
 
 /// <summary>
-/// A request to launch a git process. Immutability is SHALLOW: the collections are held by
-/// reference and are not defensively copied — the non-mutation obligation belongs to the
-/// implementation that consumes the request.
+/// A request to launch a git process. All properties are init-only and the collection CONTENTS
+/// are not defensively copied — immutability is SHALLOW: the collections are held by reference
+/// and the non-mutation obligation belongs to the implementation that consumes the request.
 /// </summary>
 /// <param name="Executable">The executable to launch (normally <c>git</c>).</param>
-/// <param name="Args">The argument list. Currently exactly one opaque argument string is supported.</param>
+/// <param name="Args">
+/// The legacy opaque argument list. Exactly one opaque argument string is supported and it is
+/// assigned to <see cref="ProcessStartInfo.Arguments"/> VERBATIM. IGNORED when
+/// <paramref name="TokenizedArgs"/> is non-null (callers pass <c>Array.Empty&lt;string&gt;()</c>).
+/// </param>
 /// <param name="WorkingDirectory">The working directory for the child process.</param>
-/// <param name="Env">The environment to scrub and hand to the child process.</param>
+/// <param name="Env">The environment to hand to the child process.</param>
+/// <param name="TokenizedArgs">
+/// Optional tokenized argument list. When non-null, each element is added in order to
+/// <see cref="ProcessStartInfo.ArgumentList"/> (no quoting) and the environment is copied
+/// VERBATIM from <see cref="Env"/> — no re-scrub, no forced additions, null-valued entries
+/// omitted at repopulation. When null, the legacy path applies: the <c>Args.Count == 1</c>
+/// validation, <c>Arguments = Args[0]</c> verbatim, and the internal five-variable scrub.
+/// </param>
 internal sealed record GitProcessRequest(
     string Executable,
     IReadOnlyList<string> Args,
     string WorkingDirectory,
-    IReadOnlyDictionary<string, string?> Env);
+    IReadOnlyDictionary<string, string?> Env,
+    IReadOnlyList<string>? TokenizedArgs = null);
 
 /// <summary>
 /// The result of a git process launch.
