@@ -1,16 +1,19 @@
 using System.Globalization;
 using System.Security;
+using CopilotHive.Configuration;
 using CopilotHive.Services;
 
 namespace CopilotHive.Worker;
 
 /// <summary>
-/// Validation and EXECUTION layer for the config-repo git seam (slices 2c-b1b-i + 2c-b1b-ii):
-/// strict per-command grammar, ref prechecks PLUS the check-ref-format subprocess, worktree
-/// containment, canonicalization, constructors, disposal, and the real process execution via
-/// the SHARED <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping
-/// and redaction boundary. The credential/origin transport (2c-b1c), the health probe (2c-b2),
-/// and the clone (2c-b3) are later slices.
+/// Validation and EXECUTION layer for the config-repo git seam (slices 2c-b1b-i, 2c-b1b-ii and
+/// 2c-b1c-i): strict per-command grammar, the Stage 6a URL resolution / transport eligibility,
+/// ref prechecks PLUS the check-ref-format subprocess, worktree containment, canonicalization,
+/// constructors, disposal, and the real process execution via the SHARED
+/// <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping and
+/// redaction boundary. The origin state machine, the credential/helper resolution and the
+/// credential env injection (2c-b1c-ii), the health probe (2c-b2), and the clone (2c-b3) are
+/// later slices.
 /// </summary>
 internal sealed class ConfigRepoGitOperations : IDisposable
 {
@@ -147,9 +150,23 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         // Every grammar rejection — misplacement, unknown option, duplicate, conflict,
         // --depth, positional count, remote identity, push arity, credential-free form
         // matching — is decided here, BEFORE Stage 6 ever looks at the ref.
-        var (scanError, refCandidate) = ScanTokens(subcommand, snapshot);
+        var (scanError, refCandidate, hasPositionals) = ScanTokens(subcommand, snapshot);
         if (scanError is not null)
             return Reject(scanError);
+
+        // Stage 6a — URL resolution (slice 2c-b1c-i), for the TRANSPORT commands
+        // (pull/push/fetch) ONLY. Local commands (checkout/add/diff/commit/merge --abort/
+        // status) skip this stage entirely: the URL resolver is NEVER read for them, and they
+        // go straight to Stage 7 with the scrubbed env. The resolver is read EXACTLY ONCE.
+        var eligibleTransport = false;
+        if (IsTransportSubcommand(subcommand))
+        {
+            var (urlError, eligible) = ResolveTransportEligibility();
+            if (urlError is not null)
+                return Reject(urlError);
+
+            eligibleTransport = eligible;
+        }
 
         // Stage 6 — ref validation: the PRECHECKS, then (when they pass) the check-ref-format
         // subprocess. Run only once the Stage 5 scan completed without a grammar rejection.
@@ -174,11 +191,24 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                 return Reject($"Invalid git ref: '{GitUrlRedactor.Redact(refCandidate)}'.");
         }
 
-        // Stage 7 — the real execution: the SNAPSHOT launched verbatim via the SHARED
-        // ExecuteProcessAsync. The working directory is the CONSTRUCTOR-canonicalized
-        // configRepoDir — NOT the call-time workingDirectory string (Stage 3 containment has
-        // already verified their equivalence).
-        var execution = await LaunchGitProcessAsync(snapshot, ct);
+        // Stage 7 — the real execution via the SHARED ExecuteProcessAsync. The working
+        // directory is the CONSTRUCTOR-canonicalized configRepoDir — NOT the call-time
+        // workingDirectory string (Stage 3 containment has already verified their
+        // equivalence).
+        //
+        // CANONICALIZATION (slice 2c-b1c-i): an ELIGIBLE pull/fetch whose validated form
+        // carries NO positionals gets the literal `origin` appended as the remote argument,
+        // so the command always targets the explicit origin remote rather than whatever
+        // upstream tracking configuration happens to exist. Every other launch — a form that
+        // already has positionals (the grammar guarantees its first positional is exactly
+        // `origin`), EVERY push form, and every Branch B (ineligible transport) command —
+        // launches the SNAPSHOT verbatim. In BOTH cases the env is the scrubbed env plus
+        // GIT_TERMINAL_PROMPT=0: this slice attaches NO credential env (2c-b1c-ii owns it).
+        string[] launchArgs = ShouldAppendExplicitOrigin(subcommand, eligibleTransport, hasPositionals)
+            ? [.. snapshot, "origin"]
+            : snapshot;
+
+        var execution = await LaunchGitProcessAsync(launchArgs, ct);
         if (execution is null)
             return Reject("Git process failed to start.");
 
@@ -321,17 +351,131 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         subcommand is "pull" or "push" or "fetch" or "checkout" or "add" or "diff" or "commit" or "merge" or "status";
 
     /// <summary>
+    /// The TRANSPORT (network) subcommands — the only ones that reach Stage 6a. Every other
+    /// subcommand is local and NEVER reads the URL resolver.
+    /// </summary>
+    private static bool IsTransportSubcommand(string subcommand) =>
+        subcommand is "pull" or "push" or "fetch";
+
+    /// <summary>
+    /// Stage 6a — resolves the config repo URL EXACTLY ONCE and decides transport eligibility.
+    /// </summary>
+    /// <returns>
+    /// <c>(Error, _)</c> with a non-null message when the command must be rejected without
+    /// ever running; otherwise <c>(null, Eligible)</c> where <c>Eligible</c> selects the
+    /// canonicalized explicit-origin launch (Branch A) over the verbatim launch (Branch B).
+    /// </returns>
+    /// <remarks>
+    /// An <see cref="OperationCanceledException"/> from the resolver PROPAGATES
+    /// unconditionally. ANY other resolver exception maps to the FIXED
+    /// <c>Config repo not provisioned.</c> message — the resolver's own text (e.g. the
+    /// production provisioner's "snapshot absent" <see cref="InvalidOperationException"/>)
+    /// NEVER escapes.
+    /// </remarks>
+    private (string? Error, bool Eligible) ResolveTransportEligibility()
+    {
+        string? resolvedUrl;
+        try
+        {
+            resolvedUrl = _resolvedUrlResolver();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return ("Config repo not provisioned.", false);
+        }
+
+        if (string.IsNullOrWhiteSpace(resolvedUrl))
+            return ("Config repo URL is not available.", false);
+
+        string? sanitized;
+        try
+        {
+            sanitized = ConfigRepoUrlSanitizer.Sanitize(resolvedUrl);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The sanitizer's messages are already redacted by construction; the returned
+            // SanitizedError still passes through GitUrlRedactor.Redact like every other one.
+            return ($"Invalid config repo URL: {ex.Message}", false);
+        }
+
+        if (string.IsNullOrWhiteSpace(sanitized))
+        {
+            // ConfigRepoUrlSanitizer.Sanitize returns null ONLY for an ABSENT value, which the
+            // whitespace check above has already rejected. Reaching this branch would mean the
+            // sanitizer broke its contract — report it as an absent URL rather than launching.
+            return ("Config repo URL is not available.", false);
+        }
+
+        return (null, IsEligibleTransportUrl(sanitized));
+    }
+
+    /// <summary>
+    /// Transport eligibility, computed from the SANITIZED URL: an <c>https</c> URL whose host
+    /// is <c>github.com</c> (case-insensitively) and whose EFFECTIVE port is 443 — the explicit
+    /// port when present, 443 implicitly when absent. An explicit <c>:443</c> IS eligible; an
+    /// explicit non-443 port, and every ssh/scp/file/local-path form, is Branch B.
+    /// </summary>
+    /// <remarks>
+    /// The host check is defence in depth: the sanitizer already rejects every https URL whose
+    /// host is not <c>github.com</c>, so no sanitized value can reach this method with a
+    /// different host. It is kept so eligibility remains self-contained and correct if the
+    /// sanitizer's host policy ever widens.
+    /// </remarks>
+    private static bool IsEligibleTransportUrl(string sanitizedUrl)
+    {
+        if (!Uri.TryCreate(sanitizedUrl, UriKind.Absolute, out var uri))
+            return false;
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Uri.Port yields the scheme default (443 for https) when no explicit port is present,
+        // which is exactly the "effective port" rule.
+        return uri.Port == 443;
+    }
+
+    /// <summary>
+    /// Whether the launch must INSERT the literal <c>origin</c> remote: only an ELIGIBLE
+    /// pull/fetch whose validated form carries NO positionals. push NEVER gets it, Branch B
+    /// NEVER gets it, and a form that already has positionals NEVER gets it.
+    /// </summary>
+    /// <remarks>
+    /// The <c>push</c> exclusion is belt-and-braces: the Stage 5 grammar requires
+    /// <c>push origin &lt;ref&gt;</c>, so a validated push always has positionals and would be
+    /// excluded by <paramref name="hasPositionals"/> alone. It is stated explicitly because
+    /// "ALL push forms launch verbatim" is the contract, not an emergent property.
+    /// </remarks>
+    private static bool ShouldAppendExplicitOrigin(
+        string subcommand, bool eligibleTransport, bool hasPositionals) =>
+        eligibleTransport && !hasPositionals && subcommand is "pull" or "fetch";
+
+    /// <summary>
     /// Stage 5 — the single left-to-right token scan plus the post-scan structural checks.
     /// Returns the first grammar error message (or <c>null</c>) together with the SELECTED
-    /// ref candidate. The ref candidate is deliberately NOT validated here: Stage 6 runs only
-    /// after the whole Stage 5 scan completed without a grammar rejection, so a Stage 5 error
-    /// always wins over a Stage 6 ref error.
+    /// ref candidate and whether the form carries ANY positional (the remote slot). The ref
+    /// candidate is deliberately NOT validated here: Stage 6 runs only after the whole Stage 5
+    /// scan completed without a grammar rejection, so a Stage 5 error always wins over a
+    /// Stage 6 ref error. <c>HasPositionals</c> feeds the Stage 7 explicit-origin
+    /// canonicalization.
     /// </summary>
-    private static (string? Error, string? RefCandidate) ScanTokens(string subcommand, string[] snapshot) =>
+    private static (string? Error, string? RefCandidate, bool HasPositionals) ScanTokens(
+        string subcommand, string[] snapshot) =>
         subcommand switch
         {
             "checkout" or "add" or "diff" or "commit" or "merge" or "status" =>
-                (ValidateLocalForm(subcommand, snapshot), null),
+                (ValidateLocalForm(subcommand, snapshot), null, false),
             "pull" or "push" or "fetch" => ScanCredentialScoped(subcommand, snapshot),
             _ => throw new InvalidOperationException($"Unhandled subcommand '{subcommand}'."),
         };
@@ -367,8 +511,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// every token; the first error wins. Structural validation (remote identity, push arity)
     /// runs after the scan. The selected ref candidate is RETURNED, never validated here —
     /// Stage 6 owns the ref prechecks and runs only after this whole scan succeeded.
+    /// <c>HasPositionals</c> reports whether the form filled the remote slot; it selects the
+    /// Stage 7 explicit-origin canonicalization.
     /// </summary>
-    private static (string? Error, string? RefCandidate) ScanCredentialScoped(
+    private static (string? Error, string? RefCandidate, bool HasPositionals) ScanCredentialScoped(
         string subcommand, string[] snapshot)
     {
         var seenOptions = new HashSet<string>(StringComparer.Ordinal);
@@ -388,13 +534,13 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             {
                 // A KNOWN option AFTER the first positional → misplacement (never a ref).
                 if (remoteSeen)
-                    return ("Invalid git command: options must precede positionals.", null);
+                    return ("Invalid git command: options must precede positionals.", null, false);
 
                 if (!seenOptions.Add(token))
-                    return ($"Invalid git command: duplicate option '{token}'.", null);
+                    return ($"Invalid git command: duplicate option '{token}'.", null, false);
 
                 if (IsConflictingOptionPair(token, seenOptions))
-                    return ("Invalid git command: --rebase and --no-rebase are mutually exclusive.", null);
+                    return ("Invalid git command: --rebase and --no-rebase are mutually exclusive.", null, false);
 
                 if (token == "--depth")
                 {
@@ -402,7 +548,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                         || IsOptionLike(snapshot[i + 1])
                         || !IsValidDepth(snapshot[i + 1]))
                     {
-                        return ("Invalid git command: --depth requires a positive integer.", null);
+                        return ("Invalid git command: --depth requires a positive integer.", null, false);
                     }
 
                     i++; // consume the value token
@@ -415,10 +561,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             {
                 // An UNKNOWN dash-prefixed token.
                 if (!remoteSeen)
-                    return ($"Invalid git command: unknown option '{token}'.", null);
+                    return ($"Invalid git command: unknown option '{token}'.", null, false);
 
                 if (refSeen)
-                    return ("Invalid git command: too many arguments.", null);
+                    return ("Invalid git command: too many arguments.", null, false);
 
                 // A ref CANDIDATE — recorded now, validated by Stage 6 after this scan.
                 refSlot = token;
@@ -435,7 +581,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             }
 
             if (refSeen)
-                return ("Invalid git command: too many arguments.", null);
+                return ("Invalid git command: too many arguments.", null, false);
 
             refSlot = token;
             refSeen = true;
@@ -446,17 +592,17 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         {
             // Arity is checked BEFORE remote identity: `push badremote` is an arity failure.
             if (!remoteSeen || !refSeen)
-                return ("Invalid git command: push requires 'origin <ref>'.", null);
+                return ("Invalid git command: push requires 'origin <ref>'.", null, false);
 
             if (remote != "origin")
-                return ("Invalid git command: the remote must be 'origin'.", null);
+                return ("Invalid git command: the remote must be 'origin'.", null, false);
         }
         else if (remoteSeen && remote != "origin")
         {
-            return ("Invalid git command: the remote must be 'origin'.", null);
+            return ("Invalid git command: the remote must be 'origin'.", null, false);
         }
 
-        return (null, refSlot);
+        return (null, refSlot, remoteSeen);
     }
 
     private static bool IsKnownOption(string subcommand, string token) => subcommand switch

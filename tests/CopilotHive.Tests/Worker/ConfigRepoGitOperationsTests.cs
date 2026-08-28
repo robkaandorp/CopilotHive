@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Security;
+using CopilotHive.Configuration;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Worker;
 using Grpc.Core;
@@ -8,15 +9,18 @@ namespace CopilotHive.Tests.Worker;
 
 /// <summary>
 /// Table-driven tests for the validation AND execution seam <see cref="ConfigRepoGitOperations"/>
-/// (slices 2c-b1b-i + 2c-b1b-ii). The validation-stage contract tests (grammar messages,
-/// containment, snapshot ordering, disposal at entry, canonicalization seam) assert exact
-/// messages / exact outcome shapes so that deleting or reordering validation stages breaks
+/// (slices 2c-b1b-i, 2c-b1b-ii and 2c-b1c-i). The validation-stage contract tests (grammar
+/// messages, containment, snapshot ordering, disposal at entry, canonicalization seam) assert
+/// exact messages / exact outcome shapes so that deleting or reordering validation stages breaks
 /// the suite (removal-proof). The execution-stage tests (2c-b1b-ii) assert the EXACT
 /// <see cref="GitProcessRequest"/> shapes (ref-validation and final execution), the concrete
 /// result mapping, the redaction boundary over process output, the cancellation precedence
 /// (TCS-gated), the TCS-gated defensive snapshot, and the TCS-gated disposal-vs-in-flight
-/// contract — all via the <see cref="GitOperations.ProcessRunner"/> seam (restored in a
-/// finally block) and TCS gates for synchronization (no timing-based tests).
+/// contract. The Stage 6a tests (2c-b1c-i) assert the URL resolution outcomes, the transport
+/// ELIGIBILITY rule, the canonicalized explicit-origin launch, the exact SEQUENCING
+/// (Stage 5 → Stage 6a → Stage 6 → Stage 7) with EXACT subprocess invocation totals, and the
+/// resolver-exception policy — all via the <see cref="GitOperations.ProcessRunner"/> seam
+/// (restored in a finally block) and TCS gates for synchronization (no timing-based tests).
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ConfigRepoGitOperationsTests
@@ -25,6 +29,21 @@ public sealed class ConfigRepoGitOperationsTests
     private const string InvalidArguments = "Invalid arguments.";
     private const string NotConfigRepo =
         "Invalid git command: the working directory is not the config repository.";
+
+    /// <summary>The Stage 6a message when the resolved config repo URL is absent.</summary>
+    private const string UrlUnavailable = "Config repo URL is not available.";
+
+    /// <summary>The FIXED Stage 6a message for ANY non-cancellation resolver exception.</summary>
+    private const string NotProvisioned = "Config repo not provisioned.";
+
+    /// <summary>
+    /// A resolved config repo URL that is ELIGIBLE for the canonicalized explicit-origin
+    /// launch: HTTPS, host <c>github.com</c>, implicit port 443.
+    /// </summary>
+    private const string EligibleUrl = "https://github.com/org/config-repo.git";
+
+    /// <summary>A bound on every await that a mutant could otherwise block forever.</summary>
+    private static readonly TimeSpan AwaitTimeout = TimeSpan.FromSeconds(30);
 
     private static readonly string RepoDir = OperatingSystem.IsWindows()
         ? @"C:\config-repo"
@@ -37,18 +56,28 @@ public sealed class ConfigRepoGitOperationsTests
 
     private static WorkerLogger Log() => new("Test");
 
+    /// <summary>
+    /// Builds the seam. The URL resolver defaults to a VALID, ELIGIBLE HTTPS github.com URL
+    /// so every transport (pull/push/fetch) test passes Stage 6a and really reaches the
+    /// stages under test; the Stage 6a rejection paths supply their own resolver explicitly.
+    /// </summary>
     private static ConfigRepoGitOperations CreateSeam(
         Action? onDispose = null,
         Func<string, string>? pathCanonicalizer = null,
-        string? configRepoDir = null) =>
+        string? configRepoDir = null,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string?>? credentialResolver = null) =>
         new(
             configRepoDir ?? RepoDir,
-            static () => null,
-            static () => null,
+            resolvedUrlResolver ?? (static () => EligibleUrl),
+            credentialResolver ?? (static () => null),
             Log(),
             static () => "/helper",
             onDispose ?? (static () => { }),
             pathCanonicalizer);
+
+    /// <summary>A URL resolver returning a fixed value (possibly <c>null</c>).</summary>
+    private static Func<string?> UrlResolver(string? url) => () => url;
 
     // ------------------------------------------------------------------
     // Execution-stage helpers (2c-b1b-ii)
@@ -322,18 +351,26 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     // ------------------------------------------------------------------
-    // The delegates are NEVER invoked; onDispose is exempt
+    // The CREDENTIAL delegates are NEVER invoked; the URL resolver is read
+    // exactly once per TRANSPORT command (Stage 6a) and never otherwise
     // ------------------------------------------------------------------
 
+    /// <summary>
+    /// The credential resolver and the credential-helper path are still NEVER invoked by this
+    /// slice (2c-b1c-ii owns the credential/helper resolution and the env injection). The URL
+    /// resolver, by contrast, IS read — exactly once — for every TRANSPORT command
+    /// (pull/push/fetch) that reaches Stage 6a, and never for a local command or for a command
+    /// rejected before Stage 6a.
+    /// </summary>
     [Fact]
-    public async Task RunConfigRepoCommandAsync_NeverInvokesResolversOrCredentialHelperPath()
+    public async Task RunConfigRepoCommandAsync_NeverInvokesCredentialResolverOrHelperPath()
     {
         var urlCalls = 0;
         var credentialCalls = 0;
         var helperCalls = 0;
         using var seam = new ConfigRepoGitOperations(
             RepoDir,
-            () => { urlCalls++; return null; },
+            () => { urlCalls++; return EligibleUrl; },
             () => { credentialCalls++; return null; },
             Log(),
             () => { helperCalls++; return "/helper"; },
@@ -350,11 +387,11 @@ public sealed class ConfigRepoGitOperationsTests
 
             foreach (var args in new[]
                      {
-                         new[] { "pull", "origin", "main" },
-                         new[] { "push", "origin", "main" },
-                         new[] { "fetch", "--prune" },
-                         new[] { "status" },
-                         new[] { "https://x-access-token:tok@github.com/o" },
+                         new[] { "pull", "origin", "main" },   // transport → Stage 6a
+                         new[] { "push", "origin", "main" },   // transport → Stage 6a
+                         new[] { "fetch", "--prune" },         // transport → Stage 6a
+                         new[] { "status" },                   // local → Stage 6a SKIPPED
+                         new[] { "https://x-access-token:tok@github.com/o" }, // Stage 4 rejection
                      })
             {
                 var result = await seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None);
@@ -370,7 +407,9 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = originalRunner;
         }
 
-        Assert.Equal(0, urlCalls);
+        // EXACTLY one read per transport command; the local command and the Stage 4 rejection
+        // never touch the resolver.
+        Assert.Equal(3, urlCalls);
         Assert.Equal(0, credentialCalls);
         Assert.Equal(0, helperCalls);
     }
@@ -2060,6 +2099,657 @@ public sealed class ConfigRepoGitOperationsTests
         var result = await RunAsync(seam, new[] { "pull", "origin", "https://x-access-token:tok@github.com/o/r" });
 
         AssertRejected(result, "Invalid git ref: 'https://github.com/o/r'.");
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 6a (slice 2c-b1c-i) — URL resolution, eligibility, canonicalization
+    // ------------------------------------------------------------------
+
+    /// <summary>An absolute local path used as an INELIGIBLE resolved config repo URL.</summary>
+    private static readonly string LocalPathUrl = OperatingSystem.IsWindows()
+        ? @"C:\srv\config-repo.git"
+        : "/srv/config-repo.git";
+
+    /// <summary>A <c>file:</c> URL used as an INELIGIBLE resolved config repo URL.</summary>
+    private static readonly string FileUrl = OperatingSystem.IsWindows()
+        ? "file:///C:/srv/config-repo.git"
+        : "file:///srv/config-repo.git";
+
+    /// <summary>Bounds an await so a mutant can never block the suite forever.</summary>
+    private static Task<T> Bounded<T>(Task<T> task) =>
+        task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// Runs a command against a RECORDING ProcessRunner (restored in a finally block) and
+    /// returns the result together with EVERY captured request, so the exact invocation TOTAL
+    /// — not merely the last request's shape — can be asserted.
+    /// </summary>
+    private static async Task<(ConfigRepoOpResult Result, List<GitProcessRequest> Requests)> RunCapturingAsync(
+        Func<string?> resolvedUrlResolver,
+        string[] args,
+        int exitCode = 0,
+        Func<string?>? credentialResolver = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(new GitProcessResult(exitCode, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam(
+                resolvedUrlResolver: resolvedUrlResolver, credentialResolver: credentialResolver);
+            var result = await Bounded(
+                seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None));
+            return (result, requests);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// ELIGIBLE resolved URLs: HTTPS, host <c>github.com</c> (case-insensitively), effective
+    /// port 443 — implicit, or EXPLICIT <c>:443</c>.
+    /// </summary>
+    public static TheoryData<string> EligibleUrlCases => new()
+    {
+        "https://github.com/org/config-repo.git",
+        "https://github.com:443/org/config-repo.git",
+        "https://GITHUB.COM/org/config-repo.git",
+        "https://GitHub.Com/org/config-repo.git",
+    };
+
+    /// <summary>
+    /// An eligible URL makes a POSITIONAL-FREE pull the CANONICALIZED explicit-origin launch.
+    /// Exactly ONE subprocess is launched (a bare pull has no ref candidate).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(EligibleUrlCases))]
+    public async Task Stage6a_EligibleUrl_BarePull_LaunchesExplicitOrigin(string url)
+    {
+        var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
+
+        Assert.True(result.Success);
+        Assert.Single(requests);
+        Assert.Equal(new[] { "pull", "origin" }, requests[0].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// INELIGIBLE resolved URLs — every one of them is a value the sanitizer ACCEPTS, so the
+    /// command still runs; it simply launches the snapshot VERBATIM (Branch B).
+    /// </summary>
+    public static TheoryData<string> IneligibleUrlCases => new()
+    {
+        "https://github.com:8443/org/config-repo.git",  // explicit NON-443 port
+        "https://github.com:8080/org/config-repo.git",
+        "ssh://git@github.com/org/config-repo.git",     // ssh
+        // ssh on the HTTPS default port: host github.com AND effective port 443, so ONLY the
+        // scheme rule keeps it ineligible.
+        "ssh://git@github.com:443/org/config-repo.git",
+        "git@github.com:org/config-repo.git",           // scp-style → ssh
+        FileUrl,                                        // file:
+        LocalPathUrl,                                   // bare local path
+    };
+
+    /// <summary>
+    /// A Branch B (ineligible) transport command launches the SNAPSHOT verbatim — no
+    /// <c>origin</c> is inserted.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IneligibleUrlCases))]
+    public async Task Stage6a_IneligibleUrl_BarePull_LaunchesSnapshotVerbatim(string url)
+    {
+        var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
+
+        Assert.True(result.Success);
+        Assert.Single(requests);
+        Assert.Equal(new[] { "pull" }, requests[0].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// Every ineligible vector really IS accepted by the sanitizer — otherwise the verbatim
+    /// launch above would be passing for the wrong reason (a Sanitize rejection instead of a
+    /// Branch B launch).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IneligibleUrlCases))]
+    public void Stage6a_IneligibleUrlVectors_AreAcceptedBySanitizer(string url) =>
+        Assert.False(string.IsNullOrWhiteSpace(ConfigRepoUrlSanitizer.Sanitize(url)));
+
+    /// <summary>
+    /// The full canonicalization table for ELIGIBLE transport commands: a positional-free
+    /// pull/fetch gets the literal <c>origin</c> APPENDED as the remote argument; a form that
+    /// already carries positionals — and EVERY push form — launches VERBATIM.
+    /// </summary>
+    public static TheoryData<string[], string[]> CanonicalizationCases => new()
+    {
+        // Positional-free pull/fetch → the explicit origin is INSERTED.
+        { ["pull"], ["pull", "origin"] },
+        { ["pull", "--ff-only"], ["pull", "--ff-only", "origin"] },
+        { ["pull", "--rebase", "--tags", "--prune"], ["pull", "--rebase", "--tags", "--prune", "origin"] },
+        { ["pull", "--depth", "10", "--tags"], ["pull", "--depth", "10", "--tags", "origin"] },
+        { ["fetch"], ["fetch", "origin"] },
+        { ["fetch", "--tags", "--prune"], ["fetch", "--tags", "--prune", "origin"] },
+        // Forms that ALREADY have positionals launch VERBATIM.
+        { ["pull", "origin"], ["pull", "origin"] },
+        { ["fetch", "origin"], ["fetch", "origin"] },
+        { ["fetch", "--depth", "2", "origin"], ["fetch", "--depth", "2", "origin"] },
+        { ["pull", "--prune", "--depth", "1", "origin"], ["pull", "--prune", "--depth", "1", "origin"] },
+    };
+
+    [Theory]
+    [MemberData(nameof(CanonicalizationCases))]
+    public async Task Stage6a_EligibleUrl_CanonicalizesPositionalFreeFormsOnly(
+        string[] args, string[] expectedLaunch)
+    {
+        var (result, requests) = await RunCapturingAsync(UrlResolver(EligibleUrl), args);
+
+        Assert.True(result.Success);
+        Assert.Single(requests); // EXACTLY one launch — no ref candidate, no duplicate launch
+        Assert.Equal(expectedLaunch, requests[0].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// The very same positional-free forms launch VERBATIM under Branch B — proving the
+    /// insertion is gated on ELIGIBILITY and not applied unconditionally.
+    /// </summary>
+    [Theory]
+    [InlineData("pull")]
+    [InlineData("fetch")]
+    public async Task Stage6a_IneligibleUrl_PositionalFreeForm_LaunchesVerbatim(string subcommand)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver("https://github.com:8443/org/config-repo.git"), [subcommand, "--tags"]);
+
+        Assert.True(result.Success);
+        Assert.Single(requests);
+        Assert.Equal(new[] { subcommand, "--tags" }, requests[0].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// A ref-bearing form launches the ref-validation subprocess FIRST and then the SNAPSHOT
+    /// verbatim — exactly two launches, and the <c>origin</c> insertion never applies.
+    /// </summary>
+    [Theory]
+    [InlineData("pull")]
+    [InlineData("fetch")]
+    [InlineData("push")]
+    public async Task Stage6a_EligibleUrl_RefBearingForm_LaunchesSnapshotVerbatim(string subcommand)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), [subcommand, "origin", "main"]);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, requests.Count);
+        Assert.Equal(
+            new[] { "check-ref-format", "--allow-onelevel", "main" },
+            requests[0].TokenizedArgs!.ToArray());
+        Assert.Equal(new[] { subcommand, "origin", "main" }, requests[1].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// The Stage 6a launches carry the SAME child env as every other launch: the scrubbed
+    /// inherited snapshot plus <c>GIT_TERMINAL_PROMPT=0</c>, and NOTHING else — this slice
+    /// attaches NO credential environment (2c-b1c-ii owns the injection).
+    /// </summary>
+    [Theory]
+    [InlineData(EligibleUrl)]
+    [InlineData("ssh://git@github.com/org/config-repo.git")]
+    public async Task Stage6a_LaunchEnv_IsScrubbedEnvPlusTerminalPromptOnly(string url)
+    {
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
+
+            Assert.True(result.Success);
+            Assert.Single(requests);
+            AssertChildEnv(requests[0]);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    // ── Stage 6a rejections ───────────────────────────────────────────────
+
+    /// <summary>
+    /// A null/whitespace resolved URL rejects the transport command with the fixed message —
+    /// the command NEVER runs (ZERO subprocess launches).
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\t")]
+    [InlineData("\n ")]
+    public async Task Stage6a_MissingResolvedUrl_RejectsWithoutLaunching(string? url)
+    {
+        foreach (var args in new[]
+                 {
+                     new[] { "pull" },
+                     new[] { "fetch", "--tags" },
+                     new[] { "push", "origin", "main" },
+                 })
+        {
+            var (result, requests) = await RunCapturingAsync(UrlResolver(url), args);
+
+            AssertRejected(result, UrlUnavailable);
+            Assert.Empty(requests);
+        }
+    }
+
+    /// <summary>
+    /// Vectors the sanitizer REJECTS, with the EXACT surfaced message: the fixed
+    /// <c>Invalid config repo URL: </c> prefix plus the sanitizer's full (already redacted)
+    /// message.
+    /// </summary>
+    public static TheoryData<string, string> SanitizeRejectedUrlCases => new()
+    {
+        {
+            "https://x-access-token:ghp_supersecret@github.com/org/config-repo.git",
+            "https URL carries userinfo credentials, which are not allowed"
+        },
+        {
+            "https://evil.example.com/org/config-repo.git",
+            "host must be exactly 'github.com'"
+        },
+        {
+            "ftp://github.com/org/config-repo.git",
+            "unsupported scheme (only https, ssh and file are allowed)"
+        },
+        {
+            "ssh://mallory@github.com/org/config-repo.git",
+            "ssh URL username must be exactly 'git'"
+        },
+        {
+            "relative/config-repo.git",
+            "relative local paths are not allowed (use an absolute path)"
+        },
+        {
+            "https://github.com/org/config-repo.git?token=secret",
+            "URL must not contain a query string"
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(SanitizeRejectedUrlCases))]
+    public async Task Stage6a_SanitizeRejectedUrl_ReturnsInvalidConfigRepoUrlMessage(
+        string url, string expectedReason)
+    {
+        var sanitizerMessage =
+            "Invalid --config-repo value: "
+            + expectedReason
+            + ". (The supplied value is redacted because it may contain credentials.)";
+
+        // The vector really IS a Sanitize rejection, and its message is exactly the reason —
+        // so the assertion below cannot pass for the wrong reason.
+        var rejection = Assert.ThrowsAny<ArgumentException>(() => ConfigRepoUrlSanitizer.Sanitize(url));
+        Assert.Equal(sanitizerMessage, rejection.Message);
+
+        var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
+
+        AssertRejected(result, "Invalid config repo URL: " + sanitizerMessage);
+        Assert.Empty(requests);                       // the command NEVER runs
+        Assert.DoesNotContain("ghp_supersecret", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ANY non-cancellation exception from the URL resolver maps to the FIXED
+    /// <c>Config repo not provisioned.</c> message — the resolver's own text (the production
+    /// provisioner throws <see cref="InvalidOperationException"/> when the provisioning
+    /// snapshot is absent) NEVER escapes, and nothing is launched.
+    /// </summary>
+    [Theory]
+    [InlineData("pull")]
+    [InlineData("fetch")]
+    [InlineData("push")]
+    public async Task Stage6a_ThrowingUrlResolver_ReturnsNotProvisionedWithoutLaunching(string subcommand)
+    {
+        string[] args = subcommand == "push" ? [subcommand, "origin", "main"] : [subcommand];
+
+        foreach (var thrower in new Func<string?>[]
+                 {
+                     static () => throw new InvalidOperationException(
+                         "config repo provisioning snapshot for https://x-access-token:ghp_leak@github.com/o is absent"),
+                     static () => throw new NullReferenceException("resolver blew up"),
+                     static () => throw new TimeoutException("resolver timed out"),
+                 })
+        {
+            var (result, requests) = await RunCapturingAsync(thrower, args);
+
+            AssertRejected(result, NotProvisioned);
+            Assert.Empty(requests);
+            Assert.DoesNotContain("ghp_leak", result.SanitizedError, StringComparison.Ordinal);
+            Assert.DoesNotContain("absent", result.SanitizedError, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> thrown by the URL resolver PROPAGATES
+    /// unconditionally — it is NEVER mapped to <c>Config repo not provisioned.</c> — and no
+    /// subprocess is launched. The caller token stays LIVE, so a mutant that only rethrows
+    /// when the token is cancelled still fails.
+    /// </summary>
+    [Fact]
+    public async Task Stage6a_UrlResolverThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invocations = 0;
+        var resolverOce = new OperationCanceledException("resolver cancelled");
+
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invocations++;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam(resolvedUrlResolver: () => throw resolverOce);
+            using var liveCts = new CancellationTokenSource(); // the token stays LIVE
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => Bounded(seam.RunConfigRepoCommandAsync(
+                    new[] { "pull", "origin", "main" }, RepoDir, liveCts.Token)));
+
+            Assert.Same(resolverOce, ex);
+            Assert.Equal(0, invocations); // Stage 6 never reached
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 6a SEQUENCING — mutation-resistant ─────────────────────────
+
+    /// <summary>
+    /// The adversarial vector: a Stage 6a failure combined with a ref that WOULD reach the
+    /// check-ref-format subprocess. The URL error WINS and NOT A SINGLE subprocess is launched.
+    /// A mutant that moves Stage 6a after the ref validation launches one subprocess and fails.
+    /// </summary>
+    public static TheoryData<Func<string?>, string> Stage6aBeatsStage6Cases => new()
+    {
+        { static () => null, UrlUnavailable },
+        { static () => "   ", UrlUnavailable },
+        {
+            static () => "https://x-access-token:ghp_supersecret@github.com/org/config-repo.git",
+            "Invalid config repo URL: Invalid --config-repo value: https URL carries userinfo "
+            + "credentials, which are not allowed. (The supplied value is redacted because it "
+            + "may contain credentials.)"
+        },
+        { static () => throw new InvalidOperationException("not provisioned"), NotProvisioned },
+    };
+
+    [Theory]
+    [MemberData(nameof(Stage6aBeatsStage6Cases))]
+    public async Task Stage6a_PrecedesStage6_UrlErrorWinsAndNoSubprocessLaunches(
+        Func<string?> resolver, string expected)
+    {
+        // Exit 2 would REJECT the ref — but the subprocess must never run at all.
+        var (result, requests) = await RunCapturingAsync(
+            resolver, ["pull", "origin", "main"], exitCode: 2);
+
+        AssertRejected(result, expected);
+        Assert.Empty(requests); // ZERO check-ref-format launches
+        Assert.DoesNotContain("Invalid git ref", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Stage 6a also precedes the PURE ref prechecks (the part of Stage 6 that needs no
+    /// subprocess): with a failing Stage 6a the URL error wins over <c>Invalid git ref</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Stage6aBeatsStage6Cases))]
+    public async Task Stage6a_PrecedesTheRefPrechecks_UrlErrorWins(
+        Func<string?> resolver, string expected)
+    {
+        var (result, requests) = await RunCapturingAsync(resolver, ["pull", "origin", "-bad"]);
+
+        AssertRejected(result, expected);
+        Assert.Empty(requests);
+        Assert.DoesNotContain("Invalid git ref", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The converse for the pure prechecks: with a VALID eligible URL the very same command
+    /// surfaces the ref precheck rejection and still launches NOTHING.
+    /// </summary>
+    [Fact]
+    public async Task Stage6a_ValidUrl_RefPrecheckStillRejects()
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull", "origin", "-bad"]);
+
+        AssertRejected(result, "Invalid git ref: '-bad'.");
+        Assert.Empty(requests);
+    }
+
+    /// <summary>
+    /// The converse: with a VALID eligible URL the very same command DOES reach Stage 6 and
+    /// the ref rejection surfaces after EXACTLY ONE check-ref-format subprocess. Without this
+    /// row a mutant that rejects every transport command at Stage 6a would survive.
+    /// </summary>
+    [Fact]
+    public async Task Stage6a_ValidUrl_Stage6StillRejectsTheRefAfterExactlyOneSubprocess()
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull", "origin", "main"], exitCode: 2);
+
+        AssertRejected(result, "Invalid git ref: 'main'.");
+        Assert.Single(requests);
+        Assert.Equal(
+            new[] { "check-ref-format", "--allow-onelevel", "main" },
+            requests[0].TokenizedArgs!.ToArray());
+    }
+
+    /// <summary>
+    /// Stage 5 STRICTLY PRECEDES Stage 6a: a grammar rejection wins and the URL resolver is
+    /// NEVER read. The resolver THROWS, so a mutant that resolved the URL first would surface
+    /// <c>Config repo not provisioned.</c> instead of the grammar message.
+    /// </summary>
+    public static TheoryData<string[], string> Stage5BeatsStage6aCases => new()
+    {
+        { ["pull", "main"], "Invalid git command: the remote must be 'origin'." },
+        { ["fetch", "badremote"], "Invalid git command: the remote must be 'origin'." },
+        { ["push"], "Invalid git command: push requires 'origin <ref>'." },
+        { ["pull", "--squash"], "Invalid git command: unknown option '--squash'." },
+        { ["pull", "--tags", "--tags"], "Invalid git command: duplicate option '--tags'." },
+    };
+
+    [Theory]
+    [MemberData(nameof(Stage5BeatsStage6aCases))]
+    public async Task Stage5_PrecedesStage6a_GrammarErrorWinsAndUrlResolverIsNotRead(
+        string[] args, string expected)
+    {
+        var urlCalls = 0;
+        var (result, requests) = await RunCapturingAsync(
+            () => { urlCalls++; throw new InvalidOperationException("resolver must not be read"); },
+            args);
+
+        AssertRejected(result, expected);
+        Assert.Equal(0, urlCalls);
+        Assert.Empty(requests);
+    }
+
+    /// <summary>
+    /// The Stage 5 grammar is UNCHANGED by this slice: the bare <c>pull</c>/<c>fetch</c> forms
+    /// remain ACCEPTED (they reach the canonicalized launch) while <c>[pull, main]</c> remains
+    /// a validated rejection — with a VALID eligible URL supplied, so the rejection cannot be
+    /// a Stage 6a artefact.
+    /// </summary>
+    [Fact]
+    public async Task Stage5_GrammarUnchanged_BareFormsAcceptedAndBadRemoteStillRejected()
+    {
+        var (bareResult, bareRequests) = await RunCapturingAsync(UrlResolver(EligibleUrl), ["pull"]);
+        Assert.True(bareResult.Success);
+        Assert.Single(bareRequests);
+
+        var (badRemote, badRemoteRequests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull", "main"]);
+        AssertRejected(badRemote, "Invalid git command: the remote must be 'origin'.");
+        Assert.Empty(badRemoteRequests);
+    }
+
+    /// <summary>
+    /// LOCAL commands skip Stage 6a ENTIRELY: a THROWING URL resolver still lets every local
+    /// form succeed, and the resolver is never read.
+    /// </summary>
+    public static TheoryData<string[]> LocalCommandCases => new()
+    {
+        new[] { "checkout", "--", "agents/" },
+        new[] { "add", "agents/*.agents.md" },
+        new[] { "diff", "--cached", "--name-only", "-z" },
+        new[] { "commit", "-m", "update agents" },
+        new[] { "merge", "--abort" },
+        new[] { "status" },
+    };
+
+    [Theory]
+    [MemberData(nameof(LocalCommandCases))]
+    public async Task Stage6a_LocalCommand_NeverReadsTheUrlResolver(string[] args)
+    {
+        var urlCalls = 0;
+        var (result, requests) = await RunCapturingAsync(
+            () => { urlCalls++; throw new InvalidOperationException("the resolver must not be read"); },
+            args);
+
+        Assert.True(result.Success);
+        Assert.Equal(0, urlCalls);
+        Assert.Single(requests);
+        Assert.Equal(args, requests[0].TokenizedArgs!.ToArray()); // verbatim, never canonicalized
+    }
+
+    /// <summary>
+    /// The URL resolver is read EXACTLY ONCE per transport command, no matter how many
+    /// subprocesses the command launches (a ref-bearing command launches two).
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "pull" }, 1)]
+    [InlineData(new[] { "pull", "origin", "main" }, 2)]
+    [InlineData(new[] { "push", "origin", "main" }, 2)]
+    [InlineData(new[] { "fetch", "--tags" }, 1)]
+    public async Task Stage6a_UrlResolverIsReadExactlyOnce(string[] args, int expectedLaunches)
+    {
+        var urlCalls = 0;
+        var (result, requests) = await RunCapturingAsync(
+            () => { urlCalls++; return EligibleUrl; }, args);
+
+        Assert.True(result.Success);
+        Assert.Equal(1, urlCalls);
+        Assert.Equal(expectedLaunches, requests.Count);
+    }
+
+    /// <summary>
+    /// The CREDENTIAL resolver is NOT invoked on ANY Stage 6a path — success, Branch B,
+    /// missing URL, Sanitize rejection, or a throwing resolver. (2c-b1c-ii owns the credential
+    /// resolution and injection.)
+    /// </summary>
+    public static TheoryData<Func<string?>> CredentialFreeStage6aResolvers => new()
+    {
+        static () => EligibleUrl,                                     // Branch A
+        static () => "ssh://git@github.com/org/config-repo.git",      // Branch B
+        static () => null,                                            // missing
+        static () => "   ",                                           // whitespace
+        static () => "https://x-access-token:tok@github.com/o/r.git", // Sanitize rejection
+        static () => throw new InvalidOperationException("boom"),     // resolver failure
+    };
+
+    [Theory]
+    [MemberData(nameof(CredentialFreeStage6aResolvers))]
+    public async Task Stage6a_CredentialResolverIsNeverInvoked(Func<string?> resolver)
+    {
+        var credentialCalls = 0;
+
+        foreach (var args in new[]
+                 {
+                     new[] { "pull" },
+                     new[] { "fetch", "--tags" },
+                     new[] { "push", "origin", "main" },
+                     new[] { "pull", "origin", "main" },
+                 })
+        {
+            await RunCapturingAsync(
+                resolver,
+                args,
+                credentialResolver: () => { credentialCalls++; return "token"; });
+        }
+
+        Assert.Equal(0, credentialCalls);
+    }
+
+    /// <summary>
+    /// Cancellation still PROPAGATES from both launch sites for a transport command that has
+    /// passed Stage 6a — the Stage 6a insertion must not swallow it. The gate is TCS-based
+    /// (no timing) and every await is bounded.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "pull", "origin", "main" }, new[] { "check-ref-format", "--allow-onelevel", "main" })]
+    [InlineData(new[] { "pull" }, new[] { "pull", "origin" })]
+    public async Task Stage6a_PassedTransportCommand_CancellationPropagatesAtTheFirstLaunch(
+        string[] args, string[] expectedFirstLaunch)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoOpResult> execution = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                requests.Add(request);
+                entered.TrySetResult();
+                try
+                {
+                    await gate.Task.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw new OperationCanceledException(ct);
+                }
+
+                return new GitProcessResult(0, string.Empty, string.Empty);
+            };
+
+            using var seam = CreateSeam(resolvedUrlResolver: UrlResolver(EligibleUrl));
+            execution = seam.RunConfigRepoCommandAsync(args, RepoDir, cts.Token);
+
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            Assert.Single(requests);
+            Assert.Equal(expectedFirstLaunch, requests[0].TokenizedArgs!.ToArray());
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(execution));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            Assert.Single(requests);
+        }
+        finally
+        {
+            // Settle the outstanding operation BEFORE restoring the static seam.
+            gate.TrySetResult();
+            try
+            {
+                await execution;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected — the operation was cancelled.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     // ------------------------------------------------------------------
