@@ -1,5 +1,6 @@
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Extensions.AI;
 using YamlDotNet.Serialization;
 
 namespace CopilotHive.Configuration;
@@ -9,6 +10,15 @@ namespace CopilotHive.Configuration;
 /// </summary>
 public sealed class HiveConfigFile
 {
+    /// <summary>
+    /// Serialises the atomic catalog operations and the <see cref="ReloadFrom"/> top-level
+    /// replacement on this instance. Lock identity: <c>_catalogLock</c> is Lock 1 and the
+    /// <see cref="ConfigModelService"/> save lock is Lock 2. Lock order is always Lock 2
+    /// BEFORE Lock 1 — never acquire Lock 2 while holding Lock 1. In this checkpoint all
+    /// catalog paths acquire ONLY this lock.
+    /// </summary>
+    private readonly object _catalogLock = new();
+
     /// <summary>Schema version of the config file.</summary>
     public string Version { get; set; } = "1.0";
     /// <summary>List of repositories this hive operates on.</summary>
@@ -308,6 +318,235 @@ public sealed class HiveConfigFile
     public int GetContextWindowForRole(WorkerRole role) => GetContextWindowForRole(role.ToRoleName());
 
     /// <summary>
+    /// Returns a detached deep copy of the <see cref="ModelsConfig.AvailableModels"/> catalog,
+    /// or <c>null</c> when no catalog is configured. The copy is safe from concurrent mutation
+    /// by <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs.
+    /// </summary>
+    public IReadOnlyList<ModelEntry>? GetAvailableModelsSnapshot()
+    {
+        lock (_catalogLock)
+        {
+            return Models?.AvailableModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
+        }
+    }
+
+    /// <summary>
+    /// Returns a detached deep copy of the <see cref="ModelsConfig.SubAgentModels"/> catalog,
+    /// or <c>null</c> when no catalog is configured. The copy is safe from concurrent mutation
+    /// by <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs.
+    /// </summary>
+    public IReadOnlyList<ModelEntry>? GetSubAgentModelsSnapshot()
+    {
+        lock (_catalogLock)
+        {
+            return Models?.SubAgentModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
+        }
+    }
+
+    /// <summary>
+    /// Atomically adds a model to <see cref="ModelsConfig.AvailableModels"/>. Returns
+    /// <c>false</c> when a case-insensitive duplicate of <paramref name="request"/>'s name
+    /// already exists; the catalog is left unchanged in that case.
+    /// </summary>
+    /// <param name="request">The model to add. <see cref="AvailableModelRequest.Name"/> is the
+    /// stored name; the reasoning effort is unset for available models.</param>
+    /// <returns><c>true</c> when the model was added; <c>false</c> on duplicate.</returns>
+    public bool TryAddAvailableModel(AvailableModelRequest request)
+    {
+        lock (_catalogLock)
+        {
+            Models ??= new ModelsConfig();
+            Models.AvailableModels ??= new List<ModelEntry>();
+
+            if (Models.AvailableModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            Models.AvailableModels.Add(new ModelEntry
+            {
+                Name = request.Name,
+                ContextWindow = request.ContextWindow,
+                ReasoningEffort = null,
+                Description = request.Description,
+                SupportsVision = request.SupportsVision
+            });
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically updates the FIRST case-insensitive match of <paramref name="name"/> in
+    /// <see cref="ModelsConfig.AvailableModels"/>. The entry's existing
+    /// <see cref="ModelEntry.ReasoningEffort"/> is preserved. <see cref="AvailableModelRequest.Name"/>
+    /// is ignored — the <paramref name="name"/> argument identifies the entry (no rename behavior).
+    /// </summary>
+    /// <param name="name">Route/name of the entry to update.</param>
+    /// <param name="request">The new context window, description and vision flag.</param>
+    /// <returns><c>true</c> when the entry was found and updated; <c>false</c> when missing.</returns>
+    public bool TryUpdateAvailableModel(string name, AvailableModelRequest request)
+    {
+        lock (_catalogLock)
+        {
+            var entry = Models?.AvailableModels?.FirstOrDefault(
+                m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+                return false;
+
+            entry.ContextWindow = request.ContextWindow;
+            entry.Description = request.Description;
+            entry.SupportsVision = request.SupportsVision;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically removes the FIRST case-insensitive match of <paramref name="name"/> from
+    /// <see cref="ModelsConfig.AvailableModels"/>.
+    /// </summary>
+    /// <param name="name">Route/name of the entry to remove.</param>
+    /// <returns><c>true</c> when the entry was found and removed; <c>false</c> when missing.</returns>
+    public bool TryRemoveAvailableModel(string name)
+    {
+        lock (_catalogLock)
+        {
+            var list = Models?.AvailableModels;
+            if (list is null)
+                return false;
+
+            var entry = list.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+                return false;
+
+            return list.Remove(entry);
+        }
+    }
+
+    /// <summary>
+    /// Atomically adds a model to <see cref="ModelsConfig.SubAgentModels"/>. Returns
+    /// <c>false</c> when a case-insensitive duplicate of <paramref name="request"/>'s name
+    /// already exists; the catalog is left unchanged in that case.
+    /// </summary>
+    /// <param name="request">The model to add. <see cref="SubAgentModelRequest.Name"/> is the
+    /// stored name; the reasoning effort is formatted to its canonical wire form.</param>
+    /// <returns><c>true</c> when the model was added; <c>false</c> on duplicate.</returns>
+    public bool TryAddSubAgentModel(SubAgentModelRequest request)
+    {
+        lock (_catalogLock)
+        {
+            Models ??= new ModelsConfig();
+            Models.SubAgentModels ??= new List<ModelEntry>();
+
+            if (Models.SubAgentModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            Models.SubAgentModels.Add(new ModelEntry
+            {
+                Name = request.Name,
+                ContextWindow = request.ContextWindow,
+                ReasoningEffort = ReasoningEffortConverter.Format(request.ReasoningEffort),
+                Description = request.Description,
+                SupportsVision = request.SupportsVision
+            });
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically updates the FIRST case-insensitive match of <paramref name="name"/> in
+    /// <see cref="ModelsConfig.SubAgentModels"/>. <see cref="SubAgentModelRequest.Name"/> is
+    /// ignored — the <paramref name="name"/> argument identifies the entry (no rename behavior).
+    /// </summary>
+    /// <param name="name">Route/name of the entry to update.</param>
+    /// <param name="request">The new context window, reasoning effort, description and vision flag.</param>
+    /// <returns><c>true</c> when the entry was found and updated; <c>false</c> when missing.</returns>
+    public bool TryUpdateSubAgentModel(string name, SubAgentModelRequest request)
+    {
+        lock (_catalogLock)
+        {
+            var entry = Models?.SubAgentModels?.FirstOrDefault(
+                m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+                return false;
+
+            entry.ContextWindow = request.ContextWindow;
+            entry.ReasoningEffort = ReasoningEffortConverter.Format(request.ReasoningEffort);
+            entry.Description = request.Description;
+            entry.SupportsVision = request.SupportsVision;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Atomically removes the FIRST case-insensitive match of <paramref name="name"/> from
+    /// <see cref="ModelsConfig.SubAgentModels"/>.
+    /// </summary>
+    /// <param name="name">Route/name of the entry to remove.</param>
+    /// <returns><c>true</c> when the entry was found and removed; <c>false</c> when missing.</returns>
+    public bool TryRemoveSubAgentModel(string name)
+    {
+        lock (_catalogLock)
+        {
+            var list = Models?.SubAgentModels;
+            if (list is null)
+                return false;
+
+            var entry = list.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+                return false;
+
+            return list.Remove(entry);
+        }
+    }
+
+    /// <summary>
+    /// Atomically applies per-sub-agent-model reasoning efforts. Matching is case-insensitive
+    /// on the entry name; a <c>null</c> value is a no-op for that entry; unknown names are
+    /// ignored. The method does NOT validate case-insensitive duplicate keys — callers must
+    /// reject those during request validation, mirroring the current
+    /// <see cref="ConfigModelService.SaveModelConfigAsync"/> contract for identical inputs.
+    /// </summary>
+    /// <param name="efforts">Model name → reasoning effort assignments.</param>
+    public void SetSubAgentModelReasoningEfforts(Dictionary<string, ReasoningEffort?> efforts)
+    {
+        lock (_catalogLock)
+        {
+            if (efforts is null || Models?.SubAgentModels is not { } subAgentModels)
+                return;
+
+            foreach (var entry in subAgentModels)
+            {
+                if (!TryGetEffortIgnoreCase(efforts, entry.Name, out var value) || value is null)
+                    continue;
+                entry.ReasoningEffort = ReasoningEffortConverter.Format(value);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the configured compaction model, or <c>null</c> when unset. The read is
+    /// synchronized with concurrent writers on the catalog lock.
+    /// </summary>
+    public string? GetCompactionModel()
+    {
+        lock (_catalogLock)
+        {
+            return Models?.CompactionModel;
+        }
+    }
+
+    /// <summary>
+    /// Atomically sets the compaction model, creating <see cref="ModelsConfig"/> when absent.
+    /// </summary>
+    /// <param name="value">The compaction model, or <c>null</c> to clear it.</param>
+    public void SetCompactionModel(string? value)
+    {
+        lock (_catalogLock)
+        {
+            Models ??= new ModelsConfig();
+            Models.CompactionModel = value;
+        }
+    }
+
+    /// <summary>
     /// Deep-copies all top-level properties from <paramref name="source"/> onto this instance,
     /// replacing old collections with new instances so callers holding the singleton reference
     /// see the updated data immediately.
@@ -316,103 +555,188 @@ public sealed class HiveConfigFile
     /// loaded onto this singleton, so a configured instance that reloads stays
     /// <c>IsConfigured = true</c>.
     /// </para>
+    /// <para>
+    /// The replacement is atomic: ONE complete detached snapshot of <paramref name="source"/> is
+    /// captured first, then the entire top-level replacement happens under this instance's catalog
+    /// lock. The checkpoint-1 guarantee (readers never observe a torn catalog) holds only when
+    /// concurrent catalog writers use <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized
+    /// catalog APIs — direct public-list mutations are excluded from the invariant.
+    /// </para>
     /// </summary>
     public void ReloadFrom(HiveConfigFile source)
     {
-        Version = source.Version;
+        var snapshot = source.CaptureConfigSnapshot();
 
-        Repositories = new List<RepositoryConfig>(
-            source.Repositories.Select(r => new RepositoryConfig
-            {
-                Name = r.Name,
-                Url = r.Url,
-                DefaultBranch = r.DefaultBranch,
-                MonitorCi = r.MonitorCi,
-                CiTimeoutMinutes = r.CiTimeoutMinutes,
-                Release = r.Release is null ? null : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch },
-                PublishNuGet = r.PublishNuGet is null
-                    ? null
-                    : new NuGetPublishConfig
-                    {
-                        Packages = r.PublishNuGet.Packages
-                            .Select(p => new NuGetPackageEntry { PackageId = p.PackageId })
-                            .ToList()
-                    }
-            }));
-
-        Workers = new Dictionary<string, WorkerConfig>(
-            source.Workers.Select(kv => KeyValuePair.Create(
-                kv.Key,
-                new WorkerConfig
-                {
-                    Model = kv.Value.Model,
-                    PremiumModel = kv.Value.PremiumModel,
-                    ContextWindow = kv.Value.ContextWindow,
-                    ReasoningEffort = kv.Value.ReasoningEffort,
-                    PremiumReasoningEffort = kv.Value.PremiumReasoningEffort
-                })));
-
-        Orchestrator = new OrchestratorConfig
+        lock (_catalogLock)
         {
-            Model = source.Orchestrator.Model,
-            MaxIterations = source.Orchestrator.MaxIterations,
-            MaxRetriesPerTask = source.Orchestrator.MaxRetriesPerTask,
-            MaxParallelGoals = source.Orchestrator.MaxParallelGoals,
-            VerboseLogging = source.Orchestrator.VerboseLogging,
-            BrainMaxSteps = source.Orchestrator.BrainMaxSteps,
-            BranchCleanupDelayHours = source.Orchestrator.BranchCleanupDelayHours,
-            WorkerTaskTimeoutMinutes = source.Orchestrator.WorkerTaskTimeoutMinutes,
-            ReasoningEffort = source.Orchestrator.ReasoningEffort
-        };
-
-        if (source.Models is not null)
-        {
-            Models = new ModelsConfig
-            {
-                CompactionModel = source.Models.CompactionModel,
-                AvailableModels = source.Models.AvailableModels?.Select(m => new ModelEntry
-                {
-                    Name = m.Name,
-                    ContextWindow = m.ContextWindow,
-                    ReasoningEffort = m.ReasoningEffort,
-                    Description = m.Description,
-                    SupportsVision = m.SupportsVision
-                }).ToList(),
-                SubAgentModels = source.Models.SubAgentModels?.Select(m => new ModelEntry
-                {
-                    Name = m.Name,
-                    ContextWindow = m.ContextWindow,
-                    ReasoningEffort = m.ReasoningEffort,
-                    Description = m.Description,
-                    SupportsVision = m.SupportsVision
-                }).ToList()
-            };
-        }
-        else
-        {
-            Models = null;
-        }
-
-        if (source.Composer is not null)
-        {
-            Composer = new ComposerConfig
-            {
-                Model = source.Composer.Model,
-                MaxSteps = source.Composer.MaxSteps,
-                ReasoningEffort = source.Composer.ReasoningEffort,
-                EventNotifications = source.Composer.EventNotifications is null
-                    ? null
-                    : new EventNotificationsConfig
-                    {
-                        Mode = source.Composer.EventNotifications.Mode,
-                        ActiveEvents = source.Composer.EventNotifications.ActiveEvents?.ToList(),
-                        ThrottleSeconds = source.Composer.EventNotifications.ThrottleSeconds
-                    }
-            };
-        }
-        else
-        {
-            Composer = null;
+            Version = snapshot.Version!;
+            Repositories = snapshot.Repositories!;
+            Workers = snapshot.Workers!;
+            Orchestrator = snapshot.Orchestrator!;
+            Models = snapshot.Models;
+            Composer = snapshot.Composer;
         }
     }
+
+    /// <summary>
+    /// Captures a complete detached deep copy of every property EXCEPT <see cref="IsConfigured"/>.
+    /// The capture is atomic with respect to this instance's catalog lock. The checkpoint-1
+    /// guarantee (the snapshot never observes a torn catalog) holds only when concurrent catalog
+    /// writers use <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs —
+    /// direct public-list mutations are excluded from the invariant.
+    /// </summary>
+    internal HiveConfigSnapshot CaptureConfigSnapshot()
+    {
+        lock (_catalogLock)
+        {
+            return new HiveConfigSnapshot
+            {
+                Version = Version,
+                Repositories = Repositories is null
+                    ? null
+                    : Repositories.Select(r => r is null ? null! : CloneRepository(r)).ToList(),
+                Workers = Workers is null
+                    ? null
+                    : Workers.ToDictionary(
+                        kv => kv.Key,
+                        kv => kv.Value is null ? null! : CloneWorker(kv.Value)),
+                Orchestrator = Orchestrator is null ? null : CloneOrchestrator(Orchestrator),
+                Models = Models is null ? null : CloneModels(Models),
+                Composer = Composer is null ? null : CloneComposer(Composer)
+            };
+        }
+    }
+
+    private static RepositoryConfig CloneRepository(RepositoryConfig r) => new()
+    {
+        Name = r.Name,
+        Url = r.Url,
+        DefaultBranch = r.DefaultBranch,
+        MonitorCi = r.MonitorCi,
+        CiTimeoutMinutes = r.CiTimeoutMinutes,
+        Release = r.Release is null
+            ? null
+            : new ReleaseRepoConfig { MergeTo = r.Release.MergeTo, TagBranch = r.Release.TagBranch },
+        PublishNuGet = r.PublishNuGet is null
+            ? null
+            : new NuGetPublishConfig
+            {
+                Packages = r.PublishNuGet.Packages is null
+                    ? null!
+                    : r.PublishNuGet.Packages
+                        .Select(p => p is null ? null! : new NuGetPackageEntry { PackageId = p.PackageId })
+                        .ToList()
+            }
+    };
+
+    private static WorkerConfig CloneWorker(WorkerConfig w) => new()
+    {
+        Model = w.Model,
+        PremiumModel = w.PremiumModel,
+        ContextWindow = w.ContextWindow,
+        ReasoningEffort = w.ReasoningEffort,
+        PremiumReasoningEffort = w.PremiumReasoningEffort
+    };
+
+    private static OrchestratorConfig CloneOrchestrator(OrchestratorConfig o) => new()
+    {
+        Model = o.Model,
+        MaxIterations = o.MaxIterations,
+        MaxRetriesPerTask = o.MaxRetriesPerTask,
+        MaxParallelGoals = o.MaxParallelGoals,
+        VerboseLogging = o.VerboseLogging,
+        BrainMaxSteps = o.BrainMaxSteps,
+        BranchCleanupDelayHours = o.BranchCleanupDelayHours,
+        WorkerTaskTimeoutMinutes = o.WorkerTaskTimeoutMinutes,
+        ReasoningEffort = o.ReasoningEffort
+    };
+
+    private static ModelsConfig CloneModels(ModelsConfig m) => new()
+    {
+        CompactionModel = m.CompactionModel,
+        AvailableModels = m.AvailableModels is null
+            ? null
+            : m.AvailableModels.Select(e => e is null ? null! : CloneModelEntry(e)).ToList(),
+        SubAgentModels = m.SubAgentModels is null
+            ? null
+            : m.SubAgentModels.Select(e => e is null ? null! : CloneModelEntry(e)).ToList()
+    };
+
+    private static ModelEntry CloneModelEntry(ModelEntry m) => new()
+    {
+        Name = m.Name,
+        ContextWindow = m.ContextWindow,
+        ReasoningEffort = m.ReasoningEffort,
+        Description = m.Description,
+        SupportsVision = m.SupportsVision
+    };
+
+    private static ComposerConfig CloneComposer(ComposerConfig c) => new()
+    {
+        Model = c.Model,
+        MaxSteps = c.MaxSteps,
+        ReasoningEffort = c.ReasoningEffort,
+        EventNotifications = c.EventNotifications is null
+            ? null
+            : new EventNotificationsConfig
+            {
+                Mode = c.EventNotifications.Mode,
+                ActiveEvents = c.EventNotifications.ActiveEvents?.ToList(),
+                ThrottleSeconds = c.EventNotifications.ThrottleSeconds
+            }
+    };
+
+    /// <summary>
+    /// Looks up a dictionary entry using case-insensitive key matching, mirroring the
+    /// <see cref="ConfigModelService"/> reasoning-effort application contract. Callers must
+    /// first reject case-insensitive duplicates during request validation so at most one
+    /// entry can ever match.
+    /// </summary>
+    private static bool TryGetEffortIgnoreCase(
+        Dictionary<string, ReasoningEffort?> dict, string key, out ReasoningEffort? value)
+    {
+        value = null;
+        foreach (var kv in dict)
+        {
+            if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                value = kv.Value;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// <summary>
+/// Detached deep copy of every <see cref="HiveConfigFile"/> property except
+/// <see cref="HiveConfigFile.IsConfigured"/>. Produced by
+/// <see cref="HiveConfigFile.CaptureConfigSnapshot"/> and consumed by
+/// <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>.
+/// <para>
+/// Null-tolerance: YAML-bound collections that are null at runtime stay null in the snapshot;
+/// the capture never throws on a runtime null, including the nullable catalog lists
+/// (<see cref="ModelsConfig.AvailableModels"/> / <see cref="ModelsConfig.SubAgentModels"/>).
+/// The declared non-nullable members may still hold runtime nulls when the source carried them.
+/// </para>
+/// </summary>
+internal sealed class HiveConfigSnapshot
+{
+    /// <summary>Schema version of the config file.</summary>
+    public string? Version { get; init; }
+
+    /// <summary>List of repositories this hive operates on.</summary>
+    public List<RepositoryConfig>? Repositories { get; init; }
+
+    /// <summary>Per-role worker configuration keyed by role name.</summary>
+    public Dictionary<string, WorkerConfig>? Workers { get; init; }
+
+    /// <summary>Orchestrator-level configuration.</summary>
+    public OrchestratorConfig? Orchestrator { get; init; }
+
+    /// <summary>Model-level configuration (compaction model, etc.).</summary>
+    public ModelsConfig? Models { get; init; }
+
+    /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
+    public ComposerConfig? Composer { get; init; }
 }

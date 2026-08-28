@@ -41,12 +41,24 @@ public sealed class ModelsConfig
     /// <summary>
     /// Enumerated models available for selection in the UI. When set, dropdowns use this list
     /// instead of free-text input.
+    /// <para>
+    /// Today these lists are live and mutable — direct mutation affects the catalog. A planned
+    /// checkpoint will make getters return detached copies; mutation sites must then use the
+    /// synchronized APIs on <see cref="HiveConfigFile"/>. This comment will be updated when the
+    /// flip lands.
+    /// </para>
     /// </summary>
     public List<ModelEntry>? AvailableModels { get; set; }
 
     /// <summary>
     /// Curated list of models for sub-agent selection. When null or empty,
     /// falls back to <see cref="AvailableModels"/>.
+    /// <para>
+    /// Today these lists are live and mutable — direct mutation affects the catalog. A planned
+    /// checkpoint will make getters return detached copies; mutation sites must then use the
+    /// synchronized APIs on <see cref="HiveConfigFile"/>. This comment will be updated when the
+    /// flip lands.
+    /// </para>
     /// </summary>
     public List<ModelEntry>? SubAgentModels { get; set; }
 }

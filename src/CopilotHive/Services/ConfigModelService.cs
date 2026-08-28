@@ -205,10 +205,7 @@ public sealed class ConfigModelService
             }
 
             if (update.CompactionModel is not null)
-            {
-                _config.Models ??= new ModelsConfig();
-                _config.Models.CompactionModel = update.CompactionModel;
-            }
+                _config.SetCompactionModel(update.CompactionModel);
 
             // Reasoning effort travels the API as a strongly typed enum but the YAML-bound config
             // classes remain string?, so each assignment is formatted to its canonical wire form.
