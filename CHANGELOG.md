@@ -2,9 +2,11 @@
 
 ### Changed
 
-- **Composer chat facade migration** — `ComposerChat.razor` now uses `IComposerFacade` and `IConfigFacade` instead of `HttpClient`, fixing OAuth-mode failures caused by `'<' is an invalid start of a value` deserialization errors on the Composer chat page.
-- **Composer facade** — Added `ComposerFacade` with an explicit null-Composer contract (`"Composer is not available."` / `NotConfigured`) across the five runtime operations: current model, models list, switch model, compact, and compact-partial.
-- **Wire-compatible composer endpoints** — Refactored `MapComposerEndpoints` through `IComposerFacade` while preserving the external REST contract, including null-Composer no-routes behavior and `BadRequest` mapping to HTTP 400 `{"error": ...}`.
+- **Blazor facade migration** — All seven dashboard components (`Configuration`, `ComposerChat`, `Goals`, `GoalDetail`, `Issues`, `Releases`, `ReleaseDetail`) now call shared use-case facades (`IConfigFacade`, `IBackupFacade`, `IComposerFacade`, `IGoalFacade`, `IIssueFacade`, `IReleaseFacade`) directly instead of loopback HTTP calls. This fixes OAuth-mode `'<' is an invalid start of a value` failures at the root. The scoped loopback `HttpClient` registration was removed from `Program.cs`; REST endpoints remain wire-compatible.
+- **Shared facade contract** — Added `FacadeResult<T>`/`FacadeErrorKind`, including `ServiceUnavailable`. Each facade catches only what its endpoint handler caught and rethrows everything else, preserving the wire contracts byte-identically.
+- **Release execution failure results** — Per-repository failure results now render when release execution fails.
+- **CI stability** — The `HiveIntegration` test collection is now non-parallel (`DisableParallelization`), fixing intermittent `UnauthorizedAccessException: Access to the path '/app'` CI failures caused by the `STATE_DIR` environment race.
+- **Release-metadata test consistency** — Release-metadata tests no longer hardcode version literals.
 
 ## [0.34.0] — 2026-08-26
 

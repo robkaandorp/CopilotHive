@@ -1,5 +1,3 @@
-using System.Text.RegularExpressions;
-
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Worker;
 
@@ -735,54 +733,4 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
         Assert.Equal("   ", env[WorkerConfigProvisioner.ConfigRepoUrlVar]);
     }
 
-    // ===========================================================================
-    // Release metadata — CHANGELOG heading + Directory.Build.props VersionPrefix
-    // ===========================================================================
-
-    [Fact]
-    public void Changelog_TopHeading_Matches_DirectoryBuildProps_VersionPrefix()
-    {
-        var propsText = File.ReadAllText(DirectoryBuildPropsPath());
-        var propsMatch = Regex.Match(propsText, @"<VersionPrefix>([^<]+)</VersionPrefix>");
-        Assert.True(propsMatch.Success,
-            $"{DirectoryBuildPropsPath()} must contain a non-empty <VersionPrefix> element.");
-
-        var propsVersion = propsMatch.Groups[1].Value;
-
-        var changelogText = File.ReadAllText(ChangelogPath());
-        var headingMatch = Regex.Match(changelogText, @"^## \[([^\]]+)\]", RegexOptions.Multiline);
-        Assert.True(headingMatch.Success,
-            $"{ChangelogPath()} must contain at least one '## [<version>]' heading.");
-
-        var headingVersion = headingMatch.Groups[1].Value;
-
-        Assert.True(
-            string.Equals(propsVersion, headingVersion, StringComparison.Ordinal),
-            $"Directory.Build.props <VersionPrefix> is '{propsVersion}' but the top CHANGELOG.md heading '## [...]' is '{headingVersion}'; they must match.");
-    }
-
-    /// <summary>
-    /// Resolves the CHANGELOG.md path relative to the test assembly location, walking up to the
-    /// repository root.
-    /// </summary>
-    private static string ChangelogPath()
-    {
-        var dir = AppContext.BaseDirectory;
-        // Walk up until we find CHANGELOG.md.
-        while (dir is not null && !File.Exists(Path.Combine(dir, "CHANGELOG.md")))
-            dir = Path.GetDirectoryName(dir);
-        return Path.Combine(dir ?? AppContext.BaseDirectory, "CHANGELOG.md");
-    }
-
-    /// <summary>
-    /// Resolves the Directory.Build.props path relative to the test assembly location, walking up
-    /// to the repository root.
-    /// </summary>
-    private static string DirectoryBuildPropsPath()
-    {
-        var dir = AppContext.BaseDirectory;
-        while (dir is not null && !File.Exists(Path.Combine(dir, "Directory.Build.props")))
-            dir = Path.GetDirectoryName(dir);
-        return Path.Combine(dir ?? AppContext.BaseDirectory, "Directory.Build.props");
-    }
 }

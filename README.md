@@ -162,6 +162,8 @@ Goals are stored in **SQLite** (`copilothive.db`) as the primary source of truth
 | `agents/` | Default agent templates (overridden by config repo at runtime) |
 | `docker/` | Dockerfiles and container configuration |
 
+Dashboard components call shared facades in `CopilotHive.Services` directly instead of using loopback HTTP. The REST wire contracts remain unchanged.
+
 ## Current Features
 
 - **Server-only mode** — gRPC server + HTTP health endpoint (no CLI mode)
