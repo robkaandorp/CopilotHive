@@ -291,6 +291,9 @@ public static class GitOperations
     /// <see cref="ExecuteProcessAsync"/> hands the delegate the raw, PRE-factory
     /// <see cref="GitProcessRequest"/> (never a sanitized <see cref="ProcessStartInfo"/>) and
     /// returns the delegate's result. When null, the default real runner starts a git process.
+    /// The seam is consulted only AFTER the pre-start cancellation check (observation point 1
+    /// of <see cref="ExecuteProcessAsync"/>): a pre-cancelled token throws before the delegate
+    /// is ever invoked.
     /// </summary>
     internal static Func<GitProcessRequest, CancellationToken, Task<GitProcessResult>>? ProcessRunner { get; set; }
 
@@ -441,19 +444,49 @@ public static class GitOperations
     /// <para>
     /// When the static <see cref="ProcessRunner"/> seam is non-null, the ENTIRE launch is replaced
     /// by the delegate: the request and token are passed through and no real process is started,
-    /// killed, drained, or cleaned up.
+    /// killed, drained, or cleaned up. The delegate owns its own cancellation semantics — the
+    /// seam branch is FULL DELEGATION and only observation point 1 applies.
     /// </para>
     /// <para>
-    /// Cancellation semantics: on cancellation the process tree is killed (best-effort; a Kill
+    /// The caller's token is observed at EXACTLY THREE points and nowhere else:
+    /// <list type="number">
+    ///   <item><description>PRE-START (both branches): <c>ct.ThrowIfCancellationRequested()</c>
+    ///   is the FIRST statement, before <c>Process.Start</c> and before the
+    ///   <see cref="ProcessRunner"/> seam is consulted. A token already cancelled at call time
+    ///   throws <see cref="OperationCanceledException"/> with the caller's token and NOTHING
+    ///   happens — no launch, no delegate invocation.</description></item>
+    ///   <item><description>THE EXIT WAIT (real-process branch only):
+    ///   <c>await process.WaitForExitAsync(ct)</c>. An <see cref="OperationCanceledException"/>
+    ///   from this await means cancellation was observed DURING the run and UNCONDITIONALLY
+    ///   enters the kill/drain path below (tree-kill request → root exit awaited → output
+    ///   drained within the single 10-second deadline → <see cref="OperationCanceledException"/>
+    ///   with the caller's token). There is NO <c>process.HasExited</c> result-return shortcut:
+    ///   an OCE from the exit wait ALWAYS means cancellation was observed during the run.</description></item>
+    ///   <item><description>THE IMMEDIATE POST-WAIT CHECK (real-process branch only):
+    ///   <c>ct.ThrowIfCancellationRequested()</c> immediately after <c>WaitForExitAsync(ct)</c>
+    ///   returns NORMALLY and BEFORE the stdout/stderr drain. A token cancelled during a
+    ///   very-short process DISCARDS the completed result and throws. The drain that follows
+    ///   does NOT observe the token again: a cancellation landing during the drain returns the
+    ///   completed result (the existing drain-phase behavior is preserved naturally).</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Intentional behavior change: the earlier 2c-b1a rule that "a COMPLETED process result
+    /// wins the race REGARDLESS of exit code" is REMOVED from the real-process branch. It was
+    /// specified before the fast-exit regression was known: a process that starts and exits very
+    /// quickly could complete before cancellation was observed anywhere, silently swallowing a
+    /// pre-cancelled or mid-flight-cancelled token. Observation points 1 and 3 close that gap —
+    /// a cancellation that lands before or during the run is never swallowed.
+    /// </para>
+    /// <para>
+    /// Cancellation semantics on the kill path: the process tree is killed (best-effort; a Kill
     /// throw is swallowed). When the Kill REQUEST succeeds, the root exit is awaited under a
     /// SINGLE absolute 10-second deadline shared by BOTH the exit wait AND the output draining
     /// (one deadline, not two windows), and then <see cref="OperationCanceledException"/> is
     /// thrown with the CALLER'S token attached. When Kill THROWS, neither the root exit nor the
     /// output reads are awaited: the pending reads are ABANDONED and
     /// <see cref="OperationCanceledException"/> propagates promptly.
-    /// A COMPLETED process result wins the natural-exit race REGARDLESS of its exit code: if the
-    /// process has already exited before cancellation is observed, the result is returned
-    /// normally. Descendant termination is deliberately NOT a production guarantee — arbitrary
+    /// Descendant termination is deliberately NOT a production guarantee — arbitrary
     /// descendants are not observable here (no handles/PIDs are exposed). If Kill throws or the
     /// deadline expires, the pending output reads are abandoned and
     /// <see cref="OperationCanceledException"/> is thrown even though the process tree may still
@@ -463,11 +496,18 @@ public static class GitOperations
     internal static async Task<GitProcessResult> ExecuteProcessAsync(
         GitProcessRequest request, CancellationToken ct)
     {
+        // OBSERVATION POINT 1 (both branches) — pre-start: a token already cancelled at call
+        // time throws OperationCanceledException(ct) and NOTHING happens — no launch and no
+        // ProcessRunner delegate invocation. The seam is consulted only AFTER this check.
+        ct.ThrowIfCancellationRequested();
+
         var runner = ProcessRunner;
         if (runner is not null)
         {
             // Entire launch replaced by the delegate — no real process launch and no
-            // kill/drain/cleanup of a delegate-owned launch.
+            // kill/drain/cleanup of a delegate-owned launch. The delegate owns its own
+            // cancellation semantics (full delegation; observation point 1 is the only
+            // token inspection on this branch).
             return await runner(request, ct);
         }
 
@@ -483,17 +523,15 @@ public static class GitOperations
 
         try
         {
+            // OBSERVATION POINT 2 (real-process branch) — the exit wait: an OCE from this
+            // await means cancellation was observed DURING the run.
             await process.WaitForExitAsync(ct);
         }
         catch (OperationCanceledException)
         {
-            // Natural-exit race: a COMPLETED process result wins regardless of its exit code.
-            // If the process has already exited before cancellation was observed, return the
-            // result normally; the kill path applies only when the process is still running.
-            if (process.HasExited)
-            {
-                return new GitProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
-            }
+            // OBSERVATION POINT 2 fired — cancellation was observed DURING the run.
+            // UNCONDITIONALLY the kill path: there is NO process.HasExited result-return
+            // shortcut. An OCE from the exit wait ALWAYS means the kill path.
 
             // Best-effort kill of the entire process tree; a Kill throw is swallowed.
             var killRequested = false;
@@ -548,8 +586,15 @@ public static class GitOperations
             throw new OperationCanceledException(ct);
         }
 
-        // Normal completion: the process exited (any exit code) before cancellation was
-        // observed — the completed result wins the race.
+        // OBSERVATION POINT 3 (real-process branch) — the immediate post-wait check: the
+        // exit wait returned NORMALLY, but a token cancelled during a very-short process
+        // DISCARDS the completed result and throws OperationCanceledException(ct). The drain
+        // below does NOT observe the token again: a cancellation landing during the drain
+        // returns the completed result (preserving the existing drain-phase behavior).
+        ct.ThrowIfCancellationRequested();
+
+        // Normal completion: the process exited and the token was not cancelled at
+        // observation point 2 or 3 — return the completed result (any exit code).
         return new GitProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
     }
 

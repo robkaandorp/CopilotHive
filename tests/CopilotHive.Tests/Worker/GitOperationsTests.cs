@@ -1041,6 +1041,44 @@ public sealed class GitOperationsProcessRunnerSeamTests
     }
 
     [Fact]
+    public async Task ExecuteProcessAsync_PreCancelledToken_ThrowsWithoutInvokingSeam()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invoked = 0;
+        var request = new GitProcessRequest(
+            $"definitely-not-an-executable-{Guid.NewGuid():N}",
+            [],
+            NonexistentWorkDir,
+            new Dictionary<string, string?>());
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invoked++;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // OBSERVATION POINT 1 fires BEFORE the seam is consulted: a token already
+            // cancelled at call time throws OperationCanceledException(ct) and the
+            // ProcessRunner delegate is NEVER invoked.
+            var exception = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => GitOperations.ExecuteProcessAsync(request, cts.Token));
+            Assert.Equal(cts.Token, exception.CancellationToken);
+
+            // Removal-proof: if the pre-start check is removed or moved after the seam read,
+            // the delegate IS invoked and this assertion fails.
+            Assert.Equal(0, invoked);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    [Fact]
     public async Task ExecuteProcessAsync_NonexistentExecutable_PropagatesOriginalStartException()
     {
         var originalRunner = GitOperations.ProcessRunner;
