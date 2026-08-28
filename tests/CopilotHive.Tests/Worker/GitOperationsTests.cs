@@ -693,6 +693,196 @@ public sealed class GitOperationsTests : IAsyncLifetime
             () => GitOperations.ConfigureLocalIdentity(_repoDir, cts.Token));
     }
 
+    // ── SanitizeChildEnv ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void SanitizeChildEnv_RemovesTheFiveVariables_IncludingMixedCase()
+    {
+        var input = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = "gh-secret",
+            ["github_token"] = "github-secret",
+            ["Git_AskPass"] = "/usr/bin/askpass",
+            ["GITHUB_CONFIG_REPO_TOKEN"] = "config-secret",
+            ["giT_termInal_prompt"] = "1",
+            ["PATH"] = "/usr/bin",
+        };
+
+        var result = GitOperations.SanitizeChildEnv(input);
+
+        Assert.Equal(new[] { "PATH" }, result.Keys.Order().ToArray());
+        Assert.Equal("/usr/bin", result["PATH"]);
+    }
+
+    [Fact]
+    public void SanitizeChildEnv_PreservesEssentialInheritedVariables()
+    {
+        var input = new Dictionary<string, string?>
+        {
+            ["PATH"] = "/usr/local/bin:/usr/bin",
+            ["HOME"] = "/home/hive",
+            ["GH_TOKEN"] = "gh-secret",
+            // Differently-cased, unrelated key: it is NOT one of the five and must survive.
+            ["gh_token_backup_note"] = "not-a-secret-name",
+        };
+
+        var result = GitOperations.SanitizeChildEnv(input);
+
+        Assert.Equal(
+            new[] { "HOME", "PATH", "gh_token_backup_note" },
+            result.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("/usr/local/bin:/usr/bin", result["PATH"]);
+        Assert.Equal("/home/hive", result["HOME"]);
+        Assert.Equal("not-a-secret-name", result["gh_token_backup_note"]);
+    }
+
+    [Fact]
+    public void SanitizeChildEnv_ReturnsNewCopy_AndDoesNotMutateInput()
+    {
+        var input = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = "gh-secret",
+            ["PATH"] = "/usr/bin",
+        };
+
+        var result = GitOperations.SanitizeChildEnv(input);
+
+        // The input keeps every entry, including the scrubbed one.
+        Assert.Equal(2, input.Count);
+        Assert.Equal("gh-secret", input["GH_TOKEN"]);
+        Assert.Equal("/usr/bin", input["PATH"]);
+
+        // The result is a distinct dictionary: later input edits do not leak into it.
+        Assert.NotSame(input, result);
+        input["PATH"] = "/mutated";
+        input["EXTRA"] = "added-later";
+        Assert.Equal("/usr/bin", result["PATH"]);
+        Assert.False(result.ContainsKey("EXTRA"));
+    }
+
+    [Fact]
+    public void SanitizeChildEnv_NullValuedNonScrubbedEntry_IsPreservedAsNullMarker()
+    {
+        var input = new Dictionary<string, string?>
+        {
+            ["REMOVAL_MARKER"] = null,
+            ["PATH"] = "/usr/bin",
+        };
+
+        var result = GitOperations.SanitizeChildEnv(input);
+
+        Assert.Equal(new[] { "PATH", "REMOVAL_MARKER" }, result.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.True(result.ContainsKey("REMOVAL_MARKER"));
+        Assert.Null(result["REMOVAL_MARKER"]);
+    }
+
+    [Fact]
+    public void SanitizeChildEnv_NullValuedScrubbedVariables_AreRemoved()
+    {
+        var input = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = null,
+            ["GITHUB_TOKEN"] = null,
+            ["GIT_ASKPASS"] = null,
+            ["GITHUB_CONFIG_REPO_TOKEN"] = null,
+            ["GIT_TERMINAL_PROMPT"] = null,
+            ["KEEP"] = "value",
+        };
+
+        var result = GitOperations.SanitizeChildEnv(input);
+
+        Assert.Equal(new[] { "KEEP" }, result.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("value", result["KEEP"]);
+    }
+
+    // ── CreateProcessStartInfo (pure factory) ────────────────────────────────
+
+    [Fact]
+    public void CreateProcessStartInfo_ScrubsCredentialsAndForcesNoninteractivePrompt()
+    {
+        var request = new GitProcessRequest(
+            "git",
+            ["status --porcelain"],
+            "/work/repo",
+            new Dictionary<string, string?>
+            {
+                ["PATH"] = "/usr/bin",
+                ["HOME"] = "/home/hive",
+                ["GH_TOKEN"] = "gh-secret",
+                ["GITHUB_TOKEN"] = "github-secret",
+                ["GIT_ASKPASS"] = "/usr/bin/askpass",
+                ["GITHUB_CONFIG_REPO_TOKEN"] = "config-secret",
+                ["GIT_TERMINAL_PROMPT"] = "1",
+                ["NULL_MARKER"] = null,
+            });
+
+        var psi = GitOperations.CreateProcessStartInfo(request);
+
+        // Exact child environment: sanitized copy (null marker omitted) plus GIT_TERMINAL_PROMPT=0.
+        Assert.Equal(
+            new[] { "GIT_TERMINAL_PROMPT", "HOME", "PATH" },
+            psi.Environment.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("0", psi.Environment["GIT_TERMINAL_PROMPT"]);
+        Assert.Equal("/home/hive", psi.Environment["HOME"]);
+        Assert.Equal("/usr/bin", psi.Environment["PATH"]);
+    }
+
+    [Fact]
+    public void CreateProcessStartInfo_AssignsArgumentsVerbatimAndSetsProcessProperties()
+    {
+        const string OpaqueArgs = "commit -m \"a message with spaces\"";
+        var request = new GitProcessRequest(
+            "git",
+            [OpaqueArgs],
+            "/work/repo",
+            new Dictionary<string, string?> { ["PATH"] = "/usr/bin" });
+
+        var psi = GitOperations.CreateProcessStartInfo(request);
+
+        Assert.Equal("git", psi.FileName);
+        Assert.Equal(OpaqueArgs, psi.Arguments);
+        Assert.Empty(psi.ArgumentList);
+        Assert.Equal("/work/repo", psi.WorkingDirectory);
+        Assert.True(psi.RedirectStandardOutput);
+        Assert.True(psi.RedirectStandardError);
+        Assert.False(psi.UseShellExecute);
+    }
+
+    [Fact]
+    public void CreateProcessStartInfo_DoesNotMutateRequestEnvironment()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = "gh-secret",
+            ["PATH"] = "/usr/bin",
+        };
+        var request = new GitProcessRequest("git", ["status"], "/work/repo", env);
+
+        _ = GitOperations.CreateProcessStartInfo(request);
+
+        Assert.Equal(2, env.Count);
+        Assert.Equal("gh-secret", env["GH_TOKEN"]);
+        Assert.Equal("/usr/bin", env["PATH"]);
+    }
+
+    [Fact]
+    public void CreateProcessStartInfo_ZeroArgs_ThrowsArgumentException()
+    {
+        var request = new GitProcessRequest(
+            "git", [], "/work/repo", new Dictionary<string, string?>());
+
+        Assert.Throws<ArgumentException>(() => GitOperations.CreateProcessStartInfo(request));
+    }
+
+    [Fact]
+    public void CreateProcessStartInfo_MultipleArgs_ThrowsArgumentException()
+    {
+        var request = new GitProcessRequest(
+            "git", ["status", "--porcelain"], "/work/repo", new Dictionary<string, string?>());
+
+        Assert.Throws<ArgumentException>(() => GitOperations.CreateProcessStartInfo(request));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task CommitFileAsync(string fileName, string content)
@@ -708,5 +898,168 @@ public sealed class GitOperationsTests : IAsyncLifetime
         var (exitCode, _, stderr) = await GitOperations.RunGitCommandAsync(workDir, args, CancellationToken.None);
         if (exitCode != 0)
             throw new InvalidOperationException($"git {args} failed: {stderr}");
+    }
+}
+
+/// <summary>
+/// Tests for the static <see cref="GitOperations.ProcessRunner"/> seam. These mutate static state
+/// and process-wide environment variables, so they run in the non-parallel "EnvVarMutation"
+/// collection and every assignment is restored in a <c>finally</c> block.
+/// </summary>
+[Collection("EnvVarMutation")]
+public sealed class GitOperationsProcessRunnerSeamTests
+{
+    /// <summary>A working directory that does not exist — a real launch here would throw.</summary>
+    private static readonly string NonexistentWorkDir =
+        Path.Combine(Path.GetTempPath(), $"GitOpsNoSuchDir_{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task RunGitCommandAsync_WithSeam_ReplacesEntireLaunchAndReceivesRawRequest()
+    {
+        const string OpaqueArgs = "commit -m \"seam message\"";
+        GitProcessRequest? captured = null;
+        var gate = new TaskCompletionSource<GitProcessResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                captured = request;
+                return gate.Task;
+            };
+
+            var callTask = GitOperations.RunGitCommandAsync(
+                NonexistentWorkDir, OpaqueArgs, TestContext.Current.CancellationToken);
+
+            gate.SetResult(new GitProcessResult(42, "seam-stdout", "seam-stderr"));
+            var (exitCode, stdout, stderr) = await callTask;
+
+            // The delegate's result is returned verbatim — no real process was started.
+            Assert.Equal(42, exitCode);
+            Assert.Equal("seam-stdout", stdout);
+            Assert.Equal("seam-stderr", stderr);
+            Assert.False(Directory.Exists(NonexistentWorkDir));
+
+            // The delegate received the PRE-factory request, not a ProcessStartInfo.
+            Assert.NotNull(captured);
+            Assert.Equal("git", captured!.Executable);
+            Assert.Equal(NonexistentWorkDir, captured.WorkingDirectory);
+            Assert.Equal(new[] { OpaqueArgs }, captured.Args.ToArray());
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = null;
+        }
+    }
+
+    [Fact]
+    public async Task RunGitCommandAsync_WithSeam_ReceivesRawUnsanitizedEnvironmentSnapshot()
+    {
+        var originalGhToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        var originalAskpass = Environment.GetEnvironmentVariable("GIT_ASKPASS");
+        GitProcessRequest? captured = null;
+
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", "raw-gh-secret");
+            Environment.SetEnvironmentVariable("GIT_ASKPASS", "/usr/bin/askpass");
+
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                captured = request;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            await GitOperations.RunGitCommandAsync(
+                NonexistentWorkDir, "status", TestContext.Current.CancellationToken);
+
+            // Raw (pre-factory) environment: still carries the credential variables.
+            Assert.NotNull(captured);
+            Assert.Equal("raw-gh-secret", captured!.Env["GH_TOKEN"]);
+            Assert.Equal("/usr/bin/askpass", captured.Env["GIT_ASKPASS"]);
+
+            // The factory is what strips them — applying it to the captured request proves the
+            // seam is upstream of the scrub.
+            var psi = GitOperations.CreateProcessStartInfo(captured);
+            Assert.False(psi.Environment.ContainsKey("GH_TOKEN"));
+            Assert.False(psi.Environment.ContainsKey("GIT_ASKPASS"));
+            Assert.Equal("0", psi.Environment["GIT_TERMINAL_PROMPT"]);
+
+            // The process environment itself was not mutated by the snapshot.
+            Assert.Equal("raw-gh-secret", Environment.GetEnvironmentVariable("GH_TOKEN"));
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = null;
+            Environment.SetEnvironmentVariable("GH_TOKEN", originalGhToken);
+            Environment.SetEnvironmentVariable("GIT_ASKPASS", originalAskpass);
+        }
+    }
+
+    [Fact]
+    public async Task RunGitCommandAsync_WithSeam_ForwardsCallerCancellationToken()
+    {
+        using var cts = new CancellationTokenSource();
+        CancellationToken capturedToken = default;
+
+        try
+        {
+            GitOperations.ProcessRunner = (_, ct) =>
+            {
+                capturedToken = ct;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            await GitOperations.RunGitCommandAsync(NonexistentWorkDir, "status", cts.Token);
+
+            Assert.Equal(cts.Token, capturedToken);
+            Assert.NotEqual(CancellationToken.None, capturedToken);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = null;
+        }
+    }
+
+    [Fact]
+    public async Task RunGitCommandAsync_AfterSeamRestored_UsesRealGitProcessAgain()
+    {
+        var invoked = 0;
+        var workDir = Path.Combine(Path.GetTempPath(), $"GitOpsSeamRestore_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workDir);
+
+        try
+        {
+            try
+            {
+                GitOperations.ProcessRunner = (_, _) =>
+                {
+                    invoked++;
+                    return Task.FromResult(new GitProcessResult(7, "fake", string.Empty));
+                };
+
+                var (seamExit, seamOut, _) = await GitOperations.RunGitCommandAsync(
+                    workDir, "--version", TestContext.Current.CancellationToken);
+                Assert.Equal(7, seamExit);
+                Assert.Equal("fake", seamOut);
+            }
+            finally
+            {
+                GitOperations.ProcessRunner = null;
+            }
+
+            // Restoration is observable: the seam is null and the real git CLI runs.
+            Assert.Null(GitOperations.ProcessRunner);
+
+            var (exitCode, stdout, _) = await GitOperations.RunGitCommandAsync(
+                workDir, "--version", TestContext.Current.CancellationToken);
+            Assert.Equal(0, exitCode);
+            Assert.Contains("git version", stdout);
+            Assert.Equal(1, invoked);
+        }
+        finally
+        {
+            await GitOperations.ForceDeleteDirectoryAsync(workDir);
+        }
     }
 }

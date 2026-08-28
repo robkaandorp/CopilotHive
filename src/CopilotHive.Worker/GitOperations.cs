@@ -254,21 +254,151 @@ public static class GitOperations
     }
 
     /// <summary>
+    /// Environment variable names that are ALWAYS stripped from the environment handed to a
+    /// child git process. Matching is by name using <see cref="StringComparer.OrdinalIgnoreCase"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>GIT_TERMINAL_PROMPT</c> is scrubbed together with the credential variables and then
+    /// re-set to <c>0</c> by <see cref="CreateProcessStartInfo"/>, so an inherited value can never
+    /// re-enable interactive prompting.
+    /// </remarks>
+    private static readonly string[] ScrubbedChildEnvNames =
+    [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GIT_ASKPASS",
+        "GITHUB_CONFIG_REPO_TOKEN",
+        "GIT_TERMINAL_PROMPT",
+    ];
+
+    /// <summary>
+    /// Test seam replacing the ENTIRE git process launch. When non-null,
+    /// <see cref="RunGitCommandAsync"/> hands the delegate the raw, PRE-factory
+    /// <see cref="GitProcessRequest"/> (never a sanitized <see cref="ProcessStartInfo"/>) and
+    /// returns the delegate's result. When null, the default real runner starts a git process.
+    /// </summary>
+    internal static Func<GitProcessRequest, CancellationToken, Task<GitProcessResult>>? ProcessRunner { get; set; }
+
+    /// <summary>
+    /// Returns a NEW dictionary copied from <paramref name="env"/> with the credential-bearing and
+    /// prompt-controlling variables removed. The input dictionary is never mutated.
+    /// </summary>
+    /// <remarks>
+    /// Removal is unconditional and matches variable NAMES ordinal-ignore-case. A null value for a
+    /// NON-scrubbed key is preserved as a null removal-marker (an environment block cannot hold a
+    /// null value, so such an entry behaves as an absent variable at repopulation); a null value for
+    /// a scrubbed key is simply removed like any other value.
+    /// </remarks>
+    /// <param name="env">The environment to copy and scrub.</param>
+    internal static IReadOnlyDictionary<string, string?> SanitizeChildEnv(IDictionary<string, string?> env)
+    {
+        ArgumentNullException.ThrowIfNull(env);
+
+        var copy = new Dictionary<string, string?>();
+        foreach (var (key, value) in env)
+        {
+            if (IsScrubbedChildEnvName(key))
+                continue;
+
+            copy[key] = value;
+        }
+
+        return copy;
+    }
+
+    private static bool IsScrubbedChildEnvName(string name)
+    {
+        foreach (var scrubbed in ScrubbedChildEnvNames)
+        {
+            if (string.Equals(name, scrubbed, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// PURE factory building the <see cref="ProcessStartInfo"/> for a git launch. No side effects
+    /// and no process is started. This is the SINGLE source of truth for the child-environment
+    /// clear-and-repopulate.
+    /// </summary>
+    /// <param name="request">The request describing the executable, argument, directory and environment.</param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <see cref="GitProcessRequest.Args"/> does not contain exactly one element.
+    /// </exception>
+    internal static ProcessStartInfo CreateProcessStartInfo(GitProcessRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.Args.Count != 1)
+        {
+            throw new ArgumentException(
+                $"Exactly one opaque argument string is required, got {request.Args.Count}.",
+                nameof(request));
+        }
+
+        var psi = new ProcessStartInfo(request.Executable)
+        {
+            WorkingDirectory = request.WorkingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            // Legacy opaque form: assigned VERBATIM, no splitting and no re-quoting.
+            Arguments = request.Args[0],
+        };
+
+        var sanitized = SanitizeChildEnv(new Dictionary<string, string?>(request.Env));
+
+        psi.Environment.Clear();
+        foreach (var (key, value) in sanitized)
+        {
+            // A null value is an absent variable: it is not repopulated.
+            if (value is null)
+                continue;
+
+            psi.Environment[key] = value;
+        }
+
+        // Controlled noninteractive replacement — git must never prompt for credentials.
+        psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
+
+        return psi;
+    }
+
+    /// <summary>
+    /// Snapshots the CURRENT process environment without mutating it, narrowing the non-generic
+    /// bound collection down to string keys and <c>string?</c> values.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string?> SnapshotCurrentProcessEnv()
+    {
+        var snapshot = new Dictionary<string, string?>();
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is not string key)
+                continue;
+
+            snapshot[key] = entry.Value as string;
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
     /// Run a git command and return (exitCode, stdout, stderr).
     /// </summary>
     public static async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
         string workDir, string args, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo("git")
-        {
-            WorkingDirectory = workDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            Arguments = args,
-        };
+        var request = new GitProcessRequest("git", [args], workDir, SnapshotCurrentProcessEnv());
 
-        using var process = Process.Start(psi)
+        var runner = ProcessRunner;
+        if (runner is not null)
+        {
+            var seamResult = await runner(request, ct);
+            return (seamResult.ExitCode, seamResult.Stdout, seamResult.Stderr);
+        }
+
+        using var process = Process.Start(CreateProcessStartInfo(request))
             ?? throw new InvalidOperationException("Failed to start git process.");
 
         // Read stdout and stderr concurrently to avoid deadlock when buffers fill
@@ -365,6 +495,29 @@ public static class GitOperations
         }
     }
 }
+
+/// <summary>
+/// A request to launch a git process. Immutability is SHALLOW: the collections are held by
+/// reference and are not defensively copied — the non-mutation obligation belongs to the
+/// implementation that consumes the request.
+/// </summary>
+/// <param name="Executable">The executable to launch (normally <c>git</c>).</param>
+/// <param name="Args">The argument list. Currently exactly one opaque argument string is supported.</param>
+/// <param name="WorkingDirectory">The working directory for the child process.</param>
+/// <param name="Env">The environment to scrub and hand to the child process.</param>
+internal sealed record GitProcessRequest(
+    string Executable,
+    IReadOnlyList<string> Args,
+    string WorkingDirectory,
+    IReadOnlyDictionary<string, string?> Env);
+
+/// <summary>
+/// The result of a git process launch.
+/// </summary>
+/// <param name="ExitCode">The process exit code.</param>
+/// <param name="Stdout">The captured standard output.</param>
+/// <param name="Stderr">The captured standard error.</param>
+internal sealed record GitProcessResult(int ExitCode, string Stdout, string Stderr);
 
 /// <summary>
 /// Exception thrown when a git CLI command fails.
