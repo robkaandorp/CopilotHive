@@ -120,7 +120,10 @@ public sealed class TaskExecutor(
                     if (Directory.Exists(targetDir))
                         await _git.ForceDeleteDirectoryAsync(targetDir);
 
-                    _log.Info($"Cloning {repo.Name} from {repo.Url}");
+                    // The clone URL carries credentials (the orchestrator injects a token into it),
+                    // so the log gets the credential-free form. The RAW url is still what is handed
+                    // to the git clone below — redaction is a log-construction concern only.
+                    _log.Info($"Cloning {repo.Name} from {GitUrlRedactor.Redact(repo.Url)}");
                     await _git.CloneRepositoryAsync(repo.Url, targetDir, ct);
 
                     // Handle branch operations
@@ -145,7 +148,7 @@ public sealed class TaskExecutor(
                                 }
                                 catch (GitOperationException ex)
                                 {
-                                    _log.Warn($"Checkout failed ({ex.Message}), creating branch from {baseBranch}");
+                                    _log.Warn($"Checkout failed ({GitUrlRedactor.Redact(ex.Message)}), creating branch from {baseBranch}");
                                     await _git.CreateBranchAsync(targetDir, branchInfo.FeatureBranch, baseBranch, ct);
                                 }
                                 break;
@@ -197,7 +200,7 @@ public sealed class TaskExecutor(
                 }
                 catch (Exception ex)
                 {
-                    _log.Warn($"Could not capture iteration start SHA (empty repo?): {ex.Message}");
+                    _log.Warn($"Could not capture iteration start SHA (empty repo?): {GitUrlRedactor.Redact(ex.Message)}");
                 }
             }
 
@@ -396,8 +399,14 @@ public sealed class TaskExecutor(
                         }
                         catch (Exception ex)
                         {
-                            _log.Error($"Push failed for {repo.Name}: {ex.Message}");
-                            pushErrors.Add($"Push failed for {repo.Name}: {ex.Message}");
+                            // A push failure message embeds git's stderr, which echoes the
+                            // credential-bearing remote URL. Redact ONCE here so the identical
+                            // text is safe both in the log line and in the task result, which
+                            // travels to the orchestrator to be logged and persisted.
+                            var pushError = GitUrlRedactor.Redact(
+                                $"Push failed for {repo.Name}: {ex.Message}");
+                            _log.Error(pushError);
+                            pushErrors.Add(pushError);
                         }
                     }
 
@@ -615,7 +624,7 @@ public sealed class TaskExecutor(
         catch (Exception ex)
         {
             if (ex is OperationCanceledException) throw;
-            _log.Warn($"Failed to load session '{sessionId}': {ex.Message} — starting fresh");
+            _log.Warn($"Failed to load session '{sessionId}': {GitUrlRedactor.Redact(ex.Message)} — starting fresh");
             agentRunner.SetSession(null);
         }
     }
@@ -641,7 +650,7 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
-            _log.Warn($"Failed to save session '{sessionId}': {ex.Message}");
+            _log.Warn($"Failed to save session '{sessionId}': {GitUrlRedactor.Redact(ex.Message)}");
         }
     }
 
@@ -799,10 +808,12 @@ public sealed class TaskExecutor(
         var (exitCode, stdout, stderr) = await _git.RunGitCommandAsync(
             _configRepoDir, "pull --ff-only", ct);
 
+        // git echoes the credential-bearing config-repo remote in both streams, so the LOG
+        // rendering is redacted. The raw values themselves are left untouched.
         if (exitCode == 0)
-            _log.Info($"Config repo up to date: {stdout.Trim()}");
+            _log.Info($"Config repo up to date: {GitUrlRedactor.Redact(stdout.Trim())}");
         else
-            _log.Error($"Config repo pull failed (exit {exitCode}): {stderr.Trim()}");
+            _log.Error($"Config repo pull failed (exit {exitCode}): {GitUrlRedactor.Redact(stderr.Trim())}");
     }
 
     /// <summary>
@@ -819,7 +830,7 @@ public sealed class TaskExecutor(
             _configRepoDir, "add agents/*.agents.md", ct);
         if (addExit != 0)
         {
-            _log.Error($"git add failed: {addErr.Trim()}");
+            _log.Error($"git add failed: {GitUrlRedactor.Redact(addErr.Trim())}");
             return new GitChangeSummary();
         }
 
@@ -858,11 +869,11 @@ public sealed class TaskExecutor(
             _configRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
         if (commitExit != 0)
         {
-            _log.Error($"git commit failed: {commitErr.Trim()}");
+            _log.Error($"git commit failed: {GitUrlRedactor.Redact(commitErr.Trim())}");
             return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
         }
 
-        _log.Info($"Committed: {commitOut.Trim()}");
+        _log.Info($"Committed: {GitUrlRedactor.Redact(commitOut.Trim())}");
 
         // Pull (merge orchestrator's goals/metrics commits) then push
         var pushed = false;
@@ -872,7 +883,7 @@ public sealed class TaskExecutor(
                 _configRepoDir, "pull --no-rebase", ct);
             if (pullExit != 0)
             {
-                _log.Error($"git pull failed: {pullErr.Trim()}");
+                _log.Error($"git pull failed: {GitUrlRedactor.Redact(pullErr.Trim())}");
                 // Abort any in-progress merge and try force-pushing our commit
                 await _git.RunGitCommandAsync(_configRepoDir, "merge --abort", ct);
             }
@@ -881,7 +892,7 @@ public sealed class TaskExecutor(
                 _configRepoDir, "push", ct);
             if (pushExit != 0)
             {
-                _log.Error($"git push failed: {pushErr.Trim()}");
+                _log.Error($"git push failed: {GitUrlRedactor.Redact(pushErr.Trim())}");
                 return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
             }
 
@@ -890,7 +901,7 @@ public sealed class TaskExecutor(
         }
         catch (Exception ex)
         {
-            _log.Error($"Push failed: {ex.Message}");
+            _log.Error($"Push failed: {GitUrlRedactor.Redact(ex.Message)}");
         }
 
         return new GitChangeSummary

@@ -16,6 +16,21 @@ public static class GitOperations
     public const int ChangedFilesMaxPaths = 50;
 
     /// <summary>
+    /// Builds a <see cref="GitOperationException"/> whose message has every credential-bearing
+    /// repository URL redacted.
+    /// </summary>
+    /// <remarks>
+    /// This is the single exception-CONSTRUCTION boundary of this class. A clone URL carries
+    /// userinfo credentials (<c>https://x-access-token:&lt;token&gt;@host/org/repo.git</c>) and git
+    /// echoes the remote it was given back through stderr, so both the interpolated URL and the
+    /// captured stderr can embed a token. Redaction happens HERE and nowhere earlier: the raw
+    /// stdout/stderr returned by <see cref="RunGitCommandAsync"/> stays untouched functional data
+    /// (SHAs, porcelain status, numstat diffs, filenames) for the parsing code paths.
+    /// </remarks>
+    private static GitOperationException Fail(string message) =>
+        new(GitUrlRedactor.Redact(message));
+
+    /// <summary>
     /// Clones a remote repository into the specified target directory.
     /// Throws <see cref="GitOperationException"/> on failure.
     /// </summary>
@@ -29,7 +44,7 @@ public static class GitOperations
             $"clone {url} {Path.GetFileName(targetDir)}",
             ct);
         if (exitCode != 0)
-            throw new GitOperationException($"Failed to clone '{url}': {stderr.Trim()}");
+            throw Fail($"Failed to clone '{url}': {stderr.Trim()}");
 
         await ConfigureLocalIdentity(targetDir, ct);
     }
@@ -56,11 +71,11 @@ public static class GitOperations
         }
         catch (Exception ex)
         {
-            throw new GitOperationException($"Failed to set local user.email: {ex.Message}");
+            throw Fail($"Failed to set local user.email: {ex.Message}");
         }
 
         if (emailResult.ExitCode != 0)
-            throw new GitOperationException($"Failed to set local user.email: {emailResult.Stderr.Trim()}");
+            throw Fail($"Failed to set local user.email: {emailResult.Stderr.Trim()}");
 
         try
         {
@@ -73,11 +88,11 @@ public static class GitOperations
         }
         catch (Exception ex)
         {
-            throw new GitOperationException($"Failed to set local user.name: {ex.Message}");
+            throw Fail($"Failed to set local user.name: {ex.Message}");
         }
 
         if (nameResult.ExitCode != 0)
-            throw new GitOperationException($"Failed to set local user.name: {nameResult.Stderr.Trim()}");
+            throw Fail($"Failed to set local user.name: {nameResult.Stderr.Trim()}");
     }
 
     /// <summary>
@@ -91,7 +106,7 @@ public static class GitOperations
     {
         var (exitCode, _, stderr) = await RunGitCommandAsync(repoDir, $"checkout {branch}", ct);
         if (exitCode != 0)
-            throw new GitOperationException($"Failed to checkout branch '{branch}': {stderr.Trim()}");
+            throw Fail($"Failed to checkout branch '{branch}': {stderr.Trim()}");
     }
 
     /// <summary>
@@ -121,7 +136,7 @@ public static class GitOperations
                 var (orphanExit, _, orphanStderr) = await RunGitCommandAsync(
                     repoDir, $"checkout --orphan {branchName}", ct);
                 if (orphanExit != 0)
-                    throw new GitOperationException(
+                    throw Fail(
                         $"Failed to create orphan branch '{branchName}': {orphanStderr.Trim()}");
                 return;
             }
@@ -136,7 +151,7 @@ public static class GitOperations
                 var (trackExit, _, trackStderr) = await RunGitCommandAsync(
                     repoDir, $"checkout -b {baseBranch} origin/{baseBranch}", ct);
                 if (trackExit != 0)
-                    throw new GitOperationException(
+                    throw Fail(
                         $"Failed to create tracking branch '{baseBranch}' from origin: {trackStderr.Trim()}");
             }
             else
@@ -145,14 +160,14 @@ public static class GitOperations
                 var (createBaseExit, _, createBaseStderr) = await RunGitCommandAsync(
                     repoDir, $"checkout -b {baseBranch}", ct);
                 if (createBaseExit != 0)
-                    throw new GitOperationException(
+                    throw Fail(
                         $"Failed to create base branch '{baseBranch}' from current HEAD: {createBaseStderr.Trim()}");
             }
         }
 
         var (exitCode2, _, stderr2) = await RunGitCommandAsync(repoDir, $"checkout -b {branchName}", ct);
         if (exitCode2 != 0)
-            throw new GitOperationException($"Failed to create branch '{branchName}': {stderr2.Trim()}");
+            throw Fail($"Failed to create branch '{branchName}': {stderr2.Trim()}");
     }
 
     /// <summary>
@@ -178,7 +193,7 @@ public static class GitOperations
     {
         var (exitCode, _, stderr) = await RunGitCommandAsync(repoDir, $"push origin {branch} --force", ct);
         if (exitCode != 0)
-            throw new GitOperationException($"Failed to push branch '{branch}': {stderr.Trim()}");
+            throw Fail($"Failed to push branch '{branch}': {stderr.Trim()}");
     }
 
     /// <summary>

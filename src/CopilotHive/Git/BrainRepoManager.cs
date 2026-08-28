@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using CopilotHive.Services;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Git;
@@ -124,6 +125,27 @@ public interface IBrainRepoManager
 }
 
 /// <summary>
+/// A single git invocation handed to the optional <see cref="BrainRepoManager"/> runner seam.
+/// </summary>
+/// <param name="WorkingDirectory">Working directory the git process runs in.</param>
+/// <param name="Arguments">The git arguments, already split into individual tokens.</param>
+public readonly record struct BrainGitRequest(string WorkingDirectory, IReadOnlyList<string> Arguments);
+
+/// <summary>
+/// The RAW result of a git invocation performed through the <see cref="BrainRepoManager"/>
+/// runner seam.
+/// </summary>
+/// <remarks>
+/// Deliberately raw: the seam never redacts. <see cref="BrainRepoManager"/> itself remains
+/// responsible for constructing — and redacting — every log line and failure message, so a fake
+/// runner returning credential-bearing stderr exercises the PRODUCTION redaction path.
+/// </remarks>
+/// <param name="ExitCode">The git process exit code.</param>
+/// <param name="Stdout">Raw standard output.</param>
+/// <param name="Stderr">Raw standard error.</param>
+public readonly record struct BrainGitResult(int ExitCode, string Stdout, string Stderr);
+
+/// <summary>
 /// Manages persistent clones of target repositories for the Brain.
 /// Each repository gets its own clone at <c>{basePath}/repos/{repoName}</c>,
 /// checked out to the default branch. The parent <c>repos/</c> directory serves
@@ -136,6 +158,12 @@ public sealed class BrainRepoManager : IBrainRepoManager
     private readonly string _basePath;
     private readonly ILogger _logger;
 
+    /// <summary>
+    /// Optional substitute for the real git process invocation. <c>null</c> in production, where
+    /// the private process-based runner is used.
+    /// </summary>
+    private readonly Func<BrainGitRequest, BrainGitResult>? _gitRunner;
+
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _repoLocks =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -147,10 +175,20 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// Repo clones are created at <c>{basePath}/repos/{repoName}</c>.
     /// </param>
     /// <param name="logger">Logger instance.</param>
-    public BrainRepoManager(string basePath, ILogger<BrainRepoManager> logger)
+    /// <param name="gitRunner">
+    /// Optional substitute for the real git process invocation. When <c>null</c> (the production
+    /// default, and what every existing call site gets) the private process-based runner is used.
+    /// The seam returns RAW process results — this class stays responsible for constructing and
+    /// redacting the resulting log lines and failure messages.
+    /// </param>
+    public BrainRepoManager(
+        string basePath,
+        ILogger<BrainRepoManager> logger,
+        Func<BrainGitRequest, BrainGitResult>? gitRunner = null)
     {
         _basePath = Path.GetFullPath(basePath);
         _logger = logger;
+        _gitRunner = gitRunner;
         Directory.CreateDirectory(WorkDirectory);
     }
 
@@ -201,9 +239,11 @@ public sealed class BrainRepoManager : IBrainRepoManager
             }
             else
             {
+                // The clone URL carries credentials (PipelineHelpers.InjectTokenIntoUrl), so the
+                // credential-free form is logged. The raw URL still goes to git unchanged below.
                 _logger.LogInformation(
                     "Creating Brain clone for {Repo} from {Url} (branch: {Branch})",
-                    repoName, repoUrl, defaultBranch);
+                    repoName, GitUrlRedactor.Redact(repoUrl), defaultBranch);
 
                 Directory.CreateDirectory(WorkDirectory);
                 try
@@ -394,40 +434,26 @@ public sealed class BrainRepoManager : IBrainRepoManager
     /// <summary>
     /// Runs a git command and returns the standard output as a string.
     /// Throws <see cref="InvalidOperationException"/> with stderr on non-zero exit codes.
+    /// Routed through the optional runner seam when one was supplied.
     /// </summary>
     /// <param name="workingDir">Working directory for the git process.</param>
     /// <param name="args">Arguments to pass to git.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The standard output of the git command.</returns>
-    private static async Task<string> RunGitWithOutputAsync(string workingDir, string[] args, CancellationToken ct)
+    /// <returns>The standard output of the git command, RAW and unmodified.</returns>
+    private async Task<string> RunGitWithOutputAsync(string workingDir, string[] args, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo("git")
+        var (exitCode, stdout, stderr) = await RunGitCoreAsync(workingDir, args, ct);
+
+        if (exitCode != 0)
         {
-            WorkingDirectory = workingDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-
-        foreach (var arg in args)
-            psi.ArgumentList.Add(arg);
-
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start git process");
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-
-        await Task.WhenAll(stdoutTask, stderrTask);
-        await process.WaitForExitAsync(ct);
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderrTask.Result}");
+            // Same construction boundary as RunGitAsync: the argument list and stderr can both
+            // embed a credential-bearing remote URL.
+            throw new InvalidOperationException(GitUrlRedactor.Redact(
+                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}"));
         }
 
-        return stdoutTask.Result;
+        // Returned VERBATIM: callers parse SHAs, porcelain status and ref listings out of it.
+        return stdout;
     }
 
     /// <summary>
@@ -568,8 +594,42 @@ public sealed class BrainRepoManager : IBrainRepoManager
         }
     }
 
-    private static async Task RunGitAsync(string workingDir, string[] args, CancellationToken ct)
+    /// <summary>
+    /// Runs a git command, throwing an <see cref="InvalidOperationException"/> on a non-zero
+    /// exit code. Routed through the optional runner seam when one was supplied.
+    /// </summary>
+    /// <remarks>
+    /// The failure message embeds the complete git argument list — which for a clone contains the
+    /// credential-bearing remote URL — and git's stderr, which echoes the remote back. Both are
+    /// therefore redacted at the point the message is CONSTRUCTED. The raw stdout/stderr are never
+    /// mutated: they stay functional data for the callers that parse them.
+    /// </remarks>
+    private async Task RunGitAsync(string workingDir, string[] args, CancellationToken ct)
     {
+        var (exitCode, _, stderr) = await RunGitCoreAsync(workingDir, args, ct);
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(GitUrlRedactor.Redact(
+                $"git {string.Join(' ', args)} failed (exit {exitCode}): {stderr}"));
+        }
+    }
+
+    /// <summary>
+    /// Runs a git command and returns its RAW exit code, stdout and stderr, using the injected
+    /// runner seam when present and the real git process otherwise. Never redacts and never
+    /// throws on a non-zero exit code — message construction (and redaction) is the caller's job.
+    /// </summary>
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCoreAsync(
+        string workingDir, string[] args, CancellationToken ct)
+    {
+        if (_gitRunner is { } runner)
+        {
+            ct.ThrowIfCancellationRequested();
+            var injected = runner(new BrainGitRequest(workingDir, args));
+            return (injected.ExitCode, injected.Stdout, injected.Stderr);
+        }
+
         var psi = new ProcessStartInfo("git")
         {
             WorkingDirectory = workingDir,
@@ -590,12 +650,7 @@ public sealed class BrainRepoManager : IBrainRepoManager
         await Task.WhenAll(stdoutTask, stderrTask);
         await process.WaitForExitAsync(ct);
 
-        if (process.ExitCode != 0)
-        {
-            var stderr = stderrTask.Result;
-            throw new InvalidOperationException(
-                $"git {string.Join(' ', args)} failed (exit {process.ExitCode}): {stderr}");
-        }
+        return (process.ExitCode, stdoutTask.Result, stderrTask.Result);
     }
 
     /// <summary>
@@ -901,14 +956,27 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
     /// <summary>
     /// Runs a git command capturing exit code, stdout, and stderr without throwing on non-zero exit.
+    /// Routed through the optional runner seam when one was supplied.
     /// </summary>
+    /// <remarks>
+    /// The returned stdout/stderr are RAW and are never redacted here — they are functional data
+    /// (tag listings, ref names) that callers parse. Redaction is applied by each caller at the
+    /// point where a log entry or exception message is CONSTRUCTED from them.
+    /// </remarks>
     /// <param name="workingDir">Working directory for the git process.</param>
     /// <param name="args">Arguments to pass to git.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The exit code, standard output, and standard error of the git command.</returns>
-    private static async Task<(int exitCode, string stdout, string stderr)> RunGitCaptureAsync(
+    private async Task<(int exitCode, string stdout, string stderr)> RunGitCaptureAsync(
         string workingDir, string[] args, CancellationToken ct)
     {
+        if (_gitRunner is { } runner)
+        {
+            ct.ThrowIfCancellationRequested();
+            var injected = runner(new BrainGitRequest(workingDir, args));
+            return (injected.ExitCode, injected.Stdout, injected.Stderr);
+        }
+
         var psi = new ProcessStartInfo("git")
         {
             WorkingDirectory = workingDir,
@@ -1008,11 +1076,13 @@ public sealed class BrainRepoManager : IBrainRepoManager
             _logger.LogInformation("Creating tag {Tag} on {Branch} for {Repo}", tag, branch, repoName);
 
             // Check whether the tag already exists on origin (no fetch needed).
+            // The clone's `origin` is the credential-bearing URL injected at clone time, so a
+            // failing REMOTE command echoes it through stderr — redact where the message is built.
             var (lsExit, lsStdout, lsStderr) = await RunGitCaptureAsync(
                 clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
             if (lsExit != 0)
-                throw new InvalidOperationException(
-                    $"Failed to query remote tags for '{repoName}': {lsStderr}");
+                throw new InvalidOperationException(GitUrlRedactor.Redact(
+                    $"Failed to query remote tags for '{repoName}': {lsStderr}"));
             if (!string.IsNullOrWhiteSpace(lsStdout))
             {
                 _logger.LogInformation("Tag {Tag} already exists on origin for {Repo} — skipping", tag, repoName);
@@ -1113,17 +1183,21 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             _logger.LogInformation("Deleting tag {Tag} for {Repo}", tag, repoName);
 
+            // The REMOTE query talks to the credential-bearing `origin`, so its stderr can echo
+            // the full clone URL. Redact where the exception message is constructed.
             var (remoteExit, remoteStdout, remoteStderr) = await RunGitCaptureAsync(
                 clonePath, ["ls-remote", "--tags", "origin", $"refs/tags/{tag}"], ct);
             if (remoteExit != 0)
-                throw new InvalidOperationException(
-                    $"Failed to query remote tags for '{repoName}': {remoteStderr}");
+                throw new InvalidOperationException(GitUrlRedactor.Redact(
+                    $"Failed to query remote tags for '{repoName}': {remoteStderr}"));
 
+            // The LOCAL query never contacts origin, but its message is constructed the same way
+            // so a remote-bearing message can never slip through this boundary either.
             var (localExit, localStdout, localStderr) = await RunGitCaptureAsync(
                 clonePath, ["tag", "-l", tag], ct);
             if (localExit != 0)
-                throw new InvalidOperationException(
-                    $"Failed to query local tags for '{repoName}': {localStderr}");
+                throw new InvalidOperationException(GitUrlRedactor.Redact(
+                    $"Failed to query local tags for '{repoName}': {localStderr}"));
 
             var remoteExists = !string.IsNullOrWhiteSpace(remoteStdout);
             var localExists = !string.IsNullOrWhiteSpace(localStdout);
@@ -1162,11 +1236,14 @@ public sealed class BrainRepoManager : IBrainRepoManager
             if (anyDeleted)
             {
                 // At least one side was deleted. Any failure on the other side is logged but
-                // does not fail the operation.
+                // does not fail the operation. `remoteError` comes from a `push origin` against
+                // the credential-bearing remote, so both warnings redact at construction.
                 if (localError is not null)
-                    _logger.LogWarning("Local tag delete failed for {Tag} in {Repo}: {Error}", tag, repoName, localError);
+                    _logger.LogWarning("Local tag delete failed for {Tag} in {Repo}: {Error}",
+                        tag, repoName, GitUrlRedactor.Redact(localError));
                 if (remoteError is not null)
-                    _logger.LogWarning("Remote tag delete failed for {Tag} in {Repo}: {Error}", tag, repoName, remoteError);
+                    _logger.LogWarning("Remote tag delete failed for {Tag} in {Repo}: {Error}",
+                        tag, repoName, GitUrlRedactor.Redact(remoteError));
 
                 _logger.LogInformation("Successfully deleted tag {Tag} for {Repo}", tag, repoName);
                 return true;
@@ -1174,9 +1251,9 @@ public sealed class BrainRepoManager : IBrainRepoManager
 
             // At least one location had the tag (checked above) but ZERO deletions succeeded —
             // this covers both "existed on both, both failed" and "existed on one side, that
-            // sole deletion failed". Surface a genuine failure.
-            throw new InvalidOperationException(
-                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError ?? "(n/a)"}; Remote error: {remoteError ?? "(n/a)"}");
+            // sole deletion failed". Surface a genuine failure, with both stderr copies redacted.
+            throw new InvalidOperationException(GitUrlRedactor.Redact(
+                $"Failed to delete tag '{tag}' for '{repoName}'. Local error: {localError ?? "(n/a)"}; Remote error: {remoteError ?? "(n/a)"}"));
         }
         finally
         {
