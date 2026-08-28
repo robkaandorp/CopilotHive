@@ -5,14 +5,12 @@ using CopilotHive.Services;
 namespace CopilotHive.Worker;
 
 /// <summary>
-/// Pure validation layer for the config-repo git seam (slice 2c-b1b-i): strict per-command
-/// grammar, ref prechecks, worktree containment, canonicalization, constructors, and disposal.
-/// <para>
-/// Process execution is deliberately NOT part of this slice. When every validation stage
-/// passes, a placeholder result is returned; the credential/origin transport (2c-b1c), the
-/// health probe (2c-b2), the clone (2c-b3), and process execution/result mapping (2c-b1b-ii)
-/// are later slices.
-/// </para>
+/// Validation and EXECUTION layer for the config-repo git seam (slices 2c-b1b-i + 2c-b1b-ii):
+/// strict per-command grammar, ref prechecks PLUS the check-ref-format subprocess, worktree
+/// containment, canonicalization, constructors, disposal, and the real process execution via
+/// the SHARED <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping
+/// and redaction boundary. The credential/origin transport (2c-b1c), the health probe (2c-b2),
+/// and the clone (2c-b3) are later slices.
 /// </summary>
 internal sealed class ConfigRepoGitOperations : IDisposable
 {
@@ -94,23 +92,25 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     }
 
     /// <summary>
-    /// Runs the strict validation pipeline for a config-repo git command. No process is
-    /// launched in this slice: when every stage passes, a placeholder result is returned.
+    /// Runs the strict validation pipeline for a config-repo git command and, when every
+    /// stage passes, executes the SNAPSHOTTED command via the shared
+    /// <see cref="GitOperations.ExecuteProcessAsync"/>. Stage 6 additionally validates the
+    /// ref candidate with a <c>git check-ref-format --allow-onelevel &lt;ref&gt;</c> subprocess.
     /// </summary>
-    internal Task<ConfigRepoOpResult> RunConfigRepoCommandAsync(
+    internal async Task<ConfigRepoOpResult> RunConfigRepoCommandAsync(
         IReadOnlyList<string> args, string workingDirectory, CancellationToken ct)
     {
         // Stage 1 — disposed.
         if (Volatile.Read(ref _disposed) != 0)
-            return Task.FromResult(Reject("Seam disposed."));
+            return Reject("Seam disposed.");
 
         // Stage 2a — args null or empty (BEFORE the snapshot).
         if (args is null || args.Count == 0)
-            return Task.FromResult(Reject("Invalid arguments."));
+            return Reject("Invalid arguments.");
 
         // Stage 2b — workingDirectory null/whitespace.
         if (string.IsNullOrWhiteSpace(workingDirectory))
-            return Task.FromResult(Reject("Invalid arguments."));
+            return Reject("Invalid arguments.");
 
         // Stage 2c — the snapshot, taken ONCE and used for everything downstream.
         var snapshot = args.ToArray();
@@ -119,7 +119,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         foreach (var arg in snapshot)
         {
             if (arg is null)
-                return Task.FromResult(Reject("Invalid arguments."));
+                return Reject("Invalid arguments.");
         }
 
         // Stage 2e — a path-related exception from the containment's Canonicalize.
@@ -130,17 +130,17 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or SecurityException or IOException)
         {
-            return Task.FromResult(Reject("Invalid arguments."));
+            return Reject("Invalid arguments.");
         }
 
         // Stage 3 — containment: the working directory must EQUAL the config repo directory.
         if (!IsContained(canonicalWorkingDir))
-            return Task.FromResult(Reject("Invalid git command: the working directory is not the config repository."));
+            return Reject("Invalid git command: the working directory is not the config repository.");
 
         // Stage 4 — subcommand recognition.
         var subcommand = snapshot[0];
         if (!IsKnownSubcommand(subcommand))
-            return Task.FromResult(Reject($"Invalid git command: unknown subcommand '{subcommand}'."));
+            return Reject($"Invalid git command: unknown subcommand '{subcommand}'.");
 
         // Stage 5 — the COMPLETE grammar scan. It classifies every token and, for the
         // credential-scoped commands, SELECTS (but does not yet validate) the ref candidate.
@@ -149,21 +149,40 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         // matching — is decided here, BEFORE Stage 6 ever looks at the ref.
         var (scanError, refCandidate) = ScanTokens(subcommand, snapshot);
         if (scanError is not null)
-            return Task.FromResult(Reject(scanError));
+            return Reject(scanError);
 
-        // Stage 6 — ref PRECHECKS, run only once the Stage 5 scan completed without a
-        // grammar rejection. This ordering is what makes `pull origin +bad extra` report
-        // `too many arguments.` and `pull badremote +bad` report the remote rejection:
-        // a Stage 5 error ALWAYS wins over a Stage 6 ref error.
+        // Stage 6 — ref validation: the PRECHECKS, then (when they pass) the check-ref-format
+        // subprocess. Run only once the Stage 5 scan completed without a grammar rejection.
+        // This ordering is what makes `pull origin +bad extra` report `too many arguments.`
+        // and `pull badremote +bad` report the remote rejection: a Stage 5 error ALWAYS wins
+        // over a Stage 6 ref error.
         if (refCandidate is not null)
         {
             var refError = ValidateRef(refCandidate);
             if (refError is not null)
-                return Task.FromResult(Reject(refError));
+                return Reject(refError);
+
+            // The prechecks passed — confirm with the subprocess. NO credential env in this
+            // slice (2c-b1b-ii): only the scrubbed inherited environment plus
+            // GIT_TERMINAL_PROMPT=0. A non-zero exit rejects the ref.
+            var refValidation = await LaunchGitProcessAsync(
+                new[] { "check-ref-format", "--allow-onelevel", refCandidate }, ct);
+            if (refValidation is null)
+                return Reject("Git process failed to start.");
+
+            if (refValidation.ExitCode != 0)
+                return Reject($"Invalid git ref: '{GitUrlRedactor.Redact(refCandidate)}'.");
         }
 
-        // Stage 7 — execution is NOT part of this slice.
-        return Task.FromResult(Reject("Execution deferred to slice 2c-b1b-ii."));
+        // Stage 7 — the real execution: the SNAPSHOT launched verbatim via the SHARED
+        // ExecuteProcessAsync. The working directory is the CONSTRUCTOR-canonicalized
+        // configRepoDir — NOT the call-time workingDirectory string (Stage 3 containment has
+        // already verified their equivalence).
+        var execution = await LaunchGitProcessAsync(snapshot, ct);
+        if (execution is null)
+            return Reject("Git process failed to start.");
+
+        return MapResult(execution);
     }
 
     /// <summary>
@@ -213,6 +232,90 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// </summary>
     private static ConfigRepoOpResult Reject(string message) =>
         new(false, -1, "", GitUrlRedactor.Redact(message));
+
+    /// <summary>
+    /// The child environment for EVERY git process launched by this seam: the SCRUBBED
+    /// inherited environment (the shared five-variable <see cref="GitOperations.SanitizeChildEnv"/>)
+    /// plus <c>GIT_TERMINAL_PROMPT=0</c>. NO credential environment in this slice (2c-b1c owns it).
+    /// </summary>
+    private IReadOnlyDictionary<string, string?> BuildChildEnv()
+    {
+        var sanitized = GitOperations.SanitizeChildEnv(SnapshotCurrentProcessEnv());
+        var withPromptDisabled = new Dictionary<string, string?>(sanitized);
+        withPromptDisabled["GIT_TERMINAL_PROMPT"] = "0";
+        return withPromptDisabled;
+    }
+
+    /// <summary>
+    /// Snapshots the CURRENT process environment without mutating it, narrowing the
+    /// non-generic bound collection down to string keys and <c>string?</c> values.
+    /// </summary>
+    private static IDictionary<string, string?> SnapshotCurrentProcessEnv()
+    {
+        var snapshot = new Dictionary<string, string?>();
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is not string key)
+                continue;
+
+            snapshot[key] = entry.Value as string;
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Launches a git process via the SHARED <see cref="GitOperations.ExecuteProcessAsync"/>
+    /// with the tokenized form. The working directory is ALWAYS the constructor-canonicalized
+    /// <see cref="_configRepoDirCanonical"/>.
+    /// </summary>
+    /// <returns>
+    /// The process result, or <c>null</c> when the process FAILED TO START (any exception
+    /// other than <see cref="OperationCanceledException"/> — the exception's own text is never
+    /// propagated). <see cref="OperationCanceledException"/> ALWAYS propagates, unconditionally.
+    /// </returns>
+    private async Task<GitProcessResult?> LaunchGitProcessAsync(
+        IReadOnlyList<string> tokenizedArgs, CancellationToken ct)
+    {
+        try
+        {
+            return await GitOperations.ExecuteProcessAsync(
+                new GitProcessRequest(
+                    "git",
+                    Args: Array.Empty<string>(),
+                    WorkingDirectory: _configRepoDirCanonical,
+                    Env: BuildChildEnv(),
+                    TokenizedArgs: tokenizedArgs),
+                ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // A catch-ALL for non-cancellation launch failures — including a throwing
+            // ProcessRunner delegate. The exception's own text is NEVER propagated.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Maps a completed git process result to <see cref="ConfigRepoOpResult"/>. Redaction
+    /// FIRST (<see cref="GitUrlRedactor.Redact"/>), then TrimEnd for the error. Exit codes
+    /// 0-255 are preserved verbatim; any other value is mapped to -1.
+    /// </summary>
+    private static ConfigRepoOpResult MapResult(GitProcessResult result)
+    {
+        var stdout = GitUrlRedactor.Redact(result.Stdout) ?? string.Empty;
+        var exitCode = result.ExitCode is >= 0 and <= 255 ? result.ExitCode : -1;
+
+        if (exitCode == 0)
+            return new ConfigRepoOpResult(true, 0, stdout, "");
+
+        var stderr = (GitUrlRedactor.Redact(result.Stderr) ?? string.Empty).TrimEnd();
+        return new ConfigRepoOpResult(false, exitCode, stdout, stderr);
+    }
 
     private static bool IsKnownSubcommand(string subcommand) =>
         subcommand is "pull" or "push" or "fetch" or "checkout" or "add" or "diff" or "commit" or "merge" or "status";
@@ -387,7 +490,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     }
 
     /// <summary>
-    /// Stage 6 — ref prechecks (NO subprocess; <c>check-ref-format</c> is slice 2c-b1b-ii):
+    /// Stage 6 — ref PRECHECKS (the <c>check-ref-format</c> subprocess runs afterwards):
     /// no <c>..</c>/<c>...</c>, no <c>://</c>, no leading <c>-</c>/<c>+</c>, non-empty, no
     /// whitespace/control characters, and an explicit <c>*</c> rejection.
     /// </summary>

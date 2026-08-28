@@ -7,16 +7,21 @@ using Grpc.Core;
 namespace CopilotHive.Tests.Worker;
 
 /// <summary>
-/// Table-driven tests for the PURE VALIDATION seam <see cref="ConfigRepoGitOperations"/>
-/// (slice 2c-b1b-i). No process execution exists in this slice: a fully-valid command
-/// returns the "Execution deferred to slice 2c-b1b-ii." placeholder. Every test asserts
-/// exact messages / exact outcome shapes so that deleting or reordering validation stages
-/// breaks the suite (removal-proof).
+/// Table-driven tests for the validation AND execution seam <see cref="ConfigRepoGitOperations"/>
+/// (slices 2c-b1b-i + 2c-b1b-ii). The validation-stage contract tests (grammar messages,
+/// containment, snapshot ordering, disposal at entry, canonicalization seam) assert exact
+/// messages / exact outcome shapes so that deleting or reordering validation stages breaks
+/// the suite (removal-proof). The execution-stage tests (2c-b1b-ii) assert the EXACT
+/// <see cref="GitProcessRequest"/> shapes (ref-validation and final execution), the concrete
+/// result mapping, the redaction boundary over process output, the cancellation precedence
+/// (TCS-gated), the TCS-gated defensive snapshot, and the TCS-gated disposal-vs-in-flight
+/// contract — all via the <see cref="GitOperations.ProcessRunner"/> seam (restored in a
+/// finally block) and TCS gates for synchronization (no timing-based tests).
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ConfigRepoGitOperationsTests
 {
-    private const string PlaceholderError = "Execution deferred to slice 2c-b1b-ii.";
+    private const string LaunchFailed = "Git process failed to start.";
     private const string InvalidArguments = "Invalid arguments.";
     private const string NotConfigRepo =
         "Invalid git command: the working directory is not the config repository.";
@@ -44,6 +49,123 @@ public sealed class ConfigRepoGitOperationsTests
             static () => "/helper",
             onDispose ?? (static () => { }),
             pathCanonicalizer);
+
+    // ------------------------------------------------------------------
+    // Execution-stage helpers (2c-b1b-ii)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The call-time working-directory spelling: <see cref="RepoDir"/> with a trailing
+    /// separator — observably DIFFERENT from the constructor input (<see cref="RepoDir"/>)
+    /// while still canonicalizing to the same directory.
+    /// </summary>
+    private static string RepoDirWithSeparator => RepoDir + Path.DirectorySeparatorChar;
+
+    /// <summary>
+    /// The DISTINCT canonical value produced by the canonicalizer seam used by the exact
+    /// request tests. It differs from BOTH raw spellings (the constructor input
+    /// <see cref="RepoDir"/> and the call-time <see cref="RepoDirWithSeparator"/>), so a
+    /// request built from either raw value — a mutant that launches with the call-time
+    /// workingDirectory or with the un-canonicalized constructor input — is observably
+    /// different and fails the exact-request assertions.
+    /// </summary>
+    private static readonly string CanonicalizedRepoDir =
+        Path.DirectorySeparatorChar + "canonical-config-repo";
+
+    /// <summary>
+    /// The four credential environment variable names that the shared
+    /// <see cref="GitOperations.SanitizeChildEnv"/> ALWAYS strips and that must NEVER appear
+    /// in a launched request's env. <c>GIT_TERMINAL_PROMPT</c> is deliberately NOT in this
+    /// list: it is scrubbed from the inherited set and then FORCED to <c>"0"</c> in every
+    /// child env (asserted separately).
+    /// </summary>
+    private static readonly string[] ScrubbedCredentialEnvNames =
+    [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GIT_ASKPASS",
+        "GITHUB_CONFIG_REPO_TOKEN",
+    ];
+
+    /// <summary>A non-scrubbed inherited variable that must survive the scrub untouched.</summary>
+    private const string NonScrubbedMarkerName = "CONFIG_REPO_SEAM_MARKER";
+
+    /// <summary>
+    /// Seeds ALL five scrubbed variables — including <c>GIT_TERMINAL_PROMPT</c> with a
+    /// CONFLICTING non-zero value — plus a non-scrubbed marker. Returns the previous values
+    /// for exact restoration.
+    /// </summary>
+    private static Dictionary<string, string?> SeedChildEnvVariables()
+    {
+        var previous = new Dictionary<string, string?>
+        {
+            ["GH_TOKEN"] = Environment.GetEnvironmentVariable("GH_TOKEN"),
+            ["GITHUB_TOKEN"] = Environment.GetEnvironmentVariable("GITHUB_TOKEN"),
+            ["GIT_ASKPASS"] = Environment.GetEnvironmentVariable("GIT_ASKPASS"),
+            ["GITHUB_CONFIG_REPO_TOKEN"] = Environment.GetEnvironmentVariable("GITHUB_CONFIG_REPO_TOKEN"),
+            ["GIT_TERMINAL_PROMPT"] = Environment.GetEnvironmentVariable("GIT_TERMINAL_PROMPT"),
+            [NonScrubbedMarkerName] = Environment.GetEnvironmentVariable(NonScrubbedMarkerName),
+        };
+
+        Environment.SetEnvironmentVariable("GH_TOKEN", "raw-gh-token");
+        Environment.SetEnvironmentVariable("GITHUB_TOKEN", "raw-github-token");
+        Environment.SetEnvironmentVariable("GIT_ASKPASS", "/usr/bin/askpass");
+        Environment.SetEnvironmentVariable("GITHUB_CONFIG_REPO_TOKEN", "raw-config-repo-token");
+        Environment.SetEnvironmentVariable("GIT_TERMINAL_PROMPT", "1"); // conflicting inherited value
+        Environment.SetEnvironmentVariable(NonScrubbedMarkerName, "marker-value");
+
+        return previous;
+    }
+
+    private static void RestoreChildEnvVariables(Dictionary<string, string?> previous)
+    {
+        foreach (var (name, value) in previous)
+            Environment.SetEnvironmentVariable(name, value);
+    }
+
+    /// <summary>
+    /// Builds the EXPECTED child environment for a request: the CURRENT process environment
+    /// scrubbed via the SHARED five-variable <see cref="GitOperations.SanitizeChildEnv"/> plus
+    /// EXACTLY <c>GIT_TERMINAL_PROMPT=0</c>. The caller seeds all five scrubbed variables
+    /// (with a conflicting non-zero prompt) and a marker BEFORE invoking this, so full
+    /// equality against the request env proves: every scrubbed variable absent, every
+    /// non-scrubbed variable preserved, no extra entries, and the prompt forced to "0".
+    /// </summary>
+    private static IReadOnlyDictionary<string, string?> ExpectedChildEnv()
+    {
+        var current = new Dictionary<string, string?>();
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is not string key)
+                continue;
+
+            current[key] = entry.Value as string;
+        }
+
+        var expected = new Dictionary<string, string?>(GitOperations.SanitizeChildEnv(current));
+        expected["GIT_TERMINAL_PROMPT"] = "0";
+        return expected;
+    }
+
+    /// <summary>
+    /// Asserts a launched request's environment EQUALS the complete scrubbed inherited
+    /// snapshot plus <c>GIT_TERMINAL_PROMPT=0</c>: every scrubbed variable absent (the
+    /// credential variables), every non-scrubbed variable preserved, no extra entries, and
+    /// the prompt forced to <c>"0"</c> (overriding any conflicting inherited value). The
+    /// explicit per-name absence checks document the scrub independently of the shared helper.
+    /// </summary>
+    private static void AssertChildEnv(GitProcessRequest request)
+    {
+        var expected = ExpectedChildEnv();
+        Assert.Equal(expected.Count, request.Env.Count);
+        foreach (var (key, value) in expected)
+            Assert.Equal(value, request.Env[key]);
+
+        foreach (var scrubbed in ScrubbedCredentialEnvNames)
+            Assert.False(request.Env.ContainsKey(scrubbed), $"scrubbed variable '{scrubbed}' leaked");
+
+        Assert.Equal("0", request.Env["GIT_TERMINAL_PROMPT"]);
+    }
 
     // ------------------------------------------------------------------
     // Constructor validation
@@ -217,21 +339,35 @@ public sealed class ConfigRepoGitOperationsTests
             () => { helperCalls++; return "/helper"; },
             static () => { });
 
-        foreach (var args in new[]
-                 {
-                     new[] { "pull", "origin", "main" },
-                     new[] { "push", "origin", "main" },
-                     new[] { "fetch", "--prune" },
-                     new[] { "status" },
-                     new[] { "https://x-access-token:tok@github.com/o" },
-                 })
+        // The valid rows now REACH the real execution (slice 2c-b1b-ii), so the ProcessRunner
+        // seam throws — the launch failure is mapped to the fixed message and the assertions
+        // below hold for every row without ever starting a process.
+        var originalRunner = GitOperations.ProcessRunner;
+        try
         {
-            var result = await seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None);
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
 
-            Assert.False(result.Success);
-            Assert.Equal(-1, result.ExitCode);
-            Assert.Equal("", result.Stdout);
-            Assert.NotEqual("", result.SanitizedError);
+            foreach (var args in new[]
+                     {
+                         new[] { "pull", "origin", "main" },
+                         new[] { "push", "origin", "main" },
+                         new[] { "fetch", "--prune" },
+                         new[] { "status" },
+                         new[] { "https://x-access-token:tok@github.com/o" },
+                     })
+            {
+                var result = await seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None);
+
+                Assert.False(result.Success);
+                Assert.Equal(-1, result.ExitCode);
+                Assert.Equal("", result.Stdout);
+                Assert.NotEqual("", result.SanitizedError);
+            }
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
         }
 
         Assert.Equal(0, urlCalls);
@@ -464,7 +600,9 @@ public sealed class ConfigRepoGitOperationsTests
 
     /// <summary>
     /// Stage 2c takes the snapshot EXACTLY ONCE — the source list is enumerated a single time
-    /// no matter how deep the command travels through the pipeline.
+    /// no matter how deep the command travels through the pipeline. The accepted rows
+    /// (<c>status</c>, <c>pull origin main</c>) now REACH the real execution, so the
+    /// ProcessRunner seam throws (the launch failure is mapped to the fixed message).
     /// </summary>
     [Theory]
     [InlineData("status")]
@@ -478,27 +616,51 @@ public sealed class ConfigRepoGitOperationsTests
             : [subcommand];
         var args = new InstrumentedArgs(tokens);
 
-        await RunAsync(seam, args);
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
 
-        Assert.Equal(1, args.EnumerationCount);
+            await RunAsync(seam, args);
+
+            Assert.Equal(1, args.EnumerationCount);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     /// <summary>
     /// A MUTATING source list proves the snapshot is authoritative: everything downstream reads
     /// the snapshot, so post-snapshot mutation of the source cannot change the outcome. If the
     /// implementation re-read <c>args</c> instead of the snapshot, the mutated list would turn
-    /// the accepted <c>status</c> into a form-mismatch rejection.
+    /// the accepted <c>status</c> into a form-mismatch rejection. (The accepted form now REACHES
+    /// the real execution, so the ProcessRunner seam throws and the launch-failure result is
+    /// returned instead of the removed placeholder.)
     /// </summary>
     [Fact]
     public async Task Stage2c_SnapshotIsAuthoritative_SourceMutationAfterSnapshotIsIgnored()
     {
-        using var seam = CreateSeam();
-        var source = new MutatingArgs(["status"], mutation: ["status", "--porcelain"]);
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
 
-        var result = await RunAsync(seam, source);
+            using var seam = CreateSeam();
+            var source = new MutatingArgs(["status"], mutation: ["status", "--porcelain"]);
 
-        Assert.Equal(PlaceholderError, result.SanitizedError);
-        Assert.True(source.Mutated);
+            var result = await RunAsync(seam, source);
+
+            Assert.Equal(LaunchFailed, result.SanitizedError);
+            Assert.True(source.Mutated);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     /// <summary>
@@ -907,7 +1069,7 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     // ------------------------------------------------------------------
-    // Grammar acceptance — the allowed forms (all reach the placeholder)
+    // Grammar acceptance — the allowed forms (all reach the real execution)
     // ------------------------------------------------------------------
 
     public static TheoryData<string[]> AcceptedCommandCases => new()
@@ -939,42 +1101,932 @@ public sealed class ConfigRepoGitOperationsTests
         new[] { "status" },
     };
 
+    /// <summary>
+    /// Every accepted form reaches the real execution — the ProcessRunner seam throws, and the
+    /// launch failure surfaces as the FIXED result. (The placeholder was removed by slice
+    /// 2c-b1b-ii; the accepted-form grammar contract is now asserted through the execution path.)
+    /// </summary>
     [Theory]
     [MemberData(nameof(AcceptedCommandCases))]
-    public async Task Stage7_AcceptedForms_ReturnPlaceholder(string[] args)
+    public async Task Stage7_AcceptedForms_ReachExecution_LaunchFailureReturnsFixedMessage(string[] args)
     {
-        using var seam = CreateSeam();
-        var result = await RunAsync(seam, args);
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
 
-        Assert.False(result.Success);
-        Assert.Equal(-1, result.ExitCode);
-        Assert.Equal("", result.Stdout);
-        Assert.Equal(PlaceholderError, result.SanitizedError);
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, args);
+
+            AssertRejected(result, LaunchFailed);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     [Fact]
     public async Task Stage7_DepthPlus5_IsAccepted()
     {
-        using var seam = CreateSeam();
-        var result = await RunAsync(seam, new[] { "pull", "--depth", "+5" });
-        Assert.Equal(PlaceholderError, result.SanitizedError);
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "pull", "--depth", "+5" });
+            AssertRejected(result, LaunchFailed);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     // ------------------------------------------------------------------
-    // Cancellation does NOT propagate in this slice
+    // Cancellation PROPAGATES at the first launch reached (2c-b1b-ii)
     // ------------------------------------------------------------------
 
+    /// <summary>
+    /// A command WITH a ref observes the cancellation at Stage 6 — the ref-validation
+    /// subprocess is the FIRST <c>ExecuteProcessAsync</c> reached.
+    /// </summary>
     [Fact]
-    public async Task Stage7_CancelledToken_StillReturnsPlaceholder()
+    public async Task Stage6_CancelledToken_PropagatesAtTheRefValidationSubprocess()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
+
+            using var seam = CreateSeam();
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.RunConfigRepoCommandAsync(
+                    new[] { "pull", "origin", "main" }, RepoDir, cts.Token));
+
+            Assert.Equal(cts.Token, ex.CancellationToken);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A command WITHOUT a ref (e.g. <c>status</c>) observes the cancellation at Stage 7 —
+    /// the first (and only) <c>ExecuteProcessAsync</c> reached.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_CancelledToken_PropagatesAtTheFinalExecution()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
+
+            using var seam = CreateSeam();
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.RunConfigRepoCommandAsync(
+                    new[] { "status" }, RepoDir, cts.Token));
+
+            Assert.Equal(cts.Token, ex.CancellationToken);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Execution stage (2c-b1b-ii) — the EXACT GitProcessRequests
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The ref-validation subprocess request: tokenized args EXACTLY
+    /// <c>check-ref-format --allow-onelevel &lt;ref&gt;</c>, empty <c>Args</c>, the
+    /// CONSTRUCTOR-canonicalized working directory (NOT the call-time spelling), and an env
+    /// EXACTLY equal to the scrubbed inherited snapshot plus <c>GIT_TERMINAL_PROMPT=0</c> —
+    /// every one of the FIVE scrubbed variables (GH_TOKEN, GITHUB_TOKEN, GIT_ASKPASS,
+    /// GITHUB_CONFIG_REPO_TOKEN, GIT_TERMINAL_PROMPT) absent, every non-scrubbed inherited
+    /// variable preserved, no extra entries. The exit-0 subprocess lets the command
+    /// continue, so a second (final-execution) request must carry the SNAPSHOT.
+    /// </summary>
+    [Fact]
+    public async Task Stage6_RefValidationRequest_HasExactShape()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var previousEnv = SeedChildEnvVariables();
+        var requests = new List<GitProcessRequest>();
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // Constructor input: the raw RepoDir; call-time spelling: the trailing-separator
+            // form. The canonicalizer seam maps BOTH to the DISTINCT CanonicalizedRepoDir —
+            // a request built from either raw spelling (constructor input or call-time
+            // string) is observably different and fails the WorkingDirectory assertion.
+            using var seam = CreateSeam(pathCanonicalizer: _ => CanonicalizedRepoDir);
+            var result = await RunInAsync(seam, new[] { "pull", "origin", "main" }, RepoDirWithSeparator);
+
+            // Exit 0 from check-ref-format: the command continues to Stage 7 (two launches).
+            Assert.True(result.Success);
+            Assert.Equal(2, requests.Count);
+
+            var refValidation = requests[0];
+            Assert.Equal("git", refValidation.Executable);
+            Assert.Empty(refValidation.Args);
+            Assert.Equal(CanonicalizedRepoDir, refValidation.WorkingDirectory);
+            Assert.NotEqual(RepoDir, CanonicalizedRepoDir);       // the spellings are distinct
+            Assert.NotEqual(RepoDirWithSeparator, CanonicalizedRepoDir);
+            Assert.Equal(
+                new[] { "check-ref-format", "--allow-onelevel", "main" },
+                refValidation.TokenizedArgs!.ToArray());
+
+            // Env = the COMPLETE scrubbed inherited snapshot + GIT_TERMINAL_PROMPT=0.
+            AssertChildEnv(refValidation);
+
+            // The final execution carries the snapshot verbatim and the same child env.
+            Assert.Equal(new[] { "pull", "origin", "main" },
+                requests[1].TokenizedArgs!.ToArray());
+            AssertChildEnv(requests[1]);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// A non-zero exit from the ref-validation subprocess REJECTS the ref — and the final
+    /// command is NEVER launched (exactly one <c>ExecuteProcessAsync</c> invocation).
+    /// </summary>
+    [Fact]
+    public async Task Stage6_RefValidationNonZeroExit_RejectsRef()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invocations = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invocations++;
+                return Task.FromResult(new GitProcessResult(2, "ignored", "ignored"));
+            };
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "pull", "origin", "main" });
+
+            AssertRejected(result, "Invalid git ref: 'main'.");
+            Assert.Equal(1, invocations); // Stage 7 never reached
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A launch failure at Stage 6 (throwing ProcessRunner delegate) maps to the FIXED
+    /// message — the exception's own text is never propagated — and Stage 7 is never reached.
+    /// </summary>
+    [Fact]
+    public async Task Stage6_RefValidationLaunchFailure_ReturnsFixedMessage()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invocations = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invocations++;
+                throw new InvalidOperationException("git executable missing");
+            };
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "pull", "origin", "main" });
+
+            AssertRejected(result, LaunchFailed);
+            Assert.Equal(1, invocations);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Execution stage (2c-b1b-ii) — the final-execution request and result mapping
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The final-execution request for a REF-LESS command (<c>status</c>): the ONLY launch.
+    /// Tokenized args = the snapshot verbatim; empty <c>Args</c>; the CONSTRUCTOR-canonicalized
+    /// working directory (NOT the call-time spelling); and an env EXACTLY equal to the
+    /// scrubbed inherited snapshot plus <c>GIT_TERMINAL_PROMPT=0</c> — all FIVE scrubbed
+    /// variables absent, non-scrubbed variables preserved, no extra entries, and NO
+    /// credential injection at the final launch.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_FinalExecutionRequest_HasExactShape()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var previousEnv = SeedChildEnvVariables();
+        GitProcessRequest? captured = null;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                captured = request;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // Constructor input: the raw RepoDir; call-time spelling: the trailing-separator
+            // form. The canonicalizer seam maps BOTH to the DISTINCT CanonicalizedRepoDir —
+            // a request built from the call-time string is observably different.
+            using var seam = CreateSeam(pathCanonicalizer: _ => CanonicalizedRepoDir);
+            var result = await RunInAsync(seam, new[] { "status" }, RepoDirWithSeparator);
+
+            Assert.True(result.Success);
+            Assert.NotNull(captured);
+            Assert.Equal("git", captured!.Executable);
+            Assert.Empty(captured.Args);
+            Assert.Equal(CanonicalizedRepoDir, captured.WorkingDirectory);
+            Assert.NotEqual(RepoDir, CanonicalizedRepoDir);       // the spellings are distinct
+            Assert.NotEqual(RepoDirWithSeparator, CanonicalizedRepoDir);
+            Assert.Equal(new[] { "status" }, captured.TokenizedArgs!.ToArray());
+
+            // Env = the COMPLETE scrubbed inherited snapshot + GIT_TERMINAL_PROMPT=0.
+            AssertChildEnv(captured);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// Exit 0 → <c>Success=true, ExitCode=0, Stdout=redacted stdout, SanitizedError=""</c>.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_ExitZero_MapsToSuccessWithRedactedStdout()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) => Task.FromResult(
+                new GitProcessResult(0, "clean stdout", "ignored stderr"));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            Assert.True(result.Success);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal("clean stdout", result.Stdout);
+            Assert.Equal("", result.SanitizedError);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A git failure (exit ≠ 0, in range) → <c>Success=false</c>, the exit code preserved
+    /// VERBATIM, stdout preserved, and stderr redacted-then-TrimEnd'd.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(42)]
+    [InlineData(255)]
+    public async Task Stage7_NonZeroExitInRange_PreservesExitCodeAndMapsRedactedTrimmedError(int exitCode)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) => Task.FromResult(
+                new GitProcessResult(exitCode, "some stdout", "fatal: bad thing  \n"));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            Assert.False(result.Success);
+            Assert.Equal(exitCode, result.ExitCode);
+            Assert.Equal("some stdout", result.Stdout);
+            Assert.Equal("fatal: bad thing", result.SanitizedError); // redacted, TrimEnd'd
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Exit codes OUTSIDE 0-255 are mapped to -1 (the clamp). In-range codes are preserved
+    /// verbatim (covered by <see cref="Stage7_NonZeroExitInRange_PreservesExitCodeAndMapsRedactedTrimmedError"/>).
+    /// </summary>
+    [Theory]
+    [InlineData(256)]
+    [InlineData(300)]
+    [InlineData(-1)]
+    [InlineData(-5)]
+    public async Task Stage7_ExitCodeOutsideByteRange_MappedToMinusOne(int exitCode)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) => Task.FromResult(
+                new GitProcessResult(exitCode, "stdout", "stderr"));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            Assert.False(result.Success);
+            Assert.Equal(-1, result.ExitCode);
+            Assert.Equal("stdout", result.Stdout);
+            Assert.Equal("stderr", result.SanitizedError);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A throwing ProcessRunner delegate at Stage 7 → the catch-ALL:
+    /// <c>SanitizedError="Git process failed to start."</c> with <c>Stdout=""</c> and
+    /// <c>ExitCode=-1</c>. The exception's own text is NEVER propagated. (A throwing delegate
+    /// is also covered for Stage 6 by <see cref="Stage6_RefValidationLaunchFailure_ReturnsFixedMessage"/>.)
+    /// </summary>
+    [Fact]
+    public async Task Stage7_FinalExecutionLaunchFailure_ReturnsFixedMessageWithEmptyStdout()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            AssertRejected(result, LaunchFailed);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cancellation PRECEDENCE (TCS-gated) — the first launch reached wins
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A command WITH a ref observes the cancellation at Stage 6: the FIRST
+    /// <c>ExecuteProcessAsync</c> reached is the ref-validation subprocess; the token is
+    /// cancelled while the delegate is BLOCKED on the gate; the OCE propagates and Stage 7
+    /// is never reached.
+    /// </summary>
+    [Fact]
+    public async Task CancellationPrecedence_RefBearingCommand_CancellationObservedAtStage6()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoOpResult> execution = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                requests.Add(request);
+                entered.TrySetResult();
+                try
+                {
+                    await gate.Task.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    // The delegate owns its own cancellation semantics: normalize any
+                    // cancellation (TaskCanceledException included) to an exact
+                    // OperationCanceledException carrying the caller's token.
+                    throw new OperationCanceledException(ct);
+                }
+
+                return new GitProcessResult(0, string.Empty, string.Empty);
+            };
+
+            using var seam = CreateSeam();
+            execution = seam.RunConfigRepoCommandAsync(
+                new[] { "pull", "origin", "main" }, RepoDir, cts.Token);
+
+            await entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // The FIRST launch reached is the ref-validation subprocess — NOT the command.
+            Assert.Single(requests);
+            Assert.Equal(
+                new[] { "check-ref-format", "--allow-onelevel", "main" },
+                requests[0].TokenizedArgs!.ToArray());
+
+            cts.Cancel();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => execution);
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // Stage 7 was never reached.
+            Assert.Single(requests);
+        }
+        finally
+        {
+            // Settle the outstanding operation BEFORE restoring the static seam so a
+            // failing assertion cannot leave a blocked delegate that later advances to
+            // Stage 7 with the real (un-faked) runner installed.
+            gate.TrySetResult();
+            try
+            {
+                await execution;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected — the operation was cancelled.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> thrown by the fake ProcessRunner delegate
+    /// ITSELF — with the caller token LIVE (not pre-cancelled, no gated cancellation) —
+    /// propagates UNCONDITIONALLY from Stage 6 (the ref-validation subprocess, the FIRST
+    /// launch a ref-bearing command reaches). An implementation that only rethrows OCE when
+    /// the token is cancelled but maps a delegate-thrown OCE (live token) to the fixed
+    /// launch-failure result FAILS this test.
+    /// </summary>
+    [Fact]
+    public async Task Stage6_DelegateThrowsOceWithLiveToken_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invoked = 0;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invoked++;
+                throw delegateOce;
+            };
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource(); // token stays LIVE
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.RunConfigRepoCommandAsync(
+                    new[] { "pull", "origin", "main" }, RepoDir, liveCts.Token));
+
+            // The DELEGATE was actually reached (not a pre-launch token check) and its OCE
+            // propagated verbatim — the exact instance, never the fixed launch-failure result.
+            Assert.Same(delegateOce, ex);
+            Assert.Equal(1, invoked);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A command WITHOUT a ref (<c>status</c>) observes the cancellation at Stage 7: the
+    /// FIRST (and only) <c>ExecuteProcessAsync</c> reached is the final execution.
+    /// </summary>
+    [Fact]
+    public async Task CancellationPrecedence_ReflessCommand_CancellationObservedAtStage7()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoOpResult> execution = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                requests.Add(request);
+                entered.TrySetResult();
+                try
+                {
+                    await gate.Task.WaitAsync(ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    // The delegate owns its own cancellation semantics: normalize any
+                    // cancellation (TaskCanceledException included) to an exact
+                    // OperationCanceledException carrying the caller's token.
+                    throw new OperationCanceledException(ct);
+                }
+
+                return new GitProcessResult(0, string.Empty, string.Empty);
+            };
+
+            using var seam = CreateSeam();
+            execution = seam.RunConfigRepoCommandAsync(
+                new[] { "status" }, RepoDir, cts.Token);
+
+            await entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            Assert.Single(requests);
+            Assert.Equal(new[] { "status" }, requests[0].TokenizedArgs!.ToArray());
+
+            cts.Cancel();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => execution);
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            Assert.Single(requests);
+        }
+        finally
+        {
+            // Settle the outstanding operation BEFORE restoring the static seam so a
+            // failing assertion cannot leave a blocked delegate that later completes with
+            // the real (un-faked) runner installed.
+            gate.TrySetResult();
+            try
+            {
+                await execution;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected — the operation was cancelled.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> thrown by the fake ProcessRunner delegate
+    /// ITSELF — with the caller token LIVE (not pre-cancelled, no gated cancellation) —
+    /// propagates UNCONDITIONALLY from Stage 7 (the final execution, the first and only
+    /// launch a ref-less command reaches). An implementation that only rethrows OCE when the
+    /// token is cancelled but maps a delegate-thrown OCE (live token) to the fixed
+    /// launch-failure result FAILS this test.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_DelegateThrowsOceWithLiveToken_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invoked = 0;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invoked++;
+                throw delegateOce;
+            };
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource(); // token stays LIVE
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.RunConfigRepoCommandAsync(
+                    new[] { "status" }, RepoDir, liveCts.Token));
+
+            // The DELEGATE was actually reached (not a pre-launch token check) and its OCE
+            // propagated verbatim — the exact instance, never the fixed launch-failure result.
+            Assert.Same(delegateOce, ex);
+            Assert.Equal(1, invoked);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A Stage 3 containment rejection returns its result REGARDLESS of the token state —
+    /// the token is only observed at the first <c>ExecuteProcessAsync</c>, which is never
+    /// reached here.
+    /// </summary>
+    [Fact]
+    public async Task CancellationPrecedence_ContainmentRejection_ReturnsResultRegardlessOfTokenState()
     {
         using var seam = CreateSeam();
         using var cts = new CancellationTokenSource();
         cts.Cancel();
 
         var result = await seam.RunConfigRepoCommandAsync(
-            new[] { "pull", "origin", "main" }, RepoDir, cts.Token);
+            new[] { "status" }, OutsideDir, cts.Token);
 
-        Assert.Equal(PlaceholderError, result.SanitizedError);
+        AssertRejected(result, NotConfigRepo);
+    }
+
+    /// <summary>
+    /// A Stage 5 grammar rejection returns its result REGARDLESS of the token state.
+    /// </summary>
+    [Fact]
+    public async Task CancellationPrecedence_GrammarRejection_ReturnsResultRegardlessOfTokenState()
+    {
+        using var seam = CreateSeam();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var result = await seam.RunConfigRepoCommandAsync(
+            new[] { "status", "--porcelain" }, RepoDir, cts.Token);
+
+        AssertRejected(result,
+            "Invalid git command: the arguments do not match the allowed form for 'status'.");
+    }
+
+    /// <summary>
+    /// A Stage 6 ref PRECHECK rejection (no subprocess) returns its result REGARDLESS of the
+    /// token state — the subprocess is only launched after the prechecks pass.
+    /// </summary>
+    [Fact]
+    public async Task CancellationPrecedence_RefPrecheckRejection_ReturnsResultRegardlessOfTokenState()
+    {
+        using var seam = CreateSeam();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var result = await seam.RunConfigRepoCommandAsync(
+            new[] { "pull", "origin", "-bad" }, RepoDir, cts.Token);
+
+        AssertRejected(result, "Invalid git ref: '-bad'.");
+    }
+
+    // ------------------------------------------------------------------
+    // The TCS-gated defensive snapshot (mutation while in flight)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The caller passes a <see cref="List{T}"/> as the <see cref="IReadOnlyList{T}"/>. The
+    /// fake runner BLOCKS during the ref-validation subprocess; the caller MUTATES the list
+    /// while blocked; after release the final execution must use the SNAPSHOT — the mutated
+    /// tokens NEVER reach the launched command. A production implementation that re-read the
+    /// caller's list at Stage 7 would launch the mutated tokens and fail this test.
+    /// </summary>
+    [Fact]
+    public async Task Stage2c_DefensiveSnapshot_MutationWhileBlocked_NeverReachesTheLaunch()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var refValidationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefValidation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finalExecutionEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFinalExecution = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<ConfigRepoOpResult> execution = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                if (requests.Count == 1)
+                {
+                    // The ref-validation subprocess blocks until the caller mutates the list.
+                    refValidationEntered.TrySetResult();
+                    return releaseRefValidation.Task.ContinueWith(
+                        _ => new GitProcessResult(0, string.Empty, string.Empty));
+                }
+
+                finalExecutionEntered.TrySetResult();
+                return releaseFinalExecution.Task.ContinueWith(
+                    _ => new GitProcessResult(0, "executed", string.Empty));
+            };
+
+            using var seam = CreateSeam();
+            var args = new List<string> { "pull", "origin", "main" };
+            execution = seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None);
+
+            // The ref-validation subprocess is in flight — mutate the caller's list NOW.
+            await refValidationEntered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            args[2] = "MUTATED-REF";
+
+            releaseRefValidation.TrySetResult();
+            await finalExecutionEntered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            releaseFinalExecution.TrySetResult();
+
+            var result = await execution;
+
+            // The final execution launched the SNAPSHOT, never the mutated tokens.
+            Assert.True(result.Success);
+            Assert.Equal(2, requests.Count);
+            Assert.Equal(
+                new[] { "check-ref-format", "--allow-onelevel", "main" },
+                requests[0].TokenizedArgs!.ToArray());
+            Assert.Equal(
+                new[] { "pull", "origin", "main" },
+                requests[1].TokenizedArgs!.ToArray());
+            Assert.DoesNotContain("MUTATED-REF",
+                requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
+        }
+        finally
+        {
+            // Settle the outstanding operation BEFORE restoring the static seam so a failing
+            // assertion cannot leave a blocked delegate that later advances to Stage 7 with
+            // the real (un-faked) runner installed.
+            releaseRefValidation.TrySetResult();
+            releaseFinalExecution.TrySetResult();
+            try
+            {
+                await execution;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected only if the test failed mid-flight.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The TCS-gated disposal-vs-in-flight contract
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// An operation that has ALREADY begun (past the Stage 1 disposed-check) completes
+    /// NORMALLY — disposal is checked ONLY at entry, and this test proves the contract
+    /// ACROSS the Stage 6→Stage 7 boundary: the operation is gated while BLOCKED at Stage 6
+    /// (the ref-validation subprocess of a ref-bearing command); <see cref="ConfigRepoGitOperations.Dispose"/>
+    /// is called while it is blocked there; the Stage 6 gate is released; the test then
+    /// asserts Stage 7 STILL LAUNCHES (a second request is received — a mutant that rechecks
+    /// <c>_disposed</c> before Stage 7 would return <c>Seam disposed.</c> and never launch
+    /// the second request); the in-flight operation returns its REAL result (not
+    /// <c>Seam disposed.</c>), while a SUBSEQUENT call returns exactly
+    /// <c>ConfigRepoOpResult(false, -1, "", "Seam disposed.")</c>.
+    /// </summary>
+    [Fact]
+    public async Task Disposal_InFlightOperationCompletesNormally_SubsequentCallReturnsSeamDisposed()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var stage6Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStage6 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stage7Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStage7 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<ConfigRepoOpResult> execution = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                if (requests.Count == 1)
+                {
+                    // Block DURING Stage 6 (the ref-validation subprocess) — AFTER the
+                    // Stage 1 disposed-check has already passed.
+                    stage6Entered.TrySetResult();
+                    return releaseStage6.Task.ContinueWith(
+                        _ => new GitProcessResult(0, string.Empty, string.Empty));
+                }
+
+                stage7Entered.TrySetResult();
+                return releaseStage7.Task.ContinueWith(
+                    _ => new GitProcessResult(0, "in-flight stdout", string.Empty));
+            };
+
+            var seam = CreateSeam();
+            execution = seam.RunConfigRepoCommandAsync(
+                new[] { "pull", "origin", "main" }, RepoDir, CancellationToken.None);
+
+            // The operation is IN FLIGHT at Stage 6 (past the entry disposed-check) — dispose.
+            await stage6Entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            seam.Dispose();
+
+            // Release Stage 6 — Stage 7 MUST STILL LAUNCH (disposal is NOT rechecked).
+            releaseStage6.TrySetResult();
+            await stage7Entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            releaseStage7.TrySetResult();
+
+            var result = await execution;
+
+            // Both launches happened — the ref-validation subprocess and the final execution.
+            Assert.Equal(2, requests.Count);
+            Assert.Equal(
+                new[] { "check-ref-format", "--allow-onelevel", "main" },
+                requests[0].TokenizedArgs!.ToArray());
+            Assert.Equal(
+                new[] { "pull", "origin", "main" },
+                requests[1].TokenizedArgs!.ToArray());
+
+            // The in-flight operation COMPLETES NORMALLY with its REAL result.
+            Assert.True(result.Success);
+            Assert.Equal("in-flight stdout", result.Stdout);
+            Assert.Equal("", result.SanitizedError);
+
+            // A SUBSEQUENT call is rejected at entry — the EXACT post-disposal result.
+            AssertRejected(await seam.RunConfigRepoCommandAsync(
+                new[] { "status" }, RepoDir, CancellationToken.None), "Seam disposed.");
+        }
+        finally
+        {
+            // Settle the outstanding operation BEFORE restoring the static seam so a failing
+            // assertion cannot leave a blocked delegate that later advances to Stage 7 with
+            // the real (un-faked) runner installed.
+            releaseStage6.TrySetResult();
+            releaseStage7.TrySetResult();
+            try
+            {
+                await execution;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected only if the test failed mid-flight.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The redaction boundary over PROCESS OUTPUT (universal-redaction rule)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A credential-bearing URL in the process STDOUT is redacted in <see cref="ConfigRepoOpResult.Stdout"/>.
+    /// </summary>
+    [Fact]
+    public async Task RedactionBoundary_StdoutWithCredentialUrl_IsRedacted()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) => Task.FromResult(
+                new GitProcessResult(0,
+                    "https://x-access-token:tok@github.com/org/repo.git stdout",
+                    string.Empty));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            Assert.True(result.Success);
+            Assert.Equal("https://github.com/org/repo.git stdout", result.Stdout);
+            Assert.DoesNotContain("tok", result.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A credential-bearing URL in the process STDERR is redacted and THEN TrimEnd'd in
+    /// <see cref="ConfigRepoOpResult.SanitizedError"/> — redaction FIRST, trim second.
+    /// </summary>
+    [Fact]
+    public async Task RedactionBoundary_StderrWithCredentialUrl_IsRedactedAndTrimmed()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) => Task.FromResult(
+                new GitProcessResult(1,
+                    string.Empty,
+                    "fatal: https://x-access-token:tok@github.com/org/repo.git failed  \n"));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "status" });
+
+            Assert.False(result.Success);
+            Assert.Equal(1, result.ExitCode);
+            Assert.Equal("fatal: https://github.com/org/repo.git failed", result.SanitizedError);
+            Assert.DoesNotContain("tok", result.SanitizedError, StringComparison.Ordinal);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1048,10 +2100,21 @@ public sealed class ConfigRepoGitOperationsTests
     [Fact]
     public async Task Stage3_TrailingSeparatorInWorkingDirectory_StillContained()
     {
-        var withSeparator = OperatingSystem.IsWindows() ? @"C:\config-repo\" : "/config-repo/";
-        using var seam = CreateSeam();
-        var result = await RunInAsync(seam, new[] { "status" }, withSeparator);
-        Assert.Equal(PlaceholderError, result.SanitizedError);
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("boom");
+
+            var withSeparator = OperatingSystem.IsWindows() ? @"C:\config-repo\" : "/config-repo/";
+            using var seam = CreateSeam();
+            var result = await RunInAsync(seam, new[] { "status" }, withSeparator);
+            Assert.Equal(LaunchFailed, result.SanitizedError);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
     }
 
     [Fact]
