@@ -25,7 +25,26 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
+// ProcessExit fires during process teardown, AFTER the `using var cts` below has disposed
+// the token source on the fatal path. A handler that throws there is unobservable except for
+// a runtime stack trace and a corrupted exit code (1 becomes 134 on Linux), so the handler
+// must suppress every exception — a disposed CTS raises ObjectDisposedException and
+// registered cancellation callbacks can surface AggregateException. No disposed-flag check:
+// it would race with disposal. The handler still cancels the SAME cts the worker awaits, so
+// a ProcessExit during a running task cancels it exactly as before.
+void OnProcessExit(object? sender, EventArgs e)
+{
+    try
+    {
+        cts.Cancel();
+    }
+    catch (Exception)
+    {
+        // Swallow: a throwing teardown handler is unobservable and would corrupt the exit code.
+    }
+}
+
+AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
 
 Console.WriteLine($"[Worker] Starting worker {workerId}");
 Console.WriteLine($"[Worker] Orchestrator: {orchestratorUrl}");

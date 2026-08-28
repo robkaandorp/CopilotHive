@@ -277,8 +277,10 @@ public sealed class WorkerRedactionIntegrationTests
     /// <summary>
     /// Launches the actual compiled worker entry point and forces its real fatal catch with a
     /// malformed orchestrator URI. The fatal stderr line must contain only the safe exception
-    /// classification, never the raw UriFormatException message. This covers the real Program.cs
-    /// routing rather than copying its catch block into the test.
+    /// classification, never the raw UriFormatException message, and the process must exit with
+    /// exactly code 1 — the exception-safe ProcessExit handler can no longer corrupt the exit
+    /// code during teardown. This covers the real Program.cs routing rather than copying its
+    /// catch block into the test.
     /// </summary>
     [Fact]
     public async Task WorkerProgram_ActualFatalPath_UsesSanitizedClassification()
@@ -324,14 +326,23 @@ public sealed class WorkerRedactionIntegrationTests
         }
 
         var stderr = await stderrTask;
-        _ = await stdoutTask;
+        var stdout = await stdoutTask;
 
-        // The fatal route must terminate unsuccessfully. A separate pre-existing ProcessExit
-        // handler bug can change the intended code 1 to an abort code after the sanitized line;
-        // redaction is asserted across the complete stderr regardless.
-        Assert.NotEqual(0, process.ExitCode);
+        // The fatal route must terminate with exactly the intended code 1. The ProcessExit
+        // handler is exception-safe now, so it can no longer throw ObjectDisposedException
+        // during teardown and corrupt the exit code into an abort code (134 on Linux).
+        Assert.Equal(1, process.ExitCode);
+
+        // The sanitized fatal classification is the only error output: no ObjectDisposedException
+        // from the ProcessExit handler, no unhandled runtime stack-trace noise.
         Assert.Contains("[Worker] Fatal error", stderr);
         Assert.Contains(nameof(UriFormatException), stderr);
+        Assert.DoesNotContain("ObjectDisposedException", stderr);
+        Assert.DoesNotContain("ObjectDisposedException", stdout);
+        Assert.DoesNotContain("Unhandled exception", stderr);
+        Assert.DoesNotContain("Unhandled exception", stdout);
+
+        // Redaction: the raw UriFormatException message and the malformed input never leak.
         Assert.DoesNotContain("Invalid URI", stderr);
         Assert.DoesNotContain("invalid-uri-input", stderr);
     }
