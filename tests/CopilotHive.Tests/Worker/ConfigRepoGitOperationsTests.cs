@@ -95,7 +95,11 @@ public sealed class ConfigRepoGitOperationsTests
         string? configRepoDir = null,
         Func<string?>? resolvedUrlResolver = null,
         Func<string?>? credentialResolver = null,
-        Func<string>? credentialHelperPath = null) =>
+        Func<string>? credentialHelperPath = null,
+        Func<string>? stagingNonceGenerator = null,
+        Func<string, bool>? targetEntryExists = null,
+        Func<string, bool>? stagingMarkerCreateNew = null,
+        Func<string, bool>? stagingRepoChildCreate = null) =>
         new(
             configRepoDir ?? RepoDir,
             resolvedUrlResolver ?? (static () => EligibleUrl),
@@ -103,7 +107,11 @@ public sealed class ConfigRepoGitOperationsTests
             Log(),
             credentialHelperPath ?? (static () => "/helper"),
             onDispose ?? (static () => { }),
-            pathCanonicalizer);
+            pathCanonicalizer,
+            stagingNonceGenerator,
+            targetEntryExists,
+            stagingMarkerCreateNew,
+            stagingRepoChildCreate);
 
     /// <summary>A URL resolver returning a fixed value (possibly <c>null</c>).</summary>
     private static Func<string?> UrlResolver(string? url) => () => url;
@@ -7115,5 +7123,1545 @@ public sealed class ConfigRepoGitOperationsTests
             await SettleHealthAsync(inFlight);
             GitOperations.ProcessRunner = originalRunner;
         }
+    }
+
+    // ==================================================================
+    // Slice 2c-b3 — CloneAsync: the OWNED-CONTAINER staging + atomic move.
+    // ==================================================================
+
+    /// <summary>Stage 3 / Stage 8 — an entry already occupies the clone target.</summary>
+    private const string CloneTargetExists = "Config repo clone target already exists.";
+
+    /// <summary>Stage 5 / Stage 8 — no owned staging container, or the move failed.</summary>
+    private const string StagingUnavailable =
+        "Config repo clone staging directory could not be created.";
+
+    /// <summary>Stage 7 — the mandatory clone-time identity configuration failed.</summary>
+    private const string CloneIdentityFailed = "Config repo clone identity configuration failed.";
+
+    /// <summary>The staging container name parts and the ownership marker leaf.</summary>
+    private const string ContainerInfix = ".copilothive-clone-";
+    private const string ContainerSuffix = ".copilothive-work";
+    private const string OwnerMarker = ".copilothive-owner";
+
+    /// <summary>The container child the clone writes into — it must be EMPTY at clone time.</summary>
+    private const string RepoChild = "repo";
+
+    /// <summary>The file the fake <c>git clone</c> writes, standing in for a cloned worktree.</summary>
+    private const string ClonedMarker = "cloned.txt";
+
+    /// <summary>The leaf name of the clone target inside a <see cref="CloneFixture"/>.</summary>
+    private const string TargetLeaf = "config-repo";
+
+    /// <summary>An INELIGIBLE (Branch B) config repo URL: ssh, so no credential is ever read.</summary>
+    private const string IneligibleUrl = "ssh://git@github.com/org/config-repo.git";
+
+    /// <summary>
+    /// A REAL temporary directory tree for the clone tests: the parent (<see cref="Root"/>) and
+    /// the not-yet-existing clone target inside it. The staging containers, the ownership
+    /// markers and the moved worktree are all real filesystem entries, so the marker-iff cleanup
+    /// rule and the atomic move are observed rather than mocked.
+    /// </summary>
+    private sealed class CloneFixture : IDisposable
+    {
+        public CloneFixture(bool createParent = true)
+        {
+            Root = Path.Combine(
+                Path.GetTempPath(), "copilothive-clone-" + Guid.NewGuid().ToString("N"));
+            if (createParent)
+                Directory.CreateDirectory(Root);
+
+            TargetDir = Path.Combine(Root, TargetLeaf);
+        }
+
+        /// <summary>The canonical PARENT of the clone target.</summary>
+        public string Root { get; }
+
+        /// <summary>The clone target itself — deliberately absent until a clone succeeds.</summary>
+        public string TargetDir { get; }
+
+        /// <summary>Every staging container currently present in the parent.</summary>
+        public string[] Containers =>
+            Directory.Exists(Root)
+                ? Directory.GetFileSystemEntries(Root, "*" + ContainerInfix + "*" + ContainerSuffix)
+                : [];
+
+        /// <summary>The container path this fixture's target produces for a given nonce.</summary>
+        public string Container(string nonce) =>
+            Path.Combine(Root, TargetLeaf + ContainerInfix + nonce + ContainerSuffix);
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(Root))
+                    Directory.Delete(Root, recursive: true);
+            }
+            catch (Exception)
+            {
+                // Best-effort test cleanup only.
+            }
+        }
+    }
+
+    /// <summary>
+    /// A scripted nonce generator. It records its call count and flags an OVERRUN (a call past
+    /// the script), so a test can prove the seam made EXACTLY the attempts it expects.
+    /// </summary>
+    private sealed class ScriptedNonces(params string[] nonces)
+    {
+        private int _index;
+
+        public int Calls => _index;
+
+        public bool Overrun { get; private set; }
+
+        public string Next()
+        {
+            var index = _index++;
+            if (index < nonces.Length)
+                return nonces[index];
+
+            Overrun = true;
+            return "ffffffffffff";
+        }
+    }
+
+    /// <summary>
+    /// The default fake <c>git</c> for the clone path: a <c>clone</c> POPULATES its destination
+    /// (the third token) exactly as the real git would, so a successful move really carries a
+    /// worktree onto the target; every other command succeeds silently.
+    /// </summary>
+    private static GitProcessResult CloneAwareResult(GitProcessRequest request)
+    {
+        var tokens = request.TokenizedArgs!;
+        if (tokens[0] == "clone")
+        {
+            Directory.CreateDirectory(tokens[2]);
+            File.WriteAllText(Path.Combine(tokens[2], ClonedMarker), "cloned");
+        }
+
+        return new GitProcessResult(0, string.Empty, string.Empty);
+    }
+
+    /// <summary>The outcome of one clone run: the result plus every captured request.</summary>
+    private sealed record CloneRun(ConfigRepoOpResult Result, List<GitProcessRequest> Requests);
+
+    /// <summary>
+    /// Runs <c>CloneAsync</c> against a RECORDING ProcessRunner (restored in a finally block),
+    /// with the seam configured for a real <see cref="CloneFixture"/> target. Every clone seam is
+    /// forwarded verbatim so a test can drive the nonce, the two target checks and the two
+    /// staging primitives deterministically.
+    /// <para><paramref name="targetDir"/> is sent to the SUT VERBATIM — including null.</para>
+    /// </summary>
+    private static async Task<CloneRun> CloneCapturingAsync(
+        string? targetDir,
+        string configRepoDir,
+        Func<GitProcessRequest, GitProcessResult>? respond = null,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null,
+        Func<string>? stagingNonceGenerator = null,
+        Func<string, bool>? targetEntryExists = null,
+        Func<string, bool>? stagingMarkerCreateNew = null,
+        Func<string, bool>? stagingRepoChildCreate = null,
+        Func<string, string>? pathCanonicalizer = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult((respond ?? CloneAwareResult)(request));
+            };
+
+            using var seam = CreateSeam(
+                pathCanonicalizer: pathCanonicalizer,
+                configRepoDir: configRepoDir,
+                resolvedUrlResolver: resolvedUrlResolver,
+                credentialResolver: credentialResolver,
+                credentialHelperPath: credentialHelperPath,
+                stagingNonceGenerator: stagingNonceGenerator,
+                targetEntryExists: targetEntryExists,
+                stagingMarkerCreateNew: stagingMarkerCreateNew,
+                stagingRepoChildCreate: stagingRepoChildCreate);
+
+            var result = await Bounded(seam.CloneAsync(targetDir!, CancellationToken.None));
+            return new CloneRun(result, requests);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>The common case: the clone target IS the configured config repo directory.</summary>
+    private static Task<CloneRun> CloneAsync(
+        CloneFixture fixture,
+        Func<GitProcessRequest, GitProcessResult>? respond = null,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null,
+        Func<string>? stagingNonceGenerator = null,
+        Func<string, bool>? targetEntryExists = null,
+        Func<string, bool>? stagingMarkerCreateNew = null,
+        Func<string, bool>? stagingRepoChildCreate = null,
+        string? targetDir = null) =>
+        CloneCapturingAsync(
+            targetDir ?? fixture.TargetDir,
+            fixture.TargetDir,
+            respond,
+            resolvedUrlResolver,
+            credentialResolver,
+            credentialHelperPath,
+            stagingNonceGenerator,
+            targetEntryExists,
+            stagingMarkerCreateNew,
+            stagingRepoChildCreate);
+
+    /// <summary>The clone's tokenized request: <c>clone &lt;sanitized-url&gt; &lt;container&gt;/repo</c>.</summary>
+    private static string[] CloneCommand(string url, string container) =>
+        ["clone", url, Path.Combine(container, RepoChild)];
+
+    /// <summary>Stage 7 — the clone-time identity commands, in their required order.</summary>
+    private static readonly string[] CloneIdentityEmail =
+        ["config", "user.email", "copilothive-worker@local"];
+
+    private static readonly string[] CloneIdentityName =
+        ["config", "user.name", "CopilotHive Worker"];
+
+    // ── Stage 1 / Stage 2 — disposal, the arguments and the containment ───
+
+    [Fact]
+    public async Task Clone_PostDisposal_ReturnsSeamDisposedAndStagesNothing()
+    {
+        using var fixture = new CloneFixture();
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                throw new InvalidOperationException("no subprocess may run");
+
+            using var seam = CreateSeam(configRepoDir: fixture.TargetDir);
+            seam.Dispose();
+
+            AssertRejected(
+                await Bounded(seam.CloneAsync(fixture.TargetDir, CancellationToken.None)),
+                "Seam disposed.");
+            Assert.Empty(fixture.Containers);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\t")]
+    [InlineData("\n")]
+    public async Task Clone_TargetDirNullOrWhitespace_ReturnsInvalidArguments(string? targetDir)
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneCapturingAsync(targetDir, fixture.TargetDir);
+
+        AssertRejected(run.Result, InvalidArguments);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Fact]
+    public async Task Clone_TargetDirIsNotTheConfigRepo_ReturnsContainmentRejection()
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneCapturingAsync(OutsideDir, fixture.TargetDir);
+
+        AssertRejected(run.Result, NotConfigRepo);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Theory]
+    [MemberData(nameof(ThrowingCanonicalizers))]
+    public async Task Clone_PathExceptionFromCanonicalizer_ReturnsInvalidArguments(
+        string exceptionTypeName, Func<Exception> factory)
+    {
+        Assert.False(string.IsNullOrEmpty(exceptionTypeName));
+
+        using var fixture = new CloneFixture();
+        var constructed = false;
+        var run = await CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            pathCanonicalizer: path =>
+            {
+                // The CONSTRUCTOR canonicalization must succeed; only the call-time one throws.
+                if (!constructed)
+                {
+                    constructed = true;
+                    return path;
+                }
+
+                throw factory();
+            });
+
+        AssertRejected(run.Result, InvalidArguments);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    // ── Stage 3 — the clone-target validation ─────────────────────────────
+
+    /// <summary>
+    /// EVERY kind of existing entry at the target — a directory, a file, a live symlink and a
+    /// DANGLING symlink — rejects the clone with the fixed message, launches NOTHING and stages
+    /// NOTHING. The dangling link is the reason the real algorithm falls back to enumerating the
+    /// parent: <c>File.GetAttributes</c> cannot resolve it.
+    /// </summary>
+    public static TheoryData<string> ExistingTargetKinds => new()
+    {
+        "directory",
+        "file",
+        "symlink",
+        "dangling-symlink",
+    };
+
+    [Theory]
+    [MemberData(nameof(ExistingTargetKinds))]
+    public async Task Clone_TargetAlreadyExists_RejectsWithoutStagingOrResolving(string kind)
+    {
+        using var fixture = new CloneFixture();
+        switch (kind)
+        {
+            case "directory":
+                Directory.CreateDirectory(fixture.TargetDir);
+                break;
+            case "file":
+                File.WriteAllText(fixture.TargetDir, "occupied");
+                break;
+            case "symlink":
+                var linkTarget = Path.Combine(fixture.Root, "link-target");
+                Directory.CreateDirectory(linkTarget);
+                Directory.CreateSymbolicLink(fixture.TargetDir, linkTarget);
+                break;
+            case "dangling-symlink":
+                Directory.CreateSymbolicLink(
+                    fixture.TargetDir, Path.Combine(fixture.Root, "missing-target"));
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled target kind '{kind}'.");
+        }
+
+        var urlCalls = 0;
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        var run = await CloneAsync(
+            fixture,
+            resolvedUrlResolver: () => { urlCalls++; return EligibleUrl; },
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(run.Result, CloneTargetExists);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+
+        // Stage 3 precedes Stage 4 entirely: no resolver and no helper was ever consulted.
+        Assert.Equal(0, urlCalls);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// An ABSENT parent directory is an argument failure — the seam never creates the parent.
+    /// </summary>
+    [Fact]
+    public async Task Clone_ParentDirectoryMissing_ReturnsInvalidArguments()
+    {
+        using var fixture = new CloneFixture(createParent: false);
+        var urlCalls = 0;
+        var run = await CloneAsync(
+            fixture, resolvedUrlResolver: () => { urlCalls++; return EligibleUrl; });
+
+        AssertRejected(run.Result, InvalidArguments);
+        Assert.Empty(run.Requests);
+        Assert.False(Directory.Exists(fixture.Root));
+        Assert.Equal(0, urlCalls);
+    }
+
+    // ── The CANONICAL-PATH rule ───────────────────────────────────────────
+
+    /// <summary>
+    /// A trailing-separator or dot-segment spelling of <c>targetDir</c> produces EXACTLY the
+    /// same canonical parent (the clone's working directory), the same container name, the same
+    /// tokenized clone destination and the same move destination as the plain spelling.
+    /// </summary>
+    [Theory]
+    [InlineData("separator")]
+    [InlineData("dot-segment")]
+    public async Task Clone_AlternateTargetSpelling_UsesTheCanonicalParentAndName(string spelling)
+    {
+        using var fixture = new CloneFixture();
+        var targetDir = spelling switch
+        {
+            "separator" => fixture.TargetDir + Path.DirectorySeparatorChar,
+            "dot-segment" => Path.Combine(fixture.Root, ".", TargetLeaf),
+            _ => throw new InvalidOperationException($"Unhandled spelling '{spelling}'."),
+        };
+
+        var nonces = new ScriptedNonces("abc123def456");
+        var run = await CloneAsync(
+            fixture, stagingNonceGenerator: nonces.Next, targetDir: targetDir);
+
+        Assert.True(run.Result.Success);
+        Assert.False(nonces.Overrun);
+
+        var container = fixture.Container("abc123def456");
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, container),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        Assert.Equal(fixture.Root, run.Requests[0].WorkingDirectory);
+
+        // The MOVE landed on the canonical target — not on the alternate spelling.
+        Assert.True(File.Exists(Path.Combine(fixture.TargetDir, ClonedMarker)));
+        Assert.Empty(fixture.Containers);
+    }
+
+    // ── Stage 4 — the URL / credential gating ─────────────────────────────
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Clone_MissingUrl_ReturnsUrlUnavailableWithoutStaging(string? url)
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(fixture, resolvedUrlResolver: UrlResolver(url));
+
+        AssertRejected(run.Result, UrlUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Theory]
+    [MemberData(nameof(SanitizeRejectedUrlCases))]
+    public async Task Clone_SanitizeRejectedUrl_ReturnsInvalidConfigRepoUrlWithoutStaging(
+        string url, string expectedReason)
+    {
+        using var fixture = new CloneFixture();
+        var sanitizerMessage =
+            "Invalid --config-repo value: "
+            + expectedReason
+            + ". (The supplied value is redacted because it may contain credentials.)";
+
+        var run = await CloneAsync(fixture, resolvedUrlResolver: UrlResolver(url));
+
+        AssertRejected(run.Result, "Invalid config repo URL: " + sanitizerMessage);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+        Assert.DoesNotContain("ghp_supersecret", run.Result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Clone_ThrowingUrlResolver_ReturnsNotProvisionedWithoutStaging()
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            resolvedUrlResolver: static () => throw new InvalidOperationException("snapshot absent"));
+
+        AssertRejected(run.Result, NotProvisioned);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Fact]
+    public async Task Clone_CancelledUrlResolver_PropagatesWithoutStaging()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            resolvedUrlResolver: () => throw new OperationCanceledException(cts.Token)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Empty(fixture.Containers);
+    }
+
+    /// <summary>
+    /// An INELIGIBLE (Branch B) URL clones with the PLAIN scrubbed environment: no credential is
+    /// resolved, no helper path is read, and nothing is injected into any launch.
+    /// </summary>
+    [Fact]
+    public async Task Clone_IneligibleUrl_UsesPlainScrubbedEnvAndResolvesNoCredential()
+    {
+        using var fixture = new CloneFixture();
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            var credentialCalls = 0;
+            var helperCalls = 0;
+            var nonces = new ScriptedNonces("0123456789ab");
+            var run = await CloneAsync(
+                fixture,
+                resolvedUrlResolver: UrlResolver(IneligibleUrl),
+                credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+                credentialHelperPath: () => { helperCalls++; return "/helper"; },
+                stagingNonceGenerator: nonces.Next);
+
+            Assert.True(run.Result.Success);
+            AssertSequence(
+                run.Requests,
+                CloneCommand(IneligibleUrl, fixture.Container("0123456789ab")),
+                CloneIdentityEmail,
+                CloneIdentityName);
+
+            foreach (var request in run.Requests)
+                AssertChildEnv(request);
+
+            Assert.Equal(0, credentialCalls);
+            Assert.Equal(0, helperCalls);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// An ELIGIBLE URL with a credential injects <c>GITHUB_CONFIG_REPO_TOKEN</c> and
+    /// <c>GIT_ASKPASS</c> into the CLONE launch only — the identity commands stay
+    /// credential-free — and the credential NEVER appears in any tokenized argument.
+    /// </summary>
+    [Fact]
+    public async Task Clone_EligibleUrlWithCredential_InjectsIntoTheCloneLaunchOnly()
+    {
+        using var fixture = new CloneFixture();
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            var nonces = new ScriptedNonces("0123456789ab");
+            var run = await CloneAsync(
+                fixture,
+                credentialResolver: static () => "ghp_supersecret",
+                credentialHelperPath: static () => "/helper",
+                stagingNonceGenerator: nonces.Next);
+
+            Assert.True(run.Result.Success);
+            var container = fixture.Container("0123456789ab");
+            AssertSequence(
+                run.Requests,
+                CloneCommand(EligibleUrl, container),
+                CloneIdentityEmail,
+                CloneIdentityName);
+
+            AssertChildEnvWithCredential(run.Requests[0], "ghp_supersecret", "/helper");
+            AssertChildEnv(run.Requests[1]);
+            AssertChildEnv(run.Requests[2]);
+
+            // SECRECY: the sanitized, credential-free URL is the ONLY URL git ever sees.
+            foreach (var request in run.Requests)
+            {
+                Assert.DoesNotContain(
+                    "ghp_supersecret",
+                    string.Join('\u0000', request.TokenizedArgs!),
+                    StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// A null/whitespace credential runs the clone UNAUTHENTICATED: the plain scrubbed env, and
+    /// the credential helper path is never read.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Clone_EligibleUrlWithoutCredential_RunsUnauthenticated(string? credential)
+    {
+        using var fixture = new CloneFixture();
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            var helperCalls = 0;
+            var run = await CloneAsync(
+                fixture,
+                credentialResolver: () => credential,
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            Assert.True(run.Result.Success);
+            foreach (var request in run.Requests)
+                AssertChildEnv(request);
+
+            Assert.Equal(0, helperCalls);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    [Fact]
+    public async Task Clone_ThrowingCredentialResolver_ReturnsNotProvisionedWithoutStaging()
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            credentialResolver: static () => throw new InvalidOperationException("no credential"));
+
+        AssertRejected(run.Result, NotProvisioned);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Clone_MissingHelperPath_ReturnsHelperUnavailableWithoutStaging(string? helper)
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            credentialResolver: static () => "ghp_secret",
+            credentialHelperPath: () => helper!);
+
+        AssertRejected(run.Result, HelperUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Fact]
+    public async Task Clone_ThrowingHelperDelegate_ReturnsHelperUnavailableWithoutStaging()
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            credentialResolver: static () => "ghp_supersecret",
+            credentialHelperPath: static () => throw new InvalidOperationException("no helper"));
+
+        AssertRejected(run.Result, HelperUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+        Assert.DoesNotContain("ghp_supersecret", run.Result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Clone_CancelledHelperDelegate_PropagatesWithoutStaging()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            credentialResolver: static () => "ghp_secret",
+            credentialHelperPath: () => throw new OperationCanceledException(cts.Token)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Empty(fixture.Containers);
+    }
+
+    // ── Stage 5 / 6 — the staging container and the clone subprocess ──────
+
+    /// <summary>
+    /// The EXACT staging + clone shape: the container carries the target's name plus the
+    /// high-entropy infix/suffix, the ownership marker is its DIRECT CHILD, the git destination
+    /// is the SIBLING <c>repo</c> child and it is EMPTY when git is launched, the tokenized
+    /// request is exactly <c>[clone, &lt;sanitized-url&gt;, &lt;container&gt;/repo]</c>, and the
+    /// working directory is the canonical PARENT.
+    /// </summary>
+    [Fact]
+    public async Task Clone_StagingAndCloneRequest_HaveTheExactOwnedContainerShape()
+    {
+        using var fixture = new CloneFixture();
+        var nonces = new ScriptedNonces("00aabb11ccdd");
+        var markerWasSibling = false;
+        var destinationWasEmpty = false;
+        var destinationWasDirectory = false;
+
+        var run = await CloneAsync(
+            fixture,
+            respond: request =>
+            {
+                if (request.TokenizedArgs![0] == "clone")
+                {
+                    var destination = request.TokenizedArgs[2];
+                    destinationWasDirectory = Directory.Exists(destination);
+                    destinationWasEmpty = destinationWasDirectory
+                        && !Directory.EnumerateFileSystemEntries(destination).Any();
+                    markerWasSibling = File.Exists(
+                        Path.Combine(Path.GetDirectoryName(destination)!, OwnerMarker));
+                }
+
+                return CloneAwareResult(request);
+            },
+            stagingNonceGenerator: nonces.Next);
+
+        Assert.True(run.Result.Success);
+        Assert.False(nonces.Overrun);
+        Assert.Equal(1, nonces.Calls);
+
+        var container = fixture.Container("00aabb11ccdd");
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, container),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        Assert.Equal("git", run.Requests[0].Executable);
+        Assert.Empty(run.Requests[0].Args);
+        Assert.Equal(fixture.Root, run.Requests[0].WorkingDirectory);
+
+        // The identity commands run INSIDE the cloned worktree.
+        Assert.Equal(Path.Combine(container, RepoChild), run.Requests[1].WorkingDirectory);
+        Assert.Equal(Path.Combine(container, RepoChild), run.Requests[2].WorkingDirectory);
+
+        Assert.True(destinationWasDirectory);
+        Assert.True(destinationWasEmpty);
+        Assert.True(markerWasSibling);
+    }
+
+    /// <summary>
+    /// A SUCCESSFUL clone: exit 0, exit code 0, empty stdout and empty error; the cloned
+    /// worktree sits at the target, the container is gone, and unrelated siblings are untouched.
+    /// </summary>
+    [Fact]
+    public async Task Clone_Success_MovesTheRepoChildAndRemovesTheContainer()
+    {
+        using var fixture = new CloneFixture();
+        var sibling = Path.Combine(fixture.Root, "unrelated-sibling");
+        Directory.CreateDirectory(sibling);
+        var siblingFile = Path.Combine(sibling, "keep.txt");
+        File.WriteAllText(siblingFile, "keep");
+
+        var run = await CloneAsync(fixture);
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(0, run.Result.ExitCode);
+        Assert.Equal("", run.Result.Stdout);
+        Assert.Equal("", run.Result.SanitizedError);
+
+        Assert.True(Directory.Exists(fixture.TargetDir));
+        Assert.True(File.Exists(Path.Combine(fixture.TargetDir, ClonedMarker)));
+        Assert.Empty(fixture.Containers);
+        Assert.False(File.Exists(Path.Combine(fixture.TargetDir, OwnerMarker)));
+
+        Assert.True(File.Exists(siblingFile)); // the pre-existing sibling is untouched
+    }
+
+    /// <summary>
+    /// An OCCUPIED first candidate retries with a NEW nonce and succeeds — and the occupying
+    /// FOREIGN container (unmarked) is left completely alone.
+    /// </summary>
+    [Fact]
+    public async Task Clone_OccupiedNonce_RetriesAndNeverDeletesTheForeignContainer()
+    {
+        using var fixture = new CloneFixture();
+        var occupied = fixture.Container("aaaaaaaaaaaa");
+        Directory.CreateDirectory(occupied);
+        var foreignFile = Path.Combine(occupied, "foreign.txt");
+        File.WriteAllText(foreignFile, "not ours");
+
+        var nonces = new ScriptedNonces("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+        var run = await CloneAsync(fixture, stagingNonceGenerator: nonces.Next);
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(2, nonces.Calls);
+        Assert.False(nonces.Overrun);
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, fixture.Container("bbbbbbbbbbbb")),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        // The FOREIGN, unmarked container survives untouched; only OURS was cleaned up.
+        Assert.True(File.Exists(foreignFile));
+        Assert.Equal([occupied], fixture.Containers);
+    }
+
+    /// <summary>
+    /// FIVE occupied candidates exhaust the bounded retry: the fixed staging message, no
+    /// subprocess, and every foreign container still present.
+    /// </summary>
+    [Fact]
+    public async Task Clone_FiveOccupiedNonces_ReturnsStagingUnavailable()
+    {
+        using var fixture = new CloneFixture();
+        var scripted = new[] { "aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc", "dddddddddddd", "eeeeeeeeeeee" };
+        foreach (var nonce in scripted)
+            Directory.CreateDirectory(fixture.Container(nonce));
+
+        var nonces = new ScriptedNonces(scripted);
+        var run = await CloneAsync(fixture, stagingNonceGenerator: nonces.Next);
+
+        AssertRejected(run.Result, StagingUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Equal(5, nonces.Calls);
+        Assert.False(nonces.Overrun);
+        Assert.Equal(5, fixture.Containers.Length);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// THE MARKER SEAM returning <c>false</c> on the first attempt — with the first candidate
+    /// GENUINELY free, so nothing pre-created it — retries with a NEW nonce and succeeds. The
+    /// unclaimed first container is NEVER deleted: without a successful CreateNew this
+    /// invocation cannot prove it owns it.
+    /// </summary>
+    [Fact]
+    public async Task Clone_MarkerSeamCollisionOnFirstAttempt_RetriesWithANewNonce()
+    {
+        using var fixture = new CloneFixture();
+        var first = fixture.Container("aaaaaaaaaaaa");
+        Assert.False(Directory.Exists(first)); // the candidate really is free
+
+        var markerCalls = new List<string>();
+        var nonces = new ScriptedNonces("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: nonces.Next,
+            stagingMarkerCreateNew: container =>
+            {
+                markerCalls.Add(container);
+                if (markerCalls.Count == 1)
+                    return false;
+
+                File.WriteAllText(Path.Combine(container, OwnerMarker), "");
+                return true;
+            });
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(2, nonces.Calls);
+        Assert.Equal([first, fixture.Container("bbbbbbbbbbbb")], markerCalls);
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, fixture.Container("bbbbbbbbbbbb")),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        // The UNCLAIMED container is never deleted; the OWNED one is gone.
+        Assert.Equal([first], fixture.Containers);
+        Assert.True(File.Exists(Path.Combine(fixture.TargetDir, ClonedMarker)));
+    }
+
+    /// <summary>
+    /// THE REPO-CHILD SEAM receives the fully-joined <c>&lt;container&gt;/repo</c> path. When it
+    /// fails AFTER the marker succeeded, the attempt's OWNED container is cleaned up before the
+    /// retry — so no <c>.copilothive-clone-*</c> container survives the successful second attempt.
+    /// </summary>
+    [Fact]
+    public async Task Clone_RepoChildSeamFailsAfterOwnership_CleansUpThenRetries()
+    {
+        using var fixture = new CloneFixture();
+        var repoChildCalls = new List<string>();
+        var nonces = new ScriptedNonces("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: nonces.Next,
+            stagingRepoChildCreate: path =>
+            {
+                repoChildCalls.Add(path);
+                if (repoChildCalls.Count == 1)
+                    return false;
+
+                Directory.CreateDirectory(path);
+                return true;
+            });
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(2, nonces.Calls);
+
+        // The seam received the JOINED repo path — never the bare container path.
+        Assert.Equal(
+            [
+                Path.Combine(fixture.Container("aaaaaaaaaaaa"), RepoChild),
+                Path.Combine(fixture.Container("bbbbbbbbbbbb"), RepoChild),
+            ],
+            repoChildCalls);
+
+        // The OWNED first container was deleted before the retry, and the second after the move.
+        Assert.Empty(fixture.Containers);
+        Assert.True(File.Exists(Path.Combine(fixture.TargetDir, ClonedMarker)));
+    }
+
+    /// <summary>
+    /// EVERY invalid nonce shape counts as a COLLISION: empty, over-long, and outside the safe
+    /// <c>[0-9a-f]</c> leaf alphabet (upper case, a separator, a dot segment, a wildcard).
+    /// </summary>
+    public static TheoryData<string> InvalidNonces => new()
+    {
+        "",
+        new string('a', 33),
+        "ABCDEF",
+        "abc-def",
+        "abc.def",
+        "abc/def",
+        "abc def",
+        "ghijkl",
+        "..",
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidNonces))]
+    public async Task Clone_InvalidNonce_CountsAsACollision(string nonce)
+    {
+        using var fixture = new CloneFixture();
+
+        // FIVE invalid outputs exhaust the bound: nothing is staged and nothing is launched.
+        var exhausted = await CloneAsync(fixture, stagingNonceGenerator: () => nonce);
+        AssertRejected(exhausted.Result, StagingUnavailable);
+        Assert.Empty(exhausted.Requests);
+        Assert.Empty(fixture.Containers);
+
+        // One invalid output followed by a valid one still succeeds.
+        var nonces = new ScriptedNonces(nonce, "abcdefabcdef");
+        var run = await CloneAsync(fixture, stagingNonceGenerator: nonces.Next);
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(2, nonces.Calls);
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, fixture.Container("abcdefabcdef")),
+            CloneIdentityEmail,
+            CloneIdentityName);
+    }
+
+    [Fact]
+    public async Task Clone_ThrowingNonceGenerator_CountsAsACollision()
+    {
+        using var fixture = new CloneFixture();
+
+        var exhausted = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: static () => throw new InvalidOperationException("no entropy"));
+
+        AssertRejected(exhausted.Result, StagingUnavailable);
+        Assert.Empty(exhausted.Requests);
+        Assert.Empty(fixture.Containers);
+
+        var calls = 0;
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: () =>
+                ++calls == 1 ? throw new InvalidOperationException("no entropy") : "abcdefabcdef");
+
+        Assert.True(run.Result.Success);
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
+    public async Task Clone_CancelledNonceGenerator_Propagates()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            stagingNonceGenerator: () => throw new OperationCanceledException(cts.Token)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Empty(fixture.Containers);
+    }
+
+    // ── Stage 6 — the clone failures ──────────────────────────────────────
+
+    /// <summary>
+    /// A NON-ZERO clone exit preserves the exit code, redacts the output, and DELETES the owned
+    /// container — nothing is moved and no identity command runs.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(128)]
+    public async Task Clone_NonZeroExit_PreservesTheCodeRedactsOutputAndCleansUp(int exitCode)
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            respond: _ => new GitProcessResult(
+                exitCode,
+                "cloning https://x-access-token:ghp_secret@github.com/org/config-repo.git",
+                "fatal: could not read from https://x-access-token:ghp_secret@github.com/o/r  \n"));
+
+        Assert.False(run.Result.Success);
+        Assert.Equal(exitCode, run.Result.ExitCode);
+        Assert.Equal("cloning https://github.com/org/config-repo.git", run.Result.Stdout);
+        Assert.Equal(
+            "fatal: could not read from https://github.com/o/r", run.Result.SanitizedError);
+
+        Assert.Single(run.Requests); // no identity command ran
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    [Fact]
+    public async Task Clone_LaunchFailure_ReturnsFixedMessageAndCleansUp()
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture, respond: static _ => throw new InvalidOperationException("git missing"));
+
+        AssertRejected(run.Result, LaunchFailed);
+        Assert.Single(run.Requests);
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// A cancellation observed DURING the clone cleans the owned container up BEFORE the
+    /// <see cref="OperationCanceledException"/> propagates.
+    /// </summary>
+    [Fact]
+    public async Task Clone_CancelledDuringTheClone_CleansUpBeforePropagating()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        var containerExistedDuringTheClone = false;
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            respond: request =>
+            {
+                containerExistedDuringTheClone =
+                    Directory.Exists(Path.GetDirectoryName(request.TokenizedArgs![2])!);
+                cts.Cancel();
+                throw new OperationCanceledException(cts.Token);
+            }));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.True(containerExistedDuringTheClone);
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    // ── Stage 7 — the clone-time identity ─────────────────────────────────
+
+    /// <summary>
+    /// An identity failure on EITHER command — a non-zero exit or a launch failure — aborts the
+    /// move, deletes the container and reports the fixed message. BOTH commands are attempted:
+    /// a failed <c>user.email</c> does NOT prevent the <c>user.name</c> attempt.
+    /// </summary>
+    [Theory]
+    [InlineData("user.email", "nonzero")]
+    [InlineData("user.name", "nonzero")]
+    [InlineData("user.email", "launch")]
+    [InlineData("user.name", "launch")]
+    public async Task Clone_IdentityFailure_AbortsTheMoveAndCleansUp(string setting, string mode)
+    {
+        using var fixture = new CloneFixture();
+        var run = await CloneAsync(
+            fixture,
+            respond: request =>
+            {
+                var tokens = request.TokenizedArgs!;
+                if (tokens[0] == "config" && tokens[1] == setting)
+                {
+                    return mode switch
+                    {
+                        "nonzero" => new GitProcessResult(1, "", "fatal: identity"),
+                        "launch" => throw new InvalidOperationException("git missing"),
+                        _ => throw new InvalidOperationException($"Unhandled mode '{mode}'."),
+                    };
+                }
+
+                return CloneAwareResult(request);
+            });
+
+        AssertRejected(run.Result, CloneIdentityFailed);
+
+        // BOTH identity commands were attempted, in order, after the clone.
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, Path.GetDirectoryName(run.Requests[0].TokenizedArgs![2])!),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// THE CANCELLATION PRECEDENCE: an <see cref="OperationCanceledException"/> from
+    /// <c>user.email</c> ABORTS IMMEDIATELY — <c>user.name</c> never runs — and the container is
+    /// cleaned up before the exception propagates.
+    /// </summary>
+    [Fact]
+    public async Task Clone_CancelledDuringUserEmail_AbortsBeforeUserName()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        var requests = new List<string[]>();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            respond: request =>
+            {
+                requests.Add([.. request.TokenizedArgs!]);
+                if (request.TokenizedArgs![0] == "config"
+                    && request.TokenizedArgs[1] == "user.email")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException(cts.Token);
+                }
+
+                return CloneAwareResult(request);
+            }));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Equal(2, requests.Count);              // clone + user.email ONLY
+        Assert.Equal(CloneIdentityEmail, requests[1]);
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// A cancellation from <c>user.name</c> also cleans up and propagates — the move never runs.
+    /// </summary>
+    [Fact]
+    public async Task Clone_CancelledDuringUserName_CleansUpBeforePropagating()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            respond: request =>
+            {
+                if (request.TokenizedArgs![0] == "config"
+                    && request.TokenizedArgs[1] == "user.name")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException(cts.Token);
+                }
+
+                return CloneAwareResult(request);
+            }));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    // ── Stage 8 — the absence re-check and the atomic move ────────────────
+
+    /// <summary>
+    /// THE ENTRY-EXISTENCE DELEGATE'S SCOPE: it is invoked EXACTLY TWICE — the Stage 3 initial
+    /// check and the Stage 8 re-check — always on the canonical target. The staging occupancy
+    /// checks use the REAL algorithm, so the scripted <c>false → true</c> sequence lets the
+    /// staging succeed and then fails the re-check: the container is deleted and the fixed
+    /// message is returned.
+    /// </summary>
+    [Fact]
+    public async Task Clone_TargetAppearsBeforeTheMove_RejectsAndCleansUp()
+    {
+        using var fixture = new CloneFixture();
+        var checks = new List<string>();
+        var nonces = new ScriptedNonces("aaaaaaaaaaaa");
+
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: nonces.Next,
+            targetEntryExists: path =>
+            {
+                checks.Add(path);
+                return checks.Count > 1; // absent initially, PRESENT at the re-check
+            });
+
+        AssertRejected(run.Result, CloneTargetExists);
+
+        // EXACTLY the two target checks, both on the canonical target.
+        Assert.Equal([fixture.TargetDir, fixture.TargetDir], checks);
+
+        AssertSequence(
+            run.Requests,
+            CloneCommand(EligibleUrl, fixture.Container("aaaaaaaaaaaa")),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        Assert.Empty(fixture.Containers);
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// The delegate is consulted at Stage 3 too: a <c>true</c> on the FIRST call rejects before
+    /// anything is staged, resolved or launched — one call and no more.
+    /// </summary>
+    [Fact]
+    public async Task Clone_EntryExistenceDelegateTrueAtStage3_RejectsImmediately()
+    {
+        using var fixture = new CloneFixture();
+        var checks = 0;
+        var run = await CloneAsync(fixture, targetEntryExists: _ => { checks++; return true; });
+
+        AssertRejected(run.Result, CloneTargetExists);
+        Assert.Equal(1, checks);
+        Assert.Empty(run.Requests);
+        Assert.Empty(fixture.Containers);
+    }
+
+    /// <summary>
+    /// A NON-cancellation exception from the entry-existence delegate PROPAGATES out of
+    /// <c>CloneAsync</c> — it is never mapped to a fixed result.
+    /// </summary>
+    [Fact]
+    public async Task Clone_ThrowingEntryExistenceDelegate_Propagates()
+    {
+        using var fixture = new CloneFixture();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            targetEntryExists: static _ => throw new InvalidOperationException("probe failed")));
+
+        Assert.Equal("probe failed", ex.Message);
+        Assert.Empty(fixture.Containers);
+    }
+
+    [Fact]
+    public async Task Clone_CancelledEntryExistenceDelegate_Propagates()
+    {
+        using var fixture = new CloneFixture();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => CloneCapturingAsync(
+            fixture.TargetDir,
+            fixture.TargetDir,
+            targetEntryExists: _ => throw new OperationCanceledException(cts.Token)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        Assert.Empty(fixture.Containers);
+    }
+
+    // ── The SANITIZED-URL selection (removal-proof) ───────────────────────
+
+    /// <summary>
+    /// Config repo URLs the sanitizer ACCEPTS but observably REWRITES, paired with their exact
+    /// sanitized form. Each row's raw spelling differs from its sanitized spelling BYTE-FOR-BYTE,
+    /// so a clone that launched with the raw resolver value instead of the sanitized one is
+    /// observably different — which is exactly what makes the assertion removal-proof.
+    /// </summary>
+    /// <remarks>
+    /// A credential-bearing HTTPS URL is deliberately NOT among these rows: the sanitizer
+    /// REJECTS https userinfo outright (see <see cref="SanitizeRejectedUrlCases"/>), so it can
+    /// never reach a successful clone. The credential-bearing case that IS accepted — and
+    /// stripped — is the ssh form, whose password the sanitizer removes; it is the last row and
+    /// carries <see cref="StrippedCredential"/>.
+    /// </remarks>
+    public static TheoryData<string, string> AcceptedButRewrittenUrlCases => new()
+    {
+        // The explicit default port is dropped.
+        { "https://github.com:443/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        // The host is lower-cased.
+        { "https://GITHUB.COM/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        { "https://GitHub.Com/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        // The dot segment is collapsed.
+        { "https://github.com/org/./config-repo.git", "https://github.com/org/config-repo.git" },
+        // Surrounding whitespace is trimmed.
+        { "  https://github.com/org/config-repo.git  ", "https://github.com/org/config-repo.git" },
+        // THE CREDENTIAL-BEARING accepted form: the ssh password is STRIPPED.
+        {
+            "ssh://git:" + StrippedCredential + "@github.com/org/config-repo.git",
+            "ssh://git@github.com/org/config-repo.git"
+        },
+        // A credential-bearing ssh URL whose host is ALSO rewritten.
+        {
+            "ssh://git:" + StrippedCredential + "@GITHUB.COM/org/config-repo.git",
+            "ssh://git@github.com/org/config-repo.git"
+        },
+        // The scp-style form normalizes to an ssh URL.
+        { "git@github.com:org/config-repo.git", "ssh://git@github.com/org/config-repo.git" },
+    };
+
+    /// <summary>
+    /// The credential embedded in the accepted-but-stripped ssh rows. It must never survive
+    /// into a tokenized argument, an environment value, or a returned message.
+    /// </summary>
+    private const string StrippedCredential = "ghp_urlembeddedsecret";
+
+    /// <summary>
+    /// THE SANITIZED-URL GUARANTEE: the clone's SECOND token is the SANITIZED URL byte-for-byte
+    /// — never the raw resolver value. Every row is a URL the sanitizer accepts but REWRITES, so
+    /// a mutation that passed the raw resolved URL into the clone arguments changes the captured
+    /// token and fails here. For the credential-bearing rows this is also the origin-secrecy
+    /// proof: git writes its remote from this very argument, so a raw-URL clone would persist
+    /// the credential into <c>.git/config</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AcceptedButRewrittenUrlCases))]
+    public async Task Clone_AcceptedButRewrittenUrl_LaunchesWithTheSanitizedUrlNotTheRawValue(
+        string rawUrl, string sanitizedUrl)
+    {
+        // The row really IS an accepted-but-rewritten pair — so the assertion below cannot pass
+        // for the wrong reason (a row where raw == sanitized would be vacuous).
+        Assert.Equal(sanitizedUrl, ConfigRepoUrlSanitizer.Sanitize(rawUrl));
+        Assert.NotEqual(rawUrl, sanitizedUrl);
+
+        using var fixture = new CloneFixture();
+        var nonces = new ScriptedNonces("00112233445f");
+        var run = await CloneAsync(
+            fixture,
+            resolvedUrlResolver: UrlResolver(rawUrl),
+            stagingNonceGenerator: nonces.Next);
+
+        Assert.True(run.Result.Success);
+
+        var container = fixture.Container("00112233445f");
+        AssertSequence(
+            run.Requests,
+            CloneCommand(sanitizedUrl, container),
+            CloneIdentityEmail,
+            CloneIdentityName);
+
+        // The SECOND token is the sanitized URL byte-for-byte — never the raw spelling.
+        Assert.Equal(sanitizedUrl, run.Requests[0].TokenizedArgs![1]);
+        Assert.NotEqual(rawUrl, run.Requests[0].TokenizedArgs![1]);
+
+        // SECRECY: no tokenized argument of ANY launch carries the stripped credential.
+        foreach (var request in run.Requests)
+        {
+            Assert.DoesNotContain(
+                StrippedCredential,
+                string.Join('\u0000', request.TokenizedArgs!),
+                StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain(StrippedCredential, run.Result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            StrippedCredential, run.Result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    // ── The marker-iff AND-condition: BOTH halves, in their MIXED states ──
+
+    /// <summary>
+    /// HALF A of the marker-iff rule (flag=TRUE, marker file ABSENT): the cleanup must NOT
+    /// delete a container whose marker is gone, even though this invocation's CreateNew
+    /// succeeded. The marker seam reports success WITHOUT creating the file, so the owned
+    /// attempt reaches its cleanup with the flag set and no marker on disk.
+    /// <para>
+    /// A mutation that drops the <c>File.Exists</c> half (deleting on the flag ALONE) deletes
+    /// the container here and fails this test.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The vector is driven through the REPO-CHILD failure path, which is the staging-loop
+    /// cleanup invocation. The five attempts then exhaust the bound, so the fixed staging
+    /// message is returned and no subprocess ever runs.
+    /// </remarks>
+    [Fact]
+    public async Task Clone_OwnedAttemptWithoutAMarkerFile_RetainsTheContainer()
+    {
+        using var fixture = new CloneFixture();
+        var nonces = new ScriptedNonces(FiveNonces);
+
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: nonces.Next,
+            // The flag is SET (true) but NO marker file is ever written to disk.
+            stagingMarkerCreateNew: static _ => true,
+            stagingRepoChildCreate: static _ => false);
+
+        AssertRejected(run.Result, StagingUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Equal(5, nonces.Calls);
+
+        // EVERY owned-but-unmarked container SURVIVES: the marker half of the AND is required.
+        Assert.Equal(5, fixture.Containers.Length);
+        foreach (var container in fixture.Containers)
+        {
+            Assert.True(Directory.Exists(container));
+            Assert.False(File.Exists(Path.Combine(container, OwnerMarker)));
+        }
+    }
+
+    /// <summary>
+    /// HALF A at the CloneAsync-level cleanup: the owned container is handed to the clone stage
+    /// and its marker is removed before a failure forces the finally to run. The container is
+    /// RETAINED — the flag alone must never authorize a deletion.
+    /// </summary>
+    [Fact]
+    public async Task Clone_MarkerRemovedBeforeTheCloneFails_RetainsTheContainer()
+    {
+        using var fixture = new CloneFixture();
+        var nonces = new ScriptedNonces("aaaaaaaaaaaa");
+        var container = fixture.Container("aaaaaaaaaaaa");
+
+        var run = await CloneAsync(
+            fixture,
+            respond: request =>
+            {
+                // The marker exists up to this point (the real File.Open created it); deleting
+                // it here puts the CloneAsync finally into the flag=true / file=absent state.
+                File.Delete(Path.Combine(container, OwnerMarker));
+                return new GitProcessResult(128, string.Empty, "fatal: clone failed");
+            },
+            stagingNonceGenerator: nonces.Next);
+
+        Assert.False(run.Result.Success);
+        Assert.Equal(128, run.Result.ExitCode);
+
+        // The unmarked container SURVIVES even though this invocation owned it.
+        Assert.Equal([container], fixture.Containers);
+        Assert.False(File.Exists(Path.Combine(container, OwnerMarker)));
+        Assert.False(Directory.Exists(fixture.TargetDir));
+    }
+
+    /// <summary>
+    /// HALF B of the marker-iff rule (flag=FALSE, marker file PRESENT): a FOREIGN/forged marker
+    /// exists inside the container, but THIS invocation's CreateNew did not succeed — the marker
+    /// seam forges the file and then reports a collision-category failure, so the attempt's
+    /// cleanup runs with the flag CLEAR and the marker present. The container must be RETAINED.
+    /// <para>
+    /// A mutation that drops the ownership-flag half (deleting on the marker file ALONE) deletes
+    /// this foreign container and fails this test.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The seam THROWS a collision-category <see cref="IOException"/> rather than returning
+    /// <c>false</c>: the <c>false</c> return takes the branch that deliberately abandons the
+    /// container without invoking the cleanup at all, whereas the throw routes the attempt
+    /// through the staging loop's catch and its finally — the invocation that genuinely observes
+    /// the (flag=false, marker present) state.
+    /// </remarks>
+    [Fact]
+    public async Task Clone_ForgedMarkerWithoutOwnership_RetainsTheForeignContainer()
+    {
+        using var fixture = new CloneFixture();
+        var nonces = new ScriptedNonces(FiveNonces);
+        var forged = new List<string>();
+
+        var run = await CloneAsync(
+            fixture,
+            stagingNonceGenerator: nonces.Next,
+            stagingMarkerCreateNew: container =>
+            {
+                // A FOREIGN actor's marker: present on disk, but NOT this invocation's.
+                File.WriteAllText(Path.Combine(container, OwnerMarker), "foreign");
+                forged.Add(container);
+                throw new IOException("the marker already exists");
+            });
+
+        AssertRejected(run.Result, StagingUnavailable);
+        Assert.Empty(run.Requests);
+        Assert.Equal(5, nonces.Calls);
+        Assert.Equal(5, forged.Count);
+
+        // EVERY forged container SURVIVES with its marker: the ownership half is required.
+        Assert.Equal(5, fixture.Containers.Length);
+        foreach (var container in fixture.Containers)
+        {
+            Assert.True(Directory.Exists(container));
+            Assert.True(File.Exists(Path.Combine(container, OwnerMarker)));
+        }
+    }
+
+    /// <summary>
+    /// The marker-iff rule stated as a MATRIX over its two independent inputs, so neither half
+    /// can be removed without a failure: only (flag=true, marker present) deletes.
+    /// </summary>
+    [Fact]
+    public async Task Clone_MarkerIffMatrix_OnlyOwnedAndMarkedContainersAreDeleted()
+    {
+        // (flag=true, marker PRESENT) → DELETED. The ordinary owned repo-child failure.
+        using (var fixture = new CloneFixture())
+        {
+            var nonces = new ScriptedNonces("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+            var run = await CloneAsync(
+                fixture,
+                stagingNonceGenerator: nonces.Next,
+                stagingRepoChildCreate: BuildFirstFailingRepoChild());
+
+            Assert.True(run.Result.Success);
+            Assert.Empty(fixture.Containers); // the owned, MARKED container was deleted
+        }
+
+        // (flag=true, marker ABSENT) → RETAINED.
+        using (var fixture = new CloneFixture())
+        {
+            var nonces = new ScriptedNonces(FiveNonces);
+            var run = await CloneAsync(
+                fixture,
+                stagingNonceGenerator: nonces.Next,
+                stagingMarkerCreateNew: static _ => true,      // flag set, no file written
+                stagingRepoChildCreate: static _ => false);
+
+            AssertRejected(run.Result, StagingUnavailable);
+            Assert.Equal(5, fixture.Containers.Length);
+        }
+
+        // (flag=false, marker PRESENT) → RETAINED.
+        using (var fixture = new CloneFixture())
+        {
+            var nonces = new ScriptedNonces(FiveNonces);
+            var run = await CloneAsync(
+                fixture,
+                stagingNonceGenerator: nonces.Next,
+                stagingMarkerCreateNew: static container =>
+                {
+                    File.WriteAllText(Path.Combine(container, OwnerMarker), "foreign");
+                    throw new IOException("the marker already exists");
+                });
+
+            AssertRejected(run.Result, StagingUnavailable);
+            Assert.Equal(5, fixture.Containers.Length);
+        }
+
+        // (flag=false, marker ABSENT) → RETAINED.
+        using (var fixture = new CloneFixture())
+        {
+            var nonces = new ScriptedNonces(FiveNonces);
+            var run = await CloneAsync(
+                fixture,
+                stagingNonceGenerator: nonces.Next,
+                stagingMarkerCreateNew: static _ => throw new IOException("collision"));
+
+            AssertRejected(run.Result, StagingUnavailable);
+            Assert.Equal(5, fixture.Containers.Length);
+        }
+    }
+
+    /// <summary>
+    /// Five DISTINCT valid nonces — one per staging attempt — so an exhausting vector leaves one
+    /// observable container per attempt rather than reusing a name a later attempt would find
+    /// already occupied.
+    /// </summary>
+    private static readonly string[] FiveNonces =
+        ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc", "dddddddddddd", "eeeeeeeeeeee"];
+
+    /// <summary>
+    /// A repo-child seam that FAILS the first attempt and creates the child thereafter — the
+    /// ordinary owned-cleanup-then-retry vector.
+    /// </summary>
+    private static Func<string, bool> BuildFirstFailingRepoChild()
+    {
+        var calls = 0;
+        return path =>
+        {
+            if (++calls == 1)
+                return false;
+
+            Directory.CreateDirectory(path);
+            return true;
+        };
     }
 }

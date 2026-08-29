@@ -15,8 +15,8 @@ namespace CopilotHive.Worker;
 /// origin state machine (Stages 6c/6d), the credential + helper resolution (Stage 6e) and the
 /// Stage 7 credential env injection with the literal-secret redaction pass. Slice 2c-b2 adds the
 /// credential-free HEALTH PROBE — <see cref="ProbeAndEnsureRepoHealthyAsync"/> — with the
-/// best-effort origin reconciliation-as-API and the local identity configuration. The clone
-/// (2c-b3) is a later slice.
+/// best-effort origin reconciliation-as-API and the local identity configuration. Slice 2c-b3
+/// adds the OWNED-CONTAINER staging + atomic-move CLONE — <see cref="CloneAsync"/>.
 /// </summary>
 internal sealed class ConfigRepoGitOperations : IDisposable
 {
@@ -76,6 +76,34 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// <summary>The literal-redaction replacement for an ordinal credential occurrence.</summary>
     private const string RedactedPlaceholder = "[redacted]";
 
+    /// <summary>2c-b3 — the clone target already exists, so nothing may be staged or moved.</summary>
+    private const string CloneTargetExists = "Config repo clone target already exists.";
+
+    /// <summary>2c-b3 — no owned staging container could be created within the attempt bound.</summary>
+    private const string StagingUnavailable =
+        "Config repo clone staging directory could not be created.";
+
+    /// <summary>2c-b3 — the mandatory post-clone identity configuration failed.</summary>
+    private const string CloneIdentityFailed = "Config repo clone identity configuration failed.";
+
+    /// <summary>2c-b3 — the infix marking a staging container as this seam's work directory.</summary>
+    private const string StagingContainerInfix = ".copilothive-clone-";
+
+    /// <summary>2c-b3 — the suffix closing a staging container's name.</summary>
+    private const string StagingContainerSuffix = ".copilothive-work";
+
+    /// <summary>2c-b3 — the OWNERSHIP marker file created (exclusively) inside a container.</summary>
+    private const string StagingOwnerMarker = ".copilothive-owner";
+
+    /// <summary>2c-b3 — the container child that git clones INTO (it must be EMPTY).</summary>
+    private const string StagingRepoChild = "repo";
+
+    /// <summary>2c-b3 — the bound on staging-container creation attempts.</summary>
+    private const int StagingAttempts = 5;
+
+    /// <summary>2c-b3 — the maximum accepted length of a staging nonce.</summary>
+    private const int MaxNonceLength = 32;
+
     private readonly string _configRepoDirCanonical;
     private readonly Func<string?> _resolvedUrlResolver;
     private readonly Func<string?> _credentialResolver;
@@ -83,6 +111,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     private readonly Func<string> _credentialHelperPath;
     private readonly Action _onDispose;
     private readonly Func<string, string> _pathCanonicalizer;
+    private readonly Func<string> _stagingNonceGenerator;
+    private readonly Func<string, bool>? _targetEntryExists;
+    private readonly Func<string, bool>? _stagingMarkerCreateNew;
+    private readonly Func<string, bool>? _stagingRepoChildCreate;
 
     /// <summary>
     /// Stage 6c — the PER-INSTANCE serialization lock covering Stage 6c through the completion
@@ -127,7 +159,13 @@ internal sealed class ConfigRepoGitOperations : IDisposable
 
     /// <summary>
     /// Testing constructor — the real implementation. <paramref name="pathCanonicalizer"/>
-    /// defaults to <see cref="Path.GetFullPath(string)"/>.
+    /// defaults to <see cref="Path.GetFullPath(string)"/>. The four trailing 2c-b3 delegates
+    /// are the CLONE seams: <paramref name="stagingNonceGenerator"/> (defaulting to a 12-char
+    /// hex GUID slice), <paramref name="targetEntryExists"/> (the TWO clone-target checks
+    /// only — the staging occupancy checks always use the real algorithm),
+    /// <paramref name="stagingMarkerCreateNew"/> (receiving the CONTAINER path) and
+    /// <paramref name="stagingRepoChildCreate"/> (receiving the fully-joined
+    /// <c>&lt;container&gt;/repo</c> path). A null delegate selects the real implementation.
     /// </summary>
     internal ConfigRepoGitOperations(
         string configRepoDir,
@@ -136,7 +174,11 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         WorkerLogger log,
         Func<string> credentialHelperPath,
         Action onDispose,
-        Func<string, string>? pathCanonicalizer = null)
+        Func<string, string>? pathCanonicalizer = null,
+        Func<string>? stagingNonceGenerator = null,
+        Func<string, bool>? targetEntryExists = null,
+        Func<string, bool>? stagingMarkerCreateNew = null,
+        Func<string, bool>? stagingRepoChildCreate = null)
     {
         if (string.IsNullOrWhiteSpace(configRepoDir))
             throw new ArgumentException("Config repo directory must not be null or whitespace.", nameof(configRepoDir));
@@ -156,6 +198,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         _credentialHelperPath = credentialHelperPath;
         _onDispose = onDispose;
         _pathCanonicalizer = pathCanonicalizer ?? Path.GetFullPath;
+        _stagingNonceGenerator = stagingNonceGenerator ?? DefaultNonce;
+        _targetEntryExists = targetEntryExists;
+        _stagingMarkerCreateNew = stagingMarkerCreateNew;
+        _stagingRepoChildCreate = stagingRepoChildCreate;
 
         try
         {
@@ -572,6 +618,454 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// </summary>
     private static ConfigRepoHealth Unhealthy(string reason) =>
         new(false, null, null, GitUrlRedactor.Redact(reason));
+
+    // ==================================================================
+    // Slice 2c-b3 — the OWNED-CONTAINER staging + atomic-move CLONE.
+    // ==================================================================
+
+    /// <summary>
+    /// Slice 2c-b3 — clones the configured config repo into <paramref name="targetDir"/> via an
+    /// OWNED staging container followed by an ATOMIC <see cref="Directory.Move"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE EIGHT STAGES, in order: (1) disposal; (2) the argument basics + the SAME exact
+    /// containment as every other API (<paramref name="targetDir"/> must canonicalize to the
+    /// configured config repo directory); (3) the clone-target ABSENCE check plus the
+    /// parent-existence validation; (4) the URL resolution / transport eligibility and — only
+    /// for an ELIGIBLE URL with a non-whitespace credential — the credential + helper
+    /// resolution; (5) the bounded (5-attempt) staging-container acquisition; (6) the
+    /// <c>git clone</c> subprocess; (7) the MANDATORY, credential-free clone-time identity
+    /// configuration; (8) the absence RE-CHECK and the atomic move of
+    /// <c>&lt;container&gt;/repo</c> onto the canonical target.
+    /// </para>
+    /// <para>
+    /// THE OWNED-CONTAINER DESIGN. Every attempt stages into
+    /// <c>&lt;parent&gt;/&lt;target-name&gt;.copilothive-clone-&lt;nonce&gt;.copilothive-work/</c>
+    /// and claims it by creating <c>.copilothive-owner</c> with
+    /// <see cref="FileMode.CreateNew"/> — the ATOMIC exclusive primitive that decides ownership.
+    /// The git destination is the SIBLING <c>&lt;container&gt;/repo</c>, so the directory git
+    /// clones into is EMPTY and the marker never lands inside the cloned worktree. The container
+    /// is deleted (recursively, with any deletion exception SWALLOWED) if and ONLY IF the marker
+    /// file exists at cleanup time AND the attempt's in-memory flag records that THIS
+    /// invocation's <see cref="FileMode.CreateNew"/> succeeded: a foreign, unmarked container is
+    /// NEVER deleted.
+    /// </para>
+    /// <para>
+    /// THE TWO ACCEPTED RACE LIMITATIONS. (1) THE PRE-CREATION RACE: a foreign actor could
+    /// create the container directory under this invocation's high-entropy name in the window
+    /// between the occupancy check and this seam's own creation, with the marker
+    /// <see cref="FileMode.CreateNew"/> then still succeeding INSIDE it — in which case this
+    /// invocation would take ownership of, and ultimately delete, a directory it did not create.
+    /// Guessing a <c>.copilothive-clone-&lt;nonce&gt;.copilothive-work</c> name within that
+    /// window is astronomically improbable. (2) THE REPLACEMENT RACE: after this invocation has
+    /// created its container and its marker, a foreign actor could remove the container and
+    /// recreate it with a FORGED <c>.copilothive-owner</c>; the marker-iff cleanup rule would
+    /// then see a marker plus this attempt's flag and delete the replacement. The threat model
+    /// is the single-actor operator environment: an actor racing this seam on a
+    /// <c>.copilothive-clone-&lt;nonce&gt;.copilothive-work/</c> container AND forging
+    /// <c>.copilothive-owner</c> is ADVERSARIAL, not accidental. Both residual risks are
+    /// ACCEPTED and documented rather than mitigated — no filesystem-portable primitive removes
+    /// them, and a weaker cleanup rule would leak staging directories on every failure path.
+    /// </para>
+    /// <para>
+    /// SECRECY: the credential NEVER appears in the clone's tokenized arguments (they carry the
+    /// SANITIZED, credential-free URL), so the origin git writes is credential-free too. The
+    /// injection is env-only and applies to the clone launch alone; the identity commands are
+    /// credential-free. Every returned <see cref="ConfigRepoOpResult.Stdout"/> and
+    /// <see cref="ConfigRepoOpResult.SanitizedError"/> passes through
+    /// <see cref="GitUrlRedactor"/> and then the literal-secret redaction pass.
+    /// </para>
+    /// <para>
+    /// CANCELLATION: an <see cref="OperationCanceledException"/> from ANY stage — the nonce
+    /// generator, the target-existence delegate, a staging seam, the clone, or EITHER identity
+    /// command — propagates AFTER the owned container has been cleaned up. In particular a
+    /// cancelled <c>user.email</c> ABORTS immediately: <c>user.name</c> does not run.
+    /// </para>
+    /// </remarks>
+    internal async Task<ConfigRepoOpResult> CloneAsync(string targetDir, CancellationToken ct)
+    {
+        // Stage 1 — disposed, FIRST.
+        if (Volatile.Read(ref _disposed) != 0)
+            return Reject("Seam disposed.");
+
+        // Stage 2 — argument basics, then the exact containment.
+        if (string.IsNullOrWhiteSpace(targetDir))
+            return Reject("Invalid arguments.");
+
+        string canonicalTargetDir;
+        try
+        {
+            canonicalTargetDir = Canonicalize(targetDir);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or SecurityException or IOException)
+        {
+            return Reject("Invalid arguments.");
+        }
+
+        if (!IsContained(canonicalTargetDir))
+            return Reject("Invalid git command: the working directory is not the config repository.");
+
+        // THE CANONICAL-PATH RULE: the parent, the target name, the clone arguments and the
+        // final move ALL derive from _configRepoDirCanonical — never from the caller's spelling.
+        if (TargetEntryExists())
+            return Reject(CloneTargetExists);
+
+        var parent = Path.GetDirectoryName(_configRepoDirCanonical);
+        var targetName = Path.GetFileName(_configRepoDirCanonical);
+        if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(targetName) || !Directory.Exists(parent))
+            return Reject("Invalid arguments.");
+
+        // Stage 4 — the URL / credential gating. NO container exists yet, so a rejection here
+        // leaves the filesystem completely untouched.
+        var (urlError, eligible, sanitizedUrl) = ResolveTransportEligibility();
+        if (urlError is not null)
+            return Reject(urlError);
+
+        string? credential = null;
+        string? helperPath = null;
+        if (eligible)
+        {
+            var (credentialError, resolvedCredential, resolvedHelper) = ResolveCredential();
+            credential = resolvedCredential;
+            if (credentialError is not null)
+                return RedactLiteralCredential(Reject(credentialError), credential);
+
+            helperPath = resolvedHelper;
+        }
+
+        // Stage 5 — the bounded staging-container acquisition.
+        var staging = AcquireStagingContainer(parent, targetName);
+        if (staging is null)
+            return RedactLiteralCredential(Reject(StagingUnavailable), credential);
+
+        var (container, owned) = staging.Value;
+        try
+        {
+            // Stage 6 — the clone subprocess. The working directory is the canonical PARENT
+            // (the target does not exist yet, so it cannot be the working directory).
+            var repoChild = Path.Combine(container, StagingRepoChild);
+            var clone = await LaunchCloneProcessAsync(
+                ["clone", sanitizedUrl!, repoChild], parent, ct, credential, helperPath);
+            if (clone is null)
+                return RedactLiteralCredential(Reject("Git process failed to start."), credential);
+
+            if (clone.ExitCode != 0)
+                return RedactLiteralCredential(MapResult(clone), credential);
+
+            // Stage 7 — the MANDATORY, credential-free clone-time identity, inside the clone.
+            var identityFailed = false;
+            var email = await LaunchCloneProcessAsync(
+                ["config", "user.email", IdentityEmail], repoChild, ct);
+            if (email is null || email.ExitCode != 0)
+                identityFailed = true;
+
+            var name = await LaunchCloneProcessAsync(
+                ["config", "user.name", IdentityName], repoChild, ct);
+            if (name is null || name.ExitCode != 0)
+                identityFailed = true;
+
+            if (identityFailed)
+                return RedactLiteralCredential(Reject(CloneIdentityFailed), credential);
+
+            // Stage 8 — the absence RE-CHECK, then the atomic move.
+            if (TargetEntryExists())
+                return RedactLiteralCredential(Reject(CloneTargetExists), credential);
+
+            try
+            {
+                Directory.Move(repoChild, _configRepoDirCanonical);
+            }
+            catch (PathTooLongException)
+            {
+                // The PATH-RETRY category, caught BEFORE IOException.
+                return RedactLiteralCredential(Reject(StagingUnavailable), credential);
+            }
+            catch (Exception ex) when (ex is SecurityException or ArgumentException)
+            {
+                return RedactLiteralCredential(Reject(StagingUnavailable), credential);
+            }
+            catch (Exception ex) when (ex is IOException and not PathTooLongException
+                or UnauthorizedAccessException or NotSupportedException)
+            {
+                // The COLLISION category. Anything ELSE PROPAGATES.
+                return RedactLiteralCredential(Reject(StagingUnavailable), credential);
+            }
+
+            return new ConfigRepoOpResult(true, 0, "", "");
+        }
+        finally
+        {
+            // The marker-iff cleanup. On the successful move the container still holds only the
+            // marker, so it is removed here too and nothing is ever left behind.
+            CleanupOwnedContainer(container, owned);
+        }
+    }
+
+    /// <summary>
+    /// Stage 5 — acquires an OWNED staging container within <see cref="StagingAttempts"/>
+    /// attempts. Each attempt: a fresh, VALIDATED nonce → the real occupancy check → the
+    /// container creation → the exclusive marker creation → the <c>repo</c>-child creation.
+    /// A collision or path-category failure at any step retries with a NEW nonce, cleaning up
+    /// this attempt's container FIRST when ownership had already been acquired.
+    /// </summary>
+    /// <returns>
+    /// The container path and its ownership flag, or <c>null</c> when all attempts collided.
+    /// </returns>
+    private (string Container, bool Owned)? AcquireStagingContainer(
+        string parent, string targetName)
+    {
+        for (var attempt = 0; attempt < StagingAttempts; attempt++)
+        {
+            var nonce = NextNonce();
+            if (nonce is null)
+                continue;
+
+            var candidate = Path.Combine(
+                parent, targetName + StagingContainerInfix + nonce + StagingContainerSuffix);
+
+            // The occupancy check ALWAYS uses the REAL algorithm — never the target seam — and
+            // its exceptions PROPAGATE exactly like the two target checks'.
+            if (EntryExists(candidate))
+                continue;
+
+            // THE PER-ATTEMPT marker state: an attempt owns only the container IT claimed.
+            string? container = candidate;
+            var owned = false;
+            try
+            {
+                Directory.CreateDirectory(candidate);
+
+                if (!CreateOwnershipMarker(candidate))
+                {
+                    // The marker was NOT created by this invocation, so the container must not
+                    // be deleted: it may be a foreign actor's.
+                    container = null;
+                    continue;
+                }
+
+                owned = true;
+
+                if (!CreateRepoChild(Path.Combine(candidate, StagingRepoChild)))
+                    continue; // the finally cleans up the OWNED container
+
+                container = null; // ownership passes to the caller — no cleanup here
+                return (candidate, true);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (PathTooLongException)
+            {
+                // THE PATH-RETRY CATEGORY, caught BEFORE IOException (it derives from it).
+            }
+            catch (Exception ex) when (ex is SecurityException or ArgumentException)
+            {
+                // The rest of the PATH-RETRY category.
+            }
+            catch (Exception ex) when (ex is IOException and not PathTooLongException
+                or UnauthorizedAccessException or NotSupportedException)
+            {
+                // THE COLLISION CATEGORY — the already-exists forms. Anything ELSE PROPAGATES.
+            }
+            finally
+            {
+                if (container is not null)
+                    CleanupOwnedContainer(container, owned);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Produces the next staging nonce. An INVALID output (empty, over
+    /// <see cref="MaxNonceLength"/> characters, or outside the safe leaf alphabet
+    /// <c>[0-9a-f]</c>) or a NON-cancellation throw counts as a COLLISION —
+    /// <c>null</c> here — so the attempt simply retries. An
+    /// <see cref="OperationCanceledException"/> PROPAGATES.
+    /// </summary>
+    private string? NextNonce()
+    {
+        string? nonce;
+        try
+        {
+            nonce = _stagingNonceGenerator();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        return IsValidNonce(nonce) ? nonce : null;
+    }
+
+    /// <summary>The default nonce: a 12-character lower-case hex slice of a fresh GUID.</summary>
+    private static string DefaultNonce() => Guid.NewGuid().ToString("N")[..12];
+
+    /// <summary>
+    /// The nonce domain: non-empty, at most <see cref="MaxNonceLength"/> characters, and made
+    /// exclusively of the SAFE leaf alphabet <c>[0-9a-f]</c> — so a nonce can never introduce a
+    /// separator, a dot segment, a wildcard or a case-folding surprise into the container name.
+    /// </summary>
+    private static bool IsValidNonce(string? nonce)
+    {
+        if (string.IsNullOrEmpty(nonce) || nonce.Length > MaxNonceLength)
+            return false;
+
+        foreach (var c in nonce)
+        {
+            if (c is not ((>= '0' and <= '9') or (>= 'a' and <= 'f')))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Creates the ownership marker inside <paramref name="container"/> — the ATOMIC exclusive
+    /// primitive. The real implementation is
+    /// <c>File.Open(&lt;container&gt;/.copilothive-owner, FileMode.CreateNew)</c>; the seam
+    /// receives the CONTAINER path and reports success/collision itself.
+    /// </summary>
+    private bool CreateOwnershipMarker(string container)
+    {
+        if (_stagingMarkerCreateNew is not null)
+            return _stagingMarkerCreateNew(container);
+
+        using var marker = File.Open(
+            Path.Combine(container, StagingOwnerMarker), FileMode.CreateNew);
+        return true;
+    }
+
+    /// <summary>
+    /// Creates the EMPTY git clone destination. The seam receives the fully-joined
+    /// <c>&lt;container&gt;/repo</c> PATH — not the bare container path.
+    /// </summary>
+    private bool CreateRepoChild(string repoChildPath)
+    {
+        if (_stagingRepoChildCreate is not null)
+            return _stagingRepoChildCreate(repoChildPath);
+
+        Directory.CreateDirectory(repoChildPath);
+        return true;
+    }
+
+    /// <summary>
+    /// THE CLEANUP RULE (the marker-iff): delete the container recursively IF AND ONLY IF the
+    /// marker file EXISTS at cleanup time AND this attempt's in-memory flag records that THIS
+    /// invocation's exclusive create succeeded. A foreign, unmarked container is NEVER deleted.
+    /// A deletion exception is SWALLOWED — a leaked staging directory is strictly better than a
+    /// failure that masks the operation's real outcome.
+    /// </summary>
+    private static void CleanupOwnedContainer(string container, bool owned)
+    {
+        if (!owned)
+            return;
+
+        try
+        {
+            if (!File.Exists(Path.Combine(container, StagingOwnerMarker)))
+                return;
+
+            Directory.Delete(container, recursive: true);
+        }
+        catch
+        {
+            // Swallowed — the cleanup is strictly best-effort.
+        }
+    }
+
+    /// <summary>
+    /// The TWO clone-target checks (the Stage 3 initial check and the Stage 8 re-check) over
+    /// <see cref="_configRepoDirCanonical"/>. When the seam is installed it REPLACES the
+    /// algorithm for these two call sites only — the staging occupancy checks always run the
+    /// real one. Every exception (including an <see cref="OperationCanceledException"/>)
+    /// PROPAGATES out of <see cref="CloneAsync"/> rather than being mapped to a fixed result.
+    /// </summary>
+    private bool TargetEntryExists() =>
+        _targetEntryExists is not null
+            ? _targetEntryExists(_configRepoDirCanonical)
+            : EntryExists(_configRepoDirCanonical);
+
+    /// <summary>
+    /// THE REAL entry-existence algorithm. <see cref="File.GetAttributes(string)"/> answers for
+    /// every ordinary entry — a file, a directory, or a symlink with a live target — regardless
+    /// of its attributes. Only the two ABSENCE exceptions fall through to the enumeration
+    /// fallback, which catches the DANGLING-symlink case: the link entry itself is listed in its
+    /// parent even though its target cannot be resolved. Any OTHER exception PROPAGATES.
+    /// </summary>
+    private static bool EntryExists(string path)
+    {
+        try
+        {
+            File.GetAttributes(path);
+            return true;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // The dangling-link case — fall through to the enumeration below.
+        }
+
+        var full = Path.GetFullPath(path);
+        var parent = Path.GetDirectoryName(full);
+        if (string.IsNullOrEmpty(parent) || !Directory.Exists(parent))
+            return false;
+
+        var leaf = Path.GetFileName(full);
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(parent))
+        {
+            if (string.Equals(Path.GetFileName(entry), leaf, comparison))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The clone-path launch helper: identical to <see cref="LaunchGitProcessAsync"/> except
+    /// that the working directory is EXPLICIT (the canonical parent for the clone itself, the
+    /// cloned worktree for the identity commands) rather than the config repo directory, which
+    /// does not exist yet.
+    /// </summary>
+    private async Task<GitProcessResult?> LaunchCloneProcessAsync(
+        IReadOnlyList<string> tokenizedArgs,
+        string workingDirectory,
+        CancellationToken ct,
+        string? credential = null,
+        string? helperPath = null)
+    {
+        try
+        {
+            return await GitOperations.ExecuteProcessAsync(
+                new GitProcessRequest(
+                    "git",
+                    Args: Array.Empty<string>(),
+                    WorkingDirectory: workingDirectory,
+                    Env: BuildChildEnv(credential, helperPath),
+                    TokenizedArgs: tokenizedArgs),
+                ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // A catch-ALL for non-cancellation launch failures. The exception's own text is
+            // NEVER propagated.
+            return null;
+        }
+    }
 
     /// <summary>
     /// Stage 6d — the origin state machine. Inspects <c>git remote get-url origin</c> and,
