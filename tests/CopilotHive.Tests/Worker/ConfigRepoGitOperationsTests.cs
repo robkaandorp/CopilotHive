@@ -5247,4 +5247,1873 @@ public sealed class ConfigRepoGitOperationsTests
     private static WorkerConfigProvisioner Provisioner() =>
         new("test-worker", static (_, _) =>
             Task.FromResult(new GetWorkerConfigResponse()), static _ => null, static (_, _) => { });
+
+    // ==================================================================
+    // Slice 2c-b2 — ProbeAndEnsureRepoHealthyAsync:
+    // the worktree probe, the top-level containment verification, the
+    // best-effort origin reconciliation-as-API and the local identity.
+    // ==================================================================
+
+    /// <summary>Stage 4 — a bare repository, a nonzero exit, or a probe that never ran.</summary>
+    private const string NotAWorktree = "Not a git worktree.";
+
+    /// <summary>Stage 4 — an exit-0 probe whose stdout is neither <c>true</c> nor <c>false</c>.</summary>
+    private const string UnrecognizedRevParse = "Unrecognized rev-parse output.";
+
+    /// <summary>Stage 5 — <c>rev-parse --show-toplevel</c> produced no usable answer.</summary>
+    private const string ToplevelUnknown = "Could not determine worktree root.";
+
+    /// <summary>Stage 5 — the reported worktree root is NOT the configured directory.</summary>
+    private const string ToplevelMismatch =
+        "Config repo worktree root does not match the configured directory.";
+
+    /// <summary>Stage 6 — a Branch B (ineligible) config repo needs no origin repair.</summary>
+    private const string ReconciliationSkipped =
+        "Config repo origin reconciliation skipped: the configured repository is not HTTPS github.com.";
+
+    /// <summary>Stage 6 — the NOTE prefix applied to an origin state-machine rejection.</summary>
+    private const string ReconciliationFailed = "Origin reconciliation failed: ";
+
+    /// <summary>
+    /// The four EXACT reconciliation notes. They are spelled out as LITERALS rather than
+    /// composed from the command-path constants: the note continues the prefix's sentence, so
+    /// the rejection's leading capital is lowered, and that is part of the contract.
+    /// </summary>
+    private const string NoteOriginNotVerified =
+        "Origin reconciliation failed: config repo origin could not be verified.";
+
+    private const string NoteOriginNotAdded =
+        "Origin reconciliation failed: config repo origin could not be added.";
+
+    private const string NoteOriginNotUpdated =
+        "Origin reconciliation failed: config repo origin could not be updated.";
+
+    private const string NoteOriginMismatch =
+        "Origin reconciliation failed: config repo origin does not match the configured repository.";
+
+    /// <summary>Stage 6b — the FIXED note for a failed <c>git config user.email</c>.</summary>
+    private const string IdentityEmailFailed = "Identity configuration failed: user.email.";
+
+    /// <summary>Stage 6b — the FIXED note for a failed <c>git config user.name</c>.</summary>
+    private const string IdentityNameFailed = "Identity configuration failed: user.name.";
+
+    /// <summary>Stage 4 — the worktree probe command.</summary>
+    private static readonly string[] ProbeWorktree = ["rev-parse", "--is-inside-work-tree"];
+
+    /// <summary>Stage 5 — the top-level query command.</summary>
+    private static readonly string[] ProbeToplevel = ["rev-parse", "--show-toplevel"];
+
+    /// <summary>Stage 6b — the EXACT identity commands, in their required order.</summary>
+    private static readonly string[] IdentityEmailCommand =
+        ["config", "user.email", "copilothive-worker@local"];
+
+    private static readonly string[] IdentityNameCommand =
+        ["config", "user.name", "CopilotHive Worker"];
+
+    /// <summary>
+    /// A credential-BEARING origin that is otherwise structurally equivalent to
+    /// <see cref="EligibleUrl"/>: the state machine REPAIRS it with <c>remote set-url</c>.
+    /// </summary>
+    private const string CredentialBearingOrigin =
+        "https://x-access-token:ghp_secret@github.com/org/config-repo.git";
+
+    /// <summary>The outcome of one probe run: the health plus everything observable about it.</summary>
+    private sealed record ProbeRun(
+        ConfigRepoHealth Health,
+        List<GitProcessRequest> Requests,
+        int CredentialCalls,
+        int HelperCalls);
+
+    /// <summary>
+    /// The default HEALTHY fake response for the health API's commands: the worktree probe
+    /// reports <c>true</c>, the top-level query reports <paramref name="toplevel"/> (defaulting
+    /// to <see cref="RepoDir"/> — a MATCHING root), <c>remote get-url</c> reports
+    /// <paramref name="originStdout"/> (defaulting to the already-equivalent, credential-free
+    /// <see cref="EligibleUrl"/>) and every other command succeeds silently.
+    /// </summary>
+    private static GitProcessResult HealthAwareResult(
+        GitProcessRequest request, string? toplevel = null, string? originStdout = EligibleUrl)
+    {
+        var tokens = request.TokenizedArgs!;
+        if (tokens[0] == "rev-parse")
+        {
+            return tokens[1] == "--is-inside-work-tree"
+                ? new GitProcessResult(0, "true", string.Empty)
+                : new GitProcessResult(0, toplevel ?? RepoDir, string.Empty);
+        }
+
+        if (tokens[0] == "remote")
+        {
+            return new GitProcessResult(
+                0,
+                tokens[1] == "get-url" ? originStdout ?? string.Empty : string.Empty,
+                string.Empty);
+        }
+
+        // The identity commands (`config user.email` / `config user.name`).
+        return new GitProcessResult(0, string.Empty, string.Empty);
+    }
+
+    /// <summary>
+    /// Runs the health probe against a SCRIPTED ProcessRunner (restored in a finally block),
+    /// capturing EVERY request so the exact command sequence AND the exact invocation TOTAL can
+    /// be asserted. The credential resolver and the credential-helper delegate are instrumented
+    /// so that "the health API never invokes them" is checkable on every vector.
+    /// <para>
+    /// <paramref name="targetDir"/> is sent to the SUT VERBATIM — including an explicit
+    /// <c>null</c> — otherwise the Stage 2 null row would never reach production.
+    /// </para>
+    /// </summary>
+    private static async Task<ProbeRun> ProbeInAsync(
+        Func<GitProcessRequest, GitProcessResult> respond,
+        string? targetDir,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string, string>? pathCanonicalizer = null,
+        string? configRepoDir = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(respond(request));
+            };
+
+            using var seam = CreateSeam(
+                pathCanonicalizer: pathCanonicalizer,
+                configRepoDir: configRepoDir,
+                resolvedUrlResolver: resolvedUrlResolver,
+                credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            var health = await Bounded(
+                seam.ProbeAndEnsureRepoHealthyAsync(targetDir!, CancellationToken.None));
+            return new ProbeRun(health, requests, credentialCalls, helperCalls);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>The common case: the target directory IS the configured config repo.</summary>
+    private static Task<ProbeRun> ProbeAsync(
+        Func<GitProcessRequest, GitProcessResult> respond,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string, string>? pathCanonicalizer = null) =>
+        ProbeInAsync(respond, RepoDir, resolvedUrlResolver, pathCanonicalizer);
+
+    /// <summary>The default healthy script.</summary>
+    private static Task<ProbeRun> ProbeHealthyAsync(
+        Func<string?>? resolvedUrlResolver = null,
+        string? originStdout = EligibleUrl) =>
+        ProbeAsync(request => HealthAwareResult(request, originStdout: originStdout),
+            resolvedUrlResolver);
+
+    /// <summary>
+    /// A NEGATIVE health report: no repo, NO directories, and the exact reason.
+    /// </summary>
+    private static void AssertUnhealthy(ConfigRepoHealth health, string expectedReason)
+    {
+        Assert.False(health.HasRepo);
+        Assert.Null(health.RepoDir);
+        Assert.Null(health.AgentsWorkDir);
+        Assert.Equal(expectedReason, health.SanitizedReason);
+    }
+
+    /// <summary>
+    /// The health API resolves NO credential and NO helper path: every one of its subprocesses
+    /// is credential-free, so neither Stage 6e delegate may ever be touched.
+    /// </summary>
+    private static void AssertNoCredentialDelegates(ProbeRun run)
+    {
+        Assert.Equal(0, run.CredentialCalls);
+        Assert.Equal(0, run.HelperCalls);
+    }
+
+    /// <summary>
+    /// A HEALTHY report for the default fixture: the reported root and its agents directory,
+    /// with <paramref name="expectedReason"/> as the (possibly null) aggregated note.
+    /// </summary>
+    private static void AssertHealthy(
+        ConfigRepoHealth health, string? expectedReason, string? expectedRepoDir = null)
+    {
+        var repoDir = expectedRepoDir ?? RepoDir;
+        Assert.True(health.HasRepo);
+        Assert.Equal(repoDir, health.RepoDir);
+        Assert.Equal(Path.Combine(repoDir, "agents"), health.AgentsWorkDir);
+        Assert.Equal(expectedReason, health.SanitizedReason);
+    }
+
+    /// <summary>
+    /// The four reconciliation notes really ARE the fixed prefix followed by the command
+    /// path's OWN rejection message, lower-cased at its first character to continue the
+    /// sentence. This pins the note literals to the state machine's messages, so a note that
+    /// drifted away from its rejection (or a rejection message that changed) is caught here
+    /// rather than silently accepted by the vector tests.
+    /// </summary>
+    [Fact]
+    public void Health_ReconciliationNotes_ArePrefixPlusTheStateMachineMessage()
+    {
+        Assert.All(
+            new[]
+            {
+                (Note: NoteOriginNotVerified, Rejection: OriginNotVerified),
+                (Note: NoteOriginNotAdded, Rejection: OriginNotAdded),
+                (Note: NoteOriginNotUpdated, Rejection: OriginNotUpdated),
+                (Note: NoteOriginMismatch, Rejection: OriginMismatch),
+            },
+            pair => Assert.Equal(
+                ReconciliationFailed
+                + char.ToLowerInvariant(pair.Rejection[0])
+                + pair.Rejection[1..],
+                pair.Note));
+    }
+
+    /// <summary>
+    /// THE SECRECY SWEEP: across EVERY health vector — each terminal outcome of every stage,
+    /// each reconciliation branch (absent/add-failure/unclassifiable/repair/mismatch/skipped),
+    /// each URL-resolver failure mode and each identity failure — the health API resolves NO
+    /// credential and NO helper path. A SINGLE seam instance is reused so the counters
+    /// accumulate across all of them: one stray resolution anywhere in the matrix fails here.
+    /// </summary>
+    /// <remarks>
+    /// This is deliberately a sweep rather than an assertion bolted onto the concurrency
+    /// fixtures: those drive the COMMAND path as well, which legitimately resolves a credential
+    /// for its final launch, so a zero assertion there would be wrong (and would pass for the
+    /// wrong reason if the health API started resolving too).
+    /// </remarks>
+    [Fact]
+    public async Task Health_AcrossEveryVector_NeverResolvesACredentialOrHelperPath()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        var url = EligibleUrl;
+        Func<GitProcessRequest, GitProcessResult> respond = HealthScript();
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => Task.FromResult(respond(request));
+
+            using var seam = new ConfigRepoGitOperations(
+                RepoDir,
+                () => url is null ? throw new InvalidOperationException("snapshot absent") : url,
+                () => { credentialCalls++; return "ghp_secret"; },
+                Log(),
+                () => { helperCalls++; return "/helper"; },
+                static () => { });
+
+            // Every vector: (the resolved URL — null means a THROWING resolver, the script).
+            var vectors = new (string? Url, Func<GitProcessRequest, GitProcessResult> Respond)[]
+            {
+                // Stage 3 — a foreign directory (asserted separately below).
+                (EligibleUrl, HealthScript()),
+                // Stage 4 terminals.
+                (EligibleUrl, r => r.TokenizedArgs![1] == "--is-inside-work-tree"
+                    ? new GitProcessResult(0, "false", "") : HealthAwareResult(r)),
+                (EligibleUrl, r => r.TokenizedArgs![1] == "--is-inside-work-tree"
+                    ? new GitProcessResult(0, "", "") : HealthAwareResult(r)),
+                (EligibleUrl, r => r.TokenizedArgs![1] == "--is-inside-work-tree"
+                    ? new GitProcessResult(1, "", "fatal") : HealthAwareResult(r)),
+                (EligibleUrl, _ => throw new InvalidOperationException("boom")),
+                // Stage 5 terminals.
+                (EligibleUrl, HealthScript(toplevel: OutsideDir)),
+                (EligibleUrl, HealthScript(toplevel: "")),
+                (EligibleUrl, r => r.TokenizedArgs![1] == "--show-toplevel"
+                    ? new GitProcessResult(1, "", "fatal") : HealthAwareResult(r)),
+                (EligibleUrl, r => r.TokenizedArgs![1] == "--show-toplevel"
+                    ? throw new InvalidOperationException("boom") : HealthAwareResult(r)),
+                // Stage 6 — the URL-resolution branches.
+                (null, HealthScript()),                                   // a THROWING resolver
+                ("", HealthScript()),                                     // a MISSING url
+                ("ftp://github.com/o/r.git", HealthScript()),             // a SANITIZER rejection
+                ("ssh://git@github.com/org/config-repo.git", HealthScript()), // INELIGIBLE
+                // Stage 6 — every reconciliation branch.
+                (EligibleUrl, HealthScript()),                            // equivalent, untouched
+                (EligibleUrl, HealthScript(originStdout: "")),            // ABSENT → add
+                (EligibleUrl, r => r.TokenizedArgs![0] == "remote" && r.TokenizedArgs![1] != "get-url"
+                    ? new GitProcessResult(1, "", "fatal")
+                    : HealthAwareResult(r, originStdout: "")),            // an ADD failure
+                (EligibleUrl, r => r.TokenizedArgs![0] == "remote"
+                    ? new GitProcessResult(1, "", "fatal: unrelated") : HealthAwareResult(r)),
+                (EligibleUrl, r => r.TokenizedArgs![0] == "remote"
+                    ? throw new InvalidOperationException("boom") : HealthAwareResult(r)),
+                (EligibleUrl, HealthScript(originStdout: CredentialBearingOrigin)), // REPAIR
+                (EligibleUrl, r => r.TokenizedArgs![0] == "remote" && r.TokenizedArgs![1] != "get-url"
+                    ? new GitProcessResult(1, "", "fatal")
+                    : HealthAwareResult(r, originStdout: CredentialBearingOrigin)), // set-url fail
+                (EligibleUrl, HealthScript(originStdout: "https://github.com/org/other.git")),
+                // Stage 6b — the identity failures.
+                (EligibleUrl, r => r.TokenizedArgs![0] == "config"
+                    ? new GitProcessResult(1, "", "fatal") : HealthAwareResult(r)),
+                (EligibleUrl, r => r.TokenizedArgs![0] == "config"
+                    ? throw new InvalidOperationException("boom") : HealthAwareResult(r)),
+            };
+
+            foreach (var (vectorUrl, vectorRespond) in vectors)
+            {
+                url = vectorUrl;
+                respond = vectorRespond;
+                await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None));
+            }
+
+            // The Stage 2/3 rejections too.
+            url = EligibleUrl;
+            respond = HealthScript();
+            await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(OutsideDir, CancellationToken.None));
+            await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(null!, CancellationToken.None));
+
+            // The vector list really did exercise the whole matrix.
+            Assert.Equal(23, vectors.Length);
+
+            Assert.Equal(0, credentialCalls);
+            Assert.Equal(0, helperCalls);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 1 — disposal runs FIRST ─────────────────────────────────────
+
+    /// <summary>
+    /// The disposal check is the FIRST stage: a disposed seam reports the fixed result and
+    /// launches NOTHING — even for a perfectly valid target directory.
+    /// </summary>
+    [Fact]
+    public async Task Health_PostDisposal_ReturnsSeamDisposedWithoutLaunching()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(HealthAwareResult(request));
+            };
+
+            using var seam = CreateSeam();
+            seam.Dispose();
+
+            AssertUnhealthy(
+                await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None)),
+                "Seam disposed.");
+            Assert.Empty(requests);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Stage 1 PRECEDES Stage 2: a disposed seam handed a null target directory still reports
+    /// <c>Seam disposed.</c>, never <c>Invalid arguments.</c>. Reordering the two stages flips
+    /// this message and fails the test.
+    /// </summary>
+    [Fact]
+    public async Task Health_PostDisposal_PrecedesArgumentValidation()
+    {
+        using var seam = CreateSeam();
+        seam.Dispose();
+
+        AssertUnhealthy(
+            await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(null!, CancellationToken.None)),
+            "Seam disposed.");
+    }
+
+    // ── Stage 2/3 — the argument basics and the containment ───────────────
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\t")]
+    [InlineData("\n ")]
+    public async Task Health_NullOrWhitespaceTargetDir_ReturnsInvalidArgumentsWithoutLaunching(
+        string? targetDir)
+    {
+        var run = await ProbeInAsync(HealthScript(), targetDir);
+
+        AssertUnhealthy(run.Health, InvalidArguments);
+        Assert.Empty(run.Requests);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A PATH-RELATED exception from the containment's <c>Canonicalize(targetDir)</c> maps to
+    /// the same fixed <c>Invalid arguments.</c> — for every one of the five path exception
+    /// types — and nothing is launched.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ThrowingCanonicalizers))]
+    public async Task Health_PathExceptionCanonicalizingTargetDir_ReturnsInvalidArguments(
+        string exceptionTypeName, Func<Exception> factory)
+    {
+        Assert.False(string.IsNullOrEmpty(exceptionTypeName)); // the type name labels the case
+
+        var badTarget = Path.DirectorySeparatorChar + "bad-target-dir";
+        var run = await ProbeInAsync(
+            HealthScript(),
+            badTarget,
+            pathCanonicalizer: p => p == badTarget ? throw factory() : Path.GetFullPath(p));
+
+        AssertUnhealthy(run.Health, InvalidArguments);
+        Assert.Empty(run.Requests);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A target directory OUTSIDE the configured config repo is rejected by the SAME exact
+    /// containment as the command path — and, critically, NO probe subprocess is launched: the
+    /// seam never reconciles or identity-mutates a repository it does not own.
+    /// </summary>
+    [Fact]
+    public async Task Health_TargetDirOutsideConfigRepo_RejectsWithZeroSubprocesses()
+    {
+        var run = await ProbeInAsync(HealthScript(), OutsideDir);
+
+        AssertUnhealthy(run.Health, NotConfigRepo);
+        Assert.Empty(run.Requests);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A DESCENDANT of the config repo is not the config repo: the containment is exact
+    /// directory equality, never a prefix check, so a nested path is rejected with the same
+    /// message and launches nothing.
+    /// </summary>
+    [Fact]
+    public async Task Health_TargetDirNestedInsideConfigRepo_RejectsWithZeroSubprocesses()
+    {
+        var run = await ProbeInAsync(HealthScript(), Path.Combine(RepoDir, "agents"));
+
+        AssertUnhealthy(run.Health, NotConfigRepo);
+        Assert.Empty(run.Requests);
+    }
+
+    /// <summary>A trailing separator still canonicalizes to the same directory.</summary>
+    [Fact]
+    public async Task Health_TargetDirWithTrailingSeparator_IsContained()
+    {
+        var run = await ProbeInAsync(HealthScript(), RepoDirWithSeparator);
+
+        AssertHealthy(run.Health, null);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>The default healthy script, as a reusable responder.</summary>
+    private static Func<GitProcessRequest, GitProcessResult> HealthScript(
+        string? toplevel = null, string? originStdout = EligibleUrl) =>
+        request => HealthAwareResult(request, toplevel, originStdout);
+
+    // ── Stage 4 — the worktree probe ──────────────────────────────────────
+
+    /// <summary>
+    /// The probe request has the EXACT credential-free shape: <c>rev-parse
+    /// --is-inside-work-tree</c>, empty <c>Args</c>, the CONSTRUCTOR-canonicalized working
+    /// directory (never the call-time spelling), and the scrubbed env plus
+    /// <c>GIT_TERMINAL_PROMPT=0</c>.
+    /// </summary>
+    [Fact]
+    public async Task Health_EverySubprocessIsCredentialFreeAndUsesTheCanonicalWorkingDirectory()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(
+                    HealthAwareResult(request, CanonicalizedRepoDir, CredentialBearingOrigin));
+            };
+
+            using var seam = CreateSeam(
+                pathCanonicalizer: _ => CanonicalizedRepoDir,
+                credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            var health = await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(
+                RepoDirWithSeparator, CancellationToken.None));
+
+            Assert.True(health.HasRepo);
+            Assert.Null(health.SanitizedReason);
+
+            // The repair path is exercised too, so the set-url launch is covered as well.
+            AssertSequence(
+                requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginSetUrl,
+                IdentityEmailCommand, IdentityNameCommand);
+
+            foreach (var request in requests)
+            {
+                Assert.Equal("git", request.Executable);
+                Assert.Empty(request.Args);
+                Assert.Equal(CanonicalizedRepoDir, request.WorkingDirectory);
+                AssertChildEnv(request); // credential-free, GIT_TERMINAL_PROMPT=0
+            }
+
+            // The health API resolves NO credential and NO helper path, ever.
+            Assert.Equal(0, credentialCalls);
+            Assert.Equal(0, helperCalls);
+
+            // The seam never WRITES a credential: the repair carries the SANITIZED url.
+            Assert.DoesNotContain("ghp_secret", requests[3].TokenizedArgs!, StringComparer.Ordinal);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// An exit-0 probe reporting <c>false</c> is a BARE repository: not a worktree. The probe
+    /// stops immediately — the top-level query never runs.
+    /// </summary>
+    [Theory]
+    [InlineData("false")]
+    [InlineData("false\n")]
+    [InlineData("  false  ")]
+    public async Task Health_ProbeReportsFalse_ReturnsNotAWorktreeAfterOneSubprocess(string stdout)
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![1] == "--is-inside-work-tree"
+            ? new GitProcessResult(0, stdout, string.Empty)
+            : HealthAwareResult(request));
+
+        AssertUnhealthy(run.Health, NotAWorktree);
+        AssertSequence(run.Requests, ProbeWorktree);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An exit-0 probe whose trimmed stdout is neither <c>true</c> nor <c>false</c> — INCLUDING
+    /// empty and whitespace-only output, and including a case variant, since the comparison is
+    /// ORDINAL — is unrecognized output. It is deliberately NOT folded into
+    /// <c>Not a git worktree.</c>: the seam must never act on output it cannot read.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    [InlineData("\t \r\n")]
+    [InlineData("TRUE")]
+    [InlineData("True")]
+    [InlineData("FALSE")]
+    [InlineData("yes")]
+    [InlineData("1")]
+    [InlineData("true false")]
+    [InlineData("truex")]
+    public async Task Health_ProbeUnrecognizedStdout_ReturnsUnrecognizedRevParseOutput(string stdout)
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![1] == "--is-inside-work-tree"
+            ? new GitProcessResult(0, stdout, string.Empty)
+            : HealthAwareResult(request));
+
+        AssertUnhealthy(run.Health, UnrecognizedRevParse);
+        AssertSequence(run.Requests, ProbeWorktree);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A NONZERO probe exit is <c>Not a git worktree.</c> — regardless of what it printed on
+    /// stdout, which is exactly what keeps a nonzero exit distinct from unrecognized output.
+    /// </summary>
+    [Theory]
+    [InlineData(1, "")]
+    [InlineData(128, "fatal: not a git repository")]
+    [InlineData(128, "true")]
+    [InlineData(255, "garbage")]
+    public async Task Health_ProbeNonZeroExit_ReturnsNotAWorktree(int exitCode, string stdout)
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![1] == "--is-inside-work-tree"
+            ? new GitProcessResult(exitCode, stdout, "fatal: nope")
+            : HealthAwareResult(request));
+
+        AssertUnhealthy(run.Health, NotAWorktree);
+        AssertSequence(run.Requests, ProbeWorktree);
+    }
+
+    /// <summary>
+    /// A LAUNCH failure (any non-cancellation exception from the runner) maps to the fixed
+    /// <c>Git process failed to start.</c> — the exception's own text NEVER escapes.
+    /// </summary>
+    [Fact]
+    public async Task Health_ProbeLaunchFailure_ReturnsFixedLaunchFailureMessage()
+    {
+        var run = await ProbeAsync(
+            _ => throw new InvalidOperationException("boom: https://x-access-token:tok@github.com/o"));
+
+        AssertUnhealthy(run.Health, LaunchFailed);
+        AssertSequence(run.Requests, ProbeWorktree);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> from the probe subprocess PROPAGATES — the
+    /// EXACT instance, never mapped to a launch failure and never recorded as a note.
+    /// </summary>
+    [Fact]
+    public async Task Health_ProbeThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var invoked = 0;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                invoked++;
+                throw delegateOce;
+            };
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource(); // the token stays LIVE
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, liveCts.Token));
+
+            Assert.Same(delegateOce, ex);
+            Assert.Equal(1, invoked);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>A PRE-cancelled token is observed at the probe launch.</summary>
+    [Fact]
+    public async Task Health_PreCancelledToken_PropagatesAtTheProbe()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(HealthAwareResult(request));
+            };
+
+            using var seam = CreateSeam();
+            using var cts = new CancellationTokenSource();
+            await cts.CancelAsync();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, cts.Token));
+
+            Assert.Equal(cts.Token, ex.CancellationToken);
+            Assert.Empty(requests); // ExecuteProcessAsync observed it before the delegate
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 5 — the top-level containment verification ──────────────────
+
+    /// <summary>
+    /// A MATCHING top-level reports <c>RepoDir</c> as the TRIMMED git stdout VERBATIM — the
+    /// canonicalization exists only for the COMPARISON. The fixture reports the root with
+    /// surrounding whitespace AND a trailing separator: the whitespace is trimmed, the trailing
+    /// separator SURVIVES (proving no re-canonicalization), and <c>AgentsWorkDir</c> is derived
+    /// from that exact string.
+    /// </summary>
+    [Fact]
+    public async Task Health_MatchingToplevel_ReportsTrimmedGitStdoutVerbatim()
+    {
+        var reported = RepoDir + Path.DirectorySeparatorChar;
+        var run = await ProbeAsync(HealthScript(toplevel: "  " + reported + " \n"));
+
+        Assert.True(run.Health.HasRepo);
+        Assert.Equal(reported, run.Health.RepoDir);
+        Assert.Equal(Path.Combine(reported, "agents"), run.Health.AgentsWorkDir);
+        Assert.Null(run.Health.SanitizedReason);
+
+        // The canonical form is observably DIFFERENT — a mutant re-canonicalizing the output
+        // would report this instead.
+        Assert.NotEqual(RepoDir, run.Health.RepoDir);
+    }
+
+    /// <summary>
+    /// The same rule proved through the canonicalizer SEAM: every path canonicalizes to
+    /// <see cref="CanonicalizedRepoDir"/>, so the reported root passes containment while being
+    /// a completely different string — and it is THAT string the health report carries.
+    /// </summary>
+    [Fact]
+    public async Task Health_MatchingToplevel_IsNotReCanonicalized()
+    {
+        var reported = Path.DirectorySeparatorChar + "reported-worktree-root";
+        var run = await ProbeAsync(
+            HealthScript(toplevel: reported + "\n"),
+            pathCanonicalizer: _ => CanonicalizedRepoDir);
+
+        Assert.True(run.Health.HasRepo);
+        Assert.Equal(reported, run.Health.RepoDir);
+        Assert.Equal(Path.Combine(reported, "agents"), run.Health.AgentsWorkDir);
+        Assert.NotEqual(CanonicalizedRepoDir, run.Health.RepoDir);
+        Assert.Null(run.Health.SanitizedReason);
+    }
+
+    /// <summary>
+    /// A top-level resolving OUTSIDE the configured directory keeps <c>HasRepo=true</c> — the
+    /// repository genuinely exists — but reports NO directories and SKIPS the reconciliation
+    /// and the identity entirely: exactly TWO subprocesses ran. This is the unrelated-repository
+    /// case: the seam must never reconcile or identity-mutate a repo it does not own.
+    /// </summary>
+    [Fact]
+    public async Task Health_ToplevelOutsideConfigRepo_RetainsHasRepoAndSkipsReconciliationAndIdentity()
+    {
+        var run = await ProbeAsync(HealthScript(toplevel: OutsideDir));
+
+        Assert.True(run.Health.HasRepo);
+        Assert.Null(run.Health.RepoDir);
+        Assert.Null(run.Health.AgentsWorkDir);
+        Assert.Equal(ToplevelMismatch, run.Health.SanitizedReason);
+
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+        Assert.Equal(2, run.Requests.Count);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An exit-0 top-level with EMPTY or whitespace-only stdout cannot identify a root.
+    /// <c>HasRepo</c> drops to false and nothing further runs.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    [InlineData("\t \r\n")]
+    public async Task Health_ToplevelEmptyOrWhitespace_ReturnsCouldNotDetermineWorktreeRoot(
+        string stdout)
+    {
+        var run = await ProbeAsync(HealthScript(toplevel: stdout));
+
+        AssertUnhealthy(run.Health, ToplevelUnknown);
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// The EMPTY-top-level guard is pinned INDEPENDENTLY of the canonicalizer. With the real
+    /// <see cref="Path.GetFullPath(string)"/> an empty path happens to throw, which would let a
+    /// deleted guard fall through to the identical message for the wrong reason. Here the
+    /// canonicalizer seam maps EVERY input to the configured directory and never throws, so a
+    /// missing guard would sail through the containment and report a HEALTHY repo whose root is
+    /// the empty string. The guard must fire FIRST and report the fixed message.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    public async Task Health_EmptyToplevel_GuardPrecedesCanonicalization(string stdout)
+    {
+        var run = await ProbeAsync(
+            HealthScript(toplevel: stdout),
+            pathCanonicalizer: _ => RepoDir); // never throws, always "contained"
+
+        AssertUnhealthy(run.Health, ToplevelUnknown);
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A PATH-RELATED exception while canonicalizing the reported top-level maps to the same
+    /// fixed message — for every one of the five path exception types.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ThrowingCanonicalizers))]
+    public async Task Health_PathExceptionCanonicalizingToplevel_ReturnsCouldNotDetermineWorktreeRoot(
+        string exceptionTypeName, Func<Exception> factory)
+    {
+        Assert.False(string.IsNullOrEmpty(exceptionTypeName)); // the type name labels the case
+
+        var reported = Path.DirectorySeparatorChar + "unreadable-root";
+        var run = await ProbeAsync(
+            HealthScript(toplevel: reported),
+            pathCanonicalizer: p => p == reported ? throw factory() : Path.GetFullPath(p));
+
+        AssertUnhealthy(run.Health, ToplevelUnknown);
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+    }
+
+    /// <summary>A NONZERO top-level exit maps to the same fixed message.</summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(128)]
+    public async Task Health_ToplevelNonZeroExit_ReturnsCouldNotDetermineWorktreeRoot(int exitCode)
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![1] == "--show-toplevel"
+            ? new GitProcessResult(exitCode, RepoDir, "fatal: nope")
+            : HealthAwareResult(request));
+
+        AssertUnhealthy(run.Health, ToplevelUnknown);
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+    }
+
+    /// <summary>
+    /// A LAUNCH failure on the top-level query maps to the SAME fixed message — deliberately
+    /// NOT to <c>Git process failed to start.</c>: once the worktree probe succeeded, an
+    /// unreadable root is a root problem.
+    /// </summary>
+    [Fact]
+    public async Task Health_ToplevelLaunchFailure_ReturnsCouldNotDetermineWorktreeRoot()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![1] == "--show-toplevel"
+            ? throw new InvalidOperationException("boom")
+            : HealthAwareResult(request));
+
+        AssertUnhealthy(run.Health, ToplevelUnknown);
+        AssertSequence(run.Requests, ProbeWorktree, ProbeToplevel);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>An OCE from the top-level subprocess PROPAGATES — the exact instance.</summary>
+    [Fact]
+    public async Task Health_ToplevelThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+        var commands = new List<string[]>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                commands.Add(request.TokenizedArgs!.ToArray());
+                return request.TokenizedArgs![1] == "--show-toplevel"
+                    ? throw delegateOce
+                    : Task.FromResult(HealthAwareResult(request));
+            };
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, liveCts.Token));
+
+            Assert.Same(delegateOce, ex);
+            Assert.Equal([ProbeWorktree, ProbeToplevel], commands);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 6 — the best-effort origin reconciliation ───────────────────
+
+    /// <summary>
+    /// FULL SUCCESS: an already-equivalent credential-free origin needs no repair, both
+    /// identity commands succeed, and the report carries NO reason at all.
+    /// </summary>
+    [Fact]
+    public async Task Health_FullSuccess_ReportsRepoDirsAndNullReason()
+    {
+        var run = await ProbeHealthyAsync();
+
+        AssertHealthy(run.Health, null);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An INELIGIBLE (Branch B) sanitized URL — SSH, file, a local path, or an explicit
+    /// non-443 port — SKIPS the origin reconciliation with the fixed note: the equivalence
+    /// logic requires HTTPS/443 and the health API does not extend it. The IDENTITY still runs,
+    /// and NO <c>get-url</c>/<c>add</c>/<c>set-url</c> is ever launched.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IneligibleUrlCases))]
+    public async Task Health_IneligibleUrl_SkipsReconciliationButStillConfiguresIdentity(string url)
+    {
+        var run = await ProbeHealthyAsync(UrlResolver(url));
+
+        AssertHealthy(run.Health, ReconciliationSkipped);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An ABSENT origin — every case-insensitive no-such-remote stderr pattern — is ADDED with
+    /// the SANITIZED url, and a successful reconciliation produces NO note.
+    /// </summary>
+    [Theory]
+    [InlineData("error: No such remote 'origin'")]
+    [InlineData("fatal: no such remote 'origin'")]
+    [InlineData("fatal: NOT A GIT REPOSITORY (or any of the parent directories): .git")]
+    [InlineData("fatal: does not appear to be a git repository")]
+    [InlineData("fatal: DOES NOT APPEAR TO BE A GIT REPOSITORY")]
+    public async Task Health_AbsentOriginByStderr_AddsTheOriginWithNoNote(string stderr)
+    {
+        var run = await ProbeAsync(request =>
+            request.TokenizedArgs![0] == "remote" && request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(128, string.Empty, stderr)
+                : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, null);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginAdd,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>An exit-0 inspection with EMPTY/whitespace stdout is ALSO an absent origin.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    public async Task Health_AbsentOriginByEmptyStdout_AddsTheOriginWithNoNote(string stdout)
+    {
+        var run = await ProbeHealthyAsync(originStdout: stdout);
+
+        AssertHealthy(run.Health, null);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginAdd,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A <c>remote add</c> failure — a nonzero exit — becomes a NOTE, never an abort: the
+    /// identity still runs and <c>HasRepo</c> stays true with the directories reported.
+    /// </summary>
+    [Fact]
+    public async Task Health_AddNonZeroExit_RecordsOriginNotAddedNote()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] switch
+        {
+            "remote" when request.TokenizedArgs![1] == "get-url" =>
+                new GitProcessResult(0, string.Empty, string.Empty),
+            "remote" => new GitProcessResult(1, string.Empty, "fatal: cannot add"),
+            _ => HealthAwareResult(request),
+        });
+
+        AssertHealthy(run.Health, NoteOriginNotAdded);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginAdd,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>A <c>remote add</c> LAUNCH failure maps to the same note.</summary>
+    [Fact]
+    public async Task Health_AddLaunchFailure_RecordsOriginNotAddedNote()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] switch
+        {
+            "remote" when request.TokenizedArgs![1] == "get-url" =>
+                new GitProcessResult(0, string.Empty, string.Empty),
+            "remote" => throw new InvalidOperationException("boom"),
+            _ => HealthAwareResult(request),
+        });
+
+        AssertHealthy(run.Health, NoteOriginNotAdded);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginAdd,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An UNCLASSIFIABLE <c>get-url</c> failure (a nonzero exit whose stderr matches no
+    /// absence pattern) records the verification note — and NEVER adds an origin.
+    /// </summary>
+    [Theory]
+    [InlineData("fatal: something else entirely")]
+    [InlineData("")]
+    [InlineData("error: unable to read config")]
+    public async Task Health_UnclassifiableGetUrlFailure_RecordsOriginNotVerifiedNote(string stderr)
+    {
+        var run = await ProbeAsync(request =>
+            request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(1, string.Empty, stderr)
+                : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, NoteOriginNotVerified);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>A <c>get-url</c> LAUNCH failure records the same verification note.</summary>
+    [Fact]
+    public async Task Health_GetUrlLaunchFailure_RecordsOriginNotVerifiedNote()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] == "remote"
+            ? throw new InvalidOperationException("boom")
+            : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, NoteOriginNotVerified);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A credential-BEARING but structurally equivalent origin is REPAIRED with
+    /// <c>remote set-url</c> carrying the sanitized url — a successful repair produces no note.
+    /// </summary>
+    [Fact]
+    public async Task Health_CredentialBearingEquivalentOrigin_IsRepairedWithSetUrlAndNoNote()
+    {
+        var run = await ProbeHealthyAsync(originStdout: CredentialBearingOrigin);
+
+        AssertHealthy(run.Health, null);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginSetUrl,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>A failing <c>set-url</c> — nonzero exit — records the update note.</summary>
+    [Fact]
+    public async Task Health_SetUrlNonZeroExit_RecordsOriginNotUpdatedNote()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] switch
+        {
+            "remote" when request.TokenizedArgs![1] == "get-url" =>
+                new GitProcessResult(0, CredentialBearingOrigin, string.Empty),
+            "remote" => new GitProcessResult(1, string.Empty, "fatal: cannot set-url"),
+            _ => HealthAwareResult(request),
+        });
+
+        AssertHealthy(run.Health, NoteOriginNotUpdated);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginSetUrl,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>A <c>set-url</c> LAUNCH failure records the same note.</summary>
+    [Fact]
+    public async Task Health_SetUrlLaunchFailure_RecordsOriginNotUpdatedNote()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] switch
+        {
+            "remote" when request.TokenizedArgs![1] == "get-url" =>
+                new GitProcessResult(0, CredentialBearingOrigin, string.Empty),
+            "remote" => throw new InvalidOperationException("boom"),
+            _ => HealthAwareResult(request),
+        });
+
+        AssertHealthy(run.Health, NoteOriginNotUpdated);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect, OriginSetUrl,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A PRESENT origin that is neither equivalent nor safely repairable records the MISMATCH
+    /// note — and the seam NEVER rewrites it: no <c>add</c> and no <c>set-url</c> is launched.
+    /// </summary>
+    [Theory]
+    [InlineData("https://github.com/org/other-repo.git")]
+    [InlineData("https://evil.example.com/org/config-repo.git")]
+    [InlineData("https://github.com:8443/org/config-repo.git")]
+    [InlineData("ssh://git@github.com/org/config-repo.git")]
+    [InlineData("git@github.com:org/config-repo.git")]
+    [InlineData("http://github.com/org/config-repo.git")]
+    public async Task Health_OriginMismatch_RecordsMismatchNoteAndNeverRewrites(string origin)
+    {
+        var run = await ProbeHealthyAsync(originStdout: origin);
+
+        AssertHealthy(run.Health, NoteOriginMismatch);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// An UNINITIALIZED provisioner (a non-cancellation resolver throw) records the fixed
+    /// <c>Config repo not provisioned.</c> note — the resolver's own text NEVER escapes — the
+    /// reconciliation is skipped, and the IDENTITY still runs.
+    /// </summary>
+    [Fact]
+    public async Task Health_ThrowingUrlResolver_RecordsNotProvisionedAndStillConfiguresIdentity()
+    {
+        var run = await ProbeHealthyAsync(
+            static () => throw new InvalidOperationException("config snapshot absent"));
+
+        AssertHealthy(run.Health, NotProvisioned);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A MISSING resolved URL records the fixed absence note; the identity still runs.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\t\n")]
+    public async Task Health_MissingResolvedUrl_RecordsUrlUnavailableAndStillConfiguresIdentity(
+        string? url)
+    {
+        var run = await ProbeHealthyAsync(UrlResolver(url));
+
+        AssertHealthy(run.Health, UrlUnavailable);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// A SANITIZER-rejected URL records the <c>Invalid config repo URL: </c> note with the
+    /// sanitizer's own (already redacted) message; the identity still runs.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(SanitizeRejectedUrlCases))]
+    public async Task Health_SanitizerRejectedUrl_RecordsInvalidUrlNoteAndStillConfiguresIdentity(
+        string url, string expectedReason)
+    {
+        var sanitizerMessage =
+            "Invalid --config-repo value: "
+            + expectedReason
+            + ". (The supplied value is redacted because it may contain credentials.)";
+
+        var run = await ProbeHealthyAsync(UrlResolver(url));
+
+        AssertHealthy(run.Health, "Invalid config repo URL: " + sanitizerMessage);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>An OCE from the URL resolver PROPAGATES — the exact instance.</summary>
+    [Fact]
+    public async Task Health_UrlResolverThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var resolverOce = new OperationCanceledException("resolver cancelled");
+        var commands = new List<string[]>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                commands.Add(request.TokenizedArgs!.ToArray());
+                return Task.FromResult(HealthAwareResult(request));
+            };
+
+            using var seam = CreateSeam(resolvedUrlResolver: () => throw resolverOce);
+            using var liveCts = new CancellationTokenSource();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, liveCts.Token));
+
+            Assert.Same(resolverOce, ex);
+
+            // The probe ran; the identity did NOT (the OCE was not swallowed into a note).
+            Assert.Equal([ProbeWorktree, ProbeToplevel], commands);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>An OCE from an ORIGIN subprocess PROPAGATES — never recorded as a note.</summary>
+    [Fact]
+    public async Task Health_OriginSubprocessThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+        var commands = new List<string[]>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                commands.Add(request.TokenizedArgs!.ToArray());
+                return request.TokenizedArgs![0] == "remote"
+                    ? throw delegateOce
+                    : Task.FromResult(HealthAwareResult(request));
+            };
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, liveCts.Token));
+
+            Assert.Same(delegateOce, ex);
+            Assert.Equal([ProbeWorktree, ProbeToplevel, OriginInspect], commands);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 6b — the local identity configuration ───────────────────────
+
+    /// <summary>
+    /// The identity commands are EXACTLY <c>config user.email copilothive-worker@local</c>
+    /// followed by <c>config user.name "CopilotHive Worker"</c> — the email FIRST. The seam
+    /// uses its OWN identity, deliberately not the shared
+    /// <c>GitOperations.ConfigureLocalIdentity</c> pair.
+    /// </summary>
+    [Fact]
+    public async Task Health_Identity_UsesTheExactCommandsInEmailThenNameOrder()
+    {
+        var run = await ProbeHealthyAsync();
+
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+
+        // The exact tokens — and NOT the legacy GitOperations identity.
+        Assert.Equal(
+            ["config", "user.email", "copilothive-worker@local"],
+            run.Requests[3].TokenizedArgs!.ToArray());
+        Assert.Equal(
+            ["config", "user.name", "CopilotHive Worker"],
+            run.Requests[4].TokenizedArgs!.ToArray());
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// The two identity commands are attempted INDEPENDENTLY: a failing <c>user.email</c> does
+    /// NOT prevent the <c>user.name</c> attempt (this is where the new implementation diverges
+    /// from the shared one, which stops after an email failure).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Health_IdentityEmailFailure_StillAttemptsTheNameCommand(bool launchFailure)
+    {
+        var run = await ProbeAsync(request =>
+            request.TokenizedArgs![0] == "config" && request.TokenizedArgs![1] == "user.email"
+                ? launchFailure
+                    ? throw new InvalidOperationException("boom")
+                    : new GitProcessResult(1, string.Empty, "fatal: cannot write config")
+                : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, IdentityEmailFailed);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>A failing <c>user.name</c> alone records only its own fixed note.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Health_IdentityNameFailure_RecordsOnlyTheNameNote(bool launchFailure)
+    {
+        var run = await ProbeAsync(request =>
+            request.TokenizedArgs![0] == "config" && request.TokenizedArgs![1] == "user.name"
+                ? launchFailure
+                    ? throw new InvalidOperationException("boom")
+                    : new GitProcessResult(1, string.Empty, "fatal: cannot write config")
+                : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, IdentityNameFailed);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// BOTH identity failures record BOTH fixed notes, joined in EXECUTION order.
+    /// </summary>
+    [Fact]
+    public async Task Health_BothIdentityCommandsFail_RecordsBothNotesInOrder()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] == "config"
+            ? new GitProcessResult(1, string.Empty, "fatal: cannot write config")
+            : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, IdentityEmailFailed + "; " + IdentityNameFailed);
+        Assert.Equal(
+            "Identity configuration failed: user.email.; Identity configuration failed: user.name.",
+            run.Health.SanitizedReason);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// The identity notes are FIXED text: neither the process stderr nor an exception message
+    /// ever reaches the reported reason.
+    /// </summary>
+    [Fact]
+    public async Task Health_IdentityFailureNotes_CarryNoStderrOrExceptionText()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] == "config"
+            ? request.TokenizedArgs![1] == "user.email"
+                ? new GitProcessResult(1, string.Empty, "fatal: SECRET-STDERR-MARKER")
+                : throw new InvalidOperationException("SECRET-EXCEPTION-MARKER")
+            : HealthAwareResult(request));
+
+        AssertHealthy(run.Health, IdentityEmailFailed + "; " + IdentityNameFailed);
+        Assert.DoesNotContain("SECRET-STDERR-MARKER", run.Health.SanitizedReason!, StringComparison.Ordinal);
+        Assert.DoesNotContain("SECRET-EXCEPTION-MARKER", run.Health.SanitizedReason!, StringComparison.Ordinal);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>An OCE from an IDENTITY subprocess PROPAGATES — never recorded as a note.</summary>
+    [Theory]
+    [InlineData("user.email")]
+    [InlineData("user.name")]
+    public async Task Health_IdentitySubprocessThrowsOperationCanceled_Propagates(string key)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var delegateOce = new OperationCanceledException("delegate cancelled");
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+                request.TokenizedArgs![0] == "config" && request.TokenizedArgs![1] == key
+                    ? throw delegateOce
+                    : Task.FromResult(HealthAwareResult(request));
+
+            using var seam = CreateSeam();
+            using var liveCts = new CancellationTokenSource();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, liveCts.Token));
+
+            Assert.Same(delegateOce, ex);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── The reason aggregation and the redaction scope ────────────────────
+
+    /// <summary>
+    /// THE AGGREGATION VECTOR: an unclassifiable origin inspection plus both identity failures
+    /// produce the three notes joined in EXECUTION order with <c>"; "</c> — the origin note
+    /// FIRST, then user.email, then user.name.
+    /// </summary>
+    [Fact]
+    public async Task Health_FullFailureSequence_JoinsEveryNoteInExecutionOrder()
+    {
+        var run = await ProbeAsync(request => request.TokenizedArgs![0] switch
+        {
+            "remote" => new GitProcessResult(1, string.Empty, "fatal: something else entirely"),
+            "config" => new GitProcessResult(1, string.Empty, "fatal: cannot write config"),
+            _ => HealthAwareResult(request),
+        });
+
+        Assert.Equal(
+            "Origin reconciliation failed: config repo origin could not be verified."
+            + "; Identity configuration failed: user.email."
+            + "; Identity configuration failed: user.name.",
+            run.Health.SanitizedReason);
+
+        // The report itself is still HEALTHY with both directories present.
+        AssertHealthy(
+            run.Health,
+            run.Health.SanitizedReason);
+        AssertSequence(
+            run.Requests, ProbeWorktree, ProbeToplevel, OriginInspect,
+            IdentityEmailCommand, IdentityNameCommand);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// The SKIPPED-reconciliation note also aggregates with the identity notes, in order.
+    /// </summary>
+    [Fact]
+    public async Task Health_SkippedReconciliationPlusIdentityFailures_JoinInOrder()
+    {
+        var run = await ProbeAsync(
+            request => request.TokenizedArgs![0] == "config"
+                ? new GitProcessResult(1, string.Empty, string.Empty)
+                : HealthAwareResult(request),
+            UrlResolver("ssh://git@github.com/org/config-repo.git"));
+
+        Assert.Equal(
+            ReconciliationSkipped + "; " + IdentityEmailFailed + "; " + IdentityNameFailed,
+            run.Health.SanitizedReason);
+        AssertNoCredentialDelegates(run);
+    }
+
+    /// <summary>
+    /// REDACTION SCOPE: <c>RepoDir</c> and <c>AgentsWorkDir</c> are PATHS returned as the
+    /// trimmed git output and a derived path — they are NOT run through
+    /// <see cref="CopilotHive.Services.GitUrlRedactor"/>. The fixture configures a config repo
+    /// directory that literally embeds a credential-bearing URL shape, so a mutant that redacted
+    /// either path would mangle it and fail here.
+    /// </summary>
+    [Fact]
+    public async Task Health_RepoDirAndAgentsWorkDir_AreNotRedacted()
+    {
+        var prefix = OperatingSystem.IsWindows() ? @"C:\repo\" : "/repo/";
+        var urlShapedDir = prefix + "https://x-access-token:ghp_secret@github.com/org";
+
+        // The value really IS something the redactor would rewrite — so the assertion below
+        // cannot pass for the wrong reason.
+        Assert.NotEqual(urlShapedDir, CopilotHive.Services.GitUrlRedactor.Redact(urlShapedDir));
+
+        var run = await ProbeInAsync(
+            HealthScript(toplevel: urlShapedDir),
+            urlShapedDir,
+            configRepoDir: urlShapedDir,
+            pathCanonicalizer: p => p);
+
+        Assert.True(run.Health.HasRepo);
+        Assert.Equal(urlShapedDir, run.Health.RepoDir);
+        Assert.Equal(Path.Combine(urlShapedDir, "agents"), run.Health.AgentsWorkDir);
+        Assert.Null(run.Health.SanitizedReason);
+    }
+
+    // ── Stage 6 — the SHARED per-instance semaphore ───────────────────────
+
+    /// <summary>
+    /// A gated runner whose <c>remote</c> commands block on a per-call TCS while every other
+    /// command (the two rev-parse probes and the two identity commands) completes
+    /// SYNCHRONOUSLY. That is what makes the concurrency assertions deterministic: an
+    /// operation's call returns to the test only once it has reached a genuinely incomplete
+    /// await.
+    /// </summary>
+    private sealed class GatedHealthRunner
+    {
+        private readonly List<TaskCompletionSource> _gates = [];
+        private readonly List<TaskCompletionSource> _entered = [];
+        private readonly Lock _sync = new();
+
+        public List<string[]> Commands { get; } = [];
+
+        public int InspectionCount { get; private set; }
+
+        public Task<GitProcessResult> Respond(GitProcessRequest request)
+        {
+            TaskCompletionSource gate;
+            lock (_sync)
+            {
+                Commands.Add(request.TokenizedArgs!.ToArray());
+                if (request.TokenizedArgs![0] != "remote")
+                    return Task.FromResult(HealthAwareResult(request));
+
+                var index = InspectionCount++;
+                Grow(index);
+                gate = _gates[index];
+                _entered[index].TrySetResult();
+            }
+
+            return gate.Task.ContinueWith(_ => new GitProcessResult(0, EligibleUrl, string.Empty));
+        }
+
+        public Task Entered(int index)
+        {
+            lock (_sync)
+            {
+                Grow(index);
+                return _entered[index].Task;
+            }
+        }
+
+        public void Release(int index)
+        {
+            lock (_sync)
+            {
+                Grow(index);
+                _gates[index].TrySetResult();
+            }
+        }
+
+        public void ReleaseAll()
+        {
+            lock (_sync)
+            {
+                foreach (var gate in _gates)
+                    gate.TrySetResult();
+            }
+        }
+
+        private void Grow(int index)
+        {
+            while (_gates.Count <= index)
+            {
+                _gates.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                _entered.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Settles outstanding health probes so a failing assertion can never leave a blocked
+    /// delegate that later advances with the real (un-faked) runner installed.
+    /// </summary>
+    private static async Task SettleHealthAsync(params Task<ConfigRepoHealth>?[] probes)
+    {
+        foreach (var probe in probes)
+        {
+            if (probe is null)
+                continue;
+
+            try
+            {
+                await probe;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected for the cancellation fixtures.
+            }
+            catch (Exception)
+            {
+                // Expected only if the test already failed mid-flight.
+            }
+        }
+    }
+
+    /// <summary>
+    /// The health probe's ELIGIBLE reconciliation takes the SAME per-instance gate as the
+    /// command path. A command-path operation is parked inside its origin inspection while
+    /// HOLDING the semaphore; the probe then runs both rev-parse commands (they precede the
+    /// gate) and parks — its origin inspection has NOT run. Removing the gate from the health
+    /// API makes the second inspection appear immediately and fails the assertion.
+    /// </summary>
+    [Fact]
+    public async Task Health_EligibleReconciliation_SerializesBehindTheCommandPath()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedHealthRunner();
+        Task<ConfigRepoOpResult> command = null!;
+        Task<ConfigRepoHealth> probe = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam();
+            command = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            probe = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None);
+
+            // The probe reached its Stage 6 gate wait — and not one step further.
+            Assert.Equal([OriginInspect, ProbeWorktree, ProbeToplevel], runner.Commands);
+            Assert.Equal(1, runner.InspectionCount);
+
+            runner.Release(0);
+            Assert.True((await Bounded(command)).Success);
+
+            await runner.Entered(1).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            runner.Release(1);
+            var health = await Bounded(probe);
+            AssertHealthy(health, null);
+
+            // The two operations never interleaved.
+            Assert.Equal(
+                [
+                    OriginInspect,
+                    ProbeWorktree,
+                    ProbeToplevel,
+                    ["pull", "origin"],
+                    OriginInspect,
+                    IdentityEmailCommand,
+                    IdentityNameCommand,
+                ],
+                runner.Commands);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(command);
+            await SettleHealthAsync(probe);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// The reverse direction: the PROBE holds the gate while a command-path operation waits.
+    /// The command's Stage 6b ref validation runs synchronously and then it parks on the
+    /// semaphore, so its origin inspection has not run.
+    /// </summary>
+    [Fact]
+    public async Task Health_ProbeHoldingTheGate_BlocksTheCommandPath()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedHealthRunner();
+        Task<ConfigRepoHealth> probe = null!;
+        Task<ConfigRepoOpResult> command = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam();
+            probe = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            command = seam.RunConfigRepoCommandAsync(
+                ["pull", "origin", "main"], RepoDir, CancellationToken.None);
+
+            Assert.Equal(
+                [
+                    ProbeWorktree,
+                    ProbeToplevel,
+                    OriginInspect,
+                    ["check-ref-format", "--allow-onelevel", "main"],
+                ],
+                runner.Commands);
+            Assert.Equal(1, runner.InspectionCount); // the command's inspection has NOT run
+
+            runner.Release(0);
+            AssertHealthy(await Bounded(probe), null);
+
+            await runner.Entered(1).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            runner.Release(1);
+            Assert.True((await Bounded(command)).Success);
+
+            // The GATE-PROTECTED commands never interleaved: the probe's whole reconciliation
+            // precedes the command's. The identity commands run OUTSIDE the gate, so their
+            // position relative to the command's inspection is deliberately not pinned here —
+            // only their own order is (asserted below).
+            Assert.Equal(
+                [OriginInspect, OriginInspect, ["pull", "origin", "main"]],
+                runner.Commands.Where(c => c[0] is "remote" or "pull").ToList());
+
+            var identity = runner.Commands.Where(c => c[0] == "config").ToList();
+            Assert.Equal([IdentityEmailCommand, IdentityNameCommand], identity);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleHealthAsync(probe);
+            await SettleAsync(command);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// An INELIGIBLE probe never takes the gate: it completes while a command-path operation
+    /// is parked inside its origin inspection holding the semaphore.
+    /// </summary>
+    [Fact]
+    public async Task Health_IneligibleProbe_DoesNotTakeTheGate()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedHealthRunner();
+        Task<ConfigRepoOpResult> holder = null!;
+        var helperCalls = 0;
+
+        // The FIRST read is the eligible URL (the command path); every later read is ineligible.
+        var urlReads = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam(
+                resolvedUrlResolver: () =>
+                    Interlocked.Increment(ref urlReads) == 1
+                        ? EligibleUrl
+                        : "ssh://git@github.com/org/config-repo.git",
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            holder = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            var health = await Bounded(
+                seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None));
+
+            AssertHealthy(health, ReconciliationSkipped);
+            Assert.Equal(
+                [OriginInspect, ProbeWorktree, ProbeToplevel, IdentityEmailCommand, IdentityNameCommand],
+                runner.Commands);
+
+            // The probe completed WITHOUT the command path's credential resolution having run
+            // (the holder is still parked before Stage 6e), so this zero is the PROBE's.
+            Assert.Equal(0, helperCalls);
+
+            runner.Release(0);
+            Assert.True((await Bounded(holder)).Success);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(holder);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// THE ACQUIRED-FLAG RULE for the health API: a cancellation BEFORE acquisition propagates
+    /// and releases NOTHING. The proof is that the gate's count is unchanged afterwards — a bug
+    /// that released a semaphore it never owned would leave TWO permits and let two later
+    /// eligible operations reconcile concurrently. The final assertions show only one does.
+    /// </summary>
+    [Fact]
+    public async Task Health_CancellationBeforeGateAcquisition_PropagatesAndReleasesNothing()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedHealthRunner();
+        Task<ConfigRepoOpResult> holder = null!;
+        Task<ConfigRepoHealth> waiter = null!;
+        Task<ConfigRepoHealth> third = null!;
+        Task<ConfigRepoOpResult> fourth = null!;
+        using var cts = new CancellationTokenSource();
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam();
+
+            holder = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // The probe runs both rev-parse commands and then parks ON the gate.
+            waiter = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, cts.Token);
+            Assert.Equal([OriginInspect, ProbeWorktree, ProbeToplevel], runner.Commands);
+            Assert.Equal(1, runner.InspectionCount);
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(waiter));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // The cancelled waiter reconciled nothing and configured no identity.
+            Assert.Equal([OriginInspect, ProbeWorktree, ProbeToplevel], runner.Commands);
+            Assert.Equal(1, runner.InspectionCount);
+
+            runner.Release(0);
+            Assert.True((await Bounded(holder)).Success);
+
+            // The count is intact: the next operation acquires, and the one after it WAITS.
+            third = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None);
+            await runner.Entered(1).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            fourth = seam.RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None);
+            Assert.Equal(2, runner.InspectionCount); // NOT 3 — the fourth is still waiting
+
+            runner.Release(1);
+            AssertHealthy(await Bounded(third), null);
+            await runner.Entered(2).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            runner.Release(2);
+            Assert.True((await Bounded(fourth)).Success);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(holder, fourth);
+            await SettleHealthAsync(waiter, third);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A cancellation AFTER acquisition RELEASES the gate in the finally: the probe is
+    /// cancelled while parked inside its origin inspection, and a later operation still
+    /// acquires the gate and completes.
+    /// </summary>
+    [Fact]
+    public async Task Health_CancellationAfterGateAcquisition_ReleasesTheGate()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoHealth> cancelled = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                if (request.TokenizedArgs![0] == "remote" && !entered.Task.IsCompleted)
+                {
+                    entered.TrySetResult();
+                    try
+                    {
+                        await gate.Task.WaitAsync(ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw new OperationCanceledException(ct);
+                    }
+                }
+
+                return HealthAwareResult(request);
+            };
+
+            using var seam = CreateSeam();
+            cancelled = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, cts.Token);
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(cancelled));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // The gate was RELEASED by the finally: a fresh eligible operation completes.
+            var next = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["fetch"], RepoDir, CancellationToken.None));
+            Assert.True(next.Success);
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleHealthAsync(cancelled);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// DISPOSAL while the probe HOLDS the gate: the semaphore is never disposed, so the
+    /// in-flight probe completes NORMALLY (its identity commands still run and the real health
+    /// is returned) and its release does not throw. A subsequent probe is rejected at entry.
+    /// </summary>
+    [Fact]
+    public async Task Health_DisposalWhileHoldingTheGate_InFlightProbeStillCompletes()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedHealthRunner();
+        Task<ConfigRepoHealth> inFlight = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            var seam = CreateSeam();
+            inFlight = seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None);
+
+            // The probe HOLDS the gate (it is parked inside its origin inspection).
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            seam.Dispose();
+
+            runner.Release(0);
+            AssertHealthy(await Bounded(inFlight), null);
+
+            Assert.Equal(
+                [ProbeWorktree, ProbeToplevel, OriginInspect, IdentityEmailCommand, IdentityNameCommand],
+                runner.Commands);
+
+            // A SUBSEQUENT probe is rejected at ENTRY.
+            AssertUnhealthy(
+                await Bounded(seam.ProbeAndEnsureRepoHealthyAsync(RepoDir, CancellationToken.None)),
+                "Seam disposed.");
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleHealthAsync(inFlight);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
 }

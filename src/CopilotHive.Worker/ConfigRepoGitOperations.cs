@@ -13,8 +13,10 @@ namespace CopilotHive.Worker;
 /// SHARED <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping and
 /// redaction boundary, AND — for ELIGIBLE (Branch A) transport operations — the serialized
 /// origin state machine (Stages 6c/6d), the credential + helper resolution (Stage 6e) and the
-/// Stage 7 credential env injection with the literal-secret redaction pass. The health probe
-/// (2c-b2) and the clone (2c-b3) are later slices.
+/// Stage 7 credential env injection with the literal-secret redaction pass. Slice 2c-b2 adds the
+/// credential-free HEALTH PROBE — <see cref="ProbeAndEnsureRepoHealthyAsync"/> — with the
+/// best-effort origin reconciliation-as-API and the local identity configuration. The clone
+/// (2c-b3) is a later slice.
 /// </summary>
 internal sealed class ConfigRepoGitOperations : IDisposable
 {
@@ -32,6 +34,35 @@ internal sealed class ConfigRepoGitOperations : IDisposable
 
     /// <summary>The FIXED message for any non-cancellation resolver failure (URL or credential).</summary>
     private const string NotProvisioned = "Config repo not provisioned.";
+
+    /// <summary>2c-b2 — the health probe could not read the worktree root.</summary>
+    private const string ToplevelUnknown = "Could not determine worktree root.";
+
+    /// <summary>2c-b2 — the probed worktree root is not the configured config repo directory.</summary>
+    private const string ToplevelMismatch =
+        "Config repo worktree root does not match the configured directory.";
+
+    /// <summary>2c-b2 — the origin reconciliation is not applicable to a non-HTTPS-github.com repo.</summary>
+    private const string OriginReconciliationSkipped =
+        "Config repo origin reconciliation skipped: the configured repository is not HTTPS github.com.";
+
+    /// <summary>2c-b2 — the NOTE prefix applied to an <see cref="EnsureOriginAsync"/> rejection.</summary>
+    private const string OriginReconciliationFailedPrefix = "Origin reconciliation failed: ";
+
+    /// <summary>2c-b2 — the local identity email configured by the health API.</summary>
+    private const string IdentityEmail = "copilothive-worker@local";
+
+    /// <summary>2c-b2 — the local identity name configured by the health API.</summary>
+    private const string IdentityName = "CopilotHive Worker";
+
+    /// <summary>2c-b2 — the FIXED note for a failed <c>git config user.email</c>.</summary>
+    private const string IdentityEmailFailed = "Identity configuration failed: user.email.";
+
+    /// <summary>2c-b2 — the FIXED note for a failed <c>git config user.name</c>.</summary>
+    private const string IdentityNameFailed = "Identity configuration failed: user.name.";
+
+    /// <summary>2c-b2 — the separator joining the best-effort notes in EXECUTION order.</summary>
+    private const string NoteSeparator = "; ";
 
     /// <summary>Stage 6e — the credential helper path is missing or its delegate failed.</summary>
     private const string HelperUnavailable = "Git credential helper path is not available.";
@@ -316,6 +347,231 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                 _originGate.Release();
         }
     }
+
+    /// <summary>
+    /// Slice 2c-b2 — the config-repo HEALTH PROBE, the origin reconciliation-as-API and the
+    /// local identity configuration.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The pipeline: Stage 1 disposal → Stage 2 argument basics → Stage 3 the SAME exact
+    /// containment as the command path (a foreign directory NEVER launches a probe subprocess,
+    /// so the seam can neither reconcile nor identity-mutate a repository it does not own) →
+    /// Stage 4 <c>git rev-parse --is-inside-work-tree</c> → Stage 5 the top-level containment
+    /// verification via <c>git rev-parse --show-toplevel</c> → Stage 6 the BEST-EFFORT origin
+    /// reconciliation (eligible URLs only, serialized on the same per-instance gate) → Stage 6b
+    /// the ALWAYS-attempted identity configuration.
+    /// </para>
+    /// <para>
+    /// EVERY subprocess launched here is CREDENTIAL-FREE: the probe, the top-level query, the
+    /// origin inspection/add/set-url and the two identity commands all run with the scrubbed
+    /// environment plus <c>GIT_TERMINAL_PROMPT=0</c>. The credential resolver and the credential
+    /// helper delegate are NEVER invoked by this API — no credential is needed to inspect or
+    /// repair an origin to the sanitized, credential-free URL.
+    /// </para>
+    /// <para>
+    /// Stages 6 and 6b are BEST-EFFORT: their failures become NOTES joined in EXECUTION order
+    /// with <c>"; "</c> into <see cref="ConfigRepoHealth.SanitizedReason"/>, and never downgrade
+    /// <see cref="ConfigRepoHealth.HasRepo"/> or clear the reported directories. An
+    /// <see cref="OperationCanceledException"/> from ANY stage — a subprocess, the origin gate
+    /// after acquisition, or the URL resolver — PROPAGATES rather than being recorded.
+    /// </para>
+    /// <para>
+    /// REDACTION SCOPE: <see cref="ConfigRepoHealth.SanitizedReason"/> is the only field passed
+    /// through <see cref="GitUrlRedactor.Redact"/> (the fixed notes are redaction no-ops, which
+    /// keeps the rule uniform). <see cref="ConfigRepoHealth.RepoDir"/> and
+    /// <see cref="ConfigRepoHealth.AgentsWorkDir"/> are PATHS — the trimmed git output and a
+    /// path derived from it — and carry no URL to redact.
+    /// </para>
+    /// </remarks>
+    internal async Task<ConfigRepoHealth> ProbeAndEnsureRepoHealthyAsync(
+        string targetDir, CancellationToken ct)
+    {
+        // Stage 1 — disposed, FIRST.
+        if (Volatile.Read(ref _disposed) != 0)
+            return Unhealthy("Seam disposed.");
+
+        // Stage 2 — argument basics.
+        if (string.IsNullOrWhiteSpace(targetDir))
+            return Unhealthy("Invalid arguments.");
+
+        string canonicalTargetDir;
+        try
+        {
+            canonicalTargetDir = Canonicalize(targetDir);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or SecurityException or IOException)
+        {
+            return Unhealthy("Invalid arguments.");
+        }
+
+        // Stage 3 — the containment. NO subprocess is launched for a foreign directory.
+        if (!IsContained(canonicalTargetDir))
+            return Unhealthy("Invalid git command: the working directory is not the config repository.");
+
+        // Stage 4 — the worktree probe (credential-free).
+        var probe = await LaunchGitProcessAsync(
+            new[] { "rev-parse", "--is-inside-work-tree" }, ct);
+        if (probe is null)
+            return Unhealthy("Git process failed to start.");
+
+        if (probe.ExitCode != 0)
+            return Unhealthy("Not a git worktree.");
+
+        var probeOutput = (probe.Stdout ?? string.Empty).Trim();
+
+        // A BARE repository reports `false`; anything else (including an EMPTY output) is
+        // output this seam does not recognize and must not act on.
+        if (string.Equals(probeOutput, "false", StringComparison.Ordinal))
+            return Unhealthy("Not a git worktree.");
+
+        if (!string.Equals(probeOutput, "true", StringComparison.Ordinal))
+            return Unhealthy("Unrecognized rev-parse output.");
+
+        // Stage 5 — the top-level containment verification.
+        var toplevel = await LaunchGitProcessAsync(
+            new[] { "rev-parse", "--show-toplevel" }, ct);
+        if (toplevel is null || toplevel.ExitCode != 0)
+            return Unhealthy(ToplevelUnknown);
+
+        // The reported root is returned VERBATIM after the trim — the canonicalization below
+        // exists only for the COMPARISON.
+        var repoDir = (toplevel.Stdout ?? string.Empty).Trim();
+        if (repoDir.Length == 0)
+            return Unhealthy(ToplevelUnknown);
+
+        string canonicalToplevel;
+        try
+        {
+            canonicalToplevel = Canonicalize(repoDir);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or SecurityException or IOException)
+        {
+            return Unhealthy(ToplevelUnknown);
+        }
+
+        if (!IsContained(canonicalToplevel))
+        {
+            // The repository EXISTS (HasRepo stays true) but its root is somewhere else, so the
+            // reconciliation and identity steps are SKIPPED and no directory is reported.
+            return new ConfigRepoHealth(true, null, null, GitUrlRedactor.Redact(ToplevelMismatch));
+        }
+
+        var agentsWorkDir = Path.Combine(repoDir, "agents");
+
+        // Stage 6 / 6b — the best-effort reconciliation and identity. Their notes accumulate in
+        // EXECUTION order and never change the healthy verdict.
+        var notes = new List<string>();
+        await ReconcileOriginBestEffortAsync(notes, ct);
+        await ConfigureIdentityBestEffortAsync(notes, ct);
+
+        var reason = notes.Count == 0
+            ? null
+            : GitUrlRedactor.Redact(string.Join(NoteSeparator, notes));
+
+        return new ConfigRepoHealth(true, repoDir, agentsWorkDir, reason);
+    }
+
+    /// <summary>
+    /// Stage 6 — the BEST-EFFORT origin reconciliation. The URL resolution happens BEFORE the
+    /// gate (exactly as in the command path); only an ELIGIBLE (Branch A) sanitized URL enters
+    /// the gate and runs the credential-free <see cref="EnsureOriginAsync"/> inspection / add /
+    /// set-url. Every failure becomes a NOTE; nothing aborts the health report.
+    /// </summary>
+    /// <remarks>
+    /// An INELIGIBLE (Branch B) URL — an SSH, file or local-path config repo — is
+    /// self-consistent and needs no origin repair: the 2c-b1c-ii equivalence logic requires
+    /// HTTPS/443, and the health API deliberately does NOT extend it. THE ACQUIRED-FLAG RULE
+    /// applies verbatim: a cancellation during <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+    /// BEFORE acquisition propagates without releasing a gate this call never owned.
+    /// </remarks>
+    private async Task ReconcileOriginBestEffortAsync(List<string> notes, CancellationToken ct)
+    {
+        var (urlError, eligible, sanitized) = ResolveTransportEligibility();
+        if (urlError is not null)
+        {
+            // A missing URL, a sanitizer rejection, or a non-cancellation resolver throw. There
+            // is no URL to reconcile against, so the reconciliation cannot run at all.
+            notes.Add(urlError);
+            return;
+        }
+
+        if (!eligible)
+        {
+            notes.Add(OriginReconciliationSkipped);
+            return;
+        }
+
+        var acquired = false;
+        try
+        {
+            await _originGate.WaitAsync(ct);
+            acquired = true;
+
+            var originError = await EnsureOriginAsync(sanitized!, ct);
+            if (originError is not null)
+                notes.Add(ToReconciliationNote(originError));
+        }
+        finally
+        {
+            if (acquired)
+                _originGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 2c-b2 — turns an <see cref="EnsureOriginAsync"/> rejection into a health NOTE: the fixed
+    /// <c>Origin reconciliation failed: </c> prefix followed by the rejection as a CONTINUATION
+    /// of that sentence, so its leading capital is lowered (<c>Config repo origin could not be
+    /// verified.</c> becomes <c>… failed: config repo origin could not be verified.</c>). The
+    /// four state-machine messages remain the single source of the note text.
+    /// </summary>
+    /// <remarks>
+    /// The whitelist is explicit and has NO silent fallback: an unrecognized rejection means
+    /// the state machine grew a message this mapping does not know about, which must fail
+    /// loudly rather than emit a mis-cased or unclassified note.
+    /// </remarks>
+    private static string ToReconciliationNote(string rejection)
+    {
+        if (rejection is not (OriginNotVerified or OriginNotAdded or OriginNotUpdated or OriginMismatch))
+            throw new InvalidOperationException("Unhandled origin reconciliation rejection.");
+
+        return OriginReconciliationFailedPrefix
+            + char.ToLowerInvariant(rejection[0])
+            + rejection[1..];
+    }
+
+    /// <summary>
+    /// Stage 6b — the local identity configuration, ALWAYS attempted once the probe and the
+    /// top-level verification succeeded (even with no resolved URL or a skipped reconciliation).
+    /// The two commands run INDEPENDENTLY: an <c>user.email</c> failure never prevents the
+    /// <c>user.name</c> attempt, so both notes can appear, in order.
+    /// </summary>
+    /// <remarks>
+    /// This is deliberately NOT <see cref="GitOperations.ConfigureLocalIdentity"/>: that method
+    /// configures a different identity and STOPS after an email failure. Only its command ORDER
+    /// is prior art. The notes are FIXED text — no stderr and no exception message ever reaches
+    /// them.
+    /// </remarks>
+    private async Task ConfigureIdentityBestEffortAsync(List<string> notes, CancellationToken ct)
+    {
+        var email = await LaunchGitProcessAsync(
+            new[] { "config", "user.email", IdentityEmail }, ct);
+        if (email is null || email.ExitCode != 0)
+            notes.Add(IdentityEmailFailed);
+
+        var name = await LaunchGitProcessAsync(
+            new[] { "config", "user.name", IdentityName }, ct);
+        if (name is null || name.ExitCode != 0)
+            notes.Add(IdentityNameFailed);
+    }
+
+    /// <summary>
+    /// Builds a NEGATIVE health report: no repo, no directories, and the reason redacted at
+    /// construction like every other seam message.
+    /// </summary>
+    private static ConfigRepoHealth Unhealthy(string reason) =>
+        new(false, null, null, GitUrlRedactor.Redact(reason));
 
     /// <summary>
     /// Stage 6d — the origin state machine. Inspects <c>git remote get-url origin</c> and,
@@ -1139,6 +1395,8 @@ internal sealed class ConfigRepoGitOperations : IDisposable
 internal sealed record ConfigRepoOpResult(bool Success, int ExitCode, string Stdout, string SanitizedError);
 
 /// <summary>
-/// Config-repo health summary. DECLARED in this slice; implemented by the health probe (2c-b2).
+/// Config-repo health summary. Produced by the 2c-b2 health probe
+/// (<c>ProbeAndEnsureRepoHealthyAsync</c>). <see cref="SanitizedReason"/> is redacted at
+/// construction; <see cref="RepoDir"/> and <see cref="AgentsWorkDir"/> are PATHS and are not.
 /// </summary>
 internal sealed record ConfigRepoHealth(bool HasRepo, string? RepoDir, string? AgentsWorkDir, string? SanitizedReason);
