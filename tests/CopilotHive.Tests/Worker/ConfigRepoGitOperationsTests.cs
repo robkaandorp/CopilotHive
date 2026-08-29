@@ -9,18 +9,21 @@ namespace CopilotHive.Tests.Worker;
 
 /// <summary>
 /// Table-driven tests for the validation AND execution seam <see cref="ConfigRepoGitOperations"/>
-/// (slices 2c-b1b-i, 2c-b1b-ii and 2c-b1c-i). The validation-stage contract tests (grammar
-/// messages, containment, snapshot ordering, disposal at entry, canonicalization seam) assert
-/// exact messages / exact outcome shapes so that deleting or reordering validation stages breaks
-/// the suite (removal-proof). The execution-stage tests (2c-b1b-ii) assert the EXACT
+/// (slices 2c-b1b-i, 2c-b1b-ii, 2c-b1c-i and 2c-b1c-ii). The validation-stage contract tests
+/// (grammar messages, containment, snapshot ordering, disposal at entry, canonicalization seam)
+/// assert exact messages / exact outcome shapes so that deleting or reordering validation stages
+/// breaks the suite (removal-proof). The execution-stage tests (2c-b1b-ii) assert the EXACT
 /// <see cref="GitProcessRequest"/> shapes (ref-validation and final execution), the concrete
 /// result mapping, the redaction boundary over process output, the cancellation precedence
 /// (TCS-gated), the TCS-gated defensive snapshot, and the TCS-gated disposal-vs-in-flight
 /// contract. The Stage 6a tests (2c-b1c-i) assert the URL resolution outcomes, the transport
 /// ELIGIBILITY rule, the canonicalized explicit-origin launch, the exact SEQUENCING
-/// (Stage 5 → Stage 6a → Stage 6 → Stage 7) with EXACT subprocess invocation totals, and the
-/// resolver-exception policy — all via the <see cref="GitOperations.ProcessRunner"/> seam
-/// (restored in a finally block) and TCS gates for synchronization (no timing-based tests).
+/// (Stage 5 → Stage 6a → Stage 6b → Stage 7) with EXACT subprocess invocation totals, and the
+/// resolver-exception policy. The Stage 6c/6d/6e tests (2c-b1c-ii) assert the ORIGIN state
+/// machine (inspection → add / repair / reject), the credential + helper resolution policy, the
+/// Stage 7 credential env injection and the literal-secret redaction pass — all via the
+/// <see cref="GitOperations.ProcessRunner"/> seam (restored in a finally block) and TCS gates
+/// for synchronization (no timing-based tests).
 /// </summary>
 [Collection("EnvVarMutation")]
 public sealed class ConfigRepoGitOperationsTests
@@ -33,14 +36,39 @@ public sealed class ConfigRepoGitOperationsTests
     /// <summary>The Stage 6a message when the resolved config repo URL is absent.</summary>
     private const string UrlUnavailable = "Config repo URL is not available.";
 
-    /// <summary>The FIXED Stage 6a message for ANY non-cancellation resolver exception.</summary>
+    /// <summary>The FIXED Stage 6a/6e message for ANY non-cancellation resolver exception.</summary>
     private const string NotProvisioned = "Config repo not provisioned.";
+
+    /// <summary>Stage 6d — the origin could not be INSPECTED.</summary>
+    private const string OriginNotVerified = "Config repo origin could not be verified.";
+
+    /// <summary>Stage 6d — <c>git remote add origin</c> failed.</summary>
+    private const string OriginNotAdded = "Config repo origin could not be added.";
+
+    /// <summary>Stage 6d — <c>git remote set-url origin</c> failed.</summary>
+    private const string OriginNotUpdated = "Config repo origin could not be updated.";
+
+    /// <summary>Stage 6d — the PRESENT origin is neither equivalent nor safely repairable.</summary>
+    private const string OriginMismatch = "Config repo origin does not match the configured repository.";
+
+    /// <summary>Stage 6e — the credential helper path is missing or its delegate threw.</summary>
+    private const string HelperUnavailable = "Git credential helper path is not available.";
 
     /// <summary>
     /// A resolved config repo URL that is ELIGIBLE for the canonicalized explicit-origin
-    /// launch: HTTPS, host <c>github.com</c>, implicit port 443.
+    /// launch: HTTPS, host <c>github.com</c>, implicit port 443. It is ALSO its own sanitized
+    /// form, so it is exactly what the Stage 6d origin commands must carry.
     /// </summary>
     private const string EligibleUrl = "https://github.com/org/config-repo.git";
+
+    /// <summary>The Stage 6d origin INSPECTION command (step 3a).</summary>
+    private static readonly string[] OriginInspect = ["remote", "get-url", "origin"];
+
+    /// <summary>The Stage 6d origin ADD command (step 3b) carrying the SANITIZED URL.</summary>
+    private static readonly string[] OriginAdd = ["remote", "add", "origin", EligibleUrl];
+
+    /// <summary>The Stage 6d origin REPAIR command (step 3c) carrying the SANITIZED URL.</summary>
+    private static readonly string[] OriginSetUrl = ["remote", "set-url", "origin", EligibleUrl];
 
     /// <summary>A bound on every await that a mutant could otherwise block forever.</summary>
     private static readonly TimeSpan AwaitTimeout = TimeSpan.FromSeconds(30);
@@ -66,13 +94,14 @@ public sealed class ConfigRepoGitOperationsTests
         Func<string, string>? pathCanonicalizer = null,
         string? configRepoDir = null,
         Func<string?>? resolvedUrlResolver = null,
-        Func<string?>? credentialResolver = null) =>
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null) =>
         new(
             configRepoDir ?? RepoDir,
             resolvedUrlResolver ?? (static () => EligibleUrl),
             credentialResolver ?? (static () => null),
             Log(),
-            static () => "/helper",
+            credentialHelperPath ?? (static () => "/helper"),
             onDispose ?? (static () => { }),
             pathCanonicalizer);
 
@@ -194,6 +223,44 @@ public sealed class ConfigRepoGitOperationsTests
             Assert.False(request.Env.ContainsKey(scrubbed), $"scrubbed variable '{scrubbed}' leaked");
 
         Assert.Equal("0", request.Env["GIT_TERMINAL_PROMPT"]);
+    }
+
+    /// <summary>
+    /// Asserts an INJECTED request's environment equals the scrubbed inherited snapshot plus
+    /// <c>GIT_TERMINAL_PROMPT=0</c> plus EXACTLY the two post-scrub exceptions
+    /// (<c>GITHUB_CONFIG_REPO_TOKEN</c> and <c>GIT_ASKPASS</c>) with the expected values —
+    /// nothing else. The counted equality proves the injection is additive and complete: the
+    /// two variables were re-added AFTER the scrub (they are both in the scrubbed set) and no
+    /// other inherited credential variable survived.
+    /// </summary>
+    private static void AssertChildEnvWithCredential(
+        GitProcessRequest request, string credential, string helperPath)
+    {
+        var expected = new Dictionary<string, string?>(ExpectedChildEnv())
+        {
+            ["GITHUB_CONFIG_REPO_TOKEN"] = credential,
+            ["GIT_ASKPASS"] = helperPath,
+        };
+
+        Assert.Equal(expected.Count, request.Env.Count);
+        foreach (var (key, value) in expected)
+            Assert.Equal(value, request.Env[key]);
+
+        Assert.False(request.Env.ContainsKey("GH_TOKEN"));
+        Assert.False(request.Env.ContainsKey("GITHUB_TOKEN"));
+        Assert.Equal("0", request.Env["GIT_TERMINAL_PROMPT"]);
+    }
+
+    /// <summary>
+    /// Asserts the launched requests are EXACTLY the given tokenized command sequence, in
+    /// order — the count first, so a missing or extra launch fails loudly.
+    /// </summary>
+    private static void AssertSequence(
+        IReadOnlyList<GitProcessRequest> requests, params string[][] expected)
+    {
+        Assert.Equal(expected.Length, requests.Count);
+        for (var i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], requests[i].TokenizedArgs!.ToArray());
     }
 
     // ------------------------------------------------------------------
@@ -351,19 +418,19 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     // ------------------------------------------------------------------
-    // The CREDENTIAL delegates are NEVER invoked; the URL resolver is read
-    // exactly once per TRANSPORT command (Stage 6a) and never otherwise
+    // The URL resolver is read exactly once per TRANSPORT command (Stage 6a);
+    // the CREDENTIAL delegates are read only AFTER origin verification succeeds
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// The credential resolver and the credential-helper path are still NEVER invoked by this
-    /// slice (2c-b1c-ii owns the credential/helper resolution and the env injection). The URL
-    /// resolver, by contrast, IS read — exactly once — for every TRANSPORT command
-    /// (pull/push/fetch) that reaches Stage 6a, and never for a local command or for a command
-    /// rejected before Stage 6a.
+    /// The URL resolver IS read — exactly once — for every TRANSPORT command (pull/push/fetch)
+    /// that reaches Stage 6a, and never for a local command or for a command rejected before
+    /// Stage 6a. The credential resolver and the credential-helper path are Stage 6e delegates
+    /// and are read ONLY after the Stage 6d origin verification succeeded — with every launch
+    /// failing here, neither is ever reached.
     /// </summary>
     [Fact]
-    public async Task RunConfigRepoCommandAsync_NeverInvokesCredentialResolverOrHelperPath()
+    public async Task RunConfigRepoCommandAsync_CredentialDelegatesNotReachedWhenEveryLaunchFails()
     {
         var urlCalls = 0;
         var credentialCalls = 0;
@@ -377,7 +444,7 @@ public sealed class ConfigRepoGitOperationsTests
             static () => { });
 
         // The valid rows now REACH the real execution (slice 2c-b1b-ii), so the ProcessRunner
-        // seam throws — the launch failure is mapped to the fixed message and the assertions
+        // seam throws — the launch failure is mapped to a fixed message and the assertions
         // below hold for every row without ever starting a process.
         var originalRunner = GitOperations.ProcessRunner;
         try
@@ -410,6 +477,9 @@ public sealed class ConfigRepoGitOperationsTests
         // EXACTLY one read per transport command; the local command and the Stage 4 rejection
         // never touch the resolver.
         Assert.Equal(3, urlCalls);
+
+        // Stage 6e is gated behind Stage 6d: every eligible row failed its origin inspection
+        // (or its ref validation), so neither credential delegate was ever reached.
         Assert.Equal(0, credentialCalls);
         Assert.Equal(0, helperCalls);
     }
@@ -1111,43 +1181,62 @@ public sealed class ConfigRepoGitOperationsTests
     // Grammar acceptance — the allowed forms (all reach the real execution)
     // ------------------------------------------------------------------
 
-    public static TheoryData<string[]> AcceptedCommandCases => new()
+    /// <summary>
+    /// Every accepted form, paired with the message a THROWING ProcessRunner produces at the
+    /// FIRST launch that form reaches. The first launch differs by shape (2c-b1c-ii):
+    /// <list type="bullet">
+    ///   <item><description>
+    ///   a REF-bearing form reaches the Stage 6b <c>check-ref-format</c> subprocess first →
+    ///   <c>Git process failed to start.</c>;
+    ///   </description></item>
+    ///   <item><description>
+    ///   an ELIGIBLE ref-less transport form reaches the Stage 6d origin INSPECTION first →
+    ///   <c>Config repo origin could not be verified.</c>;
+    ///   </description></item>
+    ///   <item><description>
+    ///   a LOCAL form reaches its final command first → <c>Git process failed to start.</c>.
+    ///   </description></item>
+    /// </list>
+    /// </summary>
+    public static TheoryData<string[], string> AcceptedCommandCases => new()
     {
         // pull — options in every subset/order; positionals [origin] [ref].
-        new[] { "pull" },
-        new[] { "pull", "origin" },
-        new[] { "pull", "origin", "main" },
-        new[] { "pull", "--ff-only" },
-        new[] { "pull", "--no-rebase", "--ff-only" },
-        new[] { "pull", "--rebase", "--tags", "--prune" },
-        new[] { "pull", "--prune", "--depth", "1", "origin", "main" },
-        new[] { "pull", "--depth", "10", "--tags" },
-        new[] { "pull", "origin", "v1.0" },
+        { new[] { "pull" }, OriginNotVerified },
+        { new[] { "pull", "origin" }, OriginNotVerified },
+        { new[] { "pull", "origin", "main" }, LaunchFailed },
+        { new[] { "pull", "--ff-only" }, OriginNotVerified },
+        { new[] { "pull", "--no-rebase", "--ff-only" }, OriginNotVerified },
+        { new[] { "pull", "--rebase", "--tags", "--prune" }, OriginNotVerified },
+        { new[] { "pull", "--prune", "--depth", "1", "origin", "main" }, LaunchFailed },
+        { new[] { "pull", "--depth", "10", "--tags" }, OriginNotVerified },
+        { new[] { "pull", "origin", "v1.0" }, LaunchFailed },
         // fetch — options and positionals.
-        new[] { "fetch" },
-        new[] { "fetch", "origin" },
-        new[] { "fetch", "--tags", "--prune" },
-        new[] { "fetch", "--depth", "2", "origin" },
-        new[] { "fetch", "--prune", "origin", "main" },
+        { new[] { "fetch" }, OriginNotVerified },
+        { new[] { "fetch", "origin" }, OriginNotVerified },
+        { new[] { "fetch", "--tags", "--prune" }, OriginNotVerified },
+        { new[] { "fetch", "--depth", "2", "origin" }, OriginNotVerified },
+        { new[] { "fetch", "--prune", "origin", "main" }, LaunchFailed },
         // push — the exact form.
-        new[] { "push", "origin", "main" },
-        // The credential-free EXACT shapes.
-        new[] { "checkout", "--", "agents/" },
-        new[] { "add", "agents/*.agents.md" },
-        new[] { "diff", "--cached", "--name-only", "-z" },
-        new[] { "commit", "-m", "update agents" },
-        new[] { "merge", "--abort" },
-        new[] { "status" },
+        { new[] { "push", "origin", "main" }, LaunchFailed },
+        // The credential-free EXACT shapes (local commands — no origin state machine).
+        { new[] { "checkout", "--", "agents/" }, LaunchFailed },
+        { new[] { "add", "agents/*.agents.md" }, LaunchFailed },
+        { new[] { "diff", "--cached", "--name-only", "-z" }, LaunchFailed },
+        { new[] { "commit", "-m", "update agents" }, LaunchFailed },
+        { new[] { "merge", "--abort" }, LaunchFailed },
+        { new[] { "status" }, LaunchFailed },
     };
 
     /// <summary>
     /// Every accepted form reaches the real execution — the ProcessRunner seam throws, and the
-    /// launch failure surfaces as the FIXED result. (The placeholder was removed by slice
-    /// 2c-b1b-ii; the accepted-form grammar contract is now asserted through the execution path.)
+    /// launch failure surfaces as the FIXED result for whichever launch that form reaches
+    /// first. (The placeholder was removed by slice 2c-b1b-ii; the accepted-form grammar
+    /// contract is now asserted through the execution path.)
     /// </summary>
     [Theory]
     [MemberData(nameof(AcceptedCommandCases))]
-    public async Task Stage7_AcceptedForms_ReachExecution_LaunchFailureReturnsFixedMessage(string[] args)
+    public async Task Stage7_AcceptedForms_ReachExecution_LaunchFailureReturnsFixedMessage(
+        string[] args, string expected)
     {
         var originalRunner = GitOperations.ProcessRunner;
         try
@@ -1158,7 +1247,7 @@ public sealed class ConfigRepoGitOperationsTests
             using var seam = CreateSeam();
             var result = await RunAsync(seam, args);
 
-            AssertRejected(result, LaunchFailed);
+            AssertRejected(result, expected);
         }
         finally
         {
@@ -1177,7 +1266,9 @@ public sealed class ConfigRepoGitOperationsTests
 
             using var seam = CreateSeam();
             var result = await RunAsync(seam, new[] { "pull", "--depth", "+5" });
-            AssertRejected(result, LaunchFailed);
+
+            // An eligible, ref-less pull: the Stage 6d origin inspection is the first launch.
+            AssertRejected(result, OriginNotVerified);
         }
         finally
         {
@@ -1258,8 +1349,9 @@ public sealed class ConfigRepoGitOperationsTests
     /// EXACTLY equal to the scrubbed inherited snapshot plus <c>GIT_TERMINAL_PROMPT=0</c> —
     /// every one of the FIVE scrubbed variables (GH_TOKEN, GITHUB_TOKEN, GIT_ASKPASS,
     /// GITHUB_CONFIG_REPO_TOKEN, GIT_TERMINAL_PROMPT) absent, every non-scrubbed inherited
-    /// variable preserved, no extra entries. The exit-0 subprocess lets the command
-    /// continue, so a second (final-execution) request must carry the SNAPSHOT.
+    /// variable preserved, no extra entries. The exit-0 subprocess lets the command continue
+    /// into the Stage 6d origin inspection and then the final execution, which must carry
+    /// the SNAPSHOT.
     /// </summary>
     [Fact]
     public async Task Stage6_RefValidationRequest_HasExactShape()
@@ -1273,7 +1365,7 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = (request, _) =>
             {
                 requests.Add(request);
-                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+                return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
             };
 
             // Constructor input: the raw RepoDir; call-time spelling: the trailing-separator
@@ -1283,9 +1375,11 @@ public sealed class ConfigRepoGitOperationsTests
             using var seam = CreateSeam(pathCanonicalizer: _ => CanonicalizedRepoDir);
             var result = await RunInAsync(seam, new[] { "pull", "origin", "main" }, RepoDirWithSeparator);
 
-            // Exit 0 from check-ref-format: the command continues to Stage 7 (two launches).
+            // Exit 0 from check-ref-format: the command continues through the Stage 6d origin
+            // inspection (an equivalent, credential-free origin needs NO repair) to Stage 7.
             Assert.True(result.Success);
-            Assert.Equal(2, requests.Count);
+            AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+                ["pull", "origin", "main"]);
 
             var refValidation = requests[0];
             Assert.Equal("git", refValidation.Executable);
@@ -1293,17 +1387,15 @@ public sealed class ConfigRepoGitOperationsTests
             Assert.Equal(CanonicalizedRepoDir, refValidation.WorkingDirectory);
             Assert.NotEqual(RepoDir, CanonicalizedRepoDir);       // the spellings are distinct
             Assert.NotEqual(RepoDirWithSeparator, CanonicalizedRepoDir);
-            Assert.Equal(
-                new[] { "check-ref-format", "--allow-onelevel", "main" },
-                refValidation.TokenizedArgs!.ToArray());
 
-            // Env = the COMPLETE scrubbed inherited snapshot + GIT_TERMINAL_PROMPT=0.
-            AssertChildEnv(refValidation);
-
-            // The final execution carries the snapshot verbatim and the same child env.
-            Assert.Equal(new[] { "pull", "origin", "main" },
-                requests[1].TokenizedArgs!.ToArray());
-            AssertChildEnv(requests[1]);
+            // Env = the COMPLETE scrubbed inherited snapshot + GIT_TERMINAL_PROMPT=0 for the
+            // ref validation, the origin inspection AND the final command (no credential was
+            // resolved, so nothing is injected anywhere).
+            foreach (var request in requests)
+            {
+                Assert.Equal(CanonicalizedRepoDir, request.WorkingDirectory);
+                AssertChildEnv(request);
+            }
         }
         finally
         {
@@ -1846,12 +1938,20 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = (request, _) =>
             {
                 requests.Add(request);
-                if (requests.Count == 1)
+                var tokens = request.TokenizedArgs!;
+                if (tokens[0] == "check-ref-format")
                 {
                     // The ref-validation subprocess blocks until the caller mutates the list.
                     refValidationEntered.TrySetResult();
                     return releaseRefValidation.Task.ContinueWith(
                         _ => new GitProcessResult(0, string.Empty, string.Empty));
+                }
+
+                if (tokens[0] == "remote")
+                {
+                    // The Stage 6d origin inspection: a PRESENT, equivalent, credential-free
+                    // origin — no repair follows.
+                    return Task.FromResult(new GitProcessResult(0, EligibleUrl, string.Empty));
                 }
 
                 finalExecutionEntered.TrySetResult();
@@ -1877,13 +1977,8 @@ public sealed class ConfigRepoGitOperationsTests
 
             // The final execution launched the SNAPSHOT, never the mutated tokens.
             Assert.True(result.Success);
-            Assert.Equal(2, requests.Count);
-            Assert.Equal(
-                new[] { "check-ref-format", "--allow-onelevel", "main" },
-                requests[0].TokenizedArgs!.ToArray());
-            Assert.Equal(
-                new[] { "pull", "origin", "main" },
-                requests[1].TokenizedArgs!.ToArray());
+            AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+                ["pull", "origin", "main"]);
             Assert.DoesNotContain("MUTATED-REF",
                 requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
         }
@@ -1914,14 +2009,16 @@ public sealed class ConfigRepoGitOperationsTests
     /// <summary>
     /// An operation that has ALREADY begun (past the Stage 1 disposed-check) completes
     /// NORMALLY — disposal is checked ONLY at entry, and this test proves the contract
-    /// ACROSS the Stage 6→Stage 7 boundary: the operation is gated while BLOCKED at Stage 6
-    /// (the ref-validation subprocess of a ref-bearing command); <see cref="ConfigRepoGitOperations.Dispose"/>
-    /// is called while it is blocked there; the Stage 6 gate is released; the test then
-    /// asserts Stage 7 STILL LAUNCHES (a second request is received — a mutant that rechecks
-    /// <c>_disposed</c> before Stage 7 would return <c>Seam disposed.</c> and never launch
-    /// the second request); the in-flight operation returns its REAL result (not
-    /// <c>Seam disposed.</c>), while a SUBSEQUENT call returns exactly
-    /// <c>ConfigRepoOpResult(false, -1, "", "Seam disposed.")</c>.
+    /// ACROSS the Stage 6b→6d→Stage 7 boundary: the operation is gated while BLOCKED at
+    /// Stage 6b (the ref-validation subprocess of a ref-bearing command);
+    /// <see cref="ConfigRepoGitOperations.Dispose"/> is called while it is blocked there; the
+    /// Stage 6b gate is released; the test then asserts the Stage 6d origin inspection AND
+    /// Stage 7 STILL LAUNCH (a mutant that rechecks <c>_disposed</c> after Stage 6b would
+    /// return <c>Seam disposed.</c> and never launch them); the in-flight operation returns
+    /// its REAL result (not <c>Seam disposed.</c>), while a SUBSEQUENT call returns exactly
+    /// <c>ConfigRepoOpResult(false, -1, "", "Seam disposed.")</c>. It also proves the Stage 6c
+    /// semaphore is NEVER disposed by <c>Dispose()</c>: an in-flight operation holding it must
+    /// be able to release it after disposal without faulting.
     /// </summary>
     [Fact]
     public async Task Disposal_InFlightOperationCompletesNormally_SubsequentCallReturnsSeamDisposed()
@@ -1939,14 +2036,18 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = (request, _) =>
             {
                 requests.Add(request);
-                if (requests.Count == 1)
+                var tokens = request.TokenizedArgs!;
+                if (tokens[0] == "check-ref-format")
                 {
-                    // Block DURING Stage 6 (the ref-validation subprocess) — AFTER the
+                    // Block DURING Stage 6b (the ref-validation subprocess) — AFTER the
                     // Stage 1 disposed-check has already passed.
                     stage6Entered.TrySetResult();
                     return releaseStage6.Task.ContinueWith(
                         _ => new GitProcessResult(0, string.Empty, string.Empty));
                 }
+
+                if (tokens[0] == "remote")
+                    return Task.FromResult(new GitProcessResult(0, EligibleUrl, string.Empty));
 
                 stage7Entered.TrySetResult();
                 return releaseStage7.Task.ContinueWith(
@@ -1957,12 +2058,13 @@ public sealed class ConfigRepoGitOperationsTests
             execution = seam.RunConfigRepoCommandAsync(
                 new[] { "pull", "origin", "main" }, RepoDir, CancellationToken.None);
 
-            // The operation is IN FLIGHT at Stage 6 (past the entry disposed-check) — dispose.
+            // The operation is IN FLIGHT at Stage 6b (past the entry disposed-check) — dispose.
             await stage6Entered.Task.WaitAsync(
                 TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             seam.Dispose();
 
-            // Release Stage 6 — Stage 7 MUST STILL LAUNCH (disposal is NOT rechecked).
+            // Release Stage 6b — Stage 6d and Stage 7 MUST STILL LAUNCH (disposal is NOT
+            // rechecked, and the Stage 6c semaphore was NOT disposed underneath the operation).
             releaseStage6.TrySetResult();
             await stage7Entered.Task.WaitAsync(
                 TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -1970,14 +2072,10 @@ public sealed class ConfigRepoGitOperationsTests
 
             var result = await execution;
 
-            // Both launches happened — the ref-validation subprocess and the final execution.
-            Assert.Equal(2, requests.Count);
-            Assert.Equal(
-                new[] { "check-ref-format", "--allow-onelevel", "main" },
-                requests[0].TokenizedArgs!.ToArray());
-            Assert.Equal(
-                new[] { "pull", "origin", "main" },
-                requests[1].TokenizedArgs!.ToArray());
+            // All THREE launches happened — the ref validation, the origin inspection and the
+            // final execution.
+            AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+                ["pull", "origin", "main"]);
 
             // The in-flight operation COMPLETES NORMALLY with its REAL result.
             Assert.True(result.Success);
@@ -2123,12 +2221,22 @@ public sealed class ConfigRepoGitOperationsTests
     /// Runs a command against a RECORDING ProcessRunner (restored in a finally block) and
     /// returns the result together with EVERY captured request, so the exact invocation TOTAL
     /// — not merely the last request's shape — can be asserted.
+    /// <para>
+    /// The Stage 6d origin commands are answered separately from the command under test:
+    /// <c>remote get-url origin</c> reports <paramref name="originStdout"/> (defaulting to the
+    /// configured <see cref="EligibleUrl"/> — a PRESENT, credential-free, fully equivalent
+    /// origin, so no <c>remote add</c>/<c>set-url</c> follows), and every other
+    /// <c>remote …</c> command succeeds. <paramref name="exitCode"/> applies to the
+    /// ref-validation subprocess and the final command only.
+    /// </para>
     /// </summary>
     private static async Task<(ConfigRepoOpResult Result, List<GitProcessRequest> Requests)> RunCapturingAsync(
         Func<string?> resolvedUrlResolver,
         string[] args,
         int exitCode = 0,
-        Func<string?>? credentialResolver = null)
+        Func<string?>? credentialResolver = null,
+        string? originStdout = EligibleUrl,
+        Func<string>? credentialHelperPath = null)
     {
         var originalRunner = GitOperations.ProcessRunner;
         var requests = new List<GitProcessRequest>();
@@ -2137,11 +2245,13 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = (request, _) =>
             {
                 requests.Add(request);
-                return Task.FromResult(new GitProcessResult(exitCode, string.Empty, string.Empty));
+                return Task.FromResult(OriginAwareResult(request, exitCode, originStdout));
             };
 
             using var seam = CreateSeam(
-                resolvedUrlResolver: resolvedUrlResolver, credentialResolver: credentialResolver);
+                resolvedUrlResolver: resolvedUrlResolver,
+                credentialResolver: credentialResolver,
+                credentialHelperPath: credentialHelperPath);
             var result = await Bounded(
                 seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None));
             return (result, requests);
@@ -2150,6 +2260,26 @@ public sealed class ConfigRepoGitOperationsTests
         {
             GitOperations.ProcessRunner = originalRunner;
         }
+    }
+
+    /// <summary>
+    /// The shared fake response: the Stage 6d origin commands always succeed (the inspection
+    /// reporting <paramref name="originStdout"/>), everything else reports
+    /// <paramref name="exitCode"/>.
+    /// </summary>
+    private static GitProcessResult OriginAwareResult(
+        GitProcessRequest request, int exitCode, string? originStdout)
+    {
+        var tokens = request.TokenizedArgs!;
+        if (tokens.Count > 0 && tokens[0] == "remote")
+        {
+            var stdout = tokens.Count > 1 && tokens[1] == "get-url"
+                ? originStdout ?? string.Empty
+                : string.Empty;
+            return new GitProcessResult(0, stdout, string.Empty);
+        }
+
+        return new GitProcessResult(exitCode, string.Empty, string.Empty);
     }
 
     /// <summary>
@@ -2166,17 +2296,21 @@ public sealed class ConfigRepoGitOperationsTests
 
     /// <summary>
     /// An eligible URL makes a POSITIONAL-FREE pull the CANONICALIZED explicit-origin launch.
-    /// Exactly ONE subprocess is launched (a bare pull has no ref candidate).
+    /// Branch A always runs the Stage 6d origin INSPECTION first; the fixture reports an
+    /// already-equivalent, credential-free origin, so no repair follows and the sequence is
+    /// exactly inspection → the canonicalized command.
     /// </summary>
     [Theory]
     [MemberData(nameof(EligibleUrlCases))]
     public async Task Stage6a_EligibleUrl_BarePull_LaunchesExplicitOrigin(string url)
     {
-        var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
+        // The origin reported by the fixture must be the SANITIZED form of the resolved URL,
+        // otherwise the equivalence check would (correctly) reject it.
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(url), ["pull"], originStdout: ConfigRepoUrlSanitizer.Sanitize(url));
 
         Assert.True(result.Success);
-        Assert.Single(requests);
-        Assert.Equal(new[] { "pull", "origin" }, requests[0].TokenizedArgs!.ToArray());
+        AssertSequence(requests, OriginInspect, ["pull", "origin"]);
     }
 
     /// <summary>
@@ -2250,8 +2384,10 @@ public sealed class ConfigRepoGitOperationsTests
         var (result, requests) = await RunCapturingAsync(UrlResolver(EligibleUrl), args);
 
         Assert.True(result.Success);
-        Assert.Single(requests); // EXACTLY one launch — no ref candidate, no duplicate launch
-        Assert.Equal(expectedLaunch, requests[0].TokenizedArgs!.ToArray());
+        // EXACTLY two launches: the Stage 6d origin inspection (the origin is already
+        // equivalent and credential-free, so no repair follows) and the final command. No ref
+        // candidate, so no check-ref-format and no duplicate final launch.
+        AssertSequence(requests, OriginInspect, expectedLaunch);
     }
 
     /// <summary>
@@ -2272,8 +2408,9 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     /// <summary>
-    /// A ref-bearing form launches the ref-validation subprocess FIRST and then the SNAPSHOT
-    /// verbatim — exactly two launches, and the <c>origin</c> insertion never applies.
+    /// A ref-bearing form launches the ref-validation subprocess FIRST, then the Stage 6d
+    /// origin inspection, then the SNAPSHOT verbatim — exactly three launches, and the
+    /// <c>origin</c> insertion never applies.
     /// </summary>
     [Theory]
     [InlineData("pull")]
@@ -2285,17 +2422,14 @@ public sealed class ConfigRepoGitOperationsTests
             UrlResolver(EligibleUrl), [subcommand, "origin", "main"]);
 
         Assert.True(result.Success);
-        Assert.Equal(2, requests.Count);
-        Assert.Equal(
-            new[] { "check-ref-format", "--allow-onelevel", "main" },
-            requests[0].TokenizedArgs!.ToArray());
-        Assert.Equal(new[] { subcommand, "origin", "main" }, requests[1].TokenizedArgs!.ToArray());
+        AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+            [subcommand, "origin", "main"]);
     }
 
     /// <summary>
-    /// The Stage 6a launches carry the SAME child env as every other launch: the scrubbed
-    /// inherited snapshot plus <c>GIT_TERMINAL_PROMPT=0</c>, and NOTHING else — this slice
-    /// attaches NO credential environment (2c-b1c-ii owns the injection).
+    /// The launches carry the SAME child env as every other launch: the scrubbed inherited
+    /// snapshot plus <c>GIT_TERMINAL_PROMPT=0</c>, and NOTHING else — with a null credential
+    /// (the default resolver) NOTHING is ever injected, on either branch.
     /// </summary>
     [Theory]
     [InlineData(EligibleUrl)]
@@ -2308,8 +2442,9 @@ public sealed class ConfigRepoGitOperationsTests
             var (result, requests) = await RunCapturingAsync(UrlResolver(url), ["pull"]);
 
             Assert.True(result.Success);
-            Assert.Single(requests);
-            AssertChildEnv(requests[0]);
+            Assert.NotEmpty(requests);
+            foreach (var request in requests)
+                AssertChildEnv(request);
         }
         finally
         {
@@ -2590,7 +2725,7 @@ public sealed class ConfigRepoGitOperationsTests
     {
         var (bareResult, bareRequests) = await RunCapturingAsync(UrlResolver(EligibleUrl), ["pull"]);
         Assert.True(bareResult.Success);
-        Assert.Single(bareRequests);
+        AssertSequence(bareRequests, OriginInspect, ["pull", "origin"]);
 
         var (badRemote, badRemoteRequests) = await RunCapturingAsync(
             UrlResolver(EligibleUrl), ["pull", "main"]);
@@ -2629,13 +2764,15 @@ public sealed class ConfigRepoGitOperationsTests
 
     /// <summary>
     /// The URL resolver is read EXACTLY ONCE per transport command, no matter how many
-    /// subprocesses the command launches (a ref-bearing command launches two).
+    /// subprocesses the command launches. The totals are the migrated Branch A sequences: an
+    /// eligible ref-less form launches the origin inspection + the command; a ref-bearing form
+    /// launches the ref validation + the origin inspection + the command.
     /// </summary>
     [Theory]
-    [InlineData(new[] { "pull" }, 1)]
-    [InlineData(new[] { "pull", "origin", "main" }, 2)]
-    [InlineData(new[] { "push", "origin", "main" }, 2)]
-    [InlineData(new[] { "fetch", "--tags" }, 1)]
+    [InlineData(new[] { "pull" }, 2)]
+    [InlineData(new[] { "pull", "origin", "main" }, 3)]
+    [InlineData(new[] { "push", "origin", "main" }, 3)]
+    [InlineData(new[] { "fetch", "--tags" }, 2)]
     public async Task Stage6a_UrlResolverIsReadExactlyOnce(string[] args, int expectedLaunches)
     {
         var urlCalls = 0;
@@ -2648,13 +2785,12 @@ public sealed class ConfigRepoGitOperationsTests
     }
 
     /// <summary>
-    /// The CREDENTIAL resolver is NOT invoked on ANY Stage 6a path — success, Branch B,
-    /// missing URL, Sanitize rejection, or a throwing resolver. (2c-b1c-ii owns the credential
-    /// resolution and injection.)
+    /// The CREDENTIAL resolver is NOT invoked on ANY Stage 6a REJECTION path, nor on Branch B
+    /// (an ineligible transport command runs unauthenticated and never reaches Stage 6e).
+    /// Branch A is covered separately by the Stage 6e tests.
     /// </summary>
     public static TheoryData<Func<string?>> CredentialFreeStage6aResolvers => new()
     {
-        static () => EligibleUrl,                                     // Branch A
         static () => "ssh://git@github.com/org/config-repo.git",      // Branch B
         static () => null,                                            // missing
         static () => "   ",                                           // whitespace
@@ -2692,7 +2828,7 @@ public sealed class ConfigRepoGitOperationsTests
     /// </summary>
     [Theory]
     [InlineData(new[] { "pull", "origin", "main" }, new[] { "check-ref-format", "--allow-onelevel", "main" })]
-    [InlineData(new[] { "pull" }, new[] { "pull", "origin" })]
+    [InlineData(new[] { "pull" }, new[] { "remote", "get-url", "origin" })]
     public async Task Stage6a_PassedTransportCommand_CancellationPropagatesAtTheFirstLaunch(
         string[] args, string[] expectedFirstLaunch)
     {
@@ -2749,6 +2885,2296 @@ public sealed class ConfigRepoGitOperationsTests
             }
 
             GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 6c/6d/6e (slice 2c-b1c-ii) — the origin state machine, the
+    // credential + helper resolution, the env injection and the literal pass
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs a command against a SCRIPTED ProcessRunner (restored in a finally block). The
+    /// script may throw to model a launch failure.
+    /// </summary>
+    private static async Task<(ConfigRepoOpResult Result, List<GitProcessRequest> Requests)> RunScriptedAsync(
+        Func<GitProcessRequest, GitProcessResult> respond,
+        string[] args,
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null,
+        Func<string?>? resolvedUrlResolver = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(respond(request));
+            };
+
+            using var seam = CreateSeam(
+                resolvedUrlResolver: resolvedUrlResolver ?? UrlResolver(EligibleUrl),
+                credentialResolver: credentialResolver,
+                credentialHelperPath: credentialHelperPath);
+            var result = await Bounded(
+                seam.RunConfigRepoCommandAsync(args, RepoDir, CancellationToken.None));
+            return (result, requests);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 6d step 3a — the origin INSPECTION ──────────────────────────
+
+    /// <summary>
+    /// The origin-inspection request has the EXACT credential-free shape:
+    /// <c>remote get-url origin</c>, empty <c>Args</c>, the CONSTRUCTOR-canonicalized working
+    /// directory, and the scrubbed env plus <c>GIT_TERMINAL_PROMPT=0</c> — even though a
+    /// NON-WHITESPACE credential is resolvable for the final command.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_OriginInspectionRequest_IsCredentialFreeAndHasExactShape()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+            };
+
+            using var seam = CreateSeam(
+                pathCanonicalizer: _ => CanonicalizedRepoDir,
+                credentialResolver: static () => "ghp_secret");
+            var result = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["pull"], RepoDirWithSeparator, CancellationToken.None));
+
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+
+            var inspection = requests[0];
+            Assert.Equal("git", inspection.Executable);
+            Assert.Empty(inspection.Args);
+            Assert.Equal(CanonicalizedRepoDir, inspection.WorkingDirectory);
+            AssertChildEnv(inspection); // credential-free
+
+            // The FINAL command is the ONLY one that carries the credential.
+            AssertChildEnvWithCredential(requests[1], "ghp_secret", "/helper");
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// A nonzero inspection exit whose stderr matches the ABSENCE classification (checked
+    /// case-INSENSITIVELY) means an ABSENT origin → <c>remote add origin &lt;sanitized&gt;</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("error: No such remote 'origin'")]
+    [InlineData("fatal: no such remote 'origin'")]
+    [InlineData("fatal: NOT A GIT REPOSITORY (or any of the parent directories): .git")]
+    [InlineData("fatal: does not appear to be a git repository")]
+    [InlineData("fatal: DOES NOT APPEAR TO BE A GIT REPOSITORY")]
+    public async Task Stage6d_AbsenceStderrClassification_AddsTheOrigin(string stderr)
+    {
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote" && request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(128, string.Empty, stderr)
+                : new GitProcessResult(0, string.Empty, string.Empty),
+            ["pull"]);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect, OriginAdd, ["pull", "origin"]);
+    }
+
+    /// <summary>
+    /// An exit-0 inspection with EMPTY (or whitespace-only) stdout is ALSO an ABSENT origin.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\n")]
+    public async Task Stage6d_ExitZeroWithEmptyStdout_AddsTheOrigin(string stdout)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull"], originStdout: stdout);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect, OriginAdd, ["pull", "origin"]);
+    }
+
+    /// <summary>
+    /// ANY OTHER nonzero inspection exit is an inspection FAILURE — the fixed message, exit
+    /// code ALWAYS -1, empty stdout, and the internal output DISCARDED. Nothing else launches.
+    /// </summary>
+    [Theory]
+    [InlineData(1, "fatal: something else went wrong")]
+    [InlineData(128, "fatal: unable to read config")]
+    [InlineData(2, "")]
+    public async Task Stage6d_OtherNonZeroInspectionExit_ReturnsOriginNotVerified(
+        int exitCode, string stderr)
+    {
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(exitCode, "internal stdout", stderr)
+                : new GitProcessResult(0, string.Empty, string.Empty),
+            ["pull"]);
+
+        AssertRejected(result, OriginNotVerified);
+        AssertSequence(requests, OriginInspect);
+    }
+
+    /// <summary>
+    /// A LAUNCH failure at the origin inspection maps to the SAME fixed message — the
+    /// exception's own text never escapes — and nothing else launches.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_InspectionLaunchFailure_ReturnsOriginNotVerified()
+    {
+        var (result, requests) = await RunScriptedAsync(
+            _ => throw new InvalidOperationException("git executable missing"),
+            ["pull"]);
+
+        AssertRejected(result, OriginNotVerified);
+        AssertSequence(requests, OriginInspect);
+    }
+
+    // ── Stage 6d step 3b — ADD an absent origin ───────────────────────────
+
+    /// <summary>
+    /// A nonzero <c>remote add</c> exit rejects with the fixed message; the final command
+    /// NEVER launches, and NEITHER Stage 6e delegate is reached — Stage 6e runs only after
+    /// origin verification SUCCEEDS, so a mutant that resolved the credential ahead of the
+    /// failed reconciliation fails the invocation counts.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_AddNonZeroExit_ReturnsOriginNotAdded()
+    {
+        var credentialCalls = 0;
+        var helperCalls = 0;
+
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![1] switch
+            {
+                "get-url" => new GitProcessResult(0, string.Empty, string.Empty),
+                _ => new GitProcessResult(3, "internal stdout", "internal stderr"),
+            },
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(result, OriginNotAdded);
+        AssertSequence(requests, OriginInspect, OriginAdd);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// A LAUNCH failure at <c>remote add</c> maps to the same fixed message, and neither
+    /// Stage 6e delegate is reached.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_AddLaunchFailure_ReturnsOriginNotAdded()
+    {
+        var credentialCalls = 0;
+        var helperCalls = 0;
+
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(0, string.Empty, string.Empty)
+                : throw new InvalidOperationException("boom"),
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(result, OriginNotAdded);
+        AssertSequence(requests, OriginInspect, OriginAdd);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// The ABSENCE path end-to-end: the inspection classifies the origin as ABSENT, the seam
+    /// ADDS it with the SANITIZED url, and the final command then proceeds WITH the credential
+    /// injected — while the inspection and the add themselves stay CREDENTIAL-FREE.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_AbsentOrigin_AddsThenProceedsWithTheCredential()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(
+                    request.TokenizedArgs![1] == "get-url"
+                        ? new GitProcessResult(128, string.Empty, "fatal: No Such Remote 'origin'")
+                        : new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam(
+                credentialResolver: static () => "ghp_secret",
+                credentialHelperPath: static () => "/tmp/askpass.sh");
+            var result = await Bounded(
+                seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None));
+
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, OriginAdd, ["pull", "origin"]);
+
+            // The inspection AND the add are credential-free; only the final command carries it.
+            AssertChildEnv(requests[0]);
+            AssertChildEnv(requests[1]);
+            AssertChildEnvWithCredential(requests[2], "ghp_secret", "/tmp/askpass.sh");
+
+            // The seam NEVER WRITES a credential: the add argument is the SANITIZED URL.
+            Assert.DoesNotContain("ghp_secret", requests[1].TokenizedArgs!, StringComparer.Ordinal);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// The REPAIR path end-to-end: the <c>set-url</c> subprocess itself is CREDENTIAL-FREE
+    /// even though the final command that follows it is injected.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_RepairSubprocess_IsCredentialFreeWhileTheFinalCommandIsInjected()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(OriginAwareResult(
+                    request, 0, "https://x-access-token:ghp_secret@github.com/org/config-repo.git"));
+            };
+
+            using var seam = CreateSeam(
+                credentialResolver: static () => "ghp_secret",
+                credentialHelperPath: static () => "/tmp/askpass.sh");
+            var result = await Bounded(
+                seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None));
+
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, OriginSetUrl, ["pull", "origin"]);
+
+            AssertChildEnv(requests[0]);
+            AssertChildEnv(requests[1]);
+            AssertChildEnvWithCredential(requests[2], "ghp_secret", "/tmp/askpass.sh");
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    // ── Stage 6d step 3c — the rejection classes, one test per class ──────
+
+    /// <summary>
+    /// The repair predicate requires EVERY component to match. These tests pin each rejection
+    /// class SEPARATELY, so deleting any single conjunct of the predicate fails a dedicated
+    /// test rather than merely thinning a shared table. Each origin is credential-BEARING and
+    /// differs from the configured URL in EXACTLY ONE respect, so the only reason it is not
+    /// repaired is the conjunct under test.
+    /// </summary>
+    private static async Task AssertOriginRejectedAsync(string origin)
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        try
+        {
+            var (result, requests) = await RunCapturingAsync(
+                UrlResolver(EligibleUrl),
+                ["pull"],
+                credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+                originStdout: origin,
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            AssertRejected(result, OriginMismatch);
+
+            // NO add, NO set-url and NO final command: the seam never rewrites nor runs.
+            AssertSequence(requests, OriginInspect);
+
+            // Neither credential delegate is reached by an origin-rejected operation, and the
+            // one subprocess that DID run carries no credential env.
+            Assert.Equal(0, credentialCalls);
+            Assert.Equal(0, helperCalls);
+            AssertChildEnv(requests[0]);
+
+            Assert.DoesNotContain("ghp_secret", result.SanitizedError, StringComparison.Ordinal);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>A credential-bearing origin over <c>http://</c> is REJECTED — never upgraded.</summary>
+    [Fact]
+    public Task Stage6d_CredentialBearingOriginOverHttp_IsRejected() =>
+        AssertOriginRejectedAsync("http://x-access-token:ghp_secret@github.com/org/config-repo.git");
+
+    /// <summary>A credential-bearing origin on a NON-443 port is REJECTED — never re-pointed.</summary>
+    [Theory]
+    [InlineData("https://x-access-token:ghp_secret@github.com:8443/org/config-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.com:8080/org/config-repo.git")]
+    public Task Stage6d_CredentialBearingOriginOnNon443Port_IsRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>A credential-bearing origin at a DIFFERENT HOST is REJECTED.</summary>
+    [Theory]
+    [InlineData("https://x-access-token:ghp_secret@gitlab.com/org/config-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.example.com/org/config-repo.git")]
+    public Task Stage6d_CredentialBearingOriginAtDifferentHost_IsRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>A credential-bearing origin at a DIFFERENT PATH is REJECTED.</summary>
+    [Theory]
+    [InlineData("https://x-access-token:ghp_secret@github.com/other/config-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/other-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo/extra.git")]
+    public Task Stage6d_CredentialBearingOriginAtDifferentPath_IsRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>
+    /// A credential-bearing origin carrying a QUERY or a FRAGMENT is REJECTED — the seam never
+    /// drops either component in the course of a "repair".
+    /// </summary>
+    [Theory]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo.git?token=other")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo.git?x=1")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo.git#frag")]
+    public Task Stage6d_CredentialBearingOriginWithQueryOrFragment_IsRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>An SSH origin — in URL and scp-style spelling — is REJECTED.</summary>
+    [Theory]
+    [InlineData("ssh://git@github.com/org/config-repo.git")]
+    [InlineData("ssh://git@github.com:443/org/config-repo.git")]
+    [InlineData("git@github.com:org/config-repo.git")]
+    public Task Stage6d_SshOrigin_IsRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>A <c>file://</c> origin and a bare local absolute path are REJECTED.</summary>
+    [Fact]
+    public async Task Stage6d_FileAndLocalPathOrigin_AreRejected()
+    {
+        await AssertOriginRejectedAsync(FileUrl);
+        await AssertOriginRejectedAsync(LocalPathUrl);
+    }
+
+    /// <summary>A credential-FREE origin on an explicit non-443 port is REJECTED.</summary>
+    [Fact]
+    public Task Stage6d_CredentialFreeOriginOnNon443Port_IsRejected() =>
+        AssertOriginRejectedAsync("https://github.com:8443/org/config-repo.git");
+
+    /// <summary>
+    /// A credential-FREE STALE origin (the right SHAPE — https, github.com, 443 — but the
+    /// WRONG repository) is REJECTED with NO rewrite: there is no <c>set-url</c> in the
+    /// sequence, and no subprocess ever carries credential env. Rewriting a stale origin
+    /// would silently retarget the worker at a different repository.
+    /// </summary>
+    [Theory]
+    [InlineData("https://github.com/other-org/config-repo.git")]
+    [InlineData("https://github.com/org/some-other-repo.git")]
+    [InlineData("https://github.com/org/config-repo/nested.git")]
+    public Task Stage6d_CredentialFreeStaleOrigin_IsRejectedWithoutRewriting(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>
+    /// The NON-ASCII percent-escape vector. Adjacent escapes are decoded BYTE-TO-CODE-POINT
+    /// (Latin-1 style), NEVER re-assembled as UTF-8. The discriminating row is
+    /// <c>r%E9po</c> vs <c>r%EF%BF%BDpo</c>: a UTF-8 decoder with a replacement fallback maps
+    /// BOTH to <c>r\uFFFDpo</c> (the lone <c>0xE9</c> is invalid UTF-8, and <c>EF BF BD</c>
+    /// IS the replacement character) and would call them EQUIVALENT — so a UTF-8-decoding
+    /// implementation issues a <c>set-url</c> and rewrites the origin. The Latin-1 rule keeps
+    /// them DISTINCT, which is what the REJECTION asserts.
+    /// </summary>
+    [Theory]
+    // The discriminator: equal under UTF-8-with-replacement, DISTINCT under Latin-1.
+    [InlineData("https://github.com/org/r%E9po.git", "https://github.com/org/r%EF%BF%BDpo.git", false)]
+    [InlineData("https://github.com/org/r%EF%BF%BDpo.git", "https://github.com/org/r%E9po.git", false)]
+    // A two-escape UTF-8 sequence never collapses into the single code point it would encode.
+    [InlineData("https://github.com/org/r%C3%A9po.git", "https://github.com/org/r%E9po.git", false)]
+    // Identical escapes ARE equivalent — the decoding is not simply broken for every input.
+    [InlineData("https://github.com/org/r%E9po.git", "https://github.com/org/r%E9po.git", true)]
+    [InlineData("https://github.com/org/r%C3%A9po.git", "https://github.com/org/r%C3%A9po.git", true)]
+    public async Task Stage6d_NonAsciiEscapesAreDecodedByteToCodePoint(
+        string configuredUrl, string origin, bool equivalent)
+    {
+        // The vectors really are distinct SANITIZED urls, so the outcome cannot be an artefact
+        // of the sanitizer normalizing them to the same string.
+        var sanitized = ConfigRepoUrlSanitizer.Sanitize(configuredUrl);
+        Assert.False(string.IsNullOrWhiteSpace(sanitized));
+
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(configuredUrl), ["pull"], originStdout: origin);
+
+        if (equivalent)
+        {
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+        }
+        else
+        {
+            AssertRejected(result, OriginMismatch);
+            AssertSequence(requests, OriginInspect);
+        }
+    }
+
+    /// <summary>
+    /// The path comparison runs over the RAW url string, NEVER over a
+    /// <see cref="System.Uri"/>-canonicalized path. <see cref="System.Uri"/> silently applies
+    /// transformations that are NOT among the four permitted normalization steps — dot-segment
+    /// collapse (<c>/a/../b</c> → <c>/b</c>), <c>\</c>→<c>/</c> normalization, and unescaping
+    /// of unreserved characters — so an implementation that read the path through
+    /// <see cref="System.Uri"/> would treat each of these ALIASES as equivalent to the
+    /// configured URL and, for the credential-bearing rows, silently "repair" an origin whose
+    /// raw components do not match. Every row here must be REJECTED.
+    /// </summary>
+    [Theory]
+    // Dot-segment aliases: the raw components include the literal ".." / "." segments.
+    [InlineData("https://github.com/org/other/../config-repo.git")]
+    [InlineData("https://github.com/org/./config-repo.git")]
+    [InlineData("https://github.com/./org/config-repo.git")]
+    [InlineData("https://github.com/org/a/b/../../config-repo.git")]
+    // The credential-bearing dot-segment alias must NOT be "safely repaired" either.
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/other/../config-repo.git")]
+    // Backslash alias: Uri normalizes '\' to '/', the raw algorithm does not.
+    [InlineData("https://github.com/org\\config-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org\\config-repo.git")]
+    // A duplicate-slash alias is a genuinely different raw component list (an EMPTY component).
+    [InlineData("https://github.com/org//config-repo.git")]
+    public Task Stage6d_UriCanonicalizationAliases_AreRejected(string origin) =>
+        AssertOriginRejectedAsync(origin);
+
+    /// <summary>
+    /// The converse of <see cref="Stage6d_UriCanonicalizationAliases_AreRejected"/>: the
+    /// EXACT raw path still matches, so the alias rejection is not simply "reject everything".
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_ExactRawPath_IsStillEquivalent()
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull"], originStdout: EligibleUrl);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+    }
+
+    /// <summary>
+    /// PERCENT-DECODING discriminators. Every row is chosen so that DELETING the decode step
+    /// (comparing the raw components directly) flips the outcome:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///   ENCODED-vs-LITERAL: the sanitized configured path holds the literal <c>echo</c> while
+    ///   the origin spells it <c>%65cho</c>. The raw components DIFFER and only the decode
+    ///   makes them equal — so without the decode the row is rejected and the test fails.
+    ///   </description></item>
+    ///   <item><description>
+    ///   MALFORMED escapes stay LITERAL: the sanitizer re-escapes the stray <c>%</c> to
+    ///   <c>%25</c>, so the configured side reads <c>a%25zzb</c> and the origin <c>a%zzb</c>.
+    ///   One decode pass turns the former into <c>a%zzb</c> and leaves the latter's malformed
+    ///   <c>%zz</c> exactly as it is — they match only because BOTH rules hold.
+    ///   </description></item>
+    ///   <item><description>
+    ///   SINGLE-PASS, not recursive: <c>%252F</c> decodes ONCE to the literal four-character
+    ///   string <c>%2F</c>, never onwards to <c>/</c>. A recursive decoder would equate
+    ///   <c>x%252Fy</c> with <c>x%2Fy</c> (both reaching <c>x/y</c>) and wrongly accept the
+    ///   origin; the rejection pins exactly one pass.
+    ///   </description></item>
+    /// </list>
+    /// </summary>
+    [Theory]
+    // (a) ENCODED vs LITERAL — decode-EQUAL though raw-DIFFERENT → EQUIVALENT, no set-url.
+    [InlineData("https://github.com/org/%65cho.git", "https://github.com/org/%65cho.git", true)]
+    [InlineData("https://github.com/org/echo.git", "https://github.com/org/%65cho.git", true)]
+    [InlineData("https://github.com/org/%65cho.git", "https://github.com/org/echo.git", true)]
+    // A DIFFERENT decoded character is still a mismatch — the decode is not "accept anything".
+    [InlineData("https://github.com/org/%65cho.git", "https://github.com/org/%66cho.git", false)]
+    // (b) MALFORMED escapes remain literal (and %25 decodes in the same single pass).
+    [InlineData("https://github.com/org/a%zzb.git", "https://github.com/org/a%zzb.git", true)]
+    [InlineData("https://github.com/org/a%2.git", "https://github.com/org/a%2.git", true)]
+    // (c) SINGLE-PASS vs recursive: %252F must NOT reach the separator.
+    [InlineData("https://github.com/org/x%252Fy.git", "https://github.com/org/x%2Fy.git", false)]
+    [InlineData("https://github.com/org/x%252Fy.git", "https://github.com/org/x%252Fy.git", true)]
+    public async Task Stage6d_PercentDecodingDiscriminators(
+        string configuredUrl, string origin, bool equivalent)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(configuredUrl), ["pull"], originStdout: origin);
+
+        if (equivalent)
+        {
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+        }
+        else
+        {
+            AssertRejected(result, OriginMismatch);
+            AssertSequence(requests, OriginInspect);
+        }
+    }
+
+    /// <summary>
+    /// The ENCODED-vs-LITERAL equivalence also holds for a CREDENTIAL-BEARING origin, which is
+    /// therefore safely REPAIRED rather than rejected — proving the decode participates in the
+    /// repair predicate, not merely in the leave-as-is branch.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_PercentDecoding_AppliesToTheRepairPredicate()
+    {
+        const string configured = "https://github.com/org/echo.git";
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(configured),
+            ["pull"],
+            originStdout: "https://x-access-token:ghp_secret@github.com/org/%65cho.git");
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect,
+            ["remote", "set-url", "origin", configured], ["pull", "origin"]);
+    }
+
+    /// <summary>
+    /// THE ORIGIN WRITE TARGET IS THE **SANITIZED** URL, NEVER THE RAW RESOLVED ONE. Every
+    /// other add/set-url expectation uses <see cref="EligibleUrl"/>, whose raw and sanitized
+    /// spellings are identical, so a mutant forwarding the RAW resolver value would survive
+    /// them all. These rows resolve URLs the sanitizer demonstrably REWRITES — an explicit
+    /// default <c>:443</c> it strips, and a host casing it lower-cases — and assert the EXACT
+    /// argument string handed to <c>git remote add origin</c> / <c>git remote set-url origin</c>.
+    /// </summary>
+    public static TheoryData<string, string> RawVersusSanitizedUrlCases => new()
+    {
+        // The sanitizer strips the explicit default port.
+        { "https://github.com:443/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        // The sanitizer lower-cases the host.
+        { "https://GitHub.Com/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        { "https://GITHUB.COM/org/config-repo.git", "https://github.com/org/config-repo.git" },
+        // Both at once.
+        { "https://GITHUB.COM:443/org/config-repo.git", "https://github.com/org/config-repo.git" },
+    };
+
+    /// <summary>
+    /// The vectors really ARE rewritten by the sanitizer — otherwise the assertions below
+    /// would pass for the wrong reason (raw == sanitized).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RawVersusSanitizedUrlCases))]
+    public void Stage6d_RawVersusSanitizedVectors_AreGenuinelyRewritten(string raw, string sanitized)
+    {
+        Assert.NotEqual(raw, sanitized);
+        Assert.Equal(sanitized, ConfigRepoUrlSanitizer.Sanitize(raw));
+    }
+
+    /// <summary>
+    /// An ABSENT origin is added with the SANITIZED url — not the raw resolved spelling.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RawVersusSanitizedUrlCases))]
+    public async Task Stage6d_AddUsesTheSanitizedUrlNotTheRawResolvedUrl(string raw, string sanitized)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(raw), ["pull"], originStdout: "");
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect,
+            ["remote", "add", "origin", sanitized], ["pull", "origin"]);
+
+        // Belt and braces: the RAW spelling never reaches any launched argument.
+        Assert.DoesNotContain(raw, requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// A credential-bearing origin is repaired to the SANITIZED url — not the raw resolved
+    /// spelling. The origin here is the credential-bearing form of the RAW url, so it is
+    /// equivalent under the repair predicate and the write target is the only variable.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RawVersusSanitizedUrlCases))]
+    public async Task Stage6d_SetUrlUsesTheSanitizedUrlNotTheRawResolvedUrl(string raw, string sanitized)
+    {
+        var credentialBearingOrigin = raw.Replace(
+            "https://", "https://x-access-token:ghp_secret@", StringComparison.Ordinal);
+
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(raw), ["pull"], originStdout: credentialBearingOrigin);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect,
+            ["remote", "set-url", "origin", sanitized], ["pull", "origin"]);
+
+        Assert.DoesNotContain(raw, requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
+        Assert.DoesNotContain("ghp_secret", requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
+    }
+
+    // ── Stage 6d step 3c — a PRESENT origin ───────────────────────────────
+
+    /// <summary>
+    /// A credential-free origin that is FULLY equivalent is LEFT AS IS — no <c>set-url</c>,
+    /// even when it differs lexically by a <c>.git</c> suffix, a trailing slash, an explicit
+    /// <c>:443</c> or host casing.
+    /// </summary>
+    [Theory]
+    [InlineData("https://github.com/org/config-repo.git")]
+    [InlineData("https://github.com/org/config-repo")]
+    [InlineData("https://github.com/org/config-repo/")]
+    [InlineData("https://github.com/org/config-repo///")]
+    [InlineData("https://github.com:443/org/config-repo.git")]
+    [InlineData("https://GITHUB.COM/org/config-repo.git")]
+    public async Task Stage6d_EquivalentCredentialFreeOrigin_IsLeftUntouched(string origin)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull"], originStdout: origin);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+    }
+
+    /// <summary>
+    /// A credential-BEARING origin that is otherwise fully equivalent is SAFELY REPAIRED with
+    /// <c>remote set-url origin &lt;sanitized&gt;</c> — a credential-free URL — before the
+    /// final command runs.
+    /// </summary>
+    [Theory]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo.git")]
+    [InlineData("https://x-access-token:ghp_secret@github.com/org/config-repo")]
+    [InlineData("https://x-access-token:ghp_secret@github.com:443/org/config-repo/")]
+    [InlineData("https://ghp_secret@GITHUB.COM/org/config-repo.git")]
+    public async Task Stage6d_CredentialBearingEquivalentOrigin_IsRepairedWithSetUrl(string origin)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl), ["pull"], originStdout: origin);
+
+        Assert.True(result.Success);
+        AssertSequence(requests, OriginInspect, OriginSetUrl, ["pull", "origin"]);
+
+        // The seam NEVER WRITES a credential: the set-url argument is the SANITIZED URL.
+        Assert.DoesNotContain("ghp_secret", requests[1].TokenizedArgs!, StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// A nonzero <c>remote set-url</c> exit rejects with the fixed message; the final command
+    /// NEVER launches, and NEITHER Stage 6e delegate is reached.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_SetUrlNonZeroExit_ReturnsOriginNotUpdated()
+    {
+        var credentialCalls = 0;
+        var helperCalls = 0;
+
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![1] switch
+            {
+                "get-url" => new GitProcessResult(
+                    0, "https://x-access-token:ghp_secret@github.com/org/config-repo.git", string.Empty),
+                _ => new GitProcessResult(4, "internal stdout", "internal stderr"),
+            },
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(result, OriginNotUpdated);
+        AssertSequence(requests, OriginInspect, OriginSetUrl);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// A LAUNCH failure at <c>remote set-url</c> maps to the same fixed message, and neither
+    /// Stage 6e delegate is reached.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_SetUrlLaunchFailure_ReturnsOriginNotUpdated()
+    {
+        var credentialCalls = 0;
+        var helperCalls = 0;
+
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(
+                    0, "https://x-access-token:ghp_secret@github.com/org/config-repo.git", string.Empty)
+                : throw new InvalidOperationException("boom"),
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(result, OriginNotUpdated);
+        AssertSequence(requests, OriginInspect, OriginSetUrl);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// The <c>get-url</c> reconciliation failures also reach NEITHER Stage 6e delegate.
+    /// </summary>
+    [Fact]
+    public async Task Stage6d_InspectionFailures_ReachNeitherCredentialDelegate()
+    {
+        var credentialCalls = 0;
+        var helperCalls = 0;
+
+        // (a) an unclassifiable nonzero exit.
+        var (nonZero, nonZeroRequests) = await RunScriptedAsync(
+            _ => new GitProcessResult(1, string.Empty, "fatal: something else went wrong"),
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(nonZero, OriginNotVerified);
+        AssertSequence(nonZeroRequests, OriginInspect);
+
+        // (b) a launch failure.
+        var (launchFailure, launchRequests) = await RunScriptedAsync(
+            _ => throw new InvalidOperationException("boom"),
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+        AssertRejected(launchFailure, OriginNotVerified);
+        AssertSequence(launchRequests, OriginInspect);
+
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// THE POSITIVE ORDERING PROOF: Stage 6e runs strictly AFTER the Stage 6d reconciliation
+    /// COMPLETES. The reconciliation is gated at a TCS; while the gate is held the credential
+    /// resolver has been invoked ZERO times (and the helper likewise); after release the
+    /// resolver is invoked EXACTLY ONCE and the helper exactly once. An implementation that
+    /// resolved the credential before or during reconciliation fails the held-gate assertion.
+    /// </summary>
+    /// <param name="gateAdd">
+    /// When true the gate sits on the <c>remote add</c> (an ABSENT origin), otherwise on the
+    /// <c>remote get-url</c> inspection — so both reconciliation subprocesses are covered.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Stage6e_DelegatesResolveOnlyAfterReconciliationCompletes(bool gateAdd)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sync = new Lock();
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        var helperCallsWhenCredentialResolved = -1;
+        var gatedSubcommand = gateAdd ? "add" : "get-url";
+        Task<ConfigRepoOpResult> operation = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!;
+                bool block;
+                lock (sync)
+                {
+                    commands.Add(tokens.ToArray());
+                    block = tokens[0] == "remote" && tokens[1] == gatedSubcommand
+                        && !entered.Task.IsCompleted;
+                }
+
+                if (!block)
+                {
+                    // An ABSENT origin when the ADD is the gated step, otherwise an already
+                    // equivalent one.
+                    return Task.FromResult(OriginAwareResult(
+                        request, 0, gateAdd ? string.Empty : EligibleUrl));
+                }
+
+                entered.TrySetResult();
+                return gate.Task.ContinueWith(_ => OriginAwareResult(
+                    request, 0, gateAdd ? string.Empty : EligibleUrl));
+            };
+
+            using var seam = CreateSeam(
+                credentialResolver: () =>
+                {
+                    // Captured so the helper's ordering relative to the resolver is provable.
+                    helperCallsWhenCredentialResolved = Volatile.Read(ref helperCalls);
+                    Interlocked.Increment(ref credentialCalls);
+                    return "ghp_secret";
+                },
+                credentialHelperPath: () =>
+                {
+                    Interlocked.Increment(ref helperCalls);
+                    return "/helper";
+                });
+
+            operation = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+
+            // The operation is parked INSIDE the gated reconciliation subprocess.
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // Stage 6d has NOT completed — Stage 6e must not have run.
+            Assert.Equal(0, Volatile.Read(ref credentialCalls));
+            Assert.Equal(0, Volatile.Read(ref helperCalls));
+
+            gate.TrySetResult();
+            Assert.True((await Bounded(operation)).Success);
+
+            // After the reconciliation completed: EXACTLY once each.
+            Assert.Equal(1, Volatile.Read(ref credentialCalls));
+            Assert.Equal(1, Volatile.Read(ref helperCalls));
+
+            // The helper is resolved only AFTER the credential (it is gated on a
+            // non-whitespace credential having been resolved first).
+            Assert.Equal(0, helperCallsWhenCredentialResolved);
+
+            lock (sync)
+            {
+                Assert.Equal(
+                    gateAdd
+                        ? [OriginInspect, OriginAdd, ["pull", "origin"]]
+                        : [OriginInspect, ["pull", "origin"]],
+                    commands);
+            }
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleAsync(operation);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Every REJECTED origin: a credential-bearing origin over <c>http://</c>, on a non-443
+    /// port, at a different host or path, or carrying a query/fragment; AND a credential-free
+    /// STALE origin (which is never rewritten). The seam never upgrades a scheme or a port,
+    /// never retargets a repository, and never drops a query/fragment.
+    /// </summary>
+    public static TheoryData<string> RejectedOriginCases => new()
+    {
+        // Credential-bearing but NOT safely repairable.
+        "http://x-access-token:ghp_secret@github.com/org/config-repo.git",     // http
+        "https://x-access-token:ghp_secret@github.com:8443/org/config-repo.git", // non-443 port
+        "https://x-access-token:ghp_secret@gitlab.com/org/config-repo.git",    // different host
+        "https://x-access-token:ghp_secret@github.com/other/config-repo.git",  // different path
+        "https://x-access-token:ghp_secret@github.com/org/config-repo.git#frag", // fragment
+        // Credential-FREE and stale/mismatched — REJECTED, never rewritten.
+        "https://github.com/other/config-repo.git",
+        "https://github.com/org/other-repo.git",
+        "https://github.com/org/config-repo/extra.git",
+        "https://github.com:8443/org/config-repo.git",
+        "http://github.com/org/config-repo.git",
+        "ssh://git@github.com/org/config-repo.git",
+        "git@github.com:org/config-repo.git",
+        "/srv/config-repo.git",
+        // The percent-encoding vector: a DECODED %2F never becomes a path separator.
+        "https://github.com/org/config%2Frepo.git",
+        // The .git strip is case-SENSITIVE.
+        "https://github.com/org/config-repo.GIT",
+    };
+
+    [Theory]
+    [MemberData(nameof(RejectedOriginCases))]
+    public async Task Stage6d_RejectedOrigin_ReturnsMismatchAndNeverRewrites(string origin)
+    {
+        var credentialCalls = 0;
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; },
+            originStdout: origin);
+
+        AssertRejected(result, OriginMismatch);
+
+        // NO set-url, NO add, and NO final command — the inspection is the only launch.
+        AssertSequence(requests, OriginInspect);
+
+        // An origin-rejected operation invokes the credential resolver ZERO times.
+        Assert.Equal(0, credentialCalls);
+
+        // The rejection message never carries the origin or its credential.
+        Assert.DoesNotContain("ghp_secret", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The PATH-NORMALIZATION test vectors, asserted through the seam: a raw <c>%2F</c> never
+    /// acts as a separator, the <c>.git</c> strip is lower-case only, and every trailing slash
+    /// is trimmed. The MATCHING rows must NOT produce a <c>set-url</c> (they are equivalent);
+    /// the NON-matching rows must be REJECTED.
+    /// </summary>
+    [Theory]
+    // configured .../org/repo%2Fname.git vs an origin with a REAL separator → NOT equivalent.
+    [InlineData("https://github.com/org/repo%2Fname.git", "https://github.com/org/repo/name.git", false)]
+    [InlineData("https://github.com/org/repo/name.git", "https://github.com/org/repo%2Fname.git", false)]
+    // The identical percent-encoded form IS equivalent.
+    [InlineData("https://github.com/org/repo%2Fname.git", "https://github.com/org/repo%2Fname.git", true)]
+    // Trailing slashes and the .git suffix all normalize away.
+    [InlineData("https://github.com/org/repo.git", "https://github.com/org/repo/", true)]
+    [InlineData("https://github.com/org/repo.git", "https://github.com/org/repo", true)]
+    [InlineData("https://github.com/org/repo", "https://github.com/org/repo.git", true)]
+    // The .git strip is case-SENSITIVE — .GIT is NOT stripped.
+    [InlineData("https://github.com/org/repo", "https://github.com/org/repo.GIT", false)]
+    // THE ORDER: the .git strip runs on the LAST component BEFORE the trailing-slash trim, so
+    // ".git/" keeps its suffix (the last component is the EMPTY one) and does NOT match "repo".
+    [InlineData("https://github.com/org/repo", "https://github.com/org/repo.git/", false)]
+    [InlineData("https://github.com/org/repo.git", "https://github.com/org/repo.git/", false)]
+    // The path comparison itself is case-SENSITIVE.
+    [InlineData("https://github.com/org/repo.git", "https://github.com/ORG/repo.git", false)]
+    public async Task Stage6d_PathNormalizationVectors(
+        string configuredUrl, string origin, bool equivalent)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(configuredUrl), ["pull"], originStdout: origin);
+
+        if (equivalent)
+        {
+            Assert.True(result.Success);
+            AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+        }
+        else
+        {
+            AssertRejected(result, OriginMismatch);
+            AssertSequence(requests, OriginInspect);
+        }
+    }
+
+    // ── Stage 6e — the credential + helper resolution ─────────────────────
+
+    /// <summary>
+    /// The credential resolver is read EXACTLY ONCE per eligible operation, and ONLY after the
+    /// origin has been verified.
+    /// </summary>
+    [Fact]
+    public async Task Stage6e_CredentialResolverIsReadExactlyOncePerEligibleOperation()
+    {
+        var credentialCalls = 0;
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull", "origin", "main"],
+            credentialResolver: () => { credentialCalls++; return "ghp_secret"; });
+
+        Assert.True(result.Success);
+        Assert.Equal(1, credentialCalls);
+        AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+            ["pull", "origin", "main"]);
+    }
+
+    /// <summary>
+    /// ANY non-cancellation credential-resolver exception maps to the FIXED
+    /// <c>Config repo not provisioned.</c> — the resolver's text NEVER escapes — and the final
+    /// command never launches.
+    /// </summary>
+    [Theory]
+    [InlineData(typeof(InvalidOperationException))]
+    [InlineData(typeof(NullReferenceException))]
+    [InlineData(typeof(TimeoutException))]
+    public async Task Stage6e_ThrowingCredentialResolver_ReturnsNotProvisioned(Type exceptionType)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull"],
+            credentialResolver: () => throw (Exception)Activator.CreateInstance(
+                exceptionType, "resolver leaked ghp_secret")!);
+
+        AssertRejected(result, NotProvisioned);
+        AssertSequence(requests, OriginInspect); // the final command never launched
+        Assert.DoesNotContain("ghp_secret", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> from the credential resolver PROPAGATES
+    /// unconditionally with the caller token LIVE — it is never mapped to the fixed message.
+    /// </summary>
+    [Fact]
+    public async Task Stage6e_CredentialResolverThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var resolverOce = new OperationCanceledException("credential resolver cancelled");
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+            };
+
+            using var seam = CreateSeam(credentialResolver: () => throw resolverOce);
+            using var liveCts = new CancellationTokenSource(); // the token stays LIVE
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => Bounded(seam.RunConfigRepoCommandAsync(["pull"], RepoDir, liveCts.Token)));
+
+            Assert.Same(resolverOce, ex);
+            AssertSequence(requests, OriginInspect);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A null/whitespace credential runs the operation UNAUTHENTICATED: no token, no askpass,
+    /// and the helper-path delegate is NEVER invoked.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public async Task Stage6e_AbsentCredential_RunsUnauthenticatedAndNeverReadsTheHelper(
+        string? credential)
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var helperCalls = 0;
+        try
+        {
+            var (result, requests) = await RunCapturingAsync(
+                UrlResolver(EligibleUrl),
+                ["pull"],
+                credentialResolver: () => credential,
+                credentialHelperPath: () => { helperCalls++; return "/helper"; });
+
+            Assert.True(result.Success);
+            Assert.Equal(0, helperCalls);
+            AssertSequence(requests, OriginInspect, ["pull", "origin"]);
+
+            // No injection anywhere — GIT_TERMINAL_PROMPT=0 still forces the fail-fast.
+            foreach (var request in requests)
+                AssertChildEnv(request);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// A null/empty/whitespace helper path — or a THROWING helper delegate — rejects with the
+    /// fixed message, and the final command NEVER launches.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Stage6e_UnusableHelperPath_ReturnsHelperUnavailable(string? helperPath)
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret",
+            credentialHelperPath: () => helperPath!);
+
+        AssertRejected(result, HelperUnavailable);
+        AssertSequence(requests, OriginInspect);
+    }
+
+    [Fact]
+    public async Task Stage6e_ThrowingHelperDelegate_ReturnsHelperUnavailable()
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret",
+            credentialHelperPath: static () => throw new InvalidOperationException("helper ghp_secret blew up"));
+
+        AssertRejected(result, HelperUnavailable);
+        AssertSequence(requests, OriginInspect);
+        Assert.DoesNotContain("ghp_secret", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An <see cref="OperationCanceledException"/> from the helper-path delegate PROPAGATES
+    /// unconditionally with the caller token LIVE.
+    /// </summary>
+    [Fact]
+    public async Task Stage6e_HelperDelegateThrowsOperationCanceled_Propagates()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var helperOce = new OperationCanceledException("helper cancelled");
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+                Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+
+            using var seam = CreateSeam(
+                credentialResolver: static () => "ghp_secret",
+                credentialHelperPath: () => throw helperOce);
+            using var liveCts = new CancellationTokenSource();
+
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+                () => Bounded(seam.RunConfigRepoCommandAsync(["pull"], RepoDir, liveCts.Token)));
+
+            Assert.Same(helperOce, ex);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── The Stage 7 injection ─────────────────────────────────────────────
+
+    /// <summary>
+    /// The FINAL command of an eligible operation with a NON-WHITESPACE credential gains
+    /// EXACTLY <c>GITHUB_CONFIG_REPO_TOKEN</c> and <c>GIT_ASKPASS</c> AFTER the scrub — and
+    /// NOTHING else. The ref-validation subprocess AND every origin command stay
+    /// credential-free. The credential NEVER appears in the launched ARGS.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_EligibleOperationWithCredential_InjectsOnlyIntoTheFinalCommand()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            // An ABSENT origin so the add command is exercised too.
+            var (result, requests) = await RunCapturingAsync(
+                UrlResolver(EligibleUrl),
+                ["pull", "origin", "main"],
+                credentialResolver: static () => "ghp_secret",
+                credentialHelperPath: static () => "/tmp/askpass.sh",
+                originStdout: "");
+
+            Assert.True(result.Success);
+            AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+                OriginAdd, ["pull", "origin", "main"]);
+
+            // Every subprocess BEFORE the final command is credential-free.
+            for (var i = 0; i < requests.Count - 1; i++)
+                AssertChildEnv(requests[i]);
+
+            AssertChildEnvWithCredential(requests[^1], "ghp_secret", "/tmp/askpass.sh");
+
+            // The credential is ENV-ONLY: never an argument of any launch.
+            Assert.DoesNotContain("ghp_secret",
+                requests.SelectMany(r => r.TokenizedArgs!), StringComparer.Ordinal);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// A Branch B (ineligible) transport command NEVER gets the injection, never runs the
+    /// origin state machine, and never reads the credential resolver.
+    /// </summary>
+    [Fact]
+    public async Task Stage7_BranchB_NeverInjectsAndNeverRunsTheOriginStateMachine()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        var credentialCalls = 0;
+        try
+        {
+            var (result, requests) = await RunCapturingAsync(
+                UrlResolver("ssh://git@github.com/org/config-repo.git"),
+                ["pull"],
+                credentialResolver: () => { credentialCalls++; return "ghp_secret"; });
+
+            Assert.True(result.Success);
+            AssertSequence(requests, ["pull"]);
+            Assert.Equal(0, credentialCalls);
+            AssertChildEnv(requests[0]);
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    // ── The literal-secret redaction pass ─────────────────────────────────
+
+    /// <summary>
+    /// For an operation with a resolved NON-WHITESPACE credential, EVERY ordinal occurrence of
+    /// the credential in the returned <c>Stdout</c>/<c>SanitizedError</c> becomes
+    /// <c>[redacted]</c> — AFTER the structural <c>GitUrlRedactor</c> pass.
+    /// </summary>
+    [Fact]
+    public async Task LiteralRedaction_CredentialInProcessOutput_IsReplacedEverywhere()
+    {
+        var (result, requests) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : new GitProcessResult(
+                    1,
+                    "ghp_secret leaked once and ghp_secret twice",
+                    "fatal: ghp_secret rejected  \n"),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret");
+
+        Assert.Equal(2, requests.Count);
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
+        Assert.Equal("[redacted] leaked once and [redacted] twice", result.Stdout);
+        Assert.Equal("fatal: [redacted] rejected", result.SanitizedError);
+        Assert.DoesNotContain("ghp_secret", result.Stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_secret", result.SanitizedError, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The literal pass runs AFTER the structural <c>GitUrlRedactor.Redact</c>: a credential-bearing
+    /// URL loses its userinfo structurally, and any remaining bare occurrence of the credential
+    /// is then literally replaced — so neither the credential nor a credential-bearing URL
+    /// survives.
+    /// </summary>
+    [Fact]
+    public async Task LiteralRedaction_RunsAfterTheStructuralRedaction()
+    {
+        var (result, _) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : new GitProcessResult(
+                    0,
+                    "https://x-access-token:ghp_secret@github.com/org/config-repo.git and ghp_secret",
+                    string.Empty),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret");
+
+        Assert.True(result.Success);
+        Assert.Equal(
+            "https://github.com/org/config-repo.git and [redacted]", result.Stdout);
+        Assert.DoesNotContain("ghp_secret", result.Stdout, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The literal pass applies to a resolved credential even when it was NEVER injected: the
+    /// helper-path failure path still runs it. The credential here is a substring of the fixed
+    /// message, so its replacement is directly observable.
+    /// </summary>
+    [Fact]
+    public async Task LiteralRedaction_AppliesEvenWhenTheCredentialWasNotInjected()
+    {
+        var (result, requests) = await RunCapturingAsync(
+            UrlResolver(EligibleUrl),
+            ["pull"],
+            credentialResolver: static () => "available",
+            credentialHelperPath: static () => "  ");
+
+        AssertSequence(requests, OriginInspect);
+        Assert.Equal("Git credential helper path is not [redacted].", result.SanitizedError);
+    }
+
+    /// <summary>
+    /// A WHITESPACE credential does NOT trigger the literal pass (it is scoped to a
+    /// non-whitespace credential), so ordinary output survives verbatim.
+    /// </summary>
+    [Fact]
+    public async Task LiteralRedaction_WhitespaceCredential_DoesNotRewriteOutput()
+    {
+        var (result, _) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : new GitProcessResult(0, "   spaced   output   ", string.Empty),
+            ["pull"],
+            credentialResolver: static () => "   ");
+
+        Assert.True(result.Success);
+        Assert.Equal("   spaced   output   ", result.Stdout);
+    }
+
+    /// <summary>
+    /// The two returned text fields are redacted INDEPENDENTLY. The first case is a SUCCESS
+    /// (exit 0), where only <c>Stdout</c> is populated; the second is a runner-produced FAILURE
+    /// whose credential appears ONLY in stderr, so only <c>SanitizedError</c> can carry it.
+    /// Asserting each exactly proves both fields go through the literal pass — an
+    /// implementation that redacted just one of them fails exactly one of these cases.
+    /// </summary>
+    [Fact]
+    public async Task LiteralRedaction_StdoutAndSanitizedErrorAreRedactedIndependently()
+    {
+        // (a) exit 0 — the credential is echoed in STDOUT only.
+        var (success, _) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : new GitProcessResult(0, "branch ghp_secret up to date", "ghp_secret in ignored stderr"),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret");
+
+        Assert.True(success.Success);
+        Assert.Equal(0, success.ExitCode);
+        Assert.Equal("branch [redacted] up to date", success.Stdout);
+        Assert.Equal("", success.SanitizedError); // exit 0 discards stderr entirely
+
+        // (b) a runner-produced FAILURE — the credential is echoed in STDERR only.
+        var (failure, _) = await RunScriptedAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : new GitProcessResult(128, "clean stdout", "fatal: authentication failed for ghp_secret  \n"),
+            ["pull"],
+            credentialResolver: static () => "ghp_secret");
+
+        Assert.False(failure.Success);
+        Assert.Equal(128, failure.ExitCode);
+        Assert.Equal("clean stdout", failure.Stdout);
+        Assert.Equal("fatal: authentication failed for [redacted]", failure.SanitizedError);
+    }
+
+    /// <summary>
+    /// EVERY subprocess that precedes the final command is credential-free in the FULL
+    /// three-subprocess path (ref validation → origin inspection → origin add → the injected
+    /// final command), asserted with the full-env equality helpers so a stray post-scrub
+    /// addition on ANY earlier request fails.
+    /// </summary>
+    [Fact]
+    public async Task Stage6e_OnlyTheFinalCommandCarriesCredentialEnvAcrossTheWholePath()
+    {
+        var previousEnv = SeedChildEnvVariables();
+        try
+        {
+            var (result, requests) = await RunCapturingAsync(
+                UrlResolver(EligibleUrl),
+                ["pull", "origin", "main"],
+                credentialResolver: static () => "ghp_secret",
+                credentialHelperPath: static () => "/tmp/askpass.sh",
+                originStdout: ""); // ABSENT → the add runs too
+
+            Assert.True(result.Success);
+            AssertSequence(requests, ["check-ref-format", "--allow-onelevel", "main"], OriginInspect,
+                OriginAdd, ["pull", "origin", "main"]);
+
+            AssertChildEnv(requests[0]); // ref validation
+            AssertChildEnv(requests[1]); // origin inspection
+            AssertChildEnv(requests[2]); // origin add
+            AssertChildEnvWithCredential(requests[3], "ghp_secret", "/tmp/askpass.sh");
+        }
+        finally
+        {
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    // ── Stage 6c — the per-instance serialization semaphore ───────────────
+
+    /// <summary>
+    /// A recording runner whose ORIGIN INSPECTION blocks on a per-call gate, so an eligible
+    /// operation can be parked while holding the Stage 6c semaphore. Every other command
+    /// completes SYNCHRONOUSLY, which is what makes the concurrency assertions deterministic:
+    /// an operation's <c>RunConfigRepoCommandAsync</c> call returns to the test only once the
+    /// operation has reached a genuinely incomplete await.
+    /// </summary>
+    private sealed class GatedOriginRunner
+    {
+        private readonly List<TaskCompletionSource> _gates = [];
+        private readonly List<TaskCompletionSource> _entered = [];
+        private readonly Lock _sync = new();
+
+        public List<string[]> Commands { get; } = [];
+
+        public int InspectionCount { get; private set; }
+
+        public Task<GitProcessResult> Respond(GitProcessRequest request)
+        {
+            TaskCompletionSource gate;
+            lock (_sync)
+            {
+                Commands.Add(request.TokenizedArgs!.ToArray());
+                if (request.TokenizedArgs![0] != "remote")
+                    return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+
+                var index = InspectionCount++;
+                while (_gates.Count <= index)
+                {
+                    _gates.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                    _entered.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                }
+
+                gate = _gates[index];
+                _entered[index].TrySetResult();
+            }
+
+            return gate.Task.ContinueWith(_ => new GitProcessResult(0, EligibleUrl, string.Empty));
+        }
+
+        public Task Entered(int index)
+        {
+            lock (_sync)
+            {
+                while (_entered.Count <= index)
+                {
+                    _gates.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                    _entered.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                }
+
+                return _entered[index].Task;
+            }
+        }
+
+        public void Release(int index)
+        {
+            lock (_sync)
+            {
+                while (_gates.Count <= index)
+                {
+                    _gates.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                    _entered.Add(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+                }
+
+                _gates[index].TrySetResult();
+            }
+        }
+
+        public void ReleaseAll()
+        {
+            lock (_sync)
+            {
+                foreach (var gate in _gates)
+                    gate.TrySetResult();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stage 6c SERIALIZES eligible operations on the SAME instance. The first operation is
+    /// parked inside its origin inspection while HOLDING the semaphore; the second operation's
+    /// ref validation (which precedes Stage 6c) has already completed synchronously, so when
+    /// its <c>RunConfigRepoCommandAsync</c> call returns it is provably parked ON THE
+    /// SEMAPHORE — and its origin inspection has NOT run. Removing the semaphore makes the
+    /// second inspection appear immediately and fails the assertion.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_EligibleOperationsAreSerializedOnThePerInstanceSemaphore()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedOriginRunner();
+        Task<ConfigRepoOpResult> first = null!;
+        Task<ConfigRepoOpResult> second = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam();
+            first = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // The second operation runs its Stage 6b ref validation SYNCHRONOUSLY and then
+            // parks: the call below returns only once it has hit an incomplete await, which
+            // — with the semaphore held — is the Stage 6c wait.
+            second = seam.RunConfigRepoCommandAsync(
+                ["pull", "origin", "main"], RepoDir, CancellationToken.None);
+
+            Assert.Equal(
+                [["remote", "get-url", "origin"], ["check-ref-format", "--allow-onelevel", "main"]],
+                runner.Commands);
+            Assert.Equal(1, runner.InspectionCount); // the second inspection has NOT run
+
+            runner.Release(0);
+            var firstResult = await Bounded(first);
+            Assert.True(firstResult.Success);
+
+            await runner.Entered(1).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            runner.Release(1);
+            var secondResult = await Bounded(second);
+            Assert.True(secondResult.Success);
+
+            // The two operations never interleaved.
+            Assert.Equal(
+                [
+                    ["remote", "get-url", "origin"],
+                    ["check-ref-format", "--allow-onelevel", "main"],
+                    ["pull", "origin"],
+                    ["remote", "get-url", "origin"],
+                    ["pull", "origin", "main"],
+                ],
+                runner.Commands);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(first, second);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A Branch B (ineligible) operation does NOT take the Stage 6c lock: it runs to
+    /// completion while an eligible operation is parked inside its origin inspection holding
+    /// the semaphore.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_BranchBOperationDoesNotTakeTheLock()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedOriginRunner();
+        Task<ConfigRepoOpResult> eligible = null!;
+
+        // The FIRST read is the eligible URL; every later read is the ineligible one.
+        var urlReads = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam(resolvedUrlResolver: () =>
+                Interlocked.Increment(ref urlReads) == 1
+                    ? EligibleUrl
+                    : "ssh://git@github.com/org/config-repo.git");
+
+            eligible = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // Branch B: no origin state machine, no lock — it completes right now.
+            var branchB = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["fetch", "--tags"], RepoDir, CancellationToken.None));
+
+            Assert.True(branchB.Success);
+            Assert.Equal(
+                [["remote", "get-url", "origin"], ["fetch", "--tags"]],
+                runner.Commands);
+
+            runner.Release(0);
+            Assert.True((await Bounded(eligible)).Success);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(eligible);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// THE ACQUIRED-FLAG RULE: a cancellation BEFORE acquisition propagates and releases
+    /// NOTHING. The proof is that the semaphore's count is unchanged afterwards: a bug that
+    /// released a semaphore it never owned would leave TWO permits, letting two later eligible
+    /// operations run their origin inspections concurrently. The final assertion shows only
+    /// one does.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_CancellationBeforeAcquisition_PropagatesAndReleasesNothing()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedOriginRunner();
+        Task<ConfigRepoOpResult> holder = null!;
+        Task<ConfigRepoOpResult> waiter = null!;
+        Task<ConfigRepoOpResult> third = null!;
+        Task<ConfigRepoOpResult> fourth = null!;
+        using var cts = new CancellationTokenSource();
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam();
+
+            holder = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(0).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // The waiter parks ON the semaphore (the call returns at that incomplete await).
+            waiter = seam.RunConfigRepoCommandAsync(["fetch"], RepoDir, cts.Token);
+            Assert.Equal(1, runner.InspectionCount);
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(waiter));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // The cancelled waiter never ran anything.
+            Assert.Equal(1, runner.InspectionCount);
+
+            runner.Release(0);
+            Assert.True((await Bounded(holder)).Success);
+
+            // The count is intact: the next operation acquires, and the one after it WAITS.
+            third = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await runner.Entered(1).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            fourth = seam.RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None);
+            Assert.Equal(2, runner.InspectionCount); // NOT 3 — the fourth is still waiting
+
+            runner.Release(1);
+            Assert.True((await Bounded(third)).Success);
+            await runner.Entered(2).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            runner.Release(2);
+            Assert.True((await Bounded(fourth)).Success);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            await SettleAsync(holder, waiter, third, fourth);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// A cancellation AFTER acquisition RELEASES the semaphore in the finally: the operation
+    /// is cancelled while parked inside its origin inspection, and a later operation still
+    /// acquires the gate and completes.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_CancellationAfterAcquisition_ReleasesTheSemaphore()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var requests = new List<GitProcessRequest>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoOpResult> cancelled = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                requests.Add(request);
+                if (request.TokenizedArgs![0] == "remote" && !entered.Task.IsCompleted)
+                {
+                    entered.TrySetResult();
+                    try
+                    {
+                        await gate.Task.WaitAsync(ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw new OperationCanceledException(ct);
+                    }
+                }
+
+                return OriginAwareResult(request, 0, EligibleUrl);
+            };
+
+            using var seam = CreateSeam();
+            cancelled = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, cts.Token);
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(cancelled));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // The semaphore was RELEASED by the finally: a fresh operation completes.
+            var next = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["fetch"], RepoDir, CancellationToken.None));
+            Assert.True(next.Success);
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleAsync(cancelled);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Concurrent eligible calls SERIALIZE their origin reconciliation, so the second call
+    /// OBSERVES the first's result rather than racing it. The fake models a real remote: the
+    /// origin starts ABSENT, and the first operation's <c>remote add</c> makes it PRESENT and
+    /// equivalent. Because the second operation's inspection runs only AFTER the first
+    /// operation's final command, it observes the ADDED origin and issues NO second
+    /// <c>add</c>. Without the Stage 6c gate both inspections would observe the ABSENT origin
+    /// and BOTH would issue an <c>add</c> — the exact sequence assertion catches that.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_SecondOperationObservesTheFirstOperationsOriginReconciliation()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sync = new Lock();
+        var originPresent = false; // the fake remote's observable state
+        Task<ConfigRepoOpResult> first = null!;
+        Task<ConfigRepoOpResult> second = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!;
+                bool block;
+                bool present;
+                lock (sync)
+                {
+                    commands.Add(tokens.ToArray());
+
+                    if (tokens[0] == "remote" && tokens[1] == "add")
+                        originPresent = true; // the add MUTATES the fake remote
+
+                    present = originPresent;
+                    block = tokens[0] == "remote" && tokens[1] == "get-url" && !entered.Task.IsCompleted;
+                }
+
+                if (block)
+                {
+                    // The FIRST inspection parks while holding the semaphore. It reports the
+                    // state as observed at ENTRY: ABSENT.
+                    entered.TrySetResult();
+                    return gate.Task.ContinueWith(
+                        _ => new GitProcessResult(0, string.Empty, string.Empty));
+                }
+
+                if (tokens[0] == "remote" && tokens[1] == "get-url")
+                    return Task.FromResult(new GitProcessResult(
+                        0, present ? EligibleUrl : string.Empty, string.Empty));
+
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam();
+
+            first = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // Issued while the first operation HOLDS the gate: it must park on the semaphore.
+            second = seam.RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None);
+            lock (sync)
+            {
+                // Only the FIRST inspection has run — the second is still waiting.
+                Assert.Equal([["remote", "get-url", "origin"]], commands);
+            }
+
+            gate.TrySetResult();
+            Assert.True((await Bounded(first)).Success);
+            Assert.True((await Bounded(second)).Success);
+
+            // The second operation's get-url runs AFTER the first's final command and OBSERVES
+            // the added origin, so it issues NO second add.
+            lock (sync)
+            {
+                Assert.Equal(
+                    [
+                        ["remote", "get-url", "origin"],
+                        ["remote", "add", "origin", EligibleUrl],
+                        ["pull", "origin"],
+                        ["remote", "get-url", "origin"],
+                        ["fetch", "origin"],
+                    ],
+                    commands);
+            }
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleAsync(first, second);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// The Stage 6c gate is PER-INSTANCE, not static/global. Seam instance A's eligible
+    /// operation is parked inside its origin inspection while HOLDING A's semaphore; a SECOND,
+    /// DISTINCT seam instance then runs its own eligible operation to COMPLETION. Replacing
+    /// the per-instance <c>SemaphoreSlim</c> with a static one makes B block behind A, so the
+    /// bounded await expires and the test FAILS FAST rather than hanging the suite. Together
+    /// with <see cref="Stage6c_EligibleOperationsAreSerializedOnThePerInstanceSemaphore"/>
+    /// (which proves the SAME instance DOES serialize) this pins the ownership scope exactly.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_GateIsPerInstance_ASecondSeamInstanceIsNotBlocked()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var seamAEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var seamAGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sync = new Lock();
+        Task<ConfigRepoOpResult> seamAOperation = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!;
+                bool block;
+                lock (sync)
+                {
+                    commands.Add(tokens.ToArray());
+                    // Only the FIRST inspection (seam A's) is gated; seam B's runs freely.
+                    block = tokens[0] == "remote" && !seamAEntered.Task.IsCompleted;
+                }
+
+                if (!block)
+                    return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+
+                seamAEntered.TrySetResult();
+                return seamAGate.Task.ContinueWith(
+                    _ => new GitProcessResult(0, EligibleUrl, string.Empty));
+            };
+
+            using var seamA = CreateSeam();
+            using var seamB = CreateSeam();
+
+            // Seam A acquires ITS gate and parks inside the origin inspection.
+            seamAOperation = seamA.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await seamAEntered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // Seam B is a DISTINCT instance: its eligible operation must run to completion
+            // even though seam A still holds seam A's semaphore. With a STATIC gate this
+            // await times out (a bounded await, so the test fails instead of hanging).
+            var seamBResult = await seamB
+                .RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None)
+                .WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            Assert.True(seamBResult.Success);
+
+            // Seam B ran its FULL Branch A sequence while seam A was still parked.
+            lock (sync)
+            {
+                Assert.Equal(
+                    [OriginInspect, OriginInspect, ["fetch", "origin"]],
+                    commands);
+            }
+
+            // Seam A then completes normally on its own gate.
+            seamAGate.TrySetResult();
+            Assert.True((await Bounded(seamAOperation)).Success);
+        }
+        finally
+        {
+            seamAGate.TrySetResult();
+            await SettleAsync(seamAOperation);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// The per-instance scope holds for the WAITING side too: seam A's operation is parked
+    /// holding A's gate, a SECOND operation on seam A parks behind it (proving A serializes),
+    /// and meanwhile seam B completes — so the gate is neither global nor absent.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_GateIsPerInstance_SameInstanceWaitsWhileOtherInstanceProceeds()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var seamAEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var seamAGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sync = new Lock();
+        Task<ConfigRepoOpResult> seamAFirst = null!;
+        Task<ConfigRepoOpResult> seamASecond = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!;
+                bool block;
+                lock (sync)
+                {
+                    commands.Add(tokens.ToArray());
+                    block = tokens[0] == "remote" && !seamAEntered.Task.IsCompleted;
+                }
+
+                if (!block)
+                    return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+
+                seamAEntered.TrySetResult();
+                return seamAGate.Task.ContinueWith(
+                    _ => new GitProcessResult(0, EligibleUrl, string.Empty));
+            };
+
+            using var seamA = CreateSeam();
+            using var seamB = CreateSeam();
+
+            seamAFirst = seamA.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+            await seamAEntered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // A SECOND operation on the SAME instance parks on A's gate — no new inspection.
+            seamASecond = seamA.RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None);
+            lock (sync)
+            {
+                Assert.Equal([OriginInspect], commands);
+            }
+
+            // The OTHER instance proceeds regardless.
+            var seamBResult = await seamB
+                .RunConfigRepoCommandAsync(["fetch"], RepoDir, CancellationToken.None)
+                .WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            Assert.True(seamBResult.Success);
+
+            seamAGate.TrySetResult();
+            Assert.True((await Bounded(seamAFirst)).Success);
+            Assert.True((await Bounded(seamASecond)).Success);
+        }
+        finally
+        {
+            seamAGate.TrySetResult();
+            await SettleAsync(seamAFirst, seamASecond);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ── Stage 6c — the gate is RELEASED on EVERY post-acquisition exit ────
+
+
+
+    /// <summary>
+    /// The scripted responses for a Branch A operation, keyed by which post-acquisition exit
+    /// the operation must take. The first operation is GATED at its origin inspection so it
+    /// provably HOLDS the semaphore while the follow-up is issued; releasing the gate lets it
+    /// run on to its exit, and the follow-up must then acquire and complete. A gate leak on
+    /// ANY of these exits hangs the follow-up, which the bounded await turns into a failure.
+    /// </summary>
+    private sealed class GatedExitRunner(
+        Func<GitProcessRequest, GitProcessResult> firstOperationResponder)
+    {
+        private readonly Lock _sync = new();
+
+        /// <summary>Completed once the FIRST operation's origin inspection has been entered.</summary>
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Held until the test releases the FIRST operation's origin inspection.</summary>
+        public TaskCompletionSource Gate { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<string[]> Commands { get; } = [];
+
+        /// <summary>Set once the first operation has finished; later calls are the follow-up.</summary>
+        public bool FirstOperationDone { get; set; }
+
+        public Task<GitProcessResult> Respond(GitProcessRequest request)
+        {
+            bool followUp;
+            lock (_sync)
+            {
+                Commands.Add(request.TokenizedArgs!.ToArray());
+                followUp = FirstOperationDone;
+            }
+
+            // The FOLLOW-UP operation always sees a present, equivalent, credential-free
+            // origin and a clean final command, so its only possible failure is a gate leak.
+            if (followUp)
+                return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+
+            if (request.TokenizedArgs![0] == "remote" && request.TokenizedArgs![1] == "get-url"
+                && !Entered.Task.IsCompleted)
+            {
+                Entered.TrySetResult();
+                return Gate.Task.ContinueWith(_ => firstOperationResponder(request));
+            }
+
+            return Task.FromResult(firstOperationResponder(request));
+        }
+    }
+
+    /// <summary>
+    /// The shared driver for the "no deadlock after a post-acquisition exit" family. The first
+    /// operation acquires the Stage 6c gate and parks inside its origin inspection; the gate
+    /// is then released so it runs on to the exit under test; finally a follow-up eligible
+    /// operation must ACQUIRE and COMPLETE. Because the follow-up's own script is always
+    /// clean, its only possible failure mode is an unreleased semaphore.
+    /// </summary>
+    /// <remarks>
+    /// The credential/helper delegates are scoped to the FIRST operation via the runner's
+    /// <see cref="GatedExitRunner.FirstOperationDone"/> flag: the follow-up must see WORKING
+    /// delegates, otherwise it would fail for its own reason and mask a gate leak.
+    /// </remarks>
+    private static async Task AssertGateReleasedAfterExitAsync(
+        Func<GitProcessRequest, GitProcessResult> firstOperationResponder,
+        string expectedError,
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var runner = new GatedExitRunner(firstOperationResponder);
+        Task<ConfigRepoOpResult> failing = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) => runner.Respond(request);
+
+            using var seam = CreateSeam(
+                credentialResolver: credentialResolver is null
+                    ? null
+                    : () => runner.FirstOperationDone ? null : credentialResolver(),
+                credentialHelperPath: credentialHelperPath is null
+                    ? null
+                    : () => runner.FirstOperationDone ? "/helper" : credentialHelperPath());
+
+            failing = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+
+            // The first operation is parked INSIDE the gate — it HOLDS the semaphore.
+            await runner.Entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            runner.Gate.TrySetResult();
+            AssertRejected(await Bounded(failing), expectedError);
+            runner.FirstOperationDone = true;
+
+            // The follow-up must acquire the gate the failed operation released.
+            var followUp = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["fetch"], RepoDir, CancellationToken.None));
+
+            Assert.True(followUp.Success);
+            Assert.Equal(
+                ["remote", "get-url", "origin"],
+                runner.Commands[^2]);
+            Assert.Equal(["fetch", "origin"], runner.Commands[^1]);
+        }
+        finally
+        {
+            runner.Gate.TrySetResult();
+            await SettleAsync(failing);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>A <c>get-url</c> FAILURE exit releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterGetUrlFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            _ => new GitProcessResult(1, string.Empty, "fatal: something else went wrong"),
+            OriginNotVerified);
+
+    /// <summary>An <c>add</c> FAILURE exit releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterAddFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            request => request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(0, string.Empty, string.Empty)   // ABSENT → add
+                : new GitProcessResult(9, string.Empty, string.Empty),  // the add fails
+            OriginNotAdded);
+
+    /// <summary>A <c>set-url</c> FAILURE exit releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterSetUrlFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            request => request.TokenizedArgs![1] == "get-url"
+                ? new GitProcessResult(
+                    0, "https://x-access-token:ghp_secret@github.com/org/config-repo.git", string.Empty)
+                : new GitProcessResult(9, string.Empty, string.Empty), // the set-url fails
+            OriginNotUpdated);
+
+    /// <summary>An origin MISMATCH rejection releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterOriginMismatch() =>
+        AssertGateReleasedAfterExitAsync(
+            _ => new GitProcessResult(0, "https://github.com/other/repo.git", string.Empty),
+            OriginMismatch);
+
+    /// <summary>A credential-RESOLVER failure releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterCredentialResolverFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            _ => new GitProcessResult(0, EligibleUrl, string.Empty),
+            NotProvisioned,
+            credentialResolver: static () => throw new InvalidOperationException("boom"));
+
+    /// <summary>A HELPER-path failure releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterHelperFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            _ => new GitProcessResult(0, EligibleUrl, string.Empty),
+            HelperUnavailable,
+            credentialResolver: static () => "ghp_secret",
+            credentialHelperPath: static () => throw new InvalidOperationException("boom"));
+
+    /// <summary>A FINAL-COMMAND launch failure releases the gate.</summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterFinalCommandLaunchFailure() =>
+        AssertGateReleasedAfterExitAsync(
+            request => request.TokenizedArgs![0] == "remote"
+                ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                : throw new InvalidOperationException("boom"),
+            LaunchFailed);
+
+    /// <summary>
+    /// A CANCELLATION while RECONCILING (parked inside the origin inspection) releases the
+    /// gate: the OCE propagates, and a follow-up eligible operation still acquires and
+    /// completes. Distinct from
+    /// <see cref="Stage6c_CancellationAfterAcquisition_ReleasesTheSemaphore"/> in that it also
+    /// asserts the follow-up's FULL command sequence.
+    /// </summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterCancellationWhileReconciling() =>
+        AssertGateReleasedByCancellationAsync(cancelDuringFinalCommand: false);
+
+    /// <summary>
+    /// A CANCELLATION while EXECUTING the final command (i.e. AFTER the origin has been
+    /// reconciled) releases the gate too.
+    /// </summary>
+    [Fact]
+    public Task Stage6c_GateReleasedAfterCancellationWhileExecuting() =>
+        AssertGateReleasedByCancellationAsync(cancelDuringFinalCommand: true);
+
+    /// <summary>
+    /// Cancels a Branch A operation at one of the two post-acquisition blocking points and
+    /// proves the semaphore was released: the follow-up operation runs its own origin
+    /// inspection and final command to completion.
+    /// </summary>
+    private static async Task AssertGateReleasedByCancellationAsync(bool cancelDuringFinalCommand)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockedCommand = cancelDuringFinalCommand ? "pull" : "remote";
+        var sync = new Lock();
+        using var cts = new CancellationTokenSource();
+        Task<ConfigRepoOpResult> cancelled = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = async (request, ct) =>
+            {
+                bool block;
+                lock (sync)
+                {
+                    commands.Add(request.TokenizedArgs!.ToArray());
+                    block = request.TokenizedArgs![0] == blockedCommand && !entered.Task.IsCompleted;
+                }
+
+                if (block)
+                {
+                    entered.TrySetResult();
+                    try
+                    {
+                        await gate.Task.WaitAsync(ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // The delegate owns its cancellation semantics: normalize to an exact
+                        // OperationCanceledException carrying the caller's token.
+                        throw new OperationCanceledException(ct);
+                    }
+                }
+
+                return OriginAwareResult(request, 0, EligibleUrl);
+            };
+
+            using var seam = CreateSeam();
+            cancelled = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, cts.Token);
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // The operation is parked PAST acquisition — at the inspection or at the final
+            // command, per the parameter.
+            lock (sync)
+            {
+                Assert.Equal(
+                    cancelDuringFinalCommand ? 2 : 1,
+                    commands.Count);
+            }
+
+            await cts.CancelAsync();
+            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => Bounded(cancelled));
+            Assert.Equal(cts.Token, ex.CancellationToken);
+
+            // The gate was released by the finally: the follow-up acquires and completes.
+            var followUp = await Bounded(seam.RunConfigRepoCommandAsync(
+                ["fetch"], RepoDir, CancellationToken.None));
+
+            Assert.True(followUp.Success);
+            lock (sync)
+            {
+                Assert.Equal(["remote", "get-url", "origin"], commands[^2]);
+                Assert.Equal(["fetch", "origin"], commands[^1]);
+            }
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleAsync(cancelled);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// DISPOSAL while an eligible operation HOLDS the Stage 6c semaphore: the semaphore is
+    /// never disposed, so the in-flight operation completes NORMALLY (its final command still
+    /// launches and its real result is returned) and its release does not throw. A subsequent
+    /// call is rejected at entry with the exact post-disposal result. A mutant that disposed
+    /// the semaphore in <c>Dispose()</c> would fault the in-flight release with an
+    /// <see cref="ObjectDisposedException"/> instead of returning the real result.
+    /// </summary>
+    [Fact]
+    public async Task Stage6c_DisposalWhileHoldingTheSemaphore_InFlightOperationStillCompletes()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var commands = new List<string[]>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sync = new Lock();
+        Task<ConfigRepoOpResult> inFlight = null!;
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                bool block;
+                lock (sync)
+                {
+                    commands.Add(request.TokenizedArgs!.ToArray());
+                    block = request.TokenizedArgs![0] == "remote" && !entered.Task.IsCompleted;
+                }
+
+                if (!block)
+                    return Task.FromResult(OriginAwareResult(request, 0, EligibleUrl));
+
+                entered.TrySetResult();
+                return gate.Task.ContinueWith(
+                    _ => new GitProcessResult(0, EligibleUrl, string.Empty));
+            };
+
+            var seam = CreateSeam();
+            inFlight = seam.RunConfigRepoCommandAsync(["pull"], RepoDir, CancellationToken.None);
+
+            // The operation HOLDS the semaphore (it is parked inside its origin inspection).
+            await entered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            seam.Dispose();
+
+            gate.TrySetResult();
+            var result = await Bounded(inFlight);
+
+            // It completed NORMALLY: the final command launched and the real result came back.
+            Assert.True(result.Success);
+            lock (sync)
+            {
+                Assert.Equal(
+                    [["remote", "get-url", "origin"], ["pull", "origin"]],
+                    commands);
+            }
+
+            // A SUBSEQUENT call is rejected at ENTRY — the exact post-disposal result.
+            AssertRejected(
+                await Bounded(seam.RunConfigRepoCommandAsync(
+                    ["pull"], RepoDir, CancellationToken.None)),
+                "Seam disposed.");
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await SettleAsync(inFlight);
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Awaits outstanding operations so a failing assertion can never leave a blocked delegate
+    /// that later advances with the real (un-faked) runner installed.
+    /// </summary>
+    private static async Task SettleAsync(params Task<ConfigRepoOpResult>?[] operations)
+    {
+        foreach (var operation in operations)
+        {
+            if (operation is null)
+                continue;
+
+            try
+            {
+                await operation;
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected for the cancellation fixtures.
+            }
+            catch (Exception)
+            {
+                // Expected only if the test already failed mid-flight.
+            }
         }
     }
 

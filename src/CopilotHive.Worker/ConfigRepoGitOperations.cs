@@ -6,17 +6,45 @@ using CopilotHive.Services;
 namespace CopilotHive.Worker;
 
 /// <summary>
-/// Validation and EXECUTION layer for the config-repo git seam (slices 2c-b1b-i, 2c-b1b-ii and
-/// 2c-b1c-i): strict per-command grammar, the Stage 6a URL resolution / transport eligibility,
-/// ref prechecks PLUS the check-ref-format subprocess, worktree containment, canonicalization,
-/// constructors, disposal, and the real process execution via the SHARED
-/// <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping and
-/// redaction boundary. The origin state machine, the credential/helper resolution and the
-/// credential env injection (2c-b1c-ii), the health probe (2c-b2), and the clone (2c-b3) are
-/// later slices.
+/// Validation and EXECUTION layer for the config-repo git seam (slices 2c-b1b-i, 2c-b1b-ii,
+/// 2c-b1c-i and 2c-b1c-ii): strict per-command grammar, the Stage 6a URL resolution / transport
+/// eligibility, ref prechecks PLUS the check-ref-format subprocess (Stage 6b), worktree
+/// containment, canonicalization, constructors, disposal, the real process execution via the
+/// SHARED <see cref="GitOperations.ExecuteProcessAsync"/> with the concrete result mapping and
+/// redaction boundary, AND — for ELIGIBLE (Branch A) transport operations — the serialized
+/// origin state machine (Stages 6c/6d), the credential + helper resolution (Stage 6e) and the
+/// Stage 7 credential env injection with the literal-secret redaction pass. The health probe
+/// (2c-b2) and the clone (2c-b3) are later slices.
 /// </summary>
 internal sealed class ConfigRepoGitOperations : IDisposable
 {
+    /// <summary>Stage 6d — the origin could not be INSPECTED (or the inspection failed to launch).</summary>
+    private const string OriginNotVerified = "Config repo origin could not be verified.";
+
+    /// <summary>Stage 6d — <c>git remote add origin</c> failed.</summary>
+    private const string OriginNotAdded = "Config repo origin could not be added.";
+
+    /// <summary>Stage 6d — <c>git remote set-url origin</c> failed.</summary>
+    private const string OriginNotUpdated = "Config repo origin could not be updated.";
+
+    /// <summary>Stage 6d — the PRESENT origin is neither equivalent nor safely repairable.</summary>
+    private const string OriginMismatch = "Config repo origin does not match the configured repository.";
+
+    /// <summary>The FIXED message for any non-cancellation resolver failure (URL or credential).</summary>
+    private const string NotProvisioned = "Config repo not provisioned.";
+
+    /// <summary>Stage 6e — the credential helper path is missing or its delegate failed.</summary>
+    private const string HelperUnavailable = "Git credential helper path is not available.";
+
+    /// <summary>The env variable carrying the config-repo credential to the FINAL command.</summary>
+    private const string CredentialEnvName = "GITHUB_CONFIG_REPO_TOKEN";
+
+    /// <summary>The env variable pointing git at the non-interactive credential helper.</summary>
+    private const string AskpassEnvName = "GIT_ASKPASS";
+
+    /// <summary>The literal-redaction replacement for an ordinal credential occurrence.</summary>
+    private const string RedactedPlaceholder = "[redacted]";
+
     private readonly string _configRepoDirCanonical;
     private readonly Func<string?> _resolvedUrlResolver;
     private readonly Func<string?> _credentialResolver;
@@ -24,6 +52,20 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     private readonly Func<string> _credentialHelperPath;
     private readonly Action _onDispose;
     private readonly Func<string, string> _pathCanonicalizer;
+
+    /// <summary>
+    /// Stage 6c — the PER-INSTANCE serialization lock covering Stage 6c through the completion
+    /// of Stage 7 for ELIGIBLE (Branch A) operations only. Branch B and local commands NEVER
+    /// take it.
+    /// </summary>
+    /// <remarks>
+    /// It is INTENTIONALLY never disposed by <see cref="Dispose"/>: the seam's disposal
+    /// contract is that in-flight operations complete normally, and disposing the semaphore
+    /// underneath them would fault a waiter or a release. Letting the finalizer-free
+    /// <see cref="SemaphoreSlim"/> be garbage-collected with the instance is the correct
+    /// trade-off here.
+    /// </remarks>
+    private readonly SemaphoreSlim _originGate = new(1, 1);
 
     /// <summary>0 = not disposed; 1 = disposed. Guarded by <see cref="Interlocked"/>.</summary>
     private int _disposed;
@@ -97,8 +139,11 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// <summary>
     /// Runs the strict validation pipeline for a config-repo git command and, when every
     /// stage passes, executes the SNAPSHOTTED command via the shared
-    /// <see cref="GitOperations.ExecuteProcessAsync"/>. Stage 6 additionally validates the
-    /// ref candidate with a <c>git check-ref-format --allow-onelevel &lt;ref&gt;</c> subprocess.
+    /// <see cref="GitOperations.ExecuteProcessAsync"/>. Stage 6b additionally validates the
+    /// ref candidate with a <c>git check-ref-format --allow-onelevel &lt;ref&gt;</c>
+    /// subprocess, and an ELIGIBLE (Branch A) transport command then runs — serialized on the
+    /// per-instance Stage 6c gate — the Stage 6d origin state machine and the Stage 6e
+    /// credential/helper resolution before its final, credential-carrying launch.
     /// </summary>
     internal async Task<ConfigRepoOpResult> RunConfigRepoCommandAsync(
         IReadOnlyList<string> args, string workingDirectory, CancellationToken ct)
@@ -159,16 +204,18 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         // status) skip this stage entirely: the URL resolver is NEVER read for them, and they
         // go straight to Stage 7 with the scrubbed env. The resolver is read EXACTLY ONCE.
         var eligibleTransport = false;
+        string? sanitizedUrl = null;
         if (IsTransportSubcommand(subcommand))
         {
-            var (urlError, eligible) = ResolveTransportEligibility();
+            var (urlError, eligible, sanitized) = ResolveTransportEligibility();
             if (urlError is not null)
                 return Reject(urlError);
 
             eligibleTransport = eligible;
+            sanitizedUrl = sanitized;
         }
 
-        // Stage 6 — ref validation: the PRECHECKS, then (when they pass) the check-ref-format
+        // Stage 6b — ref validation: the PRECHECKS, then (when they pass) the check-ref-format
         // subprocess. Run only once the Stage 5 scan completed without a grammar rejection.
         // This ordering is what makes `pull origin +bad extra` report `too many arguments.`
         // and `pull badremote +bad` report the remote rejection: a Stage 5 error ALWAYS wins
@@ -179,9 +226,9 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             if (refError is not null)
                 return Reject(refError);
 
-            // The prechecks passed — confirm with the subprocess. NO credential env in this
-            // slice (2c-b1b-ii): only the scrubbed inherited environment plus
-            // GIT_TERMINAL_PROMPT=0. A non-zero exit rejects the ref.
+            // The prechecks passed — confirm with the subprocess. The ref-validation
+            // subprocess is ALWAYS credential-free: only the scrubbed inherited environment
+            // plus GIT_TERMINAL_PROMPT=0. A non-zero exit rejects the ref.
             var refValidation = await LaunchGitProcessAsync(
                 new[] { "check-ref-format", "--allow-onelevel", refCandidate }, ct);
             if (refValidation is null)
@@ -191,10 +238,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                 return Reject($"Invalid git ref: '{GitUrlRedactor.Redact(refCandidate)}'.");
         }
 
-        // Stage 7 — the real execution via the SHARED ExecuteProcessAsync. The working
-        // directory is the CONSTRUCTOR-canonicalized configRepoDir — NOT the call-time
-        // workingDirectory string (Stage 3 containment has already verified their
-        // equivalence).
+        // The Stage 7 launch arguments.
         //
         // CANONICALIZATION (slice 2c-b1c-i): an ELIGIBLE pull/fetch whose validated form
         // carries NO positionals gets the literal `origin` appended as the remote argument,
@@ -202,23 +246,430 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         // upstream tracking configuration happens to exist. Every other launch — a form that
         // already has positionals (the grammar guarantees its first positional is exactly
         // `origin`), EVERY push form, and every Branch B (ineligible transport) command —
-        // launches the SNAPSHOT verbatim. In BOTH cases the env is the scrubbed env plus
-        // GIT_TERMINAL_PROMPT=0: this slice attaches NO credential env (2c-b1c-ii owns it).
+        // launches the SNAPSHOT verbatim.
         string[] launchArgs = ShouldAppendExplicitOrigin(subcommand, eligibleTransport, hasPositionals)
             ? [.. snapshot, "origin"]
             : snapshot;
 
-        var execution = await LaunchGitProcessAsync(launchArgs, ct);
-        if (execution is null)
-            return Reject("Git process failed to start.");
+        // Branch B (and every local command) — Stage 7 directly, with the scrubbed env plus
+        // GIT_TERMINAL_PROMPT=0 and NO credential environment. No origin state machine, no
+        // credential resolution, and NO serialization lock.
+        if (!eligibleTransport)
+        {
+            var execution = await LaunchGitProcessAsync(launchArgs, ct);
+            if (execution is null)
+                return Reject("Git process failed to start.");
 
-        return MapResult(execution);
+            return MapResult(execution);
+        }
+
+        // Branch A — Stages 6c → 6d → 6e → 7, serialized on the per-instance gate.
+        return await RunEligibleOperationAsync(launchArgs, sanitizedUrl!, ct);
+    }
+
+    /// <summary>
+    /// Branch A (an ELIGIBLE transport operation): Stage 6c (the per-instance serialization
+    /// gate), Stage 6d (the origin state machine), Stage 6e (the credential + helper
+    /// resolution) and Stage 7 (the final launch with the credential env injection and the
+    /// literal-secret redaction pass).
+    /// </summary>
+    /// <remarks>
+    /// THE ACQUIRED-FLAG RULE: <see cref="SemaphoreSlim.Release()"/> runs in the finally ONLY
+    /// when <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/> actually completed —
+    /// a cancellation BEFORE acquisition propagates without releasing a semaphore this call
+    /// never owned; a cancellation AFTER acquisition releases normally.
+    /// </remarks>
+    private async Task<ConfigRepoOpResult> RunEligibleOperationAsync(
+        string[] launchArgs, string sanitizedUrl, CancellationToken ct)
+    {
+        var acquired = false;
+        string? credential = null;
+        try
+        {
+            // Stage 6c.
+            await _originGate.WaitAsync(ct);
+            acquired = true;
+
+            // Stage 6d — the origin must be PRESENT, credential-free and equivalent to the
+            // sanitized configured URL before any credential is ever resolved.
+            var originError = await EnsureOriginAsync(sanitizedUrl, ct);
+            if (originError is not null)
+                return Reject(originError);
+
+            // Stage 6e — read the credential ONCE and (only when it will be injected) the
+            // credential helper path.
+            var (credentialError, resolvedCredential, helperPath) = ResolveCredential();
+            credential = resolvedCredential;
+            if (credentialError is not null)
+                return RedactLiteralCredential(Reject(credentialError), credential);
+
+            // Stage 7 — the FINAL command; the only launch that ever carries the credential.
+            var execution = await LaunchGitProcessAsync(launchArgs, ct, credential, helperPath);
+            if (execution is null)
+                return RedactLiteralCredential(Reject("Git process failed to start."), credential);
+
+            return RedactLiteralCredential(MapResult(execution), credential);
+        }
+        finally
+        {
+            if (acquired)
+                _originGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stage 6d — the origin state machine. Inspects <c>git remote get-url origin</c> and,
+    /// depending on the outcome, ADDS an absent origin, REPAIRS a credential-bearing but
+    /// otherwise equivalent origin with <c>git remote set-url origin</c>, leaves an equivalent
+    /// credential-free origin untouched, or REJECTS. Every subprocess here is credential-free.
+    /// </summary>
+    /// <returns>The fixed rejection message, or <c>null</c> when the origin is verified.</returns>
+    private async Task<string?> EnsureOriginAsync(string sanitizedUrl, CancellationToken ct)
+    {
+        // Step 3a — inspection.
+        var inspection = await LaunchGitProcessAsync(
+            new[] { "remote", "get-url", "origin" }, ct);
+        if (inspection is null)
+            return OriginNotVerified;
+
+        string? origin = null;
+        if (inspection.ExitCode == 0)
+        {
+            var trimmed = (inspection.Stdout ?? string.Empty).Trim();
+            if (trimmed.Length != 0)
+                origin = trimmed;
+        }
+        else if (!IsAbsentOriginStderr(inspection.Stderr))
+        {
+            return OriginNotVerified;
+        }
+
+        // Step 3b — an ABSENT origin is ADDED with the sanitized URL.
+        if (origin is null)
+        {
+            var add = await LaunchGitProcessAsync(
+                new[] { "remote", "add", "origin", sanitizedUrl }, ct);
+            return add is null || add.ExitCode != 0 ? OriginNotAdded : null;
+        }
+
+        // Step 3c — a PRESENT origin: equivalence, then repair-vs-reject.
+        if (!IsStructurallyEquivalentOrigin(origin, sanitizedUrl))
+            return OriginMismatch;
+
+        // Structurally equivalent AND credential-free: leave it exactly as it is.
+        if (!IsCredentialBearing(origin))
+            return null;
+
+        var setUrl = await LaunchGitProcessAsync(
+            new[] { "remote", "set-url", "origin", sanitizedUrl }, ct);
+        return setUrl is null || setUrl.ExitCode != 0 ? OriginNotUpdated : null;
+    }
+
+    /// <summary>
+    /// The ABSENCE classification for a NON-ZERO <c>git remote get-url origin</c> exit,
+    /// decided case-INSENSITIVELY over stderr. Anything else is an inspection FAILURE.
+    /// </summary>
+    private static bool IsAbsentOriginStderr(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr))
+            return false;
+
+        return stderr.Contains("no such remote", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("does not appear to be a git repository", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("not a git repository", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Whether a URL carries a credential, decided by the SHARED structural redactor: a URL
+    /// the redactor rewrites is credential-bearing.
+    /// </summary>
+    private static bool IsCredentialBearing(string url) =>
+        !string.Equals(GitUrlRedactor.Redact(url), url, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Structural origin equivalence against the SANITIZED configured URL: HTTPS scheme,
+    /// effective port 443, a case-insensitively equal host, NO query and NO fragment, and a
+    /// path that matches after the exact RAW normalization (see
+    /// <see cref="NormalizePathComponents"/>). It is deliberately independent of the presence
+    /// of a credential — the credential decides REPAIR vs LEAVE-AS-IS, never equivalence.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Uri"/> is consulted ONLY for the validated AUTHORITY facts — scheme, host,
+    /// effective port, and query/fragment PRESENCE. It is deliberately NOT used to obtain the
+    /// path: <see cref="Uri"/> canonicalizes a path before handing it over (dot-segment
+    /// collapse, <c>\</c>→<c>/</c> normalization, and unescaping of unreserved characters),
+    /// and NONE of those transformations is among the four permitted normalization steps. An
+    /// alias such as <c>/org/other/../config-repo.git</c> would otherwise be accepted as
+    /// equivalent to <c>/org/config-repo.git</c> — and, when credential-bearing, silently
+    /// "repaired" — even though the RAW components differ. The path therefore comes from
+    /// <see cref="ExtractRawPath"/>, which slices the ORIGINAL string.
+    /// </remarks>
+    private static bool IsStructurallyEquivalentOrigin(string origin, string sanitizedUrl)
+    {
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var originUri))
+            return false;
+
+        if (!Uri.TryCreate(sanitizedUrl, UriKind.Absolute, out var targetUri))
+            return false;
+
+        if (!string.Equals(originUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (originUri.Port != 443)
+            return false;
+
+        if (!string.Equals(originUri.Host, targetUri.Host, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.IsNullOrEmpty(originUri.Query) || !string.IsNullOrEmpty(originUri.Fragment))
+            return false;
+
+        // The path comparison runs over the RAW strings — never over a Uri-canonicalized path.
+        var originPath = NormalizePathComponents(origin);
+        var targetPath = NormalizePathComponents(sanitizedUrl);
+        if (originPath.Count != targetPath.Count)
+            return false;
+
+        for (var i = 0; i < originPath.Count; i++)
+        {
+            // The components are compared as .NET strings, case-SENSITIVELY.
+            if (!string.Equals(originPath[i], targetPath[i], StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Slices the RAW path out of a URL STRING: the characters from the first <c>/</c> after
+    /// the authority up to (excluding) the first <c>?</c> or <c>#</c>. Nothing is canonicalized,
+    /// re-escaped, unescaped, or collapsed — the substring is returned exactly as the caller
+    /// wrote it.
+    /// </summary>
+    /// <returns>
+    /// The raw path INCLUDING its leading <c>/</c>, or the empty string when the URL carries
+    /// no path at all. Both sides of a comparison go through this method, so the leading
+    /// separator contributes the same leading empty component to each.
+    /// </returns>
+    private static string ExtractRawPath(string url)
+    {
+        // The authority begins after the scheme delimiter.
+        var schemeDelimiter = url.IndexOf("://", StringComparison.Ordinal);
+        if (schemeDelimiter < 0)
+            return string.Empty;
+
+        var authorityStart = schemeDelimiter + 3;
+
+        // The path begins at the FIRST '/' after the authority. A '?' or '#' encountered
+        // first means the URL has no path component.
+        var pathStart = -1;
+        for (var i = authorityStart; i < url.Length; i++)
+        {
+            var c = url[i];
+            if (c == '/')
+            {
+                pathStart = i;
+                break;
+            }
+
+            if (c is '?' or '#')
+                return string.Empty;
+        }
+
+        if (pathStart < 0)
+            return string.Empty;
+
+        // The path ends at the FIRST '?' or '#'.
+        var pathEnd = url.Length;
+        for (var i = pathStart; i < url.Length; i++)
+        {
+            if (url[i] is '?' or '#')
+            {
+                pathEnd = i;
+                break;
+            }
+        }
+
+        return url[pathStart..pathEnd];
+    }
+
+    /// <summary>
+    /// THE PATH-NORMALIZATION ORDER (exact), applied to the RAW path of
+    /// <paramref name="url"/> (see <see cref="ExtractRawPath"/>): (1) split on RAW <c>/</c>;
+    /// (2) strip ONE trailing <c>.git</c> from the LAST component, case-SENSITIVELY;
+    /// (3) trim ALL trailing <c>/</c> characters from the end of the whole path (i.e. drop
+    /// every trailing EMPTY component); (4) single-pass percent-decode each component. The
+    /// components are returned separately so a DECODED <c>%2F</c> can never act as a
+    /// separator: the split happened on the RAW string, before any decoding.
+    /// </summary>
+    private static IReadOnlyList<string> NormalizePathComponents(string url)
+    {
+        // (0) the RAW path — no Uri canonicalization of any kind.
+        var path = ExtractRawPath(url);
+
+        // (1) split on the RAW separator.
+        var components = new List<string>(path.Split('/'));
+
+        // (2) strip ONE trailing ".git" from the LAST component (lower-case only).
+        if (components.Count > 0)
+        {
+            var last = components[^1];
+            if (last.EndsWith(".git", StringComparison.Ordinal))
+                components[^1] = last[..^4];
+        }
+
+        // (3) trim ALL trailing separators from the whole path.
+        while (components.Count > 0 && components[^1].Length == 0)
+            components.RemoveAt(components.Count - 1);
+
+        // (4) percent-decode each component, LAST.
+        for (var i = 0; i < components.Count; i++)
+            components[i] = PercentDecode(components[i]);
+
+        return components;
+    }
+
+    /// <summary>
+    /// A SINGLE-PASS percent decoder: <c>%xx</c> with two hex digits becomes the corresponding
+    /// byte mapped BYTE-TO-CODE-POINT (Latin-1 style — adjacent escapes are never combined
+    /// into a UTF-8 sequence); a malformed escape is left exactly as it is; the decoded output
+    /// is never re-scanned.
+    /// </summary>
+    private static string PercentDecode(string component)
+    {
+        if (!component.Contains('%', StringComparison.Ordinal))
+            return component;
+
+        var builder = new System.Text.StringBuilder(component.Length);
+        for (var i = 0; i < component.Length; i++)
+        {
+            if (component[i] == '%'
+                && i + 2 < component.Length
+                && TryParseHexDigit(component[i + 1], out var high)
+                && TryParseHexDigit(component[i + 2], out var low))
+            {
+                builder.Append((char)((high << 4) | low));
+                i += 2;
+                continue;
+            }
+
+            builder.Append(component[i]);
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool TryParseHexDigit(char c, out int value)
+    {
+        if (c is >= '0' and <= '9')
+        {
+            value = c - '0';
+            return true;
+        }
+
+        if (c is >= 'a' and <= 'f')
+        {
+            value = c - 'a' + 10;
+            return true;
+        }
+
+        if (c is >= 'A' and <= 'F')
+        {
+            value = c - 'A' + 10;
+            return true;
+        }
+
+        value = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Stage 6e — reads the credential resolver EXACTLY ONCE and, only when a NON-WHITESPACE
+    /// credential will be injected, the credential helper path.
+    /// </summary>
+    /// <returns>
+    /// <c>(Error, Credential, HelperPath)</c>. A null error with a null credential is the
+    /// UNAUTHENTICATED run (a null/whitespace credential); a non-null error still reports the
+    /// resolved credential when there was one, so the literal-secret redaction pass applies to
+    /// the returned message too.
+    /// </returns>
+    /// <remarks>
+    /// An <see cref="OperationCanceledException"/> from either delegate PROPAGATES
+    /// unconditionally. Any other credential-resolver exception maps to the FIXED
+    /// <c>Config repo not provisioned.</c>; any other helper-path failure (a throw, or a
+    /// null/empty/whitespace path) maps to the FIXED
+    /// <c>Git credential helper path is not available.</c>.
+    /// </remarks>
+    private (string? Error, string? Credential, string? HelperPath) ResolveCredential()
+    {
+        string? credential;
+        try
+        {
+            credential = _credentialResolver();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return (NotProvisioned, null, null);
+        }
+
+        // The credential ABSENCE: the operation runs UNAUTHENTICATED (fail-fast with
+        // GIT_TERMINAL_PROMPT=0), and the helper path is NEVER read.
+        if (string.IsNullOrWhiteSpace(credential))
+            return (null, null, null);
+
+        string? helperPath;
+        try
+        {
+            helperPath = _credentialHelperPath();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return (HelperUnavailable, credential, null);
+        }
+
+        if (string.IsNullOrWhiteSpace(helperPath))
+            return (HelperUnavailable, credential, null);
+
+        return (null, credential, helperPath);
+    }
+
+    /// <summary>
+    /// The LITERAL-secret redaction pass, applied AFTER <see cref="GitUrlRedactor.Redact"/>
+    /// to every result of an operation for which a NON-WHITESPACE credential was resolved
+    /// (whether it was injected or not): every ORDINAL occurrence of the credential in
+    /// <see cref="ConfigRepoOpResult.Stdout"/> and
+    /// <see cref="ConfigRepoOpResult.SanitizedError"/> becomes <c>[redacted]</c>.
+    /// </summary>
+    private static ConfigRepoOpResult RedactLiteralCredential(
+        ConfigRepoOpResult result, string? credential)
+    {
+        if (string.IsNullOrWhiteSpace(credential))
+            return result;
+
+        return result with
+        {
+            Stdout = result.Stdout.Replace(credential, RedactedPlaceholder, StringComparison.Ordinal),
+            SanitizedError = result.SanitizedError.Replace(credential, RedactedPlaceholder, StringComparison.Ordinal),
+        };
     }
 
     /// <summary>
     /// Fires <c>onDispose</c> exactly once; exceptions from it are swallowed. Post-disposal
     /// calls return <c>Seam disposed.</c>.
     /// </summary>
+    /// <remarks>
+    /// The Stage 6c semaphore is INTENTIONALLY NOT disposed here — see
+    /// <see cref="_originGate"/>. In-flight operations complete normally, and one of them may
+    /// still own the gate.
+    /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0)
@@ -264,15 +715,27 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         new(false, -1, "", GitUrlRedactor.Redact(message));
 
     /// <summary>
-    /// The child environment for EVERY git process launched by this seam: the SCRUBBED
-    /// inherited environment (the shared five-variable <see cref="GitOperations.SanitizeChildEnv"/>)
-    /// plus <c>GIT_TERMINAL_PROMPT=0</c>. NO credential environment in this slice (2c-b1c owns it).
+    /// The child environment for a git process launched by this seam: the SCRUBBED inherited
+    /// environment (the shared five-variable <see cref="GitOperations.SanitizeChildEnv"/>)
+    /// plus <c>GIT_TERMINAL_PROMPT=0</c>, and — ONLY for the FINAL command of an eligible
+    /// operation with a NON-WHITESPACE credential — <c>GITHUB_CONFIG_REPO_TOKEN</c> and
+    /// <c>GIT_ASKPASS</c>. Those two are the SOLE post-scrub exceptions and are added AFTER
+    /// the scrub. Every other launch (the origin inspection/add/set-url and the ref-validation
+    /// subprocess) is credential-free.
     /// </summary>
-    private IReadOnlyDictionary<string, string?> BuildChildEnv()
+    private IReadOnlyDictionary<string, string?> BuildChildEnv(
+        string? credential = null, string? helperPath = null)
     {
         var sanitized = GitOperations.SanitizeChildEnv(SnapshotCurrentProcessEnv());
         var withPromptDisabled = new Dictionary<string, string?>(sanitized);
         withPromptDisabled["GIT_TERMINAL_PROMPT"] = "0";
+
+        if (!string.IsNullOrWhiteSpace(credential) && !string.IsNullOrWhiteSpace(helperPath))
+        {
+            withPromptDisabled[CredentialEnvName] = credential;
+            withPromptDisabled[AskpassEnvName] = helperPath;
+        }
+
         return withPromptDisabled;
     }
 
@@ -305,7 +768,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// propagated). <see cref="OperationCanceledException"/> ALWAYS propagates, unconditionally.
     /// </returns>
     private async Task<GitProcessResult?> LaunchGitProcessAsync(
-        IReadOnlyList<string> tokenizedArgs, CancellationToken ct)
+        IReadOnlyList<string> tokenizedArgs,
+        CancellationToken ct,
+        string? credential = null,
+        string? helperPath = null)
     {
         try
         {
@@ -314,7 +780,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                     "git",
                     Args: Array.Empty<string>(),
                     WorkingDirectory: _configRepoDirCanonical,
-                    Env: BuildChildEnv(),
+                    Env: BuildChildEnv(credential, helperPath),
                     TokenizedArgs: tokenizedArgs),
                 ct);
         }
@@ -361,9 +827,11 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// Stage 6a — resolves the config repo URL EXACTLY ONCE and decides transport eligibility.
     /// </summary>
     /// <returns>
-    /// <c>(Error, _)</c> with a non-null message when the command must be rejected without
-    /// ever running; otherwise <c>(null, Eligible)</c> where <c>Eligible</c> selects the
-    /// canonicalized explicit-origin launch (Branch A) over the verbatim launch (Branch B).
+    /// <c>(Error, _, _)</c> with a non-null message when the command must be rejected without
+    /// ever running; otherwise <c>(null, Eligible, Sanitized)</c> where <c>Eligible</c> selects
+    /// the canonicalized explicit-origin launch (Branch A) over the verbatim launch (Branch B)
+    /// and <c>Sanitized</c> is the sanitized resolved URL used by the Stage 6d origin state
+    /// machine.
     /// </returns>
     /// <remarks>
     /// An <see cref="OperationCanceledException"/> from the resolver PROPAGATES
@@ -372,7 +840,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// production provisioner's "snapshot absent" <see cref="InvalidOperationException"/>)
     /// NEVER escapes.
     /// </remarks>
-    private (string? Error, bool Eligible) ResolveTransportEligibility()
+    private (string? Error, bool Eligible, string? Sanitized) ResolveTransportEligibility()
     {
         string? resolvedUrl;
         try
@@ -385,11 +853,11 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         }
         catch (Exception)
         {
-            return ("Config repo not provisioned.", false);
+            return (NotProvisioned, false, null);
         }
 
         if (string.IsNullOrWhiteSpace(resolvedUrl))
-            return ("Config repo URL is not available.", false);
+            return ("Config repo URL is not available.", false, null);
 
         string? sanitized;
         try
@@ -404,7 +872,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         {
             // The sanitizer's messages are already redacted by construction; the returned
             // SanitizedError still passes through GitUrlRedactor.Redact like every other one.
-            return ($"Invalid config repo URL: {ex.Message}", false);
+            return ($"Invalid config repo URL: {ex.Message}", false, null);
         }
 
         if (string.IsNullOrWhiteSpace(sanitized))
@@ -412,10 +880,10 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             // ConfigRepoUrlSanitizer.Sanitize returns null ONLY for an ABSENT value, which the
             // whitespace check above has already rejected. Reaching this branch would mean the
             // sanitizer broke its contract — report it as an absent URL rather than launching.
-            return ("Config repo URL is not available.", false);
+            return ("Config repo URL is not available.", false, null);
         }
 
-        return (null, IsEligibleTransportUrl(sanitized));
+        return (null, IsEligibleTransportUrl(sanitized), sanitized);
     }
 
     /// <summary>
