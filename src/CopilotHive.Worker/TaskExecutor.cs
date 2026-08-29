@@ -34,6 +34,61 @@ public sealed class TaskExecutor(
     private readonly string _configAgentsDir = Path.Combine(configRepoDir, "agents");
 
     /// <summary>
+    /// The config-repo git seam (slices 2c-b1b/2c-b1c/2c-b2/2c-b3). When non-null, EVERY
+    /// config-repo git command is routed through it in TOKENIZED form; when null, the LEGACY
+    /// opaque-argument path via <see cref="IGitOperations.RunGitCommandAsync"/> applies.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The seam is INJECTED (see the internal testing constructor) — never constructed here and
+    /// never disposed here, so <see cref="TaskExecutor"/> does not become
+    /// <see cref="IDisposable"/>. The PUBLIC constructor leaves this null, so production keeps
+    /// the legacy routing; the production activation is a later slice.
+    /// </para>
+    /// <para>
+    /// <b>The askpass content contract.</b> For an eligible transport command the seam injects
+    /// <c>GITHUB_CONFIG_REPO_TOKEN</c> plus <c>GIT_ASKPASS</c> (pointing at the credential
+    /// helper path supplied to its constructor). The helper script implements git's
+    /// <c>$1</c>-prompt protocol and is TOKEN-FREE — the credential is read from the
+    /// environment at invocation time, so the script itself may be written to disk with no
+    /// secret in it:
+    /// </para>
+    /// <code>
+    /// #!/bin/sh
+    /// case "$1" in
+    ///   *sername*) printf '%s' "x-access-token" ;;
+    ///   *) printf '%s' "$GITHUB_CONFIG_REPO_TOKEN" ;;
+    /// esac
+    /// </code>
+    /// <para>
+    /// git invokes the helper once per prompt, passing the prompt text as <c>$1</c>: a
+    /// username prompt (matching <c>*sername*</c>) answers with the fixed
+    /// <c>x-access-token</c> principal, and every other prompt (the password) answers with the
+    /// environment-supplied token. This contract is DOCUMENTED here only — this slice neither
+    /// writes the script nor provisions a placeholder for it.
+    /// </para>
+    /// </remarks>
+    private readonly ConfigRepoGitOperations? _configRepoSeam;
+
+    /// <summary>
+    /// Testing constructor: identical to the public constructor plus an INJECTED config-repo
+    /// git seam that takes over every config-repo git command. The seam is owned by the
+    /// CALLER — this type never constructs or disposes it.
+    /// </summary>
+    internal TaskExecutor(
+        IAgentRunner agentRunner,
+        IToolCallBridge? toolBridge,
+        IGitOperations? gitOperations,
+        ISessionClient? sessionClient,
+        string configRepoDir,
+        ConfigRepoGitOperations configRepoSeam)
+        : this(agentRunner, toolBridge, gitOperations, sessionClient, configRepoDir)
+    {
+        ArgumentNullException.ThrowIfNull(configRepoSeam);
+        _configRepoSeam = configRepoSeam;
+    }
+
+    /// <summary>
     /// Maximum number of changed-file paths rendered into the worker-side Improver log line.
     /// Keeps the log bounded regardless of how many files the improver touched; the remainder
     /// is reported as a <c>(+N more)</c> count. This governs LOG OUTPUT ONLY — the diagnostic
@@ -44,6 +99,15 @@ public sealed class TaskExecutor(
 
     private readonly WorkerLogger _log = new("Task");
     private readonly IGitOperations _git = gitOperations ?? new DefaultGitOperations();
+
+    /// <summary>
+    /// The improver's config-repo commit message. Shared by BOTH dispatch forms — the
+    /// tokenized <c>commit -m &lt;message&gt;</c> (no quoting: the seam hands each token to
+    /// <c>ArgumentList</c>) and the legacy opaque <c>commit -m "&lt;message&gt;"</c> — so the
+    /// two paths can never drift apart.
+    /// </summary>
+    private const string ImproverCommitMessage =
+        "Improve agents.md files (automated by CopilotHive Improver)";
 
     /// <summary>
     /// Writes to <see cref="Console.Error"/> safely, swallowing <see cref="ObjectDisposedException"/>
@@ -768,7 +832,7 @@ public sealed class TaskExecutor(
             _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}. Discarding all changes.");
 
             // Discard all agents.md changes to keep config repo clean
-            await _git.RunGitCommandAsync(_configRepoDir, "checkout -- agents/", ct);
+            await RunConfigRepoCommandAsync(["checkout", "--", "agents/"], "checkout -- agents/", ct);
             previousOutput += $"\n\n[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]";
         }
 
@@ -793,6 +857,46 @@ public sealed class TaskExecutor(
     }
 
     /// <summary>
+    /// The SINGLE dispatch for every config-repo git command. When the seam is injected the
+    /// TOKENIZED form is validated and executed by <see cref="ConfigRepoGitOperations"/>;
+    /// otherwise the LEGACY opaque form is handed to <see cref="IGitOperations.RunGitCommandAsync"/>
+    /// and its tuple is mapped DETERMINISTICALLY onto the same
+    /// <see cref="ConfigRepoOpResult"/> shape, so every caller sees one uniform result
+    /// regardless of the path taken.
+    /// </summary>
+    /// <param name="tokenizedForm">The seam input: one token per argument, never re-parsed.</param>
+    /// <param name="legacyOpaqueForm">
+    /// The EXACT legacy argument string (carried alongside the tokenized form so nothing is
+    /// reconstructed from it — the two forms are not always mechanically related, e.g. the
+    /// tokenized <c>push origin HEAD</c> versus the legacy bare <c>push</c>).
+    /// </param>
+    /// <param name="ct">Cancellation token, forwarded verbatim on BOTH paths.</param>
+    private async Task<ConfigRepoOpResult> RunConfigRepoCommandAsync(
+        IReadOnlyList<string> tokenizedForm, string legacyOpaqueForm, CancellationToken ct)
+    {
+        if (_configRepoSeam is not null)
+            return await _configRepoSeam.RunConfigRepoCommandAsync(tokenizedForm, _configRepoDir, ct);
+
+        var (exitCode, stdout, stderr) = await _git.RunGitCommandAsync(
+            _configRepoDir, legacyOpaqueForm, ct);
+
+        return new ConfigRepoOpResult(
+            Success: exitCode == 0,
+            ExitCode: exitCode,
+            Stdout: stdout,
+            SanitizedError: string.IsNullOrWhiteSpace(stderr) ? "" : stderr.Trim());
+    }
+
+    /// <summary>
+    /// Renders an untrusted config-repo result field for a log line: TRIM, then the
+    /// credential REDACTION, then the control-character SANITIZATION. TaskExecutor's logging
+    /// is the sanitization boundary — the seam's results (and raw git output) may carry
+    /// newlines, ESC or Unicode line separators that would otherwise forge log lines.
+    /// </summary>
+    private static string RenderForLog(string value) =>
+        LogSanitizer.SanitizeText(GitUrlRedactor.Redact(value.Trim()));
+
+    /// <summary>
     /// Pulls the latest changes from the config repo so the improver works on fresh agents.md files.
     /// The config repo is cloned at container startup by entrypoint.sh.
     /// </summary>
@@ -805,15 +909,14 @@ public sealed class TaskExecutor(
         }
 
         _log.Info("Pulling latest config repo for improver...");
-        var (exitCode, stdout, stderr) = await _git.RunGitCommandAsync(
-            _configRepoDir, "pull --ff-only", ct);
+        var result = await RunConfigRepoCommandAsync(["pull", "--ff-only"], "pull --ff-only", ct);
 
         // git echoes the credential-bearing config-repo remote in both streams, so the LOG
-        // rendering is redacted. The raw values themselves are left untouched.
-        if (exitCode == 0)
-            _log.Info($"Config repo up to date: {GitUrlRedactor.Redact(stdout.Trim())}");
+        // rendering is redacted AND control-character sanitized. The raw values are untouched.
+        if (result.Success)
+            _log.Info($"Config repo up to date: {RenderForLog(result.Stdout)}");
         else
-            _log.Error($"Config repo pull failed (exit {exitCode}): {GitUrlRedactor.Redact(stderr.Trim())}");
+            _log.Error($"Config repo pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
     }
 
     /// <summary>
@@ -826,25 +929,25 @@ public sealed class TaskExecutor(
             return new GitChangeSummary();
 
         // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
-        var (addExit, _, addErr) = await _git.RunGitCommandAsync(
-            _configRepoDir, "add agents/*.agents.md", ct);
-        if (addExit != 0)
+        var addResult = await RunConfigRepoCommandAsync(
+            ["add", "agents/*.agents.md"], "add agents/*.agents.md", ct);
+        if (!addResult.Success)
         {
-            _log.Error($"git add failed: {GitUrlRedactor.Redact(addErr.Trim())}");
+            _log.Error($"git add failed: {RenderForLog(addResult.SanitizedError)}");
             return new GitChangeSummary();
         }
 
         // Check if there are staged changes.
         // `-z` gives NUL-delimited, UNQUOTED paths so filenames with unusual characters survive.
-        var (diffExit, diffOut, _) = await _git.RunGitCommandAsync(
-            _configRepoDir, "diff --cached --name-only -z", ct);
-        if (diffExit != 0 || string.IsNullOrWhiteSpace(diffOut))
+        var diffResult = await RunConfigRepoCommandAsync(
+            ["diff", "--cached", "--name-only", "-z"], "diff --cached --name-only -z", ct);
+        if (!diffResult.Success || string.IsNullOrWhiteSpace(diffResult.Stdout))
         {
             _log.Info("No agents.md changes to commit");
             return new GitChangeSummary();
         }
 
-        var changedFiles = diffOut.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        var changedFiles = diffResult.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries);
         var filesChanged = changedFiles.Length;
 
         // Diagnostic path list for the orchestrator. The config repo is a SINGLE repository,
@@ -865,34 +968,36 @@ public sealed class TaskExecutor(
                   $"{LogSanitizer.FormatPathList(displayPaths, filesChanged)}");
 
         // Commit
-        var (commitExit, commitOut, commitErr) = await _git.RunGitCommandAsync(
-            _configRepoDir, "commit -m \"Improve agents.md files (automated by CopilotHive Improver)\"", ct);
-        if (commitExit != 0)
+        var commitResult = await RunConfigRepoCommandAsync(
+            ["commit", "-m", ImproverCommitMessage],
+            $"commit -m \"{ImproverCommitMessage}\"",
+            ct);
+        if (!commitResult.Success)
         {
-            _log.Error($"git commit failed: {GitUrlRedactor.Redact(commitErr.Trim())}");
+            _log.Error($"git commit failed: {RenderForLog(commitResult.SanitizedError)}");
             return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
         }
 
-        _log.Info($"Committed: {GitUrlRedactor.Redact(commitOut.Trim())}");
+        _log.Info($"Committed: {RenderForLog(commitResult.Stdout)}");
 
         // Pull (merge orchestrator's goals/metrics commits) then push
         var pushed = false;
         try
         {
-            var (pullExit, pullOut, pullErr) = await _git.RunGitCommandAsync(
-                _configRepoDir, "pull --no-rebase", ct);
-            if (pullExit != 0)
+            var pullResult = await RunConfigRepoCommandAsync(
+                ["pull", "--no-rebase"], "pull --no-rebase", ct);
+            if (!pullResult.Success)
             {
-                _log.Error($"git pull failed: {GitUrlRedactor.Redact(pullErr.Trim())}");
+                _log.Error($"git pull failed: {RenderForLog(pullResult.SanitizedError)}");
                 // Abort any in-progress merge and try force-pushing our commit
-                await _git.RunGitCommandAsync(_configRepoDir, "merge --abort", ct);
+                await RunConfigRepoCommandAsync(["merge", "--abort"], "merge --abort", ct);
             }
 
-            var (pushExit, _, pushErr) = await _git.RunGitCommandAsync(
-                _configRepoDir, "push", ct);
-            if (pushExit != 0)
+            var pushResult = await RunConfigRepoCommandAsync(
+                ["push", "origin", "HEAD"], "push", ct);
+            if (!pushResult.Success)
             {
-                _log.Error($"git push failed: {GitUrlRedactor.Redact(pushErr.Trim())}");
+                _log.Error($"git push failed: {RenderForLog(pushResult.SanitizedError)}");
                 return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
             }
 

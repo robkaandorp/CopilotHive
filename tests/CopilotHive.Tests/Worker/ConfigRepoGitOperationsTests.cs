@@ -1128,6 +1128,37 @@ public sealed class ConfigRepoGitOperationsTests
             $"Invalid git ref: '{refToken}'.");
     }
 
+    /// <summary>
+    /// The seam's RAW rejected-ref contract: a ref carrying a NEWLINE is rejected by the
+    /// Stage 6b character scan, and the returned <see cref="ConfigRepoOpResult.SanitizedError"/>
+    /// embeds that newline VERBATIM. "Sanitized" here means REDACTED
+    /// (<see cref="CopilotHive.Services.GitUrlRedactor"/>) — the seam deliberately performs NO
+    /// control-character pass, because raw fidelity is what its own callers assert against.
+    /// Sanitizing control characters for a log line is the CALLER's boundary (TaskExecutor),
+    /// not the seam's.
+    /// </summary>
+    [Fact]
+    public async Task Stage6_NewlineBearingRef_IsRejectedWithTheRawNewlineInTheError()
+    {
+        using var seam = CreateSeam();
+        const string refToken = "bad\nref";
+
+        var result = await RunAsync(seam, new[] { "pull", "--ff-only", "origin", refToken });
+
+        AssertRejected(result, $"Invalid git ref: '{refToken}'.");
+
+        // The newline survives the seam's redaction VERBATIM — the seam does not
+        // control-sanitize, so the raw value is exactly what a caller receives.
+        Assert.Contains("\n", result.SanitizedError, StringComparison.Ordinal);
+        Assert.Contains(refToken, result.SanitizedError, StringComparison.Ordinal);
+
+        // Proof the value really is un-sanitized: routing it through the log-sanitization
+        // boundary would CHANGE it.
+        Assert.NotEqual(
+            result.SanitizedError,
+            CopilotHive.Services.LogSanitizer.SanitizeText(result.SanitizedError));
+    }
+
     // ------------------------------------------------------------------
     // Stage 5 STRICTLY PRECEDES Stage 6 — the ref prechecks run only after the WHOLE
     // grammar scan completed. A Stage 6 message appearing for any of these rows means the

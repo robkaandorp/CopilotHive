@@ -16,7 +16,7 @@ public sealed class TaskExecutorTests
     /// <summary>
     /// Mock implementation of <see cref="IGitOperations"/> that simulates git operations.
     /// </summary>
-    private sealed class MockGitOperations : IGitOperations
+    internal sealed class MockGitOperations : IGitOperations
     {
         /// <summary>Controls whether PushBranchAsync throws an exception.</summary>
         public bool PushShouldFail { get; set; }
@@ -92,11 +92,15 @@ public sealed class TaskExecutorTests
         /// <summary>Every working directory passed to <see cref="RunGitCommandAsync"/>, in order.</summary>
         public List<string> WorkDirs { get; } = [];
 
+        /// <summary>Every cancellation token passed to <see cref="RunGitCommandAsync"/>, in order.</summary>
+        public List<CancellationToken> GitTokens { get; } = [];
+
         public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
             string workDir, string args, CancellationToken ct)
         {
             GitCommands.Add(args);
             WorkDirs.Add(workDir);
+            GitTokens.Add(ct);
             if (GitCommandThrower?.Invoke(args) is { } ex)
                 throw ex;
             var scripted = GitCommandResponder?.Invoke(args);
@@ -110,7 +114,7 @@ public sealed class TaskExecutorTests
     /// <summary>
     /// Mock implementation of <see cref="IAgentRunner"/> for testing.
     /// </summary>
-    private sealed class MockAgentRunner : IAgentRunner
+    internal sealed class MockAgentRunner : IAgentRunner
     {
         /// <summary>
         /// The WorkerReport to inject into <see cref="LastWorkerReport"/> when <see cref="SendPromptAsync"/> is called.
@@ -2080,5 +2084,776 @@ public sealed class TaskExecutorTests
         // a Pushed value. It must be either Cancelled or Failed.
         Assert.NotEqual(TaskOutcome.Completed, result.Status);
         Assert.Null(result.GitStatus);
+    }
+
+    // ── Config-repo git routing: the SEAM path vs the LEGACY path (slice 2c-c-i) ──────
+
+    /// <summary>The improver's config-repo commit message, identical on BOTH dispatch paths.</summary>
+    private const string ImproverCommitMessage =
+        "Improve agents.md files (automated by CopilotHive Improver)";
+
+    /// <summary>
+    /// An ELIGIBLE resolved config repo URL (HTTPS, host <c>github.com</c>, implicit port 443),
+    /// so transport commands take the seam's Branch A: origin state machine, credential
+    /// resolution and the canonicalized explicit-origin launch.
+    /// </summary>
+    private const string SeamEligibleUrl = "https://github.com/org/config-repo.git";
+
+    /// <summary>The credential the test's resolver hands the seam for eligible transport.</summary>
+    private const string SeamCredential = "ghp_test_credential";
+
+    /// <summary>The credential helper path the test's delegate hands the seam.</summary>
+    private const string SeamHelperPath = "/tmp/copilothive-askpass.sh";
+
+    /// <summary>
+    /// A fake <see cref="GitOperations.ProcessRunner"/>: it records every launched request and
+    /// the token it was launched with, answers the Stage 6d origin commands and the Stage 6b
+    /// <c>check-ref-format</c> subprocess, and delegates everything else to
+    /// <see cref="Responder"/> (defaulting to a success).
+    /// </summary>
+    private sealed class SeamProcessRunnerFake
+    {
+        public List<GitProcessRequest> Requests { get; } = [];
+
+        public List<CancellationToken> Tokens { get; } = [];
+
+        /// <summary>The origin reported by <c>remote get-url origin</c> (exit 0 by default).</summary>
+        public string OriginStdout { get; set; } = SeamEligibleUrl;
+
+        public int OriginExitCode { get; set; }
+
+        public string OriginStderr { get; set; } = "";
+
+        /// <summary>Scripted answer keyed on the tokenized args; null falls through to success.</summary>
+        public Func<IReadOnlyList<string>, GitProcessResult?>? Responder { get; set; }
+
+        public Task<GitProcessResult> RunAsync(GitProcessRequest request, CancellationToken ct)
+        {
+            Requests.Add(request);
+            Tokens.Add(ct);
+
+            var tokens = request.TokenizedArgs!;
+            if (tokens[0] == "remote")
+            {
+                return Task.FromResult(tokens[1] == "get-url"
+                    ? new GitProcessResult(OriginExitCode, OriginStdout, OriginStderr)
+                    : new GitProcessResult(0, "", ""));
+            }
+
+            if (tokens[0] == "check-ref-format")
+                return Task.FromResult(new GitProcessResult(0, "", ""));
+
+            return Task.FromResult(Responder?.Invoke(tokens) ?? new GitProcessResult(0, "", ""));
+        }
+
+        /// <summary>The tokenized command of each recorded request, in launch order.</summary>
+        public List<string[]> Launched =>
+            [.. Requests.Select(r => r.TokenizedArgs!.ToArray())];
+    }
+
+    /// <summary>
+    /// Builds the injected config-repo seam. Every delegate is controlled by the test; the
+    /// disposal callback is a no-op because <see cref="TaskExecutor"/> never disposes it.
+    /// </summary>
+    private static ConfigRepoGitOperations CreateConfigRepoSeam(
+        string configRepoDir,
+        Func<string?>? resolvedUrlResolver = null,
+        Func<string?>? credentialResolver = null,
+        Func<string>? credentialHelperPath = null) =>
+        new(
+            configRepoDir,
+            resolvedUrlResolver ?? (static () => SeamEligibleUrl),
+            credentialResolver ?? (static () => SeamCredential),
+            new WorkerLogger("Test"),
+            credentialHelperPath ?? (static () => SeamHelperPath),
+            static () => { });
+
+    /// <summary>
+    /// Runs the improver through the SEAM path with the fake process runner installed
+    /// (restored in a <c>finally</c>) while capturing both console streams.
+    /// </summary>
+    private static async Task<(TaskResult Result, string Stdout, string Stderr)> RunImproverWithSeamAsync(
+        string taskId,
+        string configRepoDir,
+        ConfigRepoGitOperations seam,
+        SeamProcessRunnerFake fake,
+        MockGitOperations git,
+        CancellationToken? ct = null)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        using var outWriter = new StringWriter();
+        using var errWriter = new StringWriter();
+        try
+        {
+            GitOperations.ProcessRunner = fake.RunAsync;
+            Console.SetOut(outWriter);
+            Console.SetError(errWriter);
+
+            var executor = new TaskExecutor(
+                new MockAgentRunner(), null, git, null, configRepoDir, seam);
+            var result = await executor.ExecuteAsync(
+                BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
+
+            return (result, outWriter.ToString(), errWriter.ToString());
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+    }
+
+    /// <summary>
+    /// Runs the improver through the LEGACY path (the PUBLIC constructor) while capturing both
+    /// console streams. The <see cref="GitOperations.ProcessRunner"/> seam is NOT installed —
+    /// the mock intercepts at <see cref="IGitOperations.RunGitCommandAsync"/>.
+    /// </summary>
+    private static async Task<(TaskResult Result, string Stdout, string Stderr)> RunImproverLegacyAsync(
+        string taskId, string configRepoDir, MockGitOperations git, CancellationToken? ct = null)
+    {
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        using var outWriter = new StringWriter();
+        using var errWriter = new StringWriter();
+        try
+        {
+            Console.SetOut(outWriter);
+            Console.SetError(errWriter);
+
+            var executor = new TaskExecutor(
+                new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
+            var result = await executor.ExecuteAsync(
+                BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
+
+            return (result, outWriter.ToString(), errWriter.ToString());
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+    }
+
+    /// <summary>NUL-delimited <c>diff --cached --name-only -z</c> output for the given paths.</summary>
+    private static string StagedOutput(params string[] paths) =>
+        string.Concat(paths.Select(p => p + "\0"));
+
+    /// <summary>
+    /// The canonical spelling the seam launches with: the fully-qualified config repo directory
+    /// with any trailing separator removed.
+    /// </summary>
+    private static string CanonicalConfigRepoDir(string configRepoDir) =>
+        Path.GetFullPath(configRepoDir)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    private static void AssertLaunchedSequence(SeamProcessRunnerFake fake, params string[][] expected)
+    {
+        Assert.Equal(expected.Length, fake.Requests.Count);
+        for (var i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], fake.Launched[i]);
+    }
+
+    /// <summary>
+    /// Splits captured console output on EVERY line-breaking convention, so a forged line
+    /// surfaces as its own entry rather than hiding inside a matched line.
+    /// </summary>
+    private static string[] SplitLines(string output) =>
+        output.Split(['\n', '\r', '\u0085', '\u2028', '\u2029']);
+
+    private static string FindLine(string output, string needle)
+    {
+        var line = Array.Find(SplitLines(output), l => l.Contains(needle, StringComparison.Ordinal));
+        Assert.NotNull(line);
+        return line!;
+    }
+
+    // ── (a) Complete routing on the SEAM path ────────────────────────────────
+
+    /// <summary>
+    /// The FULL improver flow routed through the injected seam: EVERY config-repo command is
+    /// launched by the seam, in order, with the seam's canonicalization and origin state
+    /// machine — and the legacy <see cref="IGitOperations.RunGitCommandAsync"/> is never
+    /// touched. Deleting the seam branch of the dispatch leaves the fake with zero requests
+    /// and the mock with the opaque strings, failing this test.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_LaunchesEveryConfigRepoCommandThroughTheSeam()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] staged = ["agents/coder.agents.md", "agents/tester.agents.md"];
+
+        var urlCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff"
+                ? new GitProcessResult(0, StagedOutput(staged), "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir, () => { urlCalls++; return SeamEligibleUrl; });
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-routing", configRepoDir, seam, fake, git);
+
+        // The COMPLETE launch sequence, including the seam's explicit-origin canonicalization
+        // of the two positional-free pulls and the full push sequence.
+        AssertLaunchedSequence(fake,
+            ["remote", "get-url", "origin"],
+            ["pull", "--ff-only", "origin"],
+            ["add", "agents/*.agents.md"],
+            ["diff", "--cached", "--name-only", "-z"],
+            ["commit", "-m", ImproverCommitMessage],
+            ["remote", "get-url", "origin"],
+            ["pull", "--no-rebase", "origin"],
+            ["check-ref-format", "--allow-onelevel", "HEAD"],
+            ["remote", "get-url", "origin"],
+            ["push", "origin", "HEAD"]);
+
+        // The legacy path was NEVER consulted.
+        Assert.Empty(git.GitCommands);
+
+        // Every launch used the CANONICALIZED config repo directory.
+        var canonical = CanonicalConfigRepoDir(configRepoDir);
+        Assert.All(fake.Requests, r => Assert.Equal(canonical, r.WorkingDirectory));
+
+        // The `-z` parsing and the summary construction are preserved.
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // Stage 6a runs for the THREE transport commands only — the local commands
+        // (add/diff/commit) never resolve the URL.
+        Assert.Equal(3, urlCalls);
+    }
+
+    /// <summary>
+    /// The credential boundary on the seam path: ONLY the final command of an eligible
+    /// transport operation carries <c>GITHUB_CONFIG_REPO_TOKEN</c> / <c>GIT_ASKPASS</c>.
+    /// Every local command, every origin inspection and the ref-validation subprocess are
+    /// credential-free — and no local command triggers a <c>remote get-url</c> at all.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_LocalCommandsCarryNoUrlResolutionOrCredential()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff"
+                ? new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        await RunImproverWithSeamAsync("improver-seam-credential", configRepoDir, seam, fake, git);
+
+        string[][] credentialCarrying =
+        [
+            ["pull", "--ff-only", "origin"],
+            ["pull", "--no-rebase", "origin"],
+            ["push", "origin", "HEAD"],
+        ];
+
+        foreach (var request in fake.Requests)
+        {
+            var tokens = request.TokenizedArgs!.ToArray();
+            var expectsCredential = credentialCarrying.Any(c => c.SequenceEqual(tokens));
+
+            Assert.Equal(expectsCredential, request.Env.ContainsKey("GITHUB_CONFIG_REPO_TOKEN"));
+            Assert.Equal(expectsCredential, request.Env.ContainsKey("GIT_ASKPASS"));
+            if (expectsCredential)
+            {
+                Assert.Equal(SeamCredential, request.Env["GITHUB_CONFIG_REPO_TOKEN"]);
+                Assert.Equal(SeamHelperPath, request.Env["GIT_ASKPASS"]);
+            }
+        }
+
+        // The origin inspection happens EXACTLY three times: once per transport command. A
+        // local command never reaches Stage 6d.
+        Assert.Equal(3, fake.Launched.Count(t => t is ["remote", "get-url", "origin"]));
+    }
+
+    /// <summary>
+    /// An ABSENT origin is ADDED by the seam before the transport command; a CREDENTIAL-BEARING
+    /// but equivalent origin is REPAIRED with <c>set-url</c>. Both variants carry the SANITIZED
+    /// URL and precede the canonicalized pull.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_SeamPath_OriginIsAddedOrRepairedBeforeTheTransportCommand(bool originAbsent)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            // An absent origin: non-zero inspection with the recognized stderr. A present but
+            // credential-bearing origin: exit 0 reporting the credential-bearing URL.
+            OriginExitCode = originAbsent ? 2 : 0,
+            OriginStdout = originAbsent
+                ? ""
+                : "https://x-access-token:ghp_secret@github.com/org/config-repo.git",
+            OriginStderr = originAbsent ? "fatal: no such remote 'origin'" : "",
+            // No staged changes: the flow stops after add + diff, isolating the FIRST pull.
+            Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        await RunImproverWithSeamAsync("improver-seam-origin", configRepoDir, seam, fake, git);
+
+        string[] repair = originAbsent
+            ? ["remote", "add", "origin", SeamEligibleUrl]
+            : ["remote", "set-url", "origin", SeamEligibleUrl];
+
+        AssertLaunchedSequence(fake,
+            ["remote", "get-url", "origin"],
+            repair,
+            ["pull", "--ff-only", "origin"],
+            ["add", "agents/*.agents.md"],
+            ["diff", "--cached", "--name-only", "-z"]);
+    }
+
+    /// <summary>
+    /// The oversized-agent-file DISCARD path routes through the seam as the tokenized
+    /// <c>checkout -- agents/</c> local command.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_OversizedAgentsFile_DiscardsThroughTheSeam()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(configRepoDir, "agents", "coder.agents.md"),
+            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
+            TestContext.Current.CancellationToken);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        await RunImproverWithSeamAsync("improver-seam-discard", configRepoDir, seam, fake, git);
+
+        AssertLaunchedSequence(fake,
+            ["remote", "get-url", "origin"],
+            ["pull", "--ff-only", "origin"],
+            ["checkout", "--", "agents/"],
+            ["add", "agents/*.agents.md"],
+            ["diff", "--cached", "--name-only", "-z"]);
+        Assert.Empty(git.GitCommands);
+    }
+
+    /// <summary>
+    /// A FAILING <c>pull --no-rebase</c> still aborts the merge and force-pushes — through the
+    /// seam, with the tokenized <c>merge --abort</c> between them.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_AbortsMergeAndStillPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(1, "", "merge conflict"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-merge-abort", configRepoDir, seam, fake, git);
+
+        AssertLaunchedSequence(fake,
+            ["remote", "get-url", "origin"],
+            ["pull", "--ff-only", "origin"],
+            ["add", "agents/*.agents.md"],
+            ["diff", "--cached", "--name-only", "-z"],
+            ["commit", "-m", ImproverCommitMessage],
+            ["remote", "get-url", "origin"],
+            ["pull", "--no-rebase", "origin"],
+            ["merge", "--abort"],
+            ["check-ref-format", "--allow-onelevel", "HEAD"],
+            ["remote", "get-url", "origin"],
+            ["push", "origin", "HEAD"]);
+
+        Assert.Contains("git pull failed: merge conflict", FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
+        Assert.True(result.GitStatus!.Pushed);
+    }
+
+    // ── (b) The LEGACY path (public constructor) ─────────────────────────────
+
+    /// <summary>
+    /// The public constructor keeps the LEGACY opaque routing — every argument string arrives
+    /// VERBATIM, including the QUOTED commit message and the BARE <c>push</c> (which the
+    /// tokenized form spells <c>push origin HEAD</c>). Reconstructing the opaque form from the
+    /// tokenized one would produce <c>push origin HEAD</c> and fail here.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_SendsTheExactOpaqueArgumentStrings()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: false),
+        };
+
+        await RunImproverLegacyAsync("improver-legacy-opaque", configRepoDir, git);
+
+        Assert.Equal(
+            [
+                "pull --ff-only",
+                "add agents/*.agents.md",
+                "diff --cached --name-only -z",
+                $"commit -m \"{ImproverCommitMessage}\"",
+                "pull --no-rebase",
+                "push",
+            ],
+            git.GitCommands);
+        Assert.All(git.WorkDirs, dir => Assert.Equal(configRepoDir, dir));
+    }
+
+    /// <summary>
+    /// The legacy DISCARD and <c>merge --abort</c> opaque strings, which the happy path never
+    /// reaches.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_DiscardAndMergeAbort_UseTheExactOpaqueStrings()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(configRepoDir, "agents", "coder.agents.md"),
+            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
+            TestContext.Current.CancellationToken);
+
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                "pull --no-rebase" => (1, "", "merge conflict"),
+                _ => null,
+            },
+        };
+
+        await RunImproverLegacyAsync("improver-legacy-abort", configRepoDir, git);
+
+        Assert.Equal(
+            [
+                "pull --ff-only",
+                "checkout -- agents/",
+                "add agents/*.agents.md",
+                "diff --cached --name-only -z",
+                $"commit -m \"{ImproverCommitMessage}\"",
+                "pull --no-rebase",
+                "merge --abort",
+                "push",
+            ],
+            git.GitCommands);
+    }
+
+    /// <summary>
+    /// The legacy mapping is <c>Success == exitCode == 0</c> — NOT "stderr is empty". A
+    /// SUCCESSFUL <c>add</c> that still wrote to stderr must not be treated as a failure: the
+    /// flow proceeds to the diff and produces a real summary.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ZeroExitWithStderr_IsStillSuccess()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "add agents/*.agents.md" => (0, "", "warning: LF will be replaced by CRLF"),
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-zero-exit", configRepoDir, git);
+
+        Assert.DoesNotContain("git add failed", stderr, StringComparison.Ordinal);
+        Assert.Equal(1, result.GitStatus!.FilesChanged);
+        Assert.Contains("push", git.GitCommands);
+    }
+
+    /// <summary>
+    /// The legacy mapping TRIMS a non-blank stderr and maps a WHITESPACE-ONLY stderr to the
+    /// empty string, so the error log line renders nothing rather than stray blank space.
+    /// </summary>
+    [Theory]
+    [InlineData("   boom   ", "git add failed: boom")]
+    [InlineData("\t \n ", "git add failed:")]
+    public async Task Improver_LegacyPath_MapsStderrDeterministically(string stderr, string expectedLine)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+                args == "add agents/*.agents.md" ? (1, "", stderr) : null,
+        };
+
+        var (result, _, captured) = await RunImproverLegacyAsync(
+            "improver-legacy-map-" + expectedLine.Length, configRepoDir, git);
+
+        Assert.Equal(expectedLine, FindLine(captured, "git add failed").Replace("[Task] ERROR: ", "").TrimEnd());
+
+        // The `add` failure is an early return: no diff was ever queried.
+        Assert.DoesNotContain("diff --cached --name-only -z", git.GitCommands);
+        Assert.Equal(0, result.GitStatus!.FilesChanged);
+    }
+
+    // ── (c) Cancellation flows downstream on BOTH paths ──────────────────────
+
+    /// <summary>
+    /// The token handed to <see cref="TaskExecutor.ExecuteAsync"/> reaches the FINAL requests
+    /// on the seam path unchanged — no derived token, no <see cref="CancellationToken.None"/>.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_ForwardsTheExecuteTokenToEveryLaunch()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff"
+                ? new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        await RunImproverWithSeamAsync(
+            "improver-seam-token", configRepoDir, seam, fake, git, cts.Token);
+
+        Assert.NotEmpty(fake.Tokens);
+        Assert.All(fake.Tokens, t => Assert.Equal(cts.Token, t));
+    }
+
+    /// <summary>
+    /// The legacy path forwards the SAME token to <see cref="IGitOperations.RunGitCommandAsync"/>.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ForwardsTheExecuteTokenToEveryCommand()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: false),
+        };
+
+        await RunImproverLegacyAsync("improver-legacy-token", configRepoDir, git, cts.Token);
+
+        Assert.NotEmpty(git.GitTokens);
+        Assert.All(git.GitTokens, t => Assert.Equal(cts.Token, t));
+    }
+
+    /// <summary>
+    /// An ALREADY-CANCELLED token still produces the established <c>Cancelled</c> result on the
+    /// seam path: the shared launch layer observes the cancellation before the fake runner is
+    /// ever consulted, and <see cref="TaskExecutor.ExecuteAsync"/>'s outer guard maps it.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_CancelledToken_ProducesCancelledResult()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var fake = new SeamProcessRunnerFake();
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-cancelled", configRepoDir, seam, fake, git, cts.Token);
+
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Empty(fake.Requests); // the pre-launch check fired before the delegate
+    }
+
+    // ── (d) Preserved behaviors on the SEAM path ─────────────────────────────
+
+    /// <summary>
+    /// The <c>Directory.Exists(.git)</c> early-outs are preserved: with no <c>.git</c> marker
+    /// NEITHER the pull NOR the commit/push sequence launches anything.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_MissingGitMarker_LaunchesNothing()
+    {
+        var configRepoDir = Path.Combine(
+            Path.GetTempPath(), $"copilothive-test-nogit-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
+        using var remover = new DirectoryRemover(configRepoDir);
+
+        var fake = new SeamProcessRunnerFake();
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, stdout, _) = await RunImproverWithSeamAsync(
+            "improver-seam-nogit", configRepoDir, seam, fake, git);
+
+        Assert.Empty(fake.Requests);
+        Assert.Empty(git.GitCommands);
+        Assert.Contains("Config repo not found", stdout, StringComparison.Ordinal);
+        Assert.Equal(0, result.GitStatus!.FilesChanged);
+    }
+
+    /// <summary>
+    /// The uniform exit-code handling: a NON-ZERO seam result renders the preserved
+    /// <c>Config repo pull failed (exit N)</c> wording with the seam's exit code.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_NonZeroPull_LogsThePreservedExitCodeWording()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["pull", "--ff-only", ..] => new GitProcessResult(3, "", "could not fast-forward"),
+                ["diff", ..] => new GitProcessResult(0, "", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (_, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-exit3", configRepoDir, seam, fake, git);
+
+        Assert.Contains(
+            "Config repo pull failed (exit 3): could not fast-forward",
+            FindLine(stderr, "Config repo pull failed"),
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A seam REJECTION (Stage 6a: the resolved URL is absent) never launches a process and
+    /// flows into the SAME error log lines as a legacy non-zero exit, carrying the seam's
+    /// fixed <c>SanitizedError</c> and its <c>-1</c> exit code.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Rejection_FlowsIntoTheSameErrorLogLines()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff"
+                ? new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), "")
+                : null,
+        };
+        // No resolved URL: every TRANSPORT command is rejected at Stage 6a; the local
+        // commands are unaffected and still launch.
+        using var seam = CreateConfigRepoSeam(configRepoDir, resolvedUrlResolver: static () => null);
+        var git = new MockGitOperations();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-reject", configRepoDir, seam, fake, git);
+
+        Assert.Contains(
+            "Config repo pull failed (exit -1): Config repo URL is not available.",
+            FindLine(stderr, "Config repo pull failed"),
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "git pull failed: Config repo URL is not available.",
+            FindLine(stderr, "git pull failed"),
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "git push failed: Config repo URL is not available.",
+            FindLine(stderr, "git push failed"),
+            StringComparison.Ordinal);
+
+        // Only the LOCAL commands reached a launch — no transport, no origin inspection.
+        AssertLaunchedSequence(fake,
+            ["add", "agents/*.agents.md"],
+            ["diff", "--cached", "--name-only", "-z"],
+            ["commit", "-m", ImproverCommitMessage],
+            ["merge", "--abort"]);
+
+        // The push-failure path preserves the diagnostic paths and reports Pushed = false.
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+    }
+
+    // ── (e) The reachable control-character boundary vector ──────────────────
+
+    /// <summary>
+    /// THE SANITIZATION BOUNDARY. A LOCAL command (<c>add</c>) fails with a stderr carrying an
+    /// embedded NEWLINE. The seam redacts but deliberately does NOT control-sanitize, so the
+    /// uniform result's <c>SanitizedError</c> reaches TaskExecutor with the newline intact —
+    /// and the log line must render it as <c>LogSanitizer.SanitizeText(...)</c> does, with the
+    /// newline replaced by <c>'?'</c>, so no extra log line can be forged.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_NewlineBearingStderr_IsRenderedControlSafe()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "add"
+                ? new GitProcessResult(1, "", "fatal: bad path\n[Task] ERROR: forged line")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (_, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-newline", configRepoDir, seam, fake, git);
+
+        var line = FindLine(stderr, "git add failed");
+        Assert.Contains(
+            "git add failed: fatal: bad path?[Task] ERROR: forged line",
+            line,
+            StringComparison.Ordinal);
+
+        // The raw newline never reached the sink: the message occupies exactly ONE line and
+        // the forged text is not on a line of its own.
+        Assert.DoesNotContain(
+            "fatal: bad path\n", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SplitLines(stderr), l => l.Trim() == "[Task] ERROR: forged line");
+    }
+
+    /// <summary>
+    /// The same boundary on the LEGACY path — the mapping trims but does not sanitize, so the
+    /// SAME rendering rule must apply there too.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_NewlineBearingStderr_IsRenderedControlSafe()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "add agents/*.agents.md"
+                ? (1, "", "fatal: bad path\n[Task] ERROR: forged line")
+                : null,
+        };
+
+        var (_, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-newline", configRepoDir, git);
+
+        Assert.Contains(
+            "git add failed: fatal: bad path?[Task] ERROR: forged line",
+            FindLine(stderr, "git add failed"),
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SplitLines(stderr), l => l.Trim() == "[Task] ERROR: forged line");
     }
 }

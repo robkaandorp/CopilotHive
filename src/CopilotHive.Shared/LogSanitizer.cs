@@ -37,6 +37,33 @@ public static class LogSanitizer
     }
 
     /// <summary>
+    /// Replaces every character that could break a log line into multiple lines with
+    /// <see cref="Placeholder"/>, leaving all other characters (including legal non-ASCII
+    /// characters and leading/trailing whitespace) untouched.
+    /// </summary>
+    /// <remarks>
+    /// The free-text counterpart of <see cref="SanitizePath"/>: SAME unsafe-character set
+    /// (<see cref="IsLogUnsafe"/>), SAME <see cref="Placeholder"/> substitution and SAME
+    /// null/empty passthrough. Use it for any untrusted, externally-supplied message
+    /// (git stderr, seam error text) that is rendered into a single-line log message.
+    /// </remarks>
+    /// <param name="text">The raw text to render. May be null or empty.</param>
+    /// <returns>The sanitized text, safe to embed in a single-line log message.</returns>
+    public static string SanitizeText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        Span<char> buffer = text.Length <= 512 ? stackalloc char[text.Length] : new char[text.Length];
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            buffer[i] = IsLogUnsafe(c) ? Placeholder : c;
+        }
+        return new string(buffer);
+    }
+
+    /// <summary>
     /// True when the character is a control character (C0 <c>0x00-0x1F</c> including NUL,
     /// backspace, tab, newline, vertical tab, form feed and ESC; DEL <c>0x7F</c>; and the C1
     /// range <c>0x80-0x9F</c>, which already includes U+0085 NEL) or one of the Unicode
