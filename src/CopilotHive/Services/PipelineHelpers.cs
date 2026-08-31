@@ -165,11 +165,13 @@ internal static class PipelineHelpers
     }
 
     /// <summary>
-    /// Injects GH_TOKEN into a GitHub URL for authenticated operations.
+    /// Injects the environment credential into a GitHub URL for authenticated operations.
+    /// <c>GH_TOKEN</c> takes precedence; <c>GITHUB_TOKEN</c> is the fallback when it is absent.
     /// </summary>
     internal static string InjectTokenIntoUrl(string url)
     {
-        var token = Environment.GetEnvironmentVariable("GH_TOKEN");
+        var token = Environment.GetEnvironmentVariable("GH_TOKEN")
+                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
         if (string.IsNullOrEmpty(token) || !url.StartsWith("https://github.com/"))
             return url;
 

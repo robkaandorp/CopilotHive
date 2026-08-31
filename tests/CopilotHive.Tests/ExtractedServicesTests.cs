@@ -54,11 +54,13 @@ public sealed class PipelineHelpersTests
     public void InjectTokenIntoUrl_NoToken_ReturnsOriginal()
     {
         var url = "https://github.com/owner/repo.git";
-        // Clear GH_TOKEN if set
+        // Clear BOTH credential variables — either one alone would inject a token.
         var originalToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        var originalGithubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
         try
         {
             Environment.SetEnvironmentVariable("GH_TOKEN", null);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", null);
             var result = PipelineHelpers.InjectTokenIntoUrl(url);
             Assert.Equal(url, result);
         }
@@ -66,6 +68,7 @@ public sealed class PipelineHelpersTests
         {
             if (originalToken is not null)
                 Environment.SetEnvironmentVariable("GH_TOKEN", originalToken);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", originalGithubToken);
         }
     }
 
@@ -87,6 +90,101 @@ public sealed class PipelineHelpersTests
             else
                 Environment.SetEnvironmentVariable("GH_TOKEN", null);
         }
+    }
+
+    // ── InjectTokenIntoUrl: the GITHUB_TOKEN fallback ────────────────────────
+
+    /// <summary>
+    /// Runs <paramref name="assert"/> with the two credential variables set to the given values,
+    /// restoring BOTH originals afterwards.
+    /// </summary>
+    private static void WithTokens(string? ghToken, string? githubToken, Action assert)
+    {
+        var originalGh = Environment.GetEnvironmentVariable("GH_TOKEN");
+        var originalGithub = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", ghToken);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", githubToken);
+            assert();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", originalGh);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", originalGithub);
+        }
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_OnlyGhToken_InjectsGhToken()
+    {
+        WithTokens("gh-token", null, () =>
+            Assert.Equal(
+                "https://x-access-token:gh-token@github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_GhTokenAbsent_FallsBackToGithubToken()
+    {
+        WithTokens(null, "github-token", () =>
+            Assert.Equal(
+                "https://x-access-token:github-token@github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_BothTokensPresent_GhTokenWins()
+    {
+        WithTokens("gh-token", "github-token", () =>
+        {
+            var result = PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git");
+
+            Assert.Equal("https://x-access-token:gh-token@github.com/owner/repo.git", result);
+            Assert.DoesNotContain("github-token", result, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_BothTokensAbsent_ReturnsOriginal()
+    {
+        WithTokens(null, null, () =>
+            Assert.Equal(
+                "https://github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_GithubTokenFallbackWithNonGitHubUrl_ReturnsOriginal()
+    {
+        // The https://github.com/ gate is unchanged — the fallback never widens it.
+        WithTokens(null, "github-token", () =>
+            Assert.Equal(
+                "https://gitlab.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://gitlab.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_EmptyGhToken_FallsBackToGithubToken()
+    {
+        // An EMPTY GH_TOKEN is indistinguishable from unset for the ?? chain only when it is
+        // null; an empty string wins the ?? and is then rejected by the IsNullOrEmpty gate.
+        // The gate stays IsNullOrEmpty (NOT whitespace-aware) — assert that documented shape.
+        WithTokens(string.Empty, "github-token", () =>
+            Assert.Equal(
+                "https://github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_WhitespaceGithubTokenFallback_IsStillInjected()
+    {
+        // The gate is IsNullOrEmpty, NOT IsNullOrWhiteSpace — a whitespace token is injected.
+        // Pinning the existing (deliberately unchanged) behaviour.
+        WithTokens(null, " ", () =>
+            Assert.Equal(
+                "https://x-access-token: @github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
     }
 
     // ── GetLastCraftPromptFromConversation ───────────────────────────────────

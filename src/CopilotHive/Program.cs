@@ -94,6 +94,81 @@ public sealed class Program
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
         };
 
+    /// <summary>
+    /// Reads the persisted admin OAuth access token DIRECTLY from the SQLite database, before the
+    /// host is built and therefore before any DI container exists.
+    /// <para>
+    /// This is the OAuth bridge for the very first startup sync of the config repo: on an
+    /// OAuth-only deployment the admin token lives in the database, not in the environment, so
+    /// without this the startup <c>SyncRepoAsync</c> would authenticate with nothing. It reads the
+    /// admin user exactly as <see cref="UserService.GetAdminUserAsync"/> does (first user by
+    /// <c>Id</c>, no tracking) and constructs its own context on the SAME SQLite options as the
+    /// <c>AddDbContextFactory</c> registration.
+    /// </para>
+    /// <para>
+    /// <b>The first-run limitation is DECLARED and accepted.</b> A fresh OAuth-only deployment has
+    /// no persisted token until the first login, so this returns <c>null</c> and the
+    /// <c>GH_TOKEN</c>/<c>GITHUB_TOKEN</c> environment fallback applies. This is a restart /
+    /// existing-installation bridge, not a first-run bootstrap.
+    /// </para>
+    /// </summary>
+    /// <param name="dbPath">Filesystem path of the SQLite database file.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The admin user's non-whitespace access token, or <c>null</c> when no user exists, the token
+    /// is whitespace, or the database could not be read. A CALLER cancellation is RETHROWN — only
+    /// non-cancellation failures degrade to <c>null</c>.
+    /// </returns>
+    internal static async Task<string?> PreBuildOAuthTokenLookup(string dbPath, CancellationToken ct)
+    {
+        try
+        {
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite($"Data Source={dbPath}")
+                .Options;
+
+            await using var db = new CopilotHiveDbContext(options);
+            var admin = await db.Users.AsNoTracking().OrderBy(u => u.Id).FirstOrDefaultAsync(ct);
+
+            return string.IsNullOrWhiteSpace(admin?.AccessToken) ? null : admin.AccessToken;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException && ct.IsCancellationRequested)
+        {
+            // A caller cancellation is never a "no token" answer — it must terminate the caller.
+            throw;
+        }
+        catch
+        {
+            // The database may be missing, locked or corrupt on a fresh/broken installation.
+            // A startup credential lookup must never abort startup: degrade to the env chain.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Re-points the registered <see cref="ConfigRepoManager"/>'s token resolver at the LIVE
+    /// <see cref="UserService"/> once the host is built, replacing the pre-Build direct-database
+    /// lookup so every later config-repo operation reads the current token through the service.
+    /// </summary>
+    /// <remarks>
+    /// Extracted as a named helper (mirroring <see cref="PreBuildOAuthTokenLookup"/>) so the
+    /// reattachment is verifiable without booting the host. The <see cref="ConfigRepoManager"/> is
+    /// registered ONLY when a config repo is configured, so its absence is the normal
+    /// no-config-repo case and is a silent no-op.
+    /// </remarks>
+    /// <param name="services">The built application's service provider.</param>
+    /// <param name="userService">The live user service supplying the active access token.</param>
+    /// <returns><c>true</c> when a <see cref="ConfigRepoManager"/> was present and reattached.</returns>
+    internal static bool AttachLiveTokenResolver(IServiceProvider services, UserService userService)
+    {
+        var configRepo = services.GetService<ConfigRepoManager>();
+        if (configRepo is null)
+            return false;
+
+        configRepo.TokenResolver = ct => userService.GetActiveAccessTokenAsync(ct);
+        return true;
+    }
+
     private static async Task<int> Main(string[] args)
     {
         // ── Server mode (only mode) ──────────────────────────────────────────────────
@@ -224,6 +299,10 @@ public sealed class Program
             if (!string.IsNullOrEmpty(configRepoUrl))
             {
                 var configRepo = new ConfigRepoManager(configRepoUrl, configRepoPath);
+                // The OAuth bridge for the FIRST sync: on an OAuth-only deployment the admin
+                // token lives in the database, so it is read directly (pre-Build, no DI yet).
+                // Reattached to the live UserService after Build.
+                configRepo.TokenResolver = ct => PreBuildOAuthTokenLookup(dbPath, ct);
                 await configRepo.SyncRepoAsync();
                 hiveConfigFile = await configRepo.LoadConfigAsync();
 
@@ -767,6 +846,12 @@ public sealed class Program
             var userService = app.Services.GetRequiredService<UserService>();
             SharpCoder.Providers.ChatClientFactory.SetTokenProvider(() =>
                 userService.GetActiveAccessTokenAsync(CancellationToken.None).GetAwaiter().GetResult());
+
+            // Re-point the config repo's OAuth bridge from the pre-Build direct-database lookup
+            // to the LIVE user service, so every later config-repo operation (sync, model-catalog
+            // push, AGENTS.md commit) reads the current token through the service. A no-op when
+            // no config repo is configured.
+            AttachLiveTokenResolver(app.Services, userService);
 
             // Brain registration is config-driven (Slice 2): enabled exactly when the parsed
             // hive-config declares a non-blank orchestrator.model.
