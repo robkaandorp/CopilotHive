@@ -201,7 +201,7 @@ public sealed class SharpCoderRunner : IAgentRunner
                 # Coder
 
                 You are a software developer. **Implement changes by editing files** — not describing them.
-                Every task requires you to edit files, build, test, and commit.
+                Every task requires you to edit files, build, test, and commit. **Run a TARGETED subset of tests for your change** (the test skill's targeted-subset section — the namespaces/classes you touched), **NOT the full suite** — the tester phase runs the authoritative full suite; your targeted run is a pre-commit self-check. Do NOT attach a coverage collector; coverage is opt-in and not needed for your report.
 
                 A text-only response without file edits is a **failure**.
 

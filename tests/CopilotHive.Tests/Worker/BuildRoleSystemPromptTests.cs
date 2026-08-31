@@ -254,6 +254,72 @@ public sealed class BuildRoleSystemPromptTests
         Assert.DoesNotContain("# Learned Heuristics", prompt);
     }
 
+    // ── Coder targeted-subset / no-coverage contract ─────────────────────────
+
+    /// <summary>
+    /// The Coder prompt must instruct the coder to run a TARGETED subset of tests for
+    /// the change instead of the full suite. Removal-proof: fails if the targeted-subset
+    /// instruction sentence is removed from the prompt.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Coder_ContainsTargetedSubsetInstruction()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, null);
+
+        Assert.Contains("Run a TARGETED subset of tests for your change", prompt);
+        Assert.Contains("the test skill's targeted-subset section", prompt);
+    }
+
+    /// <summary>
+    /// The Coder prompt must forbid attaching a coverage collector — coverage is opt-in.
+    /// Removal-proof: fails if the no-coverage instruction sentence is removed.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Coder_ContainsNoCoverageCollectorInstruction()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, null);
+
+        Assert.Contains("Do NOT attach a coverage collector", prompt);
+        Assert.Contains("coverage is opt-in and not needed for your report", prompt);
+    }
+
+    /// <summary>
+    /// The Coder prompt must NOT contain an affirmative, coder-directed full-suite
+    /// instruction. The new targeted-subset sentence legitimately mentions the full suite
+    /// twice in negation ("NOT the full suite", "the tester phase runs the authoritative
+    /// full suite"), so the absence assertion only targets affirmatively directed
+    /// full-suite phrasings.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Coder_DoesNotInstructFullSuiteRun()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, null);
+
+        Assert.DoesNotContain("Run the full suite", prompt);
+        Assert.DoesNotContain("run the full suite", prompt);
+        Assert.DoesNotContain("run all tests", prompt);
+        Assert.DoesNotContain("run all tests with coverage", prompt);
+        Assert.DoesNotContain("run the FULL suite", prompt);
+    }
+
+    /// <summary>
+    /// The Tester prompt must NOT receive the Coder-only targeted-subset or no-coverage
+    /// instructions, and must retain its existing authoritative full-suite testing role.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Tester_DoesNotContainCoderTargetedSubsetInstructions()
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Tester, null);
+
+        Assert.DoesNotContain("Run a TARGETED subset of tests for your change", prompt);
+        Assert.DoesNotContain("Do NOT attach a coverage collector", prompt);
+        Assert.DoesNotContain("targeted run is a pre-commit self-check", prompt);
+
+        // The Tester remains the authoritative full-suite phase.
+        Assert.Contains("comprehensive testing of the codebase", prompt);
+        Assert.Contains("verify that the system actually works as a whole", prompt);
+    }
+
     // ── Unknown role guard ────────────────────────────────────────────────────
 
     /// <summary>
