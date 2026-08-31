@@ -71,10 +71,17 @@ public sealed class TaskExecutor(
     private readonly ConfigRepoGitOperations? _configRepoSeam;
 
     /// <summary>
-    /// Testing constructor: identical to the public constructor plus an INJECTED config-repo
-    /// git seam that takes over every config-repo git command. The seam is owned by the
-    /// CALLER — this type never constructs or disposes it.
+    /// The CALLER-OWNED integration constructor: identical to the public constructor plus an
+    /// INJECTED config-repo git seam that takes over every config-repo git command.
     /// </summary>
+    /// <remarks>
+    /// It is used by BOTH the <c>WorkerService</c> PRODUCTION assignment path — which builds a
+    /// per-assignment seam (with its askpass helper), prepares the config repo through it and
+    /// then constructs this executor around it — AND by tests that inject a seam directly. In
+    /// every case the seam's lifetime belongs to the CALLER: this type never constructs it and
+    /// never disposes it, which is exactly why <see cref="TaskExecutor"/> is not
+    /// <see cref="IDisposable"/>.
+    /// </remarks>
     internal TaskExecutor(
         IAgentRunner agentRunner,
         IToolCallBridge? toolBridge,

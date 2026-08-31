@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using Grpc.Core;
 using Grpc.Net.Client;
 using CopilotHive.Services;
@@ -37,6 +38,57 @@ public sealed class WorkerService(
 
     // The gRPC client, set after successful registration — used by session RPCs
     private HiveOrchestrator.HiveOrchestratorClient? _client;
+
+    /// <summary>
+    /// The provisioner created in <see cref="RunAsync"/> after an ACCEPTED registration. It is
+    /// the SAME instance handed to the agent runner, so the config-repo seam resolves its URL
+    /// and credential from exactly the state the runner's own provisioning fetch produced.
+    /// Remains <c>null</c> until registration succeeds (and for direct message-loop tests that
+    /// never run <see cref="RunAsync"/>), which selects the LEGACY, seam-free path.
+    /// </summary>
+    private WorkerConfigProvisioner? _provisioner;
+
+    /// <summary>
+    /// TEST SEAM — overrides the <see cref="RunAsync"/>-created provisioner. When BOTH this and
+    /// <see cref="_provisioner"/> are <c>null</c> the per-assignment config-repo preparation is
+    /// SKIPPED entirely (no probe, no clone, no askpass helper, no seam) and the executor is
+    /// built with the legacy public constructor.
+    /// </summary>
+    internal WorkerConfigProvisioner? TestProvisioner { get; set; }
+
+    /// <summary>TEST SEAM — creates the askpass helper directory. <c>null</c> selects the real implementation.</summary>
+    internal Action<string>? AskpassDirCreate { get; set; }
+
+    /// <summary>TEST SEAM — writes the askpass helper script. <c>null</c> selects the real implementation.</summary>
+    internal Action<string>? AskpassScriptWrite { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — applies the owner-only mode to ONE path per call. <c>null</c> selects the real
+    /// implementation (<see cref="File.SetUnixFileMode(string, UnixFileMode)"/>).
+    /// </summary>
+    internal Action<string>? AskpassChmod { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — decides whether the chmod step runs at all. <c>null</c> selects the real
+    /// platform predicate (<c>!OperatingSystem.IsWindows()</c>).
+    /// </summary>
+    internal Func<bool>? AskpassChmodPlatform { get; set; }
+
+    /// <summary>The askpass helper script's file name inside its own private directory.</summary>
+    private const string AskpassScriptName = "askpass.sh";
+
+    /// <summary>
+    /// The EXACT askpass helper script. It implements git's <c>$1</c>-prompt protocol and is
+    /// TOKEN-FREE: a username prompt (matching <c>*sername*</c>) answers with the fixed
+    /// <c>x-access-token</c> principal, every other prompt reads the credential from the
+    /// environment variable the seam injects for the final, credential-carrying launch.
+    /// </summary>
+    private const string AskpassScriptContent =
+        "#!/bin/sh\n"
+        + "case \"$1\" in\n"
+        + "  *sername*) printf '%s' \"x-access-token\" ;;\n"
+        + "  *) printf '%s' \"$GITHUB_CONFIG_REPO_TOKEN\" ;;\n"
+        + "esac\n";
 
     /// <summary>
     /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
@@ -90,6 +142,10 @@ public sealed class WorkerService(
             _assignedId,
             (request, token) => client.GetWorkerConfigAsync(request, cancellationToken: token).ResponseAsync);
         _agentRunner.SetConfigProvisioner(provisioner.EnsureProvisionedAsync);
+
+        // The SAME instance backs the per-assignment config-repo seam, so the seam's URL and
+        // credential resolution always reflects the runner's provisioning state.
+        _provisioner = provisioner;
 
         // 2. Start heartbeat background task
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -211,16 +267,41 @@ public sealed class WorkerService(
                         {
                             try
                             {
-                                var executor = new TaskExecutor(_agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
-                                var result = await executor.ExecuteAsync(domainTask, bodyCts.Token);
-
-                                await stream.RequestStream.WriteAsync(new WorkerMessage
+                                // STEP 1 — provisioner selection. A null provisioner (no
+                                // RunAsync registration, no test override) SKIPS the whole
+                                // config-repo preparation and keeps the LEGACY executor.
+                                var provisioner = TestProvisioner ?? _provisioner;
+                                if (provisioner is null)
                                 {
-                                    WorkerId = assignedId,
-                                    Complete = GrpcMapper.ToGrpc(result),
-                                }, ct);
+                                    var legacyExecutor = new TaskExecutor(
+                                        _agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
+                                    await ExecuteAndReportAsync(
+                                        legacyExecutor, domainTask, stream, assignedId, bodyCts.Token, ct);
+                                }
+                                else
+                                {
+                                    // STEP 2 — the ONE eager provisioning call. Everything below
+                                    // depends on the provisioner's config-repo accessors, which
+                                    // throw until the environment snapshot has been taken.
+                                    await provisioner.EnsureProvisionedAsync(taskModel, bodyCts.Token);
 
-                                _log.Info($"Task {domainTask.TaskId} completed ({result.Status})");
+                                    // STEPS 3-4 — the askpass helper and the seam that owns it.
+                                    // The seam is a per-assignment LOCAL: WorkerService owns it,
+                                    // and this `using` encloses the executor's whole lifetime.
+                                    using var seam = CreateConfigRepoSeam(provisioner);
+
+                                    // STEP 5 — probe / clone / agents directory, BEFORE the
+                                    // executor exists, let alone runs.
+                                    await PrepareConfigRepoAsync(seam, bodyCts.Token);
+
+                                    // STEP 6 — the executor is constructed LAST and receives the
+                                    // caller-owned seam; it never disposes it.
+                                    var executor = new TaskExecutor(
+                                        _agentRunner, this, gitOperations: null, sessionClient: this,
+                                        configRepoDir: _configRepoDir, configRepoSeam: seam);
+                                    await ExecuteAndReportAsync(
+                                        executor, domainTask, stream, assignedId, bodyCts.Token, ct);
+                                }
                             }
                             catch (OperationCanceledException) { }
                             catch (Exception ex)
@@ -368,6 +449,214 @@ public sealed class WorkerService(
 
         assignment.Cts.Dispose();
     }
+
+    #region Assignment execution and config-repo preparation
+
+    /// <summary>
+    /// Runs one assignment through an executor and reports its result upstream. Shared by BOTH
+    /// dispatch forms (the legacy, seam-free executor and the seam-carrying one) so the two can
+    /// never drift apart in what they write or log.
+    /// </summary>
+    /// <param name="executor">The executor to run — already fully constructed.</param>
+    /// <param name="task">The domain task.</param>
+    /// <param name="stream">The bidirectional work stream.</param>
+    /// <param name="assignedId">This worker's orchestrator-assigned identifier.</param>
+    /// <param name="bodyToken">The ASSIGNMENT's token, which cancels the execution itself.</param>
+    /// <param name="streamToken">The STREAM's token, used for the completion write.</param>
+    private async Task ExecuteAndReportAsync(
+        TaskExecutor executor,
+        WorkTask task,
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        string assignedId,
+        CancellationToken bodyToken,
+        CancellationToken streamToken)
+    {
+        var result = await executor.ExecuteAsync(task, bodyToken);
+
+        await stream.RequestStream.WriteAsync(new WorkerMessage
+        {
+            WorkerId = assignedId,
+            Complete = GrpcMapper.ToGrpc(result),
+        }, streamToken);
+
+        _log.Info($"Task {task.TaskId} completed ({result.Status})");
+    }
+
+    /// <summary>
+    /// Creates the per-assignment askpass helper and the config-repo git seam that OWNS it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE OWNERSHIP-TRANSFER GUARD. The helper directory is created, the script written and
+    /// (on a non-Windows platform) chmodded to owner-only inside a single <c>try</c> that also
+    /// covers the seam construction. Ownership transfers to the seam — via the idempotent
+    /// <c>onDispose</c> delete — ONLY when every one of those steps succeeded. Any exception
+    /// leaves <c>helperOwned</c> false and the <c>finally</c> best-effort deletes the captured
+    /// directory, so a partially-built helper is never left behind on disk.
+    /// </para>
+    /// <para>
+    /// Construction is SYNCHRONOUS and takes NO cancellation token: there is nothing to await
+    /// and no interleaving point at which a token could be observed. The <c>finally</c> covers
+    /// exceptions only; a cancellation lands AFTER construction, in the preparation or the
+    /// execution phase, where the seam is already owned and disposed by the caller's
+    /// <c>using</c>.
+    /// </para>
+    /// </remarks>
+    private ConfigRepoGitOperations CreateConfigRepoSeam(WorkerConfigProvisioner provisioner)
+    {
+        var helperDir = Path.Combine(
+            Path.GetTempPath(), $"copilothive-askpass-{Guid.NewGuid():N}");
+        var scriptPath = Path.Combine(helperDir, AskpassScriptName);
+
+        var helperOwned = false;
+        try
+        {
+            CreateAskpassDir(helperDir);
+            WriteAskpassScript(scriptPath);
+
+            // The SCRIPT first, then the DIR — exactly two calls, or none at all.
+            if (AskpassChmodPlatform?.Invoke() ?? !OperatingSystem.IsWindows())
+            {
+                ApplyOwnerOnlyMode(scriptPath);
+                ApplyOwnerOnlyMode(helperDir);
+            }
+
+            var seam = new ConfigRepoGitOperations(
+                _configRepoDir,
+                provisioner,
+                _log,
+                () => scriptPath,
+                BuildHelperDirCleanup(helperDir));
+
+            helperOwned = true;
+            return seam;
+        }
+        finally
+        {
+            // ONLY when ownership never transferred — otherwise the seam's onDispose owns it.
+            if (!helperOwned)
+                TryDeleteHelperDir(helperDir);
+        }
+    }
+
+    /// <summary>
+    /// The seam's <c>onDispose</c>: an IDEMPOTENT, best-effort delete of the helper directory.
+    /// The interlocked flag means a repeated disposal (or a disposal racing one) deletes once.
+    /// </summary>
+    private static Action BuildHelperDirCleanup(string helperDir)
+    {
+        var deleted = 0;
+        return () =>
+        {
+            if (Interlocked.Exchange(ref deleted, 1) == 0)
+                TryDeleteHelperDir(helperDir);
+        };
+    }
+
+    /// <summary>Best-effort recursive delete of the askpass helper directory; never throws.</summary>
+    private static void TryDeleteHelperDir(string helperDir)
+    {
+        try
+        {
+            if (Directory.Exists(helperDir))
+                Directory.Delete(helperDir, recursive: true);
+        }
+        catch
+        {
+            // Swallowed — a leaked temp directory must never fail an assignment.
+        }
+    }
+
+    private void CreateAskpassDir(string helperDir)
+    {
+        if (AskpassDirCreate is not null)
+            AskpassDirCreate(helperDir);
+        else
+            Directory.CreateDirectory(helperDir);
+    }
+
+    /// <summary>
+    /// Writes the fixed helper script as UTF-8 WITHOUT a BOM and with its trailing newline —
+    /// the bytes matter, since <c>/bin/sh</c> must see <c>#!</c> as the first two bytes.
+    /// </summary>
+    private void WriteAskpassScript(string scriptPath)
+    {
+        if (AskpassScriptWrite is not null)
+            AskpassScriptWrite(scriptPath);
+        else
+            File.WriteAllText(scriptPath, AskpassScriptContent, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    /// <summary>
+    /// Applies mode 0700 (owner read/write/execute) to ONE path — the SELECTED chmod action:
+    /// the injected <see cref="AskpassChmod"/> when non-null, otherwise the REAL
+    /// <see cref="File.SetUnixFileMode(string, UnixFileMode)"/>.
+    /// </summary>
+    /// <remarks>
+    /// There is NO platform special-casing here. <see cref="AskpassChmodPlatform"/> (defaulting
+    /// to <c>!OperatingSystem.IsWindows()</c>) is the SINGLE authority: it decides whether the
+    /// chmod step runs at all. On Windows the real path therefore never reaches this method,
+    /// which is precisely why the unsupported-platform call is safe — a no-op branch inside the
+    /// action would instead break the null-to-real selection contract by silently doing nothing.
+    /// </remarks>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage(
+        "Interoperability",
+        "CA1416:Validate platform compatibility",
+        Justification = "Guarded by AskpassChmodPlatform, which defaults to !OperatingSystem.IsWindows(); "
+            + "the analyzer cannot see through the delegate. The predicate is the single authority.")]
+    private void ApplyOwnerOnlyMode(string path)
+    {
+        if (AskpassChmod is not null)
+        {
+            AskpassChmod(path);
+            return;
+        }
+
+        File.SetUnixFileMode(
+            path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
+    /// <summary>
+    /// Prepares the config repo for one assignment: the HEALTH PROBE, the clone when no repo is
+    /// present, and the UNCONDITIONAL <c>agents/</c> directory creation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The <c>agents/</c> creation is idempotent and runs in EVERY non-cancelled case — after a
+    /// healthy probe, after a successful clone AND after a failed one — so the improver's
+    /// working directory always exists once this returns normally. An existing corrupt or
+    /// non-git target is NOT repaired: the probe reports it, the clone is skipped (the target
+    /// exists), and the assignment proceeds with whatever the directory holds.
+    /// </para>
+    /// <para>
+    /// A non-cancellation failure PROPAGATES into the assignment body's generic failure handler;
+    /// a cancellation unwinds without the directory guarantee.
+    /// </para>
+    /// </remarks>
+    private async Task PrepareConfigRepoAsync(ConfigRepoGitOperations seam, CancellationToken ct)
+    {
+        var health = await seam.ProbeAndEnsureRepoHealthyAsync(_configRepoDir, ct);
+
+        if (!health.HasRepo)
+        {
+            var result = await seam.CloneAsync(_configRepoDir, ct);
+            if (result.Success)
+            {
+                _log.Info("Config repo cloned");
+            }
+            else
+            {
+                // The seam's error is already URL-redacted; the log rendering additionally
+                // strips control characters so git output can never forge a log line.
+                _log.Warn("Config repo clone failed: "
+                    + LogSanitizer.SanitizeText(GitUrlRedactor.Redact(result.SanitizedError.Trim())));
+            }
+        }
+
+        Directory.CreateDirectory(Path.Combine(_configRepoDir, "agents"));
+    }
+
+    #endregion
 
     #region IToolCallBridge
 
