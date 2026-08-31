@@ -3,7 +3,7 @@ using System.Xml.Linq;
 namespace CopilotHive.Tests.Orchestration;
 
 /// <summary>
-/// Verifies that the SharpCoder package reference is pinned to 0.18.0, which is required for the
+/// Verifies that the SharpCoder package reference is pinned to 0.18.1, which is required for the
 /// agent-level <c>CodingAgent.SubAgentChanged</c> event used by the sub-agent panel, for the
 /// <c>SubAgentModelInfo</c> overload carrying the informational <c>supportsVision</c> flag, and for
 /// the internal <c>ImageLoader.MaxTotalBytes</c> limit mirrored by
@@ -12,7 +12,7 @@ namespace CopilotHive.Tests.Orchestration;
 public sealed class SharpCoderPackageVersionTests
 {
     [Fact]
-    public void SharpCoder_PackageReference_IsVersion0_18_0()
+    public void SharpCoder_PackageReference_IsVersion0_18_1()
     {
         // Walk up from the test bin directory to the repository root.
         var repoRoot = Path.GetFullPath(
@@ -30,17 +30,18 @@ public sealed class SharpCoderPackageVersionTests
 
         Assert.NotNull(sharpCoder);
         var version = sharpCoder!.Attribute("Version")?.Value;
-        Assert.Equal("0.18.0", version);
+        Assert.Equal("0.18.1", version);
     }
 
     /// <summary>
-    /// <c>SharpCoder.Providers</c> must be pinned to 0.18.0, the first version exposing
-    /// <c>ChatClientFactory.IsTokenAvailable</c> — the single source of truth for GitHub Copilot
+    /// <c>SharpCoder.Providers</c> must be pinned to 0.18.1. <c>ChatClientFactory.IsTokenAvailable</c>
+    /// — the single source of truth for GitHub Copilot
     /// token availability used by <see cref="CopilotHive.Orchestration.LlmConnectionCoordinator"/>
-    /// to gate the Composer's startup connect.
+    /// to gate the Composer's startup connect — was first introduced in 0.18.0 and remains present in
+    /// the 0.18.1 pin.
     /// </summary>
     [Fact]
-    public void SharpCoderProviders_PackageReference_IsVersion0_18_0()
+    public void SharpCoderProviders_PackageReference_IsVersion0_18_1()
     {
         var repoRoot = Path.GetFullPath(
             Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
@@ -54,7 +55,7 @@ public sealed class SharpCoderPackageVersionTests
                 && e.Attribute("Include")?.Value == "SharpCoder.Providers");
 
         Assert.NotNull(providers);
-        Assert.Equal("0.18.0", providers!.Attribute("Version")?.Value);
+        Assert.Equal("0.18.1", providers!.Attribute("Version")?.Value);
     }
 
     /// <summary>
