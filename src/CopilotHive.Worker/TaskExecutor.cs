@@ -905,7 +905,9 @@ public sealed class TaskExecutor(
 
     /// <summary>
     /// Pulls the latest changes from the config repo so the improver works on fresh agents.md files.
-    /// The config repo is cloned at container startup by entrypoint.sh.
+    /// The config repository is prepared per task assignment — WorkerService performs the
+    /// per-assignment preparation (the probe plus the clone-if-absent) BEFORE this assignment's
+    /// TaskExecutor runs, and <see cref="PullConfigRepoAsync"/> operates on that prepared repository.
     /// </summary>
     private async Task PullConfigRepoAsync(CancellationToken ct)
     {

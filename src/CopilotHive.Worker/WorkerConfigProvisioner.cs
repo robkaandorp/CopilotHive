@@ -110,6 +110,27 @@ public sealed class WorkerConfigProvisioner
     private string? _provisionedConfigRepoUrl;
 
     /// <summary>
+    /// The most recently provisioned non-whitespace GitHub token from the response, tracked
+    /// in memory ONLY for the config-repo credential chain — it is the token the orchestrator
+    /// provisioned for THIS worker, independent of what the environment currently holds.
+    /// <para>
+    /// Lifecycle (the same stale-state contract as <see cref="_provisionedConfigRepoUrl"/>):
+    /// replaced or CLEARED on every successful provisioning response (a whitespace token is
+    /// absence, so a later response without a token clears it); cleared on an RPC
+    /// availability/server failure BEFORE the fallible env revert; NOT cleared on
+    /// caller-triggered cancellation (the rethrow happens before provisioned state is touched).
+    /// </para>
+    /// <para>
+    /// This field is ADDITIVE to the environment write: <see cref="ApplyTokenAlias"/> still
+    /// writes the provisioned token to <c>GH_TOKEN</c> under the operator-override and
+    /// alias-precedence rules because SharpCoder's <c>ChatClientFactory</c> reads
+    /// <c>GH_TOKEN</c> from the environment for LLM auth. Only the config-repo credential
+    /// chain (see <see cref="ResolveConfigRepoCredential"/>) consumes this field.
+    /// </para>
+    /// </summary>
+    private string? _provisionedGithubToken;
+
+    /// <summary>
     /// Creates a provisioner.
     /// </summary>
     /// <param name="workerId">The worker's identifier, sent with the request for orchestrator-side logging.</param>
@@ -167,11 +188,28 @@ public sealed class WorkerConfigProvisioner
     }
 
     /// <summary>
-    /// Resolves the token for config-repo operations in the existing precedence: operator
-    /// <c>GH_TOKEN</c>, then operator <c>GITHUB_TOKEN</c>, then the currently-provisioned token
-    /// in the environment (whitespace is absence). The provisioned token is written to
-    /// <c>GH_TOKEN</c> by <see cref="EnsureProvisionedAsync"/>; there is no separately stored
-    /// token field.
+    /// Resolves the token for config-repo operations in this precedence:
+    /// <list type="number">
+    ///   <item>the in-memory provisioned token (the token the orchestrator provisioned for
+    ///   this worker, tracked by <see cref="_provisionedGithubToken"/> — replaced or cleared
+    ///   on every successful response, cleared on an RPC availability/server failure, and
+    ///   NOT cleared on caller-triggered cancellation);</item>
+    ///   <item>the <c>GH_TOKEN</c> environment value (whether operator-set or
+    ///   provisioned-into-the-env);</item>
+    ///   <item>the <c>GITHUB_TOKEN</c> environment value.</item>
+    /// </list>
+    /// <para>
+    /// Whitespace is absence at EACH step, enforced per candidate via
+    /// <see cref="GitCredentialResolver.Resolve"/>. The environment is NOT an operator-vs-
+    /// provisioned distinction here — a live non-whitespace <c>GH_TOKEN</c> value applies
+    /// whenever no in-memory provisioned token exists.
+    /// </para>
+    /// <para>
+    /// <see cref="ConfigRepoUrlVar"/>'s sibling secret <c>GITHUB_CONFIG_REPO_TOKEN</c> is
+    /// NEVER read from the worker's environment: it exists only on the git CHILD PROCESS
+    /// environment (the askpass mechanism sets it just before each git invocation), so it is
+    /// not a candidate in this chain and is not part of the operator snapshot.
+    /// </para>
     /// </summary>
     /// <exception cref="InvalidOperationException">
     /// The environment snapshot has not been taken yet — call <see cref="EnsureProvisionedAsync"/>
@@ -181,25 +219,14 @@ public sealed class WorkerConfigProvisioner
     {
         EnsureSnapshotTaken();
 
-        // Operator values win outright; only when neither alias was operator-set does the
-        // currently-provisioned token (written to GH_TOKEN) apply. Whitespace-as-absent
-        // applies at EACH step: a live value that normalizes to null falls through to the
-        // next candidate.
-        if (IsOperatorProvided(GhTokenVar))
-        {
-            var ghToken = Normalize(_readEnv(GhTokenVar));
-            if (ghToken is not null)
-                return ghToken;
-        }
-
-        if (IsOperatorProvided(GitHubTokenVar))
-        {
-            var githubToken = Normalize(_readEnv(GitHubTokenVar));
-            if (githubToken is not null)
-                return githubToken;
-        }
-
-        return Normalize(_readEnv(GhTokenVar));
+        // In-memory provisioned token first (whitespace is absence, so a cleared field
+        // falls through to the environment chain), then the env aliases. Each candidate
+        // is passed RAW — GitCredentialResolver treats whitespace as absence per step
+        // and returns the selected candidate unchanged.
+        return GitCredentialResolver.Resolve(
+            _provisionedGithubToken,
+            _readEnv(GhTokenVar),
+            _readEnv(GitHubTokenVar));
     }
 
     /// <summary>
@@ -317,10 +344,12 @@ public sealed class WorkerConfigProvisioner
             // Rethrow before touching provisioned state so the caller unwinds normally.
             ct.ThrowIfCancellationRequested();
 
-            // The provisioned config repo URL is part of the provisioned state: a stale-but-known
-            // URL must NOT survive an RPC failure. Cleared BEFORE the fallible env revert so the
-            // URL is dropped even if an environment write throws.
+            // The provisioned config repo URL and the in-memory provisioned GitHub token are
+            // part of the provisioned state: a stale-but-known URL or token must NOT survive
+            // an RPC failure. Both are cleared BEFORE the fallible env revert so they are
+            // dropped even if an environment write throws.
             _provisionedConfigRepoUrl = null;
+            _provisionedGithubToken = null;
 
             // Drop every provisioned value BEFORE reporting the fallback, so the subsequent
             // credential check and any later client creation see only operator-provided state.
@@ -386,9 +415,16 @@ public sealed class WorkerConfigProvisioner
         ApplyVar(OllamaModelVar, Normalize(response.HasOllamaModel ? response.OllamaModel : null), applied, cleared);
         ApplyVar(GitHubModelVar, Normalize(response.HasGithubModel ? response.GithubModel : null), applied, cleared);
 
-        // The config repo URL is tracked in memory only — it is NEVER written to the
-        // environment (the env only ever carries the operator value). Whitespace is absence.
+        // The config repo URL and the in-memory provisioned GitHub token are tracked in
+        // memory only — they are NEVER written to the environment by these fields (the
+        // env only ever carries the operator value for CONFIG_REPO_URL; the token is still
+        // written to GH_TOKEN by ApplyTokenAlias below under the operator-override and
+        // alias-precedence rules, because SharpCoder's ChatClientFactory reads GH_TOKEN
+        // from the env for LLM auth). Whitespace is absence: a response with no/whitespace
+        // token CLEARS the in-memory field. Both fields are set UNCONDITIONALLY — not
+        // gated on operator overrides, matching the stale-state contract.
         _provisionedConfigRepoUrl = Normalize(response.HasConfigRepoUrl ? response.ConfigRepoUrl : null);
+        _provisionedGithubToken = Normalize(response.HasGithubToken ? response.GithubToken : null);
 
         // Names only — a provisioned VALUE is never written to a log.
         _log.Info($"Applied provisioning: set=[{Render(applied)}], cleared=[{Render(cleared)}]");
@@ -444,9 +480,12 @@ public sealed class WorkerConfigProvisioner
         && value is not null;
 
     /// <summary>
-    /// Applies the token under alias precedence: an operator value in EITHER alias wins outright,
-    /// and provisioning only ever writes <see cref="GhTokenVar"/> — never <see cref="GitHubTokenVar"/>,
-    /// so an operator who set only <c>GITHUB_TOKEN</c> never gets a competing <c>GH_TOKEN</c>.
+    /// Applies the token under alias precedence: an operator value in EITHER alias suppresses
+    /// the environment write entirely, and provisioning only ever writes <see cref="GhTokenVar"/>
+    /// — never <see cref="GitHubTokenVar"/>, so an operator who set only <c>GITHUB_TOKEN</c>
+    /// never gets a competing <c>GH_TOKEN</c>. The in-memory provisioned token field
+    /// (<see cref="_provisionedGithubToken"/>, consumed only by the config-repo credential
+    /// chain) is updated independently in <see cref="Apply"/> and is NOT affected by this gate.
     /// </summary>
     private void ApplyTokenAlias(string? provisioned, List<string> applied, List<string> cleared)
     {

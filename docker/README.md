@@ -140,6 +140,18 @@ Without explicit `--platform`, Docker defaults to the host architecture.
 | `BRAIN_MODEL`          | —         | LLM model for the orchestrator Brain              |
 | `BRAIN_CONTEXT_WINDOW` | `100000`  | Max context window in tokens for the Brain        |
 
+## Worker Config Repo Access
+
+The entrypoint script no longer clones the config repository. As part of the per-assignment preparation, WorkerService probes the config repo and clones it if absent per task assignment, using the owned-container staging directory and an atomic move, immediately before that assignment's TaskExecutor runs.
+
+`GITHUB_CONFIG_REPO_TOKEN` is NOT an operator setting — CopilotHive sets it only on the git child process environment (child-process-only). The token-free askpass helper reads the variable at invocation and answers git's credential prompts: when git prompts with `$1 = "Username"`, it answers `x-access-token`; when `$1 = "Password"`, it outputs the environment variable's value. CopilotHive itself never writes the token into a git URL or to disk.
+
+The config repository and its local hooks are TRUSTED. Credential-scoped git child processes may execute repository hooks; this is a deliberate trust boundary decision because the config repository is operator-controlled.
+
+The worker's git seam verifies the TEXTUAL origin URL it compares, and the operator's own git configuration—including `url.<base>.insteadOf` rewriting rules—is trusted. A rewritten URL that changes the effective remote will not be detected by the textual comparison.
+
+Worker git child processes scrub these five variables from their environment: `GH_TOKEN`, `GITHUB_TOKEN`, `GIT_ASKPASS`, `GITHUB_CONFIG_REPO_TOKEN`, and `GIT_TERMINAL_PROMPT`. Consequently, a TASK repository that relies on the worker's own `GH_TOKEN` or `GITHUB_TOKEN` environment variables loses that authentication; task-repo credentials now come via the per-task provisioned URL.
+
 ## Volumes
 
 | Volume              | Mount Point    | Description                     |

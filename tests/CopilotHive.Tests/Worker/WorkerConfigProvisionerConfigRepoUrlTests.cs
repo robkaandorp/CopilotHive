@@ -120,9 +120,57 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
         public string? this[string name] => Read(name);
     }
 
-    // ── Factory ────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// An in-memory environment that COUNTS every read per variable name and can be configured
+    /// to THROW when a forbidden variable is read. Used to prove the never-read contract for
+    /// <c>GITHUB_CONFIG_REPO_TOKEN</c>: the production code must never call
+    /// <c>Read("GITHUB_CONFIG_REPO_TOKEN")</c> at all — not during the snapshot, not in
+    /// <c>Apply</c>, and not in <c>ResolveConfigRepoCredential</c>. A test that only asserts the
+    /// RESULT is unaffected would still pass if the variable were read and then discarded; this
+    /// seam makes the READ itself observable.
+    /// </summary>
+    private sealed class ReadCountingEnv
+    {
+        private readonly Dictionary<string, string?> _values = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, int> _readCounts = new(StringComparer.Ordinal);
+        private readonly string? _forbiddenVar;
 
+        internal ReadCountingEnv(string? forbiddenVar, params (string Key, string? Value)[] initial)
+        {
+            _forbiddenVar = forbiddenVar;
+            foreach (var (k, v) in initial)
+                _values[k] = v;
+        }
+
+        /// <summary>The number of times the named variable was read through this seam.</summary>
+        internal int ReadCount(string name) => _readCounts.TryGetValue(name, out var c) ? c : 0;
+
+        public string? Read(string name)
+        {
+            _readCounts[name] = ReadCount(name) + 1;
+
+            if (_forbiddenVar is not null && string.Equals(name, _forbiddenVar, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Forbidden environment read of '{name}' — this variable exists only on the git child process environment.");
+
+            return _values.TryGetValue(name, out var v) ? v : null;
+        }
+
+        public void Write(string name, string? value) => _values[name] = value;
+
+        /// <summary>Gets the current value WITHOUT counting the read.</summary>
+        public string? Peek(string name) => _values.TryGetValue(name, out var v) ? v : null;
+    }
+
+    // ── Factory ────────────────────────────────────────────────────────────────
     private static WorkerConfigProvisioner Create(InMemoryEnv env, FetchController fetch) =>
+        new("worker-cfgrepo", fetch.Fetch, env.Read, env.Write);
+
+    /// <summary>
+    /// Creates a provisioner backed by a <see cref="ReadCountingEnv"/> so every environment READ
+    /// the production code performs is observable.
+    /// </summary>
+    private static WorkerConfigProvisioner CreateReadCounting(ReadCountingEnv env, FetchController fetch) =>
         new("worker-cfgrepo", fetch.Fetch, env.Read, env.Write);
 
     /// <summary>
@@ -427,83 +475,126 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
     }
 
     // ===========================================================================
-    // ResolveConfigRepoCredential — precedence, whitespace, revert, guard
+    // ResolveConfigRepoCredential — chain: in-memory provisioned token → GH_TOKEN
+    // env → GITHUB_TOKEN env (whitespace is absence at EACH step), revert, guard
     // ===========================================================================
 
+    /// <summary>
+    /// The in-memory provisioned token is the FIRST candidate: it wins over both environment
+    /// aliases even when both are set to different values. Neither alias is written through
+    /// the env when the operator set one — the in-memory value resolves regardless.
+    /// </summary>
     [Fact]
-    public async Task ResolveConfigRepoCredential_OperatorGhToken_Wins()
+    public async Task ResolveConfigRepoCredential_InMemoryProvisionedToken_WinsOverBothEnvAliases()
     {
         var env = new InMemoryEnv(
-            (WorkerConfigProvisioner.GhTokenVar, "operator-gh-token"),
-            (WorkerConfigProvisioner.GitHubTokenVar, "operator-github-token"));
+            (WorkerConfigProvisioner.GhTokenVar, "env-gh-token"),
+            (WorkerConfigProvisioner.GitHubTokenVar, "env-github-token"));
         var fetch = new FetchController();
-        // Provisioning writes a token, but operator GH_TOKEN wins.
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
+        // A response token is applied to the in-memory field UNCONDITIONALLY — even though
+        // the operator alias group is satisfied, so NOTHING is written to the env.
+        fetch.EnqueueResponse(Resp(githubToken: "in-memory-token", setToken: true));
         var prov = Create(env, fetch);
 
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
 
-        Assert.Equal("operator-gh-token", prov.ResolveConfigRepoCredential());
-    }
-
-    [Fact]
-    public async Task ResolveConfigRepoCredential_OperatorGithubToken_WinsOverProvisionedWhenNoGhToken()
-    {
-        var env = new InMemoryEnv(
-            (WorkerConfigProvisioner.GitHubTokenVar, "operator-github-token"));
-        var fetch = new FetchController();
-        // Provisioning would write GH_TOKEN, but the alias group is satisfied by operator GITHUB_TOKEN,
-        // so no GH_TOKEN is written. The resolver must then read the operator GITHUB_TOKEN.
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
-        var prov = Create(env, fetch);
-
-        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-
-        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]); // alias precedence: not provisioned
-        Assert.Equal("operator-github-token", prov.ResolveConfigRepoCredential());
-    }
-
-    [Fact]
-    public async Task ResolveConfigRepoCredential_NoOperatorToken_ProvisionedTokenApplies()
-    {
-        var env = new InMemoryEnv();
-        var fetch = new FetchController();
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
-        var prov = Create(env, fetch);
-
-        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-
-        // No operator token; the provisioned token (written to GH_TOKEN) is the resolved credential.
-        Assert.Equal("ghp_provisioned", env[WorkerConfigProvisioner.GhTokenVar]);
-        Assert.Equal("ghp_provisioned", prov.ResolveConfigRepoCredential());
-    }
-
-    [Theory]
-    [InlineData("")]
-    [InlineData("   ")]
-    [InlineData("\t\n")]
-    public async Task ResolveConfigRepoCredential_WhitespaceOperatorTokens_TreatedAsAbsent(string whitespace)
-    {
-        var env = new InMemoryEnv(
-            (WorkerConfigProvisioner.GhTokenVar, whitespace),
-            (WorkerConfigProvisioner.GitHubTokenVar, whitespace));
-        var fetch = new FetchController();
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
-        var prov = Create(env, fetch);
-
-        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-
-        // Whitespace operator values = absent; the provisioned token applies.
-        Assert.Equal("ghp_provisioned", prov.ResolveConfigRepoCredential());
+        // The env is untouched…
+        Assert.Equal("env-gh-token", env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("env-github-token", env[WorkerConfigProvisioner.GitHubTokenVar]);
+        // …but the in-memory field still wins the chain.
+        Assert.Equal("in-memory-token", prov.ResolveConfigRepoCredential());
     }
 
     /// <summary>
-    /// Bug-2 regression (iteration 2): <c>ResolveConfigRepoCredential</c> must apply
-    /// whitespace-as-absent at EACH precedence step. The operator set <c>GH_TOKEN</c> to a real
-    /// value (so <c>IsOperatorProvided</c> is true), but the LIVE env value is whitespace. The
-    /// iteration-1 code returned the normalized whitespace (null) immediately and stopped; the
-    /// fix falls through to <c>GITHUB_TOKEN</c>. Asserting the EXACT <c>GITHUB_TOKEN</c> value
-    /// makes this removal-proof: reverting the fix returns null instead.
+    /// With an EMPTY in-memory provisioned token (no response token), the chain falls through
+    /// to the environment: <c>GH_TOKEN</c> resolves before <c>GITHUB_TOKEN</c>.
+    /// </summary>
+    [Fact]
+    public async Task ResolveConfigRepoCredential_NoInMemoryToken_GhTokenResolvesBeforeGithubToken()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GhTokenVar, "gh-token-value"),
+            (WorkerConfigProvisioner.GitHubTokenVar, "github-token-value"));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // No operator override: GH_TOKEN itself is now provisioned (alias precedence writes
+        // the response token to GH_TOKEN). The chain reads the live env GH_TOKEN first.
+        Assert.Equal("gh-token-value", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// With NO in-memory provisioned token (an empty response carries no token field, so the
+    /// in-memory field stays null) and NO <c>GH_TOKEN</c> in the environment, the chain must
+    /// reach its THIRD candidate and resolve the env <c>GITHUB_TOKEN</c> value exactly.
+    /// </summary>
+    [Fact]
+    public async Task ResolveConfigRepoCredential_NoInMemoryTokenNoGhToken_GithubTokenResolves()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, "github-token-value"));
+        var fetch = new FetchController();
+        // An EMPTY response: no github_token field at all, so the in-memory field stays null
+        // and cannot masquerade as the GITHUB_TOKEN fallback.
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
+        var prov = Create(env, fetch);
+
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // Nothing was provisioned into GH_TOKEN, so the first two candidates are absent…
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        // …and the third candidate — the env GITHUB_TOKEN — is the resolved credential.
+        Assert.Equal("github-token-value", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// The never-read contract for <c>GITHUB_CONFIG_REPO_TOKEN</c>, proven at the READ level
+    /// rather than at the result level: the environment seam THROWS (and counts reads) if the
+    /// variable is ever read. The variable exists only on the git CHILD PROCESS environment
+    /// (the askpass mechanism sets it just before each git invocation), so no worker-side read
+    /// path — the snapshot, <c>Apply</c>, or <c>ResolveConfigRepoCredential</c> — may touch it.
+    /// <para>
+    /// A result-level assertion would still pass if the production code read the variable and
+    /// discarded it; this test fails outright (the throw propagates) the moment a read happens,
+    /// and additionally asserts the read count is exactly zero.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ResolveConfigRepoCredential_ConfigRepoTokenInEnv_IsNeverRead()
+    {
+        const string ForbiddenVar = "GITHUB_CONFIG_REPO_TOKEN";
+        var env = new ReadCountingEnv(
+            forbiddenVar: ForbiddenVar,
+            initial: (ForbiddenVar, "child-process-only-token"));
+        var fetch = new FetchController();
+        // A full response so Apply() exercises every provisioning write path too.
+        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
+        var prov = CreateReadCounting(env, fetch);
+
+        // The snapshot + Apply must not read the forbidden variable (the seam would throw).
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // The resolution chain must not read it either.
+        Assert.Equal("ghp_provisioned", prov.ResolveConfigRepoCredential());
+
+        // A second cycle, this time an empty response, covers the clear path as well.
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Null(prov.ResolveConfigRepoCredential());
+
+        // The decisive assertion: the variable was NEVER read, not merely ignored.
+        Assert.Equal(0, env.ReadCount(ForbiddenVar));
+        // Sanity: the seam DOES observe the chain's real reads, so a zero count above is
+        // meaningful rather than a broken counter.
+        Assert.True(env.ReadCount(WorkerConfigProvisioner.GhTokenVar) > 0);
+    }
+
+    /// <summary>
+    /// Whitespace is absence at EACH step of the chain: a live env <c>GH_TOKEN</c> that is
+    /// whitespace falls through to <c>GITHUB_TOKEN</c>. Asserting the EXACT value makes this
+    /// removal-proof.
     /// </summary>
     [Theory]
     [InlineData("")]
@@ -511,78 +602,80 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
     [InlineData("\t\n")]
     public async Task ResolveConfigRepoCredential_WhitespaceLiveGhToken_FallsThroughToGithubToken(string whitespace)
     {
-        // Operator set BOTH aliases to real values — so both are "operator-provided" per the
-        // snapshot. The snapshot is taken before the first fetch.
         var env = new InMemoryEnv(
-            (WorkerConfigProvisioner.GhTokenVar, "operator-gh-token"),
-            (WorkerConfigProvisioner.GitHubTokenVar, "operator-github-token"));
+            (WorkerConfigProvisioner.GhTokenVar, "gh-token-value"),
+            (WorkerConfigProvisioner.GitHubTokenVar, "github-token-value"));
         var fetch = new FetchController();
         var prov = Create(env, fetch);
 
-        // Provisioning supplies a token but does NOT write GH_TOKEN (operator alias group is
-        // satisfied), so the operator values are untouched.
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-        Assert.Equal("operator-gh-token", prov.ResolveConfigRepoCredential());
+        Assert.Equal("gh-token-value", prov.ResolveConfigRepoCredential());
 
-        // Mutate the LIVE GH_TOKEN to whitespace AFTER the snapshot was taken. This simulates an
-        // external change (e.g. another process cleared it). IsOperatorProvided still returns
-        // true (the snapshot captured the real value), but the live value is now whitespace.
+        // Mutate the LIVE GH_TOKEN to whitespace AFTER provisioning (simulating an external
+        // change). The in-memory token is still empty, so the chain must fall through the
+        // whitespace GH_TOKEN to the valid GITHUB_TOKEN.
         env.Write(WorkerConfigProvisioner.GhTokenVar, whitespace);
 
-        // The resolver must fall THROUGH the whitespace GH_TOKEN to the valid GITHUB_TOKEN.
-        Assert.Equal("operator-github-token", prov.ResolveConfigRepoCredential());
+        Assert.Equal("github-token-value", prov.ResolveConfigRepoCredential());
     }
 
     /// <summary>
-    /// Bug-2 regression (iteration 2): <c>ResolveConfigRepoCredential</c> must apply
-    /// whitespace-as-absent at EACH precedence step. The operator set ONLY <c>GITHUB_TOKEN</c>
-    /// (no operator <c>GH_TOKEN</c>), so the operator-GH_TOKEN branch is not entered at all and
-    /// the operator-GITHUB_TOKEN branch IS entered; the LIVE <c>GITHUB_TOKEN</c> is whitespace,
-    /// so the resolver must fall through to the provisioned token (written to <c>GH_TOKEN</c>).
-    /// Asserting the EXACT provisioned token value makes this removal-proof: if the per-step
-    /// GITHUB_TOKEN normalization were removed (whitespace treated as present), the resolver
-    /// would return the whitespace from the GITHUB_TOKEN branch instead of the provisioned token.
+    /// The whitespace-is-absence rule at the LAST chain step, genuinely reached: the in-memory
+    /// token is absent (empty response) and <c>GH_TOKEN</c> is absent, so <c>GITHUB_TOKEN</c>
+    /// is the only candidate examined. A whitespace value there must resolve to EXACTLY null —
+    /// if the per-step whitespace handling were removed, the whitespace itself would be
+    /// returned and this assertion fails.
     /// </summary>
     [Theory]
     [InlineData("")]
     [InlineData("   ")]
     [InlineData("\t\n")]
-    public async Task ResolveConfigRepoCredential_WhitespaceLiveGithubToken_FallsThroughToProvisionedToken(string whitespace)
+    public async Task ResolveConfigRepoCredential_WhitespaceGithubTokenIsLastCandidate_ResolvesNull(string whitespace)
     {
-        // Operator set ONLY GITHUB_TOKEN to a real value — so the operator-GH_TOKEN branch is
-        // not entered at all, and the operator-GITHUB_TOKEN branch IS entered. The snapshot is
-        // taken before the first fetch.
-        var env = new InMemoryEnv(
-            (WorkerConfigProvisioner.GitHubTokenVar, "operator-github-token"));
+        var env = new InMemoryEnv();
         var fetch = new FetchController();
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
         var prov = Create(env, fetch);
 
-        // Provisioning does NOT write GH_TOKEN (alias group satisfied by operator GITHUB_TOKEN).
-        fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]); // alias precedence: not provisioned
-        Assert.Equal("operator-github-token", prov.ResolveConfigRepoCredential());
 
-        // Mutate the LIVE GITHUB_TOKEN to whitespace AFTER the snapshot was taken (simulating an
-        // external change), and place the provisioned token in live GH_TOKEN — the final
-        // fallback step reads it.
+        // Set the LAST candidate to whitespace with the two earlier candidates absent, so the
+        // GITHUB_TOKEN step is the one under test.
         env.Write(WorkerConfigProvisioner.GitHubTokenVar, whitespace);
-        env.Write(WorkerConfigProvisioner.GhTokenVar, "ghp_provisioned");
 
-        // The resolver must fall THROUGH the whitespace GITHUB_TOKEN to the provisioned token.
-        // Assert the exact provisioned value — removing the per-step GITHUB_TOKEN normalization
-        // returns the whitespace instead.
-        Assert.Equal("ghp_provisioned", prov.ResolveConfigRepoCredential());
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Null(prov.ResolveConfigRepoCredential());
     }
 
     /// <summary>
-    /// On RPC failure, the provisioned token reverts to the operator snapshot. With no operator
-    /// token, <c>ResolveConfigRepoCredential</c> must read <c>null</c> from the env (the reverted
-    /// state), not a stale provisioned token.
+    /// The complement of the previous test on the SAME reached step: with the in-memory token
+    /// and <c>GH_TOKEN</c> absent, a real <c>GITHUB_TOKEN</c> value is resolved UNCHANGED —
+    /// proving the last step is genuinely examined (not skipped) and returns the raw value.
     /// </summary>
     [Fact]
-    public async Task ResolveConfigRepoCredential_RpcFailureAfterSuccess_RevertsProvisionedTokenToNull()
+    public async Task ResolveConfigRepoCredential_GithubTokenIsLastCandidate_ReturnedUnchanged()
+    {
+        var env = new InMemoryEnv();
+        var fetch = new FetchController();
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
+        var prov = Create(env, fetch);
+
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // A padded value: returned byte-exact, exposing any trimming along the chain.
+        env.Write(WorkerConfigProvisioner.GitHubTokenVar, "  padded-github-token  ");
+
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("  padded-github-token  ", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// On RPC failure the in-memory provisioned token is cleared (and the provisioned env token
+    /// reverts). With no env candidates, <c>ResolveConfigRepoCredential</c> must resolve to
+    /// EXACTLY null — not a stale token.
+    /// </summary>
+    [Fact]
+    public async Task ResolveConfigRepoCredential_RpcFailureAfterSuccess_ClearsInMemoryToken_ResolvesNull()
     {
         var env = new InMemoryEnv();
         var fetch = new FetchController();
@@ -595,32 +688,61 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
         fetch.EnqueueException(new RpcException(new Status(StatusCode.Unavailable, "orchestrator down")));
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
 
-        // The provisioned token is reverted to null (no operator value); the resolver reads null.
+        // The reverted state is exactly null — a stale token does NOT survive the failure.
         Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
         Assert.Null(prov.ResolveConfigRepoCredential());
     }
 
     /// <summary>
-    /// On RPC failure with an operator token present, the operator token survives the revert and
-    /// is the resolved credential — the stale provisioned token is gone.
+    /// The chain passes candidates through RAW: a padded env <c>GH_TOKEN</c> is returned
+    /// UNCHANGED (never trimmed) when no in-memory token exists. Complements the resolver's own
+    /// untrimmed vectors — this proves the provisioner feeds candidates to
+    /// GitCredentialResolver.Resolve without normalizing them first, so any
+    /// trimming introduced anywhere along the chain fails this assertion.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\n")]
+    public async Task ResolveConfigRepoCredential_PaddedLiveGhToken_NoInMemoryToken_ReturnedUnchanged(string whitespace)
+    {
+        // Operator set GITHUB_TOKEN so the response token (none here) would never reach the env;
+        // the live GH_TOKEN carries surrounding whitespace and must come back WITH it.
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, "operator-github-token"),
+            (WorkerConfigProvisioner.GhTokenVar, whitespace + "padded-gh-token" + whitespace));
+        var fetch = new FetchController();
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
+        var prov = Create(env, fetch);
+
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(whitespace + "padded-gh-token" + whitespace, prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// On RPC failure the in-memory provisioned token is cleared, so the chain continues into
+    /// the environment: an operator <c>GH_TOKEN</c> becomes the resolved credential — the stale
+    /// provisioned token is gone.
     /// </summary>
     [Fact]
-    public async Task ResolveConfigRepoCredential_RpcFailureAfterSuccess_OperatorTokenSurvivesRevert()
+    public async Task ResolveConfigRepoCredential_RpcFailureAfterSuccess_EnvOperatorTokenResolves()
     {
         var env = new InMemoryEnv(
             (WorkerConfigProvisioner.GhTokenVar, "operator-gh-token"));
         var fetch = new FetchController();
         var prov = Create(env, fetch);
 
-        // Provisioning does not write (operator GH_TOKEN present), so the operator value is the
-        // credential before and after the failure.
+        // The operator alias group is satisfied, so the response token is captured in memory
+        // but never written to the env; the in-memory field wins while it exists.
         fetch.EnqueueResponse(Resp(githubToken: "ghp_provisioned", setToken: true));
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
-        Assert.Equal("operator-gh-token", prov.ResolveConfigRepoCredential());
+        Assert.Equal("ghp_provisioned", prov.ResolveConfigRepoCredential());
 
         fetch.EnqueueException(new RpcException(new Status(StatusCode.Unavailable, "orchestrator down")));
         await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
 
+        // In-memory token cleared → the env chain resolves the operator GH_TOKEN.
         Assert.Equal("operator-gh-token", prov.ResolveConfigRepoCredential());
     }
 
@@ -633,6 +755,250 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => prov.ResolveConfigRepoCredential());
         Assert.NotNull(ex.Message);
+    }
+
+    // ===========================================================================
+    // In-memory provisioned token — lifecycle (replace, clear, RPC revert, cancellation)
+    //
+    // ISOLATION RULE for this section: every test that asserts the IN-MEMORY token's
+    // lifecycle sets a DISTINCT operator GITHUB_TOKEN. The operator alias suppresses the
+    // GH_TOKEN mirror (ApplyTokenAlias never writes when either alias is operator-set), so
+    // the response token lives ONLY in the in-memory field. A wrongly retained, wrongly
+    // cleared or wrongly un-replaced in-memory value therefore resolves to a DIFFERENT exact
+    // string than the assertion expects, and the test fails.
+    // ===========================================================================
+
+    /// <summary>The distinct operator fallback used to isolate the in-memory token's lifecycle.</summary>
+    private const string OperatorFallbackToken = "operator-github-token-fallback";
+
+    /// <summary>
+    /// A later successful response with NO token CLEARS the in-memory provisioned token. The
+    /// operator alias suppresses the GH_TOKEN mirror, so the resolved value falls through to the
+    /// DISTINCT operator fallback — a retained stale token would resolve to "first-token".
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_LaterResponseWithNoToken_Clears_FallsThroughToOperatorFallback()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        fetch.EnqueueResponse(Resp(githubToken: "first-token", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        // The token lives ONLY in memory: the mirror is suppressed by the operator alias.
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("first-token", prov.ResolveConfigRepoCredential());
+
+        // Second successful response: no github_token field at all — must clear, not retain.
+        fetch.EnqueueResponse(new GetWorkerConfigResponse());
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // Exact value: the operator fallback, NOT the stale "first-token".
+        Assert.Equal(OperatorFallbackToken, prov.ResolveConfigRepoCredential());
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+    }
+
+    /// <summary>
+    /// A later successful response carrying a WHITESPACE token also CLEARS the in-memory value
+    /// (whitespace is absence). With the mirror suppressed, the resolved value is the DISTINCT
+    /// operator fallback — a retained stale token would resolve to "first-token".
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\n")]
+    public async Task InMemoryToken_LaterResponseWithWhitespaceToken_Clears_FallsThroughToOperatorFallback(string whitespace)
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        fetch.EnqueueResponse(Resp(githubToken: "first-token", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Equal("first-token", prov.ResolveConfigRepoCredential());
+
+        // A present-but-whitespace github_token field is treated as absent → clears.
+        fetch.EnqueueResponse(Resp(githubToken: whitespace, setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(OperatorFallbackToken, prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// A later successful response with a FRESH token REPLACES the in-memory value. The operator
+    /// alias suppresses the GH_TOKEN mirror, so the assertion can only be satisfied by the
+    /// in-memory field actually being replaced: a retained first token resolves to
+    /// "first-token" and a wrongly cleared field resolves to the operator fallback — both fail.
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_LaterResponseWithFreshToken_ReplacesExactly()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        fetch.EnqueueResponse(Resp(githubToken: "first-token", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Equal("first-token", prov.ResolveConfigRepoCredential());
+
+        fetch.EnqueueResponse(Resp(githubToken: "second-fresh-token", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        // The mirror was never written, so this value can only come from the in-memory field.
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("second-fresh-token", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// Caller cancellation surfacing as a DIRECT <see cref="OperationCanceledException"/> is
+    /// excluded from the clearing: the rethrow happens before provisioned state is touched, so
+    /// the in-memory token still resolves to the exact prior value. The operator alias
+    /// suppresses the mirror, so a wrongly cleared field resolves to the operator fallback.
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_CallerCancellationDirectOce_DoesNotClear_StillResolvesExactPriorValue()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        // A successful provision populates the in-memory token (mirror suppressed).
+        fetch.EnqueueResponse(Resp(githubToken: "survives-cancellation", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("survives-cancellation", prov.ResolveConfigRepoCredential());
+
+        // The caller's token is cancelled; the fetch surfaces a direct
+        // OperationCanceledException, which FetchAndApplyAsync rethrows before touching
+        // provisioned state.
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        fetch.EnqueueException(new OperationCanceledException(cts.Token));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => prov.EnsureProvisionedAsync(null, cts.Token));
+
+        // Exact prior value — NOT the operator fallback a wrongly cleared field would yield.
+        Assert.Equal("survives-cancellation", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// The AMBIGUOUS gRPC shape that the exclusion actually exists for: an
+    /// <c>RpcException(StatusCode.Cancelled)</c> raised while the CALLER's token is already
+    /// cancelled. The <c>ct.ThrowIfCancellationRequested()</c> inside the <c>catch (RpcException)</c>
+    /// block must rethrow BEFORE the token clear, so (i) an
+    /// <see cref="OperationCanceledException"/> surfaces and (ii) the in-memory token still
+    /// resolves to the EXACT prior value. The operator alias suppresses the GH_TOKEN mirror, so
+    /// removing that guard makes this resolve to the operator fallback and fail.
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_CallerCancelledRpcException_DoesNotClear_StillResolvesExactPriorValue()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        fetch.EnqueueResponse(Resp(githubToken: "provisioned-kept", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+        Assert.Equal("provisioned-kept", prov.ResolveConfigRepoCredential());
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        fetch.EnqueueException(new RpcException(new Status(StatusCode.Cancelled, "call cancelled")));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => prov.EnsureProvisionedAsync(null, cts.Token));
+
+        // Exact prior value — the cancelled call never reached the clear.
+        Assert.Equal("provisioned-kept", prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// The COMPLEMENT that pins the discrimination: a SERVER-side cancel
+    /// (<c>StatusCode.Cancelled</c>) while the caller's token is NOT cancelled is an
+    /// availability failure and takes the normal fallback path — the in-memory token IS
+    /// cleared, so the resolved value is the DISTINCT operator fallback. Without this test the
+    /// exclusion could be widened to "never clear on Cancelled" and go undetected.
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_ServerCancelledWithoutCallerCancel_ClearsAndFallsThroughToOperatorFallback()
+    {
+        var env = new InMemoryEnv(
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = Create(env, fetch);
+
+        fetch.EnqueueResponse(Resp(githubToken: "server-cancel-victim", setToken: true));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Equal("server-cancel-victim", prov.ResolveConfigRepoCredential());
+
+        // The caller's token is LIVE; the server reports Cancelled.
+        fetch.EnqueueException(new RpcException(new Status(StatusCode.Cancelled, "server cancelled")));
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(OperatorFallbackToken, prov.ResolveConfigRepoCredential());
+    }
+
+    /// <summary>
+    /// The ORDERING proof: the in-memory token is cleared BEFORE the provisioner ENTERS the
+    /// fallible <c>RevertProvisionedToOperatorSnapshot</c> — not merely before some later write
+    /// inside it.
+    /// <para>
+    /// Construction: the operator set <c>GITHUB_TOKEN</c>, so <c>ApplyTokenAlias</c> never
+    /// provisions <c>GH_TOKEN</c> and <c>LLM_PROVIDER</c> is the ONLY provisioned variable —
+    /// hence the FIRST write the revert performs. The environment is armed to throw on that
+    /// first write, so the revert fails immediately on entry.
+    /// </para>
+    /// <para>
+    /// Decisiveness: after the exception propagates, <c>ResolveConfigRepoCredential</c> must
+    /// return the DISTINCT operator fallback. Moving the clear after the revert (or removing it)
+    /// leaves the stale provisioned token in memory and resolves to
+    /// "token-before-throwing-revert" instead — the assertion fails on the exact value.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task InMemoryToken_RpcFailureWithThrowingFirstRevertWrite_TokenClearedBeforeEnteringRevert()
+    {
+        // The operator alias is present from the start, so it is in the snapshot: GH_TOKEN is
+        // never provisioned and LLM_PROVIDER is the only provisioned variable.
+        var env = new ThrowingEnv(
+            triggerVar: WorkerConfigProvisioner.LlmProviderVar,
+            initiallyArmed: false,
+            initial: (WorkerConfigProvisioner.GitHubTokenVar, OperatorFallbackToken));
+        var fetch = new FetchController();
+        var prov = CreateThrowing(env, fetch);
+
+        var successResponse = new GetWorkerConfigResponse
+        {
+            GithubToken = "token-before-throwing-revert",
+            LlmProvider = "copilot",
+        };
+        fetch.EnqueueResponse(successResponse);
+
+        await prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken);
+        Assert.Equal("token-before-throwing-revert", prov.ResolveConfigRepoCredential());
+        Assert.Equal("copilot", env.Read(WorkerConfigProvisioner.LlmProviderVar));
+        // The mirror is suppressed: the token exists ONLY in memory.
+        Assert.Null(env.Read(WorkerConfigProvisioner.GhTokenVar));
+
+        // Arm the env so the revert's FIRST (and only) write throws.
+        env.Arm();
+
+        fetch.EnqueueException(new RpcException(new Status(StatusCode.Unavailable, "orchestrator down")));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => prov.EnsureProvisionedAsync(null, TestContext.Current.CancellationToken));
+
+        Assert.Contains("Simulated env-write failure", thrown.Message);
+        // The decisive assertion: the resolved credential is the operator fallback, proving the
+        // in-memory token was cleared BEFORE the revert's first write threw.
+        Assert.Equal(OperatorFallbackToken, prov.ResolveConfigRepoCredential());
     }
 
     // ===========================================================================

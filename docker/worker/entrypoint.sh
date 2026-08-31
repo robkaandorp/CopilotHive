@@ -24,28 +24,6 @@ echo " Mode:      SharpCoder (direct LLM)"
 echo " Provider:  ${LLM_PROVIDER:-copilot}"
 echo "============================================"
 
-# --- Config repo clone (needed for improver tasks on any generic worker) ---
-CONFIG_REPO_DIR="/config-repo"
-
-if [[ -n "${CONFIG_REPO_URL:-}" ]]; then
-    CONFIG_CLONE_URL="${CONFIG_REPO_URL}"
-    if [[ -n "${GH_TOKEN:-}" && "${CONFIG_CLONE_URL}" == https://github.com/* ]]; then
-        CONFIG_CLONE_URL="${CONFIG_CLONE_URL/https:\/\/github.com\//https://x-access-token:${GH_TOKEN}@github.com/}"
-    fi
-    if [[ -d "${CONFIG_REPO_DIR}/.git" ]]; then
-        echo "[entrypoint] Config repo already exists, pulling latest..."
-        git -C "${CONFIG_REPO_DIR}" fetch --all --prune
-        git -C "${CONFIG_REPO_DIR}" reset --hard origin/$(git -C "${CONFIG_REPO_DIR}" rev-parse --abbrev-ref HEAD)
-    else
-        rm -rf "${CONFIG_REPO_DIR}"
-        echo "[entrypoint] Cloning config repo..."
-        git clone "${CONFIG_CLONE_URL}" "${CONFIG_REPO_DIR}"
-    fi
-    git -C "${CONFIG_REPO_DIR}" config user.email "copilothive-worker@local"
-    git -C "${CONFIG_REPO_DIR}" config user.name "CopilotHive Worker"
-    echo "[entrypoint] Config repo ready at ${CONFIG_REPO_DIR}"
-fi
-
 # --- Start CopilotHive Worker client (connects to orchestrator) ---
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"
 
