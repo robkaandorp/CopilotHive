@@ -552,7 +552,7 @@ public sealed class SharpCoderRunner : IAgentRunner
         _session ??= AgentSession.Create(Guid.NewGuid().ToString("N"));
 
         // Drain the streaming response to update LastKnownContextTokens after each LLM turn
-        var result = await DrainStreamingAsync(agent, _session, prompt, ct);
+        var result = await DrainStreamingAsync(agent, _session, prompt, _log, ct);
 
         stopwatch.Stop();
         var elapsedSecs = stopwatch.Elapsed.TotalSeconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
@@ -597,22 +597,73 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// This method ensures LastKnownContextTokens is updated after every LLM turn.
     /// </summary>
     private static async Task<AgentResult> DrainStreamingAsync(
-        CodingAgent agent, AgentSession session, string prompt, CancellationToken ct)
+        CodingAgent agent, AgentSession session, string prompt, WorkerLogger log, CancellationToken ct)
     {
         AgentResult? result = null;
         await foreach (var update in agent.ExecuteStreamingAsync(session, prompt, ct))
         {
+            LogToolCallDelta(update, log);
+
             if (update.Kind == StreamingUpdateKind.Completed)
             {
                 result = update.Result;
             }
-            // Discard TextDelta — no output is streamed in worker context
+            // Ordinary chat TextDeltas are deliberately discarded — no output is
+            // streamed in worker context; only tool-call envelope lines are logged.
         }
 
         if (result == null)
             throw new InvalidOperationException("Streaming execution completed without a final AgentResult.");
 
         return result;
+    }
+
+    /// <summary>
+    /// Logs a single streaming update to the console if it is a tool-call envelope delta.
+    /// <para>
+    /// With <c>ShowToolCallsInStream</c> enabled, SharpCoder's <see cref="CodingAgent"/> emits
+    /// each tool call as an envelope TextDelta of the form `` "\n\n`🔧 Name(args)`\n" ``.
+    /// A delta is recognized as a tool-call line iff, after <c>Trim()</c>, the text starts with
+    /// the prefix backtick + 🔧 (U+1F527) + a single space, ends with a closing backtick, and
+    /// contains no inner LF/CR. The LF/CR check runs BEFORE sanitization: a delta with an
+    /// embedded line break is rejected, never sanitized-then-logged.
+    /// </para>
+    /// <para>
+    /// Accepted deltas are logged as <c>🔧 Name(args)</c> — surrounding backticks stripped —
+    /// after control-character sanitization via <see cref="LogSanitizer.SanitizeText"/> (console
+    /// line-injection prevention only; no credential redaction, no additional truncation — the
+    /// upstream <c>FormatToolCallArgs</c> already caps the args). Everything that is not a
+    /// recognized tool-call TextDelta (ordinary chat deltas, Completed, etc.) is a no-op.
+    /// </para>
+    /// </summary>
+    internal static void LogToolCallDelta(StreamingUpdate update, WorkerLogger log)
+    {
+        if (update.Kind != StreamingUpdateKind.TextDelta)
+            return;
+
+        var text = update.Text;
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        var trimmed = text.Trim();
+
+        // Recognition requires the exact envelope: `🔧 Name(args)`
+        const string Prefix = "`\uD83D\uDD27 "; // backtick + wrench emoji (U+1F527) + single space
+        const char EnvelopeClose = '`';
+
+        // LF/CR check BEFORE sanitization — an inner line break rejects the delta outright
+        if (trimmed.IndexOf('\n') >= 0 || trimmed.IndexOf('\r') >= 0)
+            return;
+
+        if (!trimmed.StartsWith(Prefix, StringComparison.Ordinal))
+            return;
+
+        if (trimmed.Length < Prefix.Length + 1 || trimmed[^1] != EnvelopeClose)
+            return;
+
+        // Strip the surrounding envelope backticks (first and last character)
+        var logged = trimmed[1..^1];
+        log.Info(LogSanitizer.SanitizeText(logged));
     }
 
     /// <summary>
