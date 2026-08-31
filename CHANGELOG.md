@@ -1,3 +1,21 @@
+## [0.36.0] — 2026-08-31
+
+### Added
+
+- **Worker config-repo git seam** — Added the grammar-validated, worktree-contained, credential-scoped `ConfigRepoGitOperations` lifecycle in the worker: strict command grammar, exact-directory containment, HTTPS-`github.com`-only transport eligibility, origin state machine, environment-scoped credential injection through a token-free askpass helper, health probing, staging-atomic-move cloning with an ownership marker, and redacted results. Production wiring prepares each assignment in `WorkerService`, routes through `TaskExecutor`, and uses sanitized logging. (`config-repo-git-credential-seam`, `config-repo-seam-operational-api`, `fix-pre-cancelled-token-swallowed`, `config-repo-seam-command-grammar`, `config-repo-seam-execution`, `config-repo-seam-credential-transport`, `config-repo-seam-origin-injection`, `config-repo-seam-health-probe`, `config-repo-seam-clone`, `config-repo-worker-integration`, `wire-config-repo-seam-worker`)
+- **Orchestrator OAuth credential bridge** — `ConfigRepoManager` now resolves the OAuth admin token, then `GH_TOKEN`, then `GITHUB_TOKEN` at every git credential point, refreshes origin before the first network command, performs a pre-build token lookup in `Program.cs`, redacts failure messages, and provides a `GITHUB_TOKEN` fallback in `PipelineHelpers.InjectTokenIntoUrl`; conflict recovery now has an explicit cancellation contract. This fixes model-list push failures in OAuth-only deployments (git exit 128). (`orchestrator-oauth-credential-bridge`)
+- **Credential redaction** — `GitUrlRedactor` is applied across worker and orchestrator log and exception boundaries. (`redact-credential-bearing-repo-urls`)
+- **Unified credential chain** — Added `GitCredentialResolver` with its stale-state lifecycle; entrypoint cloning was removed because per-assignment preparation owns it. Docker documentation covers the askpass mechanism, hooks trust, URL-rewriting caveat, and task-repository compatibility note, while `GITHUB_CONFIG_REPO_TOKEN` remains child-process-only. (`config-repo-integration-part-b`)
+- **Timeout headroom** — Doubled the Brain per-call task timeout from 10 to 20 minutes via `Constants.TaskTimeoutMinutes`; CopilotHive pins SharpCoder and SharpCoder.Providers at 0.18.1. (`double-brain-task-timeout-v2`)
+- **Console observability** — `🔧` tool-call lines are streamed to the worker console through a new logging helper. (`log-agent-tool-calls-console`)
+- **Fast test recipe** — Removed the coverage collector from the default test recipe; coder prompts now direct a targeted `--filter` subset before commit, while the tester phase remains the authoritative full-suite gate. (`fast-targeted-test-execution`)
+- **Model-catalog sync checkpoint 1** — Added a thread-safe `HiveConfigFile`-owned catalog API and `HiveConfigSnapshot` deep-copy helpers, fixing the `CompactionModel` lost-assignment race. (`synchronize-model-catalog-access`)
+
+### Fixed
+
+- **Worker process exception safety** — Fixed disposed-CTS handling around `ProcessExit` in the worker. (`fix-worker-processexit-disposed-cts`)
+- **v0.35.0 release metadata** — Completed the v0.35.0 changelog and preserved the release-metadata atomicity invariant. (`complete-v0350-changelog-and-metadata-fix`)
+
 ## [0.35.0] — 2026-08-27
 
 ### Changed
