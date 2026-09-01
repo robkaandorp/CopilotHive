@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using CopilotHive.Agents;
 using Microsoft.Extensions.Logging.Abstractions;
 using CopilotHive.Configuration;
@@ -235,8 +236,51 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
+    /// Upper bound for a single per-repository branch observation during a branch-backed resume
+    /// (variant A). The same value bounds BOTH the token handed to the branch lister
+    /// (<see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/>) and the defensive
+    /// caller-side <c>WaitAsync</c> bound. The observation runs inside the global resume lock,
+    /// so the worst-case added lock latency is <c>repositories × ResumeTimeout</c>; the 10 second
+    /// default keeps that bounded in practice. Settable for tests only.
+    /// </summary>
+    internal TimeSpan ResumeTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Test seam replacing the real remote-branch listing
+    /// (<see cref="IBrainRepoManager.ListRemoteBranchesAsync"/>) used by the resume branch
+    /// observation. <c>null</c> (the production value) means the real repo manager is used.
+    /// </summary>
+    internal Func<string, CancellationToken, Task<List<string>>>? BranchListerForTest { get; set; }
+
+    /// <summary>Result of observing one repository for the feature branch.</summary>
+    private enum ResumeBranchState
+    {
+        /// <summary>The branch was found (per repo), or found in every repo (aggregate).</summary>
+        Present,
+        /// <summary>The branch was absent (per repo), or absent in at least one repo (aggregate).</summary>
+        Absent,
+        /// <summary>The branch state could not be determined.</summary>
+        Unknown,
+    }
+
+    /// <summary>Phases that represent worker-facing work, used to resolve the failed phase.</summary>
+    private static readonly GoalPhase[] WorkerFacingPhases =
+    [
+        GoalPhase.Coding,
+        GoalPhase.Testing,
+        GoalPhase.DocWriting,
+        GoalPhase.Review,
+        GoalPhase.Improve,
+        GoalPhase.Merging,
+    ];
+
+    /// <summary>The literal rendered whenever a resume metadata value cannot be determined.</summary>
+    private const string ResumeUnknown = "unknown";
+
+    /// <summary>
     /// Determines whether a goal failed specifically due to iteration-budget exhaustion,
-    /// making it eligible for resumption via <see cref="ResumeGoalAsync"/>.
+    /// making it eligible for the branchless (variant B) resumption via
+    /// <see cref="ResumeGoalAsync"/>.
     /// Matches the failure reasons produced by <see cref="PipelineDriver"/>:
     /// "Exceeded max iterations" and "Exceeded max iterations during merge conflict resolution".
     /// </summary>
@@ -252,8 +296,274 @@ public sealed class GoalDispatcher : BackgroundService
     }
 
     /// <summary>
-    /// Resumes a goal that failed due to iteration exhaustion by extending its iteration budget
-    /// and dispatching a new iteration. Serialized via a global lock.
+    /// The cancellation predicate: a goal is cancellation-failed iff its
+    /// <see cref="Goal.FailureReason"/> EQUALS "Cancelled by user" under
+    /// <see cref="StringComparison.OrdinalIgnoreCase"/>. Equality — never <c>Contains</c>: a
+    /// reason such as "Cancelled by user (test)" is a different failure and stays resumable.
+    /// Cancellation-failed goals are never resumable (the snapshot-removal contract owns them).
+    /// </summary>
+    private static bool IsCancellationFailure(Goal goal) =>
+        string.Equals(goal.FailureReason, "Cancelled by user", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Goal-level resume eligibility: a Failed goal that was not cancelled by a user.
+    /// Deliberately broader than <see cref="IsIterationExhaustionFailure"/> so that any
+    /// non-cancellation failure reaches the in-lock pipeline load, where
+    /// <see cref="GoalPipeline.CoderBranch"/> decides between the branch-backed restart
+    /// (variant A) and the branchless exhaustion resume (variant B).
+    /// </summary>
+    private static bool IsResumeCandidateGoal(Goal goal) =>
+        goal.Status == GoalStatus.Failed && !IsCancellationFailure(goal);
+
+    /// <summary>
+    /// Collapses a failure reason to a single, bounded, control-character-free line for logging
+    /// and for the failure-informed planning context. The exact algorithm: every CR and LF becomes
+    /// a single space; every other control character (below 0x20 or 0x7F) is removed; consecutive
+    /// spaces are collapsed; the result is trimmed; anything longer than 300 characters is
+    /// truncated to 297 characters followed by "...". A null, whitespace-only, or
+    /// control-character-only input renders as the literal "unknown".
+    /// </summary>
+    /// <param name="value">The raw failure reason.</param>
+    /// <returns>The sanitized single-line rendering, never null or empty.</returns>
+    internal static string SanitizedSingleLine(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return ResumeUnknown;
+
+        var stripped = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (c is '\r' or '\n')
+            {
+                stripped.Append(' ');
+                continue;
+            }
+
+            if (c < 0x20 || c == 0x7F)
+                continue;
+
+            stripped.Append(c);
+        }
+
+        var collapsed = new StringBuilder(stripped.Length);
+        var previousWasSpace = false;
+        for (var i = 0; i < stripped.Length; i++)
+        {
+            var c = stripped[i];
+            if (c == ' ')
+            {
+                if (previousWasSpace)
+                    continue;
+                previousWasSpace = true;
+            }
+            else
+            {
+                previousWasSpace = false;
+            }
+
+            collapsed.Append(c);
+        }
+
+        var trimmed = collapsed.ToString().Trim();
+        if (trimmed.Length == 0)
+            return ResumeUnknown;
+
+        return trimmed.Length > 300 ? string.Concat(trimmed.AsSpan(0, 297), "...") : trimmed;
+    }
+
+    /// <summary>
+    /// Resolves the phase the goal failed in by scanning <see cref="GoalPipeline.PhaseLog"/>
+    /// BACKWARDS for the first entry naming a worker-facing phase (Coding, Testing, DocWriting,
+    /// Review, Improve, Merging). An empty log — or a log containing only terminal entries —
+    /// resolves to the literal "unknown".
+    /// </summary>
+    /// <param name="pipeline">The failed pipeline.</param>
+    /// <returns>The failed phase name, or "unknown".</returns>
+    internal static string ResolveFailedPhase(GoalPipeline pipeline)
+    {
+        for (var i = pipeline.PhaseLog.Count - 1; i >= 0; i--)
+        {
+            var name = pipeline.PhaseLog[i].Name;
+            if (Array.IndexOf(WorkerFacingPhases, name) >= 0)
+                return name.ToString();
+        }
+
+        return ResumeUnknown;
+    }
+
+    /// <summary>Renders a branch-observation result for the resume log line.</summary>
+    private static string RenderRepoResult(ResumeBranchState state) => state switch
+    {
+        ResumeBranchState.Present => "true",
+        ResumeBranchState.Absent => "false",
+        ResumeBranchState.Unknown => ResumeUnknown,
+        _ => throw new InvalidOperationException($"Unhandled resume branch state '{state}'"),
+    };
+
+    /// <summary>Renders an aggregate branch state for the resume log line.</summary>
+    private static string RenderBranchState(ResumeBranchState state) => state switch
+    {
+        ResumeBranchState.Present => "present",
+        ResumeBranchState.Absent => "absent",
+        ResumeBranchState.Unknown => ResumeUnknown,
+        _ => throw new InvalidOperationException($"Unhandled resume branch state '{state}'"),
+    };
+
+    /// <summary>
+    /// Observes whether the feature branch still exists, per repository, sequentially.
+    /// Every repository gets a FRESH <see cref="CancellationTokenSource"/> cancelled after
+    /// <see cref="ResumeTimeout"/>, whose token is handed to the lister so a well-behaved
+    /// listing aborts and releases its resources at the deadline. A defensive
+    /// <c>WaitAsync(ResumeTimeout)</c> caller-side bound covers a cancellation-ignoring
+    /// implementation; when it fires, the outliving lister task is observed by a continuation
+    /// (which also owns the CTS disposal) so its eventual fault is logged, never unobserved.
+    /// Any timeout or throw yields <see cref="ResumeBranchState.Unknown"/> for that repository
+    /// and the loop continues.
+    /// </summary>
+    /// <param name="pipeline">The pipeline whose <see cref="GoalPipeline.CoderBranch"/> is looked up.</param>
+    /// <returns>The aggregate state plus the per-repository results in repository order.</returns>
+    private async Task<(ResumeBranchState Aggregate, List<(string Repo, ResumeBranchState Result)> PerRepo)>
+        ObserveBranchStateAsync(GoalPipeline pipeline)
+    {
+        var branch = pipeline.CoderBranch!;
+        var perRepo = new List<(string Repo, ResumeBranchState Result)>();
+
+        foreach (var repoName in pipeline.Goal.RepositoryNames)
+            perRepo.Add((repoName, await ObserveRepositoryAsync(repoName, branch)));
+
+        ResumeBranchState aggregate;
+        if (perRepo.Count == 0)
+            aggregate = ResumeBranchState.Unknown;
+        else if (perRepo.Exists(r => r.Result == ResumeBranchState.Absent))
+            aggregate = ResumeBranchState.Absent;
+        else if (perRepo.TrueForAll(r => r.Result == ResumeBranchState.Present))
+            aggregate = ResumeBranchState.Present;
+        else
+            aggregate = ResumeBranchState.Unknown;
+
+        return (aggregate, perRepo);
+    }
+
+    /// <summary>Observes one repository for the feature branch under the per-repo deadline.</summary>
+    private async Task<ResumeBranchState> ObserveRepositoryAsync(string repoName, string branch)
+    {
+        var lister = BranchListerForTest ?? _repoManager.ListRemoteBranchesAsync;
+        var cts = new CancellationTokenSource();
+        var ctsOwnershipTransferred = false;
+        try
+        {
+            cts.CancelAfter(ResumeTimeout);
+
+            Task<List<string>> listing;
+            try
+            {
+                listing = lister(repoName, cts.Token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Resume branch observation failed for repository '{Repo}' — treating branch state as unknown", repoName);
+                return ResumeBranchState.Unknown;
+            }
+
+            List<string> branches;
+            try
+            {
+                branches = await listing.WaitAsync(ResumeTimeout);
+            }
+            catch (TimeoutException)
+            {
+                // The defensive caller-side bound fired: the listing may still be running.
+                // Never leave it unobserved — a continuation logs its eventual fault and
+                // disposes the CTS once the token can no longer be used.
+                ObserveOutlivingListing(listing, repoName, cts);
+                ctsOwnershipTransferred = true;
+                _logger.LogWarning(
+                    "Resume branch observation for repository '{Repo}' exceeded {Timeout} — treating branch state as unknown",
+                    repoName, ResumeTimeout);
+                return ResumeBranchState.Unknown;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Resume branch observation failed for repository '{Repo}' — treating branch state as unknown", repoName);
+                return ResumeBranchState.Unknown;
+            }
+
+            return branches.Exists(b => string.Equals(b, branch, StringComparison.OrdinalIgnoreCase))
+                ? ResumeBranchState.Present
+                : ResumeBranchState.Absent;
+        }
+        finally
+        {
+            if (!ctsOwnershipTransferred)
+                cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Attaches a continuation to a branch listing that outlived the observation deadline so its
+    /// eventual fault is logged and the per-repo <see cref="CancellationTokenSource"/> is disposed
+    /// only once the listing can no longer touch its token.
+    /// </summary>
+    private void ObserveOutlivingListing(Task<List<string>> listing, string repoName, CancellationTokenSource cts)
+    {
+        _ = listing.ContinueWith(
+            t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _logger.LogWarning(t.Exception,
+                        "Branch listing for repository '{Repo}' faulted after the resume observation deadline", repoName);
+                }
+
+                cts.Dispose();
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Builds the failure-informed planning context for a branch-backed (variant A) resume:
+    /// the captured failure reason, the failed phase, and the honest, conditional wording about
+    /// what the branch observation could establish.
+    /// </summary>
+    private static string BuildResumeContext(
+        string goalId, string sanitizedReason, string failedPhase, ResumeBranchState branchState)
+    {
+        var branchWording = branchState switch
+        {
+            ResumeBranchState.Present =>
+                $"The feature branch `copilothive/{goalId}` carries the prior iterations' merged work. "
+                + "Checkout the existing branch; do NOT recreate it from scratch.",
+            ResumeBranchState.Absent =>
+                "The feature branch appears absent — checkout may fall back to re-creating it from the base; "
+                + "prior branch work may be lost.",
+            ResumeBranchState.Unknown =>
+                "The branch state could not be verified; checkout may fall back to re-creating it from the base.",
+            _ => throw new InvalidOperationException($"Unhandled resume branch state '{branchState}'"),
+        };
+
+        return $"""
+            This goal is being restarted after a failure. Plan a continuation, starting with Coding.
+            Previous failure reason: {sanitizedReason}
+            Failed phase: {failedPhase}
+            {branchWording}
+            """;
+    }
+
+    /// <summary>
+    /// Resumes a failed goal. Two variants:
+    /// <list type="bullet">
+    ///   <item><b>Variant A (branch-backed restart)</b> — the pipeline has a
+    ///   <see cref="GoalPipeline.CoderBranch"/>: the branch is observed, a failure-informed
+    ///   planning context is built, the plan must start with Coding, and dispatch checks the
+    ///   existing branch out (non-destructive).</item>
+    ///   <item><b>Variant B (branchless exhaustion resume)</b> — no coder branch and an
+    ///   iteration-exhaustion failure: the historical behaviour, unchanged.</item>
+    /// </list>
+    /// Goals failed by user cancellation are never resumable. Serialized via a global lock.
     /// </summary>
     /// <param name="goalId">The goal to resume.</param>
     /// <param name="additionalIterations">Number of additional iterations to grant (1-1000).</param>
@@ -266,18 +576,19 @@ public sealed class GoalDispatcher : BackgroundService
         if (goalStore is null)
             return false;
 
-        // Check goal eligibility BEFORE acquiring lock
+        // Check goal-level eligibility BEFORE acquiring lock. Deliberately broad: the variant
+        // is decided in-lock, once the pipeline (and its CoderBranch) is loaded.
         var goal = await goalStore.GetGoalAsync(goalId, ct);
-        if (goal is null || !IsIterationExhaustionFailure(goal))
+        if (goal is null || !IsResumeCandidateGoal(goal))
             return false;
 
         var lockObj = _resumeLock;
         await lockObj.WaitAsync(ct);
         try
         {
-            // Re-check FULL eligibility inside lock (could have changed)
+            // Re-check goal-level eligibility inside lock (could have changed)
             goal = await goalStore.GetGoalAsync(goalId, ct);
-            if (goal is null || !IsIterationExhaustionFailure(goal))
+            if (goal is null || !IsResumeCandidateGoal(goal))
                 return false;
 
             // Load pipeline
@@ -292,6 +603,32 @@ public sealed class GoalDispatcher : BackgroundService
             // Require pipeline in Failed phase
             if (pipeline.Phase != GoalPhase.Failed)
                 return false;
+
+            // ── Variant selection (no mutation may precede this) ─────────────────
+            var isBranchBacked = pipeline.CoderBranch is not null;
+            if (isBranchBacked)
+            {
+                // Branch-name invariant: ORDINAL, case-SENSITIVE. Git branch names are
+                // case-sensitive, so a case-only mismatch signals a corrupted snapshot and
+                // must surface as a rejection, never as a silent recreate.
+                var canonicalBranch = $"copilothive/{goalId}";
+                if (!string.Equals(pipeline.CoderBranch, canonicalBranch, StringComparison.Ordinal))
+                {
+                    _logger.LogWarning(
+                        "Refusing to resume goal '{GoalId}': coder branch '{CoderBranch}' does not match the canonical branch '{Canonical}'",
+                        goalId, pipeline.CoderBranch, canonicalBranch);
+                    return false;
+                }
+            }
+            else if (!IsIterationExhaustionFailure(goal))
+            {
+                // Branchless resume is only defined for iteration exhaustion.
+                return false;
+            }
+
+            // Capture the failure metadata BEFORE any mutation (ExtendIterations is the first).
+            var sanitizedReason = SanitizedSingleLine(goal.FailureReason);
+            var failedPhase = ResolveFailedPhase(pipeline);
 
             // Extend budget
             pipeline.ExtendIterations(additionalIterations);
@@ -338,12 +675,26 @@ public sealed class GoalDispatcher : BackgroundService
             }
 
             // Plan a new iteration — a planning failure fails the goal (no default plan substitution)
+            // Variant A: observe the surviving feature branch and build a failure-informed context.
+            // Variant B: the historical branchless resume — a null context, no observation.
+            string? planningContext = null;
+            if (isBranchBacked)
+            {
+                var (branchState, perRepo) = await ObserveBranchStateAsync(pipeline);
+                planningContext = BuildResumeContext(goalId, sanitizedReason, failedPhase, branchState);
+
+                var repoRendering = string.Join(", ", perRepo.Select(r => $"{r.Repo}:{RenderRepoResult(r.Result)}"));
+                _logger.LogInformation(
+                    "ResumeRestart for goal {GoalId}: failed-phase={FailedPhase}, failure-reason={FailureReason}, branch={Branch}, branch-state={BranchState}, repos=[{Repos}]",
+                    goalId, failedPhase, sanitizedReason, pipeline.CoderBranch, RenderBranchState(branchState), repoRendering);
+            }
+
             PlanResult planResult;
             try
             {
                 // The CALLER's token governs planning so the cancellation distinction below is
                 // real: only an OCE carrying this token means "the caller is shutting down".
-                planResult = await ResolvePlanAsync(pipeline, null, ct);
+                planResult = await ResolvePlanAsync(pipeline, planningContext, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -379,6 +730,17 @@ public sealed class GoalDispatcher : BackgroundService
             }
 
             var validatedPlan = planResult.Plan!;
+
+            // Variant A restarts the surviving branch work — the continuation MUST start with
+            // Coding. Any other shape is rejected rather than dispatched to the wrong role.
+            if (isBranchBacked && validatedPlan.Phases.FirstOrDefault() != GoalPhase.Coding)
+            {
+                _logger.LogWarning(
+                    "Resumed plan for goal {GoalId} does not start with Coding — failing the goal", goalId);
+
+                await FailResumedGoalAsync(pipeline, "Resume plan must start with Coding");
+                return true;
+            }
 
             pipeline.SetPlan(validatedPlan);
             pipeline.StateMachine.StartIteration(validatedPlan.Phases);
