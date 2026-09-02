@@ -4,6 +4,7 @@ using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
 
@@ -14,6 +15,19 @@ namespace CopilotHive.Services;
 public sealed class GoalPipeline
 {
     private readonly object _lock = new();
+
+    /// <summary>
+    /// Work-slot registry: every registered slot keyed by its task ID, paired with its
+    /// current <see cref="WorkSlotState"/>. Guarded by <c>_lock</c>.
+    /// </summary>
+    private readonly Dictionary<string, (WorkSlot Slot, WorkSlotState State)> _slots = [];
+
+    /// <summary>
+    /// Per-position dispatch attempt counters keyed by the full
+    /// <see cref="WorkSlotPosition"/> tuple (iteration, phase, occurrence).
+    /// Guarded by <c>_lock</c>.
+    /// </summary>
+    private readonly Dictionary<WorkSlotPosition, int> _dispatchAttempts = [];
 
     /// <summary>Unique identifier of the goal this pipeline is tracking.</summary>
     public string GoalId { get; }
@@ -308,6 +322,277 @@ public sealed class GoalPipeline
     /// <summary>Build a context summary for the Brain about this pipeline's current state.</summary>
     public string BuildContextSummary() => ConversationTracker.BuildContextSummary(this);
 
+    #region Work-slot registry
+
+    /// <summary>
+    /// Allocates the next dispatch attempt number for <paramref name="position"/> and registers a
+    /// new <see cref="WorkSlotState.Pending"/> slot for <paramref name="taskId"/>.
+    /// </summary>
+    /// <remarks>
+    /// The attempt counter advance and the slot insertion commit together inside a single lock
+    /// acquisition, so a concurrent observer never sees an advanced counter without its slot.
+    /// Every refusal (validation failure or double assignment) throws <em>before</em> any mutation,
+    /// leaving the registry untouched. The broader invariant that the counter only advances for a
+    /// capture that ultimately succeeds is <em>caller-enforced</em>: the caller must perform all of
+    /// its own fallible validation before invoking this helper.
+    /// </remarks>
+    /// <param name="taskId">The task ID that will own the slot; must be non-blank and unused.</param>
+    /// <param name="position">The iteration/phase/occurrence position the slot occupies.</param>
+    /// <returns>The task ID, position, and freshly allocated attempt number.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="taskId"/> is null or blank, or a slot already exists for it in any state.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="position"/> is <c>null</c>.</exception>
+    /// <exception cref="WorkSlotException">
+    /// A live (Pending or Claimed) slot already occupies <paramref name="position"/>.
+    /// </exception>
+    internal SlotBuildResult AllocateAttemptAndRegisterSlot(string taskId, WorkSlotPosition position)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId))
+                throw new ArgumentException("Task ID must be a non-blank string.", nameof(taskId));
+            ArgumentNullException.ThrowIfNull(position);
+
+            if (_slots.ContainsKey(taskId))
+                throw new ArgumentException($"A work slot is already registered for task '{taskId}'.", nameof(taskId));
+
+            foreach (var (_, entry) in _slots)
+            {
+                if (entry.State is not (WorkSlotState.Pending or WorkSlotState.Claimed))
+                    continue;
+                if (entry.Slot.Position != position)
+                    continue;
+                throw new WorkSlotException(WorkSlotEvent.DoubleAssignment, position, entry.Slot.TaskId);
+            }
+
+            var attempt = _dispatchAttempts.TryGetValue(position, out var previous) ? previous + 1 : 1;
+            _dispatchAttempts[position] = attempt;
+            _slots[taskId] = (new WorkSlot(taskId, position, attempt), WorkSlotState.Pending);
+
+            return new SlotBuildResult(taskId, position, attempt);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the slot for <paramref name="taskId"/> and reports whether its work may proceed,
+    /// claiming a <see cref="WorkSlotState.Pending"/> slot in the process.
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <returns>
+    /// <see cref="SlotGuardResult.Proceed"/> for a Pending (now Claimed), Claimed, or Recorded slot;
+    /// <see cref="SlotGuardResult.Abandoned"/> for an abandoned slot;
+    /// <see cref="SlotGuardResult.Unknown"/> when no slot exists or the task ID is blank.
+    /// </returns>
+    internal SlotGuardResult ResolveAndCheckSlot(string taskId)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return SlotGuardResult.Unknown;
+
+            switch (entry.State)
+            {
+                case WorkSlotState.Pending:
+                    _slots[taskId] = (entry.Slot, WorkSlotState.Claimed);
+                    return SlotGuardResult.Proceed;
+                case WorkSlotState.Claimed:
+                case WorkSlotState.Recorded:
+                    return SlotGuardResult.Proceed;
+                case WorkSlotState.Abandoned:
+                    return SlotGuardResult.Abandoned;
+                default:
+                    throw new InvalidOperationException($"Unhandled WorkSlotState: {entry.State}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records the result of a claimed slot, transitioning it to <see cref="WorkSlotState.Recorded"/>.
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <returns>
+    /// <see cref="SlotRecordOutcome.Recorded"/> when a Claimed slot was recorded;
+    /// <see cref="SlotRecordOutcome.NoOp"/> for every other state, an unknown task, or a blank task ID.
+    /// </returns>
+    internal SlotRecordOutcome RecordSlot(string taskId)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return SlotRecordOutcome.NoOp;
+
+            if (entry.State != WorkSlotState.Claimed)
+                return SlotRecordOutcome.NoOp;
+
+            _slots[taskId] = (entry.Slot, WorkSlotState.Recorded);
+            return SlotRecordOutcome.Recorded;
+        }
+    }
+
+    /// <summary>
+    /// Abandons a slot that has not been claimed yet (a superseded dispatch).
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <returns><c>true</c> when a Pending slot was abandoned; otherwise <c>false</c>.</returns>
+    internal bool AbandonSlot(string taskId)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return false;
+
+            if (entry.State != WorkSlotState.Pending)
+                return false;
+
+            _slots[taskId] = (entry.Slot, WorkSlotState.Abandoned);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Fails a claimed slot, abandoning it so its result can never be recorded.
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <returns><c>true</c> when a Claimed slot was abandoned; otherwise <c>false</c>.</returns>
+    internal bool FailSlot(string taskId)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return false;
+
+            if (entry.State != WorkSlotState.Claimed)
+                return false;
+
+            _slots[taskId] = (entry.Slot, WorkSlotState.Abandoned);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Releases a claimed slot back to <see cref="WorkSlotState.Pending"/> so it can be claimed again.
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <returns><c>true</c> when a Claimed slot was released; otherwise <c>false</c>.</returns>
+    internal bool ReleaseSlot(string taskId)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return false;
+
+            if (entry.State != WorkSlotState.Claimed)
+                return false;
+
+            _slots[taskId] = (entry.Slot, WorkSlotState.Pending);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Abandons every <see cref="WorkSlotState.Pending"/> slot. Claimed slots are exempt —
+    /// work already in flight keeps its slot.
+    /// </summary>
+    internal void AbandonPendingSlots()
+    {
+        lock (_lock)
+        {
+            foreach (var taskId in _slots.Keys.ToList())
+            {
+                var entry = _slots[taskId];
+                if (entry.State == WorkSlotState.Pending)
+                    _slots[taskId] = (entry.Slot, WorkSlotState.Abandoned);
+            }
+        }
+    }
+
+    /// <summary>
+    /// TEST-ONLY: returns a fresh immutable view of every registered slot. The order is unspecified.
+    /// </summary>
+    /// <returns>One <see cref="WorkSlotView"/> per registered slot.</returns>
+    internal IReadOnlyList<WorkSlotView> GetSlotsForTest()
+    {
+        lock (_lock)
+        {
+            var views = new List<WorkSlotView>(_slots.Count);
+            foreach (var (_, entry) in _slots)
+                views.Add(new WorkSlotView(entry.Slot, entry.State));
+            return views;
+        }
+    }
+
+    /// <summary>
+    /// TEST-ONLY: forces an existing slot into <paramref name="state"/>, bypassing the transition rules.
+    /// </summary>
+    /// <param name="taskId">The task ID identifying the slot.</param>
+    /// <param name="state">The state to force.</param>
+    /// <returns><c>true</c> when the slot existed and was forced; <c>false</c> when blank or absent.</returns>
+    /// <exception cref="ArgumentException"><paramref name="state"/> is not a defined enum value.</exception>
+    internal bool ForceSlotStateForTest(string taskId, WorkSlotState state)
+    {
+        if (!Enum.IsDefined(state))
+            throw new ArgumentException($"Undefined WorkSlotState: {state}", nameof(state));
+
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return false;
+
+            _slots[taskId] = (entry.Slot, state);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// TEST-ONLY: clears every registered slot and resets all per-position attempt counters
+    /// in a single lock acquisition. Always safe to call.
+    /// </summary>
+    internal void ClearRegistryForTest()
+    {
+        lock (_lock)
+        {
+            _slots.Clear();
+            _dispatchAttempts.Clear();
+        }
+    }
+
+    /// <summary>
+    /// TEST-ONLY: registers a slot with the exact values supplied, without touching the
+    /// per-position attempt counters.
+    /// </summary>
+    /// <param name="taskId">The task ID that owns the slot.</param>
+    /// <param name="position">The position the slot occupies.</param>
+    /// <param name="attempt">The attempt number to stamp on the slot; must not be negative.</param>
+    /// <param name="state">The state to register the slot in.</param>
+    /// <returns>
+    /// <c>true</c> when the slot was registered; <c>false</c> when the task ID is blank,
+    /// the position is <c>null</c>, or a slot already exists for the task ID.
+    /// </returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="state"/> is not a defined enum value, or <paramref name="attempt"/> is negative.
+    /// </exception>
+    internal bool SeedSlotForTest(string taskId, WorkSlotPosition position, int attempt, WorkSlotState state)
+    {
+        if (!Enum.IsDefined(state))
+            throw new ArgumentException($"Undefined WorkSlotState: {state}", nameof(state));
+        if (attempt < 0)
+            throw new ArgumentException("Attempt must not be negative.", nameof(attempt));
+
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(taskId) || position is null)
+                return false;
+            if (_slots.ContainsKey(taskId))
+                return false;
+
+            _slots[taskId] = (new WorkSlot(taskId, position, attempt), state);
+            return true;
+        }
+    }
+
+    #endregion
+
     /// <summary>Returns a human-friendly display name for the given <see cref="GoalPhase"/>.</summary>
     /// <param name="phase">The pipeline phase to get a display name for.</param>
     /// <returns>A human-readable string representation of the phase.</returns>
@@ -337,4 +622,255 @@ public sealed class NarrativeEntry
     public string TaskId { get; init; } = "";
     /// <summary>Narrative content from the worker.</summary>
     public string Content { get; init; } = "";
+}
+
+/// <summary>
+/// Lifecycle state of a work slot inside a <see cref="GoalPipeline"/>'s slot registry.
+/// </summary>
+internal enum WorkSlotState
+{
+    /// <summary>The slot has been registered but its work has not been claimed yet.</summary>
+    Pending,
+    /// <summary>The slot's work has been claimed and is in flight.</summary>
+    Claimed,
+    /// <summary>The slot's result has been recorded; the slot is complete.</summary>
+    Recorded,
+    /// <summary>The slot has been abandoned; its result must never be recorded.</summary>
+    Abandoned,
+}
+
+/// <summary>
+/// Integrity violations detected while allocating or capturing a work slot.
+/// </summary>
+internal enum WorkSlotEvent
+{
+    /// <summary>A live slot already occupies the requested position.</summary>
+    DoubleAssignment,
+    /// <summary>The role passed in does not match the role derived from the pipeline state.</summary>
+    RoleMismatch,
+    /// <summary>The pipeline is not in a phase that permits a slot capture.</summary>
+    InvalidPhase,
+    /// <summary>The pipeline phase and the state-machine phase disagree.</summary>
+    PhaseDivergence,
+    /// <summary>No iteration plan is available to derive the slot from.</summary>
+    PlanUnavailable,
+}
+
+/// <summary>
+/// The unique position a work slot occupies: iteration, phase, and the occurrence of that
+/// phase within the iteration.
+/// </summary>
+/// <param name="Iteration">One-based iteration number the slot belongs to.</param>
+/// <param name="Phase">The pipeline phase the slot belongs to.</param>
+/// <param name="Occurrence">One-based occurrence of that phase within the iteration.</param>
+internal sealed record WorkSlotPosition(int Iteration, GoalPhase Phase, int Occurrence);
+
+/// <summary>
+/// An immutable work slot: the task that owns it, the position it occupies, and the
+/// dispatch attempt number allocated for that position.
+/// </summary>
+/// <param name="TaskId">The task ID that owns this slot.</param>
+/// <param name="Position">The position this slot occupies.</param>
+/// <param name="Attempt">One-based dispatch attempt number allocated for the position.</param>
+internal sealed record WorkSlot(string TaskId, WorkSlotPosition Position, int Attempt);
+
+/// <summary>
+/// Result of resolving a work slot before its work proceeds.
+/// </summary>
+internal enum SlotGuardResult
+{
+    /// <summary>The slot is live; the work may proceed.</summary>
+    Proceed,
+    /// <summary>The slot has been abandoned; the work must be discarded.</summary>
+    Abandoned,
+    /// <summary>No slot is registered for the task; the caller decides how to handle it.</summary>
+    Unknown,
+}
+
+/// <summary>
+/// Outcome of attempting to record a work slot's result.
+/// </summary>
+internal enum SlotRecordOutcome
+{
+    /// <summary>The slot transitioned to <see cref="WorkSlotState.Recorded"/>.</summary>
+    Recorded,
+    /// <summary>Nothing changed — the slot was not claimed, or does not exist.</summary>
+    NoOp,
+}
+
+/// <summary>
+/// An immutable snapshot pairing a work slot with its state at the time of capture.
+/// </summary>
+/// <param name="Slot">The slot that was observed.</param>
+/// <param name="State">The state the slot was in when observed.</param>
+internal sealed record WorkSlotView(WorkSlot Slot, WorkSlotState State);
+
+/// <summary>
+/// Result of allocating an attempt and registering a work slot.
+/// </summary>
+/// <param name="TaskId">The task ID the slot was registered for.</param>
+/// <param name="Position">The position the slot occupies.</param>
+/// <param name="Attempt">The dispatch attempt number allocated for the position.</param>
+internal sealed record SlotBuildResult(string TaskId, WorkSlotPosition Position, int Attempt);
+
+/// <summary>
+/// Raised when a work-slot integrity violation is detected. Carries the structured detail
+/// relevant to the specific <see cref="WorkSlotEvent"/>; unrelated properties stay <c>null</c>.
+/// </summary>
+internal sealed class WorkSlotException : Exception
+{
+    /// <summary>The integrity violation that was detected.</summary>
+    public WorkSlotEvent Event { get; }
+
+    /// <summary>The slot position the violation relates to. Never <c>null</c>.</summary>
+    public WorkSlotPosition Position { get; }
+
+    /// <summary>
+    /// Task ID of the slot already occupying the position, for
+    /// <see cref="WorkSlotEvent.DoubleAssignment"/>; otherwise <c>null</c>.
+    /// </summary>
+    public string? ExistingTaskId { get; }
+
+    /// <summary>
+    /// The role passed into the capture, for <see cref="WorkSlotEvent.RoleMismatch"/>;
+    /// otherwise <c>null</c>.
+    /// </summary>
+    public WorkerRole? PassedRole { get; }
+
+    /// <summary>
+    /// The role derived from the pipeline state, for <see cref="WorkSlotEvent.RoleMismatch"/>;
+    /// otherwise <c>null</c>.
+    /// </summary>
+    public WorkerRole? DerivedRole { get; }
+
+    /// <summary>
+    /// The pipeline's own phase, for <see cref="WorkSlotEvent.PhaseDivergence"/>;
+    /// otherwise <c>null</c>.
+    /// </summary>
+    public GoalPhase? PipelinePhase { get; }
+
+    /// <summary>The state-machine phase, which always equals <see cref="Position"/>'s phase.</summary>
+    public GoalPhase? MachinePhase { get; }
+
+    /// <summary>
+    /// Creates a <see cref="WorkSlotEvent.DoubleAssignment"/> exception.
+    /// </summary>
+    /// <param name="ev">Must be <see cref="WorkSlotEvent.DoubleAssignment"/>.</param>
+    /// <param name="position">The contested slot position.</param>
+    /// <param name="existingTaskId">Task ID of the live slot already at the position.</param>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="ev"/> is not <see cref="WorkSlotEvent.DoubleAssignment"/>, or
+    /// <paramref name="existingTaskId"/> is null or blank.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="position"/> is <c>null</c>.</exception>
+    internal WorkSlotException(WorkSlotEvent ev, WorkSlotPosition position, string? existingTaskId)
+        : base(FormatDoubleAssignment(ev, position, existingTaskId))
+    {
+        Event = ev;
+        Position = position;
+        ExistingTaskId = existingTaskId;
+        MachinePhase = position.Phase;
+    }
+
+    /// <summary>
+    /// Creates a <see cref="WorkSlotEvent.RoleMismatch"/> exception.
+    /// </summary>
+    /// <param name="ev">Must be <see cref="WorkSlotEvent.RoleMismatch"/>.</param>
+    /// <param name="position">The slot position the capture targeted.</param>
+    /// <param name="passedRole">The role the caller passed in.</param>
+    /// <param name="derivedRole">The role derived from the pipeline state.</param>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="ev"/> is not <see cref="WorkSlotEvent.RoleMismatch"/>.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="position"/> is <c>null</c>.</exception>
+    internal WorkSlotException(WorkSlotEvent ev, WorkSlotPosition position, WorkerRole passedRole, WorkerRole derivedRole)
+        : base(FormatRoleMismatch(ev, position, passedRole, derivedRole))
+    {
+        Event = ev;
+        Position = position;
+        PassedRole = passedRole;
+        DerivedRole = derivedRole;
+        MachinePhase = position.Phase;
+    }
+
+    /// <summary>
+    /// Creates a phase-related exception:
+    /// <see cref="WorkSlotEvent.InvalidPhase"/>, <see cref="WorkSlotEvent.PhaseDivergence"/>,
+    /// or <see cref="WorkSlotEvent.PlanUnavailable"/>.
+    /// </summary>
+    /// <param name="ev">One of InvalidPhase, PhaseDivergence, or PlanUnavailable.</param>
+    /// <param name="position">The slot position; its phase must equal <paramref name="machinePhase"/>.</param>
+    /// <param name="pipelinePhase">
+    /// The pipeline's own phase. Required (non-null) for <see cref="WorkSlotEvent.PhaseDivergence"/>
+    /// and must be <c>null</c> for the other two events.
+    /// </param>
+    /// <param name="machinePhase">The state-machine phase.</param>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="ev"/> is not one of the three permitted events, the position's phase
+    /// differs from <paramref name="machinePhase"/>, or <paramref name="pipelinePhase"/>
+    /// violates the event's nullability rule.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="position"/> is <c>null</c>.</exception>
+    internal WorkSlotException(WorkSlotEvent ev, WorkSlotPosition position, GoalPhase? pipelinePhase, GoalPhase machinePhase)
+        : base(FormatPhase(ev, position, pipelinePhase, machinePhase))
+    {
+        Event = ev;
+        Position = position;
+        PipelinePhase = pipelinePhase;
+        MachinePhase = machinePhase;
+    }
+
+    private static string FormatDoubleAssignment(WorkSlotEvent ev, WorkSlotPosition position, string? existingTaskId)
+    {
+        if (ev != WorkSlotEvent.DoubleAssignment)
+            throw new ArgumentException($"Expected {nameof(WorkSlotEvent.DoubleAssignment)} but got '{ev}'.", nameof(ev));
+        ArgumentNullException.ThrowIfNull(position);
+        if (string.IsNullOrWhiteSpace(existingTaskId))
+            throw new ArgumentException("Existing task ID must be a non-blank string.", nameof(existingTaskId));
+
+        return $"{ev}: position {Render(position)} is already occupied by task '{existingTaskId}'.";
+    }
+
+    private static string FormatRoleMismatch(WorkSlotEvent ev, WorkSlotPosition position, WorkerRole passedRole, WorkerRole derivedRole)
+    {
+        if (ev != WorkSlotEvent.RoleMismatch)
+            throw new ArgumentException($"Expected {nameof(WorkSlotEvent.RoleMismatch)} but got '{ev}'.", nameof(ev));
+        ArgumentNullException.ThrowIfNull(position);
+
+        return $"{ev}: position {Render(position)} passed role '{passedRole}' but derived role '{derivedRole}'.";
+    }
+
+    private static string FormatPhase(WorkSlotEvent ev, WorkSlotPosition position, GoalPhase? pipelinePhase, GoalPhase machinePhase)
+    {
+        ArgumentNullException.ThrowIfNull(position);
+
+        switch (ev)
+        {
+            case WorkSlotEvent.InvalidPhase:
+                if (pipelinePhase is not null)
+                    throw new ArgumentException($"{ev} must not carry a pipeline phase.", nameof(pipelinePhase));
+                break;
+            case WorkSlotEvent.PhaseDivergence:
+                if (pipelinePhase is null)
+                    throw new ArgumentException($"{ev} requires a pipeline phase.", nameof(pipelinePhase));
+                break;
+            case WorkSlotEvent.PlanUnavailable:
+                if (pipelinePhase is not null)
+                    throw new ArgumentException($"{ev} must not carry a pipeline phase.", nameof(pipelinePhase));
+                break;
+            default:
+                throw new ArgumentException(
+                    $"Event '{ev}' is not a phase-related work-slot event.", nameof(ev));
+        }
+
+        if (position.Phase != machinePhase)
+            throw new ArgumentException(
+                $"Position phase '{position.Phase}' must equal machine phase '{machinePhase}'.", nameof(machinePhase));
+
+        var pipelineText = pipelinePhase is null ? "none" : pipelinePhase.Value.ToString();
+        return $"{ev}: position {Render(position)} pipeline phase '{pipelineText}', machine phase '{machinePhase}'.";
+    }
+
+    private static string Render(WorkSlotPosition position) =>
+        $"(iteration {position.Iteration}, phase {position.Phase}, occurrence {position.Occurrence})";
 }
