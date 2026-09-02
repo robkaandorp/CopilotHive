@@ -25,6 +25,10 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
     /// <param name="maxContextTokens">Context window size in tokens for the worker's agent.</param>
     /// <param name="subAgentModels">Model catalog for sub-agent delegation, or <c>null</c> for none.</param>
     /// <param name="reasoningEffort">Explicit reasoning effort for this task, or <c>null</c> when reasoning effort is unset.</param>
+    /// <param name="taskId">
+    /// The task ID to stamp on the built task, used VERBATIM. When <c>null</c>, empty, or
+    /// whitespace, the legacy <c>{goalId}-{roleName}-{iteration:D3}</c> fallback is used instead.
+    /// </param>
     /// <returns>A fully constructed <see cref="WorkTask"/>.</returns>
     public WorkTask Build(
         string goalId,
@@ -37,7 +41,8 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
         string? model = null,
         int maxContextTokens = Constants.DefaultBrainContextWindow,
         IReadOnlyList<SubAgentModelDto>? subAgentModels = null,
-        ReasoningEffort? reasoningEffort = null)
+        ReasoningEffort? reasoningEffort = null,
+        string? taskId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -53,7 +58,7 @@ public sealed class TaskBuilder(BranchCoordinator branchCoordinator)
 
         return new WorkTask
         {
-            TaskId = $"{goalId}-{roleName}-{iteration:D3}",
+            TaskId = string.IsNullOrWhiteSpace(taskId) ? $"{goalId}-{roleName}-{iteration:D3}" : taskId,
             GoalId = goalId,
             GoalDescription = goalDescription,
             Prompt = prompt,

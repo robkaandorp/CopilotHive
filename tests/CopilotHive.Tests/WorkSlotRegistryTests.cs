@@ -1,6 +1,9 @@
+using System.Globalization;
 using System.Reflection;
 using System.Reflection.Emit;
 using CopilotHive.Goals;
+using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
@@ -1468,6 +1471,8 @@ public sealed class WorkSlotRegistryTests
     private static readonly string[] LockedRegistryMethodNames =
     [
         "AllocateAttemptAndRegisterSlot",
+        "AllocateAttemptAndRegisterSlotWithId",
+        "FindLiveSlotTaskIdAt",
         "ResolveAndCheckSlot",
         "RecordSlot",
         "AbandonSlot",
@@ -2075,6 +2080,1278 @@ public sealed class WorkSlotRegistryTests
             .ToHashSet(StringComparer.Ordinal);
 
         Assert.Equal(expected, actual);
+    }
+
+    #endregion
+
+    #region (j) The capture — fixtures
+
+    /// <summary>A plan containing every one of the five worker phases exactly once.</summary>
+    private static readonly GoalPhase[] FullPlan =
+    [
+        GoalPhase.Coding, GoalPhase.DocWriting, GoalPhase.Testing,
+        GoalPhase.Review, GoalPhase.Improve, GoalPhase.Merging,
+    ];
+
+    private static GoalPipeline NewPipeline(string goalId) =>
+        new(new Goal { Id = goalId, Description = "Test goal" });
+
+    /// <summary>
+    /// Builds a pipeline whose INSTALLED plan, MACHINE phase, PIPELINE phase and ITERATION are
+    /// each set independently, so every capture vector can be expressed declaratively.
+    /// </summary>
+    /// <param name="goalId">Goal ID (embedded verbatim in built task IDs).</param>
+    /// <param name="installedPlan">The plan handed to <c>SetPlan</c>, or <c>null</c> for none.</param>
+    /// <param name="machinePhase">The phase the state machine is restored at.</param>
+    /// <param name="pipelinePhase">The pipeline's own phase; defaults to <paramref name="machinePhase"/>.</param>
+    /// <param name="restorePlan">
+    /// The plan the MACHINE is restored from when it must differ from the installed one
+    /// (used to drive the queue length independently of the installed plan).
+    /// </param>
+    /// <param name="iteration">The one-based iteration the pipeline should report.</param>
+    private static GoalPipeline CaptureFixture(
+        string goalId = "goal-1",
+        IReadOnlyList<GoalPhase>? installedPlan = null,
+        GoalPhase machinePhase = GoalPhase.Coding,
+        GoalPhase? pipelinePhase = null,
+        IReadOnlyList<GoalPhase>? restorePlan = null,
+        int iteration = 1)
+    {
+        var pipeline = NewPipeline(goalId);
+        for (var i = 1; i < iteration; i++)
+            Assert.True(pipeline.IterationBudget.TryConsume());
+        Assert.Equal(iteration, pipeline.Iteration);
+
+        if (installedPlan is not null)
+            pipeline.SetPlan(new IterationPlan { Phases = [.. installedPlan] });
+
+        pipeline.StateMachine.RestoreFromPlan(restorePlan ?? installedPlan ?? [], machinePhase);
+        pipeline.AdvanceTo(pipelinePhase ?? machinePhase);
+        return pipeline;
+    }
+
+    /// <summary>Allocates through A1a's untouched helper purely to READ the position's counter.</summary>
+    private static int ProbeAttempt(GoalPipeline pipeline, WorkSlotPosition position, string probeId = "probe") =>
+        pipeline.AllocateAttemptAndRegisterSlot(probeId, position).Attempt;
+
+    /// <summary>The attempt number encoded in the LAST segment of a built task ID.</summary>
+    private static int AttemptFromTaskId(string taskId) =>
+        int.Parse(taskId[(taskId.LastIndexOf('-') + 1)..], CultureInfo.InvariantCulture);
+
+    #endregion
+
+    #region (k) The capture — classification refusals
+
+    /// <summary>
+    /// CLASSIFICATION FIRST: every phase outside {Coding, Testing, DocWriting, Review, Improve}
+    /// is refused as <c>InvalidPhase</c> — including the terminal and non-worker phases, and
+    /// including an UNDEFINED machine phase, which never reaches the role mapping.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Planning)]
+    [InlineData(GoalPhase.Merging)]
+    [InlineData(GoalPhase.Done)]
+    [InlineData(GoalPhase.Failed)]
+    public void Capture_NonWorkerMachinePhase_ThrowsInvalidPhase(GoalPhase phase)
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: phase, restorePlan: []);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.InvalidPhase, ex.Event);
+        Assert.Equal(phase, ex.Position.Phase);
+        Assert.Equal(phase, ex.MachinePhase);
+        Assert.Null(ex.PipelinePhase);
+        Assert.Equal(1, ex.Position.Iteration);
+
+        // NO ATTEMPT CONSUMED anywhere near the refused position.
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(1, phase, 1)));
+    }
+
+    /// <summary>An UNDEFINED machine phase classifies as InvalidPhase, not as a role problem.</summary>
+    [Fact]
+    public void Capture_UndefinedMachinePhase_ThrowsInvalidPhase()
+    {
+        const GoalPhase undefined = (GoalPhase)999;
+        var pipeline = CaptureFixture(
+            installedPlan: FullPlan,
+            machinePhase: undefined,
+            pipelinePhase: GoalPhase.Coding,
+            restorePlan: []);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.InvalidPhase, ex.Event);
+        Assert.Equal(undefined, ex.Position.Phase);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// An UNDEFINED PIPELINE phase is a DIVERGENCE, not an InvalidPhase: the classification reads
+    /// the MACHINE's phase (a valid worker phase here), and only the divergence check compares the
+    /// pipeline's own phase against it.
+    /// </summary>
+    [Fact]
+    public void Capture_UndefinedPipelinePhase_ThrowsPhaseDivergence()
+    {
+        const GoalPhase undefined = (GoalPhase)999;
+        var pipeline = CaptureFixture(
+            installedPlan: FullPlan,
+            machinePhase: GoalPhase.Coding,
+            pipelinePhase: undefined);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.PhaseDivergence, ex.Event);
+        Assert.Equal(undefined, ex.PipelinePhase);
+        Assert.Equal(GoalPhase.Coding, ex.MachinePhase);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), ex.Position);
+
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(1, GoalPhase.Coding, 1)));
+    }
+
+    /// <summary>
+    /// PLAN UNAVAILABLE, SOURCE 1: a plan IS installed — and it even contains the phase — but the
+    /// executed prefix computed from the machine's queue does not, so the occurrence walk fails.
+    /// </summary>
+    [Fact]
+    public void Capture_PlanInstalledButOccurrenceNotFound_ThrowsPlanUnavailable()
+    {
+        // Installed: [Coding, Testing, Review, Merging] (contains Review).
+        // Machine restored from a 4-entry plan STARTING at Review, so its queue holds 3 entries
+        // and the executed prefix of the installed plan is just [Coding] — Review is not there.
+        var pipeline = CaptureFixture(
+            installedPlan: [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
+            machinePhase: GoalPhase.Review,
+            restorePlan: [GoalPhase.Review, GoalPhase.Testing, GoalPhase.Improve, GoalPhase.Merging]);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Reviewer));
+
+        Assert.Equal(WorkSlotEvent.PlanUnavailable, ex.Event);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Review, 0), ex.Position);
+        Assert.Null(ex.PipelinePhase);
+        Assert.Equal(GoalPhase.Review, ex.MachinePhase);
+
+        Assert.Empty(pipeline.GetSlotsForTest());
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(1, GoalPhase.Review, 1)));
+    }
+
+    /// <summary>
+    /// PLAN UNAVAILABLE, SOURCE 2: the no-plan restoration. The snapshot constructor synced the
+    /// machine to the restored worker phase with an EMPTY queue and installed nothing, so the
+    /// capture reports the same refusal — never a fabricated occurrence.
+    /// </summary>
+    [Fact]
+    public void Capture_NoPlanRestoration_ThrowsPlanUnavailable()
+    {
+        var pipeline = RestoredWithoutPlan(GoalPhase.Coding);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.PlanUnavailable, ex.Event);
+        Assert.Equal(new WorkSlotPosition(pipeline.Iteration, GoalPhase.Coding, 0), ex.Position);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>The pipeline phase disagreeing with the machine's is a coherent divergence.</summary>
+    [Fact]
+    public void Capture_PipelinePhaseDivergesFromMachinePhase_ThrowsPhaseDivergence()
+    {
+        var pipeline = CaptureFixture(
+            installedPlan: FullPlan,
+            machinePhase: GoalPhase.Coding,
+            pipelinePhase: GoalPhase.Testing);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.PhaseDivergence, ex.Event);
+        Assert.Equal(GoalPhase.Testing, ex.PipelinePhase);
+        Assert.Equal(GoalPhase.Coding, ex.MachinePhase);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), ex.Position);
+    }
+
+    #endregion
+
+    #region (l) The capture — the exact role mapping
+
+    /// <summary>Theory feed of the EXACT phase→role mapping the capture must honour.</summary>
+    public static TheoryData<GoalPhase, WorkerRole> ExactRoleMapping => new()
+    {
+        { GoalPhase.Coding, WorkerRole.Coder },
+        { GoalPhase.Testing, WorkerRole.Tester },
+        { GoalPhase.DocWriting, WorkerRole.DocWriter },
+        { GoalPhase.Review, WorkerRole.Reviewer },
+        { GoalPhase.Improve, WorkerRole.Improver },
+    };
+
+    /// <summary>The matching role is accepted for every one of the five worker phases.</summary>
+    [Theory]
+    [MemberData(nameof(ExactRoleMapping))]
+    public void Capture_MatchingRole_Succeeds(GoalPhase phase, WorkerRole role)
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: phase);
+
+        var built = pipeline.CaptureDispatchPosition(role);
+
+        Assert.Equal(new WorkSlotPosition(1, phase, 1), built.Position);
+        Assert.Equal(1, built.Attempt);
+        Assert.Equal($"goal-1-{role.ToRoleName()}-001-01-001", built.TaskId);
+    }
+
+    /// <summary>
+    /// Every NON-matching role — including the Coding-phase + Tester vector called out explicitly
+    /// — is refused, and the exception carries both the passed and the derived role.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Coding, WorkerRole.Tester)]
+    [InlineData(GoalPhase.Coding, WorkerRole.DocWriter)]
+    [InlineData(GoalPhase.Testing, WorkerRole.Coder)]
+    [InlineData(GoalPhase.DocWriting, WorkerRole.Reviewer)]
+    [InlineData(GoalPhase.Review, WorkerRole.Improver)]
+    [InlineData(GoalPhase.Improve, WorkerRole.Coder)]
+    [InlineData(GoalPhase.Coding, WorkerRole.Unspecified)]
+    [InlineData(GoalPhase.Coding, WorkerRole.Orchestrator)]
+    [InlineData(GoalPhase.Coding, WorkerRole.MergeWorker)]
+    public void Capture_MismatchedRole_ThrowsRoleMismatch(GoalPhase phase, WorkerRole role)
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: phase);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(role));
+
+        Assert.Equal(WorkSlotEvent.RoleMismatch, ex.Event);
+        Assert.Equal(role, ex.PassedRole);
+        Assert.Equal(phase.ToWorkerRole(), ex.DerivedRole);
+        Assert.Equal(new WorkSlotPosition(1, phase, 1), ex.Position);
+
+        // NO ATTEMPT CONSUMED by the refusal.
+        Assert.Empty(pipeline.GetSlotsForTest());
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(1, phase, 1)));
+    }
+
+    /// <summary>An UNDEFINED role is simply a role that differs from the derived one.</summary>
+    [Fact]
+    public void Capture_UndefinedRole_ThrowsRoleMismatch()
+    {
+        const WorkerRole undefined = (WorkerRole)999;
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(undefined));
+
+        Assert.Equal(WorkSlotEvent.RoleMismatch, ex.Event);
+        Assert.Equal(undefined, ex.PassedRole);
+        Assert.Equal(WorkerRole.Coder, ex.DerivedRole);
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(1, GoalPhase.Coding, 1)));
+    }
+
+    #endregion
+
+    #region (m) The capture — the LIVE-position rule
+
+    /// <summary>A LIVE slot (Pending or Claimed) at the position refuses the capture.</summary>
+    [Theory]
+    [InlineData(StPending)]
+    [InlineData(StClaimed)]
+    public void Capture_LiveSlotAtPosition_ThrowsDoubleAssignment(int stateCode)
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+        var pos = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+        Assert.True(pipeline.SeedSlotForTest("occupant", pos, 4, St(stateCode)));
+
+        var before = Snapshot(pipeline);
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.DoubleAssignment, ex.Event);
+        Assert.Equal("occupant", ex.ExistingTaskId);
+        Assert.Equal(pos, ex.Position);
+
+        // Nothing was registered and nothing changed state.
+        Assert.Equal(before, Snapshot(pipeline));
+
+        // NO ATTEMPT CONSUMED: retire the occupant, then probe — attempt 1, not 2.
+        Assert.True(pipeline.ForceSlotStateForTest("occupant", WorkSlotState.Recorded));
+        Assert.Equal(1, ProbeAttempt(pipeline, pos));
+    }
+
+    /// <summary>A DEAD slot (Recorded or Abandoned) does not occupy the position.</summary>
+    [Theory]
+    [InlineData(StRecorded)]
+    [InlineData(StAbandoned)]
+    public void Capture_DeadSlotAtPosition_PermitsTheCapture(int stateCode)
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+        var pos = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+        Assert.True(pipeline.SeedSlotForTest("dead", pos, 4, St(stateCode)));
+
+        var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+
+        Assert.Equal(pos, built.Position);
+        Assert.Equal(1, built.Attempt);
+        Assert.Equal("goal-1-coder-001-01-001", built.TaskId);
+        Assert.Equal(2, pipeline.GetSlotsForTest().Count);
+    }
+
+    /// <summary>
+    /// SEEDED-COLLISION, HONEST FORM 1 — THE DUPLICATE-ID ARBITER. A dead slot parked at a
+    /// DIFFERENT position already owns the exact task ID the capture would build, so the position
+    /// is free but the ID is taken. The refusal surfaces as the allocation helper's
+    /// <see cref="ArgumentException"/> — a DIFFERENT exception type from the slot-integrity
+    /// <see cref="WorkSlotException"/>, which is precisely what identifies the rejecting layer.
+    /// </summary>
+    [Fact]
+    public void Capture_SeededCollidingTaskIdAtDifferentPosition_ThrowsTheHelpersArgumentException()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        const string collidingId = "add-auth-coder-002-01-001";
+
+        // Parked at a DIFFERENT position (occurrence 7) and DEAD, so only the ID can collide.
+        Assert.True(pipeline.SeedSlotForTest(
+            collidingId, new WorkSlotPosition(2, GoalPhase.Coding, 7), 1, WorkSlotState.Recorded));
+
+        var ex = Assert.Throws<ArgumentException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        // THE LAYER MARKER: an argument failure from the allocation, not a slot-integrity event.
+        Assert.IsNotType<WorkSlotException>(ex);
+        Assert.Contains(collidingId, ex.Message, StringComparison.Ordinal);
+
+        // The refusal consumed no attempt at the target position.
+        Assert.Single(pipeline.GetSlotsForTest());
+        Assert.Equal(1, ProbeAttempt(pipeline, new WorkSlotPosition(2, GoalPhase.Coding, 1)));
+    }
+
+    /// <summary>
+    /// SEEDED-COLLISION, HONEST FORM 2 — THE LIVE-POSITION REFUSAL. A live seeded slot both owns
+    /// the colliding ID AND occupies the position. Only the OUTCOME is asserted (the capture is
+    /// refused, nothing is registered); no claim is made about which layer rejected it.
+    /// </summary>
+    [Fact]
+    public void Capture_SeededCollidingTaskIdAtSamePosition_IsRefusedWithoutMutation()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+        Assert.True(pipeline.SeedSlotForTest("add-auth-coder-002-01-001", pos, 1, WorkSlotState.Pending));
+
+        var before = Snapshot(pipeline);
+
+        Assert.ThrowsAny<Exception>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(before, Snapshot(pipeline));
+        Assert.Single(pipeline.GetSlotsForTest());
+    }
+
+    #endregion
+
+    #region (n) The capture — success, IDs, counters and pointer independence
+
+    /// <summary>
+    /// THE LOWERCASE ID VECTOR: goal <c>add-auth</c>, iteration 2, occurrence 1, attempt 1 →
+    /// <c>add-auth-coder-002-01-001</c>, with the goal ID embedded VERBATIM.
+    /// </summary>
+    [Fact]
+    public void Capture_Success_BuildsTheExactLowercaseTaskId()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+
+        var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+
+        Assert.Equal("add-auth-coder-002-01-001", built.TaskId);
+        Assert.StartsWith("add-auth-", built.TaskId, StringComparison.Ordinal);
+        Assert.Equal(new WorkSlotPosition(2, GoalPhase.Coding, 1), built.Position);
+        Assert.Equal(1, built.Attempt);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot(built.TaskId, built.Position, 1), WorkSlotState.Pending),
+            Assert.Single(pipeline.GetSlotsForTest()));
+    }
+
+    /// <summary>A goal ID with mixed case and separators is embedded VERBATIM — never normalised.</summary>
+    [Fact]
+    public void Capture_Success_EmbedsTheGoalIdVerbatim()
+    {
+        var pipeline = CaptureFixture("Add_Auth.v2", FullPlan, GoalPhase.Review);
+
+        var built = pipeline.CaptureDispatchPosition(WorkerRole.Reviewer);
+
+        Assert.Equal("Add_Auth.v2-reviewer-001-01-001", built.TaskId);
+    }
+
+    /// <summary>
+    /// THE ID-ATTEMPT CONSISTENCY PROOF (the atomic derivation). The attempt parsed out of the
+    /// returned task ID equals the returned <c>SlotBuildResult.Attempt</c> equals the committed
+    /// counter — for BOTH the 001 vector and the 002 vector. A predicted-then-allocated
+    /// implementation could return <c>…-001</c> with Attempt 2; this pins that it cannot.
+    /// </summary>
+    [Fact]
+    public void Capture_IdAttemptConsistency_HoldsForBothThe001AndThe002Vector()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+
+        // ── The 001 vector: a fresh position ──────────────────────────────────────────
+        var first = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal("add-auth-coder-002-01-001", first.TaskId);
+        Assert.Equal(1, first.Attempt);
+        Assert.Equal(first.Attempt, AttemptFromTaskId(first.TaskId));
+
+        // ── The 002 vector: the helper-allocated 001 → the dead transition → the capture ──
+        pipeline.ClearRegistryForTest();
+        var helperAllocated = pipeline.AllocateAttemptAndRegisterSlot("add-auth-coder-002-01-001", pos);
+        Assert.Equal(1, helperAllocated.Attempt);
+        Assert.True(pipeline.ForceSlotStateForTest(helperAllocated.TaskId, WorkSlotState.Recorded));
+
+        var second = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal("add-auth-coder-002-01-002", second.TaskId);
+        Assert.Equal(2, second.Attempt);
+        Assert.Equal(second.Attempt, AttemptFromTaskId(second.TaskId));
+
+        // The COMMITTED counter agrees with both: the next allocation takes 3.
+        Assert.True(pipeline.ForceSlotStateForTest(second.TaskId, WorkSlotState.Recorded));
+        Assert.Equal(3, ProbeAttempt(pipeline, pos));
+    }
+
+    /// <summary>Per-position counters stay independent across captures at different positions.</summary>
+    [Fact]
+    public void Capture_DistinctPositions_CountersAreIndependent()
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+
+        var coding = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal(1, coding.Attempt);
+
+        // Move BOTH the machine and the pipeline to Testing: a different position entirely.
+        pipeline.StateMachine.RestoreFromPlan(FullPlan, GoalPhase.Testing);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        var testing = pipeline.CaptureDispatchPosition(WorkerRole.Tester);
+        Assert.Equal(1, testing.Attempt);
+        Assert.Equal("goal-1-tester-001-01-001", testing.TaskId);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Testing, 1), testing.Position);
+    }
+
+    /// <summary>
+    /// POINTER INDEPENDENCE: the capture neither reads nor writes <c>ActiveTaskId</c> — a success
+    /// leaves a pre-existing pointer exactly as it was, and never installs its own.
+    /// </summary>
+    [Fact]
+    public void Capture_DoesNotTouchActiveTaskId()
+    {
+        var pipeline = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // (i) With no pointer set, a success does not install one.
+        var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.NotEqual("", built.TaskId);
+
+        // (ii) With a pointer set, the next capture leaves it untouched.
+        pipeline.SetActiveTask("some-other-task");
+        Assert.True(pipeline.ForceSlotStateForTest(built.TaskId, WorkSlotState.Recorded));
+        pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal("some-other-task", pipeline.ActiveTaskId);
+
+        // (iii) And a refusal does not clear it either.
+        Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Tester));
+        Assert.Equal("some-other-task", pipeline.ActiveTaskId);
+    }
+
+    #endregion
+
+    #region (o) The _installedPhases lifecycle table
+
+    /// <summary>Builds the snapshot the restoring constructor consumes.</summary>
+    private static PipelineSnapshot SnapshotOf(GoalPhase phase, IterationPlan? plan, string goalId = "goal-1") =>
+        new()
+        {
+            GoalId = goalId,
+            Description = "Test goal",
+            Goal = new Goal { Id = goalId, Description = "Test goal" },
+            Phase = phase,
+            Iteration = 1,
+            Plan = plan,
+        };
+
+    private static GoalPipeline RestoredWithoutPlan(GoalPhase phase) =>
+        new(SnapshotOf(phase, plan: null));
+
+    /// <summary>ROW 1 — the fresh constructor installs nothing and registers nothing.</summary>
+    [Fact]
+    public void Lifecycle_FreshConstructor_InstallsNothingAndRegistersNothing()
+    {
+        var pipeline = NewPipeline();
+
+        Assert.Null(pipeline.InstalledPhasesForTest);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// ROW 2 — the snapshot constructor WITH a plan installs a defensive COPY of the plan's phases
+    /// (mutating the source list afterwards cannot reach it) and registers no slots.
+    /// </summary>
+    [Fact]
+    public void Lifecycle_SnapshotWithPlan_InstallsADetachedCopy()
+    {
+        var sourcePhases = new List<GoalPhase>(FullPlan);
+        var snapshot = SnapshotOf(GoalPhase.Coding, new IterationPlan { Phases = sourcePhases });
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(FullPlan, pipeline.InstalledPhasesForTest);
+        Assert.Empty(pipeline.GetSlotsForTest());
+
+        // MUTATION PROOF: rewriting the SOURCE plan's list does not change the installed copy.
+        sourcePhases[0] = GoalPhase.DocWriting;
+        sourcePhases.Add(GoalPhase.Improve);
+        Assert.Equal(FullPlan, pipeline.InstalledPhasesForTest);
+
+        // …and the existing machine restore still happened.
+        Assert.Equal(GoalPhase.Coding, pipeline.StateMachine.Phase);
+    }
+
+    /// <summary>
+    /// ROW 3 — THE NO-PLAN SYNC. Without a plan nothing is installed, yet the machine is driven to
+    /// the restored phase with an EMPTY queue, for every phase case.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Coding)]
+    [InlineData(GoalPhase.Planning)]
+    [InlineData(GoalPhase.Merging)]
+    [InlineData(GoalPhase.Done)]
+    [InlineData(GoalPhase.Failed)]
+    public void Lifecycle_SnapshotWithoutPlan_SyncsTheMachineWithAnEmptyQueue(GoalPhase phase)
+    {
+        var pipeline = RestoredWithoutPlan(phase);
+
+        Assert.Null(pipeline.InstalledPhasesForTest);
+        Assert.Null(pipeline.Plan);
+        Assert.Equal(phase, pipeline.StateMachine.Phase);
+        Assert.Equal(phase, pipeline.Phase);
+        Assert.Empty(pipeline.StateMachine.RemainingPhases);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// ROW 3, THE CLASSIFICATIONS. A no-plan restoration at a WORKER phase yields PlanUnavailable;
+    /// at any other phase it yields InvalidPhase.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Coding, EvPlanUnavailable)]
+    [InlineData(GoalPhase.Planning, EvInvalidPhase)]
+    [InlineData(GoalPhase.Merging, EvInvalidPhase)]
+    [InlineData(GoalPhase.Done, EvInvalidPhase)]
+    [InlineData(GoalPhase.Failed, EvInvalidPhase)]
+    public void Lifecycle_SnapshotWithoutPlan_CaptureClassifiesHonestly(GoalPhase phase, int expectedEvent)
+    {
+        var pipeline = RestoredWithoutPlan(phase);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(Ev(expectedEvent), ex.Event);
+        Assert.Equal(phase, ex.Position.Phase);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// ROW 4 — SetPlan: pendings are abandoned, CLAIMED work is exempt, the installed list is a
+    /// detached copy, and the plan becomes visible.
+    /// </summary>
+    [Fact]
+    public void Lifecycle_SetPlan_AbandonsPendingsKeepsClaimedAndInstallsACopy()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("pending", pos, 1, WorkSlotState.Pending));
+        Assert.True(pipeline.SeedSlotForTest("claimed", Position(occurrence: 2), 1, WorkSlotState.Claimed));
+        Assert.True(pipeline.SeedSlotForTest("recorded", Position(occurrence: 3), 1, WorkSlotState.Recorded));
+
+        var sourcePhases = new List<GoalPhase>(FullPlan);
+        var plan = new IterationPlan { Phases = sourcePhases };
+
+        pipeline.SetPlan(plan);
+
+        Assert.Same(plan, pipeline.Plan);
+        Assert.Equal(FullPlan, pipeline.InstalledPhasesForTest);
+
+        // MUTATION PROOF on the SetPlan path too.
+        sourcePhases.Clear();
+        Assert.Equal(FullPlan, pipeline.InstalledPhasesForTest);
+
+        Assert.Equal(
+            [
+                new WorkSlotView(new WorkSlot("pending", pos, 1), WorkSlotState.Abandoned),
+                new WorkSlotView(new WorkSlot("claimed", Position(occurrence: 2), 1), WorkSlotState.Claimed),
+                new WorkSlotView(new WorkSlot("recorded", Position(occurrence: 3), 1), WorkSlotState.Recorded),
+            ],
+            Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// ROW 4, THE NULL CONTRACT: a null plan throws <see cref="ArgumentNullException"/> BEFORE any
+    /// mutation — no slot is abandoned, the installed list is untouched, and Plan keeps its value.
+    /// </summary>
+    [Fact]
+    public void Lifecycle_SetPlanNull_ThrowsBeforeAnyMutation()
+    {
+        var pipeline = NewPipeline();
+        var original = new IterationPlan { Phases = [.. FullPlan] };
+        pipeline.SetPlan(original);
+
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("pending", pos, 1, WorkSlotState.Pending));
+        var before = Snapshot(pipeline);
+
+        Assert.Throws<ArgumentNullException>(() => pipeline.SetPlan(null!));
+
+        // NO abandonment happened…
+        Assert.Equal(before, Snapshot(pipeline));
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("pending", pos, 1), WorkSlotState.Pending),
+            Assert.Single(pipeline.GetSlotsForTest()));
+
+        // …and NO plan change happened.
+        Assert.Same(original, pipeline.Plan);
+        Assert.Equal(FullPlan, pipeline.InstalledPhasesForTest);
+    }
+
+    /// <summary>ROW 5 — ClearPlan drops both the plan and the installed list, and abandons pendings.</summary>
+    [Fact]
+    public void Lifecycle_ClearPlan_DropsPlanAndInstalledPhasesAndAbandonsPendings()
+    {
+        var pipeline = NewPipeline();
+        pipeline.SetPlan(new IterationPlan { Phases = [.. FullPlan] });
+
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("pending", pos, 1, WorkSlotState.Pending));
+        Assert.True(pipeline.SeedSlotForTest("claimed", Position(occurrence: 2), 1, WorkSlotState.Claimed));
+
+        pipeline.ClearPlan();
+
+        Assert.Null(pipeline.Plan);
+        Assert.Null(pipeline.InstalledPhasesForTest);
+        Assert.Equal(
+            [
+                new WorkSlotView(new WorkSlot("pending", pos, 1), WorkSlotState.Abandoned),
+                new WorkSlotView(new WorkSlot("claimed", Position(occurrence: 2), 1), WorkSlotState.Claimed),
+            ],
+            Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// ROW 6 — the TERMINAL-ONLY rule, observable half: reaching Done or Failed abandons every
+    /// pending slot while claimed work stays exempt, and the terminal phase is reached.
+    /// </summary>
+    [Theory]
+    [InlineData(GoalPhase.Done)]
+    [InlineData(GoalPhase.Failed)]
+    public void Lifecycle_AdvanceToTerminal_AbandonsPendingsAndKeepsClaimed(GoalPhase terminal)
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("pending", pos, 1, WorkSlotState.Pending));
+        Assert.True(pipeline.SeedSlotForTest("claimed", Position(occurrence: 2), 1, WorkSlotState.Claimed));
+
+        pipeline.AdvanceTo(terminal);
+
+        Assert.Equal(terminal, pipeline.Phase);
+        Assert.NotNull(pipeline.CompletedAt);
+        Assert.Equal(
+            [
+                new WorkSlotView(new WorkSlot("pending", pos, 1), WorkSlotState.Abandoned),
+                new WorkSlotView(new WorkSlot("claimed", Position(occurrence: 2), 1), WorkSlotState.Claimed),
+            ],
+            Snapshot(pipeline));
+    }
+
+    /// <summary>ROW 6 — every NON-terminal AdvanceTo leaves the registry completely untouched.</summary>
+    [Theory]
+    [InlineData(GoalPhase.Planning)]
+    [InlineData(GoalPhase.Coding)]
+    [InlineData(GoalPhase.Testing)]
+    [InlineData(GoalPhase.DocWriting)]
+    [InlineData(GoalPhase.Review)]
+    [InlineData(GoalPhase.Improve)]
+    [InlineData(GoalPhase.Merging)]
+    public void Lifecycle_AdvanceToNonTerminal_AbandonsNothing(GoalPhase phase)
+    {
+        var pipeline = NewPipeline();
+        Assert.True(pipeline.SeedSlotForTest("pending", Position(), 1, WorkSlotState.Pending));
+        var before = Snapshot(pipeline);
+
+        pipeline.AdvanceTo(phase);
+
+        Assert.Equal(phase, pipeline.Phase);
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// ROW 6 — the CODE-STRUCTURE half of the terminal rule, read off the compiled artifact: the
+    /// <c>AbandonPendingSlots</c> call site PRECEDES the <c>Phase</c> assignment in
+    /// <c>AdvanceTo</c>'s emitted IL, so no observer can ever see a terminal pipeline that still
+    /// carries pending slots.
+    /// </summary>
+    [Fact]
+    public void Lifecycle_AdvanceTo_CallsAbandonPendingSlotsBeforeAssigningThePhase()
+    {
+        var calls = DecodeCallSites(RegistryMethod("AdvanceTo"));
+
+        var abandon = calls.FirstOrDefault(c =>
+            c.Target.DeclaringType == typeof(GoalPipeline) && c.Target.Name == "AbandonPendingSlots");
+        var assignPhase = calls.FirstOrDefault(c =>
+            c.Target.DeclaringType == typeof(GoalPipeline) && c.Target.Name == "set_Phase");
+
+        Assert.True(abandon is not null, "AdvanceTo no longer calls AbandonPendingSlots at all.");
+        Assert.True(assignPhase is not null, "AdvanceTo no longer assigns Phase through its setter.");
+        Assert.True(
+            abandon!.Offset < assignPhase!.Offset,
+            $"AdvanceTo assigns Phase at IL offset {assignPhase.Offset} BEFORE abandoning pending slots at " +
+            $"{abandon.Offset} — the terminal abandonment must precede the phase assignment.");
+    }
+
+    #endregion
+
+    #region (p) THE LOCK ORDER — a capture parked behind an in-flight transition
+
+    /// <summary>
+    /// Runs one parked-transition round. The A0 <c>OnTransitionForTest</c> seam holds the machine
+    /// lock while a capture thread is launched; the capture parks inside
+    /// <c>StateMachine.CapturePosition</c> until the hook returns and the transition releases.
+    /// <para>
+    /// Only the two achievable facts are observed and returned: whether the capture completed
+    /// while the transition was parked (it must not), and what it ultimately produced. NOTHING is
+    /// claimed about what happens BETWEEN the release and the completion.
+    /// </para>
+    /// </summary>
+    private static (bool AttemptObserved, bool CompletedWhileParked, SlotBuildResult? Result, Exception? Error)
+        RunParkedCapture(bool aligned)
+    {
+        // Machine at Coding; the parked transition's post-state is Testing.
+        // ALIGNED: the pipeline is already at Testing. DIVERGED: it stays at Coding.
+        var pipeline = CaptureFixture(
+            installedPlan: [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging],
+            machinePhase: GoalPhase.Coding,
+            pipelinePhase: aligned ? GoalPhase.Testing : GoalPhase.Coding);
+
+        using var captureAttempted = new ManualResetEventSlim(false);
+        using var captureCompleted = new ManualResetEventSlim(false);
+        SlotBuildResult? result = null;
+        Exception? error = null;
+
+        var worker = new Thread(() =>
+        {
+            captureAttempted.Set();                                       // signalled immediately before…
+            try
+            {
+                Volatile.Write(ref result, pipeline.CaptureDispatchPosition(WorkerRole.Tester));
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref error, ex);
+            }
+            captureCompleted.Set();
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-parked-capture",
+        };
+
+        var attemptObserved = false;
+        var completedWhileParked = false;
+
+        // The hook runs UNDER the machine lock, so the capture provably parks inside it.
+        // No assertion is made here: anything the hook throws would escape through Transition.
+        pipeline.StateMachine.OnTransitionForTest = () =>
+        {
+            worker.Start();
+#pragma warning disable xUnit1051 // Timeout-only waits are intentional: the fixed bound IS the proof
+            attemptObserved = captureAttempted.Wait(WaitTimeout);
+            completedWhileParked = captureCompleted.Wait(BlockedGrace);
+#pragma warning restore xUnit1051
+        };
+
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing; releases the lock
+        pipeline.StateMachine.OnTransitionForTest = null;
+
+        Assert.True(worker.Join(WaitTimeout), "The parked capture never completed after the transition released.");
+
+        return (attemptObserved, completedWhileParked, Volatile.Read(ref result), Volatile.Read(ref error));
+    }
+
+    /// <summary>
+    /// THE ALIGNED VARIANT: the pipeline's phase agrees with the parked transition's post-state,
+    /// so once the machine lock is released the capture completes SUCCESSFULLY and coherently at
+    /// the post-transition position. Repeated so a scheduler-dependent regression cannot pass by
+    /// luck.
+    /// </summary>
+    [Fact]
+    public void LockOrder_AlignedPipeline_CaptureBlocksWhileParkedThenSucceeds()
+    {
+        for (var round = 0; round < 5; round++)
+        {
+            var (attemptObserved, completedWhileParked, result, error) = RunParkedCapture(aligned: true);
+
+            Assert.True(attemptObserved, $"Round {round}: the capture thread never signalled its attempt.");
+            Assert.False(
+                completedWhileParked,
+                $"Round {round}: the capture completed while the transition held the machine lock.");
+
+            Assert.Null(error);
+            Assert.NotNull(result);
+            Assert.Equal(new WorkSlotPosition(1, GoalPhase.Testing, 1), result.Position);
+            Assert.Equal(1, result.Attempt);
+            Assert.Equal("goal-1-tester-001-01-001", result.TaskId);
+        }
+    }
+
+    /// <summary>
+    /// THE DIVERGED VARIANT: the pipeline is left at the OLD phase, so after the release the
+    /// capture reports a coherent <c>PhaseDivergence</c> naming both sides — the pipeline's Coding
+    /// and the machine's post-transition Testing. Repeated for the same reason.
+    /// </summary>
+    [Fact]
+    public void LockOrder_DivergedPipeline_CaptureBlocksWhileParkedThenThrowsPhaseDivergence()
+    {
+        for (var round = 0; round < 5; round++)
+        {
+            var (attemptObserved, completedWhileParked, result, error) = RunParkedCapture(aligned: false);
+
+            Assert.True(attemptObserved, $"Round {round}: the capture thread never signalled its attempt.");
+            Assert.False(
+                completedWhileParked,
+                $"Round {round}: the capture completed while the transition held the machine lock.");
+
+            Assert.Null(result);
+            var ex = Assert.IsType<WorkSlotException>(error);
+            Assert.Equal(WorkSlotEvent.PhaseDivergence, ex.Event);
+            Assert.Equal(GoalPhase.Coding, ex.PipelinePhase);
+            Assert.Equal(GoalPhase.Testing, ex.MachinePhase);
+            Assert.Equal(new WorkSlotPosition(1, GoalPhase.Testing, 1), ex.Position);
+        }
+    }
+
+    #endregion
+
+    #region (q) TaskBuilder — the taskId parameter
+
+    private static WorkTask BuildTask(string? taskId) =>
+        new TaskBuilder(new BranchCoordinator()).Build(
+            "goal-1", "Test goal", WorkerRole.Coder, 1,
+            [new TargetRepository { Name = "CopilotHive", Url = "https://example.invalid/r.git", DefaultBranch = "main" }],
+            "Do the work.", BranchAction.Create,
+            taskId: taskId);
+
+    /// <summary>A null, empty or whitespace task ID falls back to the legacy generated form.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void TaskBuilder_BlankTaskId_FallsBackToTheLegacyId(string? taskId)
+    {
+        Assert.Equal("goal-1-coder-001", BuildTask(taskId).TaskId);
+    }
+
+    /// <summary>The omitted parameter keeps every existing call site on the legacy behaviour.</summary>
+    [Fact]
+    public void TaskBuilder_OmittedTaskId_KeepsTheLegacyId()
+    {
+        var task = new TaskBuilder(new BranchCoordinator()).Build(
+            "goal-1", "Test goal", WorkerRole.Coder, 1,
+            [new TargetRepository { Name = "CopilotHive", Url = "https://example.invalid/r.git", DefaultBranch = "main" }],
+            "Do the work.", BranchAction.Create);
+
+        Assert.Equal("goal-1-coder-001", task.TaskId);
+    }
+
+    /// <summary>A non-blank task ID is used VERBATIM — never reformatted, never normalised.</summary>
+    [Theory]
+    [InlineData("add-auth-coder-002-01-001")]
+    [InlineData("Add_Auth.v2-reviewer-001-01-007")]
+    [InlineData("x")]
+    public void TaskBuilder_NonBlankTaskId_IsUsedVerbatim(string taskId)
+    {
+        Assert.Equal(taskId, BuildTask(taskId).TaskId);
+    }
+
+    #endregion
+
+    #region (r) THE ATOMIC-DERIVATION PROOF UNDER GENUINE CONCURRENCY
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  WHY THIS REGION EXISTS.
+    //
+    //  The sequential 001/002 vectors in region (n) pin the RESULT of the atomic
+    //  derivation but cannot pin its ATOMICITY: an implementation that reads the next
+    //  attempt in one short lock, builds the task ID from that PREDICTION outside the
+    //  lock, and only later allocates through A1a's helper produces byte-identical
+    //  results when nothing else is running. Single-threaded execution simply never
+    //  opens the window between the prediction and the commit.
+    //
+    //  The decisive vector is therefore real interleaving at the allocation boundary:
+    //  many threads racing the SAME position at once, so the prediction window is
+    //  entered concurrently. Under the true in-lock derivation the attempt is read,
+    //  stamped into the ID, committed to the counter and registered inside ONE lock
+    //  span, so two threads can NEVER obtain the same attempt. Under the prediction
+    //  race two threads read the same "next" value and then both try to use it, which
+    //  surfaces as at least one of the invariants below breaking.
+    //
+    //  DETERMINISM: the start is a Barrier rendezvous on dedicated LongRunning threads
+    //  — no Task.Delay, no polling, no sleep, and no assertion depends on WHICH thread
+    //  wins. Every wait is bounded, so a regression fails loudly instead of hanging.
+    //  The assertions are pure outcome invariants over the SET of results, which hold
+    //  for every possible legal interleaving.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>Threads used by the contention races below; comfortably oversubscribes the CI box.</summary>
+    private const int RaceThreads = 16;
+
+    /// <summary>Capture rounds each racing thread performs on the contended position.</summary>
+    private const int RaceRoundsPerThread = 40;
+
+    /// <summary>
+    /// The outcome of a single racing capture: exactly one of these three is populated.
+    /// </summary>
+    /// <param name="Result">The successful build result, or <c>null</c>.</param>
+    /// <param name="DoubleAssignment">
+    /// <c>true</c> when the capture was refused because the position was momentarily LIVE —
+    /// the expected, legal refusal in a contended race.
+    /// </param>
+    /// <param name="Unexpected">Any other exception; must never occur.</param>
+    private sealed record RaceOutcome(SlotBuildResult? Result, bool DoubleAssignment, Exception? Unexpected);
+
+    /// <summary>
+    /// Runs <paramref name="threadCount"/> dedicated threads that all rendezvous on a
+    /// <see cref="Barrier"/> and then hammer the SAME <paramref name="position"/> with captures.
+    /// <para>
+    /// Each successful capture immediately retires its own slot to
+    /// <see cref="WorkSlotState.Recorded"/>, which frees the position for the next contender —
+    /// that is what keeps the race going for many rounds instead of stopping after the first
+    /// winner. A losing thread sees the winner's still-live slot and takes the legal
+    /// <see cref="WorkSlotEvent.DoubleAssignment"/> refusal.
+    /// </para>
+    /// </summary>
+    private static List<RaceOutcome> RaceCapturesAtOnePosition(
+        GoalPipeline pipeline,
+        WorkSlotPosition position,
+        WorkerRole role,
+        int threadCount = RaceThreads,
+        int roundsPerThread = RaceRoundsPerThread)
+    {
+        var outcomes = new List<RaceOutcome>[threadCount];
+        using var barrier = new Barrier(threadCount);
+        var threads = new Thread[threadCount];
+
+        for (var t = 0; t < threadCount; t++)
+        {
+            var index = t;
+            outcomes[index] = new List<RaceOutcome>(roundsPerThread);
+
+            threads[index] = new Thread(() =>
+            {
+                // THE RENDEZVOUS: every thread is released at the same instant, so the
+                // prediction window is entered concurrently rather than one-at-a-time.
+                barrier.SignalAndWait();
+
+                for (var round = 0; round < roundsPerThread; round++)
+                {
+                    try
+                    {
+                        var built = pipeline.CaptureDispatchPosition(role);
+                        outcomes[index].Add(new RaceOutcome(built, DoubleAssignment: false, Unexpected: null));
+
+                        // Retire immediately so the position becomes contendable again.
+                        pipeline.ForceSlotStateForTest(built.TaskId, WorkSlotState.Recorded);
+                    }
+                    catch (WorkSlotException ex) when (ex.Event == WorkSlotEvent.DoubleAssignment)
+                    {
+                        // The legal refusal: another thread held the position at that instant.
+                        outcomes[index].Add(new RaceOutcome(null, DoubleAssignment: true, Unexpected: null));
+                    }
+                    catch (Exception ex)
+                    {
+                        outcomes[index].Add(new RaceOutcome(null, DoubleAssignment: false, Unexpected: ex));
+                    }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = $"work-slot-race-{index}",
+            };
+        }
+
+        foreach (var thread in threads)
+            thread.Start();
+
+        foreach (var thread in threads)
+            Assert.True(thread.Join(RaceTimeout), "A racing capture thread never finished.");
+
+        return [.. outcomes.SelectMany(o => o)];
+    }
+
+    /// <summary>Generous bound for the whole race — a hang is a failure, not a slow test.</summary>
+    private static readonly TimeSpan RaceTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// THE ATOMIC-DERIVATION PROOF. Sixteen threads race captures at ONE position, released
+    /// together by a barrier. Four outcome invariants are asserted INDIVIDUALLY, so a failure
+    /// names the defect instead of reporting a generic mismatch:
+    /// <list type="number">
+    ///   <item>NO UNEXPECTED EXCEPTION — in particular no duplicate-ID
+    ///     <see cref="ArgumentException"/>. The real implementation derives the ID from the
+    ///     attempt it is committing inside the same lock span, so the ID is unique by
+    ///     construction and that failure is unreachable. A prediction race builds the ID from a
+    ///     value another thread may already have consumed, and because retired slots stay in the
+    ///     registry the stale ID collides — the helper then throws ArgumentException.</item>
+    ///   <item>SELF-CONSISTENCY — every returned result's parsed TaskId suffix equals its own
+    ///     <see cref="SlotBuildResult.Attempt"/>. This is the 001-vs-2 divergence, asserted per
+    ///     result.</item>
+    ///   <item>UNIQUENESS — no two successful captures share an attempt, and no two share a
+    ///     TaskId. Two threads reading the same "next attempt" outside the lock breaks this.</item>
+    ///   <item>COUNTER AGREEMENT — the committed counter equals the number of successes exactly,
+    ///     so the attempts form the contiguous run 1..N with nothing skipped or reused.</item>
+    /// </list>
+    /// <para>
+    /// The race is also required to be REAL: at least one capture must succeed and the run must
+    /// produce a meaningful number of successes, so the test can never pass vacuously by having
+    /// every thread refused.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Capture_ConcurrentSamePosition_IdAttemptAndCounterAreDerivedAtomically()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+
+        var outcomes = RaceCapturesAtOnePosition(pipeline, pos, WorkerRole.Coder);
+
+        // ── (1) NO UNEXPECTED EXCEPTION ────────────────────────────────────────────────
+        var unexpected = outcomes.Where(o => o.Unexpected is not null).Select(o => o.Unexpected!).ToList();
+        Assert.True(
+            unexpected.Count == 0,
+            "A racing capture threw an exception that atomic derivation makes unreachable — " +
+            $"{unexpected.Count} of {outcomes.Count} captures failed unexpectedly. First: " +
+            $"{unexpected.FirstOrDefault()?.GetType().Name}: {unexpected.FirstOrDefault()?.Message}. " +
+            "A duplicate-ID ArgumentException here means the task ID was built from a PREDICTED " +
+            "attempt outside the allocation lock, so a stale ID collided with an already-registered slot.");
+
+        var results = outcomes.Where(o => o.Result is not null).Select(o => o.Result!).ToList();
+
+        // THE RACE MUST BE REAL — never a vacuous pass.
+        Assert.True(results.Count > 0, "No capture succeeded — the race proved nothing.");
+
+        // ── (2) SELF-CONSISTENCY, per result ───────────────────────────────────────────
+        var inconsistent = results
+            .Where(r => AttemptFromTaskId(r.TaskId) != r.Attempt)
+            .ToList();
+        Assert.True(
+            inconsistent.Count == 0,
+            $"{inconsistent.Count} result(s) carry a TaskId whose attempt suffix differs from the returned " +
+            $"Attempt — e.g. TaskId '{inconsistent.FirstOrDefault()?.TaskId}' vs Attempt " +
+            $"{inconsistent.FirstOrDefault()?.Attempt}. The ID was not built from the attempt that was " +
+            "actually allocated, so the two were not born in one lock span.");
+
+        // ── (3) UNIQUENESS of both the attempt and the ID ──────────────────────────────
+        var duplicateAttempts = results
+            .GroupBy(r => r.Attempt)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)
+            .OrderBy(a => a)
+            .ToList();
+        Assert.True(
+            duplicateAttempts.Count == 0,
+            $"Attempt number(s) [{string.Join(", ", duplicateAttempts)}] were handed to more than one " +
+            "successful capture — two threads read the same next attempt outside the allocation lock.");
+
+        var duplicateIds = results
+            .GroupBy(r => r.TaskId, StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)
+            .ToList();
+        Assert.True(
+            duplicateIds.Count == 0,
+            $"Task ID(s) [{string.Join(", ", duplicateIds)}] were produced by more than one successful " +
+            "capture — the ID was derived from a predicted, non-exclusive attempt.");
+
+        // ── (4) COUNTER AGREEMENT: the counter committed exactly one attempt per success ──
+        // Every successful slot was retired by its own thread, so the position is free and the
+        // probe's attempt reveals the committed counter: successes + 1.
+        Assert.Equal(results.Count + 1, ProbeAttempt(pipeline, pos));
+
+        // …which, with uniqueness above, means the attempts are exactly the contiguous run 1..N.
+        Assert.Equal(
+            Enumerable.Range(1, results.Count),
+            results.Select(r => r.Attempt).OrderBy(a => a));
+    }
+
+    /// <summary>
+    /// The same race run against a position seeded with a DEAD predecessor, so every thread is
+    /// live-eligible from the very first round and the contention starts at attempt 2. This
+    /// widens the prediction window (there is a non-zero counter to mis-predict from the outset)
+    /// while pinning the same four invariants.
+    /// </summary>
+    [Fact]
+    public void Capture_ConcurrentSamePositionWithDeadPredecessor_StillDerivesAtomically()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+
+        // A helper-allocated attempt 1, retired: the counter starts at 1 and the position is free.
+        var seeded = pipeline.AllocateAttemptAndRegisterSlot("add-auth-coder-002-01-001", pos);
+        Assert.Equal(1, seeded.Attempt);
+        Assert.True(pipeline.ForceSlotStateForTest(seeded.TaskId, WorkSlotState.Recorded));
+
+        var outcomes = RaceCapturesAtOnePosition(pipeline, pos, WorkerRole.Coder);
+
+        var unexpected = outcomes.Where(o => o.Unexpected is not null).Select(o => o.Unexpected!).ToList();
+        Assert.True(
+            unexpected.Count == 0,
+            $"{unexpected.Count} racing capture(s) threw unexpectedly. First: " +
+            $"{unexpected.FirstOrDefault()?.GetType().Name}: {unexpected.FirstOrDefault()?.Message}.");
+
+        var results = outcomes.Where(o => o.Result is not null).Select(o => o.Result!).ToList();
+        Assert.True(results.Count > 0, "No capture succeeded — the race proved nothing.");
+
+        var inconsistent = results.Where(r => AttemptFromTaskId(r.TaskId) != r.Attempt).ToList();
+        Assert.True(
+            inconsistent.Count == 0,
+            $"{inconsistent.Count} result(s) carry a TaskId suffix differing from the returned Attempt — " +
+            $"e.g. '{inconsistent.FirstOrDefault()?.TaskId}' vs {inconsistent.FirstOrDefault()?.Attempt}.");
+
+        Assert.Distinct(results.Select(r => r.Attempt));
+        Assert.Distinct(results.Select(r => r.TaskId), StringComparer.Ordinal);
+
+        // The counter absorbed the seeded 1 plus exactly one per success.
+        Assert.Equal(results.Count + 2, ProbeAttempt(pipeline, pos));
+
+        // Contention genuinely began past the seeded attempt.
+        Assert.DoesNotContain(1, results.Select(r => r.Attempt));
+    }
+
+    /// <summary>
+    /// THE CONCURRENT HONEST-FORM RE-CHECK. Two threads race a capture at a position already held
+    /// by a LIVE seeded slot whose task ID is exactly the one the capture would build — both the
+    /// duplicate-ID arbiter and the LIVE-position rule apply at once.
+    /// <para>
+    /// Only the OUTCOME is asserted, per the goal's honest form: BOTH threads are refused, no
+    /// third outcome ever appears, and the registry is byte-identical afterwards. No claim is made
+    /// about WHICH layer rejected either thread.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Capture_ConcurrentSeededLiveCollision_BothThreadsAreRefusedAndNothingChanges()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+        Assert.True(pipeline.SeedSlotForTest("add-auth-coder-002-01-001", pos, 1, WorkSlotState.Pending));
+
+        var before = Snapshot(pipeline);
+
+        const int threads = 2;
+        var succeeded = 0;
+        var refused = 0;
+        using var barrier = new Barrier(threads);
+        var workers = new Thread[threads];
+
+        for (var t = 0; t < threads; t++)
+        {
+            workers[t] = new Thread(() =>
+            {
+                barrier.SignalAndWait();
+                try
+                {
+                    pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+                    Interlocked.Increment(ref succeeded);
+                }
+                catch (Exception)
+                {
+                    // The honest form: a refusal is a refusal — the layer is not claimed.
+                    Interlocked.Increment(ref refused);
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "work-slot-collision-racer",
+            };
+        }
+
+        foreach (var worker in workers)
+            worker.Start();
+        foreach (var worker in workers)
+            Assert.True(worker.Join(RaceTimeout), "A colliding capture thread never finished.");
+
+        Assert.Equal(0, Volatile.Read(ref succeeded));
+        Assert.Equal(threads, Volatile.Read(ref refused));
+
+        // No third outcome, and the registry is untouched: the seeded slot alone, unchanged.
+        Assert.Equal(before, Snapshot(pipeline));
+        Assert.Single(pipeline.GetSlotsForTest());
+
+        // No attempt was consumed by either refusal.
+        Assert.True(pipeline.ForceSlotStateForTest("add-auth-coder-002-01-001", WorkSlotState.Recorded));
+        Assert.Equal(1, ProbeAttempt(pipeline, pos, "probe-after-collision"));
+    }
+
+    #endregion
+
+    #region (s) The capture-level LIVE pre-check — the layer distinction
+
+    /// <summary>
+    /// THE CAPTURE-LEVEL LIVE PRE-CHECK IS OBSERVABLE, and this pins it.
+    /// <para>
+    /// A LIVE slot occupies the position AND already owns the exact task ID the capture would
+    /// build. Both refusal layers are therefore armed, but they are reached in a fixed order and
+    /// they throw DIFFERENT types:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item>the capture's step-6 pre-check runs FIRST and reports the slot-integrity event —
+    ///     <see cref="WorkSlotException"/> carrying <see cref="WorkSlotEvent.DoubleAssignment"/>
+    ///     and the occupant's task ID;</item>
+    ///   <item>only if that pre-check is absent does control reach the allocation helper, whose
+    ///     duplicate-ID guard is evaluated BEFORE its own live-position scan and therefore throws
+    ///     a plain <see cref="ArgumentException"/> instead.</item>
+    /// </list>
+    /// <para>
+    /// So this vector distinguishes the two layers by exception TYPE: removing the capture-level
+    /// pre-check changes the observed type from <c>WorkSlotException</c> to <c>ArgumentException</c>.
+    /// This is deliberately SEPARATE from the honest-form test
+    /// <see cref="Capture_SeededCollidingTaskIdAtSamePosition_IsRefusedWithoutMutation"/>, which
+    /// asserts only the outcome and stays as the goal specified — that test is not weakened, and
+    /// this one adds the layer fact it deliberately declines to claim.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Capture_LiveSlotOwningTheProspectiveId_IsRefusedByTheCaptureLevelPreCheck()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+
+        // The occupant is LIVE at the position AND owns the exact prospective ID.
+        const string prospectiveId = "add-auth-coder-002-01-001";
+        Assert.True(pipeline.SeedSlotForTest(prospectiveId, pos, 1, WorkSlotState.Pending));
+
+        var before = Snapshot(pipeline);
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        // THE LAYER MARKER: the slot-integrity event, NOT the helper's argument failure.
+        Assert.Equal(WorkSlotEvent.DoubleAssignment, ex.Event);
+        Assert.Equal(prospectiveId, ex.ExistingTaskId);
+        Assert.Equal(pos, ex.Position);
+
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// The same layer distinction with the occupant CLAIMED rather than Pending — the pre-check
+    /// treats both live states identically, so the type is still the slot-integrity one.
+    /// </summary>
+    [Fact]
+    public void Capture_ClaimedSlotOwningTheProspectiveId_IsRefusedByTheCaptureLevelPreCheck()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+        const string prospectiveId = "add-auth-coder-002-01-001";
+        Assert.True(pipeline.SeedSlotForTest(prospectiveId, pos, 1, WorkSlotState.Claimed));
+
+        var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
+
+        Assert.Equal(WorkSlotEvent.DoubleAssignment, ex.Event);
+        Assert.Equal(prospectiveId, ex.ExistingTaskId);
     }
 
     #endregion

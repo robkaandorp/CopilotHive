@@ -29,6 +29,15 @@ public sealed class GoalPipeline
     /// </summary>
     private readonly Dictionary<WorkSlotPosition, int> _dispatchAttempts = [];
 
+    /// <summary>
+    /// The phase sequence INSTALLED on the state machine for the current iteration, or
+    /// <c>null</c> when no plan is installed. It is a defensive COPY of the plan's phase list,
+    /// taken at install time, and is only ever REPLACED — never mutated in place — so a reference
+    /// handed to <see cref="PipelineStateMachine.CapturePosition"/> satisfies that method's
+    /// stable-input covenant without holding any lock across the call. Guarded by <c>_lock</c>.
+    /// </summary>
+    private List<GoalPhase>? _installedPhases;
+
     /// <summary>Unique identifier of the goal this pipeline is tracking.</summary>
     public string GoalId { get; }
     /// <summary>Human-readable description of the goal.</summary>
@@ -214,7 +223,23 @@ public sealed class GoalPipeline
         // Rebuild the state machine from the persisted plan so the dashboard
         // can correctly show completed / active / pending phases.
         if (Plan is not null)
+        {
+            // A defensive COPY of the restored plan: the capture's stable-input covenant is
+            // satisfied without ever holding a lock across the machine call.
+            _installedPhases = [.. Plan.Phases];
             StateMachine.RestoreFromPlan(Plan.Phases, Phase);
+        }
+        else
+        {
+            // THE NO-PLAN SYNC. Without a plan there is nothing to install, so the capture has
+            // no phase list — but the machine must still AGREE with the restored phase instead
+            // of silently sitting at its Planning default. Restoring from an EMPTY plan leaves
+            // the queue empty and drives StateMachine.Phase to snapshot.Phase, so a capture
+            // classifies honestly (InvalidPhase for a non-worker phase, PlanUnavailable for a
+            // worker phase) instead of misreporting the position.
+            _installedPhases = null;
+            StateMachine.RestoreFromPlan([], Phase);
+        }
     }
 
     /// <summary>Advance to the next phase.</summary>
@@ -222,6 +247,13 @@ public sealed class GoalPipeline
     {
         lock (_lock)
         {
+            // TERMINAL-ONLY ABANDONMENT. Reaching Done or Failed retires every slot whose work
+            // was never claimed; the abandonment happens BEFORE the phase assignment so no
+            // observer can see a terminal pipeline that still carries pending slots. Every other
+            // AdvanceTo leaves the registry untouched.
+            if (phase is GoalPhase.Done or GoalPhase.Failed)
+                AbandonPendingSlots();
+
             Phase = phase;
             if (phase is GoalPhase.Done or GoalPhase.Failed)
                 CompletedAt = DateTime.UtcNow;
@@ -266,10 +298,24 @@ public sealed class GoalPipeline
     }
 
     /// <summary>Set the iteration plan from the Brain.</summary>
+    /// <param name="plan">The plan to install. Must not be <c>null</c>.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="plan"/> is <c>null</c>. Thrown BEFORE any mutation: no slot is abandoned,
+    /// the installed phases are untouched, and <see cref="Plan"/> keeps its previous value.
+    /// </exception>
     public void SetPlan(IterationPlan plan)
     {
+        // THE NULL CONTRACT: the refusal precedes the lock, so a null plan cannot abandon a
+        // single pending slot nor replace the installed phase list.
+        ArgumentNullException.ThrowIfNull(plan);
+
         lock (_lock)
         {
+            // (a) A new plan supersedes every unclaimed dispatch; claimed work keeps its slot.
+            AbandonPendingSlots();
+            // (b) A defensive COPY: later mutation of the caller's list cannot reach the capture.
+            _installedPhases = [.. plan.Phases];
+            // (c) Only then does the plan become visible.
             Plan = plan;
         }
     }
@@ -280,6 +326,8 @@ public sealed class GoalPipeline
         lock (_lock)
         {
             Plan = null;
+            _installedPhases = null;
+            AbandonPendingSlots();
         }
     }
 
@@ -323,6 +371,221 @@ public sealed class GoalPipeline
     public string BuildContextSummary() => ConversationTracker.BuildContextSummary(this);
 
     #region Work-slot registry
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  LOCK ORDER (the prohibition, stated once for the whole region).
+    //
+    //  Two monitors exist on this path: the pipeline's own `_lock` (registry + plan state)
+    //  and PipelineStateMachine's private `_machineLock` (taken internally by every machine
+    //  entry point, including CapturePosition).
+    //
+    //  The reverse nested acquisition — holding `_lock` while acquiring `_machineLock` —
+    //  is PROHIBITED. CaptureDispatchPosition therefore calls
+    //  StateMachine.CapturePosition with NO pipeline lock held, and every registry touch
+    //  around it is a SEPARATE short-lived `_lock` acquisition. Nesting is never required,
+    //  so the two monitors can never be taken in opposing orders and no lock-order cycle
+    //  can exist.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// TEST-ONLY: a fresh copy of the phase sequence installed for the current iteration,
+    /// or <c>null</c> when nothing is installed.
+    /// </summary>
+    internal IReadOnlyList<GoalPhase>? InstalledPhasesForTest => _installedPhases is null ? null : [.. _installedPhases];
+
+    /// <summary>
+    /// Captures the pipeline's dispatch position for <paramref name="role"/> and atomically
+    /// allocates the work slot that position's next dispatch will occupy.
+    /// <para>
+    /// SEVEN STEPS, in this exact order — every refusal is a THROW, and every refusal happens
+    /// before any registry mutation:
+    /// </para>
+    /// <list type="number">
+    ///   <item>take the machine's phase/occurrence snapshot (no pipeline lock held);</item>
+    ///   <item>CLASSIFY FIRST — a phase outside {Coding, Testing, DocWriting, Review, Improve}
+    ///     is <see cref="WorkSlotEvent.InvalidPhase"/>;</item>
+    ///   <item>an unfound occurrence is <see cref="WorkSlotEvent.PlanUnavailable"/>, carrying
+    ///     occurrence <c>0</c>;</item>
+    ///   <item>a pipeline phase disagreeing with the snapshot is
+    ///     <see cref="WorkSlotEvent.PhaseDivergence"/>;</item>
+    ///   <item>a role differing from <see cref="GoalPhaseExtensions.ToWorkerRole"/>'s mapping —
+    ///     including an undefined role — is <see cref="WorkSlotEvent.RoleMismatch"/>;</item>
+    ///   <item>a LIVE slot already at the position is
+    ///     <see cref="WorkSlotEvent.DoubleAssignment"/>; a DEAD slot (Recorded or Abandoned)
+    ///     permits the capture to continue;</item>
+    ///   <item>the ATOMIC allocation via
+    ///     <see cref="AllocateAttemptAndRegisterSlotWithId"/> — the task ID is built from the
+    ///     attempt allocated inside that one lock span, so the ID's attempt, the returned
+    ///     <see cref="SlotBuildResult.Attempt"/>, and the committed counter can never diverge.</item>
+    /// </list>
+    /// <para>
+    /// HONEST ATOMICITY. The phase+occurrence PAIR is atomic at the snapshot instant (the machine
+    /// computes it under its own lock). The ITERATION is sourced separately: it is read under
+    /// <c>_lock</c> when the position is constructed, so the position's iteration and the
+    /// allocation happen in ADJACENT short-lived lock acquisitions rather than one span. The
+    /// integrity boundary is the in-memory registry: within a process lifetime a position is never
+    /// silently double-assigned; the cross-restart case is out of scope here.
+    /// </para>
+    /// <para>
+    /// POINTER INDEPENDENCE: the capture never reads or writes <see cref="ActiveTaskId"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="role">The role the caller intends to dispatch to.</param>
+    /// <returns>The freshly built task ID, its position, and its allocated attempt number.</returns>
+    /// <exception cref="WorkSlotException">Any of the six integrity refusals above.</exception>
+    internal SlotBuildResult CaptureDispatchPosition(WorkerRole role)
+    {
+        // (1) THE SNAPSHOT. `_installedPhases` is only ever REPLACED, never mutated in place, so
+        // the reference read here is stable for the whole machine call — which is made with NO
+        // pipeline lock held (see the lock-order prohibition above).
+        List<GoalPhase>? installed;
+        lock (_lock)
+        {
+            installed = _installedPhases;
+        }
+
+        var snapshot = StateMachine.CapturePosition(installed);
+
+        // The iteration is sourced separately from the phase/occurrence pair — see the honest
+        // atomicity note above.
+        int iteration;
+        GoalPhase pipelinePhase;
+        lock (_lock)
+        {
+            iteration = Iteration;
+            pipelinePhase = Phase;
+        }
+
+        // (2) CLASSIFICATION FIRST — before the plan-availability flag is consulted at all.
+        if (snapshot.Phase is not (GoalPhase.Coding or GoalPhase.Testing or GoalPhase.DocWriting
+            or GoalPhase.Review or GoalPhase.Improve))
+        {
+            throw new WorkSlotException(
+                WorkSlotEvent.InvalidPhase,
+                new WorkSlotPosition(iteration, snapshot.Phase, snapshot.Occurrence),
+                pipelinePhase: null,
+                snapshot.Phase);
+        }
+
+        // (3) NO PLAN TO DERIVE FROM. Both sources land here: a plan whose executed prefix does
+        // not contain the phase, and the no-plan restoration (occurrence 0).
+        if (!snapshot.OccurrenceFound)
+        {
+            throw new WorkSlotException(
+                WorkSlotEvent.PlanUnavailable,
+                new WorkSlotPosition(iteration, snapshot.Phase, 0),
+                pipelinePhase: null,
+                snapshot.Phase);
+        }
+
+        var position = new WorkSlotPosition(iteration, snapshot.Phase, snapshot.Occurrence);
+
+        // (4) DIVERGENCE between the pipeline's own phase and the machine's.
+        if (pipelinePhase != snapshot.Phase)
+            throw new WorkSlotException(WorkSlotEvent.PhaseDivergence, position, pipelinePhase, snapshot.Phase);
+
+        // (5) ROLE VALIDATION against the single existing mapping. An undefined role simply
+        // differs from the derived role, so it lands on the same refusal.
+        var derivedRole = snapshot.Phase.ToWorkerRole();
+        if (role != derivedRole)
+            throw new WorkSlotException(WorkSlotEvent.RoleMismatch, position, role, derivedRole);
+
+        // (6) THE LIVE-POSITION CHECK — a SHORT-LIVED registry read. A DEAD slot (Recorded or
+        // Abandoned) does not occupy the position, so the capture continues.
+        var occupant = FindLiveSlotTaskIdAt(position);
+        if (occupant is not null)
+            throw new WorkSlotException(WorkSlotEvent.DoubleAssignment, position, occupant);
+
+        // (7) THE ATOMIC ALLOCATION: counter, task ID, and registration in ONE lock span.
+        return AllocateAttemptAndRegisterSlotWithId(GoalId, role, position);
+    }
+
+    /// <summary>
+    /// Returns the task ID of the LIVE (Pending or Claimed) slot occupying
+    /// <paramref name="position"/>, or <c>null</c> when the position is free. Dead slots
+    /// (Recorded, Abandoned) never occupy a position.
+    /// </summary>
+    private string? FindLiveSlotTaskIdAt(WorkSlotPosition position)
+    {
+        lock (_lock)
+        {
+            foreach (var (_, entry) in _slots)
+            {
+                if (entry.State is not (WorkSlotState.Pending or WorkSlotState.Claimed))
+                    continue;
+                if (entry.Slot.Position != position)
+                    continue;
+                return entry.Slot.TaskId;
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Allocates the next dispatch attempt for <paramref name="position"/>, BUILDS the task ID
+    /// from that freshly allocated attempt, and registers the resulting
+    /// <see cref="WorkSlotState.Pending"/> slot — all inside ONE <c>_lock</c> acquisition.
+    /// <para>
+    /// THE PREDICTION RACE IS ELIMINATED because nothing outside the lock ever guesses the
+    /// attempt: the attempt embedded in the task ID, the returned
+    /// <see cref="SlotBuildResult.Attempt"/>, and the committed counter are the SAME value, born
+    /// in the same lock span. The ID format is
+    /// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c> (e.g.
+    /// <c>add-auth-coder-002-01-001</c>) with the goal ID used verbatim and the role name from
+    /// <see cref="WorkerRoleExtensions.ToRoleName"/>.
+    /// </para>
+    /// <para>
+    /// This is an ADDITIVE overload: <see cref="AllocateAttemptAndRegisterSlot(string, WorkSlotPosition)"/>
+    /// is untouched and keeps its own contract.
+    /// </para>
+    /// </summary>
+    /// <param name="goalId">The goal ID, embedded verbatim in the task ID; must be non-blank.</param>
+    /// <param name="role">The role whose name is embedded in the task ID.</param>
+    /// <param name="position">The iteration/phase/occurrence position the slot occupies.</param>
+    /// <returns>The built task ID, the position, and the allocated attempt number.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="goalId"/> is null or blank, or a slot is already registered for the task ID
+    /// this allocation would build.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="position"/> is <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException"><paramref name="role"/> has no role name.</exception>
+    /// <exception cref="WorkSlotException">
+    /// A live (Pending or Claimed) slot already occupies <paramref name="position"/>.
+    /// </exception>
+    internal SlotBuildResult AllocateAttemptAndRegisterSlotWithId(string goalId, WorkerRole role, WorkSlotPosition position)
+    {
+        if (string.IsNullOrWhiteSpace(goalId))
+            throw new ArgumentException("Goal ID must be a non-blank string.", nameof(goalId));
+        ArgumentNullException.ThrowIfNull(position);
+
+        var roleName = role.ToRoleName();
+
+        lock (_lock)
+        {
+            // The prospective attempt is READ but not yet committed, so every refusal below
+            // still leaves the counter exactly where it was.
+            var attempt = _dispatchAttempts.TryGetValue(position, out var previous) ? previous + 1 : 1;
+            var taskId = $"{goalId}-{roleName}-{position.Iteration:D3}-{position.Occurrence:D2}-{attempt:D3}";
+
+            if (_slots.ContainsKey(taskId))
+                throw new ArgumentException($"A work slot is already registered for task '{taskId}'.", nameof(goalId));
+
+            foreach (var (_, entry) in _slots)
+            {
+                if (entry.State is not (WorkSlotState.Pending or WorkSlotState.Claimed))
+                    continue;
+                if (entry.Slot.Position != position)
+                    continue;
+                throw new WorkSlotException(WorkSlotEvent.DoubleAssignment, position, entry.Slot.TaskId);
+            }
+
+            _dispatchAttempts[position] = attempt;
+            _slots[taskId] = (new WorkSlot(taskId, position, attempt), WorkSlotState.Pending);
+
+            return new SlotBuildResult(taskId, position, attempt);
+        }
+    }
 
     /// <summary>
     /// Allocates the next dispatch attempt number for <paramref name="position"/> and registers a
