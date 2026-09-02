@@ -57,6 +57,17 @@ internal sealed class TaskCompletionService
             return;
         }
 
+        // Guard: during the re-plan (Planning) window the state machine has an empty phase queue —
+        // any completion arriving here (late duplicate, or a task cancelled by the previous
+        // iteration) must drop cleanly instead of flowing into Transition and killing the goal.
+        if (pipeline.StateMachine.Phase == GoalPhase.Planning)
+        {
+            _logger.LogWarning(
+                "StaleCompletion goal={GoalId} task={TaskId} pipeline-phase={Phase} machine-phase={Phase} reason=planning-window",
+                pipeline.GoalId, result.TaskId, pipeline.Phase, pipeline.StateMachine.Phase);
+            return;
+        }
+
         // Guard: ignore completions from tasks that are no longer the active task
         // (e.g., a stale task from a previous phase completing after the pipeline advanced)
         if (pipeline.ActiveTaskId is not null && pipeline.ActiveTaskId != result.TaskId)

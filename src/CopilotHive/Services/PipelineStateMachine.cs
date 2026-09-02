@@ -209,8 +209,11 @@ public sealed class PipelineStateMachine
     {
         _completedPhases.Clear();
         _remainingPhases.Clear();
-        Phase = GoalPhase.Coding;
-        return new(GoalPhase.Coding, TransitionEffect.NewIteration);
+        // The re-plan window is honestly Planning: the queue is empty, so Transition() cannot
+        // advance anywhere and the Planning guard above rejects any further input until the
+        // caller re-plans and calls StartIteration().
+        Phase = GoalPhase.Planning;
+        return new(GoalPhase.Planning, TransitionEffect.NewIteration);
     }
 
     private TransitionResult Complete()

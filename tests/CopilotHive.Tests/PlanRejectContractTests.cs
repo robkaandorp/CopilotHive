@@ -1115,13 +1115,14 @@ public sealed class PlanRejectContractTests
         Assert.Equal(iterationBefore, mergingEntry.Iteration);
     }
 
-    // ── No assumed Coding phase before planning ─────────────────────────────
+    // ── No assumed Coding phase before planning: the window is honestly Planning ──
 
     [Fact]
-    public async Task HandleNewIterationAsync_PlanningObservesPrePlanningPhase_NotAssumedCoding()
+    public async Task HandleNewIterationAsync_PlanningObservesPlanningWindow_NotAssumedCoding()
     {
         // The pipeline must NOT be advanced to an assumed Coding phase before planning:
-        // planning would observe a phase the Brain never chose.
+        // planning would observe a phase the Brain never chose. Instead the re-plan window is
+        // the honest Planning phase, opened as the first operation of the handler.
         var observedPhases = new List<GoalPhase>();
         var plan = IterationPlan.Default();
         var (driver, pipeline, _) = CreateDriver(
@@ -1132,7 +1133,8 @@ public sealed class PlanRejectContractTests
 
         await driver.HandleNewIterationAsync(pipeline, "FAIL", TestContext.Current.CancellationToken);
 
-        Assert.Equal([GoalPhase.Review], observedPhases);
+        Assert.Equal([GoalPhase.Planning], observedPhases);
+        Assert.DoesNotContain(GoalPhase.Coding, observedPhases);
         // Only AFTER a valid plan is accepted does the phase move to the planned first phase.
         Assert.Equal(plan.Phases[0], pipeline.Phase);
     }
@@ -1141,6 +1143,8 @@ public sealed class PlanRejectContractTests
     public async Task HandleNewIterationAsync_CallerCancelled_LeavesNoTransientCodingPhase()
     {
         // Caller cancellation during planning must not leave a transient Coding assumption behind.
+        // Under the honest-window design the pipeline legitimately stays in Planning — the phase
+        // it was moved to when the re-plan window opened — never in an assumed Coding phase.
         using var cts = new CancellationTokenSource();
         cts.Cancel();
         var (driver, pipeline, _) = CreateDriver(
@@ -1151,8 +1155,9 @@ public sealed class PlanRejectContractTests
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
             driver.HandleNewIterationAsync(pipeline, "FAIL", cts.Token));
 
-        // The pipeline stays in its pre-planning phase — no assumed Coding transition survived.
-        Assert.Equal(GoalPhase.Review, pipeline.Phase);
+        // The pipeline stays in the honest Planning window — no assumed Coding transition survived.
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+        Assert.NotEqual(GoalPhase.Coding, pipeline.Phase);
     }
 
     [Fact]
@@ -1168,8 +1173,78 @@ public sealed class PlanRejectContractTests
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
             driver.HandleMergeFailureAsync(pipeline, "conflict in Program.cs", cts.Token));
 
-        Assert.Equal(GoalPhase.Review, pipeline.Phase);
+        // Same contract: the window phase is Planning, never an assumed Coding phase.
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+        Assert.NotEqual(GoalPhase.Coding, pipeline.Phase);
     }
+
+    // ── Iteration-budget exhaustion drops the already-built summary ─────────
+
+    [Fact]
+    public async Task HandleNewIterationAsync_IterationBudgetExhausted_DropsSummaryWithoutDuplicate()
+    {
+        // The ending-iteration summary is BUILT before TryConsume (so it snapshots the ending
+        // iteration) but only ADDED/persisted after a successful consume. On exhaustion it is
+        // dropped: FinalizeGoalAsync's terminal summary owns the record.
+        var (driver, pipeline, goalStore) = CreateDriver(
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())));
+
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        var reviewEntry = PhaseResult.Create(GoalPhase.Review, pipeline.Iteration, 1);
+        reviewEntry.Result = PhaseOutcome.Fail;
+        reviewEntry.CompletedAt = DateTime.UtcNow;
+        pipeline.PhaseLog.Add(reviewEntry);
+
+        var summariesBefore = pipeline.CompletedIterationSummaries.Count;
+
+        await driver.HandleNewIterationAsync(pipeline, "FAIL", TestContext.Current.CancellationToken);
+
+        // Terminal path taken from the honest Planning window.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(GoalPhase.Failed, pipeline.StateMachine.Phase);
+
+        // Exactly ONE summary — the terminal one from FinalizeGoalAsync, no pre-retry duplicate.
+        Assert.Equal(summariesBefore, pipeline.CompletedIterationSummaries.Count - 1);
+
+        // Exactly ONE status update carried an IterationSummary, and it is the Failed one.
+        var summaryUpdates = goalStore.StatusUpdates
+            .Where(u => u.Metadata?.IterationSummary is not null)
+            .ToList();
+        var failedUpdate = Assert.Single(summaryUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+    }
+
+    [Fact]
+    public async Task HandleNewIterationAsync_BudgetAvailable_PersistsEndingIterationSummary()
+    {
+        // With budget available, the summary is added and persisted — and it snapshots the
+        // ENDING iteration (built before TryConsume), not the new one.
+        var (driver, pipeline, goalStore) = CreateDriver(
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())));
+
+        var reviewEntry = PhaseResult.Create(GoalPhase.Review, pipeline.Iteration, 1);
+        reviewEntry.Result = PhaseOutcome.Fail;
+        reviewEntry.CompletedAt = DateTime.UtcNow;
+        pipeline.PhaseLog.Add(reviewEntry);
+        var endingIteration = pipeline.Iteration;
+
+        await driver.HandleNewIterationAsync(pipeline, "FAIL", TestContext.Current.CancellationToken);
+
+        Assert.Equal(endingIteration + 1, pipeline.Iteration);
+        var completed = Assert.Single(pipeline.CompletedIterationSummaries);
+        Assert.Equal(endingIteration, completed.Iteration);
+        Assert.Equal(PhaseOutcome.Fail,
+            Assert.Single(completed.Phases, p => p.Name == GoalPhase.Review).Result);
+
+        var inProgressUpdate = Assert.Single(
+            goalStore.StatusUpdates, u => u.Metadata?.IterationSummary is not null);
+        Assert.Equal(GoalStatus.InProgress, inProgressUpdate.Status);
+        Assert.Equal(endingIteration, inProgressUpdate.Metadata!.IterationSummary!.Iteration);
+    }
+
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 

@@ -107,6 +107,11 @@ public sealed class GoalDispatcherReviewVerdictTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries);
+        // Put the pipeline genuinely mid-iteration: the state machine must be inside the plan
+        // (not in the Planning re-plan window) or TaskCompletionService drops the completion.
+        var iterationPlan = IterationPlan.Default();
+        pipeline.SetPlan(iterationPlan);
+        pipeline.StateMachine.RestoreFromPlan(iterationPlan.Phases, phase);
         pipeline.AdvanceTo(phase);
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -1188,6 +1193,9 @@ public sealed class GoalDispatcherPhaseDurationLoggingTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var durationPlan = IterationPlan.Default();
+        pipeline.SetPlan(durationPlan);
+        pipeline.StateMachine.RestoreFromPlan(durationPlan.Phases, GoalPhase.Testing);
         pipeline.AdvanceTo(GoalPhase.Testing); // Use Testing phase to avoid no-op detection in Coding
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -1363,6 +1371,9 @@ public sealed class GoalDispatcherPhaseModelLoggingTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var modelPlan = IterationPlan.Default();
+        pipeline.SetPlan(modelPlan);
+        pipeline.StateMachine.RestoreFromPlan(modelPlan.Phases, GoalPhase.Testing);
         pipeline.AdvanceTo(GoalPhase.Testing);
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -1509,6 +1520,62 @@ public sealed class TaskCompletionServiceGuardTests
     }
 
     /// <summary>
+    /// Guard 2b: while the state machine is in the honest Planning (re-plan) window its phase
+    /// queue is empty, so any arriving completion — late duplicate or a task belonging to the
+    /// previous iteration — must drop cleanly instead of flowing into the state machine.
+    /// The guard sits BEFORE the stale-task guard, so a NON-active task ID during Planning is
+    /// classified as a planning-window completion, not a stale one.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]  // the completion IS the active task
+    [InlineData(false)] // the completion is a non-active (stale-looking) task
+    public async Task HandleTaskCompletionAsync_PlanningWindow_LogsWarningAndReturns(bool completionIsActiveTask)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var goal = new Goal { Id = $"goal-planning-{Guid.NewGuid():N}", Description = "Test" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+
+        // Simulate the re-plan window: the state machine produced the NewIteration effect
+        // (Review + FAIL → Planning) and the driver advanced the pipeline to Planning.
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
+        var transition = pipeline.StateMachine.Transition(PhaseInput.Failed);
+        Assert.Equal(TransitionEffect.NewIteration, transition.Effect);
+        Assert.Equal(GoalPhase.Planning, pipeline.StateMachine.Phase);
+        pipeline.AdvanceTo(GoalPhase.Planning);
+
+        var arrivingTaskId = "task-arriving";
+        var activeTaskId = completionIsActiveTask ? arrivingTaskId : "task-other-active";
+        pipelineManager.RegisterTask(arrivingTaskId, goal.Id);
+        pipeline.SetActiveTask(activeTaskId);
+
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = arrivingTaskId,
+            Status = TaskOutcome.Completed,
+            Output = "late completion during re-planning",
+        }, TestContext.Current.CancellationToken);
+
+        // The planning-window classification is used — never the stale-task one.
+        var windowLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message.Contains("StaleCompletion") &&
+            l.Message.Contains("reason=planning-window") &&
+            l.Message.Contains(arrivingTaskId));
+        Assert.True(windowLog != default,
+            $"Expected planning-window warning. Logs: {string.Join(", ", logger.Logs.Select(l => l.Message))}");
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("ignoring stale completion"));
+
+        // The completion did not drive the pipeline anywhere: the window is still open.
+        Assert.Equal(GoalPhase.Planning, pipeline.Phase);
+        Assert.Equal(GoalPhase.Planning, pipeline.StateMachine.Phase);
+    }
+
+    /// <summary>
     /// Guard 3: when the task ID does not match the pipeline's ActiveTaskId
     /// (stale completion from a previous phase), the service logs a warning and returns.
     /// </summary>
@@ -1519,6 +1586,11 @@ public sealed class TaskCompletionServiceGuardTests
         var goal = new Goal { Id = $"goal-stale-{Guid.NewGuid():N}", Description = "Test" };
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        // Mid-iteration (Testing), NOT in the Planning re-plan window — so a non-active task ID
+        // is classified as a stale completion rather than a planning-window completion.
+        var stalePlan = IterationPlan.Default();
+        pipeline.SetPlan(stalePlan);
+        pipeline.StateMachine.RestoreFromPlan(stalePlan.Phases, GoalPhase.Testing);
         pipeline.AdvanceTo(GoalPhase.Testing);
 
         var oldTaskId = "task-old-phase";
@@ -1618,6 +1690,9 @@ public sealed class GoalDispatcherPushFailureLoggingTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var codingPlan = IterationPlan.Default();
+        pipeline.SetPlan(codingPlan);
+        pipeline.StateMachine.RestoreFromPlan(codingPlan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -1667,6 +1742,9 @@ public sealed class GoalDispatcherPushFailureLoggingTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var codingPlan = IterationPlan.Default();
+        pipeline.SetPlan(codingPlan);
+        pipeline.StateMachine.RestoreFromPlan(codingPlan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -1714,6 +1792,9 @@ public sealed class GoalDispatcherPushFailureLoggingTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var codingPlan = IterationPlan.Default();
+        pipeline.SetPlan(codingPlan);
+        pipeline.StateMachine.RestoreFromPlan(codingPlan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";
@@ -2419,6 +2500,9 @@ public sealed class GoalDispatcherIterationShaTests
 
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries);
+        var shaPlan = IterationPlan.Default();
+        pipeline.SetPlan(shaPlan);
+        pipeline.StateMachine.RestoreFromPlan(shaPlan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
         var taskId = $"task-{Guid.NewGuid():N}";

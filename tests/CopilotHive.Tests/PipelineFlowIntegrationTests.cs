@@ -156,7 +156,7 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
 
         var failResult = pipeline.StateMachine.Transition(PhaseInput.Failed);
         Assert.Equal(TransitionEffect.NewIteration, failResult.Effect);
-        Assert.Equal(GoalPhase.Coding, failResult.NextPhase);
+        Assert.Equal(GoalPhase.Planning, failResult.NextPhase);
 
         pipeline.IterationBudget.TryConsume();
         pipeline.TestRetryBudget.TryConsume();
@@ -210,28 +210,28 @@ public sealed class PipelineFlowIntegrationTests : IAsyncDisposable
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 1
-        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
+        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Planning (NewIteration)
         var r1 = pipeline.TestRetryBudget.TryConsume();
         Assert.True(r1, "First retry should have remaining retries.");
         pipeline.StateMachine.StartIteration(StandardPlan);
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 2
-        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
+        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Planning (NewIteration)
         var r2 = pipeline.TestRetryBudget.TryConsume();
         Assert.True(r2, "Second retry should have remaining retries.");
         pipeline.StateMachine.StartIteration(StandardPlan);
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 3
-        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
+        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Planning (NewIteration)
         var r3 = pipeline.TestRetryBudget.TryConsume();
         Assert.True(r3, "Third retry should have remaining retries.");
         pipeline.StateMachine.StartIteration(StandardPlan);
         pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
 
         // Retry 4 — limit exhausted
-        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Coding (NewIteration)
+        pipeline.StateMachine.Transition(PhaseInput.Failed);    // Testing → Planning (NewIteration)
         var r4 = pipeline.TestRetryBudget.TryConsume();
         Assert.False(r4, "Fourth retry should indicate no remaining retries (limit reached).");
 

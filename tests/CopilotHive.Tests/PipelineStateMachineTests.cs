@@ -114,10 +114,10 @@ public class PipelineStateMachineTests
 
         sm.Transition(PhaseInput.Succeeded); // → Testing
         sm.Transition(PhaseInput.Succeeded); // → Merging
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration re-plan window)
 
-        // After NewIteration, phase resets to Coding
-        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        // After NewIteration, phase resets to the honest Planning window
+        Assert.Equal(GoalPhase.Planning, sm.Phase);
         Assert.Equal(1, sm.GetCurrentPhaseOccurrence(plan));
     }
 
@@ -181,7 +181,7 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
         sm.Transition(PhaseInput.Succeeded); // → Review
         var rc = sm.Transition(PhaseInput.RequestChanges);
-        Assert.Equal(GoalPhase.Coding, rc.NextPhase);
+        Assert.Equal(GoalPhase.Planning, rc.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, rc.Effect);
 
         // Iteration 2: caller re-plans and starts new iteration
@@ -209,27 +209,27 @@ public class PipelineStateMachineTests
     // ---- DocWriting RequestChanges ----
 
     [Fact]
-    public void DocWritingRequestChanges_LoopsBackToCoding()
+    public void DocWritingRequestChanges_EntersPlanningWindow()
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
 
         var rc = sm.Transition(PhaseInput.RequestChanges);
-        Assert.Equal(GoalPhase.Coding, rc.NextPhase);
+        Assert.Equal(GoalPhase.Planning, rc.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, rc.Effect);
     }
 
     // ---- Testing failure ----
 
     [Fact]
-    public void TestingFailed_LoopsBackToCoding()
+    public void TestingFailed_EntersPlanningWindow()
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
 
         var fail = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, fail.NextPhase);
+        Assert.Equal(GoalPhase.Planning, fail.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, fail.Effect);
     }
 
@@ -238,7 +238,7 @@ public class PipelineStateMachineTests
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration)
 
         sm.StartIteration(DefaultPlan);
 
@@ -254,21 +254,21 @@ public class PipelineStateMachineTests
     // ---- DocWriting failure ----
 
     [Fact]
-    public void DocWritingFailed_LoopsBackToCoding()
+    public void DocWritingFailed_EntersPlanningWindow()
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
 
         var fail = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, fail.NextPhase);
+        Assert.Equal(GoalPhase.Planning, fail.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, fail.Effect);
     }
 
     // ---- Review failure ----
 
     [Fact]
-    public void ReviewFailed_LoopsBackToCoding()
+    public void ReviewFailed_EntersPlanningWindow()
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
@@ -276,14 +276,14 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → Review
 
         var fail = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, fail.NextPhase);
+        Assert.Equal(GoalPhase.Planning, fail.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, fail.Effect);
     }
 
     // ---- Merge conflict ----
 
     [Fact]
-    public void MergingFailed_LoopsBackToCoding()
+    public void MergingFailed_EntersPlanningWindow()
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
@@ -292,7 +292,7 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → Merging
 
         var fail = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, fail.NextPhase);
+        Assert.Equal(GoalPhase.Planning, fail.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, fail.Effect);
     }
 
@@ -304,7 +304,7 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
         sm.Transition(PhaseInput.Succeeded); // → Review
         sm.Transition(PhaseInput.Succeeded); // → Merging
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration)
 
         sm.StartIteration(DefaultPlan);
 
@@ -335,12 +335,12 @@ public class PipelineStateMachineTests
     // ---- Coding failure ----
 
     [Fact]
-    public void CodingFailed_LoopsBackToCoding_NewIteration()
+    public void CodingFailed_EntersPlanningWindow_NewIteration()
     {
         var sm = CreateStarted();
 
         var fail = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, fail.NextPhase);
+        Assert.Equal(GoalPhase.Planning, fail.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, fail.Effect);
     }
 
@@ -645,7 +645,7 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
         Assert.Equal(2, sm.CompletedPhases.Count);
 
-        sm.Transition(PhaseInput.Failed); // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed); // → Planning (NewIteration)
         Assert.Empty(sm.CompletedPhases);
     }
 
@@ -695,7 +695,7 @@ public class PipelineStateMachineTests
     {
         var sm = CreateStarted();
         sm.Transition(PhaseInput.Succeeded); // → Testing
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration)
 
         Assert.Empty(sm.RemainingPhases);
     }
@@ -709,14 +709,14 @@ public class PipelineStateMachineTests
 
         // Iteration 1: fails at Testing
         sm.Transition(PhaseInput.Succeeded); // → Testing
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration)
 
         // Iteration 2: fails at Review
         sm.StartIteration(DefaultPlan);
         sm.Transition(PhaseInput.Succeeded); // → Testing
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
         sm.Transition(PhaseInput.Succeeded); // → Review
-        sm.Transition(PhaseInput.RequestChanges); // → Coding (NewIteration)
+        sm.Transition(PhaseInput.RequestChanges); // → Planning (NewIteration)
 
         // Iteration 3: fails at Merging (conflict)
         sm.StartIteration(DefaultPlan);
@@ -724,7 +724,7 @@ public class PipelineStateMachineTests
         sm.Transition(PhaseInput.Succeeded); // → DocWriting
         sm.Transition(PhaseInput.Succeeded); // → Review
         sm.Transition(PhaseInput.Succeeded); // → Merging
-        sm.Transition(PhaseInput.Failed);    // → Coding (NewIteration)
+        sm.Transition(PhaseInput.Failed);    // → Planning (NewIteration)
 
         // Iteration 4: succeeds
         sm.StartIteration(DefaultPlan);
@@ -803,7 +803,7 @@ public class PipelineStateMachineTests
             sm.Transition(PhaseInput.Succeeded);
 
         var result = sm.Transition(PhaseInput.RequestChanges);
-        Assert.Equal(GoalPhase.Coding, result.NextPhase);
+        Assert.Equal(GoalPhase.Planning, result.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, result.Effect);
     }
 
@@ -822,7 +822,7 @@ public class PipelineStateMachineTests
             sm.Transition(PhaseInput.Succeeded);
 
         var result = sm.Transition(PhaseInput.Failed);
-        Assert.Equal(GoalPhase.Coding, result.NextPhase);
+        Assert.Equal(GoalPhase.Planning, result.NextPhase);
         Assert.Equal(TransitionEffect.NewIteration, result.Effect);
     }
 
