@@ -6,6 +6,7 @@ using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -224,6 +225,88 @@ public sealed class PipelineStore : IAsyncDisposable
         {
             if (ownsContext)
                 db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Conditionally claims the <c>task_mappings</c> row for <paramref name="taskId"/> on behalf of
+    /// <paramref name="goalId"/>, NEVER overwriting a row that belongs to a different goal.
+    /// </summary>
+    /// <remarks>
+    /// A SINGLE-STATEMENT conditional upsert executed as parameterized raw SQL — there is no read,
+    /// no tracked entity, and therefore no check-then-write window a competing writer could slip
+    /// through. The <c>WHERE goal_id = @goalId</c> on the conflict branch is the ownership guard:
+    /// re-claiming our own row is idempotent, while another goal's row is left INTACT and reported
+    /// as a refusal. A store failure PROPAGATES — nothing is swallowed here.
+    /// </remarks>
+    /// <param name="taskId">The task id (primary key of <c>task_mappings</c>).</param>
+    /// <param name="goalId">The goal claiming the mapping.</param>
+    /// <returns><c>true</c> when the row is ours after the statement; <c>false</c> when it belongs to another goal.</returns>
+    public bool TrySaveTaskMappingIfUnowned(string taskId, string goalId)
+    {
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            var affected = db.Database.ExecuteSqlRaw(
+                """
+                INSERT INTO task_mappings (task_id, goal_id) VALUES (@taskId, @goalId)
+                ON CONFLICT(task_id) DO UPDATE SET goal_id = @goalId WHERE goal_id = @goalId
+                """,
+                new SqliteParameter("@taskId", taskId),
+                new SqliteParameter("@goalId", goalId));
+
+            DetachTrackedTaskMapping(db, taskId);
+            return affected == 1;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Conditionally deletes the <c>task_mappings</c> row for <paramref name="taskId"/> ONLY when it
+    /// still belongs to <paramref name="goalId"/>.
+    /// </summary>
+    /// <remarks>
+    /// A single statement carrying BOTH predicates (task id AND goal id), so a row that has since
+    /// been claimed by another goal survives untouched and the call reports <c>false</c>.
+    /// A store failure PROPAGATES.
+    /// </remarks>
+    /// <param name="taskId">The task id whose mapping to remove.</param>
+    /// <param name="goalId">The goal that must own the row for the delete to happen.</param>
+    /// <returns><c>true</c> when a row was deleted; <c>false</c> when no row matched both predicates.</returns>
+    public bool DeleteTaskMappingIfForGoal(string taskId, string goalId)
+    {
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            var affected = db.TaskMappings
+                .Where(t => t.TaskId == taskId && t.GoalId == goalId)
+                .ExecuteDelete();
+
+            DetachTrackedTaskMapping(db, taskId);
+            return affected >= 1;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Detaches any tracked <see cref="TaskMappingEntity"/> carrying <paramref name="taskId"/> so a
+    /// later read cannot observe the pre-statement (now stale) tracked copy. Applied on BOTH the
+    /// success and refusal paths — the raw statement bypassed the change tracker either way.
+    /// </summary>
+    private static void DetachTrackedTaskMapping(CopilotHiveDbContext db, string taskId)
+    {
+        foreach (var entry in db.ChangeTracker.Entries<TaskMappingEntity>().ToList())
+        {
+            if (string.Equals(entry.Entity.TaskId, taskId, StringComparison.Ordinal))
+                db.Entry(entry.Entity).State = EntityState.Detached;
         }
     }
 

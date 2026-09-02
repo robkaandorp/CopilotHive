@@ -282,6 +282,38 @@ public sealed class GoalPipeline
         }
     }
 
+    /// <summary>
+    /// Clears the active-task pointer ONLY when it currently names <paramref name="taskId"/>.
+    /// </summary>
+    /// <remarks>
+    /// The OWNERSHIP-CHECKED counterpart of <see cref="ClearActiveTask"/>. A caller that finished
+    /// with task <c>T</c> must not blank out a pointer that has since moved on to another task —
+    /// clearing a pointer it does not own would make a live dispatch look idle. Exactly four cases:
+    /// <list type="bullet">
+    ///   <item><description>The pointer names <paramref name="taskId"/> → cleared, returns <c>true</c>.</description></item>
+    ///   <item><description>The pointer names a DIFFERENT task → untouched, returns <c>false</c>.</description></item>
+    ///   <item><description>The pointer is already <c>null</c> → untouched, returns <c>false</c>.</description></item>
+    ///   <item><description><paramref name="taskId"/> is <c>null</c>/blank → untouched, returns <c>false</c>.</description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="taskId">The task id the caller believes is active.</param>
+    /// <returns><c>true</c> only when the pointer matched and was cleared.</returns>
+    internal bool ClearActiveTaskIfCurrent(string taskId)
+    {
+        // The blank refusal precedes the lock: a blank argument can never clear a live pointer.
+        if (string.IsNullOrWhiteSpace(taskId))
+            return false;
+
+        lock (_lock)
+        {
+            if (ActiveTaskId is null || !string.Equals(ActiveTaskId, taskId, StringComparison.Ordinal))
+                return false;
+
+            ActiveTaskId = null;
+            return true;
+        }
+    }
+
     /// <summary>Extend the iteration budget by the given number of additional iterations.</summary>
     public void ExtendIterations(int additional)
     {
