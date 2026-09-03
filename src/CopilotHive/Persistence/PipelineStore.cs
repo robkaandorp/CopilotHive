@@ -477,6 +477,17 @@ public sealed class PipelineStore : IAsyncDisposable
         entity.PhaseLogJson = pipeline.PhaseLog.Count > 0
             ? JsonSerializer.Serialize(pipeline.PhaseLog, JsonOptions)
             : null;
+
+        // THE COHERENT PAIR. The machine-captured position — phase AND occurrence together,
+        // computed under the machine lock by CaptureMachinePosition — is persisted as one
+        // atomic pair. entity.Phase stays the pipeline property; the divergence between the
+        // two views is resolved at RESTORE (the pair-match rule), not here.
+        // THE NULL CONTRACT: whenever OccurrenceFound == false (no installed plan at save
+        // time — e.g. the honest re-plan window), MachinePhase is persisted NULL: the honest
+        // "no position" marker that routes the restore down the legacy path.
+        var machinePosition = pipeline.CaptureMachinePosition();
+        entity.MachinePhase = machinePosition.OccurrenceFound ? machinePosition.Phase.ToString() : null;
+        entity.PhaseOccurrence = machinePosition.OccurrenceFound ? Math.Max(1, machinePosition.Occurrence) : 1;
     }
 
     private static PipelineSnapshot ToSnapshot(PipelineEntity entity)
@@ -505,7 +516,54 @@ public sealed class PipelineStore : IAsyncDisposable
             IterationStartSha = entity.IterationStartSha,
             PhaseLog = entity.PhaseLogJson is null ? []
                 : JsonSerializer.Deserialize<List<PhaseResult>>(entity.PhaseLogJson, JsonOptions) ?? [],
+            PhaseOccurrence = entity.PhaseOccurrence,
+            MachinePhase = ParseMachinePhase(entity.MachinePhase),
         };
+    }
+
+    /// <summary>
+    /// Parses the persisted machine-phase name back into a <see cref="GoalPhase"/>, or
+    /// <c>null</c> for a null or unrecognized value — an unreadable marker must fall through
+    /// to the legacy restore path, never invent a phase.
+    /// <para>
+    /// CANONICAL-NAME RECOGNITION ONLY — the exact inverse of the write side, which always
+    /// emits <c>Phase.ToString()</c>. The value is accepted ONLY when it equals one canonical
+    /// <see cref="GoalPhase"/> name under an ordinal case-insensitive comparison; NO enum
+    /// expression parsing is performed at all. This closes every
+    /// <c>Enum.TryParse</c> false-acceptance class in one rule:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>COMMA-SEPARATED EXPRESSIONS. <c>Enum.TryParse</c> combines
+    ///     comma-separated names by bitwise OR even though <see cref="GoalPhase"/> is not a
+    ///     flags enum — "Planning,Coding" and "Coding,Coding" yield the DEFINED value
+    ///     <c>Coding</c>, "Coding,Review" and "Coding, Testing" yield the DEFINED value
+    ///     <c>Testing</c> — so <c>Enum.IsDefined</c> cannot detect them. Rejected here.</description></item>
+    ///   <item><description>NUMERIC STRINGS. "999" parses to an UNDEFINED value; "0", "1",
+    ///     "+1" parse to DEFINED members. No numeric form is a canonical name. Rejected.</description></item>
+    ///   <item><description>WHITESPACE FORMS. <c>Enum.TryParse</c> tolerates surrounding
+    ///     whitespace (" Coding", "Coding ", "\tCoding", "Coding\n"). The persisted value is
+    ///     always written by <c>Phase.ToString()</c>, so any whitespace means a corrupt
+    ///     row. Rejected.</description></item>
+    ///   <item><description>Empty, blank, garbage ("not-a-phase") and non-ASCII digit forms
+    ///     never match a name. Rejected.</description></item>
+    /// </list>
+    /// <para>
+    /// PRESERVED: case-insensitive recognition of a defined name — "CODING", "coding" and
+    /// "CoDiNg" all yield <see cref="GoalPhase.Coding"/>.
+    /// </para>
+    /// </summary>
+    private static GoalPhase? ParseMachinePhase(string? machinePhase)
+    {
+        if (string.IsNullOrEmpty(machinePhase))
+            return null;
+
+        foreach (var phase in Enum.GetValues<GoalPhase>())
+        {
+            if (string.Equals(phase.ToString(), machinePhase, StringComparison.OrdinalIgnoreCase))
+                return phase;
+        }
+
+        return null;
     }
 
     private static void SaveConversationCore(CopilotHiveDbContext db, GoalPipeline pipeline)
@@ -608,4 +666,17 @@ public sealed class PipelineSnapshot
     public string? IterationStartSha { get; init; }
     /// <summary>Append-only log of phase entries recorded during this pipeline's execution.</summary>
     public List<PhaseResult> PhaseLog { get; init; } = [];
+    /// <summary>
+    /// 1-based occurrence of the pipeline's phase within the persisted plan, captured from the
+    /// state machine at save time. Defaults to 1 for pre-existing rows.
+    /// </summary>
+    public int PhaseOccurrence { get; init; } = 1;
+    /// <summary>
+    /// The machine-captured phase PAIRED with <see cref="PhaseOccurrence"/> at the same save,
+    /// or <c>null</c> when the capture found no installed plan (the honest "no position"
+    /// marker — e.g. the re-plan window). Null also on old rows predating this column.
+    /// The pair-match rule at restore trusts <see cref="PhaseOccurrence"/> only when this
+    /// phase equals the snapshot's pipeline phase; null or mismatched → the legacy path.
+    /// </summary>
+    public GoalPhase? MachinePhase { get; init; }
 }

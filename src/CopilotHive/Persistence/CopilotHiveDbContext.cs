@@ -259,6 +259,7 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.RoleSessionsJson).HasColumnName("role_sessions_json").IsRequired().HasDefaultValue("{}");
         entity.Property(e => e.IterationStartSha).HasColumnName("iteration_start_sha");
         entity.Property(e => e.PhaseOccurrence).HasColumnName("phase_occurrence").IsRequired().HasDefaultValue(1);
+        entity.Property(e => e.MachinePhase).HasColumnName("machine_phase");
         entity.Property(e => e.PhaseLogJson).HasColumnName("phase_log_json");
     }
 

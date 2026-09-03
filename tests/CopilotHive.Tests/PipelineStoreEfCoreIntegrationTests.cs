@@ -246,4 +246,336 @@ public sealed class PipelineStoreEfCoreIntegrationTests : IAsyncDisposable
         Assert.Equal("Entry 1", dbEntries[0].Content);
         Assert.Equal("Entry 2", dbEntries[1].Content);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Slice B: the coherent (phase, occurrence) pair persisted per save
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>The repeated-phase plan used across the slice-B store vectors.</summary>
+    private static readonly List<GoalPhase> SliceBPlan =
+        [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging];
+
+    /// <summary>
+    /// Drives a pipeline to the SECOND Coding of a repeated-phase plan (in-memory AND on the
+    /// state machine, kept in sync exactly as the dispatcher does) so PersistFull captures
+    /// the coherent machine pair (Coding, 2) that matches the pipeline phase.
+    /// </summary>
+    private static GoalPipeline CreateMidSecondCodingPipeline(string id, IterationPlan plan)
+    {
+        var pipeline = CreatePipeline(id, "Mid-second-coding pipeline");
+        pipeline.SetPlan(plan);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.StateMachine.StartIteration(plan.Phases);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Testing → Coding (second)
+        pipeline.AdvanceTo(GoalPhase.Coding);                   // pipeline phase follows the machine
+        return pipeline;
+    }
+
+    /// <summary>
+    /// THE COHERENT PAIR WRITTEN AND READ: PersistFull of a mid-second-Coding pipeline writes
+    /// phase_occurrence == 2 AND machine_phase == 'Coding'; LoadPipeline surfaces the pair as
+    /// the snapshot's (MachinePhase, PhaseOccurrence) — and a restore via the constructor puts
+    /// the machine back at (Coding, 2), the round-trip invariant.
+    /// </summary>
+    [Fact]
+    public void SavePipeline_MidSecondCoding_PersistsCoherentPairAndRoundTrips()
+    {
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        var pipeline = CreateMidSecondCodingPipeline("goal-occ2", plan);
+
+        _store.SavePipeline(pipeline);
+
+        // The ROW carries the coherent pair, readable via the tracked context.
+        var row = _dbContext.Pipelines.Find("goal-occ2");
+        Assert.NotNull(row);
+        Assert.Equal(2, row!.PhaseOccurrence);
+        Assert.Equal("Coding", row.MachinePhase);
+
+        // The SNAPSHOT surfaces the parsed pair.
+        var snapshot = _store.LoadPipeline("goal-occ2");
+        Assert.NotNull(snapshot);
+        Assert.Equal(GoalPhase.Coding, snapshot!.MachinePhase);
+        Assert.Equal(2, snapshot.PhaseOccurrence);
+
+        // THE ROUND-TRIP INVARIANT: the restored machine sits at (Coding, 2) again.
+        var restored = new GoalPipeline(snapshot);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true),
+            restored.CaptureMachinePosition());
+        Assert.Equal([GoalPhase.Merging], restored.StateMachine.RemainingPhases);
+    }
+
+    /// <summary>
+    /// THE HONEST-PLANNING SAVE: a pipeline in the re-plan window (no installed plan) writes
+    /// machine_phase NULL and phase_occurrence 1 — the null contract's write side — and its
+    /// restore takes the legacy path (today's semantics: queue empty of the phase, machine
+    /// agreeing with the restored phase, capture honestly not-found).
+    /// </summary>
+    [Fact]
+    public void SavePipeline_PlanningWindowNoInstalledPlan_WritesNullMachinePhaseAndRestoresLegacy()
+    {
+        var pipeline = CreatePipeline("goal-planning", "Re-plan window pipeline");
+        // No SetPlan: no installed phases → OccurrenceFound == false at capture.
+
+        _store.SavePipeline(pipeline);
+
+        // THE NULL CONTRACT, write side.
+        var row = _dbContext.Pipelines.Find("goal-planning");
+        Assert.NotNull(row);
+        Assert.Null(row!.MachinePhase);
+        Assert.Equal(1, row.PhaseOccurrence);
+
+        var snapshot = _store.LoadPipeline("goal-planning");
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.MachinePhase);
+
+        // Restore → legacy path: the machine agrees with the restored phase.
+        var restored = new GoalPipeline(snapshot);
+        Assert.Equal(GoalPhase.Planning, restored.Phase);
+        Assert.Null(restored.Plan);
+        Assert.Empty(restored.StateMachine.RemainingPhases);
+        Assert.False(restored.CaptureMachinePosition().OccurrenceFound);
+    }
+
+    /// <summary>
+    /// THE OLD-ROW PATH: a hand-inserted row with machine_phase NULL (as every pre-existing
+    /// row has) restores via the legacy fallback — exactly today's behavior.
+    /// </summary>
+    [Fact]
+    public void LoadPipeline_OldRowWithNullMachinePhase_RestoresViaLegacyFallback()
+    {
+        // Hand-insert an "old" row: no machine_phase, phase_occurrence at its default (1),
+        // a plan, and a Coding phase — exactly what a pre-slice-B row looks like.
+        var planJson = """{"phases":["Coding","Testing","Coding","Merging"],"phaseInstructions":{},"phaseTiers":{}}""";
+        _dbContext.Pipelines.Add(new PipelineEntity
+        {
+            GoalId = "goal-oldrow",
+            Description = "Pre-slice-B row",
+            GoalJson = """{"id":"goal-oldrow","description":"old row goal","repositories":[]}""",
+            Phase = "Coding",
+            PlanJson = planJson,
+            MetricsJson = "{}",
+            CreatedAt = "2025-06-15T10:00:00.0000000Z",
+            RoleSessionsJson = "{}",
+            PhaseOccurrence = 2,
+            MachinePhase = null,
+        });
+        _dbContext.SaveChanges();
+
+        var snapshot = _store.LoadPipeline("goal-oldrow");
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.MachinePhase);
+        Assert.Equal(2, snapshot.PhaseOccurrence); // carried but NOT trusted
+
+        var restored = new GoalPipeline(snapshot);
+        // THE LEGACY FALLBACK: byte-identical to today — queue [Testing, Merging],
+        // completed empty, capture (Coding, 1, true) — the occurrence is NOT honored.
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Merging], restored.StateMachine.RemainingPhases);
+        Assert.Empty(restored.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true),
+            restored.CaptureMachinePosition());
+    }
+
+    /// <summary>
+    /// THE NUMERIC-STRING CORRUPTION VECTOR: a row whose machine_phase is a pure numeric
+    /// string ("999") must parse to MachinePhase == null — Enum.TryParse alone would accept
+    /// "999" as a non-null undefined GoalPhase — and the restore constructor must take the
+    /// LEGACY path exactly as an old row: the corrupt occurrence is never trusted.
+    /// </summary>
+    [Theory]
+    [InlineData("999")]        // numeric, undefined value — the Enum.TryParse defect vector
+    [InlineData("0")]          // numeric, defined ordinal (Planning) but still rejected
+    [InlineData("1")]          // numeric, defined ordinal (Coding) but still rejected
+    [InlineData("+1")]         // signed numeric — TryParse yields the DEFINED value Coding
+    [InlineData("-1")]         // signed numeric, undefined value
+    [InlineData(" 1 ")]        // whitespace-padded numeric — TryParse yields DEFINED Coding
+    [InlineData("not-a-phase")]// non-numeric garbage
+    [InlineData("")]           // empty string
+    [InlineData("   ")]        // blank string
+    [InlineData("١")]          // non-ASCII (Arabic-Indic) digit
+    [InlineData("１")]          // non-ASCII (full-width) digit
+    public void LoadPipeline_NumericMachinePhase_ParsesNull_FollowsLegacyRestorePath(string corruptMachinePhase)
+    {
+        AssertCorruptMachinePhaseFollowsLegacyRestorePath("goal-corrupt", corruptMachinePhase);
+    }
+
+    /// <summary>
+    /// THE COMMA-EXPRESSION CORRUPTION VECTOR (the remaining false-acceptance class).
+    /// <c>Enum.TryParse</c> accepts comma-separated enum NAMES and combines their underlying
+    /// values by bitwise OR even though <c>GoalPhase</c> is not a flags enum, so
+    /// <c>Enum.IsDefined</c> cannot detect the corruption: "Planning,Coding" and
+    /// "Coding,Coding" yield the DEFINED value <c>Coding</c>, while "Coding,Review",
+    /// "Coding, Testing" and "coding,testing" yield the DEFINED value <c>Testing</c>.
+    /// A corrupt row carrying such a marker must NOT become a trusted matched pair: it must
+    /// load as null and restore through the LEGACY path.
+    /// </summary>
+    [Theory]
+    [InlineData("Planning,Coding")]  // → DEFINED Coding: would falsely MATCH the Coding row
+    [InlineData("Coding,Coding")]    // → DEFINED Coding: same false match
+    [InlineData("Coding,Review")]    // → DEFINED Testing: the defined-value trap
+    [InlineData("Coding, Testing")]  // → DEFINED Testing, with a space after the comma
+    [InlineData("coding,testing")]   // → DEFINED Testing, lower-case
+    [InlineData("Coding,")]          // trailing comma — TryParse rejects, so must we
+    [InlineData(",Coding")]          // leading comma — TryParse rejects, so must we
+    public void LoadPipeline_CommaMachinePhase_ParsesNull_FollowsLegacyRestorePath(string corruptMachinePhase)
+    {
+        AssertCorruptMachinePhaseFollowsLegacyRestorePath("goal-comma", corruptMachinePhase);
+    }
+
+    /// <summary>
+    /// THE WHITESPACE CONTRACT, pinned. <c>Enum.TryParse</c> tolerates SURROUNDING whitespace
+    /// (" Coding", "Coding ", "\tCoding", "Coding\n" all parse to <c>Coding</c>), while
+    /// INTERNAL whitespace ("Cod ing") is rejected by it. The persisted value is always written
+    /// by <c>Phase.ToString()</c>, so ANY whitespace means a corrupt row — every form below
+    /// therefore loads as null and restores through the LEGACY path.
+    /// </summary>
+    [Theory]
+    [InlineData(" Coding")]     // leading space — TryParse WOULD accept it
+    [InlineData("Coding ")]     // trailing space — TryParse WOULD accept it
+    [InlineData("  Coding  ")]  // surrounded — TryParse WOULD accept it
+    [InlineData("\tCoding")]    // leading tab — TryParse WOULD accept it
+    [InlineData("Coding\t")]    // trailing tab — TryParse WOULD accept it
+    [InlineData("Coding\n")]    // trailing newline — TryParse WOULD accept it
+    [InlineData("Cod ing")]     // internal space — TryParse rejects, so must we
+    [InlineData("Cod\ting")]    // internal tab — TryParse rejects, so must we
+    public void LoadPipeline_WhitespaceMachinePhase_ParsesNull_FollowsLegacyRestorePath(string corruptMachinePhase)
+    {
+        AssertCorruptMachinePhaseFollowsLegacyRestorePath("goal-whitespace", corruptMachinePhase);
+    }
+
+    /// <summary>
+    /// THE SHARED CORRUPT-ROW ASSERTION: a persisted row carrying <paramref name="corruptMachinePhase"/>
+    /// with the repeated-phase plan and phase_occurrence 2 must load with
+    /// <c>MachinePhase == null</c> (the occurrence still CARRIED but NOT trusted) and restore
+    /// through the LEGACY <c>RestoreFromPlan</c> path — queue [Testing, Merging], completed
+    /// empty, capture (Coding, 1, true) — exactly as an old row with machine_phase NULL.
+    /// </summary>
+    private void AssertCorruptMachinePhaseFollowsLegacyRestorePath(string goalId, string corruptMachinePhase)
+    {
+        var planJson = """{"phases":["Coding","Testing","Coding","Merging"],"phaseInstructions":{},"phaseTiers":{}}""";
+        _dbContext.Pipelines.Add(new PipelineEntity
+        {
+            GoalId = goalId,
+            Description = "Corrupt machine_phase row",
+            GoalJson = $$"""{"id":"{{goalId}}","description":"corrupt row goal","repositories":[]}""",
+            Phase = "Coding",
+            PlanJson = planJson,
+            MetricsJson = "{}",
+            CreatedAt = "2025-06-15T10:00:00.0000000Z",
+            RoleSessionsJson = "{}",
+            PhaseOccurrence = 2,
+            MachinePhase = corruptMachinePhase,
+        });
+        _dbContext.SaveChanges();
+
+        var snapshot = _store.LoadPipeline(goalId);
+        Assert.NotNull(snapshot);
+        // THE PARSING CONTRACT: every unrecognized value — numeric (any form), comma
+        // expression, whitespace form, or garbage — yields MachinePhase == null, never an
+        // invented (or falsely combined) machine phase.
+        Assert.Null(snapshot!.MachinePhase);
+        // The occurrence is still carried faithfully on the snapshot…
+        Assert.Equal(2, snapshot.PhaseOccurrence);
+
+        // …but the restore takes the LEGACY path: the pair does not match (null != Coding),
+        // so the untrustworthy occurrence is NOT honored.
+        var restored = new GoalPipeline(snapshot);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Merging], restored.StateMachine.RemainingPhases);
+        Assert.Empty(restored.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true),
+            restored.CaptureMachinePosition());
+    }
+
+    /// <summary>
+    /// Case-insensitive name parsing is PRESERVED by the strict recognition: a row whose
+    /// machine_phase is a defined name in any case still parses to the matching phase and
+    /// the matched pair takes the occurrence-aware restore.
+    /// </summary>
+    [Theory]
+    [InlineData("CODING")]
+    [InlineData("coding")]
+    [InlineData("CoDiNg")]
+    public void LoadPipeline_CaseVariantMachinePhase_ParsesPreserved_AndTakesPairMatchPath(string machinePhase)
+    {
+        var planJson = """{"phases":["Coding","Testing","Coding","Merging"],"phaseInstructions":{},"phaseTiers":{}}""";
+        _dbContext.Pipelines.Add(new PipelineEntity
+        {
+            GoalId = "goal-case-" + machinePhase.ToLowerInvariant(),
+            Description = "Case-variant machine phase",
+            GoalJson = """{"id":"case","description":"case row goal","repositories":[]}""",
+            Phase = "Coding",
+            PlanJson = planJson,
+            MetricsJson = "{}",
+            CreatedAt = "2025-06-15T10:00:00.0000000Z",
+            RoleSessionsJson = "{}",
+            PhaseOccurrence = 2,
+            MachinePhase = machinePhase,
+        });
+        _dbContext.SaveChanges();
+
+        var goalId = "goal-case-" + machinePhase.ToLowerInvariant();
+        var snapshot = _store.LoadPipeline(goalId);
+        Assert.NotNull(snapshot);
+        // Strict recognition keeps the case-insensitive parse for DEFINED names.
+        Assert.Equal(GoalPhase.Coding, snapshot!.MachinePhase);
+
+        // The matched pair takes the occurrence-aware path: restored at occurrence 2.
+        var restored = new GoalPipeline(snapshot);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true),
+            restored.CaptureMachinePosition());
+        Assert.Equal([GoalPhase.Merging], restored.StateMachine.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], restored.StateMachine.CompletedPhases);
+    }
+
+    /// <summary>
+    /// EVERY canonical <see cref="GoalPhase"/> name still round-trips through the parser —
+    /// the canonical-name recognition must accept the full member set (and its lower-case
+    /// form), not just the phases the other vectors happen to use.
+    /// </summary>
+    [Fact]
+    public void LoadPipeline_EveryCanonicalPhaseName_ParsesBackToItsPhase()
+    {
+        foreach (var phase in Enum.GetValues<GoalPhase>())
+        {
+            var goalId = $"goal-canon-{phase}";
+            _dbContext.Pipelines.Add(new PipelineEntity
+            {
+                GoalId = goalId,
+                Description = "Canonical name row",
+                GoalJson = $$"""{"id":"{{goalId}}","description":"canonical row goal","repositories":[]}""",
+                Phase = "Coding",
+                MetricsJson = "{}",
+                CreatedAt = "2025-06-15T10:00:00.0000000Z",
+                RoleSessionsJson = "{}",
+                PhaseOccurrence = 1,
+                MachinePhase = phase.ToString(),
+            });
+            _dbContext.SaveChanges();
+
+            var snapshot = _store.LoadPipeline(goalId);
+            Assert.NotNull(snapshot);
+            Assert.Equal(phase, snapshot!.MachinePhase);
+
+            // …and the lower-case form of the same name parses identically.
+            var lowerId = $"goal-canon-lower-{phase}";
+            _dbContext.Pipelines.Add(new PipelineEntity
+            {
+                GoalId = lowerId,
+                Description = "Canonical name row (lower-case)",
+                GoalJson = $$"""{"id":"{{lowerId}}","description":"canonical row goal","repositories":[]}""",
+                Phase = "Coding",
+                MetricsJson = "{}",
+                CreatedAt = "2025-06-15T10:00:00.0000000Z",
+                RoleSessionsJson = "{}",
+                PhaseOccurrence = 1,
+                MachinePhase = phase.ToString().ToLowerInvariant(),
+            });
+            _dbContext.SaveChanges();
+
+            var lowerSnapshot = _store.LoadPipeline(lowerId);
+            Assert.NotNull(lowerSnapshot);
+            Assert.Equal(phase, lowerSnapshot!.MachinePhase);
+        }
+    }
 }

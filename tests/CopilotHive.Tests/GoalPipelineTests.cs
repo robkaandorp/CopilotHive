@@ -973,6 +973,42 @@ public sealed class GoalPipelineManagerTests
         Assert.Equal(countBefore, manager.GetAllPipelines().Count);
     }
 
+    /// <summary>
+    /// THE END-TO-END PROOF (slice B): a pipeline parked mid-SECOND-Coding is persisted via
+    /// PersistFull, then a FRESH manager restores it — and the restored machine sits at
+    /// (Coding, 2, true) with the tail [Merging] queued and the executed prefix completed.
+    /// </summary>
+    [Fact]
+    public async Task RestorePipeline_MidSecondCoding_RoundTripsAtOccurrenceTwo()
+    {
+        await using var store = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store);
+
+        var pipeline = manager.CreatePipeline(CreateGoal("g-occ2", "Mid-second-coding round trip"));
+        var plan = new IterationPlan { Phases = [.. new List<GoalPhase>
+            { GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging }] };
+        pipeline.SetPlan(plan);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.StateMachine.StartIteration(plan.Phases);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Testing → Coding (second)
+        pipeline.AdvanceTo(GoalPhase.Coding);                   // pipeline phase follows the machine
+
+        manager.PersistFull(pipeline);
+
+        // Fresh manager over the same store — a simulated orchestrator restart.
+        var freshManager = new GoalPipelineManager(store);
+        var restored = freshManager.RestorePipeline("g-occ2");
+
+        Assert.NotNull(restored);
+        Assert.Equal(GoalPhase.Coding, restored!.Phase);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true),
+            restored.CaptureMachinePosition());
+        Assert.Equal([GoalPhase.Merging], restored.StateMachine.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], restored.StateMachine.CompletedPhases);
+    }
+
     [Fact]
     public async Task UnregisterTask_PersistedMappingDeleted()
     {
@@ -1224,6 +1260,171 @@ public sealed class GoalPipelineManagerTests
         pipeline.IterationStartSha = null;
 
         Assert.Null(pipeline.IterationStartSha);
+    }
+
+    #endregion
+
+    #region GoalPipeline — Work-slot restored occurrence (slice B)
+
+    /// <summary>The repeated-phase plan used across the slice-B restore vectors.</summary>
+    private static readonly List<GoalPhase> SliceBPlan =
+        [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging];
+
+    private static CopilotHive.Persistence.PipelineSnapshot CreateSnapshot(
+        string id,
+        GoalPhase phase,
+        IterationPlan? plan,
+        GoalPhase? machinePhase = null,
+        int phaseOccurrence = 1)
+    {
+        var goal = CreateGoal(id);
+        return new CopilotHive.Persistence.PipelineSnapshot
+        {
+            GoalId = goal.Id,
+            Description = goal.Description,
+            Goal = goal,
+            Phase = phase,
+            Plan = plan,
+            MachinePhase = machinePhase,
+            PhaseOccurrence = phaseOccurrence,
+            CreatedAt = DateTime.UtcNow,
+        };
+    }
+
+    /// <summary>
+    /// CONSTRUCTOR PAIR-MATCH at occurrence 2: a snapshot whose machine phase MATCHES the
+    /// pipeline phase restores at the persisted occurrence — the machine sits at the SECOND
+    /// Coding, the completed set holds the executed prefix, and the tail [Merging] survives.
+    /// </summary>
+    [Fact]
+    public void Constructor_MatchedPairAtOccurrenceTwo_RestoresAtSecondCoding()
+    {
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        var snapshot = CreateSnapshot("g-pair2", GoalPhase.Coding, plan, GoalPhase.Coding, 2);
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal([GoalPhase.Merging], pipeline.StateMachine.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], pipeline.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true),
+            pipeline.CaptureMachinePosition());
+    }
+
+    /// <summary>
+    /// THE LEGACY FALLBACK: MachinePhase NULL on a repeated-phase snapshot (old rows and
+    /// planning-window saves) routes to the LEGACY RestoreFromPlan — restored EXACTLY as today:
+    /// queue [Testing, Merging], completed empty, capture (Coding, 1, true).
+    /// </summary>
+    [Fact]
+    public void Constructor_NullMachinePhase_LegacyFallbackRestoresExactlyAsToday()
+    {
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        var snapshot = CreateSnapshot("g-legacy-null", GoalPhase.Coding, plan, machinePhase: null, phaseOccurrence: 2);
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Merging], pipeline.StateMachine.RemainingPhases);
+        Assert.Empty(pipeline.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true),
+            pipeline.CaptureMachinePosition());
+    }
+
+    /// <summary>
+    /// A MISMATCHED pair (MachinePhase != snapshot.Phase — torn/corrupt) routes to the same
+    /// legacy path; the untrustworthy occurrence is never honored.
+    /// </summary>
+    [Fact]
+    public void Constructor_MismatchedPair_LegacyFallbackRestoresExactlyAsToday()
+    {
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        // The machine claims Testing while the pipeline phase is Coding — torn pair.
+        var snapshot = CreateSnapshot("g-torn", GoalPhase.Coding, plan, GoalPhase.Testing, 2);
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Merging], pipeline.StateMachine.RemainingPhases);
+        Assert.Empty(pipeline.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true),
+            pipeline.CaptureMachinePosition());
+    }
+
+    /// <summary>THE NO-PLAN BRANCH IS UNCHANGED: RestoreFromPlan([], Phase) — empty queue.</summary>
+    [Fact]
+    public void Constructor_NoPlan_BranchUnchanged()
+    {
+        var snapshot = CreateSnapshot("g-noplan", GoalPhase.Coding, plan: null);
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Null(pipeline.Plan);
+        Assert.Null(pipeline.InstalledPhasesForTest);
+        // The no-plan sync: empty plan restore → empty queue, machine agrees with the phase.
+        Assert.Empty(pipeline.StateMachine.RemainingPhases);
+        Assert.Equal(GoalPhase.Coding, pipeline.StateMachine.Phase);
+        // No installed plan → the capture honestly reports no position.
+        Assert.False(pipeline.CaptureMachinePosition().OccurrenceFound);
+    }
+
+    /// <summary>
+    /// THE INTENDED BEHAVIOR CHANGE, asserted: a MATCHED occurrence-1 pair restores at the
+    /// FIRST Coding with the FULL tail [Testing, Coding, Merging] — nothing dropped.
+    /// </summary>
+    [Fact]
+    public void Constructor_MatchedPairAtOccurrenceOne_KeepsFullTail()
+    {
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        var snapshot = CreateSnapshot("g-pair1", GoalPhase.Coding, plan, GoalPhase.Coding, 1);
+
+        var pipeline = new GoalPipeline(snapshot);
+
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging], pipeline.StateMachine.RemainingPhases);
+        Assert.Empty(pipeline.StateMachine.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true),
+            pipeline.CaptureMachinePosition());
+    }
+
+    /// <summary>
+    /// CaptureMachinePosition mid-SECOND-Coding on a live pipeline: the coherent pair
+    /// (Coding, 2, true) — occurrence and phase move together.
+    /// </summary>
+    [Fact]
+    public void CaptureMachinePosition_MidSecondCoding_YieldsCoherentPair()
+    {
+        var pipeline = new GoalPipeline(CreateGoal("g-live2"));
+        var plan = new IterationPlan { Phases = [.. SliceBPlan] };
+        pipeline.SetPlan(plan);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.StateMachine.StartIteration(plan.Phases);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Coding → Testing
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        pipeline.StateMachine.Transition(PhaseInput.Succeeded); // Testing → Coding (second)
+        pipeline.AdvanceTo(GoalPhase.Coding);                   // pipeline phase follows the machine
+
+        var captured = pipeline.CaptureMachinePosition();
+
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true), captured);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// THE OCCURRENCEFOUND == FALSE CASE (the planning window): no installed plan → the capture
+    /// reports occurrence 0 with the honest not-found flag — the null contract's source.
+    /// </summary>
+    [Fact]
+    public void CaptureMachinePosition_NoInstalledPlan_ReportsNotFound()
+    {
+        var pipeline = new GoalPipeline(CreateGoal("g-planning"));
+
+        var captured = pipeline.CaptureMachinePosition();
+
+        Assert.Equal(GoalPhase.Planning, captured.Phase);
+        Assert.Equal(0, captured.Occurrence);
+        Assert.False(captured.OccurrenceFound);
     }
 
     #endregion

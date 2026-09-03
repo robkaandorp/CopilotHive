@@ -687,6 +687,18 @@ public sealed class CopilotHiveDbContextTests
         return columns;
     }
 
+    /// <summary>
+    /// Executes a SQL statement directly on the connection, bypassing
+    /// <c>ExecuteSqlRaw</c>'s format-placeholder parsing (which misreads literal
+    /// '{{'/'}}' braces in DDL defaults and JSON literals).
+    /// </summary>
+    private static void ExecuteDirect(SqliteConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
     // ── 9. Schema reconciliation (EnsureSchemaUpToDate) ───────────────────
 
     /// <summary>
@@ -1223,5 +1235,119 @@ public sealed class CopilotHiveDbContextTests
         Assert.Equal(2, reloaded.Notes.Count);
         Assert.Equal("test", reloaded.Metadata["env"]);
         Assert.Equal("new-value", reloaded.Metadata["new-key"]);
+    }
+
+    // ── 11. machine_phase reconciliation (slice B) ─────────────────────────
+
+    /// <summary>
+    /// THE EXPLICIT RECONCILIATION PROOF for slice B's one additive column: an existing
+    /// <c>pipelines</c> table WITH ROWS, created before <c>machine_phase</c> existed, gains the
+    /// nullable column via <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>; every row is
+    /// preserved (NULL for the new column), and a fresh context can round-trip the column.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_ExistingPipelinesTableWithRows_AddsMachinePhaseColumnAndPreservesRows()
+    {
+        using var ctx = CreateEmptyDbContext();
+        var conn = GetSqliteConnection(ctx);
+
+        // An OLD pipelines table: the pre-slice-B column set, WITHOUT machine_phase.
+        // (Executed via a raw DbCommand: ExecuteSqlRaw treats '{'/'}' as format placeholders,
+        // and the DDL carries literal '{}' default values — the same caveat the production
+        // reconciler itself works around.)
+        ExecuteDirect(conn,
+            """
+            CREATE TABLE pipelines (
+                goal_id TEXT NOT NULL PRIMARY KEY,
+                description TEXT NOT NULL,
+                goal_json TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'Planning',
+                iteration INTEGER NOT NULL DEFAULT 1,
+                review_retries INTEGER NOT NULL DEFAULT 0,
+                test_retries INTEGER NOT NULL DEFAULT 0,
+                improver_retries INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                max_iterations INTEGER NOT NULL DEFAULT 10,
+                active_task_id TEXT,
+                coder_branch TEXT,
+                plan_json TEXT,
+                phase_outputs TEXT NOT NULL DEFAULT '{}',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                goal_started_at TEXT,
+                merge_commit_hash TEXT,
+                role_sessions_json TEXT NOT NULL DEFAULT '{}',
+                iteration_start_sha TEXT,
+                phase_occurrence INTEGER NOT NULL DEFAULT 1,
+                phase_log_json TEXT
+            )
+            """);
+
+        // TWO pre-existing rows — the reconciliation must not lose either.
+        ExecuteDirect(conn,
+            """
+            INSERT INTO pipelines (goal_id, description, goal_json, created_at)
+            VALUES
+                ('legacy-row-1', 'First legacy pipeline', '{"id":"legacy-row-1"}', '2025-06-01T10:00:00.0000000Z'),
+                ('legacy-row-2', 'Second legacy pipeline', '{"id":"legacy-row-2"}', '2025-06-02T10:00:00.0000000Z')
+            """);
+
+        // Sanity: machine_phase must NOT exist yet.
+        var columnsBefore = GetTableColumns(conn, "pipelines");
+        Assert.DoesNotContain("machine_phase", columnsBefore);
+
+        DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+        // THE COLUMN WAS ADDED — and it is nullable.
+        var columnsAfter = GetTableColumns(conn, "pipelines");
+        Assert.Contains("machine_phase", columnsAfter);
+        var columnInfo = GetTableColumnInfo(conn, "pipelines");
+        Assert.False(columnInfo["machine_phase"].NotNull);
+
+        // EVERY ROW PRESERVED — with NULL for the new column (the honest old-row marker).
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*), COUNT(machine_phase) FROM pipelines";
+            using var reader = cmd.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal(2, reader.GetInt64(0));   // both rows survive
+            Assert.Equal(0, reader.GetInt64(1));   // none has a machine_phase value yet
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT phase_occurrence FROM pipelines WHERE goal_id = 'legacy-row-1'";
+            Assert.Equal(1L, cmd.ExecuteScalar());
+        }
+
+        // A FRESH CONTEXT ROUND-TRIPS THE NEW COLUMN: read via EF, write a value, re-read.
+        var freshOptions = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(conn)
+            .Options;
+        using (var ctx2 = new CopilotHiveDbContext(freshOptions))
+        {
+            var row = ctx2.Pipelines.Find("legacy-row-1");
+            Assert.NotNull(row);
+            Assert.Null(row!.MachinePhase);   // existing rows read back as NULL
+            Assert.Equal(1, row.PhaseOccurrence);
+
+            // The new column is writable through the EF model.
+            row.MachinePhase = "Coding";
+            row.PhaseOccurrence = 2;
+            ctx2.SaveChanges();
+        }
+
+        using (var ctx3 = new CopilotHiveDbContext(freshOptions))
+        {
+            var row = ctx3.Pipelines.Find("legacy-row-1");
+            Assert.NotNull(row);
+            Assert.Equal("Coding", row!.MachinePhase);
+            Assert.Equal(2, row.PhaseOccurrence);
+
+            // The untouched row is still NULL — only the written row changed.
+            var other = ctx3.Pipelines.Find("legacy-row-2");
+            Assert.NotNull(other);
+            Assert.Null(other!.MachinePhase);
+        }
     }
 }

@@ -74,6 +74,14 @@ public sealed class PipelineEntity
     /// <summary>1-based occurrence index of the current phase.</summary>
     public int PhaseOccurrence { get; set; }
 
+    /// <summary>
+    /// Machine-captured phase name (e.g. "Coding") paired with <see cref="PhaseOccurrence"/> at
+    /// save time, or null when no installed plan existed at capture (the honest "no position"
+    /// marker). Null on pre-existing rows and planning-window saves; the restore treats null
+    /// — or a pair that disagrees with the snapshot's pipeline phase — as legacy data.
+    /// </summary>
+    public string? MachinePhase { get; set; }
+
     /// <summary>JSON-serialised phase log, or null.</summary>
     public string? PhaseLogJson { get; set; }
 }

@@ -227,7 +227,15 @@ public sealed class GoalPipeline
             // A defensive COPY of the restored plan: the capture's stable-input covenant is
             // satisfied without ever holding a lock across the machine call.
             _installedPhases = [.. Plan.Phases];
-            StateMachine.RestoreFromPlan(Plan.Phases, Phase);
+
+            // THE PAIR-MATCH RULE: the persisted occurrence is trustworthy ONLY when the snapshot's
+            // pipeline phase matches the machine-captured phase from the same save. NULL (no installed
+            // plan at save time — the honest-Planning window, old rows) or a MISMATCH (torn/corrupt)
+            // → the LEGACY RestoreFromPlan call — byte-identical behavior for all existing data.
+            if (snapshot.MachinePhase is { } mp && mp == snapshot.Phase)
+                StateMachine.RestoreFromPlanAtOccurrence(_installedPhases, Phase, Math.Max(1, snapshot.PhaseOccurrence));
+            else
+                StateMachine.RestoreFromPlan(_installedPhases, Phase);
         }
         else
         {
@@ -424,6 +432,37 @@ public sealed class GoalPipeline
     /// or <c>null</c> when nothing is installed.
     /// </summary>
     internal IReadOnlyList<GoalPhase>? InstalledPhasesForTest => _installedPhases is null ? null : [.. _installedPhases];
+
+    /// <summary>
+    /// Captures the machine's position — the coherent (phase, occurrence) pair — as an
+    /// <see cref="MachinePositionSnapshot"/>, for persistence and restore decisions.
+    /// <para>
+    /// THE SAME SNAPSHOT PATTERN AS <see cref="CaptureDispatchPosition"/>'s step (1): the
+    /// <c>_installedPhases</c> reference is read under <c>_lock</c>, the lock is RELEASED, and
+    /// only then does <see cref="PipelineStateMachine.CapturePosition"/> run (which takes the
+    /// machine lock internally). NEVER hold the pipeline lock while taking the machine lock —
+    /// the reverse lock-nesting prohibition (documented in the work-slot region) applies here
+    /// too. <c>_installedPhases</c> is only ever REPLACED, never mutated in place, so the
+    /// reference handed to the capture is stable for the whole call.
+    /// </para>
+    /// </summary>
+    /// <returns>
+    /// The machine's position pair. When <c>OccurrenceFound == false</c> (no installed plan —
+    /// e.g. the honest re-plan window), the persistence layer persists <c>MachinePhase</c> as
+    /// NULL — the null contract's source.
+    /// </returns>
+    internal MachinePositionSnapshot CaptureMachinePosition()
+    {
+        // (1) Snapshot the installed-plan reference under the pipeline lock, then release it.
+        List<GoalPhase>? installed;
+        lock (_lock)
+        {
+            installed = _installedPhases;
+        }
+
+        // (2) Capture with NO pipeline lock held — the machine takes its own lock.
+        return StateMachine.CapturePosition(installed);
+    }
 
     /// <summary>
     /// Captures the pipeline's dispatch position for <paramref name="role"/> and atomically

@@ -549,4 +549,159 @@ public sealed class MachineSnapshotTests
         Assert.False(captured.OccurrenceFound);   // Failed is not part of the plan
         Assert.Equal(1, captured.Occurrence);
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  (j) SLICE B — RestoreFromPlanAtOccurrence
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// <summary>The slice-B repeated-phase plan used by the occurrence-aware vectors.</summary>
+    private static readonly List<GoalPhase> SliceBPlan =
+        [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging];
+
+    /// <summary>
+    /// THE A0 BASELINE UNTOUCHED: the legacy repeated-phase restoration is pinned by
+    /// <see cref="RestoreFromPlan_RepeatedCurrentPhase_BaselineIsPreservedExactly"/> above and
+    /// must stay green and unmodified — slice B only ADDS the occurrence-aware method.
+    /// </summary>
+    [Fact]
+    public void SliceB_LegacyRestoreFromPlanBaseline_RemainsUnmodified()
+    {
+        // Exactly the A0 baseline vector, re-run here so a regression in RestoreFromPlan
+        // surfaces in the slice-B suite too.
+        List<GoalPhase> plan = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging];
+        var sm = new PipelineStateMachine();
+
+        sm.RestoreFromPlan(plan, GoalPhase.Coding);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Merging], sm.RemainingPhases);
+        Assert.Empty(sm.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true), sm.CapturePosition(plan));
+    }
+
+    /// <summary>Occurrence 1 on the repeated-phase plan: the FIRST Coding is current.</summary>
+    [Fact]
+    public void RestoreFromPlanAtOccurrence_OccurrenceOne_RestoresAtFirstMatch()
+    {
+        var sm = new PipelineStateMachine();
+
+        sm.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Coding, 1);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging], sm.RemainingPhases);
+        Assert.Empty(sm.CompletedPhases);
+        // THE SELF-CONSISTENCY INVARIANT.
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true), sm.CapturePosition(SliceBPlan));
+    }
+
+    /// <summary>
+    /// Occurrence 2 — THE FIX'S PROOF: the second Coding is current, the first Coding and
+    /// Testing are completed, and the tail [Merging] survives the restore.
+    /// </summary>
+    [Fact]
+    public void RestoreFromPlanAtOccurrence_OccurrenceTwo_RestoresAtSecondMatch_TailPreserved()
+    {
+        var sm = new PipelineStateMachine();
+
+        sm.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Coding, 2);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal([GoalPhase.Merging], sm.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], sm.CompletedPhases);
+        // THE SELF-CONSISTENCY INVARIANT — the pair round-trips: (Coding, 2, true).
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true), sm.CapturePosition(SliceBPlan));
+    }
+
+    /// <summary>An over-count (more requested than exist) clamps to the LAST match.</summary>
+    [Fact]
+    public void RestoreFromPlanAtOccurrence_OverCount_ClampsToLastMatch()
+    {
+        var sm = new PipelineStateMachine();
+
+        // Only 2 Codings exist; requesting 5 clamps to the LAST one.
+        sm.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Coding, 5);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal([GoalPhase.Merging], sm.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing], sm.CompletedPhases);
+        // The clamp restores at the same position as occurrence 2 — the self-consistency
+        // invariant holds at the clamped position too.
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 2, OccurrenceFound: true), sm.CapturePosition(SliceBPlan));
+    }
+
+    /// <summary>Occurrence ≤ 0 is treated as 1.</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-3)]
+    public void RestoreFromPlanAtOccurrence_NonPositiveOccurrence_TreatedAsOne(int occurrence)
+    {
+        var sm = new PipelineStateMachine();
+
+        sm.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Coding, occurrence);
+
+        Assert.Equal(GoalPhase.Coding, sm.Phase);
+        Assert.Equal([GoalPhase.Testing, GoalPhase.Coding, GoalPhase.Merging], sm.RemainingPhases);
+        Assert.Empty(sm.CompletedPhases);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, 1, OccurrenceFound: true), sm.CapturePosition(SliceBPlan));
+    }
+
+    /// <summary>
+    /// NO-MATCH LEGACY PATH: when the requested phase is not in the plan at all,
+    /// every entry goes to the completed set, the queue is empty, and Phase is the requested
+    /// phase — byte-identical to RestoreFromPlan's no-match behavior.
+    /// </summary>
+    [Fact]
+    public void RestoreFromPlanAtOccurrence_NoMatch_LegacyNoFoundPath()
+    {
+        List<GoalPhase> plan = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging];
+        var sm = new PipelineStateMachine();
+
+        sm.RestoreFromPlanAtOccurrence(plan, GoalPhase.Review, 1);
+
+        Assert.Equal(GoalPhase.Review, sm.Phase);
+        Assert.Empty(sm.RemainingPhases);
+        Assert.Equal([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Merging], sm.CompletedPhases);
+
+        // Byte-identical to the legacy method's no-match behavior.
+        var legacy = new PipelineStateMachine();
+        legacy.RestoreFromPlan(plan, GoalPhase.Review);
+        Assert.Equal(legacy.Phase, sm.Phase);
+        Assert.Equal(legacy.RemainingPhases, sm.RemainingPhases);
+        Assert.Equal(legacy.CompletedPhases, sm.CompletedPhases);
+        // And the capture over a plan that does not contain the phase is identical too.
+        Assert.Equal(legacy.CapturePosition(plan), sm.CapturePosition(plan));
+    }
+
+    /// <summary>
+    /// THE SELF-CONSISTENCY INVARIANT, exercised across EVERY vector above: a restore at the
+    /// n-th existing occurrence must make CapturePosition report exactly that pair.
+    /// Runs the full plan sweep occurrence-by-occurrence.
+    /// </summary>
+    [Fact]
+    public void RestoreFromPlanAtOccurrence_SelfConsistency_InvariantHoldsForEveryMatchPosition()
+    {
+        // For each of the two Coding occurrences in the plan, restoring at n and capturing
+        // must round-trip to (Coding, n, true).
+        for (var n = 1; n <= 2; n++)
+        {
+            var sm = new PipelineStateMachine();
+            sm.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Coding, n);
+
+            var captured = sm.CapturePosition(SliceBPlan);
+            Assert.Equal(new MachinePositionSnapshot(GoalPhase.Coding, n, OccurrenceFound: true), captured);
+        }
+
+        // The same invariant holds for a NON-repeated phase position (Testing, occurrence 1).
+        var smTesting = new PipelineStateMachine();
+        smTesting.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Testing, 1);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Testing, 1, OccurrenceFound: true),
+            smTesting.CapturePosition(SliceBPlan));
+
+        // And for the final Merging entry: restore at its occurrence → nothing remains queued.
+        var smMerging = new PipelineStateMachine();
+        smMerging.RestoreFromPlanAtOccurrence(SliceBPlan, GoalPhase.Merging, 1);
+        Assert.Equal(new MachinePositionSnapshot(GoalPhase.Merging, 1, OccurrenceFound: true),
+            smMerging.CapturePosition(SliceBPlan));
+        Assert.Empty(smMerging.RemainingPhases);
+    }
 }

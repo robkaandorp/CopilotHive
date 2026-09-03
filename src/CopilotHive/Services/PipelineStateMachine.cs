@@ -193,6 +193,96 @@ public sealed class PipelineStateMachine
     }
 
     /// <summary>
+    /// Occurrence-aware restoration: rebuilds the machine so the <paramref name="occurrence"/>-th
+    /// (1-based) entry equal to <paramref name="currentPhase"/> becomes the CURRENT phase —
+    /// unlike <see cref="RestoreFromPlan"/>, which collapses ALL matching entries into the
+    /// matching branch and loses both prior occurrences and the tail after the last one.
+    /// <para>
+    /// THE MATCH INDEX. The occurrence-th entry equal to <paramref name="currentPhase"/> is the
+    /// match. Over-count (more requested than exist) CLAMPS to the LAST match. No match at all
+    /// (phase absent from the plan) takes the LEGACY no-found path — every entry to
+    /// <c>_completedPhases</c>, <see cref="Phase"/> = <paramref name="currentPhase"/>, empty
+    /// queue — byte-identical to <see cref="RestoreFromPlan"/>'s no-match behavior.
+    /// <paramref name="occurrence"/> ≤ 0 is treated as 1.
+    /// </para>
+    /// <para>
+    /// THE SPLIT. Entries BEFORE the match go to <c>_completedPhases</c> (prior occurrences of
+    /// the current phase included — they already executed); the match itself becomes the current
+    /// phase; entries AFTER it are queued in <c>_remainingPhases</c> (later occurrences included —
+    /// the tail never vanishes).
+    /// </para>
+    /// <para>
+    /// SELF-CONSISTENCY INVARIANT: after
+    /// <c>RestoreFromPlanAtOccurrence(plan, p, n)</c> where the n-th match exists,
+    /// <c>CapturePosition(plan)</c> yields EXACTLY <c>(p, n, true)</c> — tested explicitly.
+    /// </para>
+    /// </summary>
+    /// <param name="phases">The plan to restore against.</param>
+    /// <param name="currentPhase">The phase whose occurrence-th entry becomes current.</param>
+    /// <param name="occurrence">The 1-based occurrence to restore at; ≤ 0 treated as 1.</param>
+    public void RestoreFromPlanAtOccurrence(IReadOnlyList<GoalPhase> phases, GoalPhase currentPhase, int occurrence)
+    {
+        lock (_machineLock)
+        {
+            _remainingPhases.Clear();
+            _completedPhases.Clear();
+
+            // occurrence ≤ 0 → treated as 1.
+            var requested = Math.Max(1, occurrence);
+
+            // THE MATCH INDEX: locate the occurrence-th (1-based) matching entry, clamping an
+            // over-count to the LAST match. No match at all → the legacy no-found path.
+            var matchIndex = -1;
+            var seen = 0;
+            for (var i = 0; i < phases.Count; i++)
+            {
+                if (phases[i] != currentPhase)
+                    continue;
+                seen++;
+                if (seen == requested)
+                {
+                    matchIndex = i;
+                    break;
+                }
+            }
+
+            if (matchIndex < 0 && seen > 0)
+            {
+                // Over-count: clamp to the LAST match.
+                for (var i = phases.Count - 1; i >= 0; i--)
+                {
+                    if (phases[i] == currentPhase)
+                    {
+                        matchIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (matchIndex < 0)
+            {
+                // NO-MATCH LEGACY PATH — byte-identical to RestoreFromPlan's !found branch:
+                // every entry is completed, the queue is empty, Phase is the requested phase.
+                foreach (var phase in phases)
+                    _completedPhases.Add(phase);
+                Phase = currentPhase;
+                return;
+            }
+
+            // THE SPLIT: before → completed, match → current, after → queued.
+            for (var i = 0; i < phases.Count; i++)
+            {
+                if (i < matchIndex)
+                    _completedPhases.Add(phases[i]);
+                else if (i > matchIndex)
+                    _remainingPhases.Enqueue(phases[i]);
+                else
+                    Phase = currentPhase;
+            }
+        }
+    }
+
+    /// <summary>
     /// Initialize the state machine for a new iteration with the given phase plan.
     /// Resets the phase queue and sets Phase to the first phase (Coding or DocWriting).
     /// </summary>
