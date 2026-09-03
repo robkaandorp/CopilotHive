@@ -1,3 +1,12 @@
+## [Unreleased]
+
+### Changed
+
+- **Worker TaskId format change** — TaskIds are now attempt-stamped and derived at allocation time through a single atomic in-lock attempt+ID derivation, replacing the previous predicted/external format at the dispatch boundary.
+- **`CompletedPhases` defensive copy** — The pipeline state machine's `CompletedPhases` now returns a point-in-time snapshot instead of a live view.
+- **Orphan-trade note** — If an insert-then-throw occurs, a task may be left admitted with its mapping unregistered; a later assignment hits the existing no-pipeline drop path. This is an accepted, documented trade-off of the admission transaction.
+- **Mapping-ownership migration** — The dispatch admission path now uses the conditional `TryRegisterTask`/`TryUnregisterTask` ownership APIs (conditional persisted upsert/delete with rollback support) instead of the unconditional register/unregister calls.
+
 ## [0.36.0] — 2026-08-31
 
 ### Added

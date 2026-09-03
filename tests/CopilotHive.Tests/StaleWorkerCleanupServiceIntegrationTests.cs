@@ -1,9 +1,13 @@
+using CopilotHive.Goals;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Workers;
 using Microsoft.Extensions.Logging;
 using Moq;
 using System.Threading.Tasks;
 using Xunit;
+
+using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
 
@@ -121,5 +125,56 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
             l => l.Log(LogLevel.Warning, It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(),
                 It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.Never);
+    }
+
+    /// <summary>
+    /// A STALE worker (heartbeat branch, real pool) holding a live dispatch has its task's WORK
+    /// SLOT abandoned as well as its pipeline pointer cleared, so the position is free for the
+    /// redispatch's fresh capture. Without the abandonment the position would still be occupied
+    /// by a live slot and the next capture would be refused as a double assignment.
+    /// </summary>
+    [Fact]
+    public async Task RunCleanupCycle_WithRealPool_StaleWorkerWithTask_AbandonsWorkSlot()
+    {
+        var pool = new WorkerPool();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        var pipeline = pipelineManager.CreatePipeline(new Goal
+        {
+            Id = "goal-stale-slot",
+            Description = "Stale slot goal",
+            RepositoryNames = ["test-repo"],
+        });
+        var plan = IterationPlan.Default(includeImprove: true);
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var slot = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        pipeline.SetActiveTask(slot.TaskId);
+        pipelineManager.RegisterTask(slot.TaskId, pipeline.GoalId);
+
+        var staleWorker = pool.RegisterWorker("stale-worker", []);
+        staleWorker.LastHeartbeat = DateTime.UtcNow.AddMinutes(-5);
+        pool.MarkBusy("stale-worker", slot.TaskId);
+        staleWorker.LastHeartbeat = DateTime.UtcNow.AddMinutes(-5);
+
+        var svc = new StaleWorkerCleanupService(
+            pool, taskQueue, pipelineManager, Mock.Of<ILogger<StaleWorkerCleanupService>>());
+
+        await svc.RunCleanupCycleAsync();
+
+        Assert.Null(pool.GetWorker("stale-worker"));
+
+        var view = Assert.Single(pipeline.GetSlotsForTest());
+        Assert.Equal(slot.TaskId, view.Slot.TaskId);
+        Assert.Equal(WorkSlotState.Abandoned, view.State);
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // THE DEAD RULE: the redispatch's fresh capture succeeds on the freed position.
+        var redispatch = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal(2, redispatch.Attempt);
+        Assert.Equal(slot.Position, redispatch.Position);
     }
 }

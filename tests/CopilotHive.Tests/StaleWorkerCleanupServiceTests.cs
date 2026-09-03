@@ -431,4 +431,61 @@ public sealed class StaleWorkerCleanupServiceTests
 
         Assert.Empty(pool.GetWorkersWithTimedOutTasks(TimeSpan.Zero));
     }
+
+    // ── Work-slot abandonment on reschedule ───────────────────────────────────
+
+    /// <summary>
+    /// A reclaimed task's WORK SLOT is abandoned alongside the active-task pointer, so the
+    /// redispatch's fresh capture is not blocked by the dead dispatch's live slot. Asserted on
+    /// the timed-out (hung-worker) branch; the stale-worker branch is covered below.
+    /// </summary>
+    [Fact]
+    public async Task RunCleanupCycle_TaskReclaimed_AbandonsWorkSlotAndClearsPointer()
+    {
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(new CopilotHive.Goals.Goal
+        {
+            Id = "goal-reclaim",
+            Description = "Reclaim goal",
+            RepositoryNames = ["test-repo"],
+        });
+
+        var plan = IterationPlan.Default(includeImprove: true);
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var slot = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        pipeline.SetActiveTask(slot.TaskId);
+        pipelineManager.RegisterTask(slot.TaskId, pipeline.GoalId);
+
+        var hung = MakeWorker("worker-hung");
+        hung.IsBusy = true;
+        hung.CurrentTaskId = slot.TaskId;
+        hung.LastActivityAt = DateTime.UtcNow.AddMinutes(-90);
+
+        var poolMock = MakePoolMock();
+        poolMock.Setup(p => p.GetWorkersWithTimedOutTasks(It.IsAny<TimeSpan>())).Returns([hung]);
+        poolMock.Setup(p => p.TryRemoveTimedOutWorker("worker-hung", It.IsAny<TimeSpan>())).Returns(true);
+
+        var config = new CopilotHive.Configuration.HiveConfigFile
+        {
+            Orchestrator = new CopilotHive.Configuration.OrchestratorConfig { WorkerTaskTimeoutMinutes = 60 },
+        };
+        var svc = new StaleWorkerCleanupService(
+            poolMock.Object, new TaskQueue(), pipelineManager,
+            Mock.Of<ILogger<StaleWorkerCleanupService>>(), goalDispatcher: null, config: config);
+
+        await svc.RunCleanupCycleAsync();
+
+        var view = Assert.Single(pipeline.GetSlotsForTest());
+        Assert.Equal(slot.TaskId, view.Slot.TaskId);
+        Assert.Equal(WorkSlotState.Abandoned, view.State);
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // THE DEAD RULE: the freed position accepts a fresh capture (attempt 2).
+        var redispatch = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        Assert.Equal(2, redispatch.Attempt);
+        Assert.Equal(slot.Position, redispatch.Position);
+    }
 }

@@ -993,6 +993,12 @@ public sealed class TaskDispatchServiceTests
 
     // ── DispatchToRole: task registration and queue enqueue ───────────────
 
+    /// <summary>
+    /// The dispatched task ID is now ATTEMPT-STAMPED by the work-slot capture and reaches
+    /// <see cref="TaskBuilder.Build"/> verbatim, and the task → goal mapping is claimed through
+    /// the ownership-checked <c>TryRegisterTask</c> (a mapping the manager can look up, backed by
+    /// a live pending slot) rather than the legacy unconditional writer.
+    /// </summary>
     [Fact]
     public async Task DispatchToRole_RegistersTaskAndEnqueuesToQueue()
     {
@@ -1021,16 +1027,69 @@ public sealed class TaskDispatchServiceTests
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        // Task was enqueued
+        // Task was enqueued with the attempt-stamped ID the capture allocated.
         Assert.NotNull(enqueuedTask);
+        Assert.Equal($"{goal.Id}-coder-001-01-001", enqueuedTask!.TaskId);
 
         // Task was registered in pipeline manager (taskId → goalId mapping)
-        var lookupPipeline = pipelineManager.GetByTaskId(enqueuedTask!.TaskId);
+        var lookupPipeline = pipelineManager.GetByTaskId(enqueuedTask.TaskId);
         Assert.NotNull(lookupPipeline);
         Assert.Equal(goal.Id, lookupPipeline!.GoalId);
 
         // Active task was set on the pipeline
         Assert.Equal(enqueuedTask.TaskId, pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The dispatch consumes the OWNERSHIP-CHECKED registration: a mapping already owned by
+    /// another goal is REFUSED (never stolen), the captured slot is released, and no task is
+    /// enqueued. Under the legacy unconditional <c>RegisterTask</c> the mapping would silently
+    /// be overwritten and the dispatch would proceed.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenMappingOwnedByAnotherGoal_RefusesAndReleasesSlot()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var pipelineManager = new GoalPipelineManager();
+        var taskQueue = new TaskQueue();
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue);
+
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+
+        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        var otherGoal = new Goal { Id = $"goal-other-{Guid.NewGuid():N}", Description = "Other" };
+        pipelineManager.CreatePipeline(otherGoal);
+        pipelineManager.RegisterTask(expectedTaskId, otherGoal.Id);
+
+        WorkTask? enqueuedTask = null;
+        taskQueue.OnEnqueue = t => enqueuedTask = t;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        Assert.Equal(
+            $"Task mapping registration failed for {expectedTaskId} (goal {goal.Id}) — the mapping is occupied or the persistence failed",
+            ex.Message);
+        Assert.Null(ex.InnerException);
+
+        // The competing mapping is intact, nothing was delivered, and the pointer stays unset.
+        Assert.Equal(otherGoal.Id, pipelineManager.GetByTaskId(expectedTaskId)!.GoalId);
+        Assert.Null(enqueuedTask);
+        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Null(pipeline.ActiveTaskId);
     }
 
     // ── DispatchToRole: idle worker direct dispatch ───────────────────────
@@ -1478,9 +1537,20 @@ public sealed class TaskDispatchServiceTests
         return config;
     }
 
+    /// <summary>
+    /// Installs an iteration plan carrying <paramref name="tier"/> on every worker phase and
+    /// ALIGNS the state machine with the pipeline's current phase.
+    /// </summary>
+    /// <remarks>
+    /// The dispatch now captures its work-slot position before building the task, and the capture
+    /// refuses when the pipeline's phase and the machine's phase disagree. A fixture that only
+    /// called <c>StartIteration</c> would leave the machine parked on the plan's FIRST phase while
+    /// the pipeline had already advanced — an incoherent state no production path produces. The
+    /// plan includes <see cref="GoalPhase.Improve"/> so the improver vectors have a real position.
+    /// </remarks>
     private static void SetPlan(GoalPipeline pipeline, ModelTier tier)
     {
-        var plan = IterationPlan.Default();
+        var plan = IterationPlan.Default(includeImprove: true);
         // Set the requested tier on all worker phases
         foreach (var phase in plan.Phases)
         {
@@ -1490,6 +1560,8 @@ public sealed class TaskDispatchServiceTests
         }
         pipeline.SetPlan(plan);
         pipeline.StateMachine.StartIteration(plan.Phases);
+        // Align the machine with the pipeline's own phase (a no-op when it is the plan's first).
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, pipeline.Phase);
     }
 
     /// <summary>

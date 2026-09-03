@@ -285,7 +285,9 @@ public sealed class Program
                 new ComposerAttachmentService(stateDir, sp.GetRequiredService<ILogger<ComposerAttachmentService>>()));
 
             builder.Services.AddSingleton(sp =>
-                new GoalPipelineManager(sp.GetRequiredService<PipelineStore>()));
+                new GoalPipelineManager(
+                    sp.GetRequiredService<PipelineStore>(),
+                    sp.GetRequiredService<ILogger<GoalPipelineManager>>()));
 
             // HiveConfigFile: ALWAYS registered so GetService<HiveConfigFile>() is never null —
             // EXACTLY ONE registration (one configuration authority), so IEnumerable<HiveConfigFile>

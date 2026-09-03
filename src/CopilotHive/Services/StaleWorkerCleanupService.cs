@@ -176,6 +176,11 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         var pipeline = _pipelineManager.GetByTaskId(taskId);
         if (pipeline is not null)
         {
+            // THE DEAD RULE. The abandoned task's work slot is retired in BOTH branches above
+            // (queued task re-enqueued, or task already gone from the active queue), so the
+            // redispatch's fresh CaptureDispatchPosition sees a DEAD slot at the position and
+            // succeeds instead of refusing with a double-assignment.
+            pipeline.AbandonSlot(taskId);
             pipeline.ClearActiveTask();
             _goalDispatcher?.EnqueueRedispatch(pipeline.GoalId);
             _logger.LogInformation("Cleared active task on pipeline {GoalId} — queued for re-dispatch",
