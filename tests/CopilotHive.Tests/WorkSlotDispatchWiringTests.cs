@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -884,17 +885,19 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // (10) The cleanup's abandonment — both branches + the DEAD rule
+    // (10) The cleanup's replacement reclaim — D2 (retire + unregister + redispatch)
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// BOTH cleanup branches abandon the slot: the task still in the active queue (re-enqueued —
-    /// the interim behaviour, unchanged) and the task already gone from it.
+    /// THE RE-ENQUEUE INTERIM IS RETIRED. Both branches (task still active / already gone) now
+    /// complete the queue entry UNCONDITIONALLY with NO re-enqueue, retire the slot and
+    /// unregister the mapping — the replacement comes ONLY from the redispatch's fresh dispatch.
+    /// (Replaces the interim assertion that the active-task branch re-enqueues the old task.)
     /// </summary>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task Cleanup_AbandonsSlotInBothBranches(bool taskStillActive)
+    public async Task Cleanup_CompletesEntryInBothBranches_NeverReEnqueues(bool taskStillActive)
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
@@ -916,27 +919,23 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // The slot is DEAD in both branches, and the pointer is cleared.
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(pipeline.ActiveTaskId);
+        // THE MAPPING IS UNREGISTERED in both branches.
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(ReadPersistedGoalId(taskId));
 
-        // The re-enqueue interim behaviour: preserved exactly, only on the active-task branch.
-        var requeued = queue.TryDequeueAny();
-        if (taskStillActive)
-        {
-            Assert.NotNull(requeued);
-            Assert.Equal(taskId, requeued!.TaskId);
-        }
-        else
-        {
-            Assert.Null(requeued);
-        }
+        // THE RETIREMENT OF THE INTERIM: NO branch re-enqueues the old task — the entry is gone.
+        Assert.Null(queue.GetActiveTask(taskId));
+        Assert.Null(queue.TryDequeueAny());
     }
 
     /// <summary>
-    /// THE DEAD RULE, end to end: after <c>RescheduleAbandonedTask</c> the position is free again,
-    /// so the redispatch's FRESH capture SUCCEEDS (with the next attempt number) instead of being
-    /// refused as a double assignment.
+    /// THE FRESH-CAPTURE END-TO-END: after a reclaim the old TaskId is absent from
+    /// <c>_pending</c>/<c>_active</c>, and one FRESH replacement dispatch happens and is green —
+    /// the new attempt is admitted (captured, registered, pointed at, enqueued) while the old
+    /// slot stays dead.
     /// </summary>
     [Fact]
-    public async Task Cleanup_ThenRedispatch_FreshCaptureSucceeds()
+    public async Task Cleanup_ThenRedisdispatch_OldTaskAbsentOneFreshReplacementDispatchIsGreen()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
@@ -951,20 +950,170 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.NotNull(dispatched);
         queue.Activate(dispatched!, "worker-dead");
 
-        // Without the cleanup's abandonment the live slot would refuse the next capture.
         var cleanup = CreateCleanup(manager, queue, firstTaskId);
         await cleanup.RunCleanupCycleAsync();
 
-        var second = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        // THE OLD TASK IS ABSENT from both belts of the queue.
+        Assert.Null(queue.GetActiveTask(firstTaskId));
+        Assert.Null(queue.TryDequeueAny());
 
-        Assert.Equal(ExpectedTaskId(GoalId, WorkerRole.Coder, attempt: 2), second.TaskId);
-        Assert.Equal(2, second.Attempt);
-        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), second.Position);
-        // The first slot stayed dead; the new one is live.
-        var slots = pipeline.GetSlotsForTest();
-        Assert.Equal(2, slots.Count);
-        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(slots, s => s.Slot.TaskId == firstTaskId).State);
-        Assert.Equal(WorkSlotState.Pending, Assert.Single(slots, s => s.Slot.TaskId == second.TaskId).State);
+        // ONE FRESH REPLACEMENT DISPATCH happens and is GREEN: the capture succeeds, the mapping
+        // is registered (memory + persisted), the pointer names the new task, and the task is
+        // enqueued with NO integrity record of any kind.
+        var logger = new TestLogger<TaskDispatchService>();
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it again", TestContext.Current.CancellationToken);
+
+        var secondTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder, attempt: 2);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == secondTaskId).State);
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == firstTaskId).State);
+        Assert.Same(pipeline, manager.GetByTaskId(secondTaskId));
+        Assert.Equal(GoalId, ReadPersistedGoalId(secondTaskId));
+        Assert.Equal(secondTaskId, pipeline.ActiveTaskId);
+        Assert.Equal([secondTaskId], DrainPending(queue));
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("WorkSlotIntegrity", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// THE POST-RECLAIM ECHO: the reclaim's <c>(true, true)</c> unregister is the mapping belt —
+    /// when the OLD completion arrives afterwards it resolves NO pipeline and is dropped; the
+    /// pipeline is untouched by the echo.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_ReclaimThenOldCompletion_ResolvesNoPipeline()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var dispatched = queue.TryDequeueAny();
+        Assert.NotNull(dispatched);
+        queue.Activate(dispatched!, "worker-dead");
+
+        var cleanup = CreateCleanup(manager, queue, taskId);
+        await cleanup.RunCleanupCycleAsync();
+
+        // THE MAPPING BELT: the old completion can no longer resolve ANY pipeline.
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(ReadPersistedGoalId(taskId));
+
+        // THE COMPLETION GUARD'S NO-PIPELINE DROP: the late completion hits the no-pipeline
+        // warning and the pipeline's phase and admission state are untouched.
+        var completionLogger = new TestLogger<TaskCompletionService>();
+        var completionService = CreateCompletionService(manager, completionLogger);
+        await completionService.HandleTaskCompletionAsync(
+            new TaskResult { TaskId = taskId, Status = TaskOutcome.Completed, Output = "late" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains(completionLogger.LogEntries, l =>
+            l.LogLevel == LogLevel.Warning &&
+            l.Message.Contains("No pipeline found for completed task") &&
+            l.Message.Contains(taskId));
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+    }
+
+    /// <summary>
+    /// THE RESTART VECTOR — the mapping-durability claim ONLY. After the reclaim's
+    /// <c>(true, true)</c> unregister, a FRESH manager/store round (new instances reading the
+    /// same persisted store) resolves the old completion to NO pipeline, and the REPLACEMENT's
+    /// completion flows. The restored pipeline's slot/pointer reconciliation is NOT asserted —
+    /// it belongs to the completion-protocol successor.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_AfterReclaim_RestartedManagerCannotResolveOldCompletion_ButNewOneFlows()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var firstTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var dispatched = queue.TryDequeueAny();
+        Assert.NotNull(dispatched);
+        queue.Activate(dispatched!, "worker-dead");
+
+        var cleanup = CreateCleanup(manager, queue, firstTaskId);
+        await cleanup.RunCleanupCycleAsync();
+
+        // THE PERSISTED MAPPING IS GONE — the durable belt held.
+        Assert.Null(manager.GetByTaskId(firstTaskId));
+        Assert.Null(ReadPersistedGoalId(firstTaskId));
+
+        // THE RESTART: a FRESH manager and store round over the SAME persisted database.
+        var restoredStore = CreateStore();
+        var restartedManager = new GoalPipelineManager(restoredStore, new TestLogger<GoalPipelineManager>());
+        restartedManager.RestoreFromStore();
+
+        // The old completion resolves NO pipeline in the restarted world.
+        Assert.Null(restartedManager.GetByTaskId(firstTaskId));
+        var restartedLogger = new TestLogger<TaskCompletionService>();
+        var restartedCompletion = CreateCompletionService(restartedManager, restartedLogger);
+        await restartedCompletion.HandleTaskCompletionAsync(
+            new TaskResult { TaskId = firstTaskId, Status = TaskOutcome.Completed, Output = "post-restart echo" },
+            TestContext.Current.CancellationToken);
+        Assert.Contains(restartedLogger.LogEntries, l =>
+            l.LogLevel == LogLevel.Warning &&
+            l.Message.Contains("No pipeline found for completed task") &&
+            l.Message.Contains(firstTaskId));
+
+        // THE REPLACEMENT flows: a fresh dispatch in the restarted round registers its mapping
+        // (memory + persisted), and the replacement's completion resolves the pipeline.
+        const string replacementTaskId = "goal-wiring-coder-001-01-002";
+        restartedManager.RegisterTask(replacementTaskId, GoalId);
+        await restartedCompletion.HandleTaskCompletionAsync(
+            new TaskResult
+            {
+                TaskId = replacementTaskId,
+                Status = TaskOutcome.Completed,
+                Output = "the replacement completed",
+                Metrics = new TaskMetrics { Verdict = "PASS" },
+            },
+            TestContext.Current.CancellationToken);
+        // THE MAPPING CLAIM ONLY (not the restored-pipeline slot/pointer reconciliation — that is
+        // the completion-protocol successor's, per the production note): the restarted manager
+        // resolves the replacement task to the restored pipeline.
+        Assert.Same(
+            restartedManager.GetByGoalId(GoalId),
+            restartedManager.GetByTaskId(replacementTaskId));
+        Assert.DoesNotContain(restartedLogger.LogEntries, l =>
+            l.Message.Contains("No pipeline found for completed task") &&
+            l.Message.Contains(replacementTaskId));
+    }
+
+    /// <summary>
+    /// Builds a <see cref="TaskCompletionService"/> over the given manager with a pass-through
+    /// driver (no brain), so the early-exit guards are what is under test.
+    /// </summary>
+    private static TaskCompletionService CreateCompletionService(
+        GoalPipelineManager manager, TestLogger<TaskCompletionService> logger)
+    {
+        var goalManager = new GoalManager();
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+        var pipelineDriver = new PipelineDriver(
+            brain: null,
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+        return new TaskCompletionService(
+            manager, null, pipelineDriver, lifecycleService, null, logger);
     }
 
     /// <summary>Builds a cleanup service whose pool reports one dead worker holding <paramref name="taskId"/>.</summary>

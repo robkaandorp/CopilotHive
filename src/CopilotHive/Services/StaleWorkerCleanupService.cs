@@ -6,11 +6,36 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Hosted background service that periodically scans the worker pool for stale workers
 /// (workers whose heartbeat has not been received within <see cref="CleanupDefaults.StaleTimeoutMinutes"/>
-/// minutes) and removes them. When a stale worker had an active task, the task is
-/// re-enqueued for reassignment to another worker.
+/// minutes) and removes them. When a stale worker had an active task, the task is reclaimed:
+/// its queue entry is completed (never re-enqueued — the re-enqueue interim is retired), its
+/// pipeline work slot is retired atomically together with the active-task pointer, the durable
+/// task→goal mapping is unregistered, and the goal is queued for a FRESH re-dispatch.
 /// It also reclaims tasks that exceed <see cref="Configuration.OrchestratorConfig.WorkerTaskTimeoutMinutes"/>
 /// even while the worker keeps heartbeating, which covers hung LLM calls.
 /// </summary>
+/// <remarks>
+/// <para>
+/// THE TWO BELTS. A reclaim covers the race between the reclaim and a completion (or a later
+/// dispatch) through two independent belts: (1) the SLOT RETIREMENT — the D1 primitive
+/// <see cref="GoalPipeline.RetireSlotAndClearIfCurrent"/>, which atomically retires the attempt's
+/// work slot and clears the active-task pointer only when it still names the retired task; and
+/// (2) THE MAPPING UNREGISTER — <see cref="GoalPipelineManager.TryUnregisterTask"/>, which removes
+/// the durable task→goal mapping in memory and in the persisted store so the task can never
+/// resolve back to this pipeline. The completion path's abandoned-slot guard
+/// (<see cref="TaskCompletionService"/>) drops any completion that arrives in the retire's
+/// observation window — <c>RescheduleAbandonedTask</c> is synchronous with NO seam between the
+/// retire and the unregister, so the in-window echo is covered by the D1 suite's reclaim-path
+/// fixture (retire linearized, mapping intact, the completion guard's drop) — referenced here,
+/// NOT duplicated here.
+/// </para>
+/// <para>
+/// THE RESTORED-POLICY SUCCESSOR. The pipeline's slot retirement and the cleared pointer are
+/// IN-MEMORY: this reclaim calls NO <c>PersistFull</c> (or any other persistence) — the cleanup's
+/// mutation is intentionally not persisted. A pipeline restored after a restart has an EMPTY slot
+/// registry and its pointer is the snapshot's; the reconciliation of that restored state is owned
+/// by the completion-protocol successor, not by this method.
+/// </para>
+/// </remarks>
 public sealed class StaleWorkerCleanupService : BackgroundService
 {
     private readonly IWorkerPool _workerPool;
@@ -156,35 +181,126 @@ public sealed class StaleWorkerCleanupService : BackgroundService
         return anyRemoved;
     }
 
+    /// <summary>
+    /// Reclaims the task a removed (stale or timed-out) worker was holding, using the D2 shape:
+    /// <list type="number">
+    ///   <item><description><see cref="TaskQueue.MarkComplete"/> on the task's queue entry —
+    ///     UNCONDITIONAL, with NO re-enqueue (the re-enqueue interim is retired; the queue entry
+    ///     is dropped, not handed to another worker).</description></item>
+    ///   <item><description>THE RETIRE — <see cref="GoalPipeline.RetireSlotAndClearIfCurrent"/>,
+    ///     the D1 atomic primitive: the attempt's work slot is retired AND the active-task pointer
+    ///     is cleared in one lock acquisition, when and only when the pointer still names the
+    ///     retired task.</description></item>
+    ///   <item><description>THE MAPPING UNREGISTER — the durable task→goal mapping is removed
+    ///     from memory and (when a store is present) from the persisted <c>task_mappings</c>, so a
+    ///     restart can never resolve the retired task back to this pipeline. The result is ALWAYS
+    ///     logged at DEBUG; a <c>(true, false)</c> — memory removed but the persisted removal did
+    ///     not confirm — is a WARNING in conservative wording (no row-survival claim; the
+    ///     completion-protocol successor owns the durable reconciliation).</description></item>
+    ///   <item><description>THE REDISPATCH — the goal is queued for a FRESH dispatch, which
+    ///     captures a new position on the now-free position.</description></item>
+    /// </list>
+    /// The false retirement outcomes (<see cref="SlotRetirementOutcome.SlotAbsent"/> and
+    /// <see cref="SlotRetirementOutcome.AlreadyAbandoned"/>) are CONTINUATIONS: the mapping
+    /// unregister and the re-dispatch still run. The ORPHAN path (no pipeline for the task)
+    /// removes the active entry and dispatches NOTHING — a persisted mapping, if any, survives
+    /// for the successor's reconciliation.
+    /// </summary>
+    /// <param name="workerId">The id of the worker that was removed.</param>
+    /// <param name="taskId">The task id the worker was holding.</param>
     private void RescheduleAbandonedTask(string workerId, string taskId)
     {
-        var task = _taskQueue.GetActiveTask(taskId);
-        if (task is null)
+        // (1) THE UNCONDITIONAL COMPLETION. The queue entry is dropped, never re-enqueued: the
+        // re-enqueue would double-dispatch (the old task re-enqueued AND the goal redispatched),
+        // so the re-enqueue interim is retired — the replacement comes only from the fresh
+        // dispatch the redispatch triggers.
+        _taskQueue.MarkComplete(taskId);
+
+        // The pipeline may not exist for the task (an orphan) — everything below is then skipped.
+        var pipeline = _pipelineManager.GetByTaskId(taskId);
+        if (pipeline is null)
         {
-            _logger.LogWarning("Stale worker {WorkerId} had task {TaskId} but it is not in the active queue — clearing pipeline",
+            _logger.LogWarning(
+                "Worker {WorkerId} task {TaskId} reclaimed with no pipeline — the active entry removed; no re-dispatch (orphan; a persisted mapping, if any, survives for the successor's reconciliation)",
                 workerId, taskId);
+            return;
+        }
+
+        // (2) THE RETIRE: the D1 primitive. Slot retirement and the if-current pointer clear
+        // happen inside a single lock acquisition.
+        var outcome = pipeline.RetireSlotAndClearIfCurrent(taskId);
+
+        // (3) THE MAPPING UNREGISTER — the durable belt. Retirement alone is in-memory only;
+        // without the unregister a restart could still resolve the retired task to this pipeline.
+        // THE IN-WINDOW ECHO: this method is synchronous with NO seam between the retire and the
+        // unregister, so a completion arriving between them still resolves the pipeline and is
+        // dropped by the completion guard's abandoned-slot check — covered by the D1 suite's
+        // reclaim-path fixture, referenced in the class doc, NOT duplicated here.
+        var unregister = new TaskUnregisterResult(false, false);
+        try
+        {
+            unregister = _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
+        }
+        catch (Exception ex)
+        {
+            // THE DEFENSIVE CATCH. TryUnregisterTask's contract promises NEVER to throw; an escape
+            // here is a contract violation (no runtime vector — the same sealed/non-virtual
+            // treatment as the chain's established defensive paths, deliberately WITHOUT a
+            // runtime-injection seam). The reclaim continues.
+            _logger.LogWarning(
+                ex,
+                "WorkSlotIntegrity: reclaim-unregister-throw goal={GoalId} task={TaskId} — the unregister call threw; the reclaim continues",
+                pipeline.GoalId, taskId);
+        }
+
+        _logger.LogDebug(
+            "WorkSlotIntegrity: reclaim-unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved}",
+            pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved);
+
+        if (unregister.MemoryRemoved && !unregister.PersistenceRemoved)
+        {
+            // THE UNCONFIRMED PERSISTED REMOVAL, in CONSERVATIVE wording: no row-survival claim —
+            // the delete did not confirm; a restart may still resolve the task to this pipeline.
+            // The completion-protocol successor owns the durable reconciliation.
+            _logger.LogWarning(
+                "WorkSlotIntegrity: reclaim-unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved} — the mapping's persisted removal did not confirm; a restart may resolve the retired task to this pipeline; the completion-protocol successor owns the durable reconciliation",
+                pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved);
+        }
+
+        // (4) THE REDISPATCH: the replacement comes from a FRESH dispatch on the retired slot's
+        // now-free position, not from a re-enqueue of the old task.
+        _goalDispatcher?.EnqueueRedispatch(pipeline.GoalId);
+
+        // (5) THE OUTCOME-HONEST LOG.
+        if (outcome is SlotRetirementOutcome.Retired)
+        {
+            if (_goalDispatcher is not null)
+            {
+                _logger.LogInformation(
+                    "Worker {WorkerId} task {TaskId} reclaimed — slot retired; queued for re-dispatch (goal {GoalId})",
+                    workerId, taskId, pipeline.GoalId);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Worker {WorkerId} task {TaskId} reclaimed — slot retired; no dispatcher available for re-dispatch (goal {GoalId})",
+                    workerId, taskId, pipeline.GoalId);
+            }
         }
         else
         {
-            _taskQueue.MarkComplete(taskId);
-            _taskQueue.Enqueue(task);
-            _logger.LogWarning("Re-enqueued task {TaskId} from dead worker {WorkerId} for reassignment",
-                taskId, workerId);
-        }
-
-        // Clear the pipeline's active task and signal the dispatcher to re-dispatch
-        var pipeline = _pipelineManager.GetByTaskId(taskId);
-        if (pipeline is not null)
-        {
-            // THE DEAD RULE. The abandoned task's work slot is retired in BOTH branches above
-            // (queued task re-enqueued, or task already gone from the active queue), so the
-            // redispatch's fresh CaptureDispatchPosition sees a DEAD slot at the position and
-            // succeeds instead of refusing with a double-assignment.
-            pipeline.AbandonSlot(taskId);
-            pipeline.ClearActiveTask();
-            _goalDispatcher?.EnqueueRedispatch(pipeline.GoalId);
-            _logger.LogInformation("Cleared active task on pipeline {GoalId} — queued for re-dispatch",
-                pipeline.GoalId);
+            if (_goalDispatcher is not null)
+            {
+                _logger.LogInformation(
+                    "Worker {WorkerId} task {TaskId} reclaimed — slot already retired or absent (outcome={Outcome}); queued for re-dispatch (goal {GoalId})",
+                    workerId, taskId, outcome, pipeline.GoalId);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Worker {WorkerId} task {TaskId} reclaimed — slot already retired or absent (outcome={Outcome}); no dispatcher available for re-dispatch (goal {GoalId})",
+                    workerId, taskId, outcome, pipeline.GoalId);
+            }
         }
     }
 }
