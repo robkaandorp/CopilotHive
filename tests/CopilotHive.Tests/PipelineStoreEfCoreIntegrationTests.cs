@@ -753,10 +753,12 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var ex = Assert.ThrowsAny<Exception>(
             () => store.SaveAdmissionWithPointer(pipeline, "task-stagegate"));
 
-        // THE ORIGINAL exception propagates — never a conflict result, never a silent swallow.
-        var sqlite = Assert.IsType<SqliteException>(UnwrapToSqlite(ex)!);
-        Assert.Equal(19, sqlite.SqliteErrorCode);
-        Assert.Equal(1555, sqlite.SqliteExtendedErrorCode);
+        // THE ORIGINAL exception propagates BY IDENTITY — never a conflict result, never a
+        // silent swallow, never a replacement carrying the same code.
+        AssertSentinelPropagatedAtDepthOne(ex, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount); // the injection really fired, once
+        Assert.Equal(19, interceptor.Sentinel.SqliteErrorCode);
+        Assert.Equal(1555, interceptor.Sentinel.SqliteExtendedErrorCode);
 
         // The rolled-back transaction left NEITHER row behind.
         Assert.Null(ExecuteScalarOnKeeper(
@@ -811,10 +813,13 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var ex = Assert.ThrowsAny<Exception>(
             () => store.SaveAdmissionWithPointer(pipeline, $"task-prop-{code}"));
 
-        // THE ORIGINAL exception — with the EXACT configured code — propagates.
-        var sqlite = Assert.IsType<SqliteException>(UnwrapToSqlite(ex)!);
-        Assert.Equal(isExtendedCode ? 19 : code, sqlite.SqliteErrorCode);
-        Assert.Equal(code, sqlite.SqliteExtendedErrorCode);
+        // THE ORIGINAL exception propagates BY IDENTITY — the SAME INSTANCE the interceptor
+        // threw, at chain depth 1 — so a replacement carrying the same code cannot pass.
+        AssertSentinelPropagatedAtDepthOne(ex, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount);
+        // …and it carries the EXACT configured code (never reclassified as a conflict).
+        Assert.Equal(isExtendedCode ? 19 : code, interceptor.Sentinel.SqliteErrorCode);
+        Assert.Equal(code, interceptor.Sentinel.SqliteExtendedErrorCode);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -895,7 +900,16 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
 
         var ex = Assert.ThrowsAny<Exception>(
             () => store.SaveAdmissionWithPointer(pipeline, "task-unconf"));
-        _ = ex; // THE ORIGINAL outcome is preserved (the generic path's exception)
+
+        // THE ORIGINAL OUTCOME IS PRESERVED, BY IDENTITY: the propagated exception is the
+        // operation's DbUpdateException wrapping the interceptor's SENTINEL instance — the
+        // ROLLBACK's own failure (a DISTINCT sentinel instance) did NOT replace or wrap it.
+        AssertSentinelPropagatedAtDepthOne(ex, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount);
+        // THE ROLLBACK FAILURE REALLY FIRED (the guard ran and swallowed), and its distinct
+        // sentinel appears NOWHERE in the propagated chain.
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        Assert.DoesNotContain(EnumerateChain(ex), e => ReferenceEquals(e, connection.RollbackSentinel));
 
         // THE ROLLBACK WARNING was logged with the identifiers.
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
@@ -926,8 +940,14 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     /// <summary>
     /// THE THROWING LOGGER: a logger that throws while writing the rollback-failure warning in
     /// the cleanup path must NEVER mask the original outcome — the throw is silently swallowed
-    /// and the ORIGINAL exception still propagates.
+    /// and the ORIGINAL exception (BY IDENTITY) still propagates.
     /// </summary>
+    /// <remarks>
+    /// THREE distinct failure instances are in play — the interceptor's operation sentinel, the
+    /// connection's rollback sentinel, and the logger's own sentinel — so "the original was
+    /// replaced by a cleanup-time failure" is detectable by identity, and the logger's throw
+    /// COUNT proves the fallible cleanup step actually ran (rather than never having fired).
+    /// </remarks>
     [Fact]
     public void SaveAdmission_ThrowingLogger_CleanupWarning_SilentSwallow_OriginalPreserved()
     {
@@ -951,18 +971,93 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         // THE ORIGINAL exception escapes — the throwing logger did NOT mask it…
         var ex = Record.Exception(
             () => store.SaveAdmissionWithPointer(pipeline, "task-throwlog"));
-        Assert.True(ex is not null, "expected the original exception; nothing was thrown");
-        var sqlite = UnwrapToSqlite(ex!);
-        Assert.True(sqlite is not null,
-            "expected a SqliteException in the chain; observed: " + ex!.GetType().FullName +
-            (ex.InnerException is null ? "" : " ← " + ex.InnerException.GetType().FullName));
 
-        // …and the swallow was SILENT: the second-order failure never surfaced as anything.
-        // (If BestEffortWarning's catch were removed, the logger's throw would escape INSTEAD
-        // of the SqliteException and the assertion above would fail.)
+        // …and it is the SAME INSTANCE the interceptor threw, at chain depth 1.
+        AssertSentinelPropagatedAtDepthOne(ex, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // THE FALLIBLE CLEANUP REALLY RAN: the rollback failed (its guard fired) and the
+        // rollback-failure WARNING was attempted — the logger threw on it. Without this
+        // counter the vector could not distinguish "swallowed" from "never ran".
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        Assert.True(logger.ThrowCount >= 1, "the cleanup-time warning never reached the logger");
+
+        // THE SILENT SWALLOW: neither the logger's sentinel nor the rollback's sentinel
+        // appears anywhere in the propagated chain.
+        Assert.DoesNotContain(EnumerateChain(ex!), e => ReferenceEquals(e, logger.LoggerSentinel));
+        Assert.DoesNotContain(EnumerateChain(ex!), e => ReferenceEquals(e, connection.RollbackSentinel));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (8) The transaction-dispose failure ON THE FAILURE PATH
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE FAILURE-PATH TRANSACTION DISPOSE: the operation fails AND the guarded transaction
+    /// disposal also fails → the <c>admission-dispose</c> warning is logged, the dispose
+    /// failure is swallowed, and the ORIGINAL exception (BY IDENTITY) still propagates — the
+    /// dispose failure never replaces or wraps it.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_FailurePath_TransactionDisposeFails_OriginalExceptionPreserved()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        var logger = new TestLogger<PipelineStore>();
+        var connection = new DisposeThrowingConnection(SharedConnectionString);
+        _connections.Add(connection);
+        connection.Open();
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(interceptor);
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        var store = new PipelineStore(context, logger);
+
+        var pipeline = CreatePipeline("goal-dispfail", "task-dispfail");
+
+        var ex = Record.Exception(
+            () => store.SaveAdmissionWithPointer(pipeline, "task-dispfail"));
+
+        // THE ORIGINAL exception, BY IDENTITY — not the dispose failure, not a wrapper.
+        AssertSentinelPropagatedAtDepthOne(ex, interceptor.Sentinel);
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // THE GUARDED DISPOSAL REALLY FIRED (and failed) …
+        Assert.Equal(1, connection.DisposeAttemptCount);
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning
+            && e.Message.Contains("admission-dispose", StringComparison.Ordinal));
+        Assert.Contains("goal-dispfail", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task-dispfail", warning.Message, StringComparison.Ordinal);
+
+        // … and its DISTINCT sentinel appears NOWHERE in the propagated chain.
+        Assert.DoesNotContain(EnumerateChain(ex!), e => ReferenceEquals(e, connection.DisposeSentinel));
+
+        // The rollback still made the aborted mapping insert invisible.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-dispfail'"));
     }
 
     // ───────────────────────────── shared helpers ─────────────────────────────
+
+    /// <summary>
+    /// THE IDENTITY PROOF for original-exception preservation: the propagated exception must be
+    /// the <see cref="DbUpdateException"/> EF raised for the failing flush, and the exception at
+    /// chain depth 1 (its <c>InnerException</c>) must be the SAME INSTANCE as the interceptor's
+    /// pre-created sentinel. A cleanup/rollback/dispose replacement, an ADDED wrapper level, or
+    /// a newly created same-code <see cref="SqliteException"/> all fail this assertion.
+    /// </summary>
+    private static void AssertSentinelPropagatedAtDepthOne(Exception? thrown, SqliteException sentinel)
+    {
+        Assert.NotNull(thrown);
+        // The exact shape: DbUpdateException → sentinel. NOT "a SqliteException somewhere".
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(sentinel, update.InnerException);
+        // …and the chain STOPS there: no extra wrapping was inserted beneath the sentinel by a
+        // cleanup step re-throwing through it.
+        Assert.Null(sentinel.InnerException);
+    }
 
     /// <summary>Walks the exception chain to the innermost <see cref="SqliteException"/>.</summary>
     private static SqliteException? UnwrapToSqlite(Exception exception)
@@ -974,6 +1069,13 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         }
         return null;
     }
+
+    /// <summary>Every exception in the propagated chain, outermost first.</summary>
+    private static IEnumerable<Exception> EnumerateChain(Exception exception)
+    {
+        for (var current = (Exception?)exception; current is not null; current = current.InnerException)
+            yield return current;
+    }
 }
 
 /// <summary>
@@ -981,6 +1083,18 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
 /// BEFORE the first <c>task_mappings</c> or <c>pipelines</c> INSERT statement executes — the
 /// mapping flush or the pipeline flush, respectively.
 /// </summary>
+/// <remarks>
+/// THE SENTINEL: the thrown exception is a SINGLE pre-created instance exposed as
+/// <see cref="Sentinel"/>, so a test can assert IDENTITY (<c>Assert.Same</c>) at the expected
+/// position of the propagated chain. That closes the "a same-code exception exists somewhere in
+/// the chain" hole: a cleanup/rollback/dispose replacement, an added wrapper level, or a newly
+/// created exception carrying the same code all FAIL the identity assertion.
+/// <para>
+/// <see cref="PipelinesSelectCount"/> counts the <c>SELECT … FROM "pipelines"</c> reads the
+/// context issued, so a test can observe the CLEANUP-TIME reload separately from the
+/// <c>UpsertPipelineCore</c> lookup that preceded the failing write.
+/// </para>
+/// </remarks>
 internal sealed class AdmissionTargetedThrowInterceptor : DbCommandInterceptor
 {
     /// <summary>The statement the interceptor targets.</summary>
@@ -993,36 +1107,56 @@ internal sealed class AdmissionTargetedThrowInterceptor : DbCommandInterceptor
     }
 
     private readonly Target _target;
-    private readonly int _errorCode;
-    private readonly int _extendedErrorCode;
+    private int _throwCount;
+    private int _pipelinesSelectCount;
 
     public AdmissionTargetedThrowInterceptor(Target target, int errorCode, int extendedErrorCode)
     {
         _target = target;
-        _errorCode = errorCode;
-        _extendedErrorCode = extendedErrorCode;
+        Sentinel = new SqliteException(
+            target == Target.TaskMappings
+                ? "admission interceptor SENTINEL: targeted mapping flush"
+                : "admission interceptor SENTINEL: targeted pipeline flush",
+            errorCode,
+            extendedErrorCode);
     }
+
+    /// <summary>
+    /// THE PRE-CREATED SENTINEL instance this interceptor throws — the identity a preservation
+    /// vector asserts with <c>Assert.Same</c>.
+    /// </summary>
+    public SqliteException Sentinel { get; }
+
+    /// <summary>How many times the sentinel was thrown (the injection really fired).</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    /// <summary>How many <c>SELECT … FROM "pipelines"</c> reads the context issued.</summary>
+    public int PipelinesSelectCount => Volatile.Read(ref _pipelinesSelectCount);
 
     private void ThrowIfTargeted(DbCommand command)
     {
         var text = command.CommandText;
-        var isWrite = text.TrimStart().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
-            || text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+        var trimmed = text.TrimStart();
+        var isPipelinesStatement = text.Contains("pipelines", StringComparison.OrdinalIgnoreCase);
+
+        if (trimmed.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase) && isPipelinesStatement)
+            Interlocked.Increment(ref _pipelinesSelectCount);
+
+        var isWrite = trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
         if (!isWrite)
             return;
 
         var isTaskMappings = text.Contains("task_mappings", StringComparison.OrdinalIgnoreCase);
-        var isPipelines = text.Contains("pipelines", StringComparison.OrdinalIgnoreCase);
-        if (_target == Target.TaskMappings && isTaskMappings)
-            throw new SqliteException("admission interceptor: targeted mapping flush", _errorCode, _extendedErrorCode);
-        if (_target == Target.Pipelines && isPipelines)
-            throw new SqliteException("admission interceptor: targeted pipeline flush", _errorCode, _extendedErrorCode);
+        var isPipelines = isPipelinesStatement;
+        if ((_target == Target.TaskMappings && isTaskMappings)
+            || (_target == Target.Pipelines && isPipelines))
+        {
+            Interlocked.Increment(ref _throwCount);
+            throw Sentinel;
+        }
         // The mapping flush fires BEFORE the pipeline flush; the pipeline-flush target must not
         // misfire on the mapping's INSERT (both are INSERTs into similarly-named tables).
-        if (_target == Target.Pipelines && isTaskMappings && !isPipelines)
-            return;
-        if (_target == Target.TaskMappings && isPipelines && !isTaskMappings)
-            return;
     }
 
     /// <inheritdoc />
@@ -1065,12 +1199,26 @@ internal sealed class AdmissionTargetedThrowInterceptor : DbCommandInterceptor
 /// driver mechanism for the unconfirmed-rollback vector (the wrapper passes every other member
 /// through to the real connection).
 /// </summary>
+/// <remarks>
+/// The rollback failure throws a DISTINCT pre-created instance (<see cref="RollbackSentinel"/>),
+/// separate from the operation sentinel the interceptor throws, so an exception-replacement
+/// mutant (the rollback's own failure escaping or wrapping the original) is detectable by
+/// identity, and <see cref="RollbackAttemptCount"/> proves the guarded rollback actually ran.
+/// </remarks>
 internal sealed class RollbackThrowingConnection : DbConnection
 {
     private readonly SqliteConnection _inner;
+    private int _rollbackAttemptCount;
 
     public RollbackThrowingConnection(string connectionString) =>
         _inner = new SqliteConnection(connectionString);
+
+    /// <summary>The DISTINCT exception instance every forced rollback failure throws.</summary>
+    public InvalidOperationException RollbackSentinel { get; } =
+        new("forced rollback failure SENTINEL");
+
+    /// <summary>How many times the guarded rollback was attempted (and failed).</summary>
+    public int RollbackAttemptCount => Volatile.Read(ref _rollbackAttemptCount);
 
     [AllowNull]
     public override string ConnectionString
@@ -1093,6 +1241,12 @@ internal sealed class RollbackThrowingConnection : DbConnection
         new RollbackThrowingTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
 
     protected override DbCommand CreateDbCommand() => new TransactionTolerantCommand(_inner.CreateCommand());
+
+    private Exception RecordAndGetRollbackFailure()
+    {
+        Interlocked.Increment(ref _rollbackAttemptCount);
+        return RollbackSentinel;
+    }
 
     /// <summary>
     /// <see cref="Microsoft.Data.Sqlite.SqliteCommand"/> casts its transaction back to
@@ -1143,8 +1297,115 @@ internal sealed class RollbackThrowingConnection : DbConnection
         public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
         protected override DbConnection? DbConnection => _owner;
         public override void Commit() => _inner.Commit();
-        public override void Rollback() => throw new InvalidOperationException("forced rollback failure");
+        public override void Rollback() => throw _owner.RecordAndGetRollbackFailure();
         protected override void Dispose(bool disposing) => _inner.Dispose();
+    }
+}
+
+/// <summary>
+/// A connection wrapper whose transactions commit/roll back normally but THROW a DISTINCT
+/// pre-created instance on <c>Dispose</c> — the genuine driver mechanism for the failure-path
+/// transaction-dispose vector. <see cref="DisposeAttemptCount"/> proves the guarded disposal
+/// really ran.
+/// </summary>
+internal sealed class DisposeThrowingConnection : DbConnection
+{
+    private readonly SqliteConnection _inner;
+    private int _disposeAttemptCount;
+
+    public DisposeThrowingConnection(string connectionString) =>
+        _inner = new SqliteConnection(connectionString);
+
+    /// <summary>The DISTINCT exception instance every forced transaction dispose throws.</summary>
+    public InvalidOperationException DisposeSentinel { get; } =
+        new("forced transaction dispose failure SENTINEL");
+
+    /// <summary>How many times the guarded transaction disposal was attempted (and failed).</summary>
+    public int DisposeAttemptCount => Volatile.Read(ref _disposeAttemptCount);
+
+    [AllowNull]
+    public override string ConnectionString
+    {
+        get => _inner.ConnectionString;
+        set => _inner.ConnectionString = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    public override string Database => _inner.Database;
+    public override string DataSource => _inner.DataSource;
+    public override string ServerVersion => _inner.ServerVersion;
+    public override int ConnectionTimeout => _inner.ConnectionTimeout;
+    public override ConnectionState State => _inner.State;
+
+    public override void ChangeDatabase(string databaseName) => _inner.ChangeDatabase(databaseName);
+    public override void Close() => _inner.Close();
+    public override void Open() => _inner.Open();
+
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+        new DisposeThrowingTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
+
+    protected override DbCommand CreateDbCommand() => new ShieldedCommand(_inner.CreateCommand());
+
+    private Exception RecordAndGetDisposeFailure()
+    {
+        Interlocked.Increment(ref _disposeAttemptCount);
+        return DisposeSentinel;
+    }
+
+    /// <summary>Commits/rolls back for real; the DISPOSE is the injected failure.</summary>
+    private sealed class DisposeThrowingTransaction : DbTransaction
+    {
+        private readonly DisposeThrowingConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public DisposeThrowingTransaction(DisposeThrowingConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection? DbConnection => _owner;
+        public override void Commit() => _inner.Commit();
+        public override void Rollback() => _inner.Rollback();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The UNDERLYING transaction is always released (no leak); the FAILURE is the signal.
+            try
+            {
+                _inner.Dispose();
+            }
+            finally
+            {
+                throw _owner.RecordAndGetDisposeFailure();
+            }
+        }
+    }
+
+    /// <summary>Shields the wrapper transaction from <c>SqliteCommand</c>'s cast-back.</summary>
+    private sealed class ShieldedCommand : DbCommand
+    {
+        private readonly DbCommand _inner;
+
+        public ShieldedCommand(DbCommand inner) => _inner = inner;
+
+        [AllowNull]
+        public override string CommandText { get => _inner.CommandText; set => _inner.CommandText = value ?? ""; }
+        public override int CommandTimeout { get => _inner.CommandTimeout; set => _inner.CommandTimeout = value; }
+        public override CommandType CommandType { get => _inner.CommandType; set => _inner.CommandType = value; }
+        [AllowNull]
+        protected override DbConnection DbConnection { get => _inner.Connection!; set { } }
+        protected override DbParameterCollection DbParameterCollection => _inner.Parameters;
+        protected override DbTransaction? DbTransaction { get => _inner.Transaction; set { } }
+        public override bool DesignTimeVisible { get => false; set { } }
+        public override UpdateRowSource UpdatedRowSource { get => _inner.UpdatedRowSource; set => _inner.UpdatedRowSource = value; }
+
+        public override void Cancel() => _inner.Cancel();
+        public override int ExecuteNonQuery() => _inner.ExecuteNonQuery();
+        public override object? ExecuteScalar() => _inner.ExecuteScalar();
+        public override void Prepare() => _inner.Prepare();
+        protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
     }
 }
 
@@ -1153,9 +1414,22 @@ internal sealed class RollbackThrowingConnection : DbConnection
 /// the throwing-logger vector (the store's constructor logging must still succeed so the test
 /// reaches the cleanup path).
 /// </summary>
+/// <remarks>
+/// The throw is a DISTINCT pre-created instance (<see cref="LoggerSentinel"/>) so an
+/// exception-replacement mutant is detectable by identity, and <see cref="ThrowCount"/> proves
+/// the fallible cleanup-time warning ACTUALLY ran — distinguishing "the cleanup swallowed its
+/// failure and the original escaped" from "the cleanup never ran at all".
+/// </remarks>
 internal sealed class ThrowingLogger<T> : ILogger<T>
 {
     private bool _armed;
+    private int _throwCount;
+
+    /// <summary>The DISTINCT exception instance every armed log write throws.</summary>
+    public InvalidOperationException LoggerSentinel { get; } = new("the logger itself threw SENTINEL");
+
+    /// <summary>How many armed log writes threw (the fallible cleanup step really fired).</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
 
     /// <summary>Arms the throw (call AFTER store construction).</summary>
     public void Arm() => _armed = true;
@@ -1164,7 +1438,10 @@ internal sealed class ThrowingLogger<T> : ILogger<T>
     public bool IsEnabled(LogLevel logLevel) => true;
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
-        if (_armed)
-            throw new InvalidOperationException("the logger itself threw");
+        if (!_armed)
+            return;
+
+        Interlocked.Increment(ref _throwCount);
+        throw LoggerSentinel;
     }
 }

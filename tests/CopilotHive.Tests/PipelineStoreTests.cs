@@ -6,6 +6,7 @@ using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
@@ -1022,9 +1023,13 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE PRE-EXISTING ROW'S RELOAD: a failure (an exception at the pipeline flush) + the
-    /// CONFIRMED rollback → the pipeline entity is RELOADED (not merely detached) — a
-    /// subsequent <c>Find</c> on the SAME context shows the PREVIOUS pipeline pointer intact.
+    /// THE PRE-EXISTING ROW'S RELOAD, OBSERVED AT THE CLEANUP BOUNDARY: a failure (an exception
+    /// at the pipeline flush) + the CONFIRMED rollback → the pipeline entity is RELOADED, not
+    /// merely detached. The proof is taken IMMEDIATELY after <c>SaveAdmissionWithPointer</c>
+    /// returns and BEFORE any separate load: the direct context's change tracker holds the
+    /// reloaded <see cref="PipelineEntity"/> in the <see cref="EntityState.Unchanged"/> state
+    /// carrying the PREVIOUSLY PERSISTED values, and the cleanup-time SELECT is counted.
+    /// A detach-only implementation leaves NO tracked entry and issues NO second SELECT.
     /// </summary>
     [Fact]
     public void SaveAdmission_FailureWithConfirmedRollback_ReloadShowsPreviousPointer()
@@ -1037,14 +1042,36 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
             """);
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
-        var store = CreateStore(interceptor);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
         var pipeline = CreatePipeline("goal-reload", "task-new");
         pipeline.AdvanceTo(GoalPhase.Coding); // a DIFFERENT value the failed save must not leave behind
 
-        Assert.ThrowsAny<Exception>(() => store.SaveAdmissionWithPointer(pipeline, "task-new"));
+        var ex = Assert.ThrowsAny<Exception>(() => store.SaveAdmissionWithPointer(pipeline, "task-new"));
 
-        // THE RELOAD: a Find on the SAME (direct) context surfaces the PREVIOUS row intact —
-        // the stale in-flight copy was discarded through the tracker, not left ghosting.
+        // THE ORIGINAL exception propagated BY IDENTITY (the cleanup never replaced it).
+        var update = Assert.IsType<DbUpdateException>(ex);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+
+        // ── THE CLEANUP-BOUNDARY RELOAD PROOF — taken BEFORE any separate load ──
+        // A genuine reload leaves the pipeline entity TRACKED in the Unchanged state carrying
+        // the PERSISTED (pre-admission) values. A detach-only cleanup leaves NO tracked entry,
+        // and the later LoadPipeline's own Find would then be the first read — which is exactly
+        // the hole this assertion closes.
+        var trackedEntry = Assert.Single(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+        Assert.Equal(EntityState.Unchanged, trackedEntry.State);
+        Assert.Equal("goal-reload", trackedEntry.Entity.GoalId);
+        Assert.Equal("task-previous", trackedEntry.Entity.ActiveTaskId);
+        Assert.Equal("Planning", trackedEntry.Entity.Phase);
+        Assert.Equal("Previous", trackedEntry.Entity.Description);
+
+        // …and the reload really queried the database DURING the call: the UpsertPipelineCore
+        // lookup is the first SELECT, the cleanup reload the second.
+        Assert.Equal(2, interceptor.PipelinesSelectCount);
+
+        // THE END STATE (preserved from the original vector): a Find on the SAME (direct)
+        // context surfaces the PREVIOUS row intact — the stale in-flight copy was discarded
+        // through the tracker, not left ghosting.
         var row = store.LoadPipeline("goal-reload");
         Assert.NotNull(row);
         Assert.Equal("task-previous", row!.ActiveTaskId);
@@ -1157,7 +1184,8 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     /// <summary>
     /// THE FACTORY-CONTEXT GUARD, FAILURE PATH: the same throwing seam on a goal whose
     /// admission FAILS (a pipeline-flush exception) → the ORIGINAL exception still propagates
-    /// (never masked by the dispose failure), the warning is logged, and the swallow holds.
+    /// BY IDENTITY (never masked or wrapped by the dispose failure), the warning is logged,
+    /// and the swallow holds.
     /// </summary>
     [Fact]
     public void SaveAdmission_FactoryContextDisposeFails_OnFailurePath_OriginalExceptionPreserved()
@@ -1166,10 +1194,32 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
         var store = new PipelineStore(new PlainFactory(SharedConnectionString, interceptor), logger);
-        store.ContextDisposerForTest = _ => throw new InvalidOperationException("forced context dispose failure");
+        // A DISTINCT sentinel for the dispose failure, so a replacement is detectable.
+        var disposeSentinel = new InvalidOperationException("forced context dispose failure SENTINEL");
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ =>
+        {
+            disposerCalls++;
+            throw disposeSentinel;
+        };
         var pipeline = CreatePipeline("goal-factoryfail", "task-factoryfail");
 
-        Assert.ThrowsAny<Exception>(() => store.SaveAdmissionWithPointer(pipeline, "task-factoryfail"));
+        var ex = Record.Exception(() => store.SaveAdmissionWithPointer(pipeline, "task-factoryfail"));
+
+        // THE ORIGINAL exception, BY IDENTITY: the operation's DbUpdateException wrapping the
+        // interceptor's SENTINEL instance — NOT "any exception", NOT the dispose failure.
+        Assert.NotNull(ex);
+        var update = Assert.IsType<DbUpdateException>(ex);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // THE GUARDED DISPOSAL REALLY FIRED (and failed) — this distinguishes "the guard
+        // swallowed its failure" from "the guard never ran".
+        Assert.Equal(1, disposerCalls);
+
+        // …its DISTINCT sentinel appears NOWHERE in the propagated chain…
+        for (var current = (Exception?)ex; current is not null; current = current.InnerException)
+            Assert.NotSame(disposeSentinel, current);
 
         // THE WARNING was logged…
         var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
