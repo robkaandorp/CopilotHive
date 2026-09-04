@@ -1476,6 +1476,8 @@ public sealed class WorkSlotRegistryTests
         "ResolveAndCheckSlot",
         "RecordSlot",
         "AbandonSlot",
+        "RetireSlotAndClearIfCurrent",
+        "IsSlotAbandoned",
         "FailSlot",
         "ReleaseSlot",
         "AbandonPendingSlots",
@@ -3352,6 +3354,439 @@ public sealed class WorkSlotRegistryTests
 
         Assert.Equal(WorkSlotEvent.DoubleAssignment, ex.Event);
         Assert.Equal(prospectiveId, ex.ExistingTaskId);
+    }
+
+    #endregion
+
+    #region (t) RetireSlotAndClearIfCurrent — the atomic retirement primitive
+
+    // SlotRetirementOutcome is internal, so table-driven vectors carry integer codes
+    // mapped back through Ret().
+    public const int RetRetired = (int)SlotRetirementOutcome.Retired;
+    public const int RetSlotAbsent = (int)SlotRetirementOutcome.SlotAbsent;
+    public const int RetAlreadyAbandoned = (int)SlotRetirementOutcome.AlreadyAbandoned;
+
+    private static SlotRetirementOutcome Ret(int code) => (SlotRetirementOutcome)code;
+
+    /// <summary>
+    /// The three LIVE states (Pending — the allocated-but-unclaimed dispatch, plus the seeded
+    /// Claimed and Recorded ones) all retire: the slot becomes Abandoned and the outcome is
+    /// <see cref="SlotRetirementOutcome.Retired"/>. The primitive is deliberately WIDER than
+    /// <c>AbandonSlot</c> (Pending only) and <c>FailSlot</c> (Claimed only) — it retires whatever
+    /// state the attempt happens to be in.
+    /// <para>
+    /// The OWNED pointer is cleared in the same operation: the pipeline names exactly this task,
+    /// so retiring the attempt must not leave a live-looking dispatch pointer behind.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(StPending)]
+    [InlineData(StClaimed)]
+    [InlineData(StRecorded)]
+    public void RetireSlotAndClearIfCurrent_LiveSlotOwningThePointer_RetiresAndClears(int stateCode)
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, St(stateCode)));
+        pipeline.SetActiveTask("t1");
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("t1");
+
+        Assert.Equal(SlotRetirementOutcome.Retired, outcome);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The IF-CURRENT half of the contract for a live slot: when the pointer names a DIFFERENT
+    /// task the retire still succeeds, but the foreign pointer survives untouched.
+    /// </summary>
+    [Theory]
+    [InlineData(StPending)]
+    [InlineData(StClaimed)]
+    [InlineData(StRecorded)]
+    public void RetireSlotAndClearIfCurrent_LiveSlotNotOwningThePointer_RetiresWithoutClearing(int stateCode)
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, St(stateCode)));
+        pipeline.SetActiveTask("other-task");
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("t1");
+
+        Assert.Equal(SlotRetirementOutcome.Retired, outcome);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Equal("other-task", pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// THE NEWER-POINTER RACE — the load-bearing safety vector. A late cleanup retires an OLD
+    /// attempt while the pipeline has already dispatched, and pointed at, a NEWER one. The old
+    /// slot must retire, and the newer pointer must NOT be erased: erasing it would make a live,
+    /// in-flight dispatch look idle to every observer.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_OlderTaskWhilePointerNamesNewerTask_LeavesNewerPointerIntact()
+    {
+        var pipeline = NewPipeline();
+        var oldPos = Position(occurrence: 1);
+        var newPos = Position(occurrence: 2);
+        Assert.True(pipeline.SeedSlotForTest("task-old", oldPos, 1, WorkSlotState.Claimed));
+        Assert.True(pipeline.SeedSlotForTest("task-new", newPos, 2, WorkSlotState.Pending));
+        pipeline.SetActiveTask("task-new");
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("task-old");
+
+        Assert.Equal(SlotRetirementOutcome.Retired, outcome);
+        Assert.Equal("task-new", pipeline.ActiveTaskId);
+
+        // Only the OLD slot moved; the newer attempt is untouched and still live.
+        Assert.Equal(
+            new HashSet<WorkSlotView>
+            {
+                new(new WorkSlot("task-old", oldPos, 1), WorkSlotState.Abandoned),
+                new(new WorkSlot("task-new", newPos, 2), WorkSlotState.Pending),
+            },
+            Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// An ABSENT slot with a non-blank id: the registry has nothing to retire, so the outcome is
+    /// <see cref="SlotRetirementOutcome.SlotAbsent"/> — but the uniform if-current rule still
+    /// applies, so an owned pointer IS cleared.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_AbsentSlotOwningThePointer_ReportsAbsentAndClears()
+    {
+        var pipeline = NewPipeline();
+        pipeline.ClearRegistryForTest();
+        pipeline.SetActiveTask("ghost");
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("ghost");
+
+        Assert.Equal(SlotRetirementOutcome.SlotAbsent, outcome);
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Empty(pipeline.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// The same absent-slot path when the pointer names someone else: absent, and the foreign
+    /// pointer survives (the clearing is if-current ONLY, never unconditional).
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_AbsentSlotNotOwningThePointer_ReportsAbsentWithoutClearing()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("live-task", pos, 3, WorkSlotState.Claimed));
+        pipeline.SetActiveTask("live-task");
+        var before = Snapshot(pipeline);
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("ghost");
+
+        Assert.Equal(SlotRetirementOutcome.SlotAbsent, outcome);
+        Assert.Equal("live-task", pipeline.ActiveTaskId);
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// THE BLANK-ID SAFETY CONTRACT. A null/blank id names no attempt at all, so the call performs
+    /// NO mutation whatsoever — the registry is untouched AND the pointer is never cleared, not
+    /// even when the pointer itself is blank-ish. An implementation that let the blank path fall
+    /// through to the if-current clearing would blank out a pointer no caller can own.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void RetireSlotAndClearIfCurrent_NullOrBlankTaskId_IsAbsentWithoutAnyMutation(string? taskId)
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+        pipeline.SetActiveTask("t1");
+        var before = Snapshot(pipeline);
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent(taskId);
+
+        Assert.Equal(SlotRetirementOutcome.SlotAbsent, outcome);
+        Assert.Equal("t1", pipeline.ActiveTaskId);
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// The blank id must not clear a pointer that happens to hold the very same blank-ish value:
+    /// the refusal is on the ARGUMENT, so no ordinal match can smuggle a clearing through.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void RetireSlotAndClearIfCurrent_BlankTaskId_DoesNotClearAnEqualBlankPointer(string taskId)
+    {
+        var pipeline = NewPipeline();
+        pipeline.SetActiveTask(taskId);
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent(taskId);
+
+        Assert.Equal(SlotRetirementOutcome.SlotAbsent, outcome);
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// An ALREADY-Abandoned slot reports <see cref="SlotRetirementOutcome.AlreadyAbandoned"/> —
+    /// the registry does not change — yet the uniform if-current rule STILL clears an owned
+    /// pointer, because every non-blank path clears.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_AlreadyAbandonedSlot_ReportsAlreadyAbandonedAndStillClears()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Abandoned));
+        pipeline.SetActiveTask("t1");
+
+        var outcome = pipeline.RetireSlotAndClearIfCurrent("t1");
+
+        Assert.Equal(SlotRetirementOutcome.AlreadyAbandoned, outcome);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// IDEMPOTENCE on re-retire: the first call retires a live slot, every later call reports
+    /// <see cref="SlotRetirementOutcome.AlreadyAbandoned"/> and leaves the slot exactly as it was.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_RepeatedRetire_IsIdempotent()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+        pipeline.SetActiveTask("t1");
+
+        Assert.Equal(SlotRetirementOutcome.Retired, pipeline.RetireSlotAndClearIfCurrent("t1"));
+        var afterFirst = Snapshot(pipeline);
+
+        Assert.Equal(SlotRetirementOutcome.AlreadyAbandoned, pipeline.RetireSlotAndClearIfCurrent("t1"));
+        Assert.Equal(SlotRetirementOutcome.AlreadyAbandoned, pipeline.RetireSlotAndClearIfCurrent("t1"));
+
+        Assert.Equal(afterFirst, Snapshot(pipeline));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The retire never touches OTHER slots — only the addressed one moves.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_DoesNotTouchOtherSlots()
+    {
+        var pipeline = NewPipeline();
+        var target = Position(occurrence: 1);
+        var bystander = Position(occurrence: 2);
+        Assert.True(pipeline.SeedSlotForTest("t1", target, 1, WorkSlotState.Pending));
+        Assert.True(pipeline.SeedSlotForTest("t2", bystander, 4, WorkSlotState.Claimed));
+
+        Assert.Equal(SlotRetirementOutcome.Retired, pipeline.RetireSlotAndClearIfCurrent("t1"));
+
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t2", bystander, 4), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest(), v => v.Slot.TaskId == "t2"));
+    }
+
+    /// <summary>
+    /// <see cref="GoalPipeline.IsSlotAbandoned"/> is TRUE only for an Abandoned slot; every live
+    /// state, an absent slot, and a blank id all read <c>false</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(StPending, false)]
+    [InlineData(StClaimed, false)]
+    [InlineData(StRecorded, false)]
+    [InlineData(StAbandoned, true)]
+    [InlineData(StNone, false)]
+    public void IsSlotAbandoned_Matrix(int startCode, bool expected)
+    {
+        var pos = Position();
+        var pipeline = SeedMatrixRow(startCode, pos);
+
+        Assert.Equal(expected, pipeline.IsSlotAbandoned("t1"));
+
+        // The read is a READ: nothing moved.
+        AssertMatrixOutcome(pipeline, startCode, startCode, pos);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void IsSlotAbandoned_NullOrBlankTaskId_IsFalse(string? taskId)
+    {
+        var pipeline = NewPipeline();
+        Assert.True(pipeline.SeedSlotForTest("t1", Position(), 5, WorkSlotState.Abandoned));
+
+        Assert.False(pipeline.IsSlotAbandoned(taskId));
+    }
+
+    [Fact]
+    public void IsSlotAbandoned_AfterRetire_FlipsToTrue()
+    {
+        var pipeline = NewPipeline();
+        Assert.True(pipeline.SeedSlotForTest("t1", Position(), 5, WorkSlotState.Claimed));
+
+        Assert.False(pipeline.IsSlotAbandoned("t1"));
+        Assert.Equal(SlotRetirementOutcome.Retired, pipeline.RetireSlotAndClearIfCurrent("t1"));
+        Assert.True(pipeline.IsSlotAbandoned("t1"));
+    }
+
+    /// <summary>
+    /// The BEHAVIOURAL lock companion for the retirement primitive, following the existing
+    /// <c>WhileLockHeld</c> pattern (the IL backstop in region (i) remains the deterministic
+    /// authority for the lock STRUCTURE). Two facts only: the call cannot complete while the
+    /// pipeline lock is held, and once released the worker observes the COMPLETE after-state —
+    /// the retired slot AND the cleared pointer together, never one without the other.
+    /// </summary>
+    [Fact]
+    public void RetireSlotAndClearIfCurrent_WhileLockHeld_IsBlocked_ThenCommitsSlotAndPointer()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Claimed));
+        pipeline.SetActiveTask("t1");
+
+        var monitor = GetPipelineLock(pipeline);
+
+        using var callAttempted = new ManualResetEventSlim(false);
+        using var callCompleted = new ManualResetEventSlim(false);
+        SlotRetirementOutcome? workerResult = null;
+        bool attemptObserved;
+        bool completedWhileHeld;
+
+        var worker = new Thread(() =>
+        {
+            callAttempted.Set();                                          // signalled IMMEDIATELY BEFORE the call…
+            var retired = pipeline.RetireSlotAndClearIfCurrent("t1");     // …which parks on the pipeline lock
+            // SlotRetirementOutcome is a value type; the Join below establishes the happens-before.
+            workerResult = retired;
+            callCompleted.Set();
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-blocked-retirer",
+        };
+
+        Monitor.Enter(monitor);
+        try
+        {
+            worker.Start();
+#pragma warning disable xUnit1051 // Timeout-only waits are intentional: the fixed bound IS the proof
+            attemptObserved = callAttempted.Wait(WaitTimeout);
+            completedWhileHeld = callCompleted.Wait(BlockedGrace);
+#pragma warning restore xUnit1051
+        }
+        finally
+        {
+            Monitor.Exit(monitor);
+        }
+
+        Assert.True(worker.Join(WaitTimeout), "The blocked retire never completed after the lock was released.");
+
+        Assert.True(attemptObserved, "The worker thread never signalled its call attempt.");
+        Assert.False(
+            completedWhileHeld,
+            "RetireSlotAndClearIfCurrent completed while the pipeline lock was held — it is not running under the lock.");
+
+        Assert.Equal(SlotRetirementOutcome.Retired, workerResult);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The same blocked-while-held companion for the locked READ: it cannot observe the registry
+    /// while another holder has the lock, and once released it reports the post-release truth.
+    /// </summary>
+    [Fact]
+    public void IsSlotAbandoned_WhileLockHeld_IsBlocked_ThenReadsCommittedState()
+    {
+        var pipeline = NewPipeline();
+        Assert.True(pipeline.SeedSlotForTest("t1", Position(), 5, WorkSlotState.Abandoned));
+
+        var monitor = GetPipelineLock(pipeline);
+
+        using var callAttempted = new ManualResetEventSlim(false);
+        using var callCompleted = new ManualResetEventSlim(false);
+        bool? workerResult = null;
+        bool attemptObserved;
+        bool completedWhileHeld;
+
+        var worker = new Thread(() =>
+        {
+            callAttempted.Set();
+            var abandoned = pipeline.IsSlotAbandoned("t1");
+            workerResult = abandoned;
+            callCompleted.Set();
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-blocked-reader",
+        };
+
+        Monitor.Enter(monitor);
+        try
+        {
+            worker.Start();
+#pragma warning disable xUnit1051 // Timeout-only waits are intentional: the fixed bound IS the proof
+            attemptObserved = callAttempted.Wait(WaitTimeout);
+            completedWhileHeld = callCompleted.Wait(BlockedGrace);
+#pragma warning restore xUnit1051
+        }
+        finally
+        {
+            Monitor.Exit(monitor);
+        }
+
+        Assert.True(worker.Join(WaitTimeout), "The blocked read never completed after the lock was released.");
+
+        Assert.True(attemptObserved, "The worker thread never signalled its call attempt.");
+        Assert.False(
+            completedWhileHeld,
+            "IsSlotAbandoned completed while the pipeline lock was held — it is not running under the lock.");
+
+        Assert.True(workerResult);
+    }
+
+    /// <summary>
+    /// The neighbouring APIs keep their EXACT prior semantics — the new primitive is an addition,
+    /// never a redefinition. <c>AbandonSlot</c> stays Pending-only and <c>ClearActiveTaskIfCurrent</c>
+    /// stays a pointer-only, ownership-checked operation that never touches the registry.
+    /// </summary>
+    [Fact]
+    public void RetirementPrimitive_DoesNotAlterAbandonSlotOrClearActiveTaskIfCurrentSemantics()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Claimed));
+        pipeline.SetActiveTask("t1");
+
+        // AbandonSlot still refuses a Claimed slot and never touches the pointer.
+        Assert.False(pipeline.AbandonSlot("t1"));
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Equal("t1", pipeline.ActiveTaskId);
+
+        // ClearActiveTaskIfCurrent still clears only the pointer, leaving the slot live.
+        Assert.True(pipeline.ClearActiveTaskIfCurrent("t1"));
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest()));
     }
 
     #endregion

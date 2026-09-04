@@ -78,6 +78,23 @@ internal sealed class TaskCompletionService
             return;
         }
 
+        // Guard: the completion belongs to an attempt whose work slot has already been RETIRED.
+        //
+        // HONEST CONCURRENCY LANGUAGE — read this before relying on it: this guard drops
+        // completions that OBSERVE an already-Abandoned slot while the task lookup still resolves
+        // the pipeline (today's interim cleanup retires a slot but leaves the task→goal mapping in
+        // place, so the pipeline still resolves). The read is a SEPARATE locked read — it is NOT
+        // an atomic completion admission. A completion that observes `Pending` and then races the
+        // retire can still drive the pipeline; closing that window belongs to the completion
+        // protocol (the named successor goal), not here.
+        if (pipeline.IsSlotAbandoned(result.TaskId))
+        {
+            _logger.LogWarning(
+                "WorkSlotIntegrity: stale-completion goal={GoalId} task={TaskId} pipeline-phase={PipelinePhase} slot-state=abandoned — the completion is for a retired attempt; dropped",
+                pipeline.GoalId, result.TaskId, pipeline.Phase);
+            return;
+        }
+
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})",
             pipeline.GoalId, pipeline.Phase, result.Status,
             string.IsNullOrEmpty(result.Model) ? "unknown" : result.Model);

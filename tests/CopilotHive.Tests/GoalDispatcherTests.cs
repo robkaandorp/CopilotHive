@@ -1668,6 +1668,220 @@ public sealed class TaskCompletionServiceGuardTests
         Assert.NotNull(snapshot);
         Assert.Equal(pipeline.Phase, snapshot!.Phase);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  Guard 4 — THE ABANDONED-COMPLETION GUARD.
+    //
+    //  It sits immediately AFTER the stale-task guard and drops completions that observe
+    //  an already-retired work slot while the task→goal mapping still resolves the
+    //  pipeline (today's interim cleanup retires a slot but never unregisters the
+    //  mapping, so the pipeline resolution below is the real production shape).
+    //
+    //  The guard is a SEPARATE locked read, not an atomic completion admission: these
+    //  vectors pin the OBSERVED-Abandoned behaviour only. A completion that observes
+    //  Pending and then races the retire is the completion protocol's territory.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    // WorkSlotState is internal, so it cannot appear in a public test method signature.
+    // The compatibility theory below carries integer codes mapped back through SlotState().
+    public const int SlotPending = (int)WorkSlotState.Pending;
+    public const int SlotClaimed = (int)WorkSlotState.Claimed;
+    public const int SlotRecorded = (int)WorkSlotState.Recorded;
+
+    /// <summary>Sentinel meaning "no slot is registered for the task id" (the legacy column).</summary>
+    public const int SlotNone = -1;
+
+    private static WorkSlotState? SlotState(int code) => code == SlotNone ? null : (WorkSlotState)code;
+
+    /// <summary>The exact drop template the guard must emit, with the placeholders rendered.</summary>
+    private static string ExpectedDropLog(string goalId, string taskId, GoalPhase pipelinePhase) =>
+        $"WorkSlotIntegrity: stale-completion goal={goalId} task={taskId} " +
+        $"pipeline-phase={pipelinePhase} slot-state=abandoned — the completion is for a retired " +
+        "attempt; dropped";
+
+    /// <summary>
+    /// Builds the reclaim-path fixture: a mid-iteration pipeline (Testing — NOT the Planning
+    /// window) whose active task owns a registered work slot in <paramref name="slotState"/>.
+    /// <c>StNone</c>-style absence is expressed by passing <c>null</c>.
+    /// </summary>
+    private static (GoalPipelineManager Manager, GoalPipeline Pipeline, string TaskId) SlotGuardFixture(
+        string goalId,
+        WorkSlotState? slotState)
+    {
+        var goal = new Goal { Id = goalId, Description = "Test" };
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        var taskId = $"task-{Guid.NewGuid():N}";
+        // The mapping is registered and NEVER unregistered — exactly what the interim cleanup
+        // leaves behind, so the completion still resolves this pipeline.
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+
+        if (slotState is not null)
+        {
+            Assert.True(pipeline.SeedSlotForTest(
+                taskId, new WorkSlotPosition(1, GoalPhase.Testing, 1), 1, WorkSlotState.Pending));
+
+            // Reach the target state through the PRODUCTION transitions where possible, so the
+            // fixture mirrors the real reclaim path rather than forcing an arbitrary state.
+            switch (slotState.Value)
+            {
+                case WorkSlotState.Pending:
+                    break;
+                case WorkSlotState.Abandoned:
+                    // Today's interim cleanup: AbandonSlot retires the Pending slot in place.
+                    Assert.True(pipeline.AbandonSlot(taskId));
+                    break;
+                case WorkSlotState.Claimed:
+                case WorkSlotState.Recorded:
+                    Assert.True(pipeline.ForceSlotStateForTest(taskId, slotState.Value));
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unhandled WorkSlotState: {slotState.Value}");
+            }
+        }
+
+        return (pipelineManager, pipeline, taskId);
+    }
+
+    private static TaskResult CompletionFor(string taskId) => new()
+    {
+        TaskId = taskId,
+        Status = TaskOutcome.Completed,
+        Output = "Testing passed.",
+        Metrics = new TaskMetrics { Verdict = "PASS" },
+        GitStatus = new GitChangeSummary { FilesChanged = 1, Pushed = true },
+    };
+
+    /// <summary>
+    /// The completion observes an ALREADY-RETIRED slot while its task→goal mapping is still
+    /// intact, so the pipeline resolves and every earlier guard passes. The guard drops it:
+    /// the exact template is logged and the pipeline phase does NOT move.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AbandonedSlotWithIntactMapping_DropsCompletionUnmoved()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-abandoned-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        // THE EXACT TEMPLATE, rendered — not a loose substring match.
+        var dropLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message == ExpectedDropLog(pipeline.GoalId, taskId, GoalPhase.Testing));
+        Assert.True(dropLog != default,
+            $"Expected the exact WorkSlotIntegrity drop log. Logs: {string.Join(" | ", logger.Logs.Select(l => l.Message))}");
+
+        // The completion never reached the driver: the phase is untouched on BOTH the pipeline
+        // and its state machine.
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+        Assert.Equal(GoalPhase.Testing, pipeline.StateMachine.Phase);
+    }
+
+    /// <summary>
+    /// THE PRODUCTION COMPATIBILITY VECTORS: a live slot in any of Pending, Claimed or Recorded —
+    /// and an ABSENT slot (legacy, pre-registry tasks) — must all PASS the guard and drive the
+    /// pipeline exactly as before. A guard that dropped on anything but Abandoned would stall
+    /// every normal completion.
+    /// </summary>
+    [Theory]
+    [InlineData(SlotPending)]
+    [InlineData(SlotClaimed)]
+    [InlineData(SlotRecorded)]
+    [InlineData(SlotNone)]
+    public async Task HandleTaskCompletionAsync_NonAbandonedSlot_PassesTheGuardAndDrivesThePipeline(
+        int slotStateCode)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-live-{Guid.NewGuid():N}", SlotState(slotStateCode));
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("WorkSlotIntegrity"));
+        // The completion flowed through: the normal task-completed log was emitted and the
+        // pipeline left Testing.
+        Assert.Contains(logger.Logs, l => l.Message.Contains("task completed"));
+        Assert.NotEqual(GoalPhase.Testing, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// The drop fires on the NO-BRAIN fixture too: the guard precedes the brain branch, so a
+    /// brain-less service must not mark the goal completed off a retired attempt.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AbandonedSlotWithoutBrain_StillDrops()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nobrain-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+        var service = CreateService(pipelineManager, brain: null, logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        Assert.Contains(logger.Logs, l =>
+            l.Level == LogLevel.Warning &&
+            l.Message == ExpectedDropLog(pipeline.GoalId, taskId, GoalPhase.Testing));
+
+        // The no-brain path (MarkGoalCompletedAsync) was NOT taken.
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// GUARD ORDER: the new guard sits AFTER the stale-task guard. A completion that is both
+    /// stale (its task is not the active one) AND backed by an abandoned slot is classified as
+    /// STALE — the earlier guard wins and the WorkSlotIntegrity template is never emitted.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_StaleAndAbandoned_IsClassifiedByTheEarlierStaleGuard()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, oldTaskId) =
+            SlotGuardFixture($"goal-order-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+
+        // The pipeline has moved on to a NEWER task, so the old completion is stale as well.
+        pipeline.SetActiveTask("task-current-phase");
+
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(oldTaskId), TestContext.Current.CancellationToken);
+
+        Assert.Contains(logger.Logs, l =>
+            l.Level == LogLevel.Warning && l.Message.Contains("ignoring stale completion"));
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("WorkSlotIntegrity"));
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// The guard order in the other direction: the ABANDONED classification is only reached once
+    /// the stale-task guard has passed, i.e. the retired attempt IS the active task. This is the
+    /// complement of the vector above and pins the guard's position rather than its mere presence.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AbandonedActiveTask_IsClassifiedByTheNewGuardNotStale()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-order2-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("ignoring stale completion"));
+        Assert.Contains(logger.Logs, l =>
+            l.Message == ExpectedDropLog(pipeline.GoalId, taskId, GoalPhase.Testing));
+        // The guard drops BEFORE the normal task-completed log is emitted.
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("task completed"));
+    }
 }
 
 /// <summary>
