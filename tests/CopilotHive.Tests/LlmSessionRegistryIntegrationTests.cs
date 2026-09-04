@@ -1106,9 +1106,10 @@ public sealed class LlmSessionRegistryIntegrationTests
             var streaming = new StatusCapturingStreamingChatClient(registry, "composer");
             await InjectComposerChatClient(composer, streaming);
 
-            // Deterministic completion signal: OnStreamingUpdate fires in the streaming finally block
-            // (after _isStreaming is set to false and the idle status is refreshed). Complete the TCS
-            // once streaming has finished — no polling, no sleeps.
+            // Deterministic completion signal: OnStreamingUpdate fires from the actor's terminal
+            // transition callback (after _isStreaming is cleared and, per the actor's terminal
+            // ordering invariant, AFTER the idle status has already been published to the
+            // registry). Complete the TCS once streaming has finished — no polling, no sleeps.
             var finished = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             composer.OnStreamingUpdate += () =>
             {
