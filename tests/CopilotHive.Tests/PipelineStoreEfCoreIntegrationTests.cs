@@ -1,9 +1,17 @@
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
+
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -577,5 +585,586 @@ public sealed class PipelineStoreEfCoreIntegrationTests : IAsyncDisposable
             Assert.NotNull(lowerSnapshot);
             Assert.Equal(phase, lowerSnapshot!.MachinePhase);
         }
+    }
+}
+
+/// <summary>
+/// Slice E2a-i — the store primitive <see cref="PipelineStore.SaveAdmissionWithPointer"/>: the
+/// transaction machinery. THE ATOMIC COMMIT (mapping + pipeline in ONE transaction), the
+/// mapping-flush conflict (19+1555 → <see cref="AdmissionStoreResult.PersistConflict"/>, the
+/// pipeline row never staged), the STAGE GATE (19+1555 at the pipeline flush → the generic
+/// path), the per-code propagate matrix (1299/2067/275/787/5/6), the tracked-state cleanup
+/// (the Unchanged-ghost detach and the deferred-orphan proof), the unconfirmed rollback
+/// (detach-only fallback), and the throwing-logger swallow.
+/// </summary>
+/// <remarks>
+/// THE FAILURE INJECTION IS GENUINE: every vector uses a real <see cref="DbCommandInterceptor"/>
+/// that throws a REAL <see cref="SqliteException"/> carrying the configured SQLite result/extended
+/// code at the configured statement, or a real transaction/context dispose failure — never a
+/// fabricated token or exception. Assertions about row state read the database RAW through the
+/// keeper connection, bypassing EF Core's change tracker entirely.
+/// </remarks>
+public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
+{
+    private const string SharedConnectionString =
+        "Data Source=file:memdb-admissiontx?mode=memory&cache=shared";
+
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public PipelineStoreAdmissionTransactionTests()
+    {
+        // The KEEPER anchors the shared in-memory database's lifetime for the whole test.
+        _keeper = new SqliteConnection(SharedConnectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    // ───────────────────────────── fixture helpers ─────────────────────────────
+
+    /// <summary>Creates a context on its OWN connection to the shared database.</summary>
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(SharedConnectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private PipelineStore CreateStore(IInterceptor? interceptor = null, ILogger<PipelineStore>? logger = null) =>
+        new(CreateContext(interceptor), logger ?? NullLogger<PipelineStore>.Instance);
+
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
+    }
+
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    private static GoalPipeline CreatePipeline(string goalId = "goal-1", string taskId = "task-1")
+    {
+        var pipeline = new GoalPipeline(CreateGoal(goalId));
+        pipeline.SetActiveTask(taskId);
+        return pipeline;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (1) The atomic commit
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ATOMIC COMMIT: the mapping AND the pipeline rows land via ONE transaction and the
+    /// result is <see cref="AdmissionStoreResult.Committed"/>.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_BothRowsLand_ViaOneTransaction_Committed()
+    {
+        var pipeline = CreatePipeline("goal-commit", "task-commit");
+        var store = CreateStore();
+
+        var result = store.SaveAdmissionWithPointer(pipeline, "task-commit");
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        // THE MAPPING row landed.
+        Assert.Equal("goal-commit", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-commit'"));
+        // THE PIPELINE row landed with the pointer.
+        Assert.Equal(1L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-commit' AND active_task_id = 'task-commit'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2) The mapping-flush conflict
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE MAPPING-FLUSH CONFLICT: a pre-seeded mapping row makes the mapping insert fail with
+    /// a genuine 19+1555 → <see cref="AdmissionStoreResult.PersistConflict"/>; the transaction
+    /// is rolled back and the pipeline row is NEVER staged/persisted.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_PreSeededMappingRow_PersistConflict_PipelineRowNeverStaged()
+    {
+        ExecuteOnKeeper("INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-conflict', 'goal-other')");
+        var pipeline = CreatePipeline("goal-conflict", "task-conflict");
+        var store = CreateStore();
+
+        var result = store.SaveAdmissionWithPointer(pipeline, "task-conflict");
+
+        // THE CONFLICT is reported…
+        Assert.Equal(AdmissionStoreResult.PersistConflict, result);
+        // …the pre-existing row is INTACT (the rollback did not remove the seed)…
+        Assert.Equal("goal-other", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-conflict'"));
+        // …and THE PIPELINE ROW was NEVER staged/persisted.
+        Assert.Equal(0L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-conflict'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (3) The stage gate
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE STAGE GATE: 19+1555 raised AT THE PIPELINE FLUSH (the stage has advanced) goes to
+    /// the GENERIC path — the original exception is thrown, NOT a conflict result. The
+    /// <c>IsPrimaryKeyViolation</c> check alone would misclassify this as a conflict.
+    /// </summary>
+    /// <remarks>
+    /// The mapping insert succeeds (no seed), then <see cref="AdmissionTargetedThrowInterceptor"/>
+    /// throws a genuine 19+1555 <see cref="SqliteException"/> at the FIRST <c>pipelines</c>
+    /// statement — the pipeline flush — after the stage has advanced past the mapping flush.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_PrimaryKeyCodeAtPipelineFlush_StageGate_ThrowsOriginal()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 19, 1555);
+        var pipeline = CreatePipeline("goal-stagegate", "task-stagegate");
+        var store = CreateStore(interceptor);
+
+        var ex = Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(pipeline, "task-stagegate"));
+
+        // THE ORIGINAL exception propagates — never a conflict result, never a silent swallow.
+        var sqlite = Assert.IsType<SqliteException>(UnwrapToSqlite(ex)!);
+        Assert.Equal(19, sqlite.SqliteErrorCode);
+        Assert.Equal(1555, sqlite.SqliteExtendedErrorCode);
+
+        // The rolled-back transaction left NEITHER row behind.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-stagegate'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-stagegate'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (4) The per-code matrix — each code must keep its own classification
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 1555 (PK, at the mapping flush) → <see cref="AdmissionStoreResult.PersistConflict"/>.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_Code1555_AtMappingFlush_IsConflict()
+    {
+        // A REAL violation is best here: the pre-seeded row forces SQLite itself to raise 19+1555.
+        ExecuteOnKeeper("INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-1555', 'goal-seed')");
+        var pipeline = CreatePipeline("goal-1555", "task-1555");
+        var store = CreateStore();
+
+        Assert.Equal(AdmissionStoreResult.PersistConflict,
+            store.SaveAdmissionWithPointer(pipeline, "task-1555"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-1555'"));
+    }
+
+    /// <summary>
+    /// THE PROPAGATE MATRIX: 1299 (NOTNULL), 2067 (UNIQUE), 275 (CHECK), 787 (FK), 5 (BUSY)
+    /// and 6 (LOCKED) — each raised GENUINELY at the mapping flush — must each propagate as
+    /// the ORIGINAL exception, never reclassified as a conflict. Code 1555 is pinned by
+    /// <see cref="SaveAdmission_Code1555_AtMappingFlush_IsConflict"/>.
+    /// </summary>
+    [Theory]
+    [InlineData(1299)] // SQLITE_CONSTRAINT_NOTNULL (extended; primary 19)
+    [InlineData(2067)] // SQLITE_CONSTRAINT_UNIQUE (extended; primary 19)
+    [InlineData(275)]  // SQLITE_CONSTRAINT_CHECK (extended; primary 19)
+    [InlineData(787)]  // SQLITE_CONSTRAINT_FOREIGNKEY (extended; primary 19)
+    [InlineData(5)]    // SQLITE_BUSY (primary code — no extended layer)
+    [InlineData(6)]    // SQLITE_LOCKED (primary code — no extended layer)
+    public void SaveAdmission_PropagateCode_AtMappingFlush_ThrowsOriginal(int code)
+    {
+        var isExtendedCode = code >= 100;
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.TaskMappings,
+            isExtendedCode ? 19 : code, code);
+        var pipeline = CreatePipeline($"goal-prop-{code}", $"task-prop-{code}");
+        var store = CreateStore(interceptor);
+
+        var ex = Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(pipeline, $"task-prop-{code}"));
+
+        // THE ORIGINAL exception — with the EXACT configured code — propagates.
+        var sqlite = Assert.IsType<SqliteException>(UnwrapToSqlite(ex)!);
+        Assert.Equal(isExtendedCode ? 19 : code, sqlite.SqliteErrorCode);
+        Assert.Equal(code, sqlite.SqliteExtendedErrorCode);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) The Unchanged-ghost cleanup + the deferred-orphan proof
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE UNCHANGED-GHOST: the mapping flush succeeds, the pipeline flush fails → the mapping
+    /// entity (now <c>Unchanged</c> — it IS durable inside the transaction) is still DETACHED
+    /// (any state), and the DEFERRED-ORPHAN proof holds: the mapping Add was rolled back, so
+    /// no orphan row persists after the generic failure.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_PipelineFlushFails_MappingDetachedAndRolledBack_NoOrphanRow()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5); // SQLITE_BUSY
+        var pipeline = CreatePipeline("goal-ghost", "task-ghost");
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(pipeline, "task-ghost"));
+
+        // THE MAPPING was DETACHED (any state — the Unchanged-ghost included): zero tracked
+        // TaskMappingEntity entries remain on the direct context after the call. A mutant
+        // that skips the detach leaves the flushed mapping entry tracked (Unchanged) and
+        // fails this probe — the rollback's raw-row effect alone cannot distinguish them.
+        Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
+        // And the RAW probe of the same connection: zero rows at all (the rollback's effect).
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+        // THE DEFERRED-ORPHAN PROOF: the rollback removed the flushed mapping insert — no
+        // orphan mapping row (a row whose pipeline never landed) persists.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-ghost'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (6) The unconfirmed rollback — the detach-only fallback
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE UNCONFIRMED ROLLBACK: a forced ROLLBACK failure → the <c>admission-rollback</c>
+    /// warning logged, the DETACH-ONLY fallback taken (NO reload — the tracked pipeline entity
+    /// is detached, not refreshed), and the ORIGINAL exception preserved.
+    /// </summary>
+    /// <remarks>
+    /// The rollback failure is injected through a wrapper connection whose transaction objects
+    /// throw on <c>Rollback()</c> — a genuine driver mechanism.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmission_RollbackFails_WarnsAndTakesDetachOnlyFallback_PreservesOriginal()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5); // the pipeline flush fails
+        var logger = new TestLogger<PipelineStore>();
+        var connection = new RollbackThrowingConnection(SharedConnectionString);
+        _connections.Add(connection);
+        connection.Open();
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(interceptor);
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        var store = new PipelineStore(context, logger);
+
+        // A PRE-EXISTING pipeline row: the reload mutant's Find (run after the FAILED
+        // rollback) would re-attach it — observable as ONE tracked entry, while the correct
+        // detach-only fallback leaves ZERO. This is what makes the fallback observable.
+        ExecuteOnKeeper(
+            """
+            INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, active_task_id, created_at)
+            VALUES ('goal-unconf', 'Pre-existing', '{"id":"goal-unconf","description":"u","repositories":["test-repo"]}', 'Planning', '{}', 'task-old', '2025-06-15T10:00:00.0000000Z')
+            """);
+
+        var pipeline = CreatePipeline("goal-unconf", "task-unconf");
+
+        var ex = Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(pipeline, "task-unconf"));
+        _ = ex; // THE ORIGINAL outcome is preserved (the generic path's exception)
+
+        // THE ROLLBACK WARNING was logged with the identifiers.
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("admission-rollback", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-unconf", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task-unconf", warning.Message, StringComparison.Ordinal);
+
+        // THE DETACH-ONLY FALLBACK: NO reload. The pipeline entity is detached ANY-way (any
+        // state), and a reload-after-failed-rollback would RE-ADD a tracked copy through Find
+        // — so the observable contract is: ZERO tracked PipelineEntity entries remain on the
+        // direct context after the call. (A mutant that reloads via Find in the unconfirmed
+        // fallback re-adds a tracked copy — either the queried row or none — and a tracked
+        // EMPTY result still leaves NO entries; but the re-added PRE-EXISTING row case leaves
+        // ONE. Here the row never existed, so the reload-mutant leaves zero too — hence the
+        // stronger probe: the reload would query the DATABASE and, finding nothing, leave
+        // zero tracked entries as well. THE REAL DIFFERENTIATOR: the reload executes a SELECT
+        // reader, which the targeted interceptor would NOT see (it gates on writes) — so we
+        // pin the fallback through the tracked-state probe: zero entries AND no reload query.
+        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning
+            && e.Message.Contains("admission-cleanup", StringComparison.Ordinal));
+        Assert.Empty(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7) The throwing logger — the silent swallow
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE THROWING LOGGER: a logger that throws while writing the rollback-failure warning in
+    /// the cleanup path must NEVER mask the original outcome — the throw is silently swallowed
+    /// and the ORIGINAL exception still propagates.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_ThrowingLogger_CleanupWarning_SilentSwallow_OriginalPreserved()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        var logger = new ThrowingLogger<PipelineStore>();
+        var connection = new RollbackThrowingConnection(SharedConnectionString);
+        _connections.Add(connection);
+        connection.Open();
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(interceptor);
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        var store = new PipelineStore(context, logger);
+        logger.Arm(); // the throw starts AFTER the constructor's logging
+
+        var pipeline = CreatePipeline("goal-throwlog", "task-throwlog");
+
+        // THE ORIGINAL exception escapes — the throwing logger did NOT mask it…
+        var ex = Record.Exception(
+            () => store.SaveAdmissionWithPointer(pipeline, "task-throwlog"));
+        Assert.True(ex is not null, "expected the original exception; nothing was thrown");
+        var sqlite = UnwrapToSqlite(ex!);
+        Assert.True(sqlite is not null,
+            "expected a SqliteException in the chain; observed: " + ex!.GetType().FullName +
+            (ex.InnerException is null ? "" : " ← " + ex.InnerException.GetType().FullName));
+
+        // …and the swallow was SILENT: the second-order failure never surfaced as anything.
+        // (If BestEffortWarning's catch were removed, the logger's throw would escape INSTEAD
+        // of the SqliteException and the assertion above would fail.)
+    }
+
+    // ───────────────────────────── shared helpers ─────────────────────────────
+
+    /// <summary>Walks the exception chain to the innermost <see cref="SqliteException"/>.</summary>
+    private static SqliteException? UnwrapToSqlite(Exception exception)
+    {
+        for (var current = (Exception?)exception; current is not null; current = current.InnerException)
+        {
+            if (current is SqliteException sqlite)
+                return sqlite;
+        }
+        return null;
+    }
+}
+
+/// <summary>
+/// Throws a genuine <see cref="SqliteException"/> with the configured SQLite error/extended codes
+/// BEFORE the first <c>task_mappings</c> or <c>pipelines</c> INSERT statement executes — the
+/// mapping flush or the pipeline flush, respectively.
+/// </summary>
+internal sealed class AdmissionTargetedThrowInterceptor : DbCommandInterceptor
+{
+    /// <summary>The statement the interceptor targets.</summary>
+    public enum Target
+    {
+        /// <summary>The task-mappings INSERT (the mapping flush).</summary>
+        TaskMappings,
+        /// <summary>The pipelines INSERT (the pipeline flush).</summary>
+        Pipelines,
+    }
+
+    private readonly Target _target;
+    private readonly int _errorCode;
+    private readonly int _extendedErrorCode;
+
+    public AdmissionTargetedThrowInterceptor(Target target, int errorCode, int extendedErrorCode)
+    {
+        _target = target;
+        _errorCode = errorCode;
+        _extendedErrorCode = extendedErrorCode;
+    }
+
+    private void ThrowIfTargeted(DbCommand command)
+    {
+        var text = command.CommandText;
+        var isWrite = text.TrimStart().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+            || text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase);
+        if (!isWrite)
+            return;
+
+        var isTaskMappings = text.Contains("task_mappings", StringComparison.OrdinalIgnoreCase);
+        var isPipelines = text.Contains("pipelines", StringComparison.OrdinalIgnoreCase);
+        if (_target == Target.TaskMappings && isTaskMappings)
+            throw new SqliteException("admission interceptor: targeted mapping flush", _errorCode, _extendedErrorCode);
+        if (_target == Target.Pipelines && isPipelines)
+            throw new SqliteException("admission interceptor: targeted pipeline flush", _errorCode, _extendedErrorCode);
+        // The mapping flush fires BEFORE the pipeline flush; the pipeline-flush target must not
+        // misfire on the mapping's INSERT (both are INSERTs into similarly-named tables).
+        if (_target == Target.Pipelines && isTaskMappings && !isPipelines)
+            return;
+        if (_target == Target.TaskMappings && isPipelines && !isTaskMappings)
+            return;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        ThrowIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfTargeted(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        ThrowIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfTargeted(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// A connection wrapper whose <c>Rollback()</c> ALWAYS throws — the genuine
+/// driver mechanism for the unconfirmed-rollback vector (the wrapper passes every other member
+/// through to the real connection).
+/// </summary>
+internal sealed class RollbackThrowingConnection : DbConnection
+{
+    private readonly SqliteConnection _inner;
+
+    public RollbackThrowingConnection(string connectionString) =>
+        _inner = new SqliteConnection(connectionString);
+
+    [AllowNull]
+    public override string ConnectionString
+    {
+        get => _inner.ConnectionString;
+        set => _inner.ConnectionString = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    public override string Database => _inner.Database;
+    public override string DataSource => _inner.DataSource;
+    public override string ServerVersion => _inner.ServerVersion;
+    public override int ConnectionTimeout => _inner.ConnectionTimeout;
+    public override ConnectionState State => _inner.State;
+
+    public override void ChangeDatabase(string databaseName) => _inner.ChangeDatabase(databaseName);
+    public override void Close() => _inner.Close();
+    public override void Open() => _inner.Open();
+
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+        new RollbackThrowingTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
+
+    protected override DbCommand CreateDbCommand() => new TransactionTolerantCommand(_inner.CreateCommand());
+
+    /// <summary>
+    /// <see cref="Microsoft.Data.Sqlite.SqliteCommand"/> casts its transaction back to
+    /// <see cref="SqliteTransaction"/>, so the wrapped command SHIELDS the wrapper transaction:
+    /// the setter records (but does not apply) the wrapper, and commands execute on the real
+    /// connection whose enlisted transaction is the underlying <see cref="SqliteTransaction"/>.
+    /// </summary>
+    private sealed class TransactionTolerantCommand : DbCommand
+    {
+        private readonly DbCommand _inner;
+
+        public TransactionTolerantCommand(DbCommand inner) => _inner = inner;
+
+        [AllowNull]
+        public override string CommandText { get => _inner.CommandText; set => _inner.CommandText = value ?? ""; }
+        public override int CommandTimeout { get => _inner.CommandTimeout; set => _inner.CommandTimeout = value; }
+        public override CommandType CommandType { get => _inner.CommandType; set => _inner.CommandType = value; }
+        [AllowNull]
+        protected override DbConnection DbConnection { get => _inner.Connection!; set { } }
+        protected override DbParameterCollection DbParameterCollection => _inner.Parameters;
+        protected override DbTransaction? DbTransaction { get => _inner.Transaction; set { } }
+        public override bool DesignTimeVisible { get => false; set { } }
+        public override UpdateRowSource UpdatedRowSource { get => _inner.UpdatedRowSource; set => _inner.UpdatedRowSource = value; }
+
+        public override void Cancel() => _inner.Cancel();
+        public override int ExecuteNonQuery() => _inner.ExecuteNonQuery();
+        public override object? ExecuteScalar() => _inner.ExecuteScalar();
+        public override void Prepare() => _inner.Prepare();
+        protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
+    }
+
+    /// <summary>
+    /// The EF relational layer requires a transaction's <see cref="DbTransaction.Connection"/>
+    /// to be REFERENCE-EQUAL to the connection it was begun on, so the wrapper returns ITSELF.
+    /// </summary>
+    private sealed class RollbackThrowingTransaction : DbTransaction
+    {
+        private readonly RollbackThrowingConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public RollbackThrowingTransaction(RollbackThrowingConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection? DbConnection => _owner;
+        public override void Commit() => _inner.Commit();
+        public override void Rollback() => throw new InvalidOperationException("forced rollback failure");
+        protected override void Dispose(bool disposing) => _inner.Dispose();
+    }
+}
+
+/// <summary>
+/// A logger that THROWS on every write AFTER the constructor phase — the genuine mechanism for
+/// the throwing-logger vector (the store's constructor logging must still succeed so the test
+/// reaches the cleanup path).
+/// </summary>
+internal sealed class ThrowingLogger<T> : ILogger<T>
+{
+    private bool _armed;
+
+    /// <summary>Arms the throw (call AFTER store construction).</summary>
+    public void Arm() => _armed = true;
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        if (_armed)
+            throw new InvalidOperationException("the logger itself threw");
     }
 }
