@@ -387,10 +387,36 @@ internal sealed class TaskDispatchService
         LogSafely(() => _logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
             deliveryWorkerId, taskRoleName, deliveredTaskId));
 
-        // STAGE A. Best-effort by construction: SendAgentsMdToWorkerAsync catches its own send
-        // failures, so no ordinary failure of this stage is observable here. A cancellation is
-        // observed one line later, at the cancel-check.
-        await _maintenance.SendAgentsMdToWorkerAsync(idleWorker, deliveredRole, ct);
+        // STAGE A — BEST-EFFORT, AND CONTAINED AT THIS BOUNDARY.
+        //
+        // SendAgentsMdToWorkerAsync already swallows its own gateway-send failure — but it does so
+        // by LOGGING it, and that log is itself a POST-DEQUEUE diagnostic. If the logging
+        // infrastructure throws from inside that catch, the exception escapes the awaited call at
+        // the worst possible instant: the task is dequeued and the worker's Role is already
+        // reassigned, yet the task is NOT activated and the cancel-check's requeue has not run —
+        // the dequeued task would be STRANDED by a pure diagnostic failure.
+        //
+        // The boundary rule admits no exception: EVERY log call after the dequeue is best-effort,
+        // INCLUDING the ones reached indirectly. The maintenance class is not ours to change, so
+        // the containment lives here, wrapping the whole awaited call.
+        //
+        // THE CLASSIFICATION IS UNCHANGED, and this is exactly what makes the blanket catch
+        // correct rather than a mask: the recovery table declares stage A NOT OBSERVABLE from this
+        // transaction for BOTH an ordinary failure and a cancellation. Nothing observable is
+        // therefore being swallowed that the table says should be seen — a cancellation is observed
+        // one line later, at the cancel-check, from the TOKEN, never from this call's exception. So
+        // control simply FALLS THROUGH: no rethrow, and no diversion into the cancel-check's
+        // requeue (which is reserved for a genuinely cancelled token).
+        try
+        {
+            await _maintenance.SendAgentsMdToWorkerAsync(idleWorker, deliveredRole, ct);
+        }
+        catch (Exception)
+        {
+            // Deliberately empty: stage A is non-observable by contract, and a diagnostic failure
+            // escaping it must never strand the dequeued task. Re-reporting it here would need the
+            // very logger that just threw.
+        }
 
         // STAGE cancel-check — THE REQUEUE POINT. The task is dequeued, NOT activated, and the
         // worker is NOT busy: returning the task to the pending queue is provably safe here, and

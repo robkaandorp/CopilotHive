@@ -1111,8 +1111,63 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-", StringComparison.Ordinal));
     }
 
-    // ── (c) + (d-normal) + (f-normal) THE CANCEL-CHECK REQUEUE, in order ─────
+    /// <summary>
+    /// THE STAGE A STRANDING HOLE, closed: the agents-md gateway send FAILS and the maintenance
+    /// class's own catch tries to log that failure — with a logger that THROWS. That nested throw
+    /// escapes the awaited stage A call at the worst instant (task dequeued, Role reassigned, NOT
+    /// yet activated, cancel-check not yet run), so without the boundary containment the dequeued
+    /// task is STRANDED by a pure diagnostic failure.
+    /// </summary>
+    /// <remarks>
+    /// This is the vector the earlier stage A test could not reach: it used a non-throwing logger,
+    /// and the post-dequeue boundary test configured no <c>AgentsManager</c>, so the maintenance
+    /// path returned on empty content before ever reaching its logging catch. Here BOTH conditions
+    /// hold at once — a real AgentsManager with content AND a failing gateway send AND a throwing
+    /// logger — which is exactly what makes the indirect path live.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_AgentsMdFailurePathLoggerThrows_IsContainedAndTaskIsNotStranded()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
 
+        var queue = new TaskQueue();
+        var worker = CreateIdleWorker();
+        // The gateway's agents-md send FAILS → DispatcherMaintenance enters its logging catch.
+        var gateway = new DeliveryWorkerGateway(worker)
+        {
+            AgentsUpdateThrows = new InvalidOperationException("agents-md-sentinel"),
+        };
+        // ...and THAT log throws. The predicate targets the maintenance warning specifically, so
+        // the guard-swallowing being proven here is the INDIRECT stage A one, not a blanket one.
+        var logger = new SelectivelyThrowingLogger<TaskDispatchService>(
+            m => m.StartsWith("Failed to send AGENTS.md to worker", StringComparison.Ordinal));
+        var service = CreateService(
+            manager, queue, logger, workerGateway: gateway, agentsManager: CreateAgentsManager());
+
+        // (i) THE THROW DOES NOT ESCAPE the dispatch.
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // The indirect path really was exercised — otherwise this test proves nothing.
+        Assert.Equal(1, gateway.AgentsUpdateAttempts);
+        Assert.True(logger.ThrewAtLeastOnce, "the maintenance path's logger must actually have thrown");
+
+        // (ii) THE TASK IS NOT STRANDED: the dispatch proceeded THROUGH the cancel-check to the
+        // delivery, and the dequeued task reached its destination.
+        Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
+        Assert.Equal([taskId], gateway.SentTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+
+        // (iii) It was NOT diverted into the cancel-check's requeue: nothing went back to pending
+        // and no recovery record was written.
+        Assert.Empty(DrainPending(queue));
+        Assert.DoesNotContain(
+            logger.SeenMessages, m => m.Contains("delivery-", StringComparison.Ordinal));
+    }
+
+    // ── (c) + (d-normal) + (f-normal) THE CANCEL-CHECK REQUEUE, in order ─────
     /// <summary>
     /// THE REQUEUE, steps 1–5 IN ORDER: the Enqueue, then the <c>delivery-recovery</c> guard line,
     /// then the Role-ONLY restore, then the <c>delivery-failure</c> record — and finally the
@@ -1385,24 +1440,19 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     // ── (h) STAGE S — THE PRESERVE ───────────────────────────────────────────
 
     /// <summary>
-    /// A throwing <see cref="IWorkerGateway.SendTaskAsync"/> — THE AMBIGUITY POINT — is preserved:
-    /// the task stays active, the worker stays busy, the Role is NOT restored, the delivered task's
-    /// pipeline state is untouched, the <c>stage=send recovery=preserve</c> record is written and
-    /// the ORIGINAL exception is rethrown. A caller cancellation AT S takes the SAME path.
+    /// An ORDINARY throwing <see cref="IWorkerGateway.SendTaskAsync"/> — THE AMBIGUITY POINT — is
+    /// preserved: the task stays active, the worker stays busy, the Role is NOT restored, the
+    /// delivered task's pipeline state is untouched, the <c>stage=send recovery=preserve</c> record
+    /// is written and the ORIGINAL exception is rethrown.
     /// </summary>
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Delivery_SendThrows_PreservesEverythingAndPropagates(bool cancellation)
+    [Fact]
+    public async Task Delivery_SendThrows_PreservesEverythingAndPropagates()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         Arrange(pipeline, GoalPhase.Coding);
 
-        Exception sentinel = cancellation
-            ? new OperationCanceledException("send-cancel-sentinel")
-            : new InvalidOperationException("send-sentinel");
-
+        var sentinel = new InvalidOperationException("send-sentinel");
         var worker = CreateIdleWorker(role: WorkerRole.Tester);
         var queue = new TaskQueue();
         var logger = new TestLogger<TaskDispatchService>();
@@ -1413,6 +1463,69 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
+        AssertSendPreserve(manager, pipeline, queue, logger, gateway, worker);
+    }
+
+    /// <summary>
+    /// A CALLER CANCELLATION AT STAGE S takes THE SAME PRESERVE PATH, and the cancellation is
+    /// genuinely driven by the CALLER'S TOKEN — not a fabricated tokenless
+    /// <see cref="OperationCanceledException"/>.
+    /// </summary>
+    /// <remarks>
+    /// THE GENUINENESS PROOF, which a fabricated OCE cannot satisfy: the gateway records the token
+    /// it was HANDED at the send point, cancels THAT source, and throws by calling
+    /// <c>ThrowIfCancellationRequested</c> ON IT — so the observed exception's
+    /// <see cref="OperationCanceledException.CancellationToken"/> IS the caller's token, and that
+    /// token was demonstrably cancelled at observation time. Reverting to a tokenless OCE thrown
+    /// against a non-cancelled dispatch token fails all three of those assertions.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_SendObservesCancelledCallerToken_PreservesEverythingAndPropagatesOce()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+
+        // The caller's OWN source. It is NOT cancelled up front — that would trip the cancel-check
+        // long before stage S; the cancellation must first become observable AT the send point.
+        using var cts = new CancellationTokenSource();
+        var gateway = new DeliveryWorkerGateway(worker) { CancelCallerTokenAtSend = cts };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        // (i) The exception that left the dispatch is the very instance the gateway threw.
+        Assert.NotNull(gateway.ThrownAtSend);
+        Assert.Same(gateway.ThrownAtSend, thrown);
+        // (ii) It is CALLER-TOKEN-DRIVEN: the OCE carries the caller's token, not CancellationToken.None.
+        Assert.Equal(cts.Token, thrown.CancellationToken);
+        Assert.NotEqual(CancellationToken.None, thrown.CancellationToken);
+        // (iii) The token the gateway was HANDED is the caller's, and it was really cancelled then.
+        Assert.Equal(cts.Token, gateway.TokenAtSend);
+        Assert.True(gateway.TokenWasCancelledAtSend, "the caller's token must be cancelled at observation time");
+
+        // THE SAME PRESERVE as the ordinary S vector — identical assertions, identical record.
+        AssertSendPreserve(manager, pipeline, queue, logger, gateway, worker);
+    }
+
+    /// <summary>
+    /// The shared stage-S PRESERVE assertions: nothing is undone, the exact record fires, and no
+    /// recovery is attempted. Used by BOTH S vectors so the ordinary and caller-cancellation cases
+    /// are held to exactly the same standard.
+    /// </summary>
+    private void AssertSendPreserve(
+        GoalPipelineManager manager,
+        GoalPipeline pipeline,
+        TaskQueue queue,
+        TestLogger<TaskDispatchService> logger,
+        DeliveryWorkerGateway gateway,
+        ConnectedWorker worker)
+    {
         var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
 
         // THE PRESERVE: active, busy, model set, Role left on the delivered task's role.
@@ -1642,6 +1755,22 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>When set, <see cref="SendTaskAsync"/> throws it (stage S).</summary>
         public Exception? SendTaskThrows { get; init; }
 
+        /// <summary>
+        /// When set, <see cref="SendTaskAsync"/> CANCELS this source and then throws by observing
+        /// the token it was HANDED — producing a genuine caller-token-driven cancellation at
+        /// stage S rather than a fabricated <see cref="OperationCanceledException"/>.
+        /// </summary>
+        public CancellationTokenSource? CancelCallerTokenAtSend { get; init; }
+
+        /// <summary>The token the gateway was handed at the send point.</summary>
+        public CancellationToken TokenAtSend { get; private set; }
+
+        /// <summary>Whether that token was actually cancelled when the send observed it.</summary>
+        public bool TokenWasCancelledAtSend { get; private set; }
+
+        /// <summary>The exception the send actually threw, for an identity assertion.</summary>
+        public OperationCanceledException? ThrownAtSend { get; private set; }
+
         /// <summary>When set, <see cref="SendAgentsUpdateAsync"/> throws it (stage A).</summary>
         public Exception? AgentsUpdateThrows { get; init; }
 
@@ -1667,6 +1796,27 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
         {
+            TokenAtSend = ct;
+
+            if (CancelCallerTokenAtSend is not null)
+            {
+                // The CALLER's own source is cancelled HERE, at the send point — so the dispatch
+                // sailed through the cancel-check on a live token and only meets the cancellation
+                // at stage S. The throw then comes from OBSERVING the handed token, which is what
+                // makes the resulting OCE carry that token.
+                CancelCallerTokenAtSend.Cancel();
+                TokenWasCancelledAtSend = ct.IsCancellationRequested;
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException ex)
+                {
+                    ThrownAtSend = ex;
+                    throw;
+                }
+            }
+
             if (SendTaskThrows is not null)
                 throw SendTaskThrows;
 
@@ -1698,6 +1848,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>True once the throwing branch has actually been taken.</summary>
         public bool ThrewAtLeastOnce { get; private set; }
 
+        /// <summary>Every message the logger was asked to emit, throwing ones included.</summary>
+        public List<string> SeenMessages { get; } = [];
+
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -1706,7 +1859,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             LogLevel logLevel, EventId eventId, TState state, Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
-            if (!_shouldThrow(formatter(state, exception)))
+            var message = formatter(state, exception);
+            SeenMessages.Add(message);
+            if (!_shouldThrow(message))
                 return;
 
             ThrewAtLeastOnce = true;
