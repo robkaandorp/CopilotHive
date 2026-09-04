@@ -1425,7 +1425,8 @@ public sealed class TaskCompletionServiceGuardTests
         IDistributedBrain? brain,
         ILogger<TaskCompletionService> logger,
         DashboardNotifier? dashboardNotifier = null,
-        GoalManager? goalManager = null)
+        GoalManager? goalManager = null,
+        bool failTheDrive = false)
     {
         goalManager ??= new GoalManager();
         var lifecycleService = new GoalLifecycleService(
@@ -1440,7 +1441,11 @@ public sealed class TaskCompletionServiceGuardTests
             agentsManager: null,
             metricsTracker: null,
             dispatchToRole: (_, _, _, _) => Task.CompletedTask,
-            resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
+            // The failure seam: the drive reaches the next phase's prompt resolution, so throwing
+            // here makes DriveNextPhaseAsync fail exactly the way a real driver fault would.
+            resolvePrompt: failTheDrive
+                ? (_, _, _, _) => throw new InvalidOperationException("Simulated drive failure")
+                : (_, _, _, _) => Task.FromResult("prompt"),
             resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
             resolveRepositories: _ => [],
             syncAgents: _ => Task.CompletedTask,
@@ -1670,16 +1675,23 @@ public sealed class TaskCompletionServiceGuardTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════
-    //  Guard 4 — THE ABANDONED-COMPLETION GUARD.
+    //  Guard 4 — THE COMPLETION ADMISSION.
     //
-    //  It sits immediately AFTER the stale-task guard and drops completions that observe
-    //  an already-retired work slot while the task→goal mapping still resolves the
-    //  pipeline (today's interim cleanup retires a slot but never unregisters the
-    //  mapping, so the pipeline resolution below is the real production shape).
+    //  It sits immediately AFTER the stale-task guard (the position the earlier separate
+    //  locked read occupied) and is now ONE atomic, lock-scoped decision that both
+    //  classifies the completion and — for a Pending slot — CLAIMS it:
     //
-    //  The guard is a SEPARATE locked read, not an atomic completion admission: these
-    //  vectors pin the OBSERVED-Abandoned behaviour only. A completion that observes
-    //  Pending and then races the retire is the completion protocol's territory.
+    //    • SlotAbandoned       → the stale-completion template, dropped;
+    //    • SlotAlreadyAdmitted → the duplicate-completion template, dropped;
+    //    • Admitted / NoSlot   → into the drive.
+    //
+    //  Because the decision and the claim share one lock span, a retire can no longer
+    //  land between them. What is NOT claimed: a retire landing AFTER the claim still
+    //  proceeds — the drive is not isolated from it.
+    //
+    //  The completion path's counterpart to the claim is the RECORD, which sits inside
+    //  the try immediately after a SUCCESSFUL drive; a failed drive must leave the slot
+    //  Claimed. Both placements are pinned below.
     // ══════════════════════════════════════════════════════════════════════════════════
 
     // WorkSlotState is internal, so it cannot appear in a public test method signature.
@@ -1698,6 +1710,20 @@ public sealed class TaskCompletionServiceGuardTests
         $"WorkSlotIntegrity: stale-completion goal={goalId} task={taskId} " +
         $"pipeline-phase={pipelinePhase} slot-state=abandoned — the completion is for a retired " +
         "attempt; dropped";
+
+    /// <summary>
+    /// The exact DUPLICATE-completion template, with the placeholders rendered. THREE fields —
+    /// there is deliberately no <c>slot-state</c> field, because the collapsed
+    /// <c>SlotAlreadyAdmitted</c> outcome does not distinguish Claimed from Recorded and the line
+    /// must not claim knowledge it does not have.
+    /// </summary>
+    private static string ExpectedDuplicateLog(string goalId, string taskId, GoalPhase pipelinePhase) =>
+        $"WorkSlotIntegrity: duplicate-completion goal={goalId} task={taskId} " +
+        $"pipeline-phase={pipelinePhase} — the attempt was already admitted; dropped";
+
+    /// <summary>The single registered slot's state, or <c>null</c> when no slot exists.</summary>
+    private static WorkSlotState? SlotStateOf(GoalPipeline pipeline, string taskId) =>
+        pipeline.GetSlotsForTest().FirstOrDefault(v => v.Slot.TaskId == taskId)?.State;
 
     /// <summary>
     /// Builds the reclaim-path fixture: a mid-iteration pipeline (Testing — NOT the Planning
@@ -1759,6 +1785,20 @@ public sealed class TaskCompletionServiceGuardTests
     };
 
     /// <summary>
+    /// Builds a <see cref="GoalManager"/> that KNOWS the fixture's goal, so the terminal paths
+    /// (<c>MarkGoalCompletedAsync</c> / <c>MarkGoalFailedAsync</c>) can persist a status update
+    /// instead of throwing <see cref="KeyNotFoundException"/>. The polling call primes the
+    /// manager's goal→source map, exactly as the persistence vector above does.
+    /// </summary>
+    private static async Task<GoalManager> TerminalCapableGoalManagerAsync(GoalPipeline pipeline)
+    {
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new FakeGoalSource(pipeline.Goal));
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+        return goalManager;
+    }
+
+    /// <summary>
     /// The completion observes an ALREADY-RETIRED slot while its task→goal mapping is still
     /// intact, so the pipeline resolves and every earlier guard passes. The guard drops it:
     /// the exact template is logged and the pipeline phase does NOT move.
@@ -1787,17 +1827,15 @@ public sealed class TaskCompletionServiceGuardTests
     }
 
     /// <summary>
-    /// THE PRODUCTION COMPATIBILITY VECTORS: a live slot in any of Pending, Claimed or Recorded —
-    /// and an ABSENT slot (legacy, pre-registry tasks) — must all PASS the guard and drive the
-    /// pipeline exactly as before. A guard that dropped on anything but Abandoned would stall
-    /// every normal completion.
+    /// THE PASS-THROUGH SET, narrowed by E1 to exactly two members: a <c>Pending</c> slot (the
+    /// admission claims it and the drive runs) and an ABSENT slot (legacy, pre-registry tasks —
+    /// <c>NoSlot</c>, the untouched legacy pass-through). Claimed and Recorded are NO LONGER here:
+    /// under the admission they are duplicates and are dropped, as the two vectors below prove.
     /// </summary>
     [Theory]
     [InlineData(SlotPending)]
-    [InlineData(SlotClaimed)]
-    [InlineData(SlotRecorded)]
     [InlineData(SlotNone)]
-    public async Task HandleTaskCompletionAsync_NonAbandonedSlot_PassesTheGuardAndDrivesThePipeline(
+    public async Task HandleTaskCompletionAsync_AdmittedOrNoSlot_PassesTheAdmissionAndDrivesThePipeline(
         int slotStateCode)
     {
         var logger = new CollectingLogger<TaskCompletionService>();
@@ -1815,7 +1853,130 @@ public sealed class TaskCompletionServiceGuardTests
     }
 
     /// <summary>
-    /// The drop fires on the NO-BRAIN fixture too: the guard precedes the brain branch, so a
+    /// THE DUPLICATE DROP — the vector that replaces the pre-E1 Claimed/Recorded pass-throughs.
+    /// A completion for an attempt that is ALREADY admitted (its slot is Claimed or Recorded) is
+    /// a duplicate: the exact three-field template is logged and the drive NEVER runs.
+    /// <para>
+    /// Both states collapse into the one <c>SlotAlreadyAdmitted</c> outcome and therefore into the
+    /// one template — which carries no <c>slot-state</c> field precisely because it cannot tell
+    /// them apart.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(SlotClaimed)]
+    [InlineData(SlotRecorded)]
+    public async Task HandleTaskCompletionAsync_AlreadyAdmittedSlot_DropsDuplicateWithoutDriving(
+        int slotStateCode)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-duplicate-{Guid.NewGuid():N}", SlotState(slotStateCode));
+        var stateBefore = SlotStateOf(pipeline, taskId);
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        // THE EXACT TEMPLATE, rendered — not a loose substring match.
+        var duplicateLog = logger.Logs.FirstOrDefault(l =>
+            l.Level == LogLevel.Warning &&
+            l.Message == ExpectedDuplicateLog(pipeline.GoalId, taskId, GoalPhase.Testing));
+        Assert.True(duplicateLog != default,
+            $"Expected the exact duplicate-completion log. Logs: {string.Join(" | ", logger.Logs.Select(l => l.Message))}");
+
+        // THE DRIVE NEVER RAN: the drop precedes the normal task-completed log, and neither the
+        // pipeline nor its state machine moved.
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("task completed"));
+        Assert.Equal(GoalPhase.Testing, pipeline.Phase);
+        Assert.Equal(GoalPhase.Testing, pipeline.StateMachine.Phase);
+
+        // The duplicate is inert on the registry too: the slot did not move.
+        Assert.Equal(stateBefore, SlotStateOf(pipeline, taskId));
+    }
+
+    /// <summary>
+    /// The duplicate template must NEVER be confused with the abandoned one: an Abandoned slot
+    /// emits the stale-completion line and an already-admitted slot the duplicate line, and
+    /// neither vector emits the other's text.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AbandonedAndDuplicate_UseDistinctTemplates()
+    {
+        var abandonedLogger = new CollectingLogger<TaskCompletionService>();
+        var (abandonedManager, abandonedPipeline, abandonedTaskId) =
+            SlotGuardFixture($"goal-tmpl-a-{Guid.NewGuid():N}", WorkSlotState.Abandoned);
+        await CreateService(abandonedManager, brain: new FakeDispatcherBrain(), abandonedLogger)
+            .HandleTaskCompletionAsync(CompletionFor(abandonedTaskId), TestContext.Current.CancellationToken);
+
+        var duplicateLogger = new CollectingLogger<TaskCompletionService>();
+        var (duplicateManager, duplicatePipeline, duplicateTaskId) =
+            SlotGuardFixture($"goal-tmpl-d-{Guid.NewGuid():N}", WorkSlotState.Claimed);
+        await CreateService(duplicateManager, brain: new FakeDispatcherBrain(), duplicateLogger)
+            .HandleTaskCompletionAsync(CompletionFor(duplicateTaskId), TestContext.Current.CancellationToken);
+
+        Assert.Contains(abandonedLogger.Logs, l =>
+            l.Message == ExpectedDropLog(abandonedPipeline.GoalId, abandonedTaskId, GoalPhase.Testing));
+        Assert.DoesNotContain(abandonedLogger.Logs, l => l.Message.Contains("duplicate-completion"));
+
+        Assert.Contains(duplicateLogger.Logs, l =>
+            l.Message == ExpectedDuplicateLog(duplicatePipeline.GoalId, duplicateTaskId, GoalPhase.Testing));
+        Assert.DoesNotContain(duplicateLogger.Logs, l => l.Message.Contains("stale-completion"));
+    }
+
+    /// <summary>
+    /// THE POST-DRIVE RECORD, success path: an admitted (Pending → Claimed) slot whose drive
+    /// SUCCEEDS is transitioned to <c>Recorded</c> by the record call that sits immediately after
+    /// the await, inside the try.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_SuccessfulDrive_RecordsTheAdmittedSlot()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-record-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var service = CreateService(pipelineManager, brain: new FakeDispatcherBrain(), logger);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        // The drive genuinely ran…
+        Assert.NotEqual(GoalPhase.Testing, pipeline.Phase);
+        // …and the slot was recorded afterwards.
+        Assert.Equal(WorkSlotState.Recorded, SlotStateOf(pipeline, taskId));
+    }
+
+    /// <summary>
+    /// THE POST-DRIVE RECORD, failure path — the placement proof that matters: when the drive
+    /// THROWS, the slot must stay <c>Claimed</c>. A record call moved below the catch blocks would
+    /// record a slot whose work never completed, so this vector is what pins the call INSIDE the
+    /// try, immediately after the successful await.
+    /// <para>
+    /// The goal is failed by the catch, and the terminal transition abandons PENDING slots only
+    /// (the A1a in-flight exemption), so the Claimed slot survives untouched — the terminal residue
+    /// the E2 reconciliation successor owns.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_FailedDrive_LeavesTheAdmittedSlotClaimed()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-drivefail-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var service = CreateService(
+            pipelineManager, brain: new FakeDispatcherBrain(), logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline), failTheDrive: true);
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        // The drive really did fail (the catch ran and failed the goal).
+        Assert.Contains(logger.Logs, l =>
+            l.Level == LogLevel.Error && l.Message.Contains("Error driving pipeline"));
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        // THE PLACEMENT PROOF: no record happened.
+        Assert.Equal(WorkSlotState.Claimed, SlotStateOf(pipeline, taskId));
+    }
+
+    /// <summary>
+    /// The drop fires on the NO-BRAIN fixture too: the admission precedes the brain branch, so a
     /// brain-less service must not mark the goal completed off a retired attempt.
     /// </summary>
     [Fact]
@@ -1837,7 +1998,33 @@ public sealed class TaskCompletionServiceGuardTests
     }
 
     /// <summary>
-    /// GUARD ORDER: the new guard sits AFTER the stale-task guard. A completion that is both
+    /// THE NO-BRAIN ADMITTED PATH — the degenerate single-phase mode, pinned as the DELIBERATE
+    /// behaviour it is. An admitted completion completes the goal and the slot stays
+    /// <c>Claimed</c>: there is no record call on this path, on purpose. The goal is Done and its
+    /// pipeline is removed, so the slot's terminal state is irrelevant; the terminal
+    /// <c>AbandonPendingSlots</c> exempts in-flight slots, so it is not abandoned either.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_AdmittedWithoutBrain_CompletesGoalAndLeavesSlotClaimed()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nobrain-ok-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(CompletionFor(taskId), TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("WorkSlotIntegrity"));
+        // The no-brain early-out completed the goal…
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        // …and left the admitted slot Claimed — never Recorded, never Abandoned.
+        Assert.Equal(WorkSlotState.Claimed, SlotStateOf(pipeline, taskId));
+    }
+
+    /// <summary>
+    /// GUARD ORDER: the admission sits AFTER the stale-task guard. A completion that is both
     /// stale (its task is not the active one) AND backed by an abandoned slot is classified as
     /// STALE — the earlier guard wins and the WorkSlotIntegrity template is never emitted.
     /// </summary>
@@ -1864,7 +2051,8 @@ public sealed class TaskCompletionServiceGuardTests
     /// <summary>
     /// The guard order in the other direction: the ABANDONED classification is only reached once
     /// the stale-task guard has passed, i.e. the retired attempt IS the active task. This is the
-    /// complement of the vector above and pins the guard's position rather than its mere presence.
+    /// complement of the vector above and pins the admission's position rather than its mere
+    /// presence.
     /// </summary>
     [Fact]
     public async Task HandleTaskCompletionAsync_AbandonedActiveTask_IsClassifiedByTheNewGuardNotStale()

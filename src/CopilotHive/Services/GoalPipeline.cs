@@ -742,6 +742,74 @@ public sealed class GoalPipeline
     }
 
     /// <summary>
+    /// THE ATOMIC ADMISSION PRIMITIVE: decides — in ONE <c>_lock</c> span — whether a completion
+    /// for <paramref name="taskId"/> may be admitted into the completion path, and, when it may,
+    /// CLAIMS the slot as part of that same decision.
+    /// </summary>
+    /// <remarks>
+    /// The six-case input matrix, exhaustively:
+    /// <list type="bullet">
+    ///   <item><description><c>null</c>/blank id → <see cref="AdmissionOutcome.NoSlot"/> with NO
+    ///     mutation: a blank id names no attempt.</description></item>
+    ///   <item><description>No slot registered for a non-blank id →
+    ///     <see cref="AdmissionOutcome.NoSlot"/>. This is the PRE-REGISTRY PASS-THROUGH: tasks that
+    ///     were dispatched before the registry existed carry no slot, and their completions must
+    ///     keep flowing exactly as they did before.</description></item>
+    ///   <item><description><see cref="WorkSlotState.Abandoned"/> →
+    ///     <see cref="AdmissionOutcome.SlotAbandoned"/>: the attempt was retired.</description></item>
+    ///   <item><description><see cref="WorkSlotState.Pending"/> → transitioned to
+    ///     <see cref="WorkSlotState.Claimed"/> and <see cref="AdmissionOutcome.Admitted"/> is
+    ///     returned.</description></item>
+    ///   <item><description><see cref="WorkSlotState.Claimed"/> or
+    ///     <see cref="WorkSlotState.Recorded"/> → <see cref="AdmissionOutcome.SlotAlreadyAdmitted"/>:
+    ///     a DUPLICATE completion for an attempt that was already admitted. The two states collapse
+    ///     into one outcome deliberately — the caller's response is identical and the outcome does
+    ///     not pretend to distinguish them.</description></item>
+    /// </list>
+    /// <para>
+    /// WHY THIS IS NOT <see cref="ResolveAndCheckSlot"/>: the Pending → Claimed transition is
+    /// written out DIRECTLY here rather than delegating, because delegating would nest a second
+    /// acquisition of the same monitor inside this one. Avoiding that nesting is the negotiated
+    /// contract of this primitive; <see cref="ResolveAndCheckSlot"/> keeps its own (test-only)
+    /// status and its contract is unchanged by this method's existence.
+    /// </para>
+    /// <para>
+    /// HONEST CONCURRENCY LANGUAGE — what is and is NOT guaranteed: the DECISION and the CLAIM are
+    /// one linearized event under a single lock span, so a concurrent retire can no longer land
+    /// BETWEEN the state check and the claim. That is the whole guarantee. A retire that lands
+    /// AFTER the admission's claim still proceeds — it retires the now-Claimed slot while the
+    /// completion drives the pipeline. This primitive makes the admission decision atomic; it does
+    /// NOT isolate the drive that follows it.
+    /// </para>
+    /// </remarks>
+    /// <param name="taskId">The task id whose completion is seeking admission.</param>
+    /// <returns>Which of the four admission outcomes occurred.</returns>
+    internal AdmissionOutcome AdmitCompletion(string? taskId)
+    {
+        lock (_lock)
+        {
+            // Blank ids and absent slots share the one no-slot answer — neither mutates anything.
+            if (string.IsNullOrWhiteSpace(taskId) || !_slots.TryGetValue(taskId, out var entry))
+                return AdmissionOutcome.NoSlot;
+
+            switch (entry.State)
+            {
+                case WorkSlotState.Pending:
+                    // THE CLAIM, in the same lock span as the decision that authorised it.
+                    _slots[taskId] = (entry.Slot, WorkSlotState.Claimed);
+                    return AdmissionOutcome.Admitted;
+                case WorkSlotState.Claimed:
+                case WorkSlotState.Recorded:
+                    return AdmissionOutcome.SlotAlreadyAdmitted;
+                case WorkSlotState.Abandoned:
+                    return AdmissionOutcome.SlotAbandoned;
+                default:
+                    throw new InvalidOperationException($"Unhandled WorkSlotState: {entry.State}");
+            }
+        }
+    }
+
+    /// <summary>
     /// Records the result of a claimed slot, transitioning it to <see cref="WorkSlotState.Recorded"/>.
     /// </summary>
     /// <param name="taskId">The task ID identifying the slot.</param>
@@ -1124,6 +1192,28 @@ internal enum SlotRecordOutcome
     Recorded,
     /// <summary>Nothing changed — the slot was not claimed, or does not exist.</summary>
     NoOp,
+}
+
+/// <summary>
+/// Outcome of <see cref="GoalPipeline.AdmitCompletion"/> — the atomic completion-admission
+/// primitive.
+/// </summary>
+internal enum AdmissionOutcome
+{
+    /// <summary>A Pending slot was claimed; the completion may proceed into the drive.</summary>
+    Admitted,
+    /// <summary>
+    /// No slot is registered for the task id — or the id was <c>null</c>/blank. The pre-registry
+    /// pass-through: the completion proceeds, exactly as it did before the registry existed.
+    /// </summary>
+    NoSlot,
+    /// <summary>The slot was Abandoned; the completion belongs to a retired attempt.</summary>
+    SlotAbandoned,
+    /// <summary>
+    /// The slot was already admitted (Claimed or Recorded) — a duplicate completion. The two
+    /// states collapse into this one outcome; it does not distinguish them.
+    /// </summary>
+    SlotAlreadyAdmitted,
 }
 
 /// <summary>
