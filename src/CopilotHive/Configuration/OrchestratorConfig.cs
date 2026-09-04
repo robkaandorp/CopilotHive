@@ -51,9 +51,9 @@ public sealed class OrchestratorConfig
     /// Creates an orchestrator config with an UNSET <see cref="Model"/> (<c>null</c>,
     /// never <see cref="Constants.DefaultWorkerModel"/>). This is the fallback used by
     /// <c>Program.cs</c> for the no-config-repo <see cref="HiveConfigFile"/> singleton:
-    /// both the Brain factory and the Composer factory treat a null model as
-    /// "unset", so the fallback never overrides <c>BRAIN_MODEL</c> for the Brain nor
-    /// alters the Composer's model chain.
+    /// a null model means the Brain is not registered at all (config-driven registration,
+    /// no environment-variable seeding) and the Composer stays a disconnected,
+    /// resolver-only shell.
     /// </summary>
     public static OrchestratorConfig CreateEmptyModelFallback() => new() { Model = null };
 }
