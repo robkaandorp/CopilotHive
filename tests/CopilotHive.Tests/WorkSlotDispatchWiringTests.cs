@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 
+using CopilotHive.Agents;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -69,6 +70,18 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         foreach (var connection in _connections)
             connection.Dispose();
         _keeper.Dispose();
+        foreach (var directory in _tempDirectories)
+        {
+            try
+            {
+                if (Directory.Exists(directory))
+                    Directory.Delete(directory, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Best-effort temp cleanup: a locked file must never fail the fixture.
+            }
+        }
     }
 
     // ═══════════════════════════════ fixture helpers ═══════════════════════════════
@@ -144,7 +157,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         ILogger<TaskDispatchService> logger,
         IWorkerGateway? workerGateway = null,
         HiveConfigFile? config = null,
-        Goal? goal = null)
+        Goal? goal = null,
+        AgentsManager? agentsManager = null)
     {
         config ??= CreateConfig();
         workerGateway ??= new GrpcWorkerGateway(new WorkerPool());
@@ -156,13 +170,30 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var lifecycleService = new GoalLifecycleService(goalManager, logger);
         var maintenance = new DispatcherMaintenance(
             pipelineManager, goalManager, taskQueue, workerGateway,
-            brain: null, agentsManager: null, configRepo: null,
+            brain: null, agentsManager: agentsManager, configRepo: null,
             new ConcurrentQueue<string>(), logger, config: config);
 
         return new TaskDispatchService(
             taskQueue, workerGateway, new TaskBuilder(new BranchCoordinator()), config,
             logger, pipelineManager, lifecycleService, maintenance);
     }
+
+    /// <summary>
+    /// An <see cref="AgentsManager"/> rooted in a fresh temp directory with a NON-EMPTY coder
+    /// AGENTS.md, so <c>SendAgentsMdToWorkerAsync</c> actually reaches its gateway call (stage A
+    /// really runs) rather than returning early on empty content.
+    /// </summary>
+    private AgentsManager CreateAgentsManager()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"workslot-agents-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        _tempDirectories.Add(root);
+        var manager = new AgentsManager(root);
+        manager.UpdateAgentsMd(WorkerRole.Coder, "# coder agents");
+        return manager;
+    }
+
+    private readonly List<string> _tempDirectories = [];
 
     private static string ExpectedTaskId(string goalId, WorkerRole role, int iteration = 1, int occurrence = 1, int attempt = 1) =>
         $"{goalId}-{role.ToRoleName()}-{iteration:D3}-{occurrence:D2}-{attempt:D3}";
@@ -956,6 +987,544 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // (13) THE DELIVERY TRANSACTION — the stage machine and its recovery table
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>The delivery-failure record's outcome clause for the cancel-check requeue.</summary>
+    private const string RequeueOutcome = "was returned to the pending queue";
+
+    /// <summary>The delivery-failure record's outcome clause for the P2/S preserve.</summary>
+    private const string PreserveOutcome =
+        "remains active; the outcome is unknowable; the recovery is deferred";
+
+    private static string DeliveryFailureMessage(
+        string goalId, string taskId, string workerId, string stage, string recovery, string outcome) =>
+        $"WorkSlotIntegrity: delivery-failure goal={goalId} task={taskId} worker={workerId} " +
+        $"stage={stage} recovery={recovery} — the task {outcome}";
+
+    private static string DeliveryMismatchMessage(string goalId, string registeredTaskId, string deliveredTaskId) =>
+        $"WorkSlotIntegrity: delivery-mismatch goal={goalId} registered={registeredTaskId} delivered={deliveredTaskId} — " +
+        "the push delivered an earlier queued task of the requested role (role-aware FIFO; no action)";
+
+    private static string DeliveryRollbackFailureMessage(string goalId, string taskId, string step) =>
+        $"WorkSlotIntegrity: delivery-rollback-failure goal={goalId} task={taskId} step={step} — " +
+        "the rollback step failed; continuing";
+
+    private static string DeliveryRecoveryMessage(string goalId, string taskId) =>
+        $"WorkSlotIntegrity: delivery-recovery goal={goalId} task={taskId} stage=cancel-check — " +
+        "the recovery steps completed through the re-enqueue";
+
+    /// <summary>An idle worker holding <paramref name="role"/> as its PRE-MUTATION role.</summary>
+    private static ConnectedWorker CreateIdleWorker(
+        string id = "worker-delivery", WorkerRole role = WorkerRole.Tester) => new()
+        {
+            Id = id,
+            Role = role,
+            Capabilities = [],
+        };
+
+    /// <summary>Drains the pending queue WITHOUT re-triggering the enqueue callback.</summary>
+    private static IReadOnlyList<string> DrainPending(TaskQueue queue)
+    {
+        queue.OnEnqueue = null;
+        var ids = new List<string>();
+        while (queue.TryDequeueAny() is { } task)
+            ids.Add(task.TaskId);
+        return ids;
+    }
+
+    // ── (k) The happy delivery ───────────────────────────────────────────────
+
+    /// <summary>
+    /// THE HAPPY PATH, unchanged: the dequeued task is activated, the worker is marked busy with
+    /// its model, the task is sent — and NO delivery-transaction record is emitted at all.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_HappyPath_ActivatesMarksBusyAndSendsWithoutAnyDeliveryRecord()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var worker = CreateIdleWorker();
+        var gateway = new DeliveryWorkerGateway(worker);
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        Assert.Equal([taskId], gateway.SentTaskIds);
+        Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+        Assert.Equal(WorkerRole.Coder, worker.Role);
+        Assert.Equal("coder-model", worker.CurrentModel);
+
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-", StringComparison.Ordinal));
+    }
+
+    // ── (a) STAGE G — the throw propagates uncaught ──────────────────────────
+    //
+    // Covered UNMODIFIED by Dispatch_DirectPushFails_PerformsNoRollback above: the
+    // ThrowingIdleWorkerGateway's GetIdleWorker throws BEFORE the dequeue, so nothing has been
+    // touched and the delivery transaction deliberately does not guard it.
+
+    // ── (b) STAGE A — the non-observable best-effort stage ───────────────────
+
+    /// <summary>
+    /// A throwing agents-md send is swallowed by <c>DispatcherMaintenance</c>'s own catch, so
+    /// stage A is NOT OBSERVABLE from the delivery transaction: the dispatch PROCEEDS all the way
+    /// to the send.
+    /// </summary>
+    /// <remarks>
+    /// The end-to-end assertion is the point: had the transaction wrapped stage A in a recovery of
+    /// its own, the task would have been requeued or the failure re-raised and the send would never
+    /// have happened.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_AgentsMdSendThrows_IsNotObservableAndDispatchProceeds()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var worker = CreateIdleWorker();
+        var gateway = new DeliveryWorkerGateway(worker)
+        {
+            AgentsUpdateThrows = new InvalidOperationException("agents-md-sentinel"),
+        };
+        var service = CreateService(
+            manager, queue, logger, workerGateway: gateway, agentsManager: CreateAgentsManager());
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // The agents-md send WAS attempted and DID throw — the stage really ran.
+        Assert.Equal(1, gateway.AgentsUpdateAttempts);
+        Assert.Equal([taskId], gateway.SentTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-", StringComparison.Ordinal));
+    }
+
+    // ── (c) + (d-normal) + (f-normal) THE CANCEL-CHECK REQUEUE, in order ─────
+
+    /// <summary>
+    /// THE REQUEUE, steps 1–5 IN ORDER: the Enqueue, then the <c>delivery-recovery</c> guard line,
+    /// then the Role-ONLY restore, then the <c>delivery-failure</c> record — and finally the
+    /// ORIGINAL <see cref="OperationCanceledException"/>.
+    /// </summary>
+    /// <remarks>
+    /// THE ORDER PROOF is temporal, not post-hoc: the enqueue callback appends its own event to the
+    /// same list the logger appends to, and the logger captures the worker's Role AT LOG TIME. So
+    /// (1) before (2) is an index comparison, (2) before (3) is "the Role was still the ASSIGNED
+    /// value when the guard line was written", and (3) before (4) is "the Role was already the
+    /// PRE-MUTATION value when the failure line was written". Moving any step fails the test.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_CancelledBeforeCheck_RequeuesRestoresRoleLogsInOrderAndPropagates()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var events = new List<string>();
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        queue.OnEnqueue = t => events.Add($"enqueue:{t.TaskId}");
+
+        var logger = new DeliveryProbingLogger<TaskDispatchService>(events, () => worker.Role);
+        var gateway = new DeliveryWorkerGateway(worker);
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var guardLine = DeliveryRecoveryMessage(GoalId, taskId);
+        var failureLine = DeliveryFailureMessage(
+            GoalId, taskId, worker.Id, "cancel-check", "requeue", RequeueOutcome);
+
+        // (1) THE ENQUEUE — the recovery's own re-enqueue is the LAST enqueue event.
+        var lastEnqueue = events.FindLastIndex(e => e == $"enqueue:{taskId}");
+        var guardIndex = events.IndexOf($"log:{guardLine}");
+        var failureIndex = events.IndexOf($"log:{failureLine}");
+        Assert.True(lastEnqueue >= 0, "the recovery must re-enqueue the dequeued task");
+        Assert.True(guardIndex >= 0, "the guard line must be emitted after a normal Enqueue");
+        Assert.True(failureIndex >= 0, "the delivery-failure record must be emitted");
+        // (1) before (2) before (4).
+        Assert.True(lastEnqueue < guardIndex, "the Enqueue must precede the guard line");
+        Assert.True(guardIndex < failureIndex, "the guard line must precede the failure line");
+
+        // (2) before (3): the restore had NOT run when the guard line was written.
+        var guardEntry = Assert.Single(logger.Entries, e => e.Message == guardLine);
+        Assert.Equal(LogLevel.Debug, guardEntry.Level);
+        Assert.Equal(WorkerRole.Coder, guardEntry.RoleAtLog);
+
+        // (3) before (4): the ROLE-ONLY restore had already run when the failure line was written.
+        var failureEntry = Assert.Single(logger.Entries, e => e.Message == failureLine);
+        Assert.Equal(LogLevel.Warning, failureEntry.Level);
+        Assert.Equal(WorkerRole.Tester, failureEntry.RoleAtLog);
+
+        // The settled state: the pre-mutation Role restored, nothing activated, no busy worker.
+        Assert.Equal(WorkerRole.Tester, worker.Role);
+        Assert.Null(worker.CurrentModel);
+        Assert.Empty(gateway.MarkedBusyTaskIds);
+        Assert.Empty(gateway.SentTaskIds);
+        Assert.Null(queue.GetActiveTask(taskId));
+        // THE TASK IS PENDING AGAIN.
+        Assert.Equal([taskId], DrainPending(queue));
+        // A clean requeue records no rollback-step failure.
+        Assert.DoesNotContain(
+            logger.Entries, e => e.Message.Contains("delivery-rollback-failure", StringComparison.Ordinal));
+    }
+
+    // ── (d-throwing) + (j) THE GUARD LINE'S EXACT EMISSION RULE ──────────────
+
+    /// <summary>
+    /// A THROWING <see cref="TaskQueue.OnEnqueue"/> during the recovery's re-enqueue: the task IS
+    /// already pending (Enqueue inserts BEFORE invoking the callback), the
+    /// <c>delivery-rollback-failure step=re-enqueue</c> record is THE record, the guard line is NOT
+    /// emitted, the Role restore still runs, and the ORIGINAL cancellation is rethrown.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_CancelledAndRecoveryEnqueueThrows_SkipsGuardLineAndContinuesRollback()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("recovery-enqueue-sentinel");
+        var queue = new TaskQueue();
+        // The FIRST enqueue is the admission's and must succeed; only the recovery's throws.
+        var enqueues = 0;
+        queue.OnEnqueue = _ =>
+        {
+            if (++enqueues >= 2)
+                throw sentinel;
+        };
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker);
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+
+        // THE RULE: no guard line, because the Enqueue call did NOT return normally.
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message == DeliveryRecoveryMessage(GoalId, taskId));
+        // The record instead — carrying the step's own exception.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == DeliveryRollbackFailureMessage(GoalId, taskId, "re-enqueue") &&
+            ReferenceEquals(e.Exception, sentinel));
+
+        // The remaining steps CONTINUED: the Role restore ran and the failure line was written.
+        Assert.Equal(WorkerRole.Tester, worker.Role);
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == DeliveryFailureMessage(
+                GoalId, taskId, worker.Id, "cancel-check", "requeue", RequeueOutcome));
+
+        // THE INSERT-BEFORE-CALLBACK SHAPE: the task IS pending despite the callback's throw.
+        Assert.Equal([taskId], DrainPending(queue));
+        Assert.Null(queue.GetActiveTask(taskId));
+    }
+
+    // ── (f) THE ROLE RESTORE — the concurrent-mutation vector ────────────────
+
+    /// <summary>
+    /// THE CONCURRENT-MUTATION VECTOR: a third party re-assigns the worker's Role between the
+    /// delivery's assignment and the restore's compare, so the restore SKIPS — a live claim is
+    /// never overwritten.
+    /// </summary>
+    /// <remarks>
+    /// The mutation is injected from the recovery's own enqueue callback, which runs strictly
+    /// between step (1) and step (3). The check-then-write is NOT atomic — this test pins the
+    /// common overwrite being avoided, which is exactly what the production comment claims, and
+    /// nothing more. The <c>step=role-model-restore</c> catch has NO runtime vector at all:
+    /// <see cref="ConnectedWorker.Role"/> is a plain auto-property on a sealed class, so that catch
+    /// is a CODE-REVIEW CRITERION (the belt-and-braces structure), not a testable path.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_CancelledAfterConcurrentRoleReassignment_SkipsTheRestore()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var enqueues = 0;
+        queue.OnEnqueue = _ =>
+        {
+            // On the RECOVERY's enqueue only: a competitor claims the worker for another role.
+            if (++enqueues >= 2)
+                worker.Role = WorkerRole.Reviewer;
+        };
+
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger, workerGateway: new DeliveryWorkerGateway(worker));
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        // The competitor's value SURVIVES: the restore refused to write over it.
+        Assert.Equal(WorkerRole.Reviewer, worker.Role);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // The rest of the recovery still ran exactly as usual.
+        Assert.Contains(logger.LogEntries, e => e.Message == DeliveryRecoveryMessage(GoalId, taskId));
+        Assert.Contains(logger.LogEntries, e =>
+            e.Message == DeliveryFailureMessage(
+                GoalId, taskId, worker.Id, "cancel-check", "requeue", RequeueOutcome));
+        Assert.Equal([taskId], DrainPending(queue));
+    }
+
+    // ── (e) STAGE P2 — THE AMBIGUITY-PRESERVE ────────────────────────────────
+
+    /// <summary>
+    /// A throwing <see cref="IWorkerGateway.MarkBusy"/> is THE PRESERVE: NO re-enqueue, NO
+    /// MarkComplete, the task stays ACTIVE, the <c>stage=prepare recovery=preserve</c> record is
+    /// written and the ORIGINAL exception instance is rethrown.
+    /// </summary>
+    /// <remarks>
+    /// THE DEFERRAL NOTE, mirroring the production comment: (a) if the busy mutation HAD been
+    /// applied before the throw, the stale-cleanup's busy-task timeout reclaims the task; (b) if it
+    /// had NOT, the task is active with an IDLE worker — a shape the stale-cleanup's predicate does
+    /// not cover, owned by the ORDERED SUCCESSOR <c>atomic-worker-reservation</c> (the reservation
+    /// API plus the idle-worker-with-active-task reconciliation sweep). This goal does not claim
+    /// that recovery; it defers it.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_MarkBusyThrows_PreservesActiveTaskLogsPrepareAndRethrowsOriginal()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("mark-busy-sentinel");
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker) { MarkBusyThrows = sentinel };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+
+        // THE PRESERVE: still active, never sent, and NOT put back on the pending queue.
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(gateway.SentTaskIds);
+        Assert.Empty(DrainPending(queue));
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == DeliveryFailureMessage(
+                GoalId, taskId, worker.Id, "prepare", "preserve", PreserveOutcome));
+
+        // No recovery was attempted at all.
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message.Contains("delivery-rollback-failure", StringComparison.Ordinal));
+    }
+
+    // ── (g) THE POST-DEQUEUE LOGGING BOUNDARY ────────────────────────────────
+
+    /// <summary>
+    /// A logger that throws at the assigned-role record — the FIRST log call after the dequeue and
+    /// before the activation — must NOT strand the dequeued task: the logging guard swallows it and
+    /// the dispatch PROCEEDS to the delivery.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_LoggerThrowsAfterDequeue_IsSwallowedAndDeliveryProceeds()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var worker = CreateIdleWorker();
+        var gateway = new DeliveryWorkerGateway(worker);
+        // Throws ONLY on the post-dequeue assigned-role record.
+        var logger = new SelectivelyThrowingLogger<TaskDispatchService>(
+            m => m.StartsWith("Worker ", StringComparison.Ordinal));
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        Assert.True(logger.ThrewAtLeastOnce, "the throwing diagnostic must actually have been reached");
+        // The dequeued task reached the worker — it was never stranded by the diagnostic failure.
+        Assert.Equal([taskId], gateway.SentTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+    }
+
+    // ── (h) STAGE S — THE PRESERVE ───────────────────────────────────────────
+
+    /// <summary>
+    /// A throwing <see cref="IWorkerGateway.SendTaskAsync"/> — THE AMBIGUITY POINT — is preserved:
+    /// the task stays active, the worker stays busy, the Role is NOT restored, the delivered task's
+    /// pipeline state is untouched, the <c>stage=send recovery=preserve</c> record is written and
+    /// the ORIGINAL exception is rethrown. A caller cancellation AT S takes the SAME path.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Delivery_SendThrows_PreservesEverythingAndPropagates(bool cancellation)
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        Exception sentinel = cancellation
+            ? new OperationCanceledException("send-cancel-sentinel")
+            : new InvalidOperationException("send-sentinel");
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker) { SendTaskThrows = sentinel };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+
+        // THE PRESERVE: active, busy, model set, Role left on the delivered task's role.
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
+        Assert.True(worker.IsBusy);
+        Assert.Equal(WorkerRole.Coder, worker.Role);
+        Assert.Equal("coder-model", worker.CurrentModel);
+        Assert.Empty(DrainPending(queue));
+
+        // The DELIVERED task's pipeline state is untouched — no rollback of any kind.
+        Assert.Equal(WorkSlotState.Pending, SingleSlot(pipeline).State);
+        Assert.Same(pipeline, manager.GetByTaskId(taskId));
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == DeliveryFailureMessage(
+                GoalId, taskId, worker.Id, "send", "preserve", PreserveOutcome));
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
+    }
+
+    // ── (i) THE MISMATCH HANDOFF ─────────────────────────────────────────────
+
+    /// <summary>
+    /// THE ROLE-AWARE FIFO, made observable: pipeline A's EARLIER same-role task is delivered by
+    /// pipeline B's push. The <c>delivery-mismatch</c> DEBUG record carries the DELIVERED goal and
+    /// BOTH task IDs; a forced send failure preserves the DELIVERED task and names ITS goal in the
+    /// <c>delivery-failure</c> record; and B's own admission — its slot, its mapping, its pointer —
+    /// is untouched by the recovery.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_DeliversAnotherPipelinesEarlierTask_LogsMismatchAndActsOnDeliveredTaskOnly()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+
+        // Pipeline A dispatched first; its coder task sits in the pending queue with no idle worker.
+        var pipelineA = manager.CreatePipeline(CreateGoal("goal-a"));
+        Arrange(pipelineA, GoalPhase.Coding);
+        var queue = new TaskQueue();
+        var loggerA = new TestLogger<TaskDispatchService>();
+        var serviceA = CreateService(manager, queue, loggerA, goal: CreateGoal("goal-a"));
+        await serviceA.DispatchToRole(pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
+
+        var taskA = ExpectedTaskId("goal-a", WorkerRole.Coder);
+
+        // Pipeline B now dispatches WITH an idle worker — and the FIFO hands it A's task.
+        var pipelineB = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipelineB, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("send-sentinel");
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var loggerB = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker) { SendTaskThrows = sentinel };
+        var serviceB = CreateService(manager, queue, loggerB, workerGateway: gateway);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => serviceB.DispatchToRole(pipelineB, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskB = ExpectedTaskId(GoalId, WorkerRole.Coder);
+
+        // THE MISMATCH RECORD: the DELIVERED goal, plus BOTH task IDs.
+        Assert.Contains(loggerB.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug &&
+            e.Message == DeliveryMismatchMessage("goal-a", taskB, taskA));
+
+        // THE LOG OWNERSHIP: the failure record names the DELIVERED task's goal, not B's.
+        Assert.Contains(loggerB.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == DeliveryFailureMessage(
+                "goal-a", taskA, worker.Id, "send", "preserve", PreserveOutcome));
+
+        // The DELIVERED task is the one preserved.
+        Assert.NotNull(queue.GetActiveTask(taskA));
+        Assert.Equal([taskA], gateway.MarkedBusyTaskIds);
+
+        // B's ADMISSION is untouched: its slot, its mapping, its pointer — and its task is still
+        // pending, waiting for the next push.
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineB.GetSlotsForTest()).State);
+        Assert.Same(pipelineB, manager.GetByTaskId(taskB));
+        Assert.Equal(taskB, pipelineB.ActiveTaskId);
+        Assert.Equal([taskB], DrainPending(queue));
+        // NO pipeline-level operation appears in the recovery: A's admission stands too.
+        Assert.Same(pipelineA, manager.GetByTaskId(taskA));
+        Assert.Equal(taskA, pipelineA.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The MATCHING delivery — the push hands back the very task this dispatch admitted — emits NO
+    /// mismatch record. The record is a genuine discriminator, not an unconditional line.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_DeliversOwnTask_LogsNoMismatchRecord()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(
+            manager, queue, logger, workerGateway: new DeliveryWorkerGateway(CreateIdleWorker()));
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message.Contains("delivery-mismatch", StringComparison.Ordinal));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // (12) FormatLogValue — exercised through reflection so the production
     //      helper can stay PRIVATE (acceptance criterion 3).
     // ═══════════════════════════════════════════════════════════════════════
@@ -1051,6 +1620,134 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             LogLevel logLevel, EventId eventId, TState state, Exception? exception,
             Func<TState, Exception?, string> formatter) =>
             throw new InvalidOperationException("logger-sentinel");
+    }
+
+    /// <summary>
+    /// THE DELIVERY GATEWAY: hands back one fixed idle worker and records every MarkBusy/send it
+    /// receives, with an injectable throw for each stage the delivery transaction classifies.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="MarkBusy"/> also applies the REAL busy mutation on the success path (mirroring
+    /// <c>WorkerPool.MarkBusy</c>) so the S-stage preserve can assert a genuinely busy worker.
+    /// </remarks>
+    private sealed class DeliveryWorkerGateway : IWorkerGateway
+    {
+        private readonly ConnectedWorker _worker;
+
+        public DeliveryWorkerGateway(ConnectedWorker worker) => _worker = worker;
+
+        /// <summary>When set, <see cref="MarkBusy"/> throws it (stage P2).</summary>
+        public Exception? MarkBusyThrows { get; init; }
+
+        /// <summary>When set, <see cref="SendTaskAsync"/> throws it (stage S).</summary>
+        public Exception? SendTaskThrows { get; init; }
+
+        /// <summary>When set, <see cref="SendAgentsUpdateAsync"/> throws it (stage A).</summary>
+        public Exception? AgentsUpdateThrows { get; init; }
+
+        public List<string> MarkedBusyTaskIds { get; } = [];
+        public List<string> SentTaskIds { get; } = [];
+
+        /// <summary>Number of agents-md sends attempted — the proof that stage A really ran.</summary>
+        public int AgentsUpdateAttempts { get; private set; }
+
+        public ConnectedWorker? GetIdleWorker() => _worker;
+
+        public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [_worker];
+
+        public void MarkBusy(string workerId, string taskId)
+        {
+            if (MarkBusyThrows is not null)
+                throw MarkBusyThrows;
+
+            MarkedBusyTaskIds.Add(taskId);
+            _worker.IsBusy = true;
+            _worker.CurrentTaskId = taskId;
+        }
+
+        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+        {
+            if (SendTaskThrows is not null)
+                throw SendTaskThrows;
+
+            SentTaskIds.Add(task.TaskId);
+            return Task.CompletedTask;
+        }
+
+        public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default)
+        {
+            AgentsUpdateAttempts++;
+            return AgentsUpdateThrows is not null ? throw AgentsUpdateThrows : Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// A logger that throws ONLY for messages matching a predicate — the targeted vector for the
+    /// post-dequeue logging boundary, where an indiscriminate thrower would be indistinguishable
+    /// from a pre-dequeue infrastructure failure.
+    /// </summary>
+    private sealed class SelectivelyThrowingLogger<T> : ILogger<T>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+
+        public SelectivelyThrowingLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!_shouldThrow(formatter(state, exception)))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("delivery-logger-sentinel");
+        }
+    }
+
+    /// <summary>
+    /// A logger that appends every message to a SHARED event list (so log events interleave with
+    /// enqueue events on one timeline) and records the worker's Role AT LOG TIME.
+    /// </summary>
+    /// <remarks>
+    /// The Role probe reads the REAL worker instance production is mutating, never a copy, so a
+    /// record written before the restore observes the ASSIGNED role and one written after it
+    /// observes the PRE-MUTATION role — which is what pins the requeue's step order.
+    /// </remarks>
+    private sealed class DeliveryProbingLogger<T> : ILogger<T>
+    {
+        private readonly List<string> _events;
+        private readonly Func<WorkerRole> _roleProbe;
+
+        public DeliveryProbingLogger(List<string> events, Func<WorkerRole> roleProbe)
+        {
+            _events = events;
+            _roleProbe = roleProbe;
+        }
+
+        public List<(LogLevel Level, string Message, WorkerRole RoleAtLog)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            _events.Add($"log:{message}");
+            Entries.Add((logLevel, message, _roleProbe()));
+        }
     }
 
     /// <summary>
