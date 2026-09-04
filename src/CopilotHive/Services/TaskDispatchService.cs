@@ -49,7 +49,47 @@ internal sealed class TaskDispatchService
         _maintenance = maintenance;
     }
 
-    internal async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
+    /// <summary>
+    /// The PHASE-1 preparation product: everything resolved BEFORE the repository resolution.
+    /// </summary>
+    /// <param name="RoleName">The role's canonical config name.</param>
+    /// <param name="Model">The FINAL effective model — never null (the refusal gate guarantees it).</param>
+    /// <param name="PhaseTier">The phase's model tier; phase 2 needs it for the reasoning-effort
+    /// selection and for the model debug log's <c>tier=</c> field.</param>
+    /// <param name="Prompt">The prompt, defaulted when the caller passed none.</param>
+    /// <param name="BranchAction">The derived branch action.</param>
+    private sealed record DispatchContext(
+        string RoleName,
+        string Model,
+        ModelTier PhaseTier,
+        string Prompt,
+        BranchAction BranchAction);
+
+    /// <summary>
+    /// The PHASE-2 preparation product: everything resolved AFTER the repository resolution.
+    /// </summary>
+    /// <param name="Reasoning">The effective reasoning effort, or null when unset/degraded.</param>
+    /// <param name="MaxContextTokens">The resolved context window.</param>
+    /// <param name="SubAgentModels">The sub-agent model catalog.</param>
+    private sealed record DispatchTailContext(
+        ReasoningEffort? Reasoning,
+        int MaxContextTokens,
+        IReadOnlyList<SubAgentModelDto> SubAgentModels);
+
+    /// <summary>
+    /// PHASE 1 of the dispatch preparation: the model/tier resolution and its refusal gate, the
+    /// prompt defaulting and its debug preview, and the branch-action derivation.
+    /// </summary>
+    /// <remarks>
+    /// The missing-model <see cref="InvalidOperationException"/> is deliberately NOT caught here:
+    /// it propagates out of <see cref="DispatchToRole"/> exactly as it did inline.
+    /// </remarks>
+    /// <param name="pipeline">The dispatching pipeline.</param>
+    /// <param name="role">The role being dispatched to.</param>
+    /// <param name="prompt">The caller's prompt, or null to default it.</param>
+    /// <returns>The phase-1 preparation product.</returns>
+    /// <exception cref="InvalidOperationException">The role has no configured model.</exception>
+    private DispatchContext BuildDispatchContext(GoalPipeline pipeline, WorkerRole role, string? prompt)
     {
         // Slice 3b refusal gate — compute the FINAL effective model FIRST and refuse when it is
         // null, BEFORE any task registration with the pipeline manager, any enqueue, or any
@@ -83,17 +123,20 @@ internal sealed class TaskDispatchService
 
         var branchAction = pipeline.CoderBranch is null ? BranchAction.Create : BranchAction.Checkout;
 
-        List<TargetRepository> repositories;
-        try
-        {
-            repositories = ResolveRepositories(pipeline.Goal);
-        }
-        catch (InvalidOperationException ex)
-        {
-            _logger.LogError(ex, "Repository configuration error for goal {GoalId}", pipeline.GoalId);
-            await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
-            return;
-        }
+        return new DispatchContext(roleName, model, phaseTier, prompt, branchAction);
+    }
+
+    /// <summary>
+    /// PHASE 2 of the dispatch preparation: the reasoning-effort resolution and its degradation,
+    /// the model debug log, the context-window resolution and the sub-agent catalog construction.
+    /// </summary>
+    /// <param name="head">The phase-1 preparation product.</param>
+    /// <returns>The phase-2 preparation product.</returns>
+    private DispatchTailContext BuildDispatchTail(DispatchContext head)
+    {
+        var roleName = head.RoleName;
+        var model = head.Model;
+        var phaseTier = head.PhaseTier;
 
         // Resolve the effective reasoning effort for this task.
         //
@@ -155,6 +198,29 @@ internal sealed class TaskDispatchService
             });
         }
 
+        return new DispatchTailContext(effectiveReasoning, maxContextTokens, subAgentModels);
+    }
+
+    internal async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
+    {
+        // PHASE 1 of the preparation. The missing-model refusal propagates from here UNCAUGHT.
+        var head = BuildDispatchContext(pipeline, role, prompt);
+
+        List<TargetRepository> repositories;
+        try
+        {
+            repositories = ResolveRepositories(pipeline.Goal);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogError(ex, "Repository configuration error for goal {GoalId}", pipeline.GoalId);
+            await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
+            return;
+        }
+
+        // PHASE 2 of the preparation.
+        var tail = BuildDispatchTail(head);
+
         // ══════════════════════════════════════════════════════════════════════════════════
         //  THE ADMISSION TRANSACTION. Everything above is PREPARATION and touches no shared
         //  state; from here on the dispatch owns a work slot, a task→goal mapping and the
@@ -191,12 +257,12 @@ internal sealed class TaskDispatchService
                 role: role,
                 iteration: pipeline.Iteration,
                 repositories: repositories,
-                prompt: prompt,
-                branchAction: branchAction,
-                model: model,
-                maxContextTokens: maxContextTokens,
-                subAgentModels: subAgentModels,
-                reasoningEffort: effectiveReasoning,
+                prompt: head.Prompt,
+                branchAction: head.BranchAction,
+                model: head.Model,
+                maxContextTokens: tail.MaxContextTokens,
+                subAgentModels: tail.SubAgentModels,
+                reasoningEffort: tail.Reasoning,
                 taskId: taskId);
         }
         catch
