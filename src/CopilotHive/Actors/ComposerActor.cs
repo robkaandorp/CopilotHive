@@ -487,8 +487,15 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         else
         {
             _isStreaming = false;
-            TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
+
+            // INVARIANT (terminal ordering): WHEN STREAMING COMPLETION IS OBSERVABLE — i.e. once
+            // the transition callback has run and the facade has published its _isStreaming=false
+            // + OnStreamingUpdate events — THE IDLE STATUS IS ALREADY PUBLISHED to the registry.
+            // The idle refresh therefore runs BEFORE the transition callback: the callback is the
+            // public completion signal, and any subscriber that wakes on it (a UI refresh, a test
+            // gate) must never be able to read a stale "streaming" entry from the registry.
             TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+            TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
             _terminalCleanupDone = true;
         }
     }
@@ -768,8 +775,14 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
                 _streamingCts = null;
                 _isStreaming = false;
                 _pendingNotifications.Clear();
-                TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
+
+                // INVARIANT (terminal ordering) — same rule as RunTerminalSequence: WHEN
+                // STREAMING COMPLETION IS OBSERVABLE (via the transition callback / facade
+                // events), THE IDLE STATUS IS ALREADY PUBLISHED to the registry. The idle
+                // refresh therefore precedes the transition callback on this path too, so the
+                // observable ordering does not depend on which path ran the terminal sequence.
                 TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+                TryInvoke(() => _onStreamingTransition(toolCalls, false), nameof(_onStreamingTransition));
                 _terminalCleanupDone = true;
             }
         }
@@ -854,8 +867,14 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         if (!_terminalCleanupDone)
         {
             _isStreaming = false;
-            TryInvoke(() => _onStreamingTransition(0, false), nameof(_onStreamingTransition));
+
+            // INVARIANT (terminal ordering) — identical to the other two terminal sites: WHEN
+            // STREAMING COMPLETION IS OBSERVABLE (via the transition callback / facade events),
+            // THE IDLE STATUS IS ALREADY PUBLISHED to the registry. Shutdown is no exception:
+            // a subscriber woken by the shutdown transition must read "idle", never a stale
+            // "streaming" left behind by the aborted stream.
             TryInvoke(() => _refreshRegistry("idle"), nameof(_refreshRegistry));
+            TryInvoke(() => _onStreamingTransition(0, false), nameof(_onStreamingTransition));
             _terminalCleanupDone = true;
         }
 
@@ -961,7 +980,17 @@ internal sealed class ComposerActor : Actor<IComposerMessage>
         MaxContextTokens = original.MaxContextTokens,
     };
 
-    /// <summary>Persists a successful compaction and refreshes the registry entry.</summary>
+    /// <summary>Persists a successful compaction and refreshes the registry entry.
+    /// <para>
+    /// ORDERING AUDIT — the terminal-ordering invariant ("when streaming completion is
+    /// observable, the idle status is already published") is NOT APPLICABLE here and this
+    /// refresh is deliberately NOT reordered. Compaction only runs when <c>_isStreaming</c> is
+    /// false (both compact handlers reject while streaming), so there is no stream terminating,
+    /// no transition callback and no completion signal to order against: the refresh merely
+    /// re-publishes the already-idle entry with the post-compaction token count. There is
+    /// nothing to swap it with.
+    /// </para>
+    /// </summary>
     private async Task PersistCompactionAsync(CancellationToken ct)
     {
         await _saveSession(ct);

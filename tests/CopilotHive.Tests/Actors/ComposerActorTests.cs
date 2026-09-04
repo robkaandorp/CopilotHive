@@ -171,6 +171,17 @@ public sealed class ComposerActorTests
     }
 
     /// <summary>
+    /// The actor's loop cancellation token (<c>Actor&lt;T&gt;.LoopToken</c>), so a test can await
+    /// the exact moment <c>DisposeAsync</c> cancelled the loop instead of timing a delay.
+    /// </summary>
+    private static CancellationToken GetLoopToken(ComposerActor actor)
+    {
+        var property = typeof(Actor<IComposerMessage>).GetProperty("LoopToken", PrivateFlags)
+            ?? throw new InvalidOperationException("LoopToken property not found on Actor<IComposerMessage>");
+        return (CancellationToken)property.GetValue(actor)!;
+    }
+
+    /// <summary>
     /// Number of active notifications currently waiting in the actor's bounded queue. Lets a
     /// test distinguish "queued behind the live stream" from "silently dropped".
     /// </summary>
@@ -4849,8 +4860,25 @@ public sealed class ComposerActorTests
 
     // ── Terminal sequence: transition ordering and latches ──
 
+    /// <summary>
+    /// TERMINAL ORDERING INVARIANT (mailbox terminal sequence, no pending notification):
+    /// when streaming completion becomes OBSERVABLE — the moment the final transition callback
+    /// runs, which is where the facade clears its <c>_isStreaming</c> and raises
+    /// <c>OnStreamingUpdate</c> — the registry's "idle" status has ALREADY been published.
+    /// <para>
+    /// The proof is taken from INSIDE the transition callback: the snapshot of everything the
+    /// registry has been told up to that instant must already end with "idle".
+    /// </para>
+    /// <para>
+    /// Removal-proof: reverting the swap in <c>RunTerminalSequence</c>'s no-pending terminal
+    /// branch (idle refresh AFTER the transition) leaves the in-callback snapshot ending with
+    /// "streaming" and this test fails. This is the actor-level guard for the
+    /// <c>Composer_RunStreamingAsync_SetsStreamingStatus_RestoresIdle</c> flake: a subscriber
+    /// woken by the completion signal must never be able to read a stale "streaming" entry.
+    /// </para>
+    /// </summary>
     [Fact]
-    public async Task TerminalSequence_TransitionFiresBeforeRegistryIdle()
+    public async Task TerminalSequence_RegistryIdlePublishedBeforeTransition()
     {
         var stateDir = CreateTempDir();
         var client = new TextStreamingClient("hello");
@@ -4858,6 +4886,7 @@ public sealed class ComposerActorTests
         await service.ConnectAsync(TestContext.Current.CancellationToken);
 
         var order = new List<string>();
+        List<string>? registryAtTransition = null;
         var completedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var actor = CreateActor(
@@ -4868,7 +4897,15 @@ public sealed class ComposerActorTests
             () => { lock (order) order.Add("started"); },
             (tc, keep) =>
             {
-                lock (order) order.Add($"transition:{tc}:{keep}");
+                // Snapshot WHAT THE REGISTRY ALREADY KNOWS at the instant completion becomes
+                // observable. Taken before recording the transition so the snapshot contains
+                // registry events only.
+                lock (order)
+                {
+                    if (!keep)
+                        registryAtTransition = [.. order.Where(s => s.StartsWith("registry:", StringComparison.Ordinal))];
+                    order.Add($"transition:{tc}:{keep}");
+                }
                 if (!keep) completedGate.TrySetResult();
             },
             _ => { },
@@ -4882,15 +4919,21 @@ public sealed class ComposerActorTests
             await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             List<string> snapshot;
-            lock (order) snapshot = [.. order];
-            // started → streaming registry → transition(false) → idle registry
+            List<string>? atTransition;
+            lock (order)
+            {
+                snapshot = [.. order];
+                atTransition = registryAtTransition;
+            }
+
             Assert.Contains("started", snapshot);
             Assert.Contains("registry:streaming", snapshot);
-            var transitionIdx = snapshot.FindIndex(s => s.StartsWith("transition:", StringComparison.Ordinal));
-            var idleIdx = snapshot.FindIndex(s => s == "registry:idle");
-            Assert.True(transitionIdx >= 0, "transition must fire");
-            Assert.True(idleIdx > transitionIdx, "transition must fire BEFORE registry idle");
-            Assert.Equal("transition:0:False", snapshot[transitionIdx]);
+            Assert.Equal("transition:0:False", snapshot[snapshot.FindIndex(s => s.StartsWith("transition:", StringComparison.Ordinal))]);
+
+            // The contract: idle is observable AT/BEFORE the final transition's moment.
+            Assert.NotNull(atTransition);
+            Assert.Contains("registry:idle", atTransition!);
+            Assert.Equal("registry:idle", atTransition![^1]);
         }
         finally
         {
@@ -5011,8 +5054,25 @@ public sealed class ComposerActorTests
         }
     }
 
+    /// <summary>
+    /// FAILED-TELL FALLBACK (dispose while streaming) — truthful attribution.
+    /// <para>
+    /// Despite the "shutdown" framing, <c>OnShutdownAsync</c> does NOT run the terminal
+    /// sequence here. The actual source behavior: <c>DisposeAsync</c> closes the mailbox, the
+    /// loop exits and <c>OnShutdownAsync</c> cancels the streaming CTS and AWAITS the streaming
+    /// task; the stream's terminal <c>Tell</c> is therefore REJECTED (closed mailbox), so the
+    /// streaming task's failed-<c>Tell</c> fallback runs the terminal sequence and sets
+    /// <c>_terminalCleanupDone</c> BEFORE <c>OnShutdownAsync</c> checks that latch — which then
+    /// skips. The single transition observed below is the FALLBACK's.
+    /// </para>
+    /// <para>
+    /// Also asserts the terminal-ordering invariant on this path: the registry's "idle" refresh
+    /// is observable BEFORE the fallback's transition callback. Removal-proof: reverting the
+    /// swap in the failed-Tell fallback block fails the in-callback snapshot assertion.
+    /// </para>
+    /// </summary>
     [Fact]
-    public async Task Shutdown_WhileStreaming_OnShutdownAsyncRunsTransition()
+    public async Task Shutdown_WhileStreaming_FailedTellFallbackRunsTransition_IdleBeforeTransition()
     {
         var stateDir = CreateTempDir();
         var blockingClient = new BlockingStreamingClient();
@@ -5021,6 +5081,7 @@ public sealed class ComposerActorTests
 
         var registryStatuses = new List<string>();
         var transitionCalls = new List<(int, bool)>();
+        List<string>? registryAtTransition = null;
         var startedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var actor = CreateActor(
@@ -5029,7 +5090,12 @@ public sealed class ComposerActorTests
             status => { lock (registryStatuses) registryStatuses.Add(status); },
             _ => { },
             () => startedGate.TrySetResult(),
-            (tc, keep) => { lock (transitionCalls) transitionCalls.Add((tc, keep)); },
+            (tc, keep) =>
+            {
+                // What the registry already knows at the instant completion becomes observable.
+                lock (registryStatuses) registryAtTransition ??= [.. registryStatuses];
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+            },
             _ => { },
             () => { });
 
@@ -5039,22 +5105,168 @@ public sealed class ComposerActorTests
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
             await startedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
-            // Dispose while streaming: the mailbox drains without handling the terminal
-            // message, and OnShutdownAsync runs the final transition.
+            // DETERMINISM: wait until the streaming task has provably ENTERED the client and is
+            // parked on its cancellable gate. Without this the test is racy — _onStreamingStarted
+            // fires BEFORE Task.Run launches the streaming body, so a disposal that wins the race
+            // cancels the loop token and the streaming task never runs at all, which would route
+            // the terminal sequence through OnShutdownAsync instead of the fallback.
+            await blockingClient.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Dispose while streaming: the mailbox closes, OnShutdownAsync cancels the streaming
+            // CTS and AWAITS the streaming task; the stream's terminal Tell is rejected and the
+            // fallback runs the final transition (setting _terminalCleanupDone before
+            // OnShutdownAsync checks it).
             await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            Assert.True(blockingClient.WasCancelled,
+                "The streaming task must have been running and observed cancellation — otherwise the fallback did not run");
 
             lock (transitionCalls)
             {
                 Assert.Single(transitionCalls);
-                Assert.False(transitionCalls[0].Item2, "Shutdown transition must have keepStreaming=false");
+                Assert.False(transitionCalls[0].Item2, "Fallback transition must have keepStreaming=false");
             }
-            lock (registryStatuses) Assert.Contains("idle", registryStatuses);
+
+            List<string>? atTransition;
+            lock (registryStatuses)
+            {
+                Assert.Contains("idle", registryStatuses);
+                atTransition = registryAtTransition;
+            }
+
+            // Ordering: idle was already published when the fallback's transition fired.
+            Assert.NotNull(atTransition);
+            Assert.Contains("idle", atTransition!);
+            Assert.Equal("idle", atTransition![^1]);
+
             Assert.True(GetTerminalCleanupDone(actor));
             Assert.False(GetIsStreaming(actor));
         }
         finally
         {
             blockingClient.Release();
+            await actor.DisposeAsync();
+            await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// <c>OnShutdownAsync</c>'s OWN terminal branch — the vector no other test covers, built
+    /// deterministically with the <c>OnBeforeReadAsync</c> actor seam:
+    /// <list type="number">
+    /// <item>the loop is PARKED before the read that would dequeue the terminal message;</item>
+    /// <item>streaming completes normally, so the terminal <c>Tell</c> is ACCEPTED into the
+    /// mailbox behind the park (proved below: the fallback fired no transition);</item>
+    /// <item><c>DisposeAsync</c> starts and the loop token is cancelled (awaited via a token
+    /// registration — no timing waits);</item>
+    /// <item>the park is released: the cancelled loop dequeues and DISCARDS the terminal
+    /// message without handling it, so <c>_terminalCleanupDone</c> stays UNSET;</item>
+    /// <item><c>OnShutdownAsync</c> observes <c>!_terminalCleanupDone</c> and runs its terminal
+    /// sequence.</item>
+    /// </list>
+    /// <para>
+    /// Removal-proof: reverting the swap in <c>OnShutdownAsync</c>'s terminal branch (idle
+    /// refresh after the transition) leaves the in-callback registry snapshot without "idle"
+    /// and this test fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OnShutdownAsync_TerminalBranch_RegistryIdlePublishedBeforeTransition()
+    {
+        var stateDir = CreateTempDir();
+        var client = new TextStreamingClient("hello");
+        var service = CreateService(stateDir, chatClientFactory: _ => client);
+        await service.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var registryStatuses = new List<string>();
+        var transitionCalls = new List<(int ToolCalls, bool KeepStreaming)>();
+        List<string>? registryAtTransition = null;
+
+        var actor = CreateActor(
+            service,
+            _ => Task.CompletedTask,
+            status => { lock (registryStatuses) registryStatuses.Add(status); },
+            _ => { },
+            () => { },
+            (tc, keep) =>
+            {
+                lock (registryStatuses) registryAtTransition ??= [.. registryStatuses];
+                lock (transitionCalls) transitionCalls.Add((tc, keep));
+            },
+            _ => { },
+            () => { });
+
+        // Park the loop from the SECOND read onward: the first read dequeues the send message
+        // (which starts the stream); everything the stream posts afterwards — including its
+        // terminal message — stays queued behind the park.
+        var reads = 0;
+        var parked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parkGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        actor.OnBeforeReadAsync = async () =>
+        {
+            if (Interlocked.Increment(ref reads) == 1) return;
+            parked.TrySetResult();
+            await parkGate.Task;
+        };
+
+        try
+        {
+            actor.Start();
+
+            var reply = NewReply<bool>();
+            Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", reply)));
+            Assert.True(await reply.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken));
+
+            // The loop is parked before the next dequeue.
+            await parked.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Let the stream finish: once the streaming task completes, its terminal message
+            // has been Tell'd. The mailbox is still open, so the Tell was ACCEPTED — proved by
+            // the fallback NOT having run any transition.
+            var streamingTask = GetStreamingTask(actor);
+            Assert.NotNull(streamingTask);
+            await streamingTask!.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            lock (transitionCalls) Assert.Empty(transitionCalls);
+            Assert.False(GetTerminalCleanupDone(actor), "The parked terminal message must not have been handled");
+
+            // Initiate disposal and wait for the loop token to be cancelled before releasing
+            // the park, so the resumed loop provably takes the discard path.
+            var loopToken = GetLoopToken(actor);
+            var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var registration = loopToken.Register(() => cancelled.TrySetResult());
+
+            var disposeTask = actor.DisposeAsync().AsTask();
+            await cancelled.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            parkGate.TrySetResult();
+            await disposeTask.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // OnShutdownAsync ran the terminal sequence exactly once.
+            lock (transitionCalls)
+            {
+                var final = Assert.Single(transitionCalls);
+                Assert.False(final.KeepStreaming, "Shutdown transition must have keepStreaming=false");
+            }
+            Assert.True(GetTerminalCleanupDone(actor));
+            Assert.False(GetIsStreaming(actor));
+
+            List<string>? atTransition;
+            lock (registryStatuses)
+            {
+                Assert.Contains("idle", registryStatuses);
+                atTransition = registryAtTransition;
+            }
+
+            // THE ORDERING: idle was already published when OnShutdownAsync's transition fired.
+            Assert.NotNull(atTransition);
+            Assert.Contains("idle", atTransition!);
+            Assert.Equal("idle", atTransition![^1]);
+        }
+        finally
+        {
+            parkGate.TrySetResult();
             await actor.DisposeAsync();
             await service.DisposeAsync();
             TryDeleteDir(stateDir);
