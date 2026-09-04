@@ -78,21 +78,31 @@ internal sealed class TaskCompletionService
             return;
         }
 
-        // Guard: the completion belongs to an attempt whose work slot has already been RETIRED.
-        //
-        // HONEST CONCURRENCY LANGUAGE — read this before relying on it: this guard drops
-        // completions that OBSERVE an already-Abandoned slot while the task lookup still resolves
-        // the pipeline (today's interim cleanup retires a slot but leaves the task→goal mapping in
-        // place, so the pipeline still resolves). The read is a SEPARATE locked read — it is NOT
-        // an atomic completion admission. A completion that observes `Pending` and then races the
-        // retire can still drive the pipeline; closing that window belongs to the completion
-        // protocol (the named successor goal), not here.
-        if (pipeline.IsSlotAbandoned(result.TaskId))
+        // THE ADMISSION: one atomic, lock-scoped decision that both classifies the completion and
+        // — for a Pending slot — CLAIMS it. It replaces the earlier separate locked read, so a
+        // retire can no longer interleave between the check and the claim. The guarantee is the
+        // decision's atomicity: a retire landing AFTER the claim still proceeds, and the drive
+        // below is not isolated from it.
+        var admission = pipeline.AdmitCompletion(result.TaskId);
+        switch (admission)
         {
-            _logger.LogWarning(
-                "WorkSlotIntegrity: stale-completion goal={GoalId} task={TaskId} pipeline-phase={PipelinePhase} slot-state=abandoned — the completion is for a retired attempt; dropped",
-                pipeline.GoalId, result.TaskId, pipeline.Phase);
-            return;
+            case AdmissionOutcome.SlotAbandoned:
+                _logger.LogWarning(
+                    "WorkSlotIntegrity: stale-completion goal={GoalId} task={TaskId} pipeline-phase={PipelinePhase} slot-state=abandoned — the completion is for a retired attempt; dropped",
+                    pipeline.GoalId, result.TaskId, pipeline.Phase);
+                return;
+            case AdmissionOutcome.SlotAlreadyAdmitted:
+                _logger.LogWarning(
+                    "WorkSlotIntegrity: duplicate-completion goal={GoalId} task={TaskId} pipeline-phase={PipelinePhase} — the attempt was already admitted; dropped",
+                    pipeline.GoalId, result.TaskId, pipeline.Phase);
+                return;
+            case AdmissionOutcome.Admitted:
+            case AdmissionOutcome.NoSlot:
+                // Admitted: this completion owns the attempt. NoSlot: the pre-registry
+                // pass-through. Both proceed into the drive.
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled AdmissionOutcome: {admission}");
         }
 
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})",
@@ -101,6 +111,11 @@ internal sealed class TaskCompletionService
 
         if (_brain is null)
         {
+            // THE NO-BRAIN PATH — the degenerate single-phase mode. It completes the goal WITHOUT
+            // recording the slot, deliberately: the goal reaches Done and its pipeline is removed,
+            // so the admitted slot's terminal state is irrelevant. The terminal AdvanceTo abandons
+            // PENDING slots only (the A1a in-flight exemption), so this slot simply stays Claimed.
+            // This is an honest, chosen behaviour — do NOT "fix" it by adding a record call here.
             await _lifecycleService.MarkGoalCompletedAsync(pipeline, ct);
             return;
         }
@@ -109,6 +124,13 @@ internal sealed class TaskCompletionService
         try
         {
             await _pipelineDriver.DriveNextPhaseAsync(pipeline, result, ct);
+
+            // THE RECORD, and it belongs HERE — inside the try, immediately after a SUCCESSFUL
+            // drive. It must never move below the catch blocks: a FAILED drive has to leave the
+            // slot Claimed, not Recorded. The terminal AbandonPendingSlots exempts in-flight
+            // (Claimed/Recorded) slots per the A1a design, so a failed drive's slot stays Claimed;
+            // reconciling that terminal residue is the E2 successor's job, not this path's.
+            _ = pipeline.RecordSlot(result.TaskId);
         }
         catch (OperationCanceledException)
         {

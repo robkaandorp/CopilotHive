@@ -48,6 +48,12 @@ public sealed class WorkSlotRegistryTests
     public const int RecRecorded = (int)SlotRecordOutcome.Recorded;
     public const int RecNoOp = (int)SlotRecordOutcome.NoOp;
 
+    // AdmissionOutcome is internal too — the admission matrix carries integer codes.
+    public const int AdmAdmitted = (int)AdmissionOutcome.Admitted;
+    public const int AdmNoSlot = (int)AdmissionOutcome.NoSlot;
+    public const int AdmSlotAbandoned = (int)AdmissionOutcome.SlotAbandoned;
+    public const int AdmAlreadyAdmitted = (int)AdmissionOutcome.SlotAlreadyAdmitted;
+
     private static WorkSlotState St(int code) => (WorkSlotState)code;
 
     private static GoalPipeline NewPipeline() =>
@@ -1474,6 +1480,7 @@ public sealed class WorkSlotRegistryTests
         "AllocateAttemptAndRegisterSlotWithId",
         "FindLiveSlotTaskIdAt",
         "ResolveAndCheckSlot",
+        "AdmitCompletion",
         "RecordSlot",
         "AbandonSlot",
         "RetireSlotAndClearIfCurrent",
@@ -3787,6 +3794,589 @@ public sealed class WorkSlotRegistryTests
         Assert.Equal(
             new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
             Assert.Single(pipeline.GetSlotsForTest()));
+    }
+
+    #endregion
+
+    #region (u) AdmitCompletion — the atomic admission primitive
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  THE ADMISSION PRIMITIVE.
+    //
+    //  AdmitCompletion is ONE lock-scoped operation that both CLASSIFIES a completion and
+    //  — for a Pending slot — CLAIMS it. The decision and the claim are a single
+    //  linearized event, so a concurrent retire can no longer land between the state
+    //  check and the claim.
+    //
+    //  Three things are pinned here:
+    //    (1) the six-case input matrix (blank, absent, Abandoned, Pending, Claimed,
+    //        Recorded);
+    //    (2) the NESTED-LOCK AVOIDANCE contract — the Pending → Claimed transition is
+    //        written out directly and never delegates to ResolveAndCheckSlot (or any
+    //        other locked registry entry point), asserted against the compiled artifact;
+    //    (3) the retire-vs-admit linearization: the two operations serialize, and an
+    //        admitted claim is never overwritten by — nor overwrites — a retire.
+    //
+    //  The lock STRUCTURE itself is covered by region (i): "AdmitCompletion" is a member
+    //  of LockedRegistryMethodNames, so RegistryEntryPoint_RunsWhollyUnderTheLock and
+    //  RegistryEntryPoint_EmitsTheRoslynLockEnterOverload both run against it, and
+    //  LockStructureBackstop_CoversEveryRegistryEntryPoint pins the list against drift.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE SIX-CASE INPUT MATRIX (five here plus the blank-id theory below).
+    /// <list type="bullet">
+    ///   <item><description>absent slot → <c>NoSlot</c>, the pre-registry pass-through;</description></item>
+    ///   <item><description><c>Abandoned</c> → <c>SlotAbandoned</c>;</description></item>
+    ///   <item><description><c>Pending</c> → <c>Admitted</c> AND the slot is now <c>Claimed</c>;</description></item>
+    ///   <item><description><c>Claimed</c> / <c>Recorded</c> → <c>SlotAlreadyAdmitted</c>, unmoved.</description></item>
+    /// </list>
+    /// </summary>
+    [Theory]
+    [InlineData(StPending, AdmAdmitted, StClaimed)]
+    [InlineData(StClaimed, AdmAlreadyAdmitted, StClaimed)]
+    [InlineData(StRecorded, AdmAlreadyAdmitted, StRecorded)]
+    [InlineData(StAbandoned, AdmSlotAbandoned, StAbandoned)]
+    [InlineData(StNone, AdmNoSlot, StNone)]
+    public void AdmitCompletion_Matrix(int startCode, int expectedOutcomeCode, int expectedStateCode)
+    {
+        var pos = Position();
+        var pipeline = SeedMatrixRow(startCode, pos);
+
+        var outcome = pipeline.AdmitCompletion("t1");
+
+        Assert.Equal((AdmissionOutcome)expectedOutcomeCode, outcome);
+        AssertMatrixOutcome(pipeline, startCode, expectedStateCode, pos);
+    }
+
+    /// <summary>
+    /// A blank/null id names no attempt: <c>NoSlot</c> with NO mutation anywhere in the registry.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AdmitCompletion_NullOrBlankTaskId_IsNoSlotWithoutMutation(string? taskId)
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+        var before = Snapshot(pipeline);
+
+        Assert.Equal(AdmissionOutcome.NoSlot, pipeline.AdmitCompletion(taskId));
+
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// The admission never touches slots other than the addressed one, and an unknown id is a
+    /// pure read.
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_UnknownTaskId_DoesNotTouchOtherSlots()
+    {
+        var pipeline = NewPipeline();
+        Assert.True(pipeline.SeedSlotForTest("other", Position(), 5, WorkSlotState.Pending));
+        var before = Snapshot(pipeline);
+
+        Assert.Equal(AdmissionOutcome.NoSlot, pipeline.AdmitCompletion("missing"));
+
+        Assert.Equal(before, Snapshot(pipeline));
+    }
+
+    /// <summary>
+    /// The admission is a ONE-SHOT claim: the first call on a Pending slot is admitted, and every
+    /// subsequent call for the same attempt is a duplicate. This is the registry-level shape of
+    /// the completion path's duplicate drop.
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_SecondCall_IsAlreadyAdmitted()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+
+        Assert.Equal(AdmissionOutcome.Admitted, pipeline.AdmitCompletion("t1"));
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, pipeline.AdmitCompletion("t1"));
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, pipeline.AdmitCompletion("t1"));
+
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest()));
+    }
+
+    /// <summary>
+    /// <see cref="GoalPipeline.ResolveAndCheckSlot"/> keeps its EXACT prior contract — the new
+    /// primitive is an addition, never a redefinition. In particular it still answers
+    /// <c>Proceed</c> for a Claimed slot, which is precisely where the admission's
+    /// <c>SlotAlreadyAdmitted</c> diverges from it.
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_DoesNotAlterResolveAndCheckSlotSemantics()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Claimed));
+
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("t1"));
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, pipeline.AdmitCompletion("t1"));
+
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest()));
+    }
+
+    /// <summary>
+    /// THE NESTED-LOCK AVOIDANCE CONTRACT, asserted against the COMPILED ARTIFACT (deterministic —
+    /// no timing anywhere): <c>AdmitCompletion</c> must implement the Pending → Claimed transition
+    /// DIRECTLY and must not call any other locked registry entry point — above all
+    /// <c>ResolveAndCheckSlot</c> — which would re-enter the very monitor it already holds.
+    /// <para>
+    /// Deterministic kill: rewriting the body as
+    /// <c>lock (_lock) { … ResolveAndCheckSlot(taskId) … }</c> puts that call in the emitted IL and
+    /// fails here on 100% of runs.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_DoesNotNestAnyOtherLockedRegistryEntryPoint()
+    {
+        var lockedNames = LockedRegistryMethodNames.ToHashSet(StringComparer.Ordinal);
+
+        var nested = DecodeCallSites(RegistryMethod("AdmitCompletion"))
+            .Where(c => c.Target.DeclaringType == typeof(GoalPipeline) && lockedNames.Contains(c.Target.Name))
+            .Select(c => c.Target.Name)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.True(
+            nested.Count == 0,
+            $"'AdmitCompletion' calls locked registry entry point(s) [{string.Join(", ", nested)}] — the " +
+            "admission must perform its own direct Pending → Claimed transition rather than nesting a " +
+            "second acquisition of the pipeline monitor.");
+    }
+
+    /// <summary>
+    /// The BEHAVIOURAL lock companion for the admission, following the suite's established
+    /// <c>WhileLockHeld</c> pattern (region (i)'s IL backstop remains the deterministic authority
+    /// for the lock STRUCTURE). Two facts only: the call cannot complete while the pipeline lock is
+    /// held, and once released the worker observes the COMPLETE after-state — the <c>Admitted</c>
+    /// verdict AND the committed claim together, never one without the other.
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_WhileLockHeld_IsBlocked_ThenCommitsDecisionAndClaim()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+
+        var monitor = GetPipelineLock(pipeline);
+
+        using var callAttempted = new ManualResetEventSlim(false);
+        using var callCompleted = new ManualResetEventSlim(false);
+        AdmissionOutcome? workerResult = null;
+        bool attemptObserved;
+        bool completedWhileHeld;
+
+        var worker = new Thread(() =>
+        {
+            callAttempted.Set();                              // signalled IMMEDIATELY BEFORE the call…
+            var admitted = pipeline.AdmitCompletion("t1");    // …which parks on the pipeline lock
+            // AdmissionOutcome is a value type; the Join below establishes the happens-before.
+            workerResult = admitted;
+            callCompleted.Set();
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-blocked-admitter",
+        };
+
+        Monitor.Enter(monitor);
+        try
+        {
+            worker.Start();
+#pragma warning disable xUnit1051 // Timeout-only waits are intentional: the fixed bound IS the proof
+            attemptObserved = callAttempted.Wait(WaitTimeout);
+            completedWhileHeld = callCompleted.Wait(BlockedGrace);
+#pragma warning restore xUnit1051
+        }
+        finally
+        {
+            Monitor.Exit(monitor);
+        }
+
+        Assert.True(worker.Join(WaitTimeout), "The blocked admission never completed after the lock was released.");
+
+        Assert.True(attemptObserved, "The worker thread never signalled its call attempt.");
+        Assert.False(
+            completedWhileHeld,
+            "AdmitCompletion completed while the pipeline lock was held — it is not running under the lock.");
+
+        Assert.Equal(AdmissionOutcome.Admitted, workerResult);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            Assert.Single(pipeline.GetSlotsForTest()));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  THE RETIRE-vs-ADMIT ORDERING PROOFS — DETERMINISTIC, NOT RACED.
+    //
+    //  An earlier form of this proof parked both operations on the monitor and then
+    //  accepted EITHER serialization. That was not a proof: `Monitor` is not FIFO, so
+    //  neither the parked variant nor a barrier race can pin WHICH operation acquires
+    //  first, and a proof that accepts both outcomes can pass without ever observing the
+    //  edge it claims to establish. Requiring both outcomes across many rounds is worse
+    //  still — it makes a CORRECT implementation fail whenever the scheduler happens to
+    //  favour one side.
+    //
+    //  Both vectors below therefore force the order instead of observing it, and each has
+    //  a SINGLE admissible outcome:
+    //
+    //    • RETIRE-FIRST — the retire is executed BY THE TEST THREAD from inside the held
+    //      `_lock` region, while the admission is provably parked on that same monitor.
+    //      The lock — not a timing window — is what makes the retire first, so the
+    //      admission MUST report `SlotAbandoned` and MUST NOT claim.
+    //
+    //    • ADMIT-FIRST — the admission is run to completion and its committed claim is
+    //      OBSERVED (Admitted, slot Claimed) before the retiring thread is even started.
+    //      Thread.Start after an observed return is a happens-before edge, so the retire
+    //      demonstrably begins after the claim committed, and must proceed per the honest
+    //      edge contract in AdmitCompletion's XML doc.
+    //
+    //  ORDERING EVIDENCE comes only from synchronization points: every event below is
+    //  appended either from inside the contested `_lock` region or after a return that the
+    //  asserting thread has already observed. Nothing is inferred from which thread won a
+    //  race, and no assertion depends on a delay elapsing.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Deadline for the blocked-state gate below. It bounds a WAIT, never a proof: the gate
+    /// succeeds the instant the thread is observed blocked, and exceeding this deadline is a
+    /// hard FAILURE (never a silent pass), so no assertion depends on time elapsing.
+    /// </summary>
+    private static readonly TimeSpan BlockedObservationDeadline = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Blocks until <paramref name="thread"/> is observably parked on a monitor
+    /// (<see cref="ThreadState.WaitSleepJoin"/>), or the deadline expires.
+    /// <para>
+    /// THIS IS THE DISCRIMINATOR the retire-first proof needs, and it requires no production
+    /// seam: a thread's blocked state is a runtime fact, observable from outside. Its power is
+    /// entirely in WHERE the block sits relative to the implementation's read —
+    /// <list type="bullet">
+    ///   <item><description>correct implementation: the read is inside the lock span, so the
+    ///     thread parks BEFORE reading anything;</description></item>
+    ///   <item><description>check-then-claim mutant: the read is outside the lock, so the thread
+    ///     can only park at the later claim-write, i.e. AFTER it has already read.</description></item>
+    /// </list>
+    /// Observing the park therefore establishes "the mutant has read" and "the correct
+    /// implementation has not read" simultaneously — which is exactly what makes a retire issued
+    /// afterwards kill the mutant on every legal schedule.
+    /// </para>
+    /// <para>
+    /// The wait spins with <see cref="Thread.Yield"/> rather than sleeping, so it neither
+    /// depends on nor consumes a fixed delay; the deadline exists only so a regression fails
+    /// loudly instead of hanging.
+    /// </para>
+    /// </summary>
+    /// <param name="thread">The worker thread expected to park on the monitor.</param>
+    /// <param name="diagnosis">The terminal state observed, for the failure message.</param>
+    /// <returns><c>true</c> once the thread is observed blocked; <c>false</c> on deadline.</returns>
+    private static bool TryWaitUntilBlockedOnMonitor(Thread thread, out string diagnosis)
+    {
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (deadline.Elapsed < BlockedObservationDeadline)
+        {
+            var state = thread.ThreadState;
+
+            // The target state: parked on the monitor (or any wait), which is where an
+            // unacquirable lock puts a runnable thread.
+            if ((state & ThreadState.WaitSleepJoin) == ThreadState.WaitSleepJoin)
+            {
+                diagnosis = $"Observed state: {state}.";
+                return true;
+            }
+
+            // A thread that RAN TO COMPLETION never parked. Under the correct implementation
+            // that is impossible while this thread holds the monitor; under an unlocked
+            // implementation it is exactly what happens — and the caller's assertions then fail
+            // on the missing park, which is the intended kill.
+            if ((state & ThreadState.Stopped) == ThreadState.Stopped)
+            {
+                diagnosis =
+                    $"The thread ran to COMPLETION without ever parking (state: {state}) — it did not " +
+                    "contend for the pipeline monitor at all, so the operation is not running under the lock.";
+                return false;
+            }
+
+            Thread.Yield();
+        }
+
+        diagnosis = $"Timed out after {BlockedObservationDeadline.TotalSeconds:F0}s. Last state: {thread.ThreadState}.";
+        return false;
+    }
+
+    /// <summary>
+    /// Executes every registry path the retire-first proof will exercise, on a THROWAWAY
+    /// pipeline, so class-loading and JIT compilation are complete before the timed vector runs.
+    /// <para>
+    /// This is a correctness precaution, not a performance one: a first-call JIT could park the
+    /// worker thread in <see cref="ThreadState.WaitSleepJoin"/> for reasons unrelated to the
+    /// monitor and BEFORE it reaches its read, which would let the blocked-state gate fire early
+    /// and hand the check-then-claim mutant a survival window. Pre-warming removes that window.
+    /// </para>
+    /// </summary>
+    private static void WarmRegistryPaths()
+    {
+        var warm = NewPipeline();
+        Assert.True(warm.SeedSlotForTest("warm", Position(), 1, WorkSlotState.Pending));
+        warm.SetActiveTask("warm");
+        Assert.Equal(AdmissionOutcome.Admitted, warm.AdmitCompletion("warm"));
+        Assert.Equal(SlotRetirementOutcome.Retired, warm.RetireSlotAndClearIfCurrent("warm"));
+        Assert.Single(warm.GetSlotsForTest());
+    }
+
+    /// <summary>
+    /// A monotonic, lock-protected event log. Entries are appended ONLY at synchronization
+    /// points — from inside the pipeline's held `_lock` region, or after a return value the
+    /// appending thread has already observed — so the recorded sequence is a happens-before
+    /// order rather than a sampling of a race.
+    /// </summary>
+    private sealed class EventLog
+    {
+        private readonly object _gate = new();
+        private readonly List<string> _events = [];
+
+        public void Add(string entry)
+        {
+            lock (_gate)
+                _events.Add(entry);
+        }
+
+        public IReadOnlyList<string> Snapshot()
+        {
+            lock (_gate)
+                return [.. _events];
+        }
+    }
+
+    /// <summary>
+    /// THE RETIRE-FIRST ORDERING PROOF, and the vector that kills the check-then-claim race
+    /// form outright.
+    /// <para>
+    /// The test thread takes the pipeline's own monitor and starts an
+    /// <see cref="GoalPipeline.AdmitCompletion"/> that parks on it. While STILL HOLDING the
+    /// lock, the test thread performs the retire itself: the mutual exclusion — not a timing
+    /// window — is what places the retire strictly before the admission's entire lock span,
+    /// so the ordering is forced rather than raced.
+    /// </para>
+    /// <para>
+    /// Exactly ONE outcome is admissible. The admission runs on an already-Abandoned slot, so
+    /// it must return <see cref="AdmissionOutcome.SlotAbandoned"/> and must claim NOTHING; the
+    /// event log must read retire-then-admission. There is no "either order is fine" clause
+    /// here, and no assertion depends on any delay elapsing: under a correct implementation
+    /// the parked admission physically cannot proceed while the monitor is held, however long
+    /// or briefly that is.
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF against the check-then-claim form specifically — and the reason the gate
+    /// below is a THREAD-STATE observation rather than a signal fired by the worker.
+    /// </para>
+    /// <para>
+    /// The two worlds this vector must separate both end with the worker parked on the pipeline
+    /// monitor, so "the worker is parked" alone decides nothing. What differs is WHEN the
+    /// worker's decisive READ happened relative to that park:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>CORRECT implementation — the whole operation is one lock span, so the
+    ///     thread blocks at <c>Monitor.Enter</c> on ENTRY and its read has NOT yet happened;</description></item>
+    ///   <item><description>CHECK-THEN-CLAIM MUTANT — the <c>TryGetValue</c> and the Pending
+    ///     decision run OUTSIDE the lock and only the claim-write is inside, so by the time the
+    ///     thread blocks its read has ALREADY completed and it is holding a stale
+    ///     <c>Pending</c> verdict.</description></item>
+    /// </list>
+    /// <para>
+    /// A signal fired by the worker cannot express this. Any signal it can raise sits at method
+    /// ENTRY — before the mutant's read — which leaves a legal mutant schedule alive: signal,
+    /// stall before invoking, let the test's bounded wait expire, let the retire commit, then run
+    /// and read <c>Abandoned</c>, returning <c>SlotAbandoned</c> and PASSING. Placing a signal
+    /// after the read would require a production seam inside <c>AdmitCompletion</c>, which is not
+    /// permitted. So the gate uses the one fact that needs no seam at all: the worker thread's
+    /// own BLOCKED-ON-MONITOR state, which happens-AFTER the mutant's read and happens-BEFORE the
+    /// correct implementation's read. Retiring only once that state is observed therefore kills
+    /// the mutant on EVERY legal schedule, not merely on a favourable one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_RetireCommittedUnderTheLock_AdmissionObservesAbandonedAndNeverClaims()
+    {
+        // JIT PRE-WARM on a throwaway pipeline. Without it the worker's first-ever call could
+        // enter WaitSleepJoin for class-loading/JIT reasons BEFORE reaching the mutant's read,
+        // which would let the gate below fire too early and hand the mutant a survival window.
+        // Warming every method the worker and this thread will execute removes that window.
+        WarmRegistryPaths();
+
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+        pipeline.SetActiveTask("t1");
+
+        var monitor = GetPipelineLock(pipeline);
+        var log = new EventLog();
+
+        AdmissionOutcome? admission = null;
+        SlotRetirementOutcome retirement;
+
+        // NOTE the absence of any pre-call signal: the worker's body is ONLY the call and the
+        // post-return recording. Nothing it does can be mistaken for evidence about its read.
+        var admitter = new Thread(() =>
+        {
+            var outcome = pipeline.AdmitCompletion("t1");
+            // Appended only AFTER the call returned, so this thread has already observed it.
+            admission = outcome;
+            log.Add($"admit-returned:{outcome}");
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-parked-admitter",
+        };
+
+        Monitor.Enter(monitor);
+        try
+        {
+            // Started from INSIDE the held region, so the monitor is provably already held before
+            // the worker can reach it — there is no start-order race to lose.
+            admitter.Start();
+
+            // ── THE GATE: wait until the worker is OBSERVABLY BLOCKED on the monitor ──────
+            // Bounded by a deadline; no fixed sleep, no Task.Delay, no grace tolerance. In the
+            // mutant this state is reached only AFTER its unserialized read; in the correct
+            // implementation it is reached BEFORE any read. Everything below therefore
+            // happens-after the mutant's read and happens-before the real read.
+            Assert.True(
+                TryWaitUntilBlockedOnMonitor(admitter, out var gateDiagnosis),
+                $"The admitting thread never became observably blocked on the pipeline monitor. {gateDiagnosis}");
+            log.Add("admitter-blocked-on-monitor");
+
+            // THE FORCED ORDER: the retire is executed by THIS thread, which owns the monitor.
+            // `RetireSlotAndClearIfCurrent` re-enters the same re-entrant lock, so it commits
+            // here — while the worker is still parked and cannot interleave.
+            retirement = pipeline.RetireSlotAndClearIfCurrent("t1");
+            log.Add($"retire-returned:{retirement}");
+
+            // Recorded from inside the still-held region: the retire is fully committed and
+            // visible before the admission is permitted to proceed at all.
+            var underLock = Assert.Single(pipeline.GetSlotsForTest());
+            log.Add($"state-under-lock:{underLock.State}");
+        }
+        finally
+        {
+            Monitor.Exit(monitor);
+        }
+
+        Assert.True(admitter.Join(WaitTimeout), "The parked admission never completed after the lock was released.");
+
+        // ── THE ORDER ITSELF, from the synchronization points ─────────────────────────
+        // Asserted FIRST, because it is the claim this vector exists to make: the worker was
+        // parked, the retire then committed, and only afterwards did the admission return.
+        Assert.Equal(
+            [
+                "admitter-blocked-on-monitor",
+                $"retire-returned:{SlotRetirementOutcome.Retired}",
+                $"state-under-lock:{WorkSlotState.Abandoned}",
+                $"admit-returned:{AdmissionOutcome.SlotAbandoned}",
+            ],
+            log.Snapshot());
+
+        // ── THE SINGLE ADMISSIBLE OUTCOME ─────────────────────────────────────────────
+        Assert.Equal(SlotRetirementOutcome.Retired, retirement);
+        Assert.Equal(AdmissionOutcome.SlotAbandoned, admission);
+
+        // The admission claimed NOTHING: the retired attempt was not resurrected. Under the
+        // mutant the stale Pending verdict writes Claimed here instead.
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// THE ADMIT-FIRST ORDERING PROOF — the honest edge contract stated in
+    /// <see cref="GoalPipeline.AdmitCompletion"/>'s documentation: a retire landing AFTER the
+    /// admission's claim PROCEEDS. The guarantee is the atomicity of the admission decision,
+    /// not isolation of whatever the admitted completion goes on to do.
+    /// <para>
+    /// The order is established by program order and a happens-before edge, not by a race: the
+    /// admission is run to completion and its committed claim is OBSERVED (the
+    /// <c>Admitted</c> return AND the <c>Claimed</c> slot, read back under the registry's own
+    /// lock) BEFORE the retiring thread is created and started. <c>Thread.Start</c> happens
+    /// after everything the starting thread has already done, so the retire demonstrably
+    /// begins only after the claim committed.
+    /// </para>
+    /// <para>
+    /// Again exactly one outcome is admissible: the retire reports
+    /// <see cref="SlotRetirementOutcome.Retired"/>, the Claimed slot becomes Abandoned, and the
+    /// if-current pointer clears. Nothing here is scheduler-dependent.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void AdmitCompletion_ClaimCommittedFirst_TheLaterRetireProceedsPerTheEdgeContract()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+        pipeline.SetActiveTask("t1");
+
+        var log = new EventLog();
+
+        // ── (1) THE CLAIM COMMITS, AND IS OBSERVED ────────────────────────────────────
+        var admission = pipeline.AdmitCompletion("t1");
+        log.Add($"admit-returned:{admission}");
+        Assert.Equal(AdmissionOutcome.Admitted, admission);
+
+        var afterClaim = Assert.Single(pipeline.GetSlotsForTest());
+        log.Add($"claim-observed:{afterClaim.State}");
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Claimed),
+            afterClaim);
+
+        // ── (2) ONLY NOW does the retire come into existence ──────────────────────────
+        // Creating and starting the thread here — after the observations above — is the
+        // happens-before edge that orders the claim before the retire's attempt.
+        SlotRetirementOutcome retirement = default;
+        var retirer = new Thread(() =>
+        {
+            log.Add("retire-attempted");
+            var outcome = pipeline.RetireSlotAndClearIfCurrent("t1");
+            retirement = outcome;
+            log.Add($"retire-returned:{outcome}");
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-post-claim-retirer",
+        };
+
+        log.Add("retire-thread-started");
+        retirer.Start();
+        Assert.True(retirer.Join(WaitTimeout), "The post-claim retire never completed.");
+
+        // ── (3) THE EDGE CONTRACT: the later retire PROCEEDS ──────────────────────────
+        Assert.Equal(SlotRetirementOutcome.Retired, retirement);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Abandoned),
+            Assert.Single(pipeline.GetSlotsForTest()));
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // ── THE ORDER ITSELF, from program order and the Join ─────────────────────────
+        Assert.Equal(
+            [
+                $"admit-returned:{AdmissionOutcome.Admitted}",
+                $"claim-observed:{WorkSlotState.Claimed}",
+                "retire-thread-started",
+                "retire-attempted",
+                $"retire-returned:{SlotRetirementOutcome.Retired}",
+            ],
+            log.Snapshot());
     }
 
     #endregion
