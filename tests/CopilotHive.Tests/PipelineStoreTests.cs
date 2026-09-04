@@ -1,9 +1,19 @@
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
+
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CopilotHive.Tests;
@@ -876,3 +886,488 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
     }
 }
 
+
+/// <summary>
+/// Slice E2a-i — <see cref="PipelineStore.SaveAdmissionWithPointer"/> on the DIRECT-CONTEXT
+/// paths: the two validation refusals (no write on either), the pre-existing row's reload
+/// after a CONFIRMED rollback, the new row's Added-state detach and the deferred-orphan
+/// proof, the SUCCESS-PATH dispose failure (the durable commit still returns
+/// <see cref="AdmissionStoreResult.Committed"/>), and the factory-context guard.
+/// </summary>
+public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
+{
+    private const string SharedConnectionString =
+        "Data Source=file:memdb-admissiondirect?mode=memory&cache=shared";
+
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+    private readonly List<IDisposable> _disposables = [];
+
+    public PipelineStoreAdmissionDirectContextTests()
+    {
+        _keeper = new SqliteConnection(SharedConnectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+        // The shared named database survives across class instances (the keeper is
+        // per-instance); each test starts from a clean slate so the "no write" proofs and
+        // count assertions observe only their own call's effects.
+        ExecuteOnKeeper("DELETE FROM task_mappings");
+        ExecuteOnKeeper("DELETE FROM pipelines");
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        foreach (var disposable in _disposables)
+            disposable.Dispose();
+        _keeper.Dispose();
+    }
+
+    // ───────────────────────────── fixture helpers ─────────────────────────────
+
+    /// <summary>Creates a direct (caller-owned) context on its OWN connection to the shared database.</summary>
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(SharedConnectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private PipelineStore CreateStore(IInterceptor? interceptor = null, ILogger<PipelineStore>? logger = null) =>
+        new(CreateContext(interceptor), logger ?? NullLogger<PipelineStore>.Instance);
+
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
+    }
+
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    private static GoalPipeline CreatePipeline(string goalId = "goal-1", string taskId = "task-1")
+    {
+        var pipeline = new GoalPipeline(CreateGoal(goalId));
+        pipeline.SetActiveTask(taskId);
+        return pipeline;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (1) The validation refusals — no write on either
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>THE BLANK REFUSAL: <c>ArgumentException</c> with <c>ParamName == "taskId"</c>, no DB write.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void SaveAdmission_BlankTaskId_ThrowsWithParamName_AndDoesNotWrite(string blank)
+    {
+        var pipeline = CreatePipeline("goal-blank", "task-blank");
+        var store = CreateStore();
+
+        var ex = Assert.Throws<ArgumentException>(() => store.SaveAdmissionWithPointer(pipeline, blank));
+        Assert.Equal("taskId", ex.ParamName);
+
+        // NO WRITE: the mapping and the pipeline rows are both absent.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-blank'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
+
+    /// <summary>
+    /// THE MISMATCH REFUSAL: <c>pipeline.ActiveTaskId != taskId</c> → <c>ArgumentException</c>
+    /// with <c>ParamName == "taskId"</c> AND BOTH values in the message; no DB write.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_ActiveTaskIdMismatch_ThrowsWithBothValues_AndDoesNotWrite()
+    {
+        var pipeline = CreatePipeline("goal-mismatch", "task-live");
+        var store = CreateStore();
+
+        var ex = Assert.Throws<ArgumentException>(() => store.SaveAdmissionWithPointer(pipeline, "task-other"));
+        Assert.Equal("taskId", ex.ParamName);
+        // BOTH values are present in the message: the pipeline's pointer AND the passed id.
+        Assert.Contains("task-live", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("task-other", ex.Message, StringComparison.Ordinal);
+
+        // NO WRITE on the refusal.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-live'"));
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-other'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2) The pre-existing row's reload after the CONFIRMED rollback
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE PRE-EXISTING ROW'S RELOAD, OBSERVED AT THE CLEANUP BOUNDARY: a failure (an exception
+    /// at the pipeline flush) + the CONFIRMED rollback → the pipeline entity is RELOADED, not
+    /// merely detached. The proof is taken IMMEDIATELY after <c>SaveAdmissionWithPointer</c>
+    /// returns and BEFORE any separate load: the direct context's change tracker holds the
+    /// reloaded <see cref="PipelineEntity"/> in the <see cref="EntityState.Unchanged"/> state
+    /// carrying the PREVIOUSLY PERSISTED values, and the cleanup-time SELECT is counted.
+    /// A detach-only implementation leaves NO tracked entry and issues NO second SELECT.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_FailureWithConfirmedRollback_ReloadShowsPreviousPointer()
+    {
+        // Seed the pipeline row directly with a PREVIOUS pointer.
+        ExecuteOnKeeper(
+            """
+            INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, active_task_id, created_at)
+            VALUES ('goal-reload', 'Previous', '{"id":"goal-reload","description":"reload goal","repositories":["test-repo"]}', 'Planning', '{}', 'task-previous', '2025-06-15T10:00:00.0000000Z')
+            """);
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        var pipeline = CreatePipeline("goal-reload", "task-new");
+        pipeline.AdvanceTo(GoalPhase.Coding); // a DIFFERENT value the failed save must not leave behind
+
+        var ex = Assert.ThrowsAny<Exception>(() => store.SaveAdmissionWithPointer(pipeline, "task-new"));
+
+        // THE ORIGINAL exception propagated BY IDENTITY (the cleanup never replaced it).
+        var update = Assert.IsType<DbUpdateException>(ex);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+
+        // ── THE CLEANUP-BOUNDARY RELOAD PROOF — taken BEFORE any separate load ──
+        // A genuine reload leaves the pipeline entity TRACKED in the Unchanged state carrying
+        // the PERSISTED (pre-admission) values. A detach-only cleanup leaves NO tracked entry,
+        // and the later LoadPipeline's own Find would then be the first read — which is exactly
+        // the hole this assertion closes.
+        var trackedEntry = Assert.Single(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+        Assert.Equal(EntityState.Unchanged, trackedEntry.State);
+        Assert.Equal("goal-reload", trackedEntry.Entity.GoalId);
+        Assert.Equal("task-previous", trackedEntry.Entity.ActiveTaskId);
+        Assert.Equal("Planning", trackedEntry.Entity.Phase);
+        Assert.Equal("Previous", trackedEntry.Entity.Description);
+
+        // …and the reload really queried the database DURING the call: the UpsertPipelineCore
+        // lookup is the first SELECT, the cleanup reload the second.
+        Assert.Equal(2, interceptor.PipelinesSelectCount);
+
+        // THE END STATE (preserved from the original vector): a Find on the SAME (direct)
+        // context surfaces the PREVIOUS row intact — the stale in-flight copy was discarded
+        // through the tracker, not left ghosting.
+        var row = store.LoadPipeline("goal-reload");
+        Assert.NotNull(row);
+        Assert.Equal("task-previous", row!.ActiveTaskId);
+        Assert.Equal(GoalPhase.Planning, row.Phase);
+
+        // And the mapping insert was rolled back — the pointer's task never persisted.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-new'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (3) The new row: the Added-state detach + the deferred-orphan proof
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE NEW ROW: the pipeline entity is in the Added state when the pipeline flush fails →
+    /// after the CONFIRMED rollback the entity is DETACHED (Find re-reads fresh: no row), and
+    /// the DEFERRED-ORPHAN proof holds — the mapping Add was rolled back, so no orphan row
+    /// persists.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_NewRowPipelineFlushFails_AddedStateDetached_NoOrphanRow()
+    {
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        var store = CreateStore(interceptor);
+        var pipeline = CreatePipeline("goal-newrow", "task-newrow");
+
+        Assert.ThrowsAny<Exception>(() => store.SaveAdmissionWithPointer(pipeline, "task-newrow"));
+
+        // THE DETACH: the direct context re-reads FRESH (the Added copy was detached).
+        var row = store.LoadPipeline("goal-newrow");
+        Assert.Null(row);
+        // THE DEFERRED-ORPHAN PROOF: the mapping Add was rolled back.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-newrow'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (4) The success-path dispose failure — Committed STILL RETURNED
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE SUCCESS-PATH DISPOSE FAILURE: the commit SUCCEEDED, the transaction dispose is
+    /// forced to fail → the <c>admission-dispose</c> warning is logged, the swallow happens,
+    /// and <see cref="AdmissionStoreResult.Committed"/> IS STILL RETURNED — the durable
+    /// commit is the outcome.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_SuccessPath_TransactionDisposeFails_CommittedStillReturned()
+    {
+        var logger = new TestLogger<PipelineStore>();
+        var connection = new ThrowingDisposeTransactionConnection(SharedConnectionString);
+        _connections.Add(connection);
+        connection.Open();
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        var store = new PipelineStore(context, logger);
+        var pipeline = CreatePipeline("goal-dispose", "task-dispose");
+
+        var result = store.SaveAdmissionWithPointer(pipeline, "task-dispose");
+
+        // THE DURABLE COMMIT IS THE OUTCOME.
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        Assert.Equal("goal-dispose", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-dispose'"));
+        Assert.Equal(1L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-dispose'"));
+
+        // THE DISPOSE WARNING was logged with the identifiers.
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("admission-dispose", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-dispose", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task-dispose", warning.Message, StringComparison.Ordinal);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) The factory-context guard — ownsContext == true
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE FACTORY-CONTEXT GUARD, THROWING SEAM: the <c>ownsContext == true</c> path; the
+    /// <see cref="PipelineStore.ContextDisposerForTest"/> seam throws → the
+    /// <c>admission-context-dispose</c> warning is logged, the swallow happens, and the
+    /// outcome (Committed) is preserved.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_FactoryContextDisposeFails_WarnsAndPreservesOutcome()
+    {
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(new PlainFactory(SharedConnectionString), logger);
+        store.ContextDisposerForTest = _ => throw new InvalidOperationException("forced context dispose failure");
+        var pipeline = CreatePipeline("goal-factory", "task-factory");
+
+        var result = store.SaveAdmissionWithPointer(pipeline, "task-factory");
+
+        // THE OUTCOME is preserved.
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        Assert.Equal("goal-factory", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-factory'"));
+
+        // THE CONTEXT-DISPOSE WARNING was logged with the identifiers.
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("admission-context-dispose", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-factory", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task-factory", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE FACTORY-CONTEXT GUARD, FAILURE PATH: the same throwing seam on a goal whose
+    /// admission FAILS (a pipeline-flush exception) → the ORIGINAL exception still propagates
+    /// BY IDENTITY (never masked or wrapped by the dispose failure), the warning is logged,
+    /// and the swallow holds.
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_FactoryContextDisposeFails_OnFailurePath_OriginalExceptionPreserved()
+    {
+        var logger = new TestLogger<PipelineStore>();
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        var store = new PipelineStore(new PlainFactory(SharedConnectionString, interceptor), logger);
+        // A DISTINCT sentinel for the dispose failure, so a replacement is detectable.
+        var disposeSentinel = new InvalidOperationException("forced context dispose failure SENTINEL");
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ =>
+        {
+            disposerCalls++;
+            throw disposeSentinel;
+        };
+        var pipeline = CreatePipeline("goal-factoryfail", "task-factoryfail");
+
+        var ex = Record.Exception(() => store.SaveAdmissionWithPointer(pipeline, "task-factoryfail"));
+
+        // THE ORIGINAL exception, BY IDENTITY: the operation's DbUpdateException wrapping the
+        // interceptor's SENTINEL instance — NOT "any exception", NOT the dispose failure.
+        Assert.NotNull(ex);
+        var update = Assert.IsType<DbUpdateException>(ex);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // THE GUARDED DISPOSAL REALLY FIRED (and failed) — this distinguishes "the guard
+        // swallowed its failure" from "the guard never ran".
+        Assert.Equal(1, disposerCalls);
+
+        // …its DISTINCT sentinel appears NOWHERE in the propagated chain…
+        for (var current = (Exception?)ex; current is not null; current = current.InnerException)
+            Assert.NotSame(disposeSentinel, current);
+
+        // THE WARNING was logged…
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("admission-context-dispose", warning.Message, StringComparison.Ordinal);
+        // …and the MAPPING insert was rolled back (the failure path's cleanup ran).
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-factoryfail'"));
+    }
+
+    /// <summary>
+    /// THE CALLER-OWNED GUARD: with the direct (caller-owned) context, the disposer seam is
+    /// invoked ZERO times — the genuine, removal-proof proof of the "the caller-owned direct
+    /// context is NEVER disposed here" rule (the ownsContext-gating mutant — the guard running
+    /// unconditionally — is killed by this vector).
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_DirectContext_DisposerSeamNeverInvoked()
+    {
+        var logger = new TestLogger<PipelineStore>();
+        var store = CreateStore(logger: logger);
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ => disposerCalls++;
+        var pipeline = CreatePipeline("goal-nodispose", "task-nodispose");
+
+        var result = store.SaveAdmissionWithPointer(pipeline, "task-nodispose");
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        Assert.Equal(0, disposerCalls);
+    }
+
+}
+
+/// <summary>
+/// A minimal <see cref="IDbContextFactory{CopilotHiveDbContext}"/> handing out real contexts
+/// over the shared database (the ownsContext == true path).
+/// </summary>
+public sealed class PlainFactory : IDbContextFactory<CopilotHiveDbContext>
+{
+    private readonly string _connectionString;
+    private readonly IInterceptor? _interceptor;
+
+    public PlainFactory(string connectionString, IInterceptor? interceptor = null)
+    {
+        _connectionString = connectionString;
+        _interceptor = interceptor;
+    }
+
+    public CopilotHiveDbContext CreateDbContext()
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (_interceptor is not null)
+            builder.AddInterceptors(_interceptor);
+        return new CopilotHiveDbContext(builder.Options);
+    }
+}
+
+/// <summary>
+/// A <see cref="DbConnection"/> whose transactions commit normally but THROW on Dispose —
+/// used by the success-path dispose-failure vector.
+/// </summary>
+public sealed class ThrowingDisposeTransactionConnection : DbConnection
+{
+    private readonly SqliteConnection _inner;
+
+    public ThrowingDisposeTransactionConnection(string connectionString) =>
+        _inner = new SqliteConnection(connectionString);
+
+    [AllowNull]
+    public override string ConnectionString
+    {
+        get => _inner.ConnectionString;
+        set => _inner.ConnectionString = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    public override string Database => _inner.Database;
+    public override string DataSource => _inner.DataSource;
+    public override string ServerVersion => _inner.ServerVersion;
+    public override int ConnectionTimeout => _inner.ConnectionTimeout;
+    public override ConnectionState State => _inner.State;
+
+    public override void ChangeDatabase(string databaseName) => _inner.ChangeDatabase(databaseName);
+    public override void Close() => _inner.Close();
+    public override void Open() => _inner.Open();
+
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+        new ThrowingDisposeTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
+
+    protected override DbCommand CreateDbCommand() => new TransactionTolerantAdmissionCommand(_inner.CreateCommand());
+
+    /// <summary>
+    /// The EF relational layer requires a transaction's connection to be REFERENCE-EQUAL to the
+    /// connection it was begun on; <see cref="SqliteCommand"/> casts its transaction back to
+    /// <see cref="SqliteTransaction"/>, so the wrapped command shields both.
+    /// </summary>
+    private sealed class ThrowingDisposeTransaction : DbTransaction
+    {
+        private readonly ThrowingDisposeTransactionConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public ThrowingDisposeTransaction(ThrowingDisposeTransactionConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection? DbConnection => _owner;
+        public override void Commit() => _inner.Commit();
+        public override void Rollback() => _inner.Rollback();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The UNDERLYING transaction is always released (no leak); the FAILURE is the signal.
+            try
+            {
+                _inner.Dispose();
+            }
+            finally
+            {
+                throw new InvalidOperationException("forced transaction dispose failure");
+            }
+        }
+    }
+
+    private sealed class TransactionTolerantAdmissionCommand : DbCommand
+    {
+        private readonly DbCommand _inner;
+
+        public TransactionTolerantAdmissionCommand(DbCommand inner) => _inner = inner;
+
+        [AllowNull]
+        public override string CommandText { get => _inner.CommandText; set => _inner.CommandText = value ?? ""; }
+        public override int CommandTimeout { get => _inner.CommandTimeout; set => _inner.CommandTimeout = value; }
+        public override CommandType CommandType { get => _inner.CommandType; set => _inner.CommandType = value; }
+        [AllowNull]
+        protected override DbConnection DbConnection { get => _inner.Connection!; set { } }
+        protected override DbParameterCollection DbParameterCollection => _inner.Parameters;
+        protected override DbTransaction? DbTransaction { get => _inner.Transaction; set { } }
+        public override bool DesignTimeVisible { get => false; set { } }
+        public override UpdateRowSource UpdatedRowSource { get => _inner.UpdatedRowSource; set => _inner.UpdatedRowSource = value; }
+
+        public override void Cancel() => _inner.Cancel();
+        public override int ExecuteNonQuery() => _inner.ExecuteNonQuery();
+        public override object? ExecuteScalar() => _inner.ExecuteScalar();
+        public override void Prepare() => _inner.Prepare();
+        protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
+    }
+}

@@ -8,6 +8,7 @@ using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
 namespace CopilotHive.Persistence;
@@ -87,6 +88,20 @@ public sealed class PipelineStore : IAsyncDisposable
     private readonly IDbContextFactory<CopilotHiveDbContext>? _dbContextFactory;
     private readonly CopilotHiveDbContext? _directDbContext;
     private readonly ILogger<PipelineStore> _logger;
+
+    /// <summary>
+    /// THE INTERNAL SEAM for the guarded (d) context disposal of
+    /// <see cref="SaveAdmissionWithPointer"/>: when installed, it SUBSTITUTES the fallible
+    /// dispose operation (<see cref="CopilotHiveDbContext"/> is sealed, so its
+    /// <c>Dispose</c> cannot be overridden and EF never closes an externally supplied
+    /// connection — the failure is otherwise not genuinely injectable). The GUARD itself —
+    /// the try/catch, the <c>admission-context-dispose</c> warning, the swallow and the
+    /// outcome preservation — remains production code the tests exercise for real, and the
+    /// null-default branch calls the REAL <c>Dispose()</c>, so every non-injected caller and
+    /// the production path are unchanged. Instance-scoped on purpose: each store instance
+    /// carries its own seam (no static, no cross-test pollution).
+    /// </summary>
+    internal Action<CopilotHiveDbContext>? ContextDisposerForTest;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -435,6 +450,205 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
+    /// <summary>The two flushed stages of the admission transaction, used as the conflict stage gate.</summary>
+    private enum AdmissionStage
+    {
+        /// <summary>The task-mapping insert is being flushed.</summary>
+        MappingFlush,
+        /// <summary>The mapping flush succeeded; the pipeline row is being flushed.</summary>
+        PipelineFlush,
+    }
+
+    /// <summary>
+    /// Atomically registers a task admission: the <c>task_mappings</c> row (the insert IS the
+    /// existence check) AND the pipeline row in ONE explicit transaction. A mapping row that
+    /// already exists (primary-key violation at the mapping flush) rolls everything back and
+    /// reports <see cref="AdmissionStoreResult.PersistConflict"/> — the pipeline row is never
+    /// staged in that case. Every other failure PROPAGATES (the original exception, never
+    /// reclassified), and the finally's guarded cleanup never masks either outcome.
+    /// </summary>
+    /// <param name="pipeline">The pipeline whose pointer is persisted alongside the mapping.</param>
+    /// <param name="taskId">The task id being admitted; MUST equal <c>pipeline.ActiveTaskId</c>.</param>
+    /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
+    internal AdmissionStoreResult SaveAdmissionWithPointer(GoalPipeline pipeline, string taskId)
+    {
+        if (string.IsNullOrWhiteSpace(taskId))
+            throw new ArgumentException("Task id must be a non-blank value.", nameof(taskId));
+
+        if (pipeline.ActiveTaskId != taskId)
+            throw new ArgumentException(
+                $"Task id '{taskId}' does not match the pipeline's active task id '{pipeline.ActiveTaskId}' (goal={pipeline.GoalId}).",
+                nameof(taskId));
+
+        var (db, ownsContext) = ResolveDbContext();
+        IDbContextTransaction? transaction = null;
+        var stage = AdmissionStage.MappingFlush;
+        AdmissionStoreResult result;
+        var commitSucceeded = false; // the finally's rollback gate (definite-assignment safe)
+        try
+        {
+            transaction = db.Database.BeginTransaction();
+
+            // STAGE 1 — THE MAPPING (the insert IS the check; no preflight Any/Exists query).
+            db.TaskMappings.Add(new TaskMappingEntity { TaskId = taskId, GoalId = pipeline.GoalId });
+            db.SaveChanges();
+            stage = AdmissionStage.PipelineFlush;
+
+            // STAGE 2 — THE PIPELINE ROW.
+            UpsertPipelineCore(db, pipeline);
+            db.SaveChanges();
+
+            // STAGE 3 — THE COMMIT.
+            transaction.Commit();
+            commitSucceeded = true;
+            result = AdmissionStoreResult.Committed;
+        }
+        catch (DbUpdateException dbex) when (stage == AdmissionStage.MappingFlush && IsPrimaryKeyViolation(dbex))
+        {
+            // THE CONFLICT — ONLY from the mapping's flush (the stage gate). The pipeline row
+            // was never staged; the finally's rollback makes the aborted insert invisible.
+            result = AdmissionStoreResult.PersistConflict;
+        }
+        catch
+        {
+            throw; // the generic failure path — the ORIGINAL propagates after the finally's cleanup
+        }
+        finally
+        {
+            // The guarded (a)-(d) sequence — EVERY path, in this exact order. Each guard logs a
+            // BestEffortWarning on failure and swallows; the outcome/exception is NEVER masked.
+
+            // (a) Rollback — ONLY when the commit did not succeed. A rollback failure is warned
+            //     and swallowed, and selects the detach-only cleanup fallback.
+            var rollbackConfirmed = false;
+            if (transaction is not null && !commitSucceeded)
+            {
+                try
+                {
+                    transaction.Rollback();
+                    rollbackConfirmed = true;
+                }
+                catch (Exception rollbackEx)
+                {
+                    BestEffortWarning(
+                        "WorkSlotIntegrity: admission-rollback goal={GoalId} task={TaskId} — the rollback step failed (unconfirmed; the detach-only cleanup will be used): {Message}",
+                        pipeline.GoalId, taskId, rollbackEx.Message);
+                }
+            }
+
+            // (b) Tracked-state cleanup. The mapping entity is DETACHED UNCONDITIONALLY (any
+            //     state). The pipeline entity: reload-if-tracked (only when the rollback
+            //     CONFIRMED — the fresh Find discards the stale tracked copy and surfaces the
+            //     durable pointer) / detach-if-Added / detach-if-tracked (the unconfirmed
+            //     fallback, no reload).
+            try
+            {
+                foreach (var entry in db.ChangeTracker.Entries<TaskMappingEntity>().ToList())
+                    db.Entry(entry.Entity).State = EntityState.Detached;
+
+                var pipelineEntry = db.ChangeTracker.Entries<PipelineEntity>().ToList();
+                if (pipelineEntry.Count > 0)
+                {
+                    if (rollbackConfirmed)
+                    {
+                        // The rollback is CONFIRMED: the database holds the pre-existing row (or
+                        // nothing). DETACH the stale tracked copy first (a Find alone would hand
+                        // back the in-flight copy), then reload fresh through the tracker.
+                        foreach (var entry in pipelineEntry)
+                            db.Entry(entry.Entity).State = EntityState.Detached;
+                        db.Pipelines.Find(pipeline.GoalId);
+                    }
+                    else
+                    {
+                        foreach (var entry in pipelineEntry)
+                            db.Entry(entry.Entity).State = EntityState.Detached;
+                    }
+                }
+            }
+            catch (Exception cleanupEx)
+            {
+                BestEffortWarning(
+                    "WorkSlotIntegrity: admission-cleanup goal={GoalId} task={TaskId} — the tracked-state cleanup failed: {Message}",
+                    pipeline.GoalId, taskId, cleanupEx.Message);
+            }
+
+            // (c) Guarded transaction disposal — EVERY path INCLUDING THE SUCCESS PATH (a
+            //     Commit'ed transaction must not leak). On the success path a dispose failure
+            //     is warned and swallowed but Committed is STILL RETURNED: the commit already
+            //     succeeded and the row is durable — a dispose failure is a connection-state
+            //     concern, not an admission failure. On the failure paths the original
+            //     outcome/exception is preserved.
+            try
+            {
+                transaction?.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                BestEffortWarning(
+                    "WorkSlotIntegrity: admission-dispose goal={GoalId} task={TaskId} — the transaction dispose failed: {Message}",
+                    pipeline.GoalId, taskId, disposeEx.Message);
+            }
+
+            // (d) Factory-owned context disposal — the caller-owned direct context is NEVER
+            //     disposed here (the ownsContext gate). The disposer is the internal seam
+            //     (see <see cref="ContextDisposerForTest"/>); the null-default calls the
+            //     real Dispose().
+            if (ownsContext)
+            {
+                try
+                {
+                    (ContextDisposerForTest ?? (context => context.Dispose()))(db);
+                }
+                catch (Exception contextDisposeEx)
+                {
+                    BestEffortWarning(
+                        "WorkSlotIntegrity: admission-context-dispose goal={GoalId} task={TaskId} — the context dispose failed: {Message}",
+                        pipeline.GoalId, taskId, contextDisposeEx.Message);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// TRUE iff the exception chain carries a <see cref="SqliteException"/> with
+    /// <c>SqliteErrorCode == 19</c> AND <c>SqliteExtendedErrorCode == 1555</c> (SQLITE_CONSTRAINT_PRIMARYKEY).
+    /// Every other code — NOTNULL (1299), UNIQUE (2067), CHECK (275), FK (787), BUSY (5),
+    /// LOCKED (6) — stays on the generic propagate path.
+    /// </summary>
+    private static bool IsPrimaryKeyViolation(DbUpdateException exception)
+    {
+        for (var inner = (Exception?)exception; inner is not null; inner = inner.InnerException)
+        {
+            if (inner is SqliteException sqlite
+                && sqlite.SqliteErrorCode == 19
+                && sqlite.SqliteExtendedErrorCode == 1555)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// THE FINAL GUARD of the never-masked guarantee: a throwing LOGGER must never mask the
+    /// original outcome or the original exception, so the warning write itself is wrapped in a
+    /// try/catch with a SILENT swallow (there is no deeper channel to report to).
+    /// </summary>
+    private void BestEffortWarning(string template, params object[] args)
+    {
+        try
+        {
+            _logger.LogWarning(template, args);
+        }
+        catch
+        {
+            // SILENT swallow — see the summary above.
+        }
+    }
+
     private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline)
     {
         var existing = db.Pipelines.Find(pipeline.GoalId);
@@ -679,4 +893,16 @@ public sealed class PipelineSnapshot
     /// phase equals the snapshot's pipeline phase; null or mismatched → the legacy path.
     /// </summary>
     public GoalPhase? MachinePhase { get; init; }
+}
+
+/// <summary>
+/// The outcome of <see cref="PipelineStore.SaveAdmissionWithPointer"/>.
+/// </summary>
+internal enum AdmissionStoreResult
+{
+    /// <summary>The mapping row and the pipeline row landed atomically.</summary>
+    Committed,
+    /// <summary>The mapping row already exists — nothing was written (the store's admission
+    /// refusal).</summary>
+    PersistConflict,
 }
