@@ -324,29 +324,330 @@ internal sealed class TaskDispatchService
         _logger.LogInformation("Dispatched {Role} task {TaskId} for goal {GoalId} (branch={Branch})",
             role, task.TaskId, pipeline.GoalId, task.BranchInfo?.FeatureBranch);
 
-        // Try to push directly to an idle worker
+        // ══════════════════════════════════════════════════════════════════════════════════
+        //  THE DELIVERY TRANSACTION. The direct push to an idle worker, restructured into named
+        //  stages, each with ONE authoritative failure classification:
+        //
+        //    G  (get-worker)   GetIdleWorker — runs BEFORE the dequeue, so nothing is touched:
+        //                      every throw (ordinary or cancellation) PROPAGATES UNCAUGHT.
+        //    D  (dequeue)      TryDequeue(role) ?? TryDequeueAny() — no throw path; a null result
+        //                      is the honest no-op.
+        //    A  (agents-md)    BEST-EFFORT: DispatcherMaintenance swallows its own failures, so
+        //                      stage A is NOT OBSERVABLE from this transaction.
+        //    cancel-check      The observation point: dequeued, NOT activated, worker NOT busy —
+        //                      the ONE provably-safe recovery point, hence THE REQUEUE.
+        //    P1 (activate)     NON-THROWING BY CONTRACT (see the two-mutation comment below).
+        //    P2 (mark-busy)    RUNTIME-REACHABLE (the interface throw) → THE AMBIGUITY-PRESERVE.
+        //    S  (send)         THE AMBIGUITY POINT → THE PRESERVE.
+        //
+        //  THE PROPAGATION RULE: every caught DELIVERY-OPERATION exception is RETHROWN UNCHANGED
+        //  after its recovery. Every POST-DEQUEUE logger failure is swallowed by the logging
+        //  guards; PRE-DEQUEUE logger failures propagate as infrastructure failures.
+        //
+        //  THE MISMATCH HANDOFF: the push delivers whatever the queue yields — which may be an
+        //  EARLIER queued task of the requested role belonging to ANOTHER pipeline (the role-aware
+        //  FIFO — correct, and now observable through the delivery-mismatch record). Every recovery
+        //  below therefore acts on `queuedTask` ONLY: no pipeline-level operation appears anywhere
+        //  in this transaction's recoveries.
+        // ══════════════════════════════════════════════════════════════════════════════════
+
+        // STAGE G. Nothing has been dequeued yet, so this call is deliberately NOT guarded.
         var idleWorker = _workerGateway.GetIdleWorker();
-        if (idleWorker is not null)
+        if (idleWorker is null)
+            return;
+
+        // STAGE D. The role-aware dequeue first, then the role-agnostic fallback. Neither throws;
+        // a null result simply means there is nothing to push right now.
+        var queuedTask = _taskQueue.TryDequeue(role) ?? _taskQueue.TryDequeueAny();
+        if (queuedTask is null)
+            return;
+
+        // THE CAPTURE AT D — everything the recoveries and the records need, read ONCE, before any
+        // mutation. `deliveredGoalId` is the DELIVERED task's goal (the log owner); `registeredTaskId`
+        // is the task THIS dispatch admitted; `workerRoleBeforeAssignment` is the worker's
+        // PRE-MUTATION role, the only value the restore may write back.
+        var deliveryWorkerId = idleWorker.Id;
+        var deliveredTaskId = queuedTask.TaskId;
+        var deliveredRole = queuedTask.Role;
+        var deliveredModel = queuedTask.Model;
+        var deliveredGoalId = queuedTask.GoalId;
+        var registeredTaskId = task.TaskId;
+        var workerRoleBeforeAssignment = idleWorker.Role;
+
+        // ── THE POST-DEQUEUE LOGGING BOUNDARY ──────────────────────────────────────────────
+        // From here on EVERY log call inside this transaction goes through a logging guard: a
+        // diagnostic failure must NEVER strand a dequeued task. The dequeue is the boundary.
+        // ───────────────────────────────────────────────────────────────────────────────────
+
+        if (!string.Equals(deliveredTaskId, registeredTaskId, StringComparison.Ordinal))
+            LogDeliveryMismatch(deliveredGoalId, registeredTaskId, deliveredTaskId);
+
+        idleWorker.Role = deliveredRole;
+        var taskRoleName = deliveredRole.ToRoleName();
+        LogSafely(() => _logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
+            deliveryWorkerId, taskRoleName, deliveredTaskId));
+
+        // STAGE A — BEST-EFFORT, AND CONTAINED AT THIS BOUNDARY.
+        //
+        // SendAgentsMdToWorkerAsync already swallows its own gateway-send failure — but it does so
+        // by LOGGING it, and that log is itself a POST-DEQUEUE diagnostic. If the logging
+        // infrastructure throws from inside that catch, the exception escapes the awaited call at
+        // the worst possible instant: the task is dequeued and the worker's Role is already
+        // reassigned, yet the task is NOT activated and the cancel-check's requeue has not run —
+        // the dequeued task would be STRANDED by a pure diagnostic failure.
+        //
+        // The boundary rule admits no exception: EVERY log call after the dequeue is best-effort,
+        // INCLUDING the ones reached indirectly. The maintenance class is not ours to change, so
+        // the containment lives here, wrapping the whole awaited call.
+        //
+        // THE CLASSIFICATION IS UNCHANGED, and this is exactly what makes the blanket catch
+        // correct rather than a mask: the recovery table declares stage A NOT OBSERVABLE from this
+        // transaction for BOTH an ordinary failure and a cancellation. Nothing observable is
+        // therefore being swallowed that the table says should be seen — a cancellation is observed
+        // one line later, at the cancel-check, from the TOKEN, never from this call's exception. So
+        // control simply FALLS THROUGH: no rethrow, and no diversion into the cancel-check's
+        // requeue (which is reserved for a genuinely cancelled token).
+        try
         {
-            var queuedTask = _taskQueue.TryDequeue(role);
-            queuedTask ??= _taskQueue.TryDequeueAny();
+            await _maintenance.SendAgentsMdToWorkerAsync(idleWorker, deliveredRole, ct);
+        }
+        catch (Exception)
+        {
+            // Deliberately empty: stage A is non-observable by contract, and a diagnostic failure
+            // escaping it must never strand the dequeued task. Re-reporting it here would need the
+            // very logger that just threw.
+        }
 
-            if (queuedTask is not null)
+        // STAGE cancel-check — THE REQUEUE POINT. The task is dequeued, NOT activated, and the
+        // worker is NOT busy: returning the task to the pending queue is provably safe here, and
+        // ONLY here.
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException)
+        {
+            // THE REQUEUE SEQUENCE, in exact order: (1) enqueue → (2) the guard line →
+            // (3) the role restore → (4) the failure line → (5) the ORIGINAL rethrow.
+            //
+            // THE BELT-AND-BRACES: the OPERATIONAL steps (1) and (3) are individually try/caught.
+            // A step's own throw is recorded as delivery-rollback-failure and swallowed; the
+            // remaining steps still run, and the ORIGINAL exception is always what leaves here.
+
+            // (1) Return the task to the pending queue.
+            var reEnqueued = false;
+            try
             {
-                idleWorker.Role = queuedTask.Role;
-                var taskRoleName = queuedTask.Role.ToRoleName();
-                _logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
-                    idleWorker.Id, taskRoleName, queuedTask.TaskId);
-                await _maintenance.SendAgentsMdToWorkerAsync(idleWorker, queuedTask.Role, ct);
-
-                _taskQueue.Activate(queuedTask, idleWorker.Id);
-                _workerGateway.MarkBusy(idleWorker.Id, queuedTask.TaskId);
-                idleWorker.CurrentModel = queuedTask.Model;
-                await _workerGateway.SendTaskAsync(idleWorker.Id, queuedTask, ct);
-                _logger.LogInformation("Task {TaskId} pushed to worker {WorkerId}", queuedTask.TaskId, idleWorker.Id);
+                _taskQueue.Enqueue(queuedTask);
+                reEnqueued = true;
             }
+            catch (Exception stepEx)
+            {
+                LogDeliveryRollbackFailure(deliveredGoalId, deliveredTaskId, "re-enqueue", stepEx);
+            }
+
+            // (2) THE GUARD LINE — emitted IFF the Enqueue call RETURNED NORMALLY. TaskQueue.Enqueue
+            // inserts into its pending queue BEFORE invoking OnEnqueue (its only throwing seam), so
+            // a throwing OnEnqueue means the task IS already pending — but the step did not complete,
+            // and in that vector the delivery-rollback-failure record above is THE record instead.
+            // The guard line's "completed through the re-enqueue" is therefore always literally true.
+            if (reEnqueued)
+                LogDeliveryRecovery(deliveredGoalId, deliveredTaskId);
+
+            // (3) THE ROLE RESTORE — BEST-EFFORT and ROLE-ONLY. CurrentModel is NEVER assigned at
+            // this stage (it is written only after MarkBusy returns), so there is nothing of it to
+            // restore. The restore only writes back when the worker still holds THE VALUE WE
+            // ASSIGNED; a third value means someone else has since claimed the worker.
+            //
+            // HONEST LIMIT: this check-then-write is NOT atomic. It avoids the common overwrite of
+            // a concurrent assignment — it is not a concurrency guarantee.
+            //
+            // SEAM HONESTY: ConnectedWorker.Role is a plain auto-property on a sealed class, so no
+            // throwing seam exists. The catch below is a CODE-REVIEW CRITERION (the structure of the
+            // belt-and-braces), NOT a runtime vector: the only runtime-tested rollback-step failure
+            // is `re-enqueue`.
+            try
+            {
+                if (idleWorker.Role == deliveredRole)
+                    idleWorker.Role = workerRoleBeforeAssignment;
+            }
+            catch (Exception stepEx)
+            {
+                LogDeliveryRollbackFailure(deliveredGoalId, deliveredTaskId, "role-model-restore", stepEx);
+            }
+
+            // (4) The failure record, then (5) the ORIGINAL cancellation.
+            LogDeliveryFailure(
+                deliveredGoalId, deliveredTaskId, deliveryWorkerId,
+                DeliveryStage.CancelCheck, DeliveryRecovery.Requeue);
+            throw;
+        }
+
+        // STAGE P1 — NON-THROWING BY CONTRACT. THE TWO-MUTATION COMMENT: TaskQueue.Activate performs
+        // exactly two in-memory mutations — the ConcurrentDictionary indexer assignment that admits
+        // the task to the active set, AND the task.Metadata["assigned_worker"] write. Both are
+        // sealed, in-memory dictionary writes with no user-supplied seam and no failure vector, so
+        // this stage has no recovery clause. A violation of that contract is outside EVERY
+        // transaction's coverage — this one included.
+        _taskQueue.Activate(queuedTask, deliveryWorkerId);
+
+        // STAGE P2 — THE AMBIGUITY-PRESERVE. MarkBusy is an INTERFACE call, so a throw here is
+        // runtime-reachable, and whether the busy mutation was applied is UNKNOWABLE from here. The
+        // task is already active; re-enqueueing it could double-assign it. So: NO recovery steps —
+        // the record fires and the ORIGINAL exception rethrows.
+        //
+        // THE DEFERRAL NOTE (honest scope):
+        //   (a) MUTATED-then-threw — the worker IS busy with this task: the stale-cleanup's
+        //       busy-task timeout reclaims it.
+        //   (b) PRE-MUTATION throw — the task is active with an IDLE worker: NOT covered by the
+        //       stale-cleanup's predicate. THE ORDERED SUCCESSOR `atomic-worker-reservation` owns
+        //       this case; its subject is the reservation API AND the idle-worker-with-active-task
+        //       reconciliation sweep. This goal does NOT claim that case's recovery — it DEFERS it.
+        try
+        {
+            _workerGateway.MarkBusy(deliveryWorkerId, deliveredTaskId);
+            idleWorker.CurrentModel = deliveredModel;
+        }
+        catch (Exception)
+        {
+            LogDeliveryFailure(
+                deliveredGoalId, deliveredTaskId, deliveryWorkerId,
+                DeliveryStage.Prepare, DeliveryRecovery.Preserve);
+            throw;
+        }
+
+        // STAGE S — THE PRESERVE. The send's outcome is the ambiguity this whole transaction is
+        // honest about: the worker may or may not have received the assignment. Undoing anything
+        // here could deliver the same task twice, so the record fires and the ORIGINAL rethrows —
+        // a caller cancellation at S takes exactly the same path.
+        try
+        {
+            await _workerGateway.SendTaskAsync(deliveryWorkerId, queuedTask, ct);
+        }
+        catch (Exception)
+        {
+            LogDeliveryFailure(
+                deliveredGoalId, deliveredTaskId, deliveryWorkerId,
+                DeliveryStage.Send, DeliveryRecovery.Preserve);
+            throw;
+        }
+
+        LogSafely(() => _logger.LogInformation(
+            "Task {TaskId} pushed to worker {WorkerId}", deliveredTaskId, deliveryWorkerId));
+    }
+
+    /// <summary>The delivery stages that can appear in a <c>delivery-failure</c> record.</summary>
+    private enum DeliveryStage
+    {
+        /// <summary>The explicit cancellation observation after the agents-md stage.</summary>
+        CancelCheck,
+
+        /// <summary>The MarkBusy/CurrentModel stage (P2).</summary>
+        Prepare,
+
+        /// <summary>The SendTaskAsync stage (S).</summary>
+        Send,
+    }
+
+    /// <summary>The recovery classifications a <c>delivery-failure</c> record can report.</summary>
+    private enum DeliveryRecovery
+    {
+        /// <summary>The task was returned to the pending queue (cancel-check only).</summary>
+        Requeue,
+
+        /// <summary>No recovery was attempted: the outcome is unknowable (P2 and S).</summary>
+        Preserve,
+    }
+
+    /// <summary>Renders a <see cref="DeliveryStage"/> as its template token.</summary>
+    private static string RenderStage(DeliveryStage stage) => stage switch
+    {
+        DeliveryStage.CancelCheck => "cancel-check",
+        DeliveryStage.Prepare => "prepare",
+        DeliveryStage.Send => "send",
+        _ => throw new InvalidOperationException($"Unhandled DeliveryStage: {stage}"),
+    };
+
+    /// <summary>Renders a <see cref="DeliveryRecovery"/> as its template token.</summary>
+    private static string RenderRecovery(DeliveryRecovery recovery) => recovery switch
+    {
+        DeliveryRecovery.Requeue => "requeue",
+        DeliveryRecovery.Preserve => "preserve",
+        _ => throw new InvalidOperationException($"Unhandled DeliveryRecovery: {recovery}"),
+    };
+
+    /// <summary>Renders the outcome clause matching a <see cref="DeliveryRecovery"/>.</summary>
+    private static string RenderRecoveryOutcome(DeliveryRecovery recovery) => recovery switch
+    {
+        DeliveryRecovery.Requeue => "was returned to the pending queue",
+        DeliveryRecovery.Preserve => "remains active; the outcome is unknowable; the recovery is deferred",
+        _ => throw new InvalidOperationException($"Unhandled DeliveryRecovery: {recovery}"),
+    };
+
+    /// <summary>
+    /// Runs one POST-DEQUEUE diagnostic emission and SWALLOWS any failure of the logging
+    /// infrastructure.
+    /// </summary>
+    /// <remarks>
+    /// THE BOUNDARY RULE: the dequeue is the boundary. AFTER it a task is in flight and owned by
+    /// nobody but this transaction, so a logger's throw must never strand it — every record inside
+    /// the delivery transaction is best-effort. BEFORE it nothing has been touched, so pre-dequeue
+    /// logging deliberately stays unguarded and a throw there propagates as an infrastructure
+    /// failure.
+    /// </remarks>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never affect the delivery.
         }
     }
+
+    /// <summary>Logs a delivery-span failure and the recovery that was applied to it.</summary>
+    private void LogDeliveryFailure(
+        string goalId, string taskId, string workerId, DeliveryStage stage, DeliveryRecovery recovery)
+    {
+        var stageToken = RenderStage(stage);
+        var recoveryToken = RenderRecovery(recovery);
+        var outcome = RenderRecoveryOutcome(recovery);
+        LogSafely(() => _logger.LogWarning(
+            "WorkSlotIntegrity: delivery-failure goal={GoalId} task={TaskId} worker={WorkerId} stage={Stage} recovery={Recovery} — the task {Outcome}",
+            goalId, taskId, workerId, stageToken, recoveryToken, outcome));
+    }
+
+    /// <summary>
+    /// Logs that the push delivered a task OTHER than the one this dispatch admitted — the
+    /// role-aware FIFO handing over an earlier queued task of the same role. Informational only.
+    /// </summary>
+    private void LogDeliveryMismatch(string deliveredGoalId, string registeredTaskId, string deliveredTaskId) =>
+        LogSafely(() => _logger.LogDebug(
+            "WorkSlotIntegrity: delivery-mismatch goal={GoalId} registered={RegisteredTaskId} delivered={DeliveredTaskId} — the push delivered an earlier queued task of the requested role (role-aware FIFO; no action)",
+            deliveredGoalId, registeredTaskId, deliveredTaskId));
+
+    /// <summary>
+    /// Logs a failed DELIVERY rollback step. <paramref name="step"/> is one of
+    /// <c>re-enqueue</c>, <c>role-model-restore</c>. Distinct from the admission's
+    /// <c>rollback-failure</c> template.
+    /// </summary>
+    private void LogDeliveryRollbackFailure(string goalId, string taskId, string step, Exception ex) =>
+        LogSafely(() => _logger.LogWarning(
+            ex,
+            "WorkSlotIntegrity: delivery-rollback-failure goal={GoalId} task={TaskId} step={Step} — the rollback step failed; continuing",
+            goalId, taskId, step));
+
+    /// <summary>
+    /// Logs THE GUARD LINE: the cancel-check recovery got at least as far as a completed
+    /// re-enqueue. Emitted IFF <see cref="TaskQueue.Enqueue"/> returned normally.
+    /// </summary>
+    private void LogDeliveryRecovery(string goalId, string taskId) =>
+        LogSafely(() => _logger.LogDebug(
+            "WorkSlotIntegrity: delivery-recovery goal={GoalId} task={TaskId} stage=cancel-check — the recovery steps completed through the re-enqueue",
+            goalId, taskId));
 
     /// <summary>
     /// Renders a structured-log field value, substituting <c>unknown</c> for <c>null</c>.
