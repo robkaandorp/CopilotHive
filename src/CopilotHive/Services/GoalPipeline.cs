@@ -785,6 +785,100 @@ public sealed class GoalPipeline
     }
 
     /// <summary>
+    /// Retires the slot for <paramref name="taskId"/> and — for every non-blank task id — clears
+    /// the active-task pointer when, and only when, it currently names that task. Both effects
+    /// happen inside a SINGLE <c>_lock</c> acquisition, so no observer can see a retired slot that
+    /// still owns the pointer (or a cleared pointer whose slot is still live).
+    /// </summary>
+    /// <remarks>
+    /// The rules, exhaustively:
+    /// <list type="bullet">
+    ///   <item><description><paramref name="taskId"/> is <c>null</c>/blank →
+    ///     <see cref="SlotRetirementOutcome.SlotAbsent"/> with NO mutation whatsoever. The pointer
+    ///     is NEVER cleared on a blank id — a blank argument identifies no task, so clearing would
+    ///     blank out a pointer the caller cannot possibly own. This is a hard safety contract.</description></item>
+    ///   <item><description>No slot is registered for a non-blank id →
+    ///     <see cref="SlotRetirementOutcome.SlotAbsent"/>; the pointer is still if-current-cleared.</description></item>
+    ///   <item><description>The slot is already <see cref="WorkSlotState.Abandoned"/> →
+    ///     <see cref="SlotRetirementOutcome.AlreadyAbandoned"/> (idempotent re-retire); the pointer
+    ///     is still if-current-cleared, because the uniform if-current rule applies to EVERY
+    ///     non-blank path.</description></item>
+    ///   <item><description>The slot is <see cref="WorkSlotState.Pending"/>,
+    ///     <see cref="WorkSlotState.Claimed"/> or <see cref="WorkSlotState.Recorded"/> → it becomes
+    ///     <see cref="WorkSlotState.Abandoned"/> and <see cref="SlotRetirementOutcome.Retired"/> is
+    ///     returned.</description></item>
+    /// </list>
+    /// The if-current clearing is the same OWNERSHIP-CHECKED rule as
+    /// <see cref="ClearActiveTaskIfCurrent"/>: a pointer that has already moved on to a NEWER task
+    /// is never erased by retiring an older one.
+    /// <para>
+    /// This primitive is deliberately WIDER than <see cref="AbandonSlot"/> (Pending only) and
+    /// <see cref="FailSlot"/> (Claimed only): it retires whatever state the attempt is in. Those
+    /// two methods keep their narrow semantics untouched.
+    /// </para>
+    /// </remarks>
+    /// <param name="taskId">The task id whose slot is being retired.</param>
+    /// <returns>Which of the three retirement outcomes occurred.</returns>
+    internal SlotRetirementOutcome RetireSlotAndClearIfCurrent(string? taskId)
+    {
+        // THE BLANK REFUSAL, ahead of the lock: a blank id names no attempt, so it must neither
+        // touch the registry nor clear the pointer.
+        if (string.IsNullOrWhiteSpace(taskId))
+            return SlotRetirementOutcome.SlotAbsent;
+
+        lock (_lock)
+        {
+            SlotRetirementOutcome outcome;
+            if (!_slots.TryGetValue(taskId, out var entry))
+            {
+                outcome = SlotRetirementOutcome.SlotAbsent;
+            }
+            else
+            {
+                outcome = entry.State switch
+                {
+                    WorkSlotState.Pending or WorkSlotState.Claimed or WorkSlotState.Recorded =>
+                        SlotRetirementOutcome.Retired,
+                    WorkSlotState.Abandoned => SlotRetirementOutcome.AlreadyAbandoned,
+                    _ => throw new InvalidOperationException($"Unhandled WorkSlotState: {entry.State}"),
+                };
+
+                if (outcome is SlotRetirementOutcome.Retired)
+                    _slots[taskId] = (entry.Slot, WorkSlotState.Abandoned);
+            }
+
+            // THE UNIFORM IF-CURRENT RULE — one site, reached by every non-blank path (retired,
+            // already-abandoned, and absent alike), and never by the blank path above.
+            if (string.Equals(ActiveTaskId, taskId, StringComparison.Ordinal))
+                ActiveTaskId = null;
+
+            return outcome;
+        }
+    }
+
+    /// <summary>
+    /// Locked read: is the slot for <paramref name="taskId"/> in
+    /// <see cref="WorkSlotState.Abandoned"/>?
+    /// </summary>
+    /// <remarks>
+    /// A point-in-time OBSERVATION, not an admission decision: the value is stale the instant the
+    /// lock is released. A <c>false</c> answer therefore only means the slot was not abandoned when
+    /// it was read — a concurrent retire may follow immediately.
+    /// </remarks>
+    /// <param name="taskId">The task id to inspect. A <c>null</c>/blank id yields <c>false</c>.</param>
+    /// <returns><c>true</c> only when a slot exists for the id and is abandoned.</returns>
+    internal bool IsSlotAbandoned(string? taskId)
+    {
+        if (string.IsNullOrWhiteSpace(taskId))
+            return false;
+
+        lock (_lock)
+        {
+            return _slots.TryGetValue(taskId, out var entry) && entry.State == WorkSlotState.Abandoned;
+        }
+    }
+
+    /// <summary>
     /// Fails a claimed slot, abandoning it so its result can never be recorded.
     /// </summary>
     /// <param name="taskId">The task ID identifying the slot.</param>
@@ -1030,6 +1124,20 @@ internal enum SlotRecordOutcome
     Recorded,
     /// <summary>Nothing changed — the slot was not claimed, or does not exist.</summary>
     NoOp,
+}
+
+/// <summary>
+/// Outcome of <see cref="GoalPipeline.RetireSlotAndClearIfCurrent"/> — the atomic
+/// retire-and-clear-if-current primitive.
+/// </summary>
+internal enum SlotRetirementOutcome
+{
+    /// <summary>A live slot (Pending, Claimed or Recorded) was transitioned to Abandoned.</summary>
+    Retired,
+    /// <summary>No slot is registered for the task id — or the id was <c>null</c>/blank.</summary>
+    SlotAbsent,
+    /// <summary>The slot was already Abandoned; the retire was a no-op on the registry.</summary>
+    AlreadyAbandoned,
 }
 
 /// <summary>
