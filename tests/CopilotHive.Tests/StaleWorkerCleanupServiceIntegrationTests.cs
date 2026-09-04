@@ -129,12 +129,13 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
 
     /// <summary>
     /// A STALE worker (heartbeat branch, real pool) holding a live dispatch has its task's WORK
-    /// SLOT abandoned as well as its pipeline pointer cleared, so the position is free for the
-    /// redispatch's fresh capture. Without the abandonment the position would still be occupied
-    /// by a live slot and the next capture would be refused as a double assignment.
+    /// SLOT retired through the D1 primitive together with its pipeline pointer cleared, and the
+    /// durable mapping UNREGISTERED, so the position is free for the redispatch's fresh capture.
+    /// Without the retirement the position would still be occupied by a live slot and the next
+    /// capture would be refused as a double assignment.
     /// </summary>
     [Fact]
-    public async Task RunCleanupCycle_WithRealPool_StaleWorkerWithTask_AbandonsWorkSlot()
+    public async Task RunCleanupCycle_WithRealPool_StaleWorkerWithTask_RetiresWorkSlotAndUnregistersMapping()
     {
         var pool = new WorkerPool();
         var taskQueue = new TaskQueue();
@@ -151,13 +152,27 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
-        var slot = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
-        pipeline.SetActiveTask(slot.TaskId);
-        pipelineManager.RegisterTask(slot.TaskId, pipeline.GoalId);
+        var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+        var taskId = built.TaskId;
+        pipeline.SetActiveTask(taskId);
+        pipelineManager.RegisterTask(taskId, pipeline.GoalId);
+
+        // The task is ACTIVE in the queue — the replacement must complete it, never re-enqueue it.
+        var task = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = pipeline.GoalId,
+            GoalDescription = "Stale slot goal",
+            Prompt = "Code it",
+            Role = WorkerRole.Coder,
+            Repositories = [],
+        };
+        taskQueue.Enqueue(task);
+        taskQueue.Activate(taskQueue.TryDequeueAny()!, "stale-worker");
 
         var staleWorker = pool.RegisterWorker("stale-worker", []);
         staleWorker.LastHeartbeat = DateTime.UtcNow.AddMinutes(-5);
-        pool.MarkBusy("stale-worker", slot.TaskId);
+        pool.MarkBusy("stale-worker", taskId);
         staleWorker.LastHeartbeat = DateTime.UtcNow.AddMinutes(-5);
 
         var svc = new StaleWorkerCleanupService(
@@ -167,14 +182,20 @@ public sealed class StaleWorkerCleanupServiceIntegrationTests
 
         Assert.Null(pool.GetWorker("stale-worker"));
 
+        // THE RETIRE: the slot is Abandoned, the pointer is cleared, the mapping is unregistered.
         var view = Assert.Single(pipeline.GetSlotsForTest());
-        Assert.Equal(slot.TaskId, view.Slot.TaskId);
+        Assert.Equal(taskId, view.Slot.TaskId);
         Assert.Equal(WorkSlotState.Abandoned, view.State);
         Assert.Null(pipeline.ActiveTaskId);
+        Assert.Null(pipelineManager.GetByTaskId(taskId));
+
+        // THE REPLACEMENT SHAPE: the entry is gone, NOT re-queued.
+        Assert.Null(taskQueue.GetActiveTask(taskId));
+        Assert.Null(taskQueue.TryDequeueAny());
 
         // THE DEAD RULE: the redispatch's fresh capture succeeds on the freed position.
         var redispatch = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
         Assert.Equal(2, redispatch.Attempt);
-        Assert.Equal(slot.Position, redispatch.Position);
+        Assert.Equal(built.Position, redispatch.Position);
     }
 }
