@@ -41,6 +41,33 @@ internal record TaskRegistrationResult(bool Success, TaskRegistrationFailure Cau
 internal record TaskUnregisterResult(bool MemoryRemoved, bool PersistenceRemoved);
 
 /// <summary>
+/// The outcome kind of <see cref="GoalPipelineManager.PersistAdmission"/>.
+/// </summary>
+internal enum AdmissionCommitStatus
+{
+    /// <summary>The in-memory claim is held AND the mapping+pointer rows were committed.</summary>
+    Committed,
+
+    /// <summary>This manager already held an in-memory entry for the task; the store was never called.</summary>
+    MemoryConflict,
+
+    /// <summary>The persisted mapping row is owned by another attempt; the in-memory claim was rolled back.</summary>
+    PersistConflict,
+
+    /// <summary>The store threw; the exception is carried on the result and the in-memory claim was rolled back.</summary>
+    PersistenceFailed,
+
+    /// <summary>No store is configured; the in-memory claim alone is held.</summary>
+    NoStore,
+}
+
+/// <summary>PersistAdmission's outcome. PersistenceException is non-null IFF Status == PersistenceFailed (for results this method returns).</summary>
+/// <param name="Status">Which admission outcome occurred.</param>
+/// <param name="PersistenceException">The store exception when <paramref name="Status"/> is
+/// <see cref="AdmissionCommitStatus.PersistenceFailed"/>; otherwise <c>null</c>.</param>
+internal sealed record AdmissionCommitResult(AdmissionCommitStatus Status, Exception? PersistenceException = null);
+
+/// <summary>
 /// Singleton that holds all active goal pipelines and provides lookup by goalId or taskId.
 /// Persists pipeline state to SQLite via <see cref="PipelineStore"/>.
 /// </summary>
@@ -48,6 +75,66 @@ public sealed class GoalPipelineManager
 {
     private readonly ConcurrentDictionary<string, GoalPipeline> _pipelines = new();
     private readonly ConcurrentDictionary<string, string> _taskToGoal = new();
+
+    /// <summary>
+    /// THE SINGLE LOCK over this manager's MAPPING SURFACE — <see cref="RegisterTask"/>,
+    /// <see cref="TryRegisterTask"/>, <see cref="UnregisterTask"/>, <see cref="TryUnregisterTask"/>,
+    /// <see cref="RestorePipeline"/>, <see cref="RestoreFromStore"/>, <see cref="RemovePipeline"/>
+    /// and <see cref="PersistAdmission"/>. Every mutation of <see cref="_taskToGoal"/> performed by
+    /// those methods runs under it, so the WRITERS are serialized: a memory claim and its persisted
+    /// counterpart can no longer be interleaved by a second mapping-surface call.
+    /// <para>
+    /// WHAT CHANGES OBSERVABLY: nothing functional. Each wrapped method's body is unchanged, so its
+    /// results, its logs and its contracts are byte-identical. The ONLY observable change is
+    /// CONCURRENCY TIMING: mapping-surface calls for UNRELATED tasks now serialize with each other,
+    /// which adds contention and latency under load. That contention — and the possible-deadlock
+    /// surface introduced by holding the lock across the store and logger seams — is DOCUMENTED AS A
+    /// RISK, not eliminated. This is NOT a general deadlock-safety guarantee.
+    /// </para>
+    /// <para>
+    /// (a) THE REENTRANCY TRUTH. <see cref="Monitor"/> is reentrant PER THREAD, and that reentrancy
+    /// protects against NEITHER danger that matters here. First, a same-thread recursive call back
+    /// into the mapping surface (e.g. a store or logger callback that re-enters
+    /// <c>UnregisterTask</c>) is silently ADMITTED by the Monitor and mutates the dictionary in the
+    /// middle of an in-flight admission — mutual exclusion is not violated, but the ATOMICITY the
+    /// lock is supposed to provide is. Second, cross-thread cycles are not helped at all: a thread
+    /// holding <c>_mappingLock</c> that synchronously waits on another thread which is itself
+    /// blocked acquiring <c>_mappingLock</c> deadlocks outright.
+    /// </para>
+    /// <para>
+    /// (b) THE PRECONDITION. Components invoked while the lock is held — today the
+    /// <see cref="PipelineStore"/> and the <see cref="ILogger{TCategoryName}"/> — MUST NOT re-enter
+    /// this manager's mapping surface, and MUST NOT synchronously wait (<c>Task.Wait</c>,
+    /// <c>.Result</c>, <c>Join</c>, a blocking handle) on other threads that do. Any future
+    /// component wired under the lock must be audited against this precondition before it is added.
+    /// </para>
+    /// <para>
+    /// (c) THE AUDIT LOCATION. The precondition was verified by CONCRETE INSPECTION of the
+    /// production wiring at the time this lock was introduced:
+    /// <list type="bullet">
+    ///   <item><description><see cref="PipelineStore"/> — every method (<c>SavePipeline</c>,
+    ///     <c>SavePipelineState</c>, <c>SaveTaskMapping</c>, <c>TrySaveTaskMappingIfUnowned</c>,
+    ///     <c>DeleteTaskMapping</c>, <c>DeleteTaskMappingIfForGoal</c>, <c>RemovePipeline</c>,
+    ///     <c>LoadPipeline</c>, <c>LoadActivePipelines</c>, <c>SaveAdmissionWithPointer</c>) is
+    ///     synchronous EF Core work over a per-operation context; none holds a reference to
+    ///     <see cref="GoalPipelineManager"/>, none raises events or invokes callbacks into it, and
+    ///     none blocks on another thread. Its only injectable seams —
+    ///     <c>PipelineStore.ContextDisposerForTest</c> and EF <c>IInterceptor</c>s — are
+    ///     TEST-ONLY: production registers no interceptors (see the plain
+    ///     <c>AddDbContextFactory(options =&gt; options.UseSqlite(...))</c> in <c>Program.cs</c>)
+    ///     and leaves the disposer seam null.</description></item>
+    ///   <item><description>The production logger wiring in <c>Program.cs</c> — the default console
+    ///     provider plus category filters, and the single custom provider
+    ///     <c>DashboardLoggerProvider</c>. Its logger appends to <c>DashboardLogSink</c>'s
+    ///     <c>ConcurrentQueue</c> and raises <c>OnNewEntry</c>, which has NO production subscriber;
+    ///     the sink performs no manager callback and no synchronous cross-thread wait.</description></item>
+    /// </list>
+    /// Both seams are therefore confirmed callback-free into this manager and free of synchronous
+    /// cross-thread waits.
+    /// </para>
+    /// </summary>
+    private readonly object _mappingLock = new();
+
     private readonly PipelineStore? _store;
     private readonly ILogger<GoalPipelineManager>? _logger;
 
@@ -87,8 +174,11 @@ public sealed class GoalPipelineManager
     /// <summary>Register a mapping from taskId → goalId so we can look up pipelines by task.</summary>
     public void RegisterTask(string taskId, string goalId)
     {
-        _taskToGoal[taskId] = goalId;
-        _store?.SaveTaskMapping(taskId, goalId);
+        lock (_mappingLock)
+        {
+            _taskToGoal[taskId] = goalId;
+            _store?.SaveTaskMapping(taskId, goalId);
+        }
     }
 
     /// <summary>
@@ -98,30 +188,33 @@ public sealed class GoalPipelineManager
     /// </summary>
     public GoalPipeline? RestorePipeline(string goalId)
     {
-        // If already in memory, return existing
-        if (_pipelines.TryGetValue(goalId, out var existing))
-            return existing;
-
-        if (_store is null)
-            return null;
-
-        var snapshot = _store.LoadPipeline(goalId);
-        if (snapshot is null)
-            return null;
-
-        var pipeline = new GoalPipeline(snapshot);
-        if (_pipelines.TryAdd(goalId, pipeline))
+        lock (_mappingLock)
         {
-            foreach (var (taskId, gid) in snapshot.TaskMappings)
-                _taskToGoal[taskId] = gid;
-        }
-        else
-        {
-            // Another thread added it — return their instance
-            return _pipelines[goalId];
-        }
+            // If already in memory, return existing
+            if (_pipelines.TryGetValue(goalId, out var existing))
+                return existing;
 
-        return pipeline;
+            if (_store is null)
+                return null;
+
+            var snapshot = _store.LoadPipeline(goalId);
+            if (snapshot is null)
+                return null;
+
+            var pipeline = new GoalPipeline(snapshot);
+            if (_pipelines.TryAdd(goalId, pipeline))
+            {
+                foreach (var (taskId, gid) in snapshot.TaskMappings)
+                    _taskToGoal[taskId] = gid;
+            }
+            else
+            {
+                // Another thread added it — return their instance
+                return _pipelines[goalId];
+            }
+
+            return pipeline;
+        }
     }
 
     /// <summary>
@@ -129,8 +222,11 @@ public sealed class GoalPipelineManager
     /// </summary>
     public void UnregisterTask(string taskId)
     {
-        _taskToGoal.TryRemove(taskId, out _);
-        _store?.DeleteTaskMapping(taskId);
+        lock (_mappingLock)
+        {
+            _taskToGoal.TryRemove(taskId, out _);
+            _store?.DeleteTaskMapping(taskId);
+        }
     }
 
     /// <summary>
@@ -158,50 +254,53 @@ public sealed class GoalPipelineManager
     /// <returns>The registration outcome.</returns>
     internal TaskRegistrationResult TryRegisterTask(string taskId, string goalId)
     {
-        if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
+        lock (_mappingLock)
         {
-            _logger?.LogDebug(
-                "TryRegisterTask called with blank taskId or goalId — no-op refusal (taskId='{TaskId}', goalId='{GoalId}')",
+            if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
+            {
+                _logger?.LogDebug(
+                    "TryRegisterTask called with blank taskId or goalId — no-op refusal (taskId='{TaskId}', goalId='{GoalId}')",
+                    taskId, goalId);
+                return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
+            }
+
+            // The in-memory claim comes FIRST: a task this manager already tracks is refused before a
+            // single statement reaches the database.
+            if (!_taskToGoal.TryAdd(taskId, goalId))
+            {
+                _logger?.LogWarning(
+                    "Task {TaskId} is already mapped to goal {ExistingGoalId}; refusing registration for goal {GoalId}",
+                    taskId, _taskToGoal.TryGetValue(taskId, out var existing) ? existing : "(unknown)", goalId);
+                return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
+            }
+
+            if (_store is null)
+                return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
+
+            bool persisted;
+            try
+            {
+                persisted = _store.TrySaveTaskMappingIfUnowned(taskId, goalId);
+            }
+            catch (Exception ex)
+            {
+                // Pair-based rollback removes OUR entry only — never another goal's.
+                _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
+                _logger?.LogError(ex, "Failed to persist task mapping {TaskId} → {GoalId}", taskId, goalId);
+                return new TaskRegistrationResult(false, TaskRegistrationFailure.PersistenceFailed, ex);
+            }
+
+            if (persisted)
+                return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
+
+            // The persisted row is another goal's. Roll our own in-memory entry back so this manager's
+            // memory agrees with the refusal; the competing row stays INTACT.
+            _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
+            _logger?.LogWarning(
+                "Task mapping {TaskId} is already owned by another goal in the store; refusing registration for goal {GoalId}",
                 taskId, goalId);
             return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
         }
-
-        // The in-memory claim comes FIRST: a task this manager already tracks is refused before a
-        // single statement reaches the database.
-        if (!_taskToGoal.TryAdd(taskId, goalId))
-        {
-            _logger?.LogWarning(
-                "Task {TaskId} is already mapped to goal {ExistingGoalId}; refusing registration for goal {GoalId}",
-                taskId, _taskToGoal.TryGetValue(taskId, out var existing) ? existing : "(unknown)", goalId);
-            return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
-        }
-
-        if (_store is null)
-            return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
-
-        bool persisted;
-        try
-        {
-            persisted = _store.TrySaveTaskMappingIfUnowned(taskId, goalId);
-        }
-        catch (Exception ex)
-        {
-            // Pair-based rollback removes OUR entry only — never another goal's.
-            _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
-            _logger?.LogError(ex, "Failed to persist task mapping {TaskId} → {GoalId}", taskId, goalId);
-            return new TaskRegistrationResult(false, TaskRegistrationFailure.PersistenceFailed, ex);
-        }
-
-        if (persisted)
-            return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
-
-        // The persisted row is another goal's. Roll our own in-memory entry back so this manager's
-        // memory agrees with the refusal; the competing row stays INTACT.
-        _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
-        _logger?.LogWarning(
-            "Task mapping {TaskId} is already owned by another goal in the store; refusing registration for goal {GoalId}",
-            taskId, goalId);
-        return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
     }
 
     /// <summary>
@@ -220,41 +319,139 @@ public sealed class GoalPipelineManager
     /// <returns>The unregistration outcome.</returns>
     internal TaskUnregisterResult TryUnregisterTask(string taskId, string goalId)
     {
-        if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
+        lock (_mappingLock)
         {
-            _logger?.LogDebug(
-                "TryUnregisterTask called with blank taskId or goalId — no-op (taskId='{TaskId}', goalId='{GoalId}')",
-                taskId, goalId);
-            return new TaskUnregisterResult(false, false);
-        }
-
-        if (!_taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId)))
-        {
-            _logger?.LogDebug(
-                "Task {TaskId} is not mapped to goal {GoalId} in memory — nothing removed",
-                taskId, goalId);
-            return new TaskUnregisterResult(false, false);
-        }
-
-        if (_store is null)
-            return new TaskUnregisterResult(true, true);
-
-        try
-        {
-            var deleted = _store.DeleteTaskMappingIfForGoal(taskId, goalId);
-            if (!deleted)
+            if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
             {
-                _logger?.LogWarning(
-                    "Task mapping {TaskId} for goal {GoalId} was not deleted (absent or owned by another goal); persisted residue remains",
+                _logger?.LogDebug(
+                    "TryUnregisterTask called with blank taskId or goalId — no-op (taskId='{TaskId}', goalId='{GoalId}')",
                     taskId, goalId);
+                return new TaskUnregisterResult(false, false);
             }
-            return new TaskUnregisterResult(true, deleted);
+
+            if (!_taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId)))
+            {
+                _logger?.LogDebug(
+                    "Task {TaskId} is not mapped to goal {GoalId} in memory — nothing removed",
+                    taskId, goalId);
+                return new TaskUnregisterResult(false, false);
+            }
+
+            if (_store is null)
+                return new TaskUnregisterResult(true, true);
+
+            try
+            {
+                var deleted = _store.DeleteTaskMappingIfForGoal(taskId, goalId);
+                if (!deleted)
+                {
+                    _logger?.LogWarning(
+                        "Task mapping {TaskId} for goal {GoalId} was not deleted (absent or owned by another goal); persisted residue remains",
+                        taskId, goalId);
+                }
+                return new TaskUnregisterResult(true, deleted);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(
+                    ex, "Failed to delete persisted task mapping {TaskId} → {GoalId}; persisted residue remains", taskId, goalId);
+                return new TaskUnregisterResult(true, false);
+            }
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>
+    /// Admits a task attempt: the in-memory mapping claim plus the persisted mapping+pointer rows
+    /// (the E2a-i transaction). GUARANTEE (the honest wording): the mapping WRITERS are serialized
+    /// (every _taskToGoal mutation under _mappingLock) and the DATABASE commit is atomic. NOT a
+    /// single linearizable memory-plus-database event: lock-free readers may observe the transient
+    /// claim before the commit resolves, and the claim may roll back — the honesty stated.
+    /// </summary>
+    /// <remarks>
+    /// UNUSED BY DESIGN in this slice: the API is complete and tested, but no production caller
+    /// exists yet — the dispatch path's migration onto it belongs to the successor slice.
+    /// </remarks>
+    /// <param name="pipeline">The pipeline claiming the task; its <c>ActiveTaskId</c> MUST equal
+    /// <paramref name="taskId"/>.</param>
+    /// <param name="taskId">The worker task id being admitted.</param>
+    /// <returns>The admission outcome.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="pipeline"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="taskId"/> is null or blank, or does not
+    /// equal <paramref name="pipeline"/>'s active task id.</exception>
+    internal AdmissionCommitResult PersistAdmission(GoalPipeline pipeline, string taskId)
+    {
+        // THE VALIDATIONS run BEFORE the lock: an invalid call never touches the dictionary and
+        // never contends for the mapping surface.
+        ArgumentNullException.ThrowIfNull(pipeline);
+
+        if (string.IsNullOrWhiteSpace(taskId))
+            throw new ArgumentException("Task id must be a non-blank value.", nameof(taskId));
+
+        if (pipeline.ActiveTaskId != taskId)
+            throw new ArgumentException(
+                $"Task id '{taskId}' does not match the pipeline's active task id '{pipeline.ActiveTaskId}' (goal={pipeline.GoalId}).",
+                nameof(taskId));
+
+        lock (_mappingLock)
         {
-            _logger?.LogError(
-                ex, "Failed to delete persisted task mapping {TaskId} → {GoalId}; persisted residue remains", taskId, goalId);
-            return new TaskUnregisterResult(true, false);
+            // (1) PREFLIGHT: a task this manager already tracks is refused before a single
+            //     statement reaches the database and before any claim is made.
+            if (_taskToGoal.TryGetValue(taskId, out var existingGoalId))
+            {
+                _logger?.LogDebug(
+                    "Admission refused — task {TaskId} is already mapped (goal={ExistingGoalId}); no store call made",
+                    taskId, existingGoalId);
+                return new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict);
+            }
+
+            // (2) THE CLAIM.
+            _taskToGoal[taskId] = pipeline.GoalId;
+
+            // (3) NO STORE: the claim alone is the admission.
+            if (_store is null)
+            {
+                _logger?.LogDebug(
+                    "Admission committed in memory only — no store configured (goal={GoalId} task={TaskId})",
+                    pipeline.GoalId, taskId);
+                return new AdmissionCommitResult(AdmissionCommitStatus.NoStore);
+            }
+
+            // (4) THE E2a-i PRIMITIVE, consumed untouched.
+            AdmissionStoreResult storeResult;
+            try
+            {
+                storeResult = _store.SaveAdmissionWithPointer(pipeline, taskId);
+            }
+            catch (Exception ex)
+            {
+                // Pair-based rollback removes OUR claim only — never another attempt's.
+                _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
+                _logger?.LogWarning(
+                    ex,
+                    "Admission failed — the store threw for task {TaskId} (goal={GoalId}); the memory claim removed",
+                    taskId, pipeline.GoalId);
+                return new AdmissionCommitResult(AdmissionCommitStatus.PersistenceFailed, ex);
+            }
+
+            switch (storeResult)
+            {
+                case AdmissionStoreResult.Committed:
+                    _logger?.LogDebug(
+                        "Admission committed goal={GoalId} task={TaskId}",
+                        pipeline.GoalId, taskId);
+                    return new AdmissionCommitResult(AdmissionCommitStatus.Committed);
+
+                case AdmissionStoreResult.PersistConflict:
+                    _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
+                    _logger?.LogDebug(
+                        "Admission rolled back — task {TaskId}'s persisted row is owned by another attempt; the memory claim removed",
+                        taskId);
+                    return new AdmissionCommitResult(AdmissionCommitStatus.PersistConflict);
+
+                default:
+                    throw new InvalidOperationException(
+                        $"Unhandled admission store result '{storeResult}' for task '{taskId}' (goal={pipeline.GoalId}).");
+            }
         }
     }
 
@@ -278,36 +475,42 @@ public sealed class GoalPipelineManager
     /// <summary>Remove a completed pipeline to free memory and clean up storage.</summary>
     public bool RemovePipeline(string goalId)
     {
-        var wasInMemory = _pipelines.TryRemove(goalId, out _);
-        if (wasInMemory)
+        lock (_mappingLock)
         {
-            foreach (var key in _taskToGoal.Where(kv => kv.Value == goalId).Select(kv => kv.Key).ToList())
-                _taskToGoal.TryRemove(key, out _);
+            var wasInMemory = _pipelines.TryRemove(goalId, out _);
+            if (wasInMemory)
+            {
+                foreach (var key in _taskToGoal.Where(kv => kv.Value == goalId).Select(kv => kv.Key).ToList())
+                    _taskToGoal.TryRemove(key, out _);
+            }
+            _store?.RemovePipeline(goalId);  // always clean up the store, even if not in memory
+            return wasInMemory;
         }
-        _store?.RemovePipeline(goalId);  // always clean up the store, even if not in memory
-        return wasInMemory;
     }
 
     /// <summary>Restore pipelines from persistent store (called once at startup).</summary>
     public List<GoalPipeline> RestoreFromStore()
     {
-        if (_store is null) return [];
-
-        var snapshots = _store.LoadActivePipelines();
-        var restored = new List<GoalPipeline>();
-
-        foreach (var snap in snapshots)
+        lock (_mappingLock)
         {
-            var pipeline = new GoalPipeline(snap);
-            if (_pipelines.TryAdd(snap.GoalId, pipeline))
-            {
-                foreach (var (taskId, goalId) in snap.TaskMappings)
-                    _taskToGoal[taskId] = goalId;
-                restored.Add(pipeline);
-            }
-        }
+            if (_store is null) return [];
 
-        return restored;
+            var snapshots = _store.LoadActivePipelines();
+            var restored = new List<GoalPipeline>();
+
+            foreach (var snap in snapshots)
+            {
+                var pipeline = new GoalPipeline(snap);
+                if (_pipelines.TryAdd(snap.GoalId, pipeline))
+                {
+                    foreach (var (taskId, goalId) in snap.TaskMappings)
+                        _taskToGoal[taskId] = goalId;
+                    restored.Add(pipeline);
+                }
+            }
+
+            return restored;
+        }
     }
 
     /// <summary>
