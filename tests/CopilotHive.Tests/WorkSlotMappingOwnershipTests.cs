@@ -717,6 +717,160 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         Assert.Null(manager.GetByTaskId("legacy-task"));
         Assert.Null(ReadPersistedGoalId("legacy-task"));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7) β-PREP-2 — the FOUR guarded TryUnregisterTask log sites
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE BLANK SITE (~326): the predicate logger throws exactly at the blank/no-op DEBUG
+    /// template. The swallow is the guard's proof: the outcome <c>(false, false)</c> is still
+    /// returned and no exception escapes — the NEVER-THROWS contract holds even for a throwing
+    /// logger.
+    /// </summary>
+    [Fact]
+    public void TryUnregisterTask_BlankLogThrows_OutcomeStillReturned()
+    {
+        var logger = new ManagerPredicateThrowingLogger(
+            m => m.StartsWith("TryUnregisterTask called with blank taskId or goalId", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+
+        var result = manager.TryUnregisterTask("", "goal-ours");
+
+        Assert.Equal(new TaskUnregisterResult(false, false), result);
+        Assert.True(logger.ThrewAtLeastOnce, "the blank site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE NOT-MAPPED SITE (~334): the predicate logger throws exactly at the not-mapped DEBUG
+    /// template (the pair-based remove took nothing). The outcome <c>(false, false)</c> is still
+    /// returned; the logger's exception does not escape.
+    /// </summary>
+    [Fact]
+    public void TryUnregisterTask_NotMappedLogThrows_OutcomeStillReturned()
+    {
+        var logger = new ManagerPredicateThrowingLogger(
+            m => m.Contains("is not mapped to goal", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+
+        var result = manager.TryUnregisterTask("unreg-nm-throws", "goal-ours");
+
+        Assert.Equal(new TaskUnregisterResult(false, false), result);
+        Assert.Null(manager.GetByTaskId("unreg-nm-throws"));
+        Assert.True(logger.ThrewAtLeastOnce, "the not-mapped site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE RESIDUE SITE (~348): the persisted row was stolen by the racer, so the conditional
+    /// delete matched 0 rows and the residue WARNING site is reached. The predicate logger throws
+    /// there; the outcome <c>(true, false)</c> is still returned and the competing row stays
+    /// INTACT.
+    /// </summary>
+    /// <remarks>
+    /// THE PER-SITE GUARD PROOF (removal-failing): the logger records EVERY emission it was
+    /// asked to make, so the test can distinguish the residue WARNING from the store-exception
+    /// ERROR. With the WARNING's OWN guard in place the throw is swallowed locally and the
+    /// surrounding store catch never runs — the ERROR template is NEVER emitted. If the local
+    /// guard were removed, the WARNING's throw would escape into the surrounding store-exception
+    /// catch, which emits the "Failed to delete persisted task mapping" ERROR (misclassifying the
+    /// logger's exception as a store failure) — an OBSERVABLE difference this test fails on.
+    /// </remarks>
+    [Fact]
+    public void TryUnregisterTask_ResidueLogThrows_OutcomeStillReturned()
+    {
+        var logger = new ManagerPredicateThrowingLogger(
+            m => m.Contains("was not deleted (absent or owned by another goal)", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        manager.CreatePipeline(CreateGoal("goal-ours"));
+        manager.RegisterTask("unreg-residue-throws", "goal-ours");
+
+        // The racer takes over the persisted row.
+        RacerWritesMapping("unreg-residue-throws", "goal-racer");
+
+        var result = manager.TryUnregisterTask("unreg-residue-throws", "goal-ours");
+
+        Assert.Equal(new TaskUnregisterResult(true, false), result);
+        Assert.Null(manager.GetByTaskId("unreg-residue-throws"));
+        Assert.Equal("goal-racer", ReadPersistedGoalId("unreg-residue-throws"));
+        Assert.True(logger.ThrewAtLeastOnce, "the residue site's logger must actually have thrown");
+
+        // THE SITE WAS REALLY REACHED: the residue WARNING was attempted (and its throw
+        // recorded) — the swallow below is otherwise unprovable.
+        Assert.Contains(
+            logger.Emissions,
+            e => e.Level == LogLevel.Warning &&
+                 e.Message.Contains("was not deleted (absent or owned by another goal)", StringComparison.Ordinal));
+
+        // THE PER-SITE GUARD HELD: the store-exception ERROR never fired. With the residue
+        // WARNING's own guard removed, its throw escapes into the surrounding store-exception
+        // catch, which emits this ERROR — the misclassification this assertion detects.
+        Assert.DoesNotContain(
+            logger.Emissions,
+            e => e.Message.Contains("Failed to delete persisted task mapping", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// THE STORE-EXCEPTION SITE (~356): the interceptor's sentinel forces the conditional delete
+    /// to throw. The store's exception is caught (the residue signalled as <c>(true, false)</c>),
+    /// the ERROR site's logger throws, the swallow proves the guard — and the store's ORIGINAL
+    /// exception is still carried to the (guarded) ERROR line, never converted into an escape.
+    /// </summary>
+    [Fact]
+    public void TryUnregisterTask_StoreExceptionLogThrows_OutcomeStillReturned()
+    {
+        var sentinel = new InvalidOperationException("unregister-guard-sentinel");
+        var logger = new ManagerPredicateThrowingLogger(
+            m => m.Contains("Failed to delete persisted task mapping", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(
+            CreateStore(new SentinelThrowingInterceptor(sentinel, "DELETE")), logger);
+        manager.CreatePipeline(CreateGoal("goal-ours"));
+        manager.RegisterTask("unreg-store-throws", "goal-ours");
+
+        var result = manager.TryUnregisterTask("unreg-store-throws", "goal-ours");
+
+        Assert.Equal(new TaskUnregisterResult(true, false), result);
+        Assert.Null(manager.GetByTaskId("unreg-store-throws"));
+        Assert.Equal("goal-ours", ReadPersistedGoalId("unreg-store-throws"));
+        Assert.True(logger.ThrewAtLeastOnce, "the store-exception site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// β-PREP-2 vector logger: throws ONLY when the formatted message matches the predicate —
+    /// the targeted seam proving that ONE guarded site swallows the logger's exception while the
+    /// outcome is still returned. Every emission (throwing ones included) is RECORDED with its
+    /// log level and rendered message, so a test can distinguish WHICH site's emission was
+    /// attempted — the discriminator a removal-proof needs when two guarded sites sit inside the
+    /// same surrounding catch.
+    /// </summary>
+    private sealed class ManagerPredicateThrowingLogger : ILogger<GoalPipelineManager>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+
+        public ManagerPredicateThrowingLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        /// <summary>Every emission the logger was asked to make — level plus rendered message.</summary>
+        public List<(LogLevel Level, string Message)> Emissions { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            Emissions.Add((logLevel, message));
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("manager-logger-sentinel");
+        }
+    }
 }
 
 /// <summary>
@@ -1497,6 +1651,170 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
             "INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, active_task_id, created_at) " +
             "VALUES ('" + goalId + "', 'Seeded', '" + goalJson + "', 'Planning', '{}', '" + taskId +
             "', '2025-06-15T10:00:00.0000000Z')");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (E) β-PREP-2 — the FIVE guarded PersistAdmission outcome log sites
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE COMMITTED OUTCOME SITE: the predicate logger throws exactly at the committed DEBUG
+    /// template. The swallow is the guard's proof: the outcome record — Committed with both β
+    /// flags true — is still returned and no exception escapes.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_CommittedLogThrows_OutcomeStillReturned()
+    {
+        var logger = new AdmissionPredicateThrowingLogger(
+            m => m.Contains("Admission committed goal=", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-c-log", "task-c-log");
+
+        var result = manager.PersistAdmission(pipeline, "task-c-log");
+
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.Committed,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: true), result);
+        Assert.Same(pipeline, manager.GetByTaskId("task-c-log"));
+        Assert.Equal("goal-c-log", ReadPersistedGoalId("task-c-log"));
+        Assert.True(logger.ThrewAtLeastOnce, "the committed site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE MEMORY-CONFLICT OUTCOME SITE: the predicate logger throws exactly at the refused
+    /// DEBUG template (the pre-existing identical pair). The outcome record — MemoryConflict with
+    /// both flags false — is still returned; the logger's exception does not escape.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_MemoryConflictLogThrows_OutcomeStillReturned()
+    {
+        var logger = new AdmissionPredicateThrowingLogger(
+            m => m.Contains("Admission refused — task", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-mc-log", "task-mc-log");
+        manager.RegisterTask("task-mc-log", "goal-mc-log");
+
+        var result = manager.PersistAdmission(pipeline, "task-mc-log");
+
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.MemoryConflict,
+            ClaimedThisInvocation: false,
+            CommittedThisInvocation: false), result);
+        Assert.Same(pipeline, manager.GetByTaskId("task-mc-log"));
+        Assert.Equal("goal-mc-log", ReadPersistedGoalId("task-mc-log"));
+        Assert.True(logger.ThrewAtLeastOnce, "the memory-conflict site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE PERSIST-CONFLICT OUTCOME SITE: a competing persisted row (the racer's) makes the
+    /// transaction refuse; the predicate logger throws exactly at the rolled-back DEBUG template.
+    /// The outcome record — PersistConflict, Claimed=true (the claim WAS made before the α
+    /// rollback removed it), Committed=false — is still returned and the competing row stays
+    /// INTACT.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_PersistConflictLogThrows_OutcomeStillReturned()
+    {
+        ExecuteOnKeeper(
+            "INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-pc-log', 'goal-competitor')");
+        var logger = new AdmissionPredicateThrowingLogger(
+            m => m.Contains("Admission rolled back — task", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-pc-log", "task-pc-log");
+
+        var result = manager.PersistAdmission(pipeline, "task-pc-log");
+
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.PersistConflict,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: false), result);
+        Assert.Null(manager.GetByTaskId("task-pc-log"));
+        Assert.Equal("goal-competitor", ReadPersistedGoalId("task-pc-log"));
+        Assert.True(logger.ThrewAtLeastOnce, "the persist-conflict site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE PERSISTENCE-FAILED OUTCOME SITE: the interceptor's sentinel forces the store to throw;
+    /// the store's exception is caught, the claim rolled back, and the WARNING site's logger
+    /// throws. The swallow proves the guard: the outcome record — PersistenceFailed with
+    /// Claimed=true, Committed=false and the store's exception CARRIED on the result — is still
+    /// returned (the two-exception distinction: only the LOGGER's throw is swallowed).
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_PersistenceFailedLogThrows_OutcomeStillReturned()
+    {
+        var sentinel = new InvalidOperationException("admission-guard-sentinel");
+        var logger = new AdmissionPredicateThrowingLogger(
+            m => m.Contains("Admission failed — the store threw for task", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(
+            CreateStore(new SentinelThrowingInterceptor(sentinel, "INSERT")), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-pf-log", "task-pf-log");
+
+        var result = manager.PersistAdmission(pipeline, "task-pf-log");
+
+        Assert.Equal(AdmissionCommitStatus.PersistenceFailed, result.Status);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
+        Assert.NotNull(result.PersistenceException);
+        Assert.Null(manager.GetByTaskId("task-pf-log"));
+        Assert.Null(ReadPersistedGoalId("task-pf-log"));
+        Assert.True(logger.ThrewAtLeastOnce, "the persistence-failed site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// THE NO-STORE OUTCOME SITE: the predicate logger throws exactly at the in-memory-only DEBUG
+    /// template. The outcome record — NoStore with Claimed=true, Committed=false — is still
+    /// returned and the claim stands; the logger's exception does not escape.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_NoStoreLogThrows_OutcomeStillReturned()
+    {
+        var logger = new AdmissionPredicateThrowingLogger(
+            m => m.Contains("Admission committed in memory only", StringComparison.Ordinal));
+        var manager = new GoalPipelineManager(store: null, logger);
+        var pipeline = CreateActivePipeline(manager, "goal-ns-log", "task-ns-log");
+
+        var result = manager.PersistAdmission(pipeline, "task-ns-log");
+
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.NoStore,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: false), result);
+        Assert.Same(pipeline, manager.GetByTaskId("task-ns-log"));
+        Assert.True(logger.ThrewAtLeastOnce, "the no-store site's logger must actually have thrown");
+    }
+
+    /// <summary>
+    /// β-PREP-2 vector logger for <see cref="GoalPipelineManager.PersistAdmission"/>: throws ONLY
+    /// when the formatted message matches the predicate — the targeted seam proving that ONE
+    /// guarded outcome site swallows the logger's exception while the outcome record is still
+    /// returned.
+    /// </summary>
+    private sealed class AdmissionPredicateThrowingLogger : ILogger<GoalPipelineManager>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+
+        public AdmissionPredicateThrowingLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("admission-logger-sentinel");
+        }
     }
 }
 

@@ -763,30 +763,51 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // (7 + 11d) The unregister contract violation — the belt-and-braces catch
+    // (7 + 11d) The dispatch-owned unregister-result record — the GUARDED seam
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// <see cref="GoalPipelineManager.TryUnregisterTask"/> promises never to throw; an INJECTED
-    /// THROWING LOGGER is the one feasible way to violate that. The <c>step=unregister</c> catch
-    /// fires, the rollback continues, and the ORIGINAL enqueue exception is still thrown.
+    /// THE β-PREP-2 SEAM: a dispatch-level predicate logger whose throw targets ONLY the
+    /// dispatch-owned unregister-result DEBUG template. THE VECTOR: the same enqueue-throw shape
+    /// the old contract-violation test used — the OnEnqueue two-step seed (the competitor steals
+    /// the mapping, then the sentinel infrastructure throw) — so the enqueue catch's rollback
+    /// runs. The rollback's TryUnregisterTask hits the not-mapped path → (false, false); the
+    /// dispatch-owned DEBUG record of that result then THROWS — and is SWALLOWED inside
+    /// <c>TaskDispatchService.LogSafely</c>, with no catch elsewhere firing and the control
+    /// flow unchanged.
     /// </summary>
+    /// <remarks>
+    /// WHAT THE SWALLOW PROVES: with the (false, false) result, the (true-memory, failed-persist)
+    /// partial is IMPOSSIBLE here, so no LogRollbackFailure("unregister") record may appear
+    /// anywhere — the no-rollback-failure semantics of the (false, false) path are PRESERVED
+    /// through the guarded emission. The abandoned-registration line RECORDED proves the
+    /// remaining rollback steps still ran after the swallowed throw, and the ORIGINAL sentinel is
+    /// what leaves the dispatch — the logger's exception appears NOWHERE (the two-exception
+    /// distinction: only the LOGGER's throw is swallowed; the infrastructure exception still
+    /// rethrows).
+    /// </remarks>
     [Fact]
-    public async Task Dispatch_UnregisterThrows_LogsUnregisterStepAndStillRethrowsOriginal()
+    public async Task Dispatch_UnregisterResultLogThrows_LogIsSwallowedAndCleanupContinues_RethrowsOriginal()
     {
-        // A throwing logger: the success path of TryRegisterTask with a null store never logs,
-        // so only the rollback's TryUnregisterTask trips it.
-        var manager = new GoalPipelineManager(store: null, new ThrowingLogger<GoalPipelineManager>());
+        var manager = new GoalPipelineManager(store: null, new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         manager.CreatePipeline(CreateGoal("goal-other"));
         Arrange(pipeline, GoalPhase.Coding);
 
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue();
-        var logger = new TestLogger<TaskDispatchService>();
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE SEAM: throws ONLY at the dispatch-owned unregister-result DEBUG template — the
+        // guarded site under test. The earlier abandoned-registration emission (a WARNING with a
+        // different template) must therefore SUCCEED, which is what makes its presence below a
+        // real ordering proof rather than a vacuous one.
+        var logger = new SelectivelyThrowingLogger<TaskDispatchService>(
+            m => m.Contains("WorkSlotIntegrity: unregister goal=", StringComparison.Ordinal));
         var service = CreateService(manager, queue, logger);
 
-        // The race makes the manager take its DEBUG-logging branch, where the injected logger throws.
+        // The OnEnqueue two-step seed: (i) the competitor claims the mapping (so the rollback's
+        // TryUnregisterTask is not ours → (false, false)), (ii) the ORIGINAL sentinel throw.
         queue.OnEnqueue = task =>
         {
             manager.RegisterTask(task.TaskId, "goal-other");
@@ -796,20 +817,33 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
 
+        // THE TWO-EXCEPTION DISTINCTION: the ORIGINAL sentinel is what left the dispatch —
+        // the logger's exception is nowhere.
         Assert.Same(sentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
-        Assert.Contains(logger.LogEntries, e =>
-            e.LogLevel == LogLevel.Warning &&
-            e.Message == RollbackFailureMessage(GoalId, taskId, "unregister") &&
-            e.Exception is not null);
+        // THE SWALLOW HAPPENED (the guarded site really was reached)…
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m == $"WorkSlotIntegrity: unregister goal={GoalId} task={taskId} memoryRemoved=False persistenceRemoved=False");
 
-        // The rollback CONTINUED past the swallowed throw.
+        // …AND the (false, false)'s no-rollback-failure semantics are preserved: NO
+        // LogRollbackFailure("unregister") record anywhere — the DEBUG template's throw was
+        // swallowed by LogSafely, never diverted into the surrounding catch.
+        Assert.DoesNotContain(
+            logger.SeenMessages, m => m.Contains("rollback-failure", StringComparison.Ordinal));
+
+        // THE ROLLBACK CONTINUED: the slot is abandoned, the pointer cleared, and the
+        // abandoned-registration line was RECORDED (the predicate never threw at it).
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(pipeline.ActiveTaskId);
-        Assert.Contains(logger.LogEntries, e =>
-            e.LogLevel == LogLevel.Warning &&
-            e.Message == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
+
+        // THE NOT-MAPPED SEMANTICS: the pair-based remove took nothing of ours — the
+        // competitor's mapping survives (the (false, false) shape in memory).
+        var otherPipeline = manager.GetByGoalId("goal-other");
+        Assert.Same(otherPipeline, manager.GetByTaskId(taskId));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -359,9 +359,12 @@ internal sealed class TaskDispatchService
             try
             {
                 var unregister = _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
-                _logger.LogDebug(
+                // GUARDED SITE (β-PREP-2): the dispatch-owned unregister-result record goes
+                // through LogSafely, so a throwing logger is swallowed and the rollback
+                // continues — the cleanup-before-log contract.
+                LogSafely(() => _logger.LogDebug(
                     "WorkSlotIntegrity: unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved}",
-                    pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved);
+                    pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved));
 
                 if (unregister.MemoryRemoved && !unregister.PersistenceRemoved)
                     LogRollbackFailure(pipeline.GoalId, taskId, "unregister-persist", null);
@@ -651,15 +654,20 @@ internal sealed class TaskDispatchService
     };
 
     /// <summary>
-    /// Runs one POST-DEQUEUE diagnostic emission and SWALLOWS any failure of the logging
-    /// infrastructure.
+    /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never
+    /// affect the guarded operation.
     /// </summary>
     /// <remarks>
-    /// THE BOUNDARY RULE: the dequeue is the boundary. AFTER it a task is in flight and owned by
-    /// nobody but this transaction, so a logger's throw must never strand it — every record inside
-    /// the delivery transaction is best-effort. BEFORE it nothing has been touched, so pre-dequeue
-    /// logging deliberately stays unguarded and a throw there propagates as an infrastructure
-    /// failure.
+    /// TWO GUARDED ZONES:
+    /// (1) THE DELIVERY ZONE — after the dequeue: a task is in flight and owned by nobody but this
+    ///     transaction, so a logger's throw must never strand it — every record inside the delivery
+    ///     transaction is best-effort.
+    /// (2) THE ADMISSION-ROLLBACK ZONE — the rollback helpers (LogAbandonedRegistration,
+    ///     LogRollbackFailure) and the unregister-result record: their callers run after the slot
+    ///     capture, where a logger's throw must never abort the cleanup — the cleanup-before-log
+    ///     contract.
+    /// PRE-DEQUEUE preparation logging (the model/prompt diagnostics) deliberately stays UNGUARDED —
+    /// a throw there propagates as an infrastructure failure (nothing has been touched).
     /// </remarks>
     /// <param name="emit">The guarded emission.</param>
     private static void LogSafely(Action emit)
@@ -774,19 +782,19 @@ internal sealed class TaskDispatchService
 
     /// <summary>Logs that a dispatch failed before delivery and its slot was released.</summary>
     private void LogAbandonedRegistration(string goalId, string taskId, WorkSlotPosition position) =>
-        _logger.LogWarning(
+        LogSafely(() => _logger.LogWarning(
             "WorkSlotIntegrity: abandoned-registration goal={GoalId} task={TaskId} position={Iteration}:{Phase}:{Occurrence} — the dispatch failed before delivery; the slot is released",
-            goalId, taskId, position.Iteration, FormatLogValue(position.Phase), position.Occurrence);
+            goalId, taskId, position.Iteration, FormatLogValue(position.Phase), position.Occurrence));
 
     /// <summary>
     /// Logs a failed rollback step. <paramref name="step"/> is one of
     /// <c>abandon</c>, <c>pointer</c>, <c>unregister</c>, <c>unregister-persist</c>.
     /// </summary>
     private void LogRollbackFailure(string goalId, string taskId, string step, Exception? ex) =>
-        _logger.LogWarning(
+        LogSafely(() => _logger.LogWarning(
             ex,
             "WorkSlotIntegrity: rollback-failure goal={GoalId} task={TaskId} step={Step} — the rollback step failed; continuing",
-            goalId, taskId, step);
+            goalId, taskId, step));
 
     /// <summary>
     /// Resolves the list of <see cref="TargetRepository"/> instances for the given goal by looking
