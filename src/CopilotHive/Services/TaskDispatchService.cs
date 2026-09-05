@@ -781,11 +781,6 @@ internal sealed class TaskDispatchService
     }
 
     /// <summary>Logs that a dispatch failed before delivery and its slot was released.</summary>
-    /// <remarks>
-    /// GUARDED (β-PREP-2): the body runs inside <see cref="LogSafely"/>, so a throwing logger is
-    /// swallowed and the caller's rollback/cleanup control flow is untouched — the
-    /// cleanup-before-log contract.
-    /// </remarks>
     private void LogAbandonedRegistration(string goalId, string taskId, WorkSlotPosition position) =>
         LogSafely(() => _logger.LogWarning(
             "WorkSlotIntegrity: abandoned-registration goal={GoalId} task={TaskId} position={Iteration}:{Phase}:{Occurrence} — the dispatch failed before delivery; the slot is released",
@@ -795,11 +790,6 @@ internal sealed class TaskDispatchService
     /// Logs a failed rollback step. <paramref name="step"/> is one of
     /// <c>abandon</c>, <c>pointer</c>, <c>unregister</c>, <c>unregister-persist</c>.
     /// </summary>
-    /// <remarks>
-    /// GUARDED (β-PREP-2): the body runs inside <see cref="LogSafely"/>, so a throwing logger is
-    /// swallowed and the caller's rollback/cleanup control flow is untouched — the
-    /// cleanup-before-log contract.
-    /// </remarks>
     private void LogRollbackFailure(string goalId, string taskId, string step, Exception? ex) =>
         LogSafely(() => _logger.LogWarning(
             ex,

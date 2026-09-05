@@ -766,6 +766,15 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     /// there; the outcome <c>(true, false)</c> is still returned and the competing row stays
     /// INTACT.
     /// </summary>
+    /// <remarks>
+    /// THE PER-SITE GUARD PROOF (removal-failing): the logger records EVERY emission it was
+    /// asked to make, so the test can distinguish the residue WARNING from the store-exception
+    /// ERROR. With the WARNING's OWN guard in place the throw is swallowed locally and the
+    /// surrounding store catch never runs — the ERROR template is NEVER emitted. If the local
+    /// guard were removed, the WARNING's throw would escape into the surrounding store-exception
+    /// catch, which emits the "Failed to delete persisted task mapping" ERROR (misclassifying the
+    /// logger's exception as a store failure) — an OBSERVABLE difference this test fails on.
+    /// </remarks>
     [Fact]
     public void TryUnregisterTask_ResidueLogThrows_OutcomeStillReturned()
     {
@@ -784,6 +793,20 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         Assert.Null(manager.GetByTaskId("unreg-residue-throws"));
         Assert.Equal("goal-racer", ReadPersistedGoalId("unreg-residue-throws"));
         Assert.True(logger.ThrewAtLeastOnce, "the residue site's logger must actually have thrown");
+
+        // THE SITE WAS REALLY REACHED: the residue WARNING was attempted (and its throw
+        // recorded) — the swallow below is otherwise unprovable.
+        Assert.Contains(
+            logger.Emissions,
+            e => e.Level == LogLevel.Warning &&
+                 e.Message.Contains("was not deleted (absent or owned by another goal)", StringComparison.Ordinal));
+
+        // THE PER-SITE GUARD HELD: the store-exception ERROR never fired. With the residue
+        // WARNING's own guard removed, its throw escapes into the surrounding store-exception
+        // catch, which emits this ERROR — the misclassification this assertion detects.
+        Assert.DoesNotContain(
+            logger.Emissions,
+            e => e.Message.Contains("Failed to delete persisted task mapping", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -814,7 +837,10 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     /// <summary>
     /// β-PREP-2 vector logger: throws ONLY when the formatted message matches the predicate —
     /// the targeted seam proving that ONE guarded site swallows the logger's exception while the
-    /// outcome is still returned.
+    /// outcome is still returned. Every emission (throwing ones included) is RECORDED with its
+    /// log level and rendered message, so a test can distinguish WHICH site's emission was
+    /// attempted — the discriminator a removal-proof needs when two guarded sites sit inside the
+    /// same surrounding catch.
     /// </summary>
     private sealed class ManagerPredicateThrowingLogger : ILogger<GoalPipelineManager>
     {
@@ -825,6 +851,9 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         /// <summary>True once the throwing branch has actually been taken.</summary>
         public bool ThrewAtLeastOnce { get; private set; }
 
+        /// <summary>Every emission the logger was asked to make — level plus rendered message.</summary>
+        public List<(LogLevel Level, string Message)> Emissions { get; } = [];
+
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -834,6 +863,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
             Func<TState, Exception?, string> formatter)
         {
             var message = formatter(state, exception);
+            Emissions.Add((logLevel, message));
             if (!_shouldThrow(message))
                 return;
 
