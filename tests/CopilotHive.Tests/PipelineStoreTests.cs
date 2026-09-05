@@ -896,8 +896,8 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
 /// </summary>
 public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
 {
-    private const string SharedConnectionString =
-        "Data Source=file:memdb-admissiondirect?mode=memory&cache=shared";
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-admissiondirect-{Guid.NewGuid():N}?mode=memory&cache=shared";
 
     private readonly SqliteConnection _keeper;
     private readonly List<DbConnection> _connections = [];
@@ -906,12 +906,14 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
 
     public PipelineStoreAdmissionDirectContextTests()
     {
-        _keeper = new SqliteConnection(SharedConnectionString);
+        // Each instance gets its own per-instance-unique, unshared database — no rows can
+        // leak across xUnit fixture instances. The keeper anchors that database's lifetime
+        // for the whole test; each test still starts from a clean slate (the wipes are
+        // harmless on an already-empty database) so the "no write" proofs and count
+        // assertions observe only their own call's effects.
+        _keeper = new SqliteConnection(_connectionString);
         _keeper.Open();
         CreateContext().Database.EnsureCreated();
-        // The shared named database survives across class instances (the keeper is
-        // per-instance); each test starts from a clean slate so the "no write" proofs and
-        // count assertions observe only their own call's effects.
         ExecuteOnKeeper("DELETE FROM task_mappings");
         ExecuteOnKeeper("DELETE FROM pipelines");
     }
@@ -932,7 +934,7 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     /// <summary>Creates a direct (caller-owned) context on its OWN connection to the shared database.</summary>
     private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
     {
-        var connection = new SqliteConnection(SharedConnectionString);
+        var connection = new SqliteConnection(_connectionString);
         connection.Open();
         _connections.Add(connection);
 
@@ -1124,7 +1126,7 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     public void SaveAdmission_SuccessPath_TransactionDisposeFails_CommittedStillReturned()
     {
         var logger = new TestLogger<PipelineStore>();
-        var connection = new ThrowingDisposeTransactionConnection(SharedConnectionString);
+        var connection = new ThrowingDisposeTransactionConnection(_connectionString);
         _connections.Add(connection);
         connection.Open();
         var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
@@ -1163,7 +1165,7 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     public void SaveAdmission_FactoryContextDisposeFails_WarnsAndPreservesOutcome()
     {
         var logger = new TestLogger<PipelineStore>();
-        var store = new PipelineStore(new PlainFactory(SharedConnectionString), logger);
+        var store = new PipelineStore(new PlainFactory(_connectionString), logger);
         store.ContextDisposerForTest = _ => throw new InvalidOperationException("forced context dispose failure");
         var pipeline = CreatePipeline("goal-factory", "task-factory");
 
@@ -1193,7 +1195,7 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
         var logger = new TestLogger<PipelineStore>();
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
-        var store = new PipelineStore(new PlainFactory(SharedConnectionString, interceptor), logger);
+        var store = new PipelineStore(new PlainFactory(_connectionString, interceptor), logger);
         // A DISTINCT sentinel for the dispose failure, so a replacement is detectable.
         var disposeSentinel = new InvalidOperationException("forced context dispose failure SENTINEL");
         var disposerCalls = 0;
@@ -1310,6 +1312,21 @@ public sealed class ThrowingDisposeTransactionConnection : DbConnection
         new ThrowingDisposeTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
 
     protected override DbCommand CreateDbCommand() => new TransactionTolerantAdmissionCommand(_inner.CreateCommand());
+
+    // OWNERSHIP HYGIENE: this wrapper owns the inner connection and releases it when the
+    // wrapper itself is disposed (the transaction wrapper below already does the same for
+    // its inner transaction). Plain non-throwing forwarding — the injected failure here is
+    // the transaction-level dispose sentinel, NOT the connection-dispose path. This does
+    // NOT fix the cross-instance database leak — the per-instance unique names are that fix.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { _inner.Dispose(); }
+            finally { base.Dispose(disposing); }
+        }
+        else base.Dispose(disposing);
+    }
 
     /// <summary>
     /// The EF relational layer requires a transaction's connection to be REFERENCE-EQUAL to the
