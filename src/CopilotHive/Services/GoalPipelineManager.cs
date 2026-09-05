@@ -102,8 +102,9 @@ public sealed class GoalPipelineManager
     /// those methods runs under it, so the WRITERS are serialized: a memory claim and its persisted
     /// counterpart can no longer be interleaved by a second mapping-surface call.
     /// <para>
-    /// WHAT CHANGES OBSERVABLY: nothing functional. Each wrapped method's body is unchanged, so its
-    /// results, its logs and its contracts are byte-identical. The ONLY observable change is
+    /// The results and functional contracts are unchanged; the log lines are GUARDED — a throwing
+    /// logger is swallowed and the outcome returned (the β-PREP-2 hardening). For non-throwing
+    /// loggers (the production wiring) nothing observable changes. The ONLY observable change is
     /// CONCURRENCY TIMING: mapping-surface calls for UNRELATED tasks now serialize with each other,
     /// which adds contention and latency under load. That contention — and the possible-deadlock
     /// surface introduced by holding the lock across the store and logger seams — is DOCUMENTED AS A
@@ -162,7 +163,8 @@ public sealed class GoalPipelineManager
     /// <param name="store">Optional persistence store; when provided, pipeline state is saved to SQLite.</param>
     /// <param name="logger">
     /// Optional logger for the ownership-checked registration APIs. Production instances are
-    /// currently constructed WITHOUT a logger — wiring it through DI is a follow-up slice.
+    /// constructed WITH the DI-injected logger (Program.cs wires ILogger&lt;GoalPipelineManager&gt;
+    /// into the singleton); the parameter remains optional for null-logger test fixtures.
     /// </param>
     public GoalPipelineManager(PipelineStore? store = null, ILogger<GoalPipelineManager>? logger = null)
     {
@@ -331,6 +333,11 @@ public sealed class GoalPipelineManager
     /// and a store exception both yield <c>(true, false)</c> — the residue is SIGNALLED in the
     /// record rather than silently swallowed. With no store there is nothing to persist, so the
     /// persistence flag is vacuously <c>true</c>.
+    /// <para>
+    /// NEVER THROWS, given any logger: the method's own log lines are guarded (a throwing logger
+    /// is swallowed; the outcome returned). The store-failure path catches the store's exception
+    /// and returns (true, false) — the residue signalled.
+    /// </para>
     /// </remarks>
     /// <param name="taskId">The worker task id to unmap.</param>
     /// <param name="goalId">The goal that must own the mapping.</param>
@@ -341,17 +348,35 @@ public sealed class GoalPipelineManager
         {
             if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
             {
-                _logger?.LogDebug(
-                    "TryUnregisterTask called with blank taskId or goalId — no-op (taskId='{TaskId}', goalId='{GoalId}')",
-                    taskId, goalId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                try
+                {
+                    _logger?.LogDebug(
+                        "TryUnregisterTask called with blank taskId or goalId — no-op (taskId='{TaskId}', goalId='{GoalId}')",
+                        taskId, goalId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new TaskUnregisterResult(false, false);
             }
 
             if (!_taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId)))
             {
-                _logger?.LogDebug(
-                    "Task {TaskId} is not mapped to goal {GoalId} in memory — nothing removed",
-                    taskId, goalId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                try
+                {
+                    _logger?.LogDebug(
+                        "Task {TaskId} is not mapped to goal {GoalId} in memory — nothing removed",
+                        taskId, goalId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new TaskUnregisterResult(false, false);
             }
 
@@ -363,16 +388,35 @@ public sealed class GoalPipelineManager
                 var deleted = _store.DeleteTaskMappingIfForGoal(taskId, goalId);
                 if (!deleted)
                 {
-                    _logger?.LogWarning(
-                        "Task mapping {TaskId} for goal {GoalId} was not deleted (absent or owned by another goal); persisted residue remains",
-                        taskId, goalId);
+                    // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                    try
+                    {
+                        _logger?.LogWarning(
+                            "Task mapping {TaskId} for goal {GoalId} was not deleted (absent or owned by another goal); persisted residue remains",
+                            taskId, goalId);
+                    }
+                    catch
+                    {
+                        // Diagnostic failure only — never allowed to affect the guarded operation.
+                    }
                 }
                 return new TaskUnregisterResult(true, deleted);
             }
             catch (Exception ex)
             {
-                _logger?.LogError(
-                    ex, "Failed to delete persisted task mapping {TaskId} → {GoalId}; persisted residue remains", taskId, goalId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                // The STORE's original exception is still carried as the residue signal — the
+                // two-exception distinction (only the LOGGER's throw is swallowed).
+                try
+                {
+                    _logger?.LogError(
+                        ex, "Failed to delete persisted task mapping {TaskId} → {GoalId}; persisted residue remains", taskId, goalId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new TaskUnregisterResult(true, false);
             }
         }
@@ -386,8 +430,10 @@ public sealed class GoalPipelineManager
     /// claim before the commit resolves, and the claim may roll back — the honesty stated.
     /// </summary>
     /// <remarks>
-    /// UNUSED BY DESIGN in this slice: the API is complete and tested, but no production caller
-    /// exists yet — the dispatch path's migration onto it belongs to the successor slice.
+    /// The API remains uncalled in production (the successor admission-atomic-switch migrates the
+    /// dispatch onto it); the outcome record carries ClaimedThisInvocation and
+    /// CommittedThisInvocation — the cleanup truths for the successor's Flow-A/Flow-B handling
+    /// (the field semantics per the record's param docs).
     /// </remarks>
     /// <param name="pipeline">The pipeline claiming the task; its <c>ActiveTaskId</c> MUST equal
     /// <paramref name="taskId"/>.</param>
@@ -416,9 +462,18 @@ public sealed class GoalPipelineManager
             //     statement reaches the database and before any claim is made.
             if (_taskToGoal.TryGetValue(taskId, out var existingGoalId))
             {
-                _logger?.LogDebug(
-                    "Admission refused — task {TaskId} is already mapped (goal={ExistingGoalId}); no store call made",
-                    taskId, existingGoalId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                try
+                {
+                    _logger?.LogDebug(
+                        "Admission refused — task {TaskId} is already mapped (goal={ExistingGoalId}); no store call made",
+                        taskId, existingGoalId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new AdmissionCommitResult(
                     AdmissionCommitStatus.MemoryConflict,
                     ClaimedThisInvocation: false,
@@ -431,9 +486,18 @@ public sealed class GoalPipelineManager
             // (3) NO STORE: the claim alone is the admission.
             if (_store is null)
             {
-                _logger?.LogDebug(
-                    "Admission committed in memory only — no store configured (goal={GoalId} task={TaskId})",
-                    pipeline.GoalId, taskId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                try
+                {
+                    _logger?.LogDebug(
+                        "Admission committed in memory only — no store configured (goal={GoalId} task={TaskId})",
+                        pipeline.GoalId, taskId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new AdmissionCommitResult(
                     AdmissionCommitStatus.NoStore,
                     ClaimedThisInvocation: true,
@@ -450,10 +514,21 @@ public sealed class GoalPipelineManager
             {
                 // Pair-based rollback removes OUR claim only — never another attempt's.
                 _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
-                _logger?.LogWarning(
-                    ex,
-                    "Admission failed — the store threw for task {TaskId} (goal={GoalId}); the memory claim removed",
-                    taskId, pipeline.GoalId);
+                // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                // The STORE's original exception is still carried on the result — the
+                // two-exception distinction (only the LOGGER's throw is swallowed).
+                try
+                {
+                    _logger?.LogWarning(
+                        ex,
+                        "Admission failed — the store threw for task {TaskId} (goal={GoalId}); the memory claim removed",
+                        taskId, pipeline.GoalId);
+                }
+                catch
+                {
+                    // Diagnostic failure only — never allowed to affect the guarded operation.
+                }
+
                 return new AdmissionCommitResult(
                     AdmissionCommitStatus.PersistenceFailed,
                     ClaimedThisInvocation: true,
@@ -464,9 +539,18 @@ public sealed class GoalPipelineManager
             switch (storeResult)
             {
                 case AdmissionStoreResult.Committed:
-                    _logger?.LogDebug(
-                        "Admission committed goal={GoalId} task={TaskId}",
-                        pipeline.GoalId, taskId);
+                    // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                    try
+                    {
+                        _logger?.LogDebug(
+                            "Admission committed goal={GoalId} task={TaskId}",
+                            pipeline.GoalId, taskId);
+                    }
+                    catch
+                    {
+                        // Diagnostic failure only — never allowed to affect the guarded operation.
+                    }
+
                     return new AdmissionCommitResult(
                         AdmissionCommitStatus.Committed,
                         ClaimedThisInvocation: true,
@@ -474,9 +558,18 @@ public sealed class GoalPipelineManager
 
                 case AdmissionStoreResult.PersistConflict:
                     _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
-                    _logger?.LogDebug(
-                        "Admission rolled back — task {TaskId}'s persisted row is owned by another attempt; the memory claim removed",
-                        taskId);
+                    // GUARDED SITE (β-PREP-2): a throwing logger is swallowed; the outcome returns.
+                    try
+                    {
+                        _logger?.LogDebug(
+                            "Admission rolled back — task {TaskId}'s persisted row is owned by another attempt; the memory claim removed",
+                            taskId);
+                    }
+                    catch
+                    {
+                        // Diagnostic failure only — never allowed to affect the guarded operation.
+                    }
+
                     return new AdmissionCommitResult(
                         AdmissionCommitStatus.PersistConflict,
                         ClaimedThisInvocation: true,

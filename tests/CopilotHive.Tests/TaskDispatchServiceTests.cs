@@ -2,9 +2,14 @@ using System.Collections.Concurrent;
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -1615,6 +1620,47 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
+    /// THE SUPPORTING-HELPER OVERLOAD (β-PREP-2): identical to the default
+    /// <see cref="CreateService(HiveConfigFile?, GoalPipelineManager?, TaskQueue?, IWorkerGateway?, Goal?, bool)"/>
+    /// wiring, but installs a CALLER-SUPPLIED <see cref="ILogger{TaskDispatchService}"/> — the
+    /// seam the guarded-logging vectors need (a throwing logger whose predicate targets one
+    /// guarded emission). Added per the supporting-helper exception; no existing test's
+    /// assertions are affected.
+    /// </summary>
+    private static TaskDispatchService CreateService(
+        HiveConfigFile? config,
+        GoalPipelineManager pipelineManager,
+        TaskQueue taskQueue,
+        ILogger<TaskDispatchService> customLogger)
+    {
+        config ??= CreateConfig();
+        var workerGateway = new GrpcWorkerGateway(new WorkerPool());
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new DispatchTestGoalSource(
+            new Goal { Id = "setup-goal", Description = "Setup" }));
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var lifecycleService = new GoalLifecycleService(goalManager, customLogger);
+
+        var redispatchQueue = new ConcurrentQueue<string>();
+        var maintenance = new DispatcherMaintenance(
+            pipelineManager, goalManager, taskQueue, workerGateway,
+            brain: null,
+            agentsManager: null,
+            configRepo: null,
+            redispatchQueue,
+            customLogger,
+            config: config);
+
+        var taskBuilder = new TaskBuilder(new BranchCoordinator());
+
+        return new TaskDispatchService(
+            taskQueue, workerGateway, taskBuilder, config,
+            customLogger, pipelineManager, lifecycleService, maintenance);
+    }
+
+    /// <summary>
     /// Creates a <see cref="TaskDispatchService"/> and a <see cref="GoalPipeline"/> ready for
     /// DispatchToRole testing at the given phase with the given model tier.
     /// </summary>
@@ -1816,6 +1862,241 @@ public sealed class TaskDispatchServiceTests
         Assert.NotNull(capturedTask);
         // The merge preserves null, but the DTO boundary resolves it to false
         Assert.False(Assert.Single(capturedTask!.SubAgentModels).SupportsVision);
+    }
+
+    // ── β-PREP-2: the guarded admission-rollback logging helpers ─────────────
+
+    /// <summary>
+    /// THE FORCED REFUSAL VECTOR: the mapping is owned by another goal, so
+    /// <see cref="GoalPipelineManager.TryRegisterTask"/> refuses — the rollback path runs
+    /// (slot abandoned, <c>abandoned-registration</c> logged, the ORIGINAL
+    /// <see cref="InvalidOperationException"/> thrown). The predicate logger throws exactly at
+    /// the abandoned-registration template, and the throw is SWALLOWED inside
+    /// <c>TaskDispatchService.LogSafely</c>: the rollback COMPLETED (the slot abandoned,
+    /// the pointer never claimed), the logger's exception appears NOWHERE, and what leaves the
+    /// dispatch is the ORIGINAL refusal — the two-exception distinction.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_AbandonedRegistrationLogThrows_RollbackCompletesAndOriginalRethrows()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var pipelineManager = new GoalPipelineManager();
+        var taskQueue = new TaskQueue();
+
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+
+        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        var otherGoal = new Goal { Id = $"goal-other-{Guid.NewGuid():N}", Description = "Other" };
+        pipelineManager.CreatePipeline(otherGoal);
+        pipelineManager.RegisterTask(expectedTaskId, otherGoal.Id);
+
+        // THE SEAM: throws ONLY at the abandoned-registration template — the guarded helper under
+        // test. Every other emission (none occurs on this vector's refusal path) must succeed.
+        var logger = new DispatchPredicateThrowingLogger(
+            m => m.Contains("abandoned-registration", StringComparison.Ordinal));
+        var service = CreateService(
+            config, pipelineManager, taskQueue, logger);
+
+        WorkTask? enqueuedTask = null;
+        taskQueue.OnEnqueue = t => enqueuedTask = t;
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE TWO-EXCEPTION DISTINCTION: the ORIGINAL refusal (its exact message and null inner)
+        // left the dispatch — the logger's sentinel never did.
+        Assert.Equal(
+            $"Task mapping registration failed for {expectedTaskId} (goal {goal.Id}) — the mapping is occupied or the persistence failed",
+            thrown.Message);
+        Assert.Null(thrown.InnerException);
+
+        // THE GUARD ACTUALLY FIRED (the swallow is otherwise unprovable).
+        Assert.True(logger.ThrewAtLeastOnce, "the abandoned-registration site's logger must actually have thrown");
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m.Contains("abandoned-registration", StringComparison.Ordinal));
+
+        // THE ROLLBACK COMPLETED: the slot is abandoned and the pointer was never claimed.
+        Assert.Equal(WorkSlotState.Abandoned, pipeline.GetSlotsForTest().Single().State);
+        Assert.Null(pipeline.ActiveTaskId);
+        // The competing mapping is intact and nothing was enqueued.
+        Assert.Equal(otherGoal.Id, pipelineManager.GetByTaskId(expectedTaskId)!.GoalId);
+        Assert.Null(enqueuedTask);
+        Assert.Null(taskQueue.TryDequeueAny());
+    }
+
+    /// <summary>
+    /// THE (true, false) VECTOR ON THE EXISTING BRANCH: the enqueue-throw vector PLUS an
+    /// interceptor-forced store failure at the mapping-row delete. The REAL
+    /// <c>(true, false)</c> unregister result drives the EXISTING
+    /// <c>LogRollbackFailure("unregister-persist")</c> branch (NO new production branch), the
+    /// predicate logger throws at the rollback-failure template — and the throw is SWALLOWED
+    /// inside <c>TaskDispatchService.LogSafely</c>: the remaining rollback steps still run
+    /// (the pointer cleared, the abandoned-registration line recorded) and the ORIGINAL enqueue
+    /// sentinel is what leaves the dispatch.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_RollbackFailureLogThrows_RollbackContinuesAndOriginalRethrows()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var deleteSentinel = new InvalidOperationException("delete-sentinel");
+        using var storeFixture = new SqliteMappingFixture();
+        var pipelineManager = new GoalPipelineManager(
+            storeFixture.CreateStore(new SentinelThrowingInterceptor(deleteSentinel, "DELETE")));
+
+        var taskQueue = new TaskQueue();
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        taskQueue.OnEnqueue = _ => throw enqueueSentinel;
+
+        // THE SEAM: throws ONLY at the rollback-failure template — the guarded helper under test.
+        // The dispatch-owned unregister-result DEBUG record (a different template) must SUCCEED.
+        var logger = new DispatchPredicateThrowingLogger(
+            m => m.Contains("rollback-failure", StringComparison.Ordinal));
+        var service = CreateService(config, pipelineManager, taskQueue, logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE TWO-EXCEPTION DISTINCTION: the ORIGINAL enqueue sentinel left the dispatch.
+        Assert.Same(enqueueSentinel, thrown);
+
+        // THE EXISTING BRANCH REALLY FIRED: the store's delete was forced to fail, so the
+        // unregister returned (true, false) — the DEBUG record shows it…
+        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m == $"WorkSlotIntegrity: unregister goal={goal.Id} task={expectedTaskId} memoryRemoved=True persistenceRemoved=False");
+        // …and the rollback-failure template was reached (and its logger threw).
+        Assert.True(logger.ThrewAtLeastOnce, "the rollback-failure site's logger must actually have thrown");
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m.Contains("rollback-failure", StringComparison.Ordinal) &&
+                 m.Contains("unregister-persist", StringComparison.Ordinal));
+
+        // THE REMAINING ROLLBACK STEPS STILL RAN: the slot is abandoned and the pointer cleared.
+        Assert.Equal(WorkSlotState.Abandoned, pipeline.GetSlotsForTest().Single().State);
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Contains(
+            logger.SeenMessages,
+            m => m.Contains("abandoned-registration", StringComparison.Ordinal));
+
+        // THE MEMORY SIDE OF THE ROLLBACK HELD; the persisted row is the honest residue.
+        Assert.Null(pipelineManager.GetByTaskId(expectedTaskId));
+        Assert.NotNull(storeFixture.ReadPersistedGoalId(expectedTaskId));
+    }
+
+    /// <summary>
+    /// β-PREP-2 vector logger: throws ONLY when the formatted message matches the predicate —
+    /// the targeted seam proving that ONE guarded emission swallows the logger's exception while
+    /// the rollback continues. Used ONLY by this slice's two guarded-helper vectors.
+    /// </summary>
+    private sealed class DispatchPredicateThrowingLogger : ILogger<TaskDispatchService>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+
+        public DispatchPredicateThrowingLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        /// <summary>Every message the logger was asked to emit, throwing ones included.</summary>
+        public List<string> SeenMessages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            SeenMessages.Add(message);
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("dispatch-logger-sentinel");
+        }
+    }
+
+    /// <summary>
+    /// THE SQLITE-INTERCEPTION FIXTURE (the supporting-helper exception): a per-instance
+    /// shared-cache in-memory SQLite database anchored by a keeper connection, so a
+    /// <see cref="PipelineStore"/>-backed <see cref="GoalPipelineManager"/> can be exercised here
+    /// (the store-failure vector needs a REAL conditional row delete, forced to throw by an EF
+    /// interceptor). No test uses Task.Delay; the throw is injected synchronously.
+    /// </summary>
+    private sealed class SqliteMappingFixture : IDisposable
+    {
+        private readonly string _connectionString =
+            $"Data Source=file:memdb-dispatchsvctests-{Guid.NewGuid():N}?mode=memory&cache=shared";
+
+        private readonly SqliteConnection _keeper;
+
+        public SqliteMappingFixture()
+        {
+            _keeper = new SqliteConnection(_connectionString);
+            _keeper.Open();
+            using var context = CreateContext();
+            context.Database.EnsureCreated();
+        }
+
+        /// <summary>Creates a PipelineStore over its own connection to the shared database.</summary>
+        public PipelineStore CreateStore(IInterceptor? interceptor = null)
+        {
+            var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(CreateConnection());
+            if (interceptor is not null)
+                builder.AddInterceptors(interceptor);
+
+            return new PipelineStore(new CopilotHiveDbContext(builder.Options), NullLogger<PipelineStore>.Instance);
+        }
+
+        /// <summary>Reads the persisted goal id for a task RAW — no EF Core, no change tracker.</summary>
+        public string? ReadPersistedGoalId(string taskId)
+        {
+            using var command = _keeper.CreateCommand();
+            command.CommandText = "SELECT goal_id FROM task_mappings WHERE task_id = $taskId";
+            var parameter = command.CreateParameter();
+            parameter.ParameterName = "$taskId";
+            parameter.Value = taskId;
+            command.Parameters.Add(parameter);
+            return command.ExecuteScalar() as string;
+        }
+
+        private SqliteConnection CreateConnection()
+        {
+            var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            return connection;
+        }
+
+        private CopilotHiveDbContext CreateContext() =>
+            new(new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(CreateConnection()).Options);
+
+        public void Dispose() => _keeper.Dispose();
     }
 
     /// <summary>
