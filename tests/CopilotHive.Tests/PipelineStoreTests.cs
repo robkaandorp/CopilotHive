@@ -886,6 +886,518 @@ public sealed class PipelineStoreRoleSessionTests : IAsyncDisposable
     }
 }
 
+/// <summary>
+/// Slice β-PREP-1 — <see cref="PipelineStore.ClearActiveTaskIdIfMatches"/>, the ownership-checked
+/// persisted-pointer clear: the tri-state matrix (Cleared / NotMatched / Failed), the blank-input
+/// no-op (zero commands, zero log), the guarded failure paths (SQL, acquisition, detach, disposal —
+/// every one warned and swallowed, NEVER thrown), the throwing-logger guard, and the tracking
+/// truth (the stale tracked entity vs the DB's NULL) that motivates the tracker hygiene.
+/// </summary>
+/// <remarks>
+/// All persisted vectors run against a SINGLE per-instance-unique shared-cache in-memory SQLite
+/// database anchored by a long-lived keeper connection — the established GUID-suffixed pattern of
+/// this suite's neighboring classes. Assertions about row state read the database RAW (through the
+/// keeper connection), bypassing EF Core entirely.
+/// </remarks>
+public sealed class PipelineStorePointerRollbackTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-rollbackdirect-{Guid.NewGuid():N}?mode=memory&cache=shared";
+
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+    private readonly List<IDisposable> _disposables = [];
+
+    public PipelineStorePointerRollbackTests()
+    {
+        // The KEEPER anchors the shared-cache in-memory database's lifetime for the whole test.
+        // The database name is per-instance unique, so no rows can leak across xUnit fixture
+        // instances (each instance gets its own unshared database).
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+        ExecuteOnKeeper("DELETE FROM task_mappings");
+        ExecuteOnKeeper("DELETE FROM pipelines");
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        foreach (var disposable in _disposables)
+            disposable.Dispose();
+        _keeper.Dispose();
+    }
+
+    // ───────────────────────────── fixture helpers ─────────────────────────────
+
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private PipelineStore CreateStore(IInterceptor? interceptor = null, ILogger<PipelineStore>? logger = null) =>
+        new(CreateContext(interceptor), logger ?? NullLogger<PipelineStore>.Instance);
+
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        // SQL NULL surfaces as DBNull.Value — normalized to a genuine null for the assertions.
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value;
+    }
+
+    /// <summary>Seeds a pipelines row with a live pointer through the KEEPER (raw, no EF).</summary>
+    private void SeedPipelineRow(string goalId, string taskId)
+    {
+        var goalJson = "{\"id\":\"" + goalId + "\",\"description\":\"" + goalId + " goal\",\"repositories\":[\"test-repo\"]}";
+        ExecuteOnKeeper(
+            "INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, active_task_id, created_at) " +
+            "VALUES ('" + goalId + "', 'Seeded', '" + goalJson + "', 'Planning', '{}', '" + taskId +
+            "', '2025-06-15T10:00:00.0000000Z')");
+    }
+
+    /// <summary>A command counter scoped to the pipelines UPDATE, for the zero-command proofs.</summary>
+    private sealed class CountingCommandInterceptor : DbCommandInterceptor
+    {
+        private bool _recording;
+
+        public List<string> Commands { get; } = [];
+
+        public void Start()
+        {
+            Commands.Clear();
+            _recording = true;
+        }
+
+        private void Record(DbCommand command)
+        {
+            if (_recording)
+                Commands.Add(command.CommandText);
+        }
+
+        /// <inheritdoc />
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            Record(command);
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            Record(command);
+            return ValueTask.FromResult(result);
+        }
+
+        /// <inheritdoc />
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            Record(command);
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            Record(command);
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>
+    /// Throws a caller-supplied sentinel BEFORE any <c>pipelines</c> UPDATE executes — the
+    /// targeted SQL-failure injection for the rollback primitive's PHASE 2.
+    /// </summary>
+    private sealed class UpdateThrowingInterceptor : DbCommandInterceptor
+    {
+        private readonly Exception _sentinel;
+
+        public UpdateThrowingInterceptor(Exception sentinel) => _sentinel = sentinel;
+
+        private void ThrowIfTargeted(DbCommand command)
+        {
+            var text = command.CommandText;
+            if (text.Contains("pipelines", StringComparison.OrdinalIgnoreCase)
+                && text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase))
+            {
+                throw _sentinel;
+            }
+        }
+
+        /// <inheritdoc />
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowIfTargeted(command);
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="IDbContextFactory{CopilotHiveDbContext}"/> whose CreateDbContext THROWS —
+    /// the acquisition-failure injection for the rollback primitive's PHASE 1.
+    /// </summary>
+    private sealed class ThrowingFactory : IDbContextFactory<CopilotHiveDbContext>
+    {
+        private readonly Exception _sentinel;
+
+        public ThrowingFactory(Exception sentinel) => _sentinel = sentinel;
+
+        public CopilotHiveDbContext CreateDbContext() => throw _sentinel;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (1)–(3) The tri-state matrix on real rows
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>MATCHING POINTER: the row's pointer equals the expected task → Cleared, and a
+    /// FRESH-connection RAW probe reads NULL.</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_MatchingPointer_Cleared()
+    {
+        SeedPipelineRow("goal-clear", "task-clear");
+        var store = CreateStore();
+
+        var result = store.ClearActiveTaskIdIfMatches("goal-clear", "task-clear");
+
+        Assert.Equal(PointerRollbackResult.Cleared, result);
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-clear'"));
+    }
+
+    /// <summary>DIFFERENT POINTER: the row's pointer is a newer task's → NotMatched, row UNTOUCHED
+    /// (the ownership-check invariant: a newer pointer is NEVER erased).</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_DifferentPointer_NotMatched()
+    {
+        SeedPipelineRow("goal-diff", "task-live");
+        var store = CreateStore();
+
+        var result = store.ClearActiveTaskIdIfMatches("goal-diff", "task-stale");
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Equal("task-live", ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-diff'"));
+    }
+
+    /// <summary>ABSENT GOAL: no row exists → NotMatched, nothing to undo.</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_AbsentGoal_NotMatched()
+    {
+        var store = CreateStore();
+
+        var result = store.ClearActiveTaskIdIfMatches("goal-absent", "task-absent");
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (4) The blank-input no-op — no SQL, no log
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>BLANK INPUTS: every blank goalId/taskId form → NotMatched, ZERO commands issued
+    /// and ZERO log entries of ANY level written (the pre-acquisition guard returns before
+    /// anything runs).</summary>
+    /// <remarks>
+    /// THE BASELINE RESET is what makes the no-log proof genuine: the store's constructor writes
+    /// its own Information line, so the capture list is cleared AFTER construction and the
+    /// assertion below is therefore about THIS INVOCATION ALONE. It is level-agnostic
+    /// (<c>Assert.Empty</c>, not a level filter), so a mutant that emits ANYTHING — Trace, Debug,
+    /// Information, Warning, Error or Critical — from the blank guard fails this vector.
+    /// </remarks>
+    [Theory]
+    [InlineData("", "task-x")]
+    [InlineData("   ", "task-x")]
+    [InlineData("goal-blank", "")]
+    [InlineData("goal-blank", "  ")]
+    [InlineData("", "")]
+    public void ClearActiveTaskIdIfMatches_BlankInputs_NotMatchedNoSqlNoLog(string goalId, string taskId)
+    {
+        var counter = new CountingCommandInterceptor();
+        var logger = new TestLogger<PipelineStore>();
+        var store = CreateStore(counter, logger);
+        counter.Start();
+        // THE BASELINE RESET — everything the fixture setup (the constructor included) logged is
+        // discarded, so what remains after the call is EXACTLY this invocation's output.
+        logger.LogEntries.Clear();
+
+        var result = store.ClearActiveTaskIdIfMatches(goalId, taskId);
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Empty(counter.Commands);
+        // NO LOG AT ALL — no entry of ANY level was added by this invocation.
+        Assert.Empty(logger.LogEntries);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) The SQL failure — the (a) warning, Failed, no throw
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>SQL FAILURE: the interceptor throws at the UPDATE → the EXACT (a) warning template,
+    /// Failed returned, NOTHING propagates, and the row's pointer is untouched.</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_SqlFailure_FailedWarningNoThrow()
+    {
+        SeedPipelineRow("goal-sqlfail", "task-sqlfail");
+        var sentinel = new InvalidOperationException("rollback-sql-sentinel");
+        var logger = new TestLogger<PipelineStore>();
+        var store = CreateStore(new UpdateThrowingInterceptor(sentinel), logger);
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = store.ClearActiveTaskIdIfMatches("goal-sqlfail", "task-sqlfail"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Failed, observed);
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.StartsWith(
+            "WorkSlotIntegrity: pointer-rollback-failure goal=goal-sqlfail task=task-sqlfail",
+            warning.Message, StringComparison.Ordinal);
+        // THE ROW IS UNTOUCHED (its state is UNKNOWN to the caller — honestly reported as Failed).
+        Assert.Equal("task-sqlfail", ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-sqlfail'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (6) The acquisition failure — the (a) warning, Failed, disposal skipped
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>ACQUISITION FAILURE: the factory seam throws during PHASE 1 → the (a) warning,
+    /// Failed, NO throw, and the OWNED DISPOSAL IS SKIPPED (the disposer seam is never invoked —
+    /// dbOrNull is null).</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_AcquisitionFailure_FailedWarningNoThrow()
+    {
+        var sentinel = new InvalidOperationException("rollback-acquire-sentinel");
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(new ThrowingFactory(sentinel), logger);
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ => disposerCalls++;
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = store.ClearActiveTaskIdIfMatches("goal-acqfail", "task-acqfail"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Failed, observed);
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("pointer-rollback-failure", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-acqfail", warning.Message, StringComparison.Ordinal);
+        // THE DISPOSAL WAS SKIPPED: nothing was acquired, so nothing is disposed.
+        Assert.Equal(0, disposerCalls);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7) The tracker-detach failure — the (b) warning, Cleared stands, and
+    //     the DUAL tracking truth
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>TRACKER-DETACH FAILURE: the <see cref="PipelineStore.TrackerDetachForTest"/> seam
+    /// throws → the (b) cleanup warning carrying pointer-cleared=True, Cleared returned, AND the
+    /// DUAL assertion: the RAW probe shows the DB's NULL while the SAME context's Find hands back
+    /// the STALE tracked entity (its ActiveTaskId the OLD value — the EF tracking truth).</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_TrackerDetachFailure_CleanupWarningClearedStands()
+    {
+        SeedPipelineRow("goal-detach", "task-detach-old");
+        var db = CreateContext();
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(db, logger);
+        store.TrackerDetachForTest = (_, _) => throw new InvalidOperationException("detach-sentinel");
+
+        // Arranged so a tracked entry EXISTS for the goal (the hygiene phase's precondition):
+        var tracked = db.Pipelines.Find("goal-detach");
+        Assert.NotNull(tracked);
+        Assert.Equal("task-detach-old", tracked!.ActiveTaskId);
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = store.ClearActiveTaskIdIfMatches("goal-detach", "task-detach-old"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Cleared, observed);
+
+        // THE (b) CLEANUP WARNING — neutral in pointer-cleared: it interpolates the TRUE value.
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("pointer-rollback-cleanup", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("pointer-cleared=True", warning.Message, StringComparison.Ordinal);
+
+        // THE DUAL ASSERTION — the EF tracking truth vs the DB's truth:
+        // (i) the DATABASE is already NULL (the SQL's durable truth)…
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-detach'"));
+        // …while (ii) the SAME context's Find returns the STALE TRACKED entity (the entity
+        // REMAINED TRACKED — its in-memory ActiveTaskId is the OLD value).
+        var stale = db.Pipelines.Find("goal-detach");
+        Assert.Same(tracked, stale);
+        Assert.Equal("task-detach-old", stale!.ActiveTaskId);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (8) The disposal failure — the (b) warning, the result stands
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>DISPOSAL FAILURE: the <see cref="PipelineStore.ContextDisposerForTest"/> seam throws
+    /// on the factory-owned path → the (b) cleanup warning is emitted and the result (Cleared)
+    /// STANDS — the SQL's durable truth is never masked by a dispose failure.</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_DisposalFailure_CleanupWarningResultStands()
+    {
+        SeedPipelineRow("goal-dispose", "task-dispose");
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(new PlainFactory(_connectionString), logger);
+        var disposeSentinel = new InvalidOperationException("rollback-dispose-sentinel");
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ =>
+        {
+            disposerCalls++;
+            throw disposeSentinel;
+        };
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = store.ClearActiveTaskIdIfMatches("goal-dispose", "task-dispose"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Cleared, observed);
+        Assert.Equal(1, disposerCalls);
+        var warning = Assert.Single(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("pointer-rollback-cleanup", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("pointer-cleared=True", warning.Message, StringComparison.Ordinal);
+        // THE DURABLE TRUTH STANDS.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-dispose'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (9) The throwing warning logger — swallowed, the result returned
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>THROWING WARNING LOGGER: a logger that throws when the (a) template matches →
+    /// the throw is SWALLOWED by the best-effort guard and Failed is still returned (the
+    /// never-masked guarantee over the warning channel itself).</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_ThrowingWarningLogger_SwallowedResultReturned()
+    {
+        SeedPipelineRow("goal-throwlog", "task-throwlog");
+        var logger = new SelectivelyThrowingStoreLogger(
+            m => m.StartsWith(
+                "WorkSlotIntegrity: pointer-rollback-failure", StringComparison.Ordinal));
+        var store = CreateStore(
+            new UpdateThrowingInterceptor(new InvalidOperationException("rollback-sql-sentinel")),
+            logger);
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = store.ClearActiveTaskIdIfMatches("goal-throwlog", "task-throwlog"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Failed, observed);
+        // The logger REALLY threw — the swallow is not vacuous.
+        Assert.True(logger.ThrewAtLeastOnce);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (10) The hygiene success — the reuse-proof
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>HYGIENE SUCCESS: the real detach runs → the direct context's Find hands back the
+    /// entity whose ActiveTaskId IS NULL (the fresh, durable truth — the reuse-proof that a later
+    /// reader of this context cannot observe the stale pointer).</summary>
+    [Fact]
+    public void ClearActiveTaskIdIfMatches_HygieneSuccess_FindReportsNullPointer()
+    {
+        SeedPipelineRow("goal-hygiene", "task-hygiene-old");
+        var db = CreateContext();
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(db, logger);
+
+        // Arranged so a tracked entry EXISTS for the goal (the hygiene phase's precondition).
+        var tracked = db.Pipelines.Find("goal-hygiene");
+        Assert.NotNull(tracked);
+        Assert.Equal("task-hygiene-old", tracked!.ActiveTaskId);
+
+        var result = store.ClearActiveTaskIdIfMatches("goal-hygiene", "task-hygiene-old");
+
+        Assert.Equal(PointerRollbackResult.Cleared, result);
+        // THE HYGIENE WORKED: the stale tracked copy was dropped, so the re-read is FRESH.
+        var observed = db.Pipelines.Find("goal-hygiene");
+        Assert.NotSame(tracked, observed);
+        Assert.Null(observed!.ActiveTaskId);
+        // NO warnings — the happy path is silent.
+        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A logger that throws ONLY when a message matches a predicate — the targeted vector for the
+    /// best-effort warning guard, where an indiscriminate thrower would not distinguish the guarded
+    /// warning channel from an earlier infrastructure failure.
+    /// </summary>
+    private sealed class SelectivelyThrowingStoreLogger : ILogger<PipelineStore>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+
+        public SelectivelyThrowingStoreLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("rollback-logger-sentinel");
+        }
+    }
+}
+
 
 /// <summary>
 /// Slice E2a-i — <see cref="PipelineStore.SaveAdmissionWithPointer"/> on the DIRECT-CONTEXT
@@ -961,7 +1473,9 @@ public sealed class PipelineStoreAdmissionDirectContextTests : IDisposable
     {
         using var command = _keeper.CreateCommand();
         command.CommandText = sql;
-        return command.ExecuteScalar();
+        // SQL NULL surfaces as DBNull.Value — normalized to a genuine null for the assertions.
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value;
     }
 
     private static Goal CreateGoal(string id = "goal-1") =>

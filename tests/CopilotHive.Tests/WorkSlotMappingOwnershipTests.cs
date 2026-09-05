@@ -916,7 +916,9 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     {
         using var command = _keeper.CreateCommand();
         command.CommandText = sql;
-        return command.ExecuteScalar();
+        // SQL NULL surfaces as DBNull.Value — normalized to a genuine null for the assertions.
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value;
     }
 
     /// <summary>Reads the persisted goal id for a task RAW — no EF Core, no change tracker.</summary>
@@ -965,7 +967,12 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         var result = manager.PersistAdmission(pipeline, "task-commit");
 
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.Committed), result);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.Committed,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: true), result);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.True(result.CommittedThisInvocation);
         Assert.Null(result.PersistenceException);
 
         // THE MEMORY CLAIM.
@@ -995,7 +1002,12 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         counter.Start();
         var result = manager.PersistAdmission(pipeline, "task-same");
 
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict), result);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.MemoryConflict,
+            ClaimedThisInvocation: false,
+            CommittedThisInvocation: false), result);
+        Assert.False(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
         // NO STORE CALL: not a single statement reached the database.
         Assert.Empty(counter.Commands);
         // THE CLAIM IS UNTOUCHED.
@@ -1025,7 +1037,12 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         counter.Start();
         var result = manager.PersistAdmission(pipeline, "task-foreign");
 
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict), result);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.MemoryConflict,
+            ClaimedThisInvocation: false,
+            CommittedThisInvocation: false), result);
+        Assert.False(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
         Assert.Empty(counter.Commands);
         // THE FOREIGN CLAIM IS UNTOUCHED — memory and row both still the foreign goal's.
         Assert.Same(foreign, manager.GetByTaskId("task-foreign"));
@@ -1052,7 +1069,12 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         var result = manager.PersistAdmission(pipeline, "task-conflict");
 
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.PersistConflict), result);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.PersistConflict,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: false), result);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
         Assert.Null(result.PersistenceException);
         // THE PAIR-BASED ROLLBACK: no claim survives…
         Assert.Null(manager.GetByTaskId("task-conflict"));
@@ -1083,6 +1105,9 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         Assert.Equal(AdmissionCommitStatus.PersistenceFailed, result.Status);
         Assert.NotNull(result.PersistenceException);
+        // THE β FLAGS: this call DID claim before the α rollback removed it, and nothing committed.
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
         // THE EXACT SHAPE: EF wraps the interceptor's throw; the SENTINEL is the direct inner.
         var update = Assert.IsType<DbUpdateException>(result.PersistenceException);
         Assert.Same(sentinel, update.InnerException);
@@ -1115,7 +1140,12 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         var result = manager.PersistAdmission(pipeline, "task-nostore");
 
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.NoStore), result);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.NoStore,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: false), result);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
         Assert.Same(pipeline, manager.GetByTaskId("task-nostore"));
         Assert.Null(ReadPersistedGoalId("task-nostore"));
 
@@ -1267,7 +1297,13 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
             TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
         // THE CONSISTENCY PROOF (observed AFTER both): the admission committed…
-        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.Committed), admissionResult);
+        Assert.Equal(new AdmissionCommitResult(
+            AdmissionCommitStatus.Committed,
+            ClaimedThisInvocation: true,
+            CommittedThisInvocation: true), admissionResult);
+        Assert.True(admissionResult.ClaimedThisInvocation);
+        Assert.True(admissionResult.CommittedThisInvocation);
+        Assert.Null(admissionResult.PersistenceException);
         Assert.Same(pipeline, manager.GetByTaskId("task-serial"));
         Assert.Equal("goal-serial", ReadPersistedGoalId("task-serial"));
         // …AND the disjoint unregister's mutation landed.
@@ -1342,6 +1378,164 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         Assert.Null(manager.GetByTaskId("task-mon"));
         Assert.Null(ReadPersistedGoalId("task-mon"));
         Assert.True(holder.Join(TimeSpan.FromSeconds(5)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (D) RollbackPersistedPointer — the β rollback primitive (no production
+    //     caller this slice; the successor's dispatch flows consume it)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>NULL PIPELINE: the safe no-op — NotMatched, and NO store call at all
+    /// (the zero-command proof).</summary>
+    [Fact]
+    public void RollbackPersistedPointer_NullPipeline_NotMatchedNoStoreCall()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        counter.Start();
+
+        var result = manager.RollbackPersistedPointer(null!, "task-rollback");
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Empty(counter.Commands);
+    }
+
+    /// <summary>BLANK TASK ID: the same safe no-op — NotMatched, zero statements, no row disturbed.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void RollbackPersistedPointer_BlankTaskId_NotMatchedNoStoreCall(string? blank)
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var pipeline = new GoalPipeline(CreateGoal("goal-rb-blank"));
+        counter.Start();
+
+        var result = manager.RollbackPersistedPointer(pipeline, blank);
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Empty(counter.Commands);
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-rb-blank'"));
+    }
+
+    /// <summary>MATCHING POINTER: the seeded row's pointer equals the expected task → Cleared, and
+    /// the RAW probe confirms active_task_id is NULL.</summary>
+    [Fact]
+    public void RollbackPersistedPointer_MatchingPointer_Cleared()
+    {
+        SeedPipelineRow("goal-rb-match", "task-rb-match");
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = new GoalPipeline(CreateGoal("goal-rb-match"));
+
+        var result = manager.RollbackPersistedPointer(pipeline, "task-rb-match");
+
+        Assert.Equal(PointerRollbackResult.Cleared, result);
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-rb-match'"));
+    }
+
+    /// <summary>DIFFERENT POINTER: the row's pointer is a NEWER task's — the ownership check
+    /// refuses, NotMatched, and the row is UNTOUCHED.</summary>
+    [Fact]
+    public void RollbackPersistedPointer_DifferentPointer_NotMatched()
+    {
+        SeedPipelineRow("goal-rb-diff", "task-rb-live");
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = new GoalPipeline(CreateGoal("goal-rb-diff"));
+
+        var result = manager.RollbackPersistedPointer(pipeline, "task-rb-stale");
+
+        Assert.Equal(PointerRollbackResult.NotMatched, result);
+        Assert.Equal("task-rb-live", ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-rb-diff'"));
+    }
+
+    /// <summary>NULL STORE: nothing persisted to roll back — NotMatched without a store call.</summary>
+    [Fact]
+    public void RollbackPersistedPointer_NullStore_NotMatched()
+    {
+        var manager = new GoalPipelineManager(store: null, new TestLogger<GoalPipelineManager>());
+        var pipeline = new GoalPipeline(CreateGoal("goal-rb-nostore"));
+
+        Assert.Equal(
+            PointerRollbackResult.NotMatched,
+            manager.RollbackPersistedPointer(pipeline, "task-rb"));
+    }
+
+    /// <summary>STORE FAILURE: the interceptor forces the UPDATE to throw → the store's (a) WARNING
+    /// is emitted (the manager logs nothing of its own), Failed surfaces, and NOTHING propagates.</summary>
+    [Fact]
+    public void RollbackPersistedPointer_StoreFailure_FailedSurfacesNoThrow()
+    {
+        var sentinel = new InvalidOperationException("rollback-sentinel");
+        var storeLogger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(CreateContext(new PipelinesUpdateThrowingInterceptor(sentinel)), storeLogger);
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
+        SeedPipelineRow("goal-rb-fail", "task-rb-fail");
+        var pipeline = new GoalPipeline(CreateGoal("goal-rb-fail"));
+
+        PointerRollbackResult? observed = null;
+        var ex = Record.Exception(
+            () => observed = manager.RollbackPersistedPointer(pipeline, "task-rb-fail"));
+
+        Assert.Null(ex);
+        Assert.Equal(PointerRollbackResult.Failed, observed);
+        // THE (a) WARNING — the store's own logger, carrying the goal and task identifiers.
+        var warning = Assert.Single(storeLogger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        Assert.Contains("pointer-rollback-failure", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-rb-fail", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task-rb-fail", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Seeds a pipelines row with a live pointer through the KEEPER (raw, no EF).</summary>
+    private void SeedPipelineRow(string goalId, string taskId)
+    {
+        var goalJson = "{\"id\":\"" + goalId + "\",\"description\":\"" + goalId + " goal\",\"repositories\":[\"test-repo\"]}";
+        ExecuteOnKeeper(
+            "INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, active_task_id, created_at) " +
+            "VALUES ('" + goalId + "', 'Seeded', '" + goalJson + "', 'Planning', '{}', '" + taskId +
+            "', '2025-06-15T10:00:00.0000000Z')");
+    }
+}
+
+/// <summary>
+/// Throws a caller-supplied sentinel exception BEFORE any <c>pipelines</c> UPDATE executes —
+/// the targeted failure injection for the pointer-rollback primitive's SQL phase. The callback
+/// performs NO re-entrant work — it only throws.
+/// </summary>
+internal sealed class PipelinesUpdateThrowingInterceptor : DbCommandInterceptor
+{
+    private readonly Exception _sentinel;
+
+    public PipelinesUpdateThrowingInterceptor(Exception sentinel) => _sentinel = sentinel;
+
+    private void ThrowIfTargeted(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (text.Contains("pipelines", StringComparison.OrdinalIgnoreCase)
+            && text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase))
+        {
+            throw _sentinel;
+        }
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        ThrowIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfTargeted(command);
+        return ValueTask.FromResult(result);
     }
 }
 

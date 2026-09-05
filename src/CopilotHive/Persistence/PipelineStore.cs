@@ -90,8 +90,9 @@ public sealed class PipelineStore : IAsyncDisposable
     private readonly ILogger<PipelineStore> _logger;
 
     /// <summary>
-    /// THE INTERNAL SEAM for the guarded (d) context disposal of
-    /// <see cref="SaveAdmissionWithPointer"/>: when installed, it SUBSTITUTES the fallible
+    /// THE DISPOSAL SEAM for the factory-owned contexts — used by
+    /// <see cref="SaveAdmissionWithPointer"/> and <see cref="ClearActiveTaskIdIfMatches"/>. When
+    /// installed, it SUBSTITUTES the fallible
     /// dispose operation (<see cref="CopilotHiveDbContext"/> is sealed, so its
     /// <c>Dispose</c> cannot be overridden and EF never closes an externally supplied
     /// connection — the failure is otherwise not genuinely injectable). The GUARD itself —
@@ -102,6 +103,16 @@ public sealed class PipelineStore : IAsyncDisposable
     /// carries its own seam (no static, no cross-test pollution).
     /// </summary>
     internal Action<CopilotHiveDbContext>? ContextDisposerForTest;
+
+    /// <summary>Test seam: substitutes the tracker-detach step for ClearActiveTaskIdIfMatches's
+    /// hygiene phase. Null in production (the real DetachTrackedPipeline runs); a test-installed
+    /// delegate replaces the whole step (the forced-failure injection).</summary>
+    internal Action<CopilotHiveDbContext, string>? TrackerDetachForTest;
+
+    private const string PointerRollbackFailureTemplate =
+        "WorkSlotIntegrity: pointer-rollback-failure goal={GoalId} task={TaskId} — the persisted pointer's rollback failed; a restart may restore the stale pointer; the completion-protocol successor owns the durable reconciliation";
+    private const string PointerRollbackCleanupTemplate =
+        "WorkSlotIntegrity: pointer-rollback-cleanup goal={GoalId} task={TaskId} — the post-update cleanup failed; pointer-cleared={Cleared}; the context state is suspect";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -323,6 +334,17 @@ public sealed class PipelineStore : IAsyncDisposable
             if (string.Equals(entry.Entity.TaskId, taskId, StringComparison.Ordinal))
                 db.Entry(entry.Entity).State = EntityState.Detached;
         }
+    }
+
+    /// <summary>The real tracker-detach step the seam's null-default invokes: the ChangeTracker
+    /// lookup for the goal's tracked PipelineEntity and the established EntityState.Detached
+    /// assignment (the repository's established detach form).</summary>
+    private static void DetachTrackedPipeline(CopilotHiveDbContext db, string goalId)
+    {
+        var entry = db.ChangeTracker.Entries<PipelineEntity>()
+            .FirstOrDefault(e => e.Entity.GoalId == goalId);
+        if (entry is not null)
+            db.Entry(entry.Entity).State = EntityState.Detached;
     }
 
     /// <summary>Remove a completed/failed pipeline from the store.</summary>
@@ -609,6 +631,68 @@ public sealed class PipelineStore : IAsyncDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Ownership-checked persisted-pointer clear. Sets the pipeline row's active_task_id to
+    /// NULL iff the row's current value equals <paramref name="taskId"/> (a newer/different pointer
+    /// NEVER erased — the WHERE clause the ownership check). PARAMETERIZED SQL. NEVER THROWS (every
+    /// phase guarded, the acquisition included).
+    /// </summary>
+    /// <remarks>
+    /// UNUSED BY DESIGN in this slice: the API is complete and tested, but no production caller
+    /// exists yet — the dispatch path's migration onto it belongs to the successor slice.
+    /// </remarks>
+    internal PointerRollbackResult ClearActiveTaskIdIfMatches(string goalId, string taskId)
+    {
+        if (string.IsNullOrWhiteSpace(goalId) || string.IsNullOrWhiteSpace(taskId))
+            return PointerRollbackResult.NotMatched;          // the blank no-op: no SQL, no log
+
+        CopilotHiveDbContext? dbOrNull = null;
+        var ownsContext = false;
+        var cleared = false;
+        try
+        {
+            (dbOrNull, ownsContext) = ResolveDbContext();     // PHASE 1 — INSIDE the guard; a factory
+            var db = dbOrNull!;                               // throw → the catch (dbOrNull stays null);
+                                                              // the post-acquisition non-null local
+
+            var pGoal = new SqliteParameter("$goal", goalId); // PHASE 2 — THE SQL (parameterized)
+            var pTask = new SqliteParameter("$task", taskId);
+            cleared = db.Database.ExecuteSqlRaw(
+                "UPDATE pipelines SET active_task_id = NULL WHERE goal_id = $goal AND active_task_id = $task",
+                pGoal, pTask) > 0;
+
+            try                                              // PHASE 3 — THE TRACKER HYGIENE (best-effort)
+            {
+                var entry = db.ChangeTracker.Entries<PipelineEntity>()
+                    .FirstOrDefault(e => e.Entity.GoalId == goalId);
+                if (entry is not null)
+                    (TrackerDetachForTest ?? DetachTrackedPipeline)(db, goalId);
+            }
+            catch
+            {
+                BestEffortWarning(PointerRollbackCleanupTemplate, goalId, taskId, cleared);
+                // the entity REMAINS TRACKED (its stale in-memory ActiveTaskId); the DB's truth
+                // (NULL) stands; the SQL's result stands — the best-effort cleanup
+            }
+        }
+        catch (Exception ex)
+        {
+            BestEffortWarning(PointerRollbackFailureTemplate, goalId, taskId);
+            _ = ex;                                          // the structured exception optional
+            return PointerRollbackResult.Failed;             // the row's state UNKNOWN
+        }
+        finally
+        {
+            if (ownsContext && dbOrNull is not null)          // PHASE 5 — the owned disposal (guarded)
+            {
+                try { (ContextDisposerForTest ?? (static ctx => ctx.Dispose()))(dbOrNull); }
+                catch { BestEffortWarning(PointerRollbackCleanupTemplate, goalId, taskId, cleared); }
+            }                                                 // db null (the acquisition failure) → skipped;
+                                                              // the caller-owned direct context NEVER disposed
+        }
+        return cleared ? PointerRollbackResult.Cleared : PointerRollbackResult.NotMatched;
     }
 
     /// <summary>
@@ -906,3 +990,11 @@ internal enum AdmissionStoreResult
     /// refusal).</summary>
     PersistConflict,
 }
+
+/// <summary>The persisted-pointer rollback's outcome — the three distinguishable truths.</summary>
+/// <remarks>Cleared: the row's pointer matched and is now NULL (the SQL updated it).
+/// NotMatched: the row was ABSENT or its pointer did NOT equal the expected taskId — the
+/// ownership-check invariant held; NOTHING FURTHER TO UNDO.
+/// Failed: a guarded phase threw (the acquisition, the SQL) — the row's state is UNKNOWN; the
+/// (a) WARNING emitted; the durable-reconciliation successor owns the residue.</remarks>
+internal enum PointerRollbackResult { Cleared, NotMatched, Failed }

@@ -61,11 +61,29 @@ internal enum AdmissionCommitStatus
     NoStore,
 }
 
-/// <summary>PersistAdmission's outcome. PersistenceException is non-null IFF Status == PersistenceFailed (for results this method returns).</summary>
-/// <param name="Status">Which admission outcome occurred.</param>
-/// <param name="PersistenceException">The store exception when <paramref name="Status"/> is
-/// <see cref="AdmissionCommitStatus.PersistenceFailed"/>; otherwise <c>null</c>.</param>
-internal sealed record AdmissionCommitResult(AdmissionCommitStatus Status, Exception? PersistenceException = null);
+/// <summary>PersistAdmission's outcome, extended with the cleanup truth for the successor's
+/// dispatch flows.</summary>
+/// <param name="Status">The admission's outcome status (the α enum, unchanged:
+/// Committed, MemoryConflict, PersistConflict, PersistenceFailed, NoStore).</param>
+/// <param name="ClaimedThisInvocation">True IFF THIS call created the in-memory mapping claim
+/// (_taskToGoal gained the pair during this invocation). False ONLY on MemoryConflict: a
+/// pre-existing claim — identical or foreign — existed before this call and is NOT ours to
+/// remove. True on every other status: Committed/NoStore (the claim stands), and
+/// PersistConflict/PersistenceFailed (this call DID claim before the α rollback removed it).</param>
+/// <param name="CommittedThisInvocation">True ONLY on Committed: this call committed the DB rows
+/// (the task_mappings row AND the pipelines row's active_task_id pointer, one transaction via
+/// SaveAdmissionWithPointer). False on every other status — including NoStore (the in-memory
+/// claim alone; nothing persisted) and the conflict/failure statuses (the transaction refused,
+/// rolled back, or never ran).</param>
+/// <param name="PersistenceException">The store's original exception — the exact exception caught
+/// from SaveAdmissionWithPointer (the EF DbUpdateException wrapper when the store's SQL failure
+/// surfaces through EF; the interceptor's sentinel is that wrapper's InnerException — the α's
+/// existing identity contract preserved). Non-null IFF Status == PersistenceFailed.</param>
+internal sealed record AdmissionCommitResult(
+    AdmissionCommitStatus Status,
+    bool ClaimedThisInvocation,
+    bool CommittedThisInvocation,
+    Exception? PersistenceException = null);
 
 /// <summary>
 /// Singleton that holds all active goal pipelines and provides lookup by goalId or taskId.
@@ -401,7 +419,10 @@ public sealed class GoalPipelineManager
                 _logger?.LogDebug(
                     "Admission refused — task {TaskId} is already mapped (goal={ExistingGoalId}); no store call made",
                     taskId, existingGoalId);
-                return new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict);
+                return new AdmissionCommitResult(
+                    AdmissionCommitStatus.MemoryConflict,
+                    ClaimedThisInvocation: false,
+                    CommittedThisInvocation: false);
             }
 
             // (2) THE CLAIM.
@@ -413,7 +434,10 @@ public sealed class GoalPipelineManager
                 _logger?.LogDebug(
                     "Admission committed in memory only — no store configured (goal={GoalId} task={TaskId})",
                     pipeline.GoalId, taskId);
-                return new AdmissionCommitResult(AdmissionCommitStatus.NoStore);
+                return new AdmissionCommitResult(
+                    AdmissionCommitStatus.NoStore,
+                    ClaimedThisInvocation: true,
+                    CommittedThisInvocation: false);
             }
 
             // (4) THE E2a-i PRIMITIVE, consumed untouched.
@@ -430,7 +454,11 @@ public sealed class GoalPipelineManager
                     ex,
                     "Admission failed — the store threw for task {TaskId} (goal={GoalId}); the memory claim removed",
                     taskId, pipeline.GoalId);
-                return new AdmissionCommitResult(AdmissionCommitStatus.PersistenceFailed, ex);
+                return new AdmissionCommitResult(
+                    AdmissionCommitStatus.PersistenceFailed,
+                    ClaimedThisInvocation: true,
+                    CommittedThisInvocation: false,
+                    ex);
             }
 
             switch (storeResult)
@@ -439,19 +467,55 @@ public sealed class GoalPipelineManager
                     _logger?.LogDebug(
                         "Admission committed goal={GoalId} task={TaskId}",
                         pipeline.GoalId, taskId);
-                    return new AdmissionCommitResult(AdmissionCommitStatus.Committed);
+                    return new AdmissionCommitResult(
+                        AdmissionCommitStatus.Committed,
+                        ClaimedThisInvocation: true,
+                        CommittedThisInvocation: true);
 
                 case AdmissionStoreResult.PersistConflict:
                     _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
                     _logger?.LogDebug(
                         "Admission rolled back — task {TaskId}'s persisted row is owned by another attempt; the memory claim removed",
                         taskId);
-                    return new AdmissionCommitResult(AdmissionCommitStatus.PersistConflict);
+                    return new AdmissionCommitResult(
+                        AdmissionCommitStatus.PersistConflict,
+                        ClaimedThisInvocation: true,
+                        CommittedThisInvocation: false);
 
                 default:
                     throw new InvalidOperationException(
                         $"Unhandled admission store result '{storeResult}' for task '{taskId}' (goal={pipeline.GoalId}).");
             }
+        }
+    }
+
+    /// <summary>Rolls back the PERSISTED pipeline pointer (the pipelines row's active_task_id) for a
+    /// failed admission's task: the ownership-checked store clear under <see cref="_mappingLock"/>.
+    /// THE IN-MEMORY pointer is NOT touched (the caller's own ownership-checked clear owns it — the
+    /// successor's dispatch Flow-B step).</summary>
+    /// <remarks>CONTRACT: a null pipeline or a null/blank taskId → PointerRollbackResult.NotMatched
+    /// (the safe no-op — no store call); a null store → NotMatched (nothing persisted to roll back);
+    /// the store's NotMatched → the correct completion (the row absent or its pointer unmatched —
+    /// the ownership-check invariant held; nothing further to undo); the store's Cleared → the
+    /// persisted pointer is NULL; the store's Failed → the store's (a) WARNING surfaced, this method
+    /// returns Failed (the row's state unknown — the durable-reconciliation successor owns the
+    /// residue; the successor's Flow-B treats Failed as its reconciliation trigger). NEVER PROPAGATES
+    /// store or logging failures (the store's guards; this method performs no logging of its own) —
+    /// ordinary runtime failures (a thread abort mid-lock, out-of-memory) remain outside every
+    /// method's practical guarantee and are not claimed away.</remarks>
+    /// <param name="pipeline">The pipeline whose persisted pointer is rolled back; nullable — a null
+    /// is the safe no-op.</param>
+    /// <param name="taskId">The task whose pointer is expected; null/blank is the safe no-op.</param>
+    /// <returns>The tri-state outcome — the caller distinguishes the safely-preserved pointer from
+    /// the failed rollback.</returns>
+    internal PointerRollbackResult RollbackPersistedPointer(GoalPipeline? pipeline, string? taskId)
+    {
+        if (pipeline is null || string.IsNullOrWhiteSpace(taskId))
+            return PointerRollbackResult.NotMatched;   // the null/blank no-op — no store call
+        lock (_mappingLock)
+        {
+            return _store?.ClearActiveTaskIdIfMatches(pipeline.GoalId, taskId)
+                   ?? PointerRollbackResult.NotMatched;  // the null store — nothing persisted
         }
     }
 
