@@ -28,8 +28,8 @@ namespace CopilotHive.Tests;
 /// </remarks>
 public sealed class WorkSlotMappingOwnershipTests : IDisposable
 {
-    private const string SharedConnectionString =
-        "Data Source=file:memdb-workslotmapping?mode=memory&cache=shared";
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-workslotmapping-{Guid.NewGuid():N}?mode=memory&cache=shared";
 
     private readonly SqliteConnection _keeper;
     private readonly List<SqliteConnection> _connections = [];
@@ -37,8 +37,10 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
 
     public WorkSlotMappingOwnershipTests()
     {
-        // The KEEPER anchors the shared in-memory database's lifetime for the whole test.
-        _keeper = new SqliteConnection(SharedConnectionString);
+        // The KEEPER anchors the shared-cache in-memory database's lifetime for the whole test.
+        // The database name is per-instance unique, so no rows can leak across xUnit fixture
+        // instances (each instance gets its own unshared database).
+        _keeper = new SqliteConnection(_connectionString);
         _keeper.Open();
 
         CreateContext().Database.EnsureCreated();
@@ -59,7 +61,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     /// <summary>Creates a context on its OWN connection to the shared database.</summary>
     private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
     {
-        var connection = new SqliteConnection(SharedConnectionString);
+        var connection = new SqliteConnection(_connectionString);
         connection.Open();
         _connections.Add(connection);
 

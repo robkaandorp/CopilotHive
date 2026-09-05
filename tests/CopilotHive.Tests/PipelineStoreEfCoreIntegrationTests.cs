@@ -606,8 +606,8 @@ public sealed class PipelineStoreEfCoreIntegrationTests : IAsyncDisposable
 /// </remarks>
 public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
 {
-    private const string SharedConnectionString =
-        "Data Source=file:memdb-admissiontx?mode=memory&cache=shared";
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-admissiontx-{Guid.NewGuid():N}?mode=memory&cache=shared";
 
     private readonly SqliteConnection _keeper;
     private readonly List<DbConnection> _connections = [];
@@ -616,7 +616,9 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     public PipelineStoreAdmissionTransactionTests()
     {
         // The KEEPER anchors the shared in-memory database's lifetime for the whole test.
-        _keeper = new SqliteConnection(SharedConnectionString);
+        // The database name is per-instance unique, so no rows can leak across
+        // xUnit fixture instances (each instance gets its own unshared database).
+        _keeper = new SqliteConnection(_connectionString);
         _keeper.Open();
         CreateContext().Database.EnsureCreated();
     }
@@ -635,7 +637,7 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     /// <summary>Creates a context on its OWN connection to the shared database.</summary>
     private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
     {
-        var connection = new SqliteConnection(SharedConnectionString);
+        var connection = new SqliteConnection(_connectionString);
         connection.Open();
         _connections.Add(connection);
 
@@ -876,7 +878,7 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5); // the pipeline flush fails
         var logger = new TestLogger<PipelineStore>();
-        var connection = new RollbackThrowingConnection(SharedConnectionString);
+        var connection = new RollbackThrowingConnection(_connectionString);
         _connections.Add(connection);
         connection.Open();
 
@@ -954,7 +956,7 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
         var logger = new ThrowingLogger<PipelineStore>();
-        var connection = new RollbackThrowingConnection(SharedConnectionString);
+        var connection = new RollbackThrowingConnection(_connectionString);
         _connections.Add(connection);
         connection.Open();
 
@@ -1004,7 +1006,7 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var interceptor = new AdmissionTargetedThrowInterceptor(
             AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
         var logger = new TestLogger<PipelineStore>();
-        var connection = new DisposeThrowingConnection(SharedConnectionString);
+        var connection = new DisposeThrowingConnection(_connectionString);
         _connections.Add(connection);
         connection.Open();
 
@@ -1242,6 +1244,20 @@ internal sealed class RollbackThrowingConnection : DbConnection
 
     protected override DbCommand CreateDbCommand() => new TransactionTolerantCommand(_inner.CreateCommand());
 
+    // OWNERSHIP HYGIENE: this wrapper owns the inner connection and releases it when the
+    // wrapper itself is disposed (the transaction wrapper below already does the same for
+    // its inner transaction). This does NOT fix the cross-instance database leak — the
+    // per-instance unique database names are that fix.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { _inner.Dispose(); }
+            finally { base.Dispose(disposing); }
+        }
+        else base.Dispose(disposing);
+    }
+
     private Exception RecordAndGetRollbackFailure()
     {
         Interlocked.Increment(ref _rollbackAttemptCount);
@@ -1344,6 +1360,21 @@ internal sealed class DisposeThrowingConnection : DbConnection
         new DisposeThrowingTransaction(this, (SqliteTransaction)_inner.BeginTransaction(isolationLevel));
 
     protected override DbCommand CreateDbCommand() => new ShieldedCommand(_inner.CreateCommand());
+
+    // OWNERSHIP HYGIENE: this wrapper owns the inner connection and releases it when the
+    // wrapper itself is disposed (the transaction wrapper below already does the same for
+    // its inner transaction). Plain non-throwing forwarding — the injected failure here is
+    // the transaction-level dispose sentinel, NOT the connection-dispose path. This does
+    // NOT fix the cross-instance database leak — the per-instance unique names are that fix.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { _inner.Dispose(); }
+            finally { base.Dispose(disposing); }
+        }
+        else base.Dispose(disposing);
+    }
 
     private Exception RecordAndGetDisposeFailure()
     {
