@@ -425,4 +425,89 @@ public sealed class BrainPlanningPromptTests
         Assert.Contains("Phase-NAME rules (these govern the `phases` array", prompt);
         Assert.Contains("`model_tiers` KEY rules", prompt);
     }
+
+    /// <summary>
+    /// Regression guard for the "default tier" planning bug: the prompt must enumerate the ONLY
+    /// valid model_tiers VALUES ("standard" and "premium") inside the bullet itself, otherwise
+    /// the planning LLM emits "default" and the plan is rejected.
+    /// </summary>
+    [Fact]
+    public void PlanningPrompt_StatesTierValues_StandardAndPremiumOnly()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        var modelTiersIndex = prompt.IndexOf("- model_tiers: (optional)", StringComparison.Ordinal);
+        var premiumUsageIndex = prompt.IndexOf(
+            "Only use premium when previous iterations failed", StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, modelTiersIndex);
+        Assert.NotEqual(-1, premiumUsageIndex);
+
+        // The exact values enumeration must appear INSIDE the model_tiers bullet body.
+        var valuesSentence =
+            "The ONLY valid VALUES are \"standard\" and \"premium\" (case-insensitive)";
+        var valuesIndex = prompt.IndexOf(valuesSentence, StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, valuesIndex);
+        Assert.True(
+            valuesIndex > modelTiersIndex && valuesIndex < premiumUsageIndex,
+            "The tier-values enumeration must appear inside the model_tiers bullet.");
+    }
+
+    /// <summary>
+    /// The "default" trap must be called out explicitly: there is NO "default" value, and the
+    /// correct way to get the default tier is to omit the phase from model_tiers entirely.
+    /// </summary>
+    [Fact]
+    public void PlanningPrompt_WarnsAgainstDefaultTierValue()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        var modelTiersIndex = prompt.IndexOf("- model_tiers: (optional)", StringComparison.Ordinal);
+        var premiumUsageIndex = prompt.IndexOf(
+            "Only use premium when previous iterations failed", StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, modelTiersIndex);
+        Assert.NotEqual(-1, premiumUsageIndex);
+
+        var noDefaultIndex = prompt.IndexOf(
+            "there is NO \"default\" value", StringComparison.Ordinal);
+        var omitIndex = prompt.IndexOf(
+            "OMIT the phase from model_tiers entirely", StringComparison.Ordinal);
+
+        // Both statements must exist AND sit inside the model_tiers bullet body.
+        Assert.NotEqual(-1, noDefaultIndex);
+        Assert.NotEqual(-1, omitIndex);
+        Assert.True(
+            noDefaultIndex > modelTiersIndex && noDefaultIndex < premiumUsageIndex,
+            "The no-default warning must appear inside the model_tiers bullet.");
+        Assert.True(
+            omitIndex > modelTiersIndex && omitIndex < premiumUsageIndex,
+            "The omit-the-phase instruction must appear inside the model_tiers bullet.");
+    }
+
+    /// <summary>
+    /// The bullet's final line must say "standard tier" (not "default tier"), and the OLD priming
+    /// sentence — "Omitted phases use the default tier" — must be gone. That sentence is what
+    /// primed the planning LLM to emit "default" as a tier value. (The trap-callout sentence
+    /// elsewhere in the bullet deliberately mentions "the default tier" only to instruct the LLM
+    /// to OMIT the phase; that is corrective text, not priming text.)
+    /// </summary>
+    [Fact]
+    public void PlanningPrompt_UsesStandardNotDefaultWording()
+    {
+        var prompt = BuildPromptCollapsed();
+
+        var modelTiersIndex = prompt.IndexOf("- model_tiers: (optional)", StringComparison.Ordinal);
+        var bulletEndIndex = prompt.IndexOf(
+            "call the `escalate_to_composer` tool", StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, modelTiersIndex);
+        Assert.NotEqual(-1, bulletEndIndex);
+
+        var bullet = prompt[modelTiersIndex..bulletEndIndex];
+
+        Assert.Contains("Omitted phases use the standard tier", bullet);
+        Assert.DoesNotContain("Omitted phases use the default tier", bullet);
+    }
 }
