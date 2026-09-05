@@ -66,11 +66,10 @@ internal enum AdmissionCommitStatus
 /// <param name="Status">The admission's outcome status (the α enum, unchanged:
 /// Committed, MemoryConflict, PersistConflict, PersistenceFailed, NoStore).</param>
 /// <param name="ClaimedThisInvocation">True IFF THIS call created the in-memory mapping claim
-/// (<c>_taskToGoal</c> gained the pair during this invocation). False ONLY on
-/// <see cref="AdmissionCommitStatus.MemoryConflict"/>: a pre-existing claim — identical or foreign —
-/// existed before this call and is NOT ours to remove. True on every other status:
-/// Committed/NoStore (the claim stands), and PersistConflict/PersistenceFailed (this call DID claim
-/// before the α rollback removed it).</param>
+/// (_taskToGoal gained the pair during this invocation). False ONLY on MemoryConflict: a
+/// pre-existing claim — identical or foreign — existed before this call and is NOT ours to
+/// remove. True on every other status: Committed/NoStore (the claim stands), and
+/// PersistConflict/PersistenceFailed (this call DID claim before the α rollback removed it).</param>
 /// <param name="CommittedThisInvocation">True ONLY on Committed: this call committed the DB rows
 /// (the task_mappings row AND the pipelines row's active_task_id pointer, one transaction via
 /// SaveAdmissionWithPointer). False on every other status — including NoStore (the in-memory

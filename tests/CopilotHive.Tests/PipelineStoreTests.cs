@@ -1134,7 +1134,15 @@ public sealed class PipelineStorePointerRollbackTests : IDisposable
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>BLANK INPUTS: every blank goalId/taskId form → NotMatched, ZERO commands issued
-    /// and ZERO log entries written (the pre-acquisition guard returns before anything runs).</summary>
+    /// and ZERO log entries of ANY level written (the pre-acquisition guard returns before
+    /// anything runs).</summary>
+    /// <remarks>
+    /// THE BASELINE RESET is what makes the no-log proof genuine: the store's constructor writes
+    /// its own Information line, so the capture list is cleared AFTER construction and the
+    /// assertion below is therefore about THIS INVOCATION ALONE. It is level-agnostic
+    /// (<c>Assert.Empty</c>, not a level filter), so a mutant that emits ANYTHING — Trace, Debug,
+    /// Information, Warning, Error or Critical — from the blank guard fails this vector.
+    /// </remarks>
     [Theory]
     [InlineData("", "task-x")]
     [InlineData("   ", "task-x")]
@@ -1147,14 +1155,16 @@ public sealed class PipelineStorePointerRollbackTests : IDisposable
         var logger = new TestLogger<PipelineStore>();
         var store = CreateStore(counter, logger);
         counter.Start();
+        // THE BASELINE RESET — everything the fixture setup (the constructor included) logged is
+        // discarded, so what remains after the call is EXACTLY this invocation's output.
+        logger.LogEntries.Clear();
 
         var result = store.ClearActiveTaskIdIfMatches(goalId, taskId);
 
         Assert.Equal(PointerRollbackResult.NotMatched, result);
         Assert.Empty(counter.Commands);
-        // NO LOG AT ALL from the primitive itself: the constructor's init line aside, no warning
-        // (and nothing else) was emitted — the blank guard returns before any log-worthy event.
-        Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
+        // NO LOG AT ALL — no entry of ANY level was added by this invocation.
+        Assert.Empty(logger.LogEntries);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1355,36 +1365,36 @@ public sealed class PipelineStorePointerRollbackTests : IDisposable
         // NO warnings — the happy path is silent.
         Assert.DoesNotContain(logger.LogEntries, e => e.LogLevel == LogLevel.Warning);
     }
-}
 
-/// <summary>
-/// A logger that throws ONLY when a message matches a predicate — the targeted vector for the
-/// best-effort warning guard, where an indiscriminate thrower would not distinguish the guarded
-/// warning channel from an earlier infrastructure failure.
-/// </summary>
-internal sealed class SelectivelyThrowingStoreLogger : ILogger<PipelineStore>
-{
-    private readonly Func<string, bool> _shouldThrow;
-
-    public SelectivelyThrowingStoreLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
-
-    /// <summary>True once the throwing branch has actually been taken.</summary>
-    public bool ThrewAtLeastOnce { get; private set; }
-
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-
-    public bool IsEnabled(LogLevel logLevel) => true;
-
-    public void Log<TState>(
-        LogLevel logLevel, EventId eventId, TState state, Exception? exception,
-        Func<TState, Exception?, string> formatter)
+    /// <summary>
+    /// A logger that throws ONLY when a message matches a predicate — the targeted vector for the
+    /// best-effort warning guard, where an indiscriminate thrower would not distinguish the guarded
+    /// warning channel from an earlier infrastructure failure.
+    /// </summary>
+    private sealed class SelectivelyThrowingStoreLogger : ILogger<PipelineStore>
     {
-        var message = formatter(state, exception);
-        if (!_shouldThrow(message))
-            return;
+        private readonly Func<string, bool> _shouldThrow;
 
-        ThrewAtLeastOnce = true;
-        throw new InvalidOperationException("rollback-logger-sentinel");
+        public SelectivelyThrowingStoreLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw new InvalidOperationException("rollback-logger-sentinel");
+        }
     }
 }
 
