@@ -194,7 +194,26 @@ public sealed class ComposerActorTests
 
     /// <summary>
     /// Waits until the actor has reported the "streaming" registry status, i.e. the send
-    /// handler has run and the streaming task is live. Bounded so a hang fails the test.
+    /// handler has run <c>StartStream</c> to the point of the registry write. Bounded so a
+    /// hang fails the test.
+    /// <para>
+    /// ⚠ WARNING — THIS PROVES THE REGISTRY WRITE, NOT THE STREAMING BODY'S ENTRY. In
+    /// <c>ComposerActor.StartStream</c> the order is: <c>_onStreamingStarted</c> →
+    /// <c>_refreshRegistry("streaming")</c> → <c>Task.Run(RunStreamingAsync, LoopToken)</c>.
+    /// The registry write therefore happens BEFORE the streaming task is even scheduled. A
+    /// test that returns from this helper and immediately calls <c>DisposeAsync</c> has NO
+    /// guarantee the streaming body ever entered the chat client: if disposal wins the race,
+    /// <c>LoopToken</c> is cancelled before <c>Task.Run</c> schedules the body, the client is
+    /// never entered, no terminal <c>Tell</c> is ever attempted, and the terminal sequence
+    /// runs from <c>OnShutdownAsync</c> instead of the failed-<c>Tell</c> fallback — a
+    /// genuinely DIFFERENT terminal site.
+    /// </para>
+    /// <para>
+    /// A caller whose assertions depend on the streaming body having run (client behavior,
+    /// <c>WasCancelled</c>, or attribution to the failed-<c>Tell</c> fallback) MUST instead
+    /// await the fake client's <c>Entered</c> signal before disposing. This helper is only
+    /// sufficient for vectors whose assertions hold on EITHER terminal path.
+    /// </para>
     /// </summary>
     private static async Task WaitForStreamingStatusAsync(List<string> registryStatuses)
     {
@@ -1632,6 +1651,11 @@ public sealed class ComposerActorTests
 
     // ── Disposal / terminal cleanup ──
 
+    /// <summary>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED</b>
+    /// (already present). <c>WasCancelled</c> / <c>CancellationObserved</c> can only be
+    /// produced by the streaming body, so the started-signal alone would be ambiguous.
+    /// </summary>
     [Fact]
     public async Task DisposeWhileStreaming_CancelsStream_AndCleansUpTerminalState()
     {
@@ -2125,6 +2149,12 @@ public sealed class ComposerActorTests
     /// the gate first would let the ordinary mailbox handler satisfy the assertions even with
     /// the fallback removed.
     /// </para>
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED.</b>
+    /// The assertions (<c>WasCancelled</c>, exactly-one terminal sequence attributed to the
+    /// failed-<c>Tell</c> fallback) DIFFER between the two terminal sites, so the vector must
+    /// not be left to race: it awaits <c>blockingClient.Entered</c> before disposing.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task TellFails_FallbackRunsCompleteTerminalCleanupExactlyOnce()
@@ -2160,8 +2190,16 @@ public sealed class ComposerActorTests
             actor.Start();
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
-            // Wait until the stream is actually running and blocked on the client's gate.
-            await WaitForStreamingStatusAsync(registryStatuses);
+            // DETERMINISM (classification (a) — the assertions REQUIRE the streaming body to
+            // have run): wait until the streaming task has provably ENTERED the client and is
+            // parked on its cancellable gate. Gating on the "streaming" registry status alone
+            // is NOT enough — that write happens in StartStream BEFORE Task.Run schedules the
+            // streaming body, so a disposal that wins the race would cancel LoopToken, the body
+            // would never run, no terminal Tell would be attempted, and OnShutdownAsync — not
+            // the failed-Tell fallback under test — would run the terminal sequence (and
+            // WasCancelled below would be false).
+            await blockingClient.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            lock (registryStatuses) Assert.Contains("streaming", registryStatuses);
 
             // Dispose while the client is STILL BLOCKED: the mailbox closes and the stream is
             // cancelled, so the client throws OperationCanceledException and the resulting
@@ -2225,6 +2263,13 @@ public sealed class ComposerActorTests
     /// </list>
     /// <para>
     /// The assertion is that disposal has NOT completed while that callback is blocked.
+    /// </para>
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — already deterministic WITHOUT the
+    /// started-signal gate.</b> This vector never waits on a started/streaming signal: it gates
+    /// on <c>updateEntered</c>, which fires from the mailbox handler for a delta the streaming
+    /// body already produced — a strictly STRONGER body-entry proof than <c>Entered</c>. The
+    /// race described on <c>WaitForStreamingStatusAsync</c> cannot occur here.
     /// </para>
     /// </summary>
     [Fact]
@@ -2337,6 +2382,15 @@ public sealed class ComposerActorTests
     /// the facade deletes the stale session file and clears its compaction flags. A generic
     /// finish/idle fallback would silently skip it and leave the overflowing session on disk
     /// to be reloaded on the next start. Also asserts overflow still never persists the session.
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED</b>
+    /// (already present). The overflow-recovery callback only ever fires from the streaming
+    /// body's terminal handling, so if disposal won the race against <c>Task.Run</c> the body
+    /// would never run, <c>OnShutdownAsync</c> would own the terminal sequence, and
+    /// <c>overflowRecoveryCalls</c> would stay 0. The <c>client.Entered</c> await below is the
+    /// gate that makes this deterministic; the <c>WaitForStreamingStatusAsync</c> call is a
+    /// secondary registry-ordering check ONLY and proves nothing about body entry.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task OverflowTellFails_StillInvokesOverflowRecovery()
@@ -2380,6 +2434,9 @@ public sealed class ComposerActorTests
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await WaitForStreamingStatusAsync(registryStatuses);
+            // THE DETERMINISM GATE (classification (a)): the streaming body has provably
+            // ENTERED the client and is parked. The registry-status wait above proves only the
+            // "streaming" WRITE (which precedes Task.Run) — it is NOT a body-entry proof.
             await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             // Close the mailbox while the client is blocked. Cancellation makes the client
@@ -2417,6 +2474,14 @@ public sealed class ComposerActorTests
     /// Criterion 1 on the failed-<c>Tell</c> path: when the ERROR terminal <c>Tell</c> is
     /// rejected because the mailbox closed, <c>onStreamingError</c> must STILL be invoked —
     /// a generic finish/idle fallback would swallow the failure entirely.
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED</b>
+    /// (already present). The error callback carrying the client's exception text can only
+    /// originate in the streaming body; if disposal won the race against <c>Task.Run</c> the
+    /// body would never run and <c>OnShutdownAsync</c> would terminate silently with no error
+    /// reported. The <c>client.Entered</c> await below is the deterministic gate; the
+    /// <c>WaitForStreamingStatusAsync</c> call is a secondary registry-ordering check only.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task ErrorTellFails_StillReportsError()
@@ -2460,6 +2525,9 @@ public sealed class ComposerActorTests
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await WaitForStreamingStatusAsync(registryStatuses);
+            // THE DETERMINISM GATE (classification (a)): the streaming body has provably
+            // ENTERED the client and is parked. The registry-status wait above proves only the
+            // "streaming" WRITE (which precedes Task.Run) — it is NOT a body-entry proof.
             await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             // Close the mailbox while blocked so the ERROR terminal Tell is rejected.
@@ -5070,6 +5138,12 @@ public sealed class ComposerActorTests
     /// is observable BEFORE the fallback's transition callback. Removal-proof: reverting the
     /// swap in the failed-Tell fallback block fails the in-callback snapshot assertion.
     /// </para>
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED</b>
+    /// (already present, and <c>WasCancelled</c> is asserted). The ordering claim is attributed
+    /// to the FALLBACK's terminal site specifically, so the vector's assertions would differ on
+    /// the <c>OnShutdownAsync</c> path.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Shutdown_WhileStreaming_FailedTellFallbackRunsTransition_IdleBeforeTransition()
@@ -5169,6 +5243,12 @@ public sealed class ComposerActorTests
     /// Removal-proof: reverting the swap in <c>OnShutdownAsync</c>'s terminal branch (idle
     /// refresh after the transition) leaves the in-callback registry snapshot without "idle"
     /// and this test fails.
+    /// </para>
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — already deterministic WITHOUT the
+    /// started-signal gate.</b> No started/streaming signal is used: the streaming TASK is
+    /// awaited to completion before disposal, and the loop-token registration proves
+    /// cancellation, so the <c>OnShutdownAsync</c> terminal site is forced, not raced.
     /// </para>
     /// </summary>
     [Fact]
@@ -5362,6 +5442,12 @@ public sealed class ComposerActorTests
     /// <item>The client gate is released, so the stream completes normally with the real
     /// <c>ToolCallCount</c>; its terminal <c>Tell</c> is REJECTED and the fallback runs.</item>
     /// </list>
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — already deterministic WITHOUT the
+    /// started-signal gate.</b> Disposal is gated on <c>client.FinalEntered</c> AND
+    /// <c>updateEntered</c>, both of which can only fire from the streaming body — strictly
+    /// stronger body-entry proofs than <c>Entered</c>. No started/streaming signal is used.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task CompletionPath_TellFailsFallback_ForwardsNonZeroLastToolCalls()
@@ -5754,6 +5840,15 @@ public sealed class ComposerActorTests
         }
     }
 
+    /// <summary>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(b) — path-independent; the started-signal
+    /// gate is SUFFICIENT.</b> The only assertion is that no SECOND stream ever starts
+    /// (<c>startedCalls == 1</c>), and <c>_onStreamingStarted</c> fires synchronously inside
+    /// <c>StartStream</c> on the mailbox thread — never from the streaming body. Either
+    /// terminal site may run here (the failed-<c>Tell</c> fallback or <c>OnShutdownAsync</c>);
+    /// both clear <c>_pendingNotifications</c> without starting a stream, so the assertion
+    /// below covers both. No <c>Entered</c> gate is needed.
+    /// </summary>
     [Fact]
     public async Task Shutdown_DiscardsQueuedNotifications()
     {
@@ -5812,6 +5907,14 @@ public sealed class ComposerActorTests
     /// invoke the shared terminal handler (save/overflow/error callbacks) and then perform the
     /// cohesive cleanup (CTS dispose, _isStreaming=false, queue clear, transition, idle,
     /// latch). The transition must receive the correct toolCalls from the terminal message.
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED</b>
+    /// (already present). The single error callback and the toolCalls-carrying transition are
+    /// produced by the streaming body's failed-<c>Tell</c> fallback; on the
+    /// <c>OnShutdownAsync</c> path there would be NO error at all. The <c>client.Entered</c>
+    /// await below is the deterministic gate; <c>WaitForStreamingStatusAsync</c> proves only
+    /// the registry write and is not a body-entry proof.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task TellFails_CohesiveBlock_RunsHandlerThenCleanupWithCorrectToolCalls()
@@ -5847,6 +5950,9 @@ public sealed class ComposerActorTests
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
             await WaitForStreamingStatusAsync(registryStatuses);
+            // THE DETERMINISM GATE (classification (a)): the streaming body has provably
+            // ENTERED the client and is parked. The registry-status wait above proves only the
+            // "streaming" WRITE (which precedes Task.Run) — it is NOT a body-entry proof.
             await client.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
             // Dispose while the client is blocked: the terminal Tell is rejected.
@@ -5886,6 +5992,15 @@ public sealed class ComposerActorTests
     /// <summary>
     /// When the terminal Tell is REJECTED and the mailbox's OnShutdownAsync runs, it must
     /// SKIP the transition if the fallback already performed the final cleanup (_terminalCleanupDone).
+    /// <para>
+    /// DISPOSE-WHILE-STREAMING CLASSIFICATION: <b>(a) — the <c>Entered</c> gate is REQUIRED.</b>
+    /// The vector's whole point is the ATTRIBUTION "the single transition is the FALLBACK's,
+    /// and OnShutdownAsync skipped". Without a body-entry gate the disposal could win the race
+    /// against <c>Task.Run</c>, the streaming body would never run, and the single transition
+    /// observed would be <c>OnShutdownAsync</c>'s own — the exact opposite of the claim, yet
+    /// the count-only assertions would still pass. The <c>Entered</c> await below removes that
+    /// ambiguity; <c>WasCancelled</c> is asserted so the fallback attribution is positive.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task TellFails_FallbackCleanup_OnShutdownAsyncSkipsTransition()
@@ -5916,9 +6031,19 @@ public sealed class ComposerActorTests
             actor.Start();
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
+            // THE DETERMINISM GATE (classification (a)): the streaming body has provably
+            // ENTERED the client and is parked on its cancellable gate, so the terminal Tell
+            // is genuinely attempted-and-rejected and the FALLBACK owns the transition.
+            await blockingClient.Entered.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
             // Dispose while blocked — the terminal Tell is rejected and the fallback runs.
             await actor.DisposeAsync().AsTask().WaitAsync(Timeout, TestContext.Current.CancellationToken);
             await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Positive attribution: the client observed cancellation, so the streaming body
+            // really ran and really produced the rejected terminal Tell.
+            Assert.True(blockingClient.WasCancelled,
+                "The streaming task must have run and observed cancellation — otherwise the transition below is OnShutdownAsync's, not the fallback's");
 
             // Exactly ONE transition: the fallback's, not OnShutdownAsync's.
             lock (transitionCalls) Assert.Single(transitionCalls);
