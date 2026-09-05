@@ -281,6 +281,34 @@ public sealed class GoalPipeline
         }
     }
 
+    /// <summary>
+    /// THE ATOMIC ACTIVE-TASK CLAIM: under <c>_lock</c>, sets the active-task pointer iff it is
+    /// currently <c>null</c> — a live pointer is NEVER replaced (two concurrent dispatches: exactly
+    /// one claim wins; the loser returns <c>false</c> without mutating anything). On a successful
+    /// claim, the branch's first-assignment semantics match <see cref="SetActiveTask"/> (the
+    /// canonical branch assigned only when CoderBranch is null).
+    /// </summary>
+    /// <remarks>
+    /// UNUSED BY PRODUCTION this slice (the dispatch's migration onto it belongs to the successor
+    /// admission-atomic-switch); the existing SetActiveTask callers are untouched.
+    /// </remarks>
+    /// <param name="taskId">The task claiming the pointer.</param>
+    /// <param name="branch">The branch (the first-assignment semantics of SetActiveTask).</param>
+    /// <returns><c>true</c> iff the pointer was null and is now <paramref name="taskId"/>;
+    /// <c>false</c> — the refusal — when a live pointer exists (nothing mutated).</returns>
+    internal bool TrySetActiveTask(string taskId, string? branch = null)
+    {
+        lock (_lock)
+        {
+            if (ActiveTaskId is not null)
+                return false;
+            ActiveTaskId = taskId;
+            if (branch is not null && CoderBranch is null)
+                CoderBranch = branch;
+            return true;
+        }
+    }
+
     /// <summary>Clear the active task after completion.</summary>
     public void ClearActiveTask()
     {

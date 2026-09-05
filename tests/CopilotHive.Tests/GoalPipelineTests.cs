@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
@@ -147,6 +148,87 @@ public sealed class GoalPipelineTests
 
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Equal("feature/branch", pipeline.CoderBranch);
+    }
+
+    #endregion
+
+    #region GoalPipeline — TrySetActiveTask (the atomic claim, slice E2a-ii-β-PREP-3)
+
+    [Fact]
+    public void TrySetActiveTask_NullPointer_ClaimsAndReturnsTrue()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+
+        var claimed = pipeline.TrySetActiveTask("task-42", "feature/my-branch");
+
+        Assert.True(claimed);
+        Assert.Equal("task-42", pipeline.ActiveTaskId);
+        Assert.Equal("feature/my-branch", pipeline.CoderBranch);
+    }
+
+    [Fact]
+    public void TrySetActiveTask_LivePointer_RefusedNoMutation()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.SetActiveTask("task-live", "feature/live");
+
+        var claimed = pipeline.TrySetActiveTask("task-incoming", "feature/incoming");
+
+        Assert.False(claimed);
+        // UNTOUCHED: the refusal mutated neither the pointer nor the branch.
+        Assert.Equal("task-live", pipeline.ActiveTaskId);
+        Assert.Equal("feature/live", pipeline.CoderBranch);
+    }
+
+    [Fact]
+    public void TrySetActiveTask_ConcurrentClaims_ExactlyOneWins()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        const string taskA = "task-A";
+        const string taskB = "task-B";
+        // THE BARRIER GATE: both threads release simultaneously so the two claims race for
+        // real; the winner is decided by the pipeline's own lock, never by scheduling order.
+        using var barrier = new Barrier(participantCount: 2);
+        var results = new bool[2];
+
+        var threadA = new Thread(() =>
+        {
+            barrier.SignalAndWait();
+            results[0] = pipeline.TrySetActiveTask(taskA);
+        });
+        var threadB = new Thread(() =>
+        {
+            barrier.SignalAndWait();
+            results[1] = pipeline.TrySetActiveTask(taskB);
+        });
+        threadA.Start();
+        threadB.Start();
+        // BOUNDED joins: a mutant that hangs either thread (e.g. a claim that never returns)
+        // fails the test instead of hanging the run.
+        Assert.True(threadA.Join(TimeSpan.FromSeconds(30)), "thread A hung");
+        Assert.True(threadB.Join(TimeSpan.FromSeconds(30)), "thread B hung");
+
+        // EXACTLY ONE winner; the pointer is one of the two ids and NEVER the loser's.
+        var wins = results.Count(r => r);
+        Assert.Equal(1, wins);
+        var winner = results[0] ? taskA : taskB;
+        var loser = results[0] ? taskB : taskA;
+        Assert.Equal(winner, pipeline.ActiveTaskId);
+        Assert.NotEqual(loser, pipeline.ActiveTaskId);
+    }
+
+    [Fact]
+    public void TrySetActiveTask_ExistingBranch_FirstAssignmentPreserved()
+    {
+        var pipeline = new GoalPipeline(CreateGoal());
+        pipeline.CoderBranch = "feature/original";
+
+        var claimed = pipeline.TrySetActiveTask("task-42", "feature/incoming");
+
+        Assert.True(claimed);
+        Assert.Equal("task-42", pipeline.ActiveTaskId);
+        // The FIRST-ASSIGNMENT rule: the pre-seeded branch is never replaced.
+        Assert.Equal("feature/original", pipeline.CoderBranch);
     }
 
     #endregion

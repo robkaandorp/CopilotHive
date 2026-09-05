@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Threading;
 
 using CopilotHive.Goals;
 using CopilotHive.Metrics;
@@ -1900,5 +1901,263 @@ public sealed class ThrowingDisposeTransactionConnection : DbConnection
         public override void Prepare() => _inner.Prepare();
         protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
+    }
+}
+
+/// <summary>
+/// THE LOOKUP GATE (slice E2a-ii-β-PREP-3): an interceptor that parks the FIRST
+/// <c>SELECT … FROM "pipelines"</c> read — the <c>db.Pipelines.Find</c> lookup that precedes
+/// <c>ApplyToEntity</c>'s reads — so a test can land a concurrent in-memory mutation EXACTLY
+/// in the lookup→apply window, deterministically (no polling, no sleeps). The gate signals
+/// <see cref="PipelineLookupGateInterceptor.LookupReached"/> when the lookup is reached and
+/// stays blocked inside the reader callback until <c>Release()</c> is called; it arms exactly
+/// once. The test-side waits are all bounded; the parked thread is a background thread the
+/// test joins with a timeout, so a mutant that skips the lookup fails the test instead of
+/// hanging the run.
+/// </summary>
+internal sealed class PipelineLookupGateInterceptor : DbCommandInterceptor
+{
+    private readonly TaskCompletionSource<bool> _lookupReached =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _release =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _armed = 1;
+
+    /// <summary>Completes when the gated pipelines lookup has been reached.</summary>
+    public Task<bool> LookupReached => _lookupReached.Task;
+
+    /// <summary>Releases the parked lookup thread.</summary>
+    public void Release() => _release.TrySetResult();
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        GateIfPipelinesLookup(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        GateIfPipelinesLookup(command);
+        return ValueTask.FromResult(result);
+    }
+
+    private void GateIfPipelinesLookup(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
+            return;
+        if (!text.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            return;
+        if (Interlocked.Exchange(ref _armed, 0) != 1)
+            return;
+
+        // THE SIGNAL, then THE BLOCK. The bounded (test-side) awaits make a never-released
+        // gate a test failure, not a hang; the bounded Wait here additionally lets a mutant
+        // that strands the gate unwind the save thread on its own.
+        _lookupReached.TrySetResult(true);
+        _release.Task.Wait(TimeSpan.FromSeconds(60));
+    }
+}
+
+/// <summary>
+/// Slice E2a-ii-β-PREP-3 — the admission snapshot plumbing's one behavior-relevant change:
+/// <see cref="PipelineStore.SaveAdmissionWithPointer"/>'s pipeline upsert now carries the
+/// VALIDATED taskId (the snapshot taken at the call's entry) as the
+/// <c>activeTaskIdOverride</c>, so the committed active_task_id is immutable — never a mutable
+/// late read of <see cref="GoalPipeline.ActiveTaskId"/> that a concurrent clear could blank.
+/// <list type="bullet">
+///   <item>The TOCTOU vector proves the snapshot under a REAL gate parked at the pipeline
+///   lookup: a concurrent in-memory clear lands inside the lookup→apply window, and the row
+///   still commits the validated id.</item>
+///   <item>The ordinary-path vector proves the override did NOT leak:
+///   <see cref="PipelineStore.SavePipelineState"/>'s late read still persists the value read
+///   at apply time (post-clear → NULL).</item>
+/// </list>
+/// THE WINDOW/SNAPSHOT COMMENT: before this slice the admission's Stage 2 re-read
+/// <c>pipeline.ActiveTaskId</c> at <c>ApplyToEntity</c> time — AFTER the pipeline lookup — so
+/// a pointer cleared inside the lookup→apply window committed NULL and silently un-admitted a
+/// validated admission. With the override the committed value is frozen at the validated
+/// entry snapshot; the in-memory pointer is honestly left cleared (the divergence between the
+/// committed row and the in-memory state is the documented, intended outcome — the successor's
+/// rollback reconciles it).
+/// </summary>
+public sealed class PipelineStoreAdmissionSnapshotTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-admsnap-{Guid.NewGuid():N}?mode=memory&cache=shared";
+
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public PipelineStoreAdmissionSnapshotTests()
+    {
+        // Per-instance-unique, unshared database — no rows leak across fixture instances.
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+        ExecuteOnKeeper("DELETE FROM task_mappings");
+        ExecuteOnKeeper("DELETE FROM pipelines");
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    // ───────────────────────────── fixture helpers ─────────────────────────────
+
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value;
+    }
+
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static Goal CreateGoal(string id = "goal-1") =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) THE TOCTOU VECTOR — the validated snapshot survives the concurrent clear
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ADMISSION-ESCAPE WINDOW, CLOSED: <c>SaveAdmissionWithPointer</c> is parked at the
+    /// pipeline LOOKUP (the <c>db.Pipelines.Find</c> that precedes <c>ApplyToEntity</c>); while
+    /// parked, a second thread runs <c>pipeline.ClearActiveTaskIfCurrent(taskId)</c> (the
+    /// in-memory pointer → null). Released, the admission commits — and the RAW-PROBED row's
+    /// <c>active_task_id</c> IS the validated taskId. Under the two-argument mutant (the
+    /// override dropped → the mutable late read at apply time) the already-landed clear is
+    /// picked up and the row commits NULL, so the probe assertion FAILS — the vector is
+    /// removal-proof. The in-memory pointer is honestly NULL afterward: the documented
+    /// divergence (the committed row vs. the in-memory state) the successor reconciles.
+    /// </summary>
+    [Fact]
+    public async Task SaveAdmissionWithPointer_ConcurrentPointerClear_CommitsValidatedSnapshot()
+    {
+        var gate = new PipelineLookupGateInterceptor();
+        var store = new PipelineStore(CreateContext(gate), NullLogger<PipelineStore>.Instance);
+        var pipeline = new GoalPipeline(CreateGoal("goal-snapshot"));
+        pipeline.SetActiveTask("task-snapshot");
+        const string taskId = "task-snapshot";
+
+        // The admission runs on a dedicated background thread so THIS thread can serve the gate.
+        AdmissionStoreResult? savedResult = null;
+        var saveThread = new Thread(() => savedResult = store.SaveAdmissionWithPointer(pipeline, taskId))
+        {
+            IsBackground = true,
+        };
+        saveThread.Start();
+
+        // THE GATE PROOF: the lookup was reached (bounded — a mutant that skips the lookup
+        // fails here instead of hanging).
+        Assert.True(
+            await gate.LookupReached.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken),
+            "the admission never reached the pipeline lookup");
+
+        // THE CONCURRENT CLEAR, while parked: the in-memory pointer → null. The save thread is
+        // inside the Find (no pipeline lock held), so the clear is not blocked.
+        var clearThread = new Thread(() => pipeline.ClearActiveTaskIfCurrent(taskId))
+        {
+            IsBackground = true,
+        };
+        clearThread.Start();
+        Assert.True(clearThread.Join(TimeSpan.FromSeconds(30)), "the clear thread hung");
+
+        // RELEASE → the upsert applies (with the override) and commits.
+        gate.Release();
+        Assert.True(saveThread.Join(TimeSpan.FromSeconds(30)), "the save thread hung");
+
+        // (a) THE OUTCOME: committed.
+        Assert.Equal(AdmissionStoreResult.Committed, savedResult);
+
+        // (b) THE RAW PROBE — the committed pointer IS the validated snapshot. A mutable late
+        // read would have committed NULL (the clear landed inside the window); this assertion
+        // must FAIL under the two-argument mutant.
+        Assert.Equal("task-snapshot", ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-snapshot'"));
+
+        // (c) THE MAPPING row is present — the admission's first stage is intact.
+        Assert.Equal("goal-snapshot", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-snapshot'"));
+
+        // (d) THE HONEST DIVERGENCE: the in-memory pointer is null (the concurrent clear really
+        // landed); the row's snapshot (b) is the frozen validated value, not this late read.
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (6) THE ORDINARY PATH — the late read preserved (no override leak)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ORDINARY PATH'S LATE READ, PRESERVED: <c>SavePipelineState</c> (the two-argument
+    /// delegation, override null) is parked at the same pipeline lookup; the pointer is cleared
+    /// inside the window; released, the save persists the LATE value (NULL). If the override
+    /// had leaked into the ordinary path, the pointer would have been frozen at its pre-clear
+    /// value and the row would commit 'task-ordinary' — this vector kills that leak mutant.
+    /// </summary>
+    [Fact]
+    public async Task UpsertPipelineCore_OrdinaryPath_LateReadPreserved()
+    {
+        var gate = new PipelineLookupGateInterceptor();
+        var store = new PipelineStore(CreateContext(gate), NullLogger<PipelineStore>.Instance);
+        var pipeline = new GoalPipeline(CreateGoal("goal-ordinary"));
+        pipeline.SetActiveTask("task-ordinary");
+
+        // The ordinary save runs parked at the lookup, exactly like the admission vector.
+        var saveThread = new Thread(() => store.SavePipelineState(pipeline))
+        {
+            IsBackground = true,
+        };
+        saveThread.Start();
+
+        Assert.True(
+            await gate.LookupReached.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken),
+            "the ordinary save never reached the pipeline lookup");
+
+        // The concurrent clear lands inside the lookup→apply window.
+        pipeline.ClearActiveTaskIfCurrent("task-ordinary");
+
+        gate.Release();
+        Assert.True(saveThread.Join(TimeSpan.FromSeconds(30)), "the save thread hung");
+
+        // THE LATE READ: the ordinary path captured the pointer AT APPLY TIME — after the
+        // clear — so the row persists NULL. A leaked override would have frozen the
+        // pre-clear value here.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ordinary'"));
     }
 }

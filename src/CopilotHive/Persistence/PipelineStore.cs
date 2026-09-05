@@ -517,7 +517,7 @@ public sealed class PipelineStore : IAsyncDisposable
             stage = AdmissionStage.PipelineFlush;
 
             // STAGE 2 — THE PIPELINE ROW.
-            UpsertPipelineCore(db, pipeline);
+            UpsertPipelineCore(db, pipeline, taskId);
             db.SaveChanges();
 
             // STAGE 3 — THE COMMIT.
@@ -733,12 +733,15 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
-    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline)
+    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline) =>
+        UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null);
+
+    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline, string? activeTaskIdOverride)
     {
         var existing = db.Pipelines.Find(pipeline.GoalId);
         if (existing is not null)
         {
-            ApplyToEntity(pipeline, existing);
+            ApplyToEntity(pipeline, existing, activeTaskIdOverride);
         }
         else
         {
@@ -746,12 +749,12 @@ public sealed class PipelineStore : IAsyncDisposable
             {
                 GoalId = pipeline.GoalId,
             };
-            ApplyToEntity(pipeline, entity);
+            ApplyToEntity(pipeline, entity, activeTaskIdOverride);
             db.Pipelines.Add(entity);
         }
     }
 
-    private static void ApplyToEntity(GoalPipeline pipeline, PipelineEntity entity)
+    private static void ApplyToEntity(GoalPipeline pipeline, PipelineEntity entity, string? activeTaskIdOverride)
     {
         entity.Description = pipeline.Description;
         entity.GoalJson = JsonSerializer.Serialize(pipeline.Goal, JsonOptions);
@@ -761,7 +764,10 @@ public sealed class PipelineStore : IAsyncDisposable
         entity.TestRetries = pipeline.TestRetries;
         entity.MaxRetries = pipeline.MaxRetries;
         entity.MaxIterations = pipeline.MaxIterations;
-        entity.ActiveTaskId = pipeline.ActiveTaskId;
+        // THE OVERRIDE: null (the ordinary paths) → the existing LATE read at this point — the
+        // behavior IDENTICAL under all concurrency (the capture point unchanged); non-null (the
+        // admission's validated snapshot — the successor's caller) → the immutable value.
+        entity.ActiveTaskId = activeTaskIdOverride ?? pipeline.ActiveTaskId;
         entity.CoderBranch = pipeline.CoderBranch;
         entity.PlanJson = pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : null;
         entity.MetricsJson = JsonSerializer.Serialize(pipeline.Metrics, JsonOptions);

@@ -29,6 +29,13 @@ internal sealed class TaskDispatchService
     private readonly GoalLifecycleService _lifecycleService;
     private readonly DispatcherMaintenance _maintenance;
 
+    /// <summary>
+    /// Test seam: invoked between the dispatch's pointer claim and the PersistAdmission call —
+    /// the deterministic synchronization point for the admission-escape vectors (the successor's
+    /// escape-race test injects the concurrent clear here). Null in production: a no-op.
+    /// </summary>
+    internal Action<GoalPipeline, string>? AdmissionGateForTest;
+
     public TaskDispatchService(
         TaskQueue taskQueue,
         IWorkerGateway workerGateway,
