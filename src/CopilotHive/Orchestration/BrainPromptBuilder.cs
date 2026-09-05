@@ -404,13 +404,15 @@ public static class BrainPromptBuilder
               Multi-round:  {"coding-1": "step 1: revert...", "coding-2": "step 2: restructure...", "review": "..."}
             - reason: why this plan
             - model_tiers: (optional) JSON object to escalate specific phases to premium tier
-              (e.g. {"coding": "premium"}). Tierable keys — the ONLY keys allowed here — are:
-              coding, testing, docwriting, review, improve.
+              (e.g. {"coding": "premium"}). The ONLY valid VALUES are "standard" and "premium"
+              (case-insensitive) — there is NO "default" value; to use the default tier for a
+              phase, OMIT the phase from model_tiers entirely. Tierable keys — the ONLY keys
+              allowed here — are: coding, testing, docwriting, review, improve.
               Merging is a plan phase but NOT a tier key: `merging` must NEVER appear in
               model_tiers. Keep Merging in `phases` (R5 still requires it as the final phase);
               only coding/testing/docwriting/review/improve may appear in model_tiers.
               Only use premium when previous iterations failed and you believe the task requires
-              stronger reasoning. Omitted phases use the default tier.
+              stronger reasoning. Omitted phases use the standard tier.
 
             If the goal description is ambiguous or you need domain knowledge to plan properly,
             call the `escalate_to_composer` tool instead with a question and reason.
