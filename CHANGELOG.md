@@ -6,6 +6,7 @@
 - **`CompletedPhases` defensive copy** — The pipeline state machine's `CompletedPhases` now returns a point-in-time snapshot instead of a live view.
 - **Orphan-trade note** — If an insert-then-throw occurs, a task may be left admitted with its mapping unregistered; a later assignment hits the existing no-pipeline drop path. This is an accepted, documented trade-off of the admission transaction.
 - **Mapping-ownership migration** — The dispatch admission path now uses the conditional `TryRegisterTask`/`TryUnregisterTask` ownership APIs (conditional persisted upsert/delete with rollback support) instead of the unconditional register/unregister calls.
+- **SharpCoder 0.19.1 pin** — Both packages pinned at 0.19.1: the gpt-6 family's Responses-endpoint routing fix (models like `gpt-6-astra` no longer fail with `unsupported_api_for_model` through the Composer chat).
 
 ## [0.36.0] — 2026-08-31
 
