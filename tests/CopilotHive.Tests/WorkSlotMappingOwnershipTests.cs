@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Reflection;
 
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
@@ -833,6 +834,672 @@ internal sealed class TaskMappingCommandCounter : DbCommandInterceptor
         CancellationToken cancellationToken = default)
     {
         Record(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// Slice E2a-ii-α — <see cref="GoalPipelineManager.PersistAdmission"/> (the complete API, UNUSED
+/// in production this slice) and the SINGLE-LOCK POLICY over the manager's mapping surface.
+/// </summary>
+/// <remarks>
+/// The API vectors cover every branch of the admission algorithm — the committed transaction, the
+/// two memory-conflict shapes (refused BEFORE any store call), the persisted conflict's pair-based
+/// rollback, the store failure's carried exception + rollback, the no-store claim, and the three
+/// pre-lock validations — each pinned by the EXACT log template a capturing logger observed.
+/// The two POLICY vectors prove mutual exclusion honestly: one blocks INSIDE the store call while
+/// <c>_mappingLock</c> is held (an external gate in an EF interceptor), the other blocks the
+/// private monitor directly via reflection. Neither asserts an unguaranteeable ordering between a
+/// return value's observation and another thread's mutation — only mutual exclusion (the
+/// bounded-window NON-completion) plus the final consistent state.
+/// </remarks>
+public sealed class WorkSlotAdmissionCommitTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-workslotadmission-{Guid.NewGuid():N}?mode=memory&cache=shared";
+
+    private readonly SqliteConnection _keeper;
+    private readonly List<SqliteConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public WorkSlotAdmissionCommitTests()
+    {
+        // The KEEPER anchors the shared-cache in-memory database's lifetime for the whole test.
+        // The database name is per-instance unique, so no rows can leak across xUnit fixture
+        // instances (each instance gets its own unshared database).
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+
+        CreateContext().Database.EnsureCreated();
+        ExecuteOnKeeper("DELETE FROM task_mappings");
+        ExecuteOnKeeper("DELETE FROM pipelines");
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    // ───────────────────────────── fixture helpers ─────────────────────────────
+
+    /// <summary>Creates a context on its OWN connection to the shared database.</summary>
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private PipelineStore CreateStore(IInterceptor? interceptor = null) =>
+        new(CreateContext(interceptor), NullLogger<PipelineStore>.Instance);
+
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
+    }
+
+    /// <summary>Reads the persisted goal id for a task RAW — no EF Core, no change tracker.</summary>
+    private string? ReadPersistedGoalId(string taskId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "SELECT goal_id FROM task_mappings WHERE task_id = $taskId";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "$taskId";
+        parameter.Value = taskId;
+        command.Parameters.Add(parameter);
+        return command.ExecuteScalar() as string;
+    }
+
+    private static Goal CreateGoal(string id) =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    /// <summary>Creates a manager-owned pipeline whose active task pointer is already set.</summary>
+    private static GoalPipeline CreateActivePipeline(GoalPipelineManager manager, string goalId, string taskId)
+    {
+        var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        pipeline.SetActiveTask(taskId);
+        return pipeline;
+    }
+
+    private static void AssertSingleLog(
+        TestLogger<GoalPipelineManager> logger, LogLevel level, string message) =>
+        Assert.Single(
+            logger.LogEntries,
+            e => e.LogLevel == level && string.Equals(e.Message, message, StringComparison.Ordinal));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (A) PersistAdmission — the outcome matrix
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// COMMITTED: the in-memory claim is held AND the E2a-i transaction landed BOTH rows (the
+    /// mapping row and the pipeline row carrying the pointer), with the exact DEBUG template.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_Fresh_CommitsClaimAndBothPersistedRows()
+    {
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-commit", "task-commit");
+
+        var result = manager.PersistAdmission(pipeline, "task-commit");
+
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.Committed), result);
+        Assert.Null(result.PersistenceException);
+
+        // THE MEMORY CLAIM.
+        Assert.Same(pipeline, manager.GetByTaskId("task-commit"));
+        // THE PERSISTED TRANSACTION: the mapping row AND the pipeline row's pointer.
+        Assert.Equal("goal-commit", ReadPersistedGoalId("task-commit"));
+        Assert.Equal(1L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-commit' AND active_task_id = 'task-commit'"));
+
+        AssertSingleLog(logger, LogLevel.Debug, "Admission committed goal=goal-commit task=task-commit");
+    }
+
+    /// <summary>
+    /// MEMORY CONFLICT (IDENTICAL PAIR): the very same (taskId, goalId) pair is already mapped, so
+    /// the admission is refused BEFORE any store call — proved by the invocation-counting seam's
+    /// ZERO recorded statements — and the pre-existing claim is untouched.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_IdenticalPairAlreadyMapped_MemoryConflictWithoutStoreCall()
+    {
+        var counter = new AdmissionCommandCounter();
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(CreateStore(counter), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-same", "task-same");
+        manager.RegisterTask("task-same", "goal-same");
+
+        counter.Start();
+        var result = manager.PersistAdmission(pipeline, "task-same");
+
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict), result);
+        // NO STORE CALL: not a single statement reached the database.
+        Assert.Empty(counter.Commands);
+        // THE CLAIM IS UNTOUCHED.
+        Assert.Same(pipeline, manager.GetByTaskId("task-same"));
+        Assert.Equal("goal-same", ReadPersistedGoalId("task-same"));
+
+        AssertSingleLog(
+            logger, LogLevel.Debug,
+            "Admission refused — task task-same is already mapped (goal=goal-same); no store call made");
+    }
+
+    /// <summary>
+    /// MEMORY CONFLICT (FOREIGN GOAL): the task is already mapped to ANOTHER goal → the same
+    /// refusal shape, no store call, the FOREIGN goal named in the log line, and the foreign
+    /// mapping left intact (a claim would have stolen it).
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_ForeignPairAlreadyMapped_MemoryConflictWithoutStoreCall()
+    {
+        var counter = new AdmissionCommandCounter();
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(CreateStore(counter), logger);
+        var foreign = manager.CreatePipeline(CreateGoal("goal-foreign"));
+        var pipeline = CreateActivePipeline(manager, "goal-ours", "task-foreign");
+        manager.RegisterTask("task-foreign", "goal-foreign");
+
+        counter.Start();
+        var result = manager.PersistAdmission(pipeline, "task-foreign");
+
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.MemoryConflict), result);
+        Assert.Empty(counter.Commands);
+        // THE FOREIGN CLAIM IS UNTOUCHED — memory and row both still the foreign goal's.
+        Assert.Same(foreign, manager.GetByTaskId("task-foreign"));
+        Assert.Equal("goal-foreign", ReadPersistedGoalId("task-foreign"));
+
+        AssertSingleLog(
+            logger, LogLevel.Debug,
+            "Admission refused — task task-foreign is already mapped (goal=goal-foreign); no store call made");
+    }
+
+    /// <summary>
+    /// PERSIST CONFLICT: a competing persisted row (written by another attempt) makes the E2a-i
+    /// transaction refuse; the PAIR-BASED rollback leaves NO in-memory claim behind and the
+    /// competing row INTACT, with the exact DEBUG template.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_CompetingPersistedRow_RollsBackClaimAndLeavesRowIntact()
+    {
+        ExecuteOnKeeper(
+            "INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-conflict', 'goal-competitor')");
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(CreateStore(), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-ours", "task-conflict");
+
+        var result = manager.PersistAdmission(pipeline, "task-conflict");
+
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.PersistConflict), result);
+        Assert.Null(result.PersistenceException);
+        // THE PAIR-BASED ROLLBACK: no claim survives…
+        Assert.Null(manager.GetByTaskId("task-conflict"));
+        // …and the competing attempt's row was never disturbed.
+        Assert.Equal("goal-competitor", ReadPersistedGoalId("task-conflict"));
+
+        AssertSingleLog(
+            logger, LogLevel.Debug,
+            "Admission rolled back — task task-conflict's persisted row is owned by another attempt; the memory claim removed");
+    }
+
+    /// <summary>
+    /// PERSISTENCE FAILED: a forced store failure (the EF interceptor's sentinel at the mapping
+    /// INSERT) → the exception is CARRIED on the result (exact instance identity, and the same
+    /// instance is the logged exception argument), the claim is rolled back, and the exact
+    /// WARNING template is emitted.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_StoreThrows_RollsBackClaimAndCarriesException()
+    {
+        var sentinel = new InvalidOperationException("admission-sentinel");
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(
+            CreateStore(new SentinelThrowingInterceptor(sentinel, "INSERT")), logger);
+        var pipeline = CreateActivePipeline(manager, "goal-fail", "task-fail");
+
+        var result = manager.PersistAdmission(pipeline, "task-fail");
+
+        Assert.Equal(AdmissionCommitStatus.PersistenceFailed, result.Status);
+        Assert.NotNull(result.PersistenceException);
+        // THE EXACT SHAPE: EF wraps the interceptor's throw; the SENTINEL is the direct inner.
+        var update = Assert.IsType<DbUpdateException>(result.PersistenceException);
+        Assert.Same(sentinel, update.InnerException);
+
+        // THE ROLLBACK: neither the claim nor a row survives.
+        Assert.Null(manager.GetByTaskId("task-fail"));
+        Assert.Null(ReadPersistedGoalId("task-fail"));
+
+        // THE WARNING carries the EXACT carried instance as the exception argument.
+        var warning = Assert.Single(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning
+                && string.Equals(
+                    e.Message,
+                    "Admission failed — the store threw for task task-fail (goal=goal-fail); the memory claim removed",
+                    StringComparison.Ordinal));
+        Assert.Same(result.PersistenceException, warning.Exception);
+    }
+
+    /// <summary>
+    /// NO STORE: the in-memory claim alone IS the admission, retained, with the exact DEBUG
+    /// template and no persisted row anywhere.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_NullStore_KeepsClaimAndReportsNoStore()
+    {
+        var logger = new TestLogger<GoalPipelineManager>();
+        var manager = new GoalPipelineManager(store: null, logger);
+        var pipeline = CreateActivePipeline(manager, "goal-nostore", "task-nostore");
+
+        var result = manager.PersistAdmission(pipeline, "task-nostore");
+
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.NoStore), result);
+        Assert.Same(pipeline, manager.GetByTaskId("task-nostore"));
+        Assert.Null(ReadPersistedGoalId("task-nostore"));
+
+        AssertSingleLog(
+            logger, LogLevel.Debug,
+            "Admission committed in memory only — no store configured (goal=goal-nostore task=task-nostore)");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (B) PersistAdmission — the three PRE-LOCK validations
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>VALIDATION 1: a null pipeline → <c>ArgumentNullException</c>, dictionary untouched.</summary>
+    [Fact]
+    public void PersistAdmission_NullPipeline_ThrowsArgumentNullException_DictionaryUntouched()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var witness = manager.CreatePipeline(CreateGoal("goal-witness"));
+        manager.RegisterTask("task-witness", "goal-witness");
+        counter.Start();
+
+        var ex = Assert.Throws<ArgumentNullException>(() => manager.PersistAdmission(null!, "task-any"));
+
+        Assert.Equal("pipeline", ex.ParamName);
+        // THE DICTIONARY IS UNTOUCHED: nothing claimed, the witness intact, no statement issued.
+        Assert.Null(manager.GetByTaskId("task-any"));
+        Assert.Same(witness, manager.GetByTaskId("task-witness"));
+        Assert.Empty(counter.Commands);
+    }
+
+    /// <summary>VALIDATION 2: a null/blank task id → <c>ArgumentException</c>, dictionary untouched.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void PersistAdmission_NullOrBlankTaskId_ThrowsArgumentException_DictionaryUntouched(string? blank)
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var witness = manager.CreatePipeline(CreateGoal("goal-witness"));
+        manager.RegisterTask("task-witness", "goal-witness");
+        var pipeline = CreateActivePipeline(manager, "goal-blank", "task-blank");
+        counter.Start();
+
+        var ex = Assert.Throws<ArgumentException>(() => manager.PersistAdmission(pipeline, blank!));
+
+        Assert.Equal("taskId", ex.ParamName);
+        // THE DICTIONARY IS UNTOUCHED.
+        Assert.Null(manager.GetByTaskId("task-blank"));
+        Assert.Same(witness, manager.GetByTaskId("task-witness"));
+        Assert.Empty(counter.Commands);
+    }
+
+    /// <summary>
+    /// VALIDATION 3: the pipeline's active pointer does not name the admitted task →
+    /// <c>ArgumentException</c> on <c>taskId</c> carrying BOTH values, dictionary untouched.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_ActiveTaskIdMismatch_ThrowsArgumentException_DictionaryUntouched()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var witness = manager.CreatePipeline(CreateGoal("goal-witness"));
+        manager.RegisterTask("task-witness", "goal-witness");
+        var pipeline = CreateActivePipeline(manager, "goal-mismatch", "task-active");
+        counter.Start();
+
+        var ex = Assert.Throws<ArgumentException>(() => manager.PersistAdmission(pipeline, "task-requested"));
+
+        Assert.Equal("taskId", ex.ParamName);
+        // BOTH VALUES are named in the message.
+        Assert.Contains("task-requested", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("task-active", ex.Message, StringComparison.Ordinal);
+        // THE DICTIONARY IS UNTOUCHED.
+        Assert.Null(manager.GetByTaskId("task-requested"));
+        Assert.Null(manager.GetByTaskId("task-active"));
+        Assert.Same(witness, manager.GetByTaskId("task-witness"));
+        Assert.Empty(counter.Commands);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (C) The lock policy — mutual exclusion, proved honestly
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE SERIALIZATION VECTOR: an external gate inside the EF interceptor holds
+    /// <see cref="GoalPipelineManager.PersistAdmission"/> INSIDE the store call — hence INSIDE
+    /// <c>_mappingLock</c>. A concurrent <see cref="GoalPipelineManager.TryUnregisterTask"/> for a
+    /// DISJOINT task MUST NOT complete while the gate blocks: that bounded-window NON-completion is
+    /// the mutual-exclusion proof (without the lock the disjoint unregister would finish
+    /// immediately). After the release both complete within bounded waits and the final state is
+    /// consistent.
+    /// </summary>
+    /// <remarks>
+    /// THE HONEST RULE: this vector deliberately does NOT assert that <c>Committed</c> was OBSERVED
+    /// before the unregister's mutation landed. The Monitor is released before the caller's thread
+    /// observes the returned value, so that ordering is unguaranteeable. The claim proved here is
+    /// exactly: mutual exclusion while the lock is held, plus final consistency.
+    /// </remarks>
+    [Fact]
+    public async Task PersistAdmission_HoldsMappingLock_SerializingDisjointUnregister()
+    {
+        var gate = new GatedAdmissionInterceptor();
+        var manager = new GoalPipelineManager(CreateStore(gate), new TestLogger<GoalPipelineManager>());
+        var disjoint = manager.CreatePipeline(CreateGoal("goal-disjoint"));
+        manager.RegisterTask("task-disjoint", "goal-disjoint");
+        var pipeline = CreateActivePipeline(manager, "goal-serial", "task-serial");
+
+        // The gate is inert during setup and armed only now: the vector's own admission is the
+        // FIRST statement it can block.
+        gate.Arm();
+        var admissionTask = Task.Factory.StartNew(
+            () => manager.PersistAdmission(pipeline, "task-serial"),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Task<TaskUnregisterResult>? unregisterTask = null;
+        try
+        {
+            // The admission is now INSIDE the store call, holding _mappingLock.
+            await gate.Entered.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            var unregisterStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            unregisterTask = Task.Factory.StartNew(
+                () =>
+                {
+                    unregisterStarted.SetResult();
+                    return manager.TryUnregisterTask("task-disjoint", "goal-disjoint");
+                },
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            await unregisterStarted.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // THE MUTUAL-EXCLUSION PROOF: the DISJOINT unregister cannot proceed while the
+            // admission holds the lock — it must NOT complete within the bounded window.
+            await Assert.ThrowsAsync<TimeoutException>(
+                () => unregisterTask.WaitAsync(TimeSpan.FromMilliseconds(750), TestContext.Current.CancellationToken));
+            Assert.False(unregisterTask.IsCompleted);
+            // …and its mutation has NOT landed while it is blocked.
+            Assert.Same(disjoint, manager.GetByTaskId("task-disjoint"));
+        }
+        finally
+        {
+            gate.Release();
+        }
+
+        // BOUNDED waits — a timeout IS a failure.
+        var admissionResult = await admissionTask.WaitAsync(
+            TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        var unregisterResult = await unregisterTask!.WaitAsync(
+            TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        // THE CONSISTENCY PROOF (observed AFTER both): the admission committed…
+        Assert.Equal(new AdmissionCommitResult(AdmissionCommitStatus.Committed), admissionResult);
+        Assert.Same(pipeline, manager.GetByTaskId("task-serial"));
+        Assert.Equal("goal-serial", ReadPersistedGoalId("task-serial"));
+        // …AND the disjoint unregister's mutation landed.
+        Assert.Equal(new TaskUnregisterResult(true, true), unregisterResult);
+        Assert.Null(manager.GetByTaskId("task-disjoint"));
+        Assert.Null(ReadPersistedGoalId("task-disjoint"));
+        Assert.Equal(1, gate.BlockCount);
+    }
+
+    /// <summary>
+    /// THE DIRECT-MONITOR CONTENTION VECTOR: the private <c>_mappingLock</c> is obtained by
+    /// reflection and held by a dedicated thread. A mapping-surface call for a DISJOINT task
+    /// cannot complete while the monitor is held; after the release it completes within a bounded
+    /// wait (the timeout IS the failure) with the correct final outcome.
+    /// </summary>
+    [Fact]
+    public async Task MappingSurface_BlocksWhileTheMonitorIsHeldDirectly()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal("goal-mon"));
+        manager.RegisterTask("task-mon", "goal-mon");
+
+        var field = typeof(GoalPipelineManager).GetField(
+            "_mappingLock", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        var mappingLock = field!.GetValue(manager);
+        Assert.NotNull(mappingLock);
+
+        var held = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holder = new Thread(() =>
+        {
+            lock (mappingLock!)
+            {
+                held.SetResult();
+                release.Task.GetAwaiter().GetResult();
+            }
+        })
+        { IsBackground = true, Name = "mapping-lock-holder" };
+
+        Task<TaskUnregisterResult>? unregisterTask = null;
+        try
+        {
+            holder.Start();
+            await held.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            unregisterTask = Task.Factory.StartNew(
+                () =>
+                {
+                    started.SetResult();
+                    return manager.TryUnregisterTask("task-mon", "goal-mon");
+                },
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // BLOCKED on the monitor: neither completion nor mutation while it is held.
+            await Assert.ThrowsAsync<TimeoutException>(
+                () => unregisterTask.WaitAsync(TimeSpan.FromMilliseconds(750), TestContext.Current.CancellationToken));
+            Assert.False(unregisterTask.IsCompleted);
+            Assert.Same(pipeline, manager.GetByTaskId("task-mon"));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        // THE BOUNDED COMPLETION — the timeout IS the failure.
+        var result = await unregisterTask!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(new TaskUnregisterResult(true, true), result);
+        Assert.Null(manager.GetByTaskId("task-mon"));
+        Assert.Null(ReadPersistedGoalId("task-mon"));
+        Assert.True(holder.Join(TimeSpan.FromSeconds(5)));
+    }
+}
+
+/// <summary>
+/// Records EVERY statement issued while recording is enabled, so a test can prove that a refusal
+/// path made no store call at all. The callback performs NO re-entrant work.
+/// </summary>
+internal sealed class AdmissionCommandCounter : DbCommandInterceptor
+{
+    private bool _recording;
+
+    /// <summary>The captured statements.</summary>
+    public List<string> Commands { get; } = [];
+
+    /// <summary>Begins capturing.</summary>
+    public void Start()
+    {
+        Commands.Clear();
+        _recording = true;
+    }
+
+    private void Record(DbCommand command)
+    {
+        if (_recording)
+            Commands.Add(command.CommandText);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<object> ScalarExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+    {
+        Record(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<object>> ScalarExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<object> result,
+        CancellationToken cancellationToken = default)
+    {
+        Record(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// Blocks the FIRST <c>task_mappings</c> INSERT on an EXTERNAL gate, holding the calling thread
+/// INSIDE the store's admission transaction until <see cref="Release"/> is called. The callback
+/// performs NO re-entrant work into the manager — it only signals and waits on its own gate.
+/// </summary>
+internal sealed class GatedAdmissionInterceptor : DbCommandInterceptor
+{
+    private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _blockCount;
+    private volatile bool _armed;
+
+    /// <summary>Completes once the store call is blocked inside the transaction.</summary>
+    public Task Entered => _entered.Task;
+
+    /// <summary>How many times the gate actually blocked (the injection really fired).</summary>
+    public int BlockCount => Volatile.Read(ref _blockCount);
+
+    /// <summary>
+    /// Arms the gate. Until this is called the interceptor is inert, so fixture SETUP writes
+    /// (the seed mappings, the pipeline rows) run through untouched and only the vector's own
+    /// admission is blocked.
+    /// </summary>
+    public void Arm() => _armed = true;
+
+    /// <summary>Releases the blocked statement. Idempotent.</summary>
+    public void Release() => _release.TrySetResult();
+
+    private void BlockIfTargeted(DbCommand command)
+    {
+        if (!_armed)
+            return;
+
+        var text = command.CommandText;
+        if (!text.Contains("task_mappings", StringComparison.OrdinalIgnoreCase)
+            || !text.TrimStart().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        // Only the FIRST targeted statement blocks; TrySetResult is the one-shot latch.
+        if (!_entered.TrySetResult())
+            return;
+
+        Interlocked.Increment(ref _blockCount);
+        _release.Task.GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        BlockIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        BlockIfTargeted(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        BlockIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        BlockIfTargeted(command);
         return ValueTask.FromResult(result);
     }
 }
