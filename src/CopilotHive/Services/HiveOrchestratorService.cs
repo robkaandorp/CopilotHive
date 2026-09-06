@@ -742,25 +742,13 @@ public sealed class HiveOrchestratorService(
             complete.TaskId, worker.Id, complete.Status,
             string.IsNullOrEmpty(completedTaskModel) ? "unknown" : completedTaskModel);
 
-        // Capture role before MarkIdle resets it to Unspecified
-        var workerRole = worker.Role;
-
         ApplyTaskCompletion(worker, complete.TaskId);
 
-        // Update pipeline state
-        var pipeline = pipelineManager.GetByTaskId(complete.TaskId);
-        if (pipeline is not null)
-        {
-            pipeline.ClearActiveTask();
-            if (workerRole != Workers.WorkerRole.Unspecified && complete.Status != Shared.Grpc.TaskStatus.Failed)
-            {
-                var outputText = !string.IsNullOrWhiteSpace(complete.Metrics?.Summary)
-                    ? complete.Metrics.Summary
-                    : complete.Output;
-                if (pipeline.CurrentPhaseEntry is { } entry)
-                    entry.WorkerOutput = outputText;
-            }
-        }
+        // MUTATION OWNERSHIP: transport does NOT touch the pipeline. The active-task pointer and
+        // the phase entry's worker output are owned exclusively by the ADMITTED completion path
+        // (TaskCompletionService's guards + admission, and the PipelineDriver it drives). A
+        // pre-admission write here could clear a SUCCESSOR's live pointer and overwrite its phase
+        // output on behalf of a duplicate completion that admission subsequently rejects.
 
         // Convert to domain type at the boundary, injecting the model retrieved above
         var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel ?? "" };

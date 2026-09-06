@@ -2070,6 +2070,360 @@ public sealed class TaskCompletionServiceGuardTests
         // The guard drops BEFORE the normal task-completed log is emitted.
         Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("task completed"));
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  THE NO-BRAIN OUTPUT COPY — the admitted completion's half of the mutation-ownership
+    //  split introduced when the transport's pre-admission pipeline write was deleted.
+    //
+    //  WHAT IT IS: inside the no-brain branch, AFTER every guard/admission and the
+    //  ownership-checked pointer release and BEFORE MarkGoalCompletedAsync, the current phase
+    //  entry receives result.Metrics.Summary when that is non-whitespace, otherwise
+    //  result.Output — UNTRUNCATED, and only when result.Status is NOT Failed.
+    //
+    //  THE DELIBERATE NORMALIZATION: a TaskResult carries no worker role, so the copy now
+    //  applies to EVERY admitted no-brain completion — direct domain callers and
+    //  Unspecified-role transport alike. The old transport block skipped Unspecified-role
+    //  workers; that distinction was accidental and is NOT reproduced (no provenance field,
+    //  and the pipeline phase is never used as a stand-in for a worker role).
+    //
+    //  Cancelled stays ELIGIBLE: the exclusion predicate is non-Failed, not "success only".
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>An identifiable pre-existing phase output no rejected completion may overwrite.</summary>
+    private const string PhaseOutputSentinel = "SENTINEL-PRE-EXISTING-PHASE-OUTPUT";
+
+    /// <summary>
+    /// Appends a Testing phase entry to <paramref name="pipeline"/>'s log (the fixture builds no
+    /// phase entries of its own) and seeds it with <paramref name="output"/>.
+    /// </summary>
+    private static PhaseResult SeedPhaseEntry(GoalPipeline pipeline, string? output = PhaseOutputSentinel)
+    {
+        var entry = PhaseResult.Create(GoalPhase.Testing, pipeline.Iteration, 1);
+        entry.WorkerOutput = output;
+        pipeline.PhaseLog.Add(entry);
+        return entry;
+    }
+
+    /// <summary>A completion carrying an explicit status, output and (optional) summary.</summary>
+    private static TaskResult CompletionWith(
+        string taskId, TaskOutcome status, string output, string? summary) => new()
+        {
+            TaskId = taskId,
+            Status = status,
+            Output = output,
+            Metrics = summary is null ? null : new TaskMetrics { Verdict = "PASS", Summary = summary },
+        };
+
+    /// <summary>
+    /// SUMMARY PREFERENCE. An admitted no-brain completion whose metrics carry a non-blank
+    /// summary writes THAT summary into the current phase entry — never the raw output.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainAccepted_PrefersNonBlankSummary()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-summary-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "RAW-OUTPUT", "THE-SUMMARY"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("THE-SUMMARY", entry.WorkerOutput);
+        // The lifecycle/slot contract of the no-brain path is untouched by the copy.
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+        Assert.Equal(WorkSlotState.Claimed, SlotStateOf(pipeline, taskId));
+    }
+
+    /// <summary>
+    /// SUMMARY FALLBACK. A null, empty or whitespace-only summary is not a value: the raw
+    /// output is copied instead. (Null metrics is the "no metrics at all" vector.)
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   \t\r\n ")]
+    public async Task HandleTaskCompletionAsync_NoBrainAccepted_BlankSummaryFallsBackToOutput(string? summary)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-fallback-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "RAW-OUTPUT", summary),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("RAW-OUTPUT", entry.WorkerOutput);
+    }
+
+    /// <summary>
+    /// UNTRUNCATED. The no-brain value is copied exactly as transport supplied it. The 4,000
+    /// character truncation belongs to the BRAIN-driven <c>PipelineDriver</c> path alone, and
+    /// must not leak onto this one.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainAccepted_LongOutputStaysUntruncated()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-long-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var longOutput = new string('x', 9_000);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, longOutput, summary: null),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(longOutput, entry.WorkerOutput);
+        Assert.Equal(9_000, entry.WorkerOutput!.Length);
+        Assert.DoesNotContain("chars total", entry.WorkerOutput);
+    }
+
+    /// <summary>
+    /// THE FAILED EXCLUSION. A Failed result must never overwrite an existing phase output —
+    /// the sentinel survives verbatim.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainFailed_LeavesExistingOutputUnchanged()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-failed-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Failed, "CRASH-OUTPUT", "CRASH-SUMMARY"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(PhaseOutputSentinel, entry.WorkerOutput);
+        // The no-brain lifecycle is unchanged by the exclusion: the goal still completes.
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// CANCELLED REMAINS ELIGIBLE. The predicate is "not Failed", not "success only" — the same
+    /// rule the deleted transport block used.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainCancelled_StillWritesOutput()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-cancelled-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Cancelled, "CANCELLED-OUTPUT", summary: null),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("CANCELLED-OUTPUT", entry.WorkerOutput);
+    }
+
+    /// <summary>
+    /// A MISSING PHASE ENTRY IS A NO-OP: an empty phase log neither throws nor invents an entry,
+    /// and the rest of the no-brain path still runs.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainWithoutPhaseEntry_IsANoOp()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-nolog-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        Assert.Empty(pipeline.PhaseLog);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "RAW-OUTPUT", "THE-SUMMARY"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Empty(pipeline.PhaseLog);
+        Assert.Equal(GoalPhase.Done, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// THE NORMALIZATION, pinned. <see cref="TaskResult"/> carries NO worker role, so a DIRECT
+    /// domain caller — the vector the old transport block could never produce — receives exactly
+    /// the same output behaviour as a transport-originated completion. Its transport twin (an
+    /// Unspecified-role worker delivering through <c>WorkStream</c>) is pinned in
+    /// <c>DashboardNotifierWorkerWiringTests</c>.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_NoBrainDirectDomainCaller_ReceivesTheSameOutputWrite()
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-nb-direct-{Guid.NewGuid():N}", WorkSlotState.Pending);
+        var entry = SeedPhaseEntry(pipeline);
+        var service = CreateService(
+            pipelineManager, brain: null, logger,
+            goalManager: await TerminalCapableGoalManagerAsync(pipeline));
+
+        // No role is expressible on this call — that is the whole point of the normalization.
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "DIRECT-OUTPUT", summary: null),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("DIRECT-OUTPUT", entry.WorkerOutput);
+    }
+
+    // ── REJECTED COMPLETIONS GAIN NO OUTPUT WRITE ────────────────────────────────────
+
+    /// <summary>
+    /// THE REJECTION SET: a completion dropped by ANY guard — terminal goal, planning window,
+    /// stale task, abandoned slot, or already-admitted (duplicate) slot — leaves the phase
+    /// output at its sentinel. The copy sits behind the admission, so no rejected completion can
+    /// reach it. This is the domain-side counterpart to the deleted transport write, which ran
+    /// BEFORE every one of these guards.
+    /// <para>
+    /// EACH VECTOR ISOLATES ITS OWN GUARD, and the slot state is chosen for exactly that reason
+    /// (see <see cref="SlotStateForRejection"/>). A vector that could be rejected by a LATER
+    /// guard as well would still pass with its named guard deleted — a no-op that proves
+    /// nothing — so every vector additionally asserts that its OWN classification was logged and
+    /// that NO OTHER guard's classification was.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("terminal")]
+    [InlineData("planning")]
+    [InlineData("stale")]
+    [InlineData("abandoned")]
+    [InlineData("duplicate")]
+    public async Task HandleTaskCompletionAsync_RejectedCompletion_NeverWritesPhaseOutput(string rejection)
+    {
+        var logger = new CollectingLogger<TaskCompletionService>();
+        var (pipelineManager, pipeline, taskId) =
+            SlotGuardFixture($"goal-reject-{rejection}-{Guid.NewGuid():N}", SlotStateForRejection(rejection));
+        var entry = SeedPhaseEntry(pipeline);
+
+        switch (rejection)
+        {
+            case "terminal":
+                // No slot was seeded, so this AdvanceTo has nothing to abandon and the terminal
+                // guard is the ONLY thing standing between this completion and the drive.
+                pipeline.AdvanceTo(GoalPhase.Done);
+                Assert.Empty(pipeline.GetSlotsForTest());
+                break;
+            case "planning":
+                pipeline.StateMachine.RestoreFromPlan([], GoalPhase.Planning);
+                pipeline.AdvanceTo(GoalPhase.Planning);
+                // AdvanceTo abandons Pending slots ONLY on the terminal phases, so the slot is
+                // still live here and the admission would ADMIT this completion.
+                Assert.Equal(WorkSlotState.Pending, SlotStateOf(pipeline, taskId));
+                break;
+            case "stale":
+                // The pipeline has moved on to a newer task. The slot stays Pending, so the
+                // admission would admit — the stale guard is the sole rejecting authority.
+                pipeline.SetActiveTask("task-newer-than-the-completion");
+                Assert.Equal(WorkSlotState.Pending, SlotStateOf(pipeline, taskId));
+                break;
+            case "abandoned":
+            case "duplicate":
+                // Every earlier guard passes (active task, mid-iteration, non-terminal), so the
+                // admission itself is the sole rejecting authority.
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled rejection vector: {rejection}");
+        }
+
+        // The no-brain flavour: its output copy is the one that must stay unreachable. The
+        // brain-driven path shares every guard above, so neither flavour may write.
+        var service = CreateService(pipelineManager, brain: null, logger);
+
+        await service.HandleTaskCompletionAsync(
+            CompletionWith(taskId, TaskOutcome.Completed, "REJECTED-OUTPUT", "REJECTED-SUMMARY"),
+            TestContext.Current.CancellationToken);
+
+        // (a) THE OUTPUT CLAIM: the sentinel survived.
+        Assert.Equal(PhaseOutputSentinel, entry.WorkerOutput);
+
+        // (b) THE CLASSIFICATION CLAIM: the NAMED guard did the rejecting, and no other did.
+        // Without this, deleting the named guard could leave a LATER guard to reject the same
+        // completion and the sentinel assertion above would pass for the wrong reason.
+        AssertRejectedBy(logger.Logs, rejection, pipeline.GoalId, taskId);
+
+        // (c) THE REACHABILITY CLAIM: the completion never got past the guards at all. This
+        // line is emitted immediately AFTER the admission and the pointer release, so its
+        // absence proves the drive/no-brain branch — and therefore the copy — was never reached.
+        Assert.DoesNotContain(logger.Logs, l => l.Message.Contains("task completed"));
+    }
+
+    /// <summary>
+    /// The slot state each rejection vector must be built with so that its NAMED guard is the
+    /// SOLE rejecting authority.
+    /// </summary>
+    /// <remarks>
+    /// THE TERMINAL VECTOR'S <c>null</c> IS THE POINT. <see cref="GoalPipeline.AdvanceTo"/>
+    /// abandons every PENDING slot when it moves to Done or Failed. A terminal vector built with
+    /// a Pending slot would therefore be rejected TWICE — by the terminal guard, and (with that
+    /// guard deleted) by the admission's <c>SlotAbandoned</c> outcome — so removing the terminal
+    /// guard would leave the pipeline in a state-identical no-op and the vector would pass under
+    /// the mutant. Building it with NO slot puts it on the legacy pre-registry pass-through
+    /// (<c>AdmissionOutcome.NoSlot</c>, whose semantics are untouched here), so with the terminal
+    /// guard deleted the completion flows all the way into the no-brain branch and overwrites the
+    /// sentinel. The other four vectors keep a LIVE (or deliberately dead) slot for the same
+    /// reason: none of them may be rescued by a guard other than their own.
+    /// </remarks>
+    private static WorkSlotState? SlotStateForRejection(string rejection) => rejection switch
+    {
+        "terminal" => null,
+        "planning" => WorkSlotState.Pending,
+        "stale" => WorkSlotState.Pending,
+        "abandoned" => WorkSlotState.Abandoned,
+        "duplicate" => WorkSlotState.Claimed,
+        _ => throw new InvalidOperationException($"Unhandled rejection vector: {rejection}"),
+    };
+
+    /// <summary>
+    /// Asserts that <paramref name="rejection"/>'s own guard emitted its classification and that
+    /// none of the OTHER guards' classifications appear anywhere in the log.
+    /// </summary>
+    private static void AssertRejectedBy(
+        IReadOnlyList<(LogLevel Level, string Message)> logs, string rejection, string goalId, string taskId)
+    {
+        // The five mutually exclusive classification markers, one per guard.
+        var markers = new Dictionary<string, Func<(LogLevel Level, string Message), bool>>(StringComparer.Ordinal)
+        {
+            ["terminal"] = l => l.Level == LogLevel.Information &&
+                l.Message == $"Task {taskId} completed but goal {goalId} already Done — ignoring duplicate",
+            ["planning"] = l => l.Level == LogLevel.Warning &&
+                l.Message.Contains("StaleCompletion") && l.Message.Contains("reason=planning-window"),
+            ["stale"] = l => l.Level == LogLevel.Warning &&
+                l.Message.Contains("ignoring stale completion"),
+            ["abandoned"] = l => l.Level == LogLevel.Warning &&
+                l.Message == ExpectedDropLog(goalId, taskId, GoalPhase.Testing),
+            ["duplicate"] = l => l.Level == LogLevel.Warning &&
+                l.Message == ExpectedDuplicateLog(goalId, taskId, GoalPhase.Testing),
+        };
+
+        Assert.True(logs.Any(markers[rejection]),
+            $"Expected the '{rejection}' guard's classification. Logs: {string.Join(" | ", logs.Select(l => l.Message))}");
+
+        foreach (var (name, marker) in markers)
+        {
+            if (name == rejection)
+                continue;
+            Assert.DoesNotContain(logs, l => marker(l));
+        }
+    }
 }
 
 /// <summary>

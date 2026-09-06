@@ -139,6 +139,26 @@ internal sealed class TaskCompletionService
 
         if (_brain is null)
         {
+            // THE NO-BRAIN OUTPUT COPY — the admitted completion's half of the mutation-ownership
+            // split. The no-brain path bypasses PipelineDriver entirely, so nothing else would
+            // record this worker's output. It sits HERE deliberately: after every guard and the
+            // admission (so a stale/duplicate/abandoned/terminal/planning completion can never
+            // write), after the pointer release, and before the terminal MarkGoalCompletedAsync.
+            //
+            // Summary-preferred, output otherwise, and UNTRUNCATED — the value transport used to
+            // write directly. A Failed result never overwrites an existing entry; Cancelled stays
+            // eligible (the predicate is non-Failed, not "success only"). No phase entry → no-op.
+            //
+            // NORMALIZATION, deliberately: this applies to EVERY admitted no-brain completion —
+            // including Unspecified-role transport and direct domain callers — because a
+            // TaskResult carries no worker role and the pipeline phase is not a stand-in for one.
+            if (result.Status != TaskOutcome.Failed && pipeline.CurrentPhaseEntry is { } noBrainEntry)
+            {
+                noBrainEntry.WorkerOutput = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
+                    ? result.Metrics.Summary
+                    : result.Output;
+            }
+
             // THE NO-BRAIN PATH — the degenerate single-phase mode. It completes the goal WITHOUT
             // recording the slot, deliberately: the goal reaches Done and its pipeline is removed,
             // so the admitted slot's terminal state is irrelevant. The terminal AdvanceTo abandons
