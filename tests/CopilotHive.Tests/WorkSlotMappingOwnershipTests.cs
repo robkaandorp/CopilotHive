@@ -82,6 +82,40 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     private void RacerWritesMapping(string taskId, string goalId) =>
         CreateStore().SaveTaskMapping(taskId, goalId);
 
+    /// <summary>
+    /// Seeds a DURABLE <c>task_mappings</c> row directly through the store.
+    /// </summary>
+    /// <remarks>
+    /// The registers became MEMORY-ONLY with the admission-atomic-switch, so
+    /// <c>RegisterTask</c>/<c>TryRegisterTask</c> no longer create a row. Tests that need durable
+    /// coverage seed it explicitly here — the store is the only remaining writer outside the
+    /// admission path.
+    /// </remarks>
+    private void SeedPersistedMapping(string taskId, string goalId) =>
+        CreateStore().SaveTaskMapping(taskId, goalId);
+
+    /// <summary>
+    /// Seeds a durable <c>task_mappings</c> row through the RAW keeper connection, bypassing EF
+    /// Core entirely — used when the test's store carries a throwing interceptor that must apply
+    /// ONLY to the operation under test, not to the seeding.
+    /// </summary>
+    private void SeedPersistedMappingRaw(string taskId, string goalId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText =
+            "INSERT INTO task_mappings (task_id, goal_id) VALUES ($taskId, $goalId) " +
+            "ON CONFLICT(task_id) DO UPDATE SET goal_id = $goalId";
+        var taskParameter = command.CreateParameter();
+        taskParameter.ParameterName = "$taskId";
+        taskParameter.Value = taskId;
+        command.Parameters.Add(taskParameter);
+        var goalParameter = command.CreateParameter();
+        goalParameter.ParameterName = "$goalId";
+        goalParameter.Value = goalId;
+        command.Parameters.Add(goalParameter);
+        command.ExecuteNonQuery();
+    }
+
     private void ExecuteOnKeeper(string sql)
     {
         using var command = _keeper.CreateCommand();
@@ -382,61 +416,84 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     // (4) GoalPipelineManager.TryRegisterTask
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// A fresh task is claimed IN MEMORY ONLY. The admission-atomic-switch removed the register's
+    /// store path, so no <c>task_mappings</c> row is written even though a store is configured —
+    /// the persisted row belongs exclusively to the admission path (<c>PersistAdmission</c>).
+    /// </summary>
     [Fact]
-    public void TryRegisterTask_FreshTask_SucceedsAndPersistsOwnership()
+    public void TryRegisterTask_FreshTask_SucceedsInMemoryOnly()
     {
-        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var counter = new TaskMappingCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal("goal-ours"));
 
+        counter.Start();
         var result = manager.TryRegisterTask("reg-fresh", "goal-ours");
 
         Assert.Equal(new TaskRegistrationResult(true, TaskRegistrationFailure.None, null), result);
         Assert.Same(pipeline, manager.GetByTaskId("reg-fresh"));
-        Assert.Equal("goal-ours", ReadPersistedGoalId("reg-fresh"));
+        // MEMORY-ONLY: not a single statement reached the database, and no row exists.
+        Assert.Empty(counter.Commands);
+        Assert.Null(ReadPersistedGoalId("reg-fresh"));
     }
 
+    /// <summary>
+    /// Blank arguments now THROW instead of returning a no-op refusal: both registers validate
+    /// <c>taskId</c> then <c>goalId</c> with <c>ArgumentException.ThrowIfNullOrWhiteSpace</c>
+    /// BEFORE any mutation, so nothing is claimed and no SQL runs.
+    /// </summary>
     [Theory]
-    [InlineData("", "goal-ours")]
-    [InlineData("   ", "goal-ours")]
-    [InlineData("reg-blank", "")]
-    [InlineData("reg-blank", "  ")]
-    public void TryRegisterTask_BlankArgument_IsNoOpRefusalWithoutSql(string taskId, string goalId)
+    [InlineData("", "goal-ours", "taskId")]
+    [InlineData("   ", "goal-ours", "taskId")]
+    [InlineData("reg-blank", "", "goalId")]
+    [InlineData("reg-blank", "  ", "goalId")]
+    public void TryRegisterTask_BlankArgument_ThrowsWithoutSql(string taskId, string goalId, string expectedParam)
     {
         var counter = new TaskMappingCommandCounter();
         var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
         counter.Start();
 
-        var result = manager.TryRegisterTask(taskId, goalId);
+        var ex = Assert.Throws<ArgumentException>(() => manager.TryRegisterTask(taskId, goalId));
 
-        Assert.Equal(new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null), result);
+        // THE VALIDATION ORDER is observable through ParamName: taskId is checked first.
+        Assert.Equal(expectedParam, ex.ParamName);
         Assert.Empty(counter.Commands);
         Assert.Null(manager.GetByTaskId(taskId));
     }
 
     /// <summary>
-    /// NULL vectors of the null/blank no-op contract — the genuine <c>null</c> path, not the
-    /// empty-string path. The guard must refuse before <c>TryAdd</c> ever sees the argument:
-    /// with the guard removed a null taskId reaches <c>ConcurrentDictionary.TryAdd</c> and throws,
-    /// and a null goalId is claimed in memory and carried into the SQL — either way the exact
-    /// result record, the zero command count and the untouched witness mapping all break.
+    /// NULL vectors of the validation contract — the genuine <c>null</c> path, not the
+    /// empty-string path. The guard must refuse before <c>TryAdd</c> ever sees the argument.
     /// </summary>
+    /// <remarks>
+    /// REMOVAL PROOF: with the validation removed a null taskId reaches
+    /// <c>ConcurrentDictionary.TryAdd</c> and throws <c>ArgumentNullException</c> (a DIFFERENT
+    /// type with no ParamName ordering guarantee), and a null goalId is claimed in memory — either
+    /// way the exact exception type, the ParamName and the untouched witness mapping all break.
+    /// </remarks>
     [Theory]
-    [InlineData(null, "goal-ours")]
-    [InlineData("reg-null", null)]
-    [InlineData(null, null)]
-    public void TryRegisterTask_NullArgument_IsNoOpRefusalWithoutSql(string? taskId, string? goalId)
+    [InlineData(null, "goal-ours", "taskId")]
+    [InlineData("reg-null", null, "goalId")]
+    [InlineData(null, null, "taskId")]
+    public void TryRegisterTask_NullArgument_ThrowsWithoutSql(string? taskId, string? goalId, string expectedParam)
     {
         var counter = new TaskMappingCommandCounter();
         var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
         var witnessPipeline = manager.CreatePipeline(CreateGoal("goal-ours"));
 
-        // A pre-existing mapping that must survive the refusal untouched.
+        // A pre-existing mapping that must survive the refusal untouched. Seeded durably via the
+        // store because the memory-only register no longer writes a row.
         manager.RegisterTask("reg-null-witness", "goal-ours");
+        SeedPersistedMapping("reg-null-witness", "goal-ours");
         counter.Start();
 
-        var result = manager.TryRegisterTask(taskId!, goalId!);
+        // ArgumentNullException (the null path) DERIVES from ArgumentException (the blank path),
+        // so the assertion is on the base type — matching the register's declared contract.
+        var ex = Assert.ThrowsAny<ArgumentException>(() => manager.TryRegisterTask(taskId!, goalId!));
 
-        Assert.Equal(new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null), result);
+        // THE VALIDATION ORDER: taskId first, so a null/null pair names taskId.
+        Assert.Equal(expectedParam, ex.ParamName);
         Assert.Empty(counter.Commands);
 
         // Memory unchanged: the witness still resolves, and nothing was claimed for the argument.
@@ -450,8 +507,9 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     }
 
     /// <summary>
-    /// In-memory duplicate: this manager already holds an entry for the task, so the refusal must
-    /// happen BEFORE any statement reaches the database (proved by the zero command count).
+    /// In-memory duplicate: this manager already holds an entry for the task, so the refusal is
+    /// reported through the result (NON-THROWING) and the existing entry is left INTACT. No
+    /// statement reaches the database — the register is memory-only.
     /// </summary>
     [Fact]
     public void TryRegisterTask_InMemoryDuplicate_RefusesWithoutExecutingSql()
@@ -461,6 +519,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var first = manager.CreatePipeline(CreateGoal("goal-first"));
         manager.CreatePipeline(CreateGoal("goal-second"));
         manager.RegisterTask("reg-dup", "goal-first");
+        SeedPersistedMapping("reg-dup", "goal-first");
 
         counter.Start();
         var result = manager.TryRegisterTask("reg-dup", "goal-second");
@@ -472,47 +531,66 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     }
 
     /// <summary>
-    /// DATABASE-CONFLICT vector: the competing row is pre-arranged by the racer's separate context,
-    /// so this manager's <c>TryAdd</c> succeeds and only the conditional statement can catch the
-    /// conflict. Removing the pair-based rollback leaves this manager's memory claiming a mapping
-    /// it does not own — the <c>GetByTaskId</c> assertion is what fails then.
+    /// A pre-existing persisted row owned by another goal is now IRRELEVANT to the register: the
+    /// memory-only claim succeeds because this manager holds no in-memory entry, and the competing
+    /// row is neither read nor written.
     /// </summary>
+    /// <remarks>
+    /// This replaces the former database-conflict vector. The store path (and with it the
+    /// conditional write, the row-conflict refusal and the pair-based memory rollback) was removed
+    /// by the admission-atomic-switch; the persisted-ownership conflict is now the admission
+    /// path's concern and is covered by the PersistConflict tests in
+    /// <c>WorkSlotAdmissionCommitTests</c>.
+    /// </remarks>
     [Fact]
-    public void TryRegisterTask_DatabaseConflict_RollsBackMemoryAndLeavesRowIntact()
+    public void TryRegisterTask_ForeignPersistedRow_IsIgnoredByTheMemoryOnlyRegister()
     {
         RacerWritesMapping("reg-conflict", "goal-racer");
 
-        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
-        manager.CreatePipeline(CreateGoal("goal-ours"));
+        var counter = new TaskMappingCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var ours = manager.CreatePipeline(CreateGoal("goal-ours"));
 
+        counter.Start();
         var result = manager.TryRegisterTask("reg-conflict", "goal-ours");
 
-        Assert.Equal(new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null), result);
+        // The memory claim succeeds — the register never consults the store.
+        Assert.Equal(new TaskRegistrationResult(true, TaskRegistrationFailure.None, null), result);
+        Assert.Same(ours, manager.GetByTaskId("reg-conflict"));
+        Assert.Empty(counter.Commands);
+        // The competing row is untouched.
         Assert.Equal("goal-racer", ReadPersistedGoalId("reg-conflict"));
-        Assert.Null(manager.GetByTaskId("reg-conflict"));
     }
 
     /// <summary>
-    /// FAILURE vector: the store throws a DISTINCT sentinel before the statement runs. The result
-    /// must CARRY that exact exception instance and the in-memory claim must be rolled back.
+    /// A throwing store can no longer affect the register: with the store path removed, an
+    /// interceptor primed to blow up on INSERT is never reached, so the claim succeeds, no
+    /// exception is carried, and nothing is logged as an error.
     /// </summary>
+    /// <remarks>
+    /// This replaces the former persistence-failure vector.
+    /// <see cref="TaskRegistrationFailure.PersistenceFailed"/> and
+    /// <see cref="TaskRegistrationResult.PersistenceException"/> are retained for compatibility but
+    /// are UNREACHABLE from the registers; the admission path's persistence failure (which DOES
+    /// carry the store exception) is covered by <c>WorkSlotAdmissionCommitTests</c>.
+    /// </remarks>
     [Fact]
-    public void TryRegisterTask_PersistenceFailure_RollsBackAndCarriesException()
+    public void TryRegisterTask_ThrowingStore_IsNeverReachedByTheMemoryOnlyRegister()
     {
         var sentinel = new InvalidOperationException("register-sentinel");
         var logger = new TestLogger<GoalPipelineManager>();
         var manager = new GoalPipelineManager(
             CreateStore(new SentinelThrowingInterceptor(sentinel, "INSERT")), logger);
-        manager.CreatePipeline(CreateGoal("goal-ours"));
+        var ours = manager.CreatePipeline(CreateGoal("goal-ours"));
 
         var result = manager.TryRegisterTask("reg-fail", "goal-ours");
 
-        Assert.False(result.Success);
-        Assert.Equal(TaskRegistrationFailure.PersistenceFailed, result.Cause);
-        Assert.Same(sentinel, result.PersistenceException);
-        Assert.Null(manager.GetByTaskId("reg-fail"));
+        Assert.Equal(new TaskRegistrationResult(true, TaskRegistrationFailure.None, null), result);
+        Assert.Null(result.PersistenceException);
+        Assert.Same(ours, manager.GetByTaskId("reg-fail"));
+        // Nothing persisted, and the sentinel never surfaced anywhere.
         Assert.Null(ReadPersistedGoalId("reg-fail"));
-        Assert.Contains(logger.LogEntries, e => e.LogLevel == LogLevel.Error && ReferenceEquals(e.Exception, sentinel));
+        Assert.DoesNotContain(logger.LogEntries, e => ReferenceEquals(e.Exception, sentinel));
     }
 
     [Fact]
@@ -565,6 +643,9 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var witnessPipeline = manager.CreatePipeline(CreateGoal("goal-ours"));
         manager.RegisterTask("unreg-null-witness", "goal-ours");
+        // The register is MEMORY-ONLY since the admission-atomic-switch, so the durable row the
+        // persisted-survival assertion needs is seeded explicitly through the store.
+        SeedPersistedMapping("unreg-null-witness", "goal-ours");
 
         var result = manager.TryUnregisterTask(taskId!, goalId!);
 
@@ -587,6 +668,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         manager.CreatePipeline(CreateGoal("goal-ours"));
         var other = manager.CreatePipeline(CreateGoal("goal-other"));
         manager.RegisterTask("unreg-replaced", "goal-other");
+        SeedPersistedMapping("unreg-replaced", "goal-other");
 
         var result = manager.TryUnregisterTask("unreg-replaced", "goal-ours");
 
@@ -601,6 +683,9 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         manager.CreatePipeline(CreateGoal("goal-ours"));
         Assert.True(manager.TryRegisterTask("unreg-own", "goal-ours").Success);
+        // The memory claim above no longer persists anything; seed the row so the conditional
+        // DELETE has something of ours to remove (the behaviour under test).
+        SeedPersistedMapping("unreg-own", "goal-ours");
 
         var result = manager.TryUnregisterTask("unreg-own", "goal-ours");
 
@@ -619,6 +704,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         manager.CreatePipeline(CreateGoal("goal-ours"));
         manager.RegisterTask("unreg-residue", "goal-ours");
+        SeedPersistedMapping("unreg-residue", "goal-ours");
 
         // The racer takes over the persisted row.
         RacerWritesMapping("unreg-residue", "goal-racer");
@@ -639,6 +725,9 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(interceptor), logger);
         manager.CreatePipeline(CreateGoal("goal-ours"));
         manager.RegisterTask("unreg-throw", "goal-ours");
+        // Seeded RAW (not through the intercepted store) so the DELETE interceptor is the only
+        // thing this test injects: the memory-only register writes no row of its own.
+        SeedPersistedMappingRaw("unreg-throw", "goal-ours");
 
         var result = manager.TryUnregisterTask("unreg-throw", "goal-ours");
 
@@ -666,18 +755,23 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// LEGACY-STEAL vector — the declared remnant of this slice: the conditional write protects a
-    /// row only against OTHER conditional writers. The legacy unconditional
-    /// <see cref="PipelineStore.SaveTaskMapping"/> (still the active dispatch writer until the
-    /// follow-up slice migrates it) overwrites the row regardless of ownership, and this test
-    /// records that fact rather than pretending otherwise.
+    /// LEGACY-STEAL vector — the declared remnant, restated for the memory-only registers: the
+    /// unconditional <see cref="PipelineStore.SaveTaskMapping"/> overwrites a persisted row
+    /// regardless of ownership. This test records that store-API property rather than pretending
+    /// otherwise.
     /// </summary>
     /// <remarks>
+    /// WHAT CHANGED: the register no longer participates in persistence at all, so the row under
+    /// attack is seeded explicitly. On the production ADMISSION path the row is written only by
+    /// <c>PersistAdmission</c>, whose transaction refuses a row owned by another attempt
+    /// (PersistConflict); <c>SaveTaskMapping</c> remains for fixture seeding and the legacy
+    /// recovery paths, and it is unconditional by design.
+    /// <para>
     /// CAPTURE-LEVEL PROTECTION: in the real flow this race cannot arise, because a dispatch must
     /// first capture its work-slot POSITION (A1b's <c>CaptureDispatchPosition</c>), and a position
     /// that is already live refuses a second capture — two dispatches for one position can never
-    /// both reach the mapping write. The remnant here is therefore a property of the store API in
-    /// isolation, not of the orchestrator's dispatch path.
+    /// both reach the mapping write.
+    /// </para>
     /// </remarks>
     [Fact]
     public void LegacyUnconditionalWrite_StealsRowOwnedByConditionalWriter()
@@ -685,9 +779,11 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         manager.CreatePipeline(CreateGoal("goal-ours"));
 
+        // The memory claim succeeds; the durable row it used to write is now seeded explicitly.
         Assert.Equal(
             new TaskRegistrationResult(true, TaskRegistrationFailure.None, null),
             manager.TryRegisterTask("steal-me", "goal-ours"));
+        SeedPersistedMapping("steal-me", "goal-ours");
         Assert.Equal("goal-ours", ReadPersistedGoalId("steal-me"));
 
         // The racer's separate context performs the LEGACY unconditional write.
@@ -696,26 +792,105 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
         Assert.Equal("goal-racer", ReadPersistedGoalId("steal-me"));
     }
 
-    /// <summary>PRESERVATION: the existing unconditional writers behave exactly as before.</summary>
+    /// <summary>
+    /// THE BREAKING CHANGE, pinned: <c>RegisterTask</c>'s unconditional overwrite became a SILENT,
+    /// NON-THROWING refusal, and its durable write became memory-only. <c>UnregisterTask</c>
+    /// keeps its unconditional behaviour.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: restoring <c>_taskToGoal[taskId] = goalId</c> (the old overwrite)
+    /// re-points the mapping at the second goal and the <c>Assert.Same(first, ...)</c> below
+    /// fails; restoring the <c>SaveTaskMapping</c> call makes the memory-only assertion fail.
+    /// </remarks>
     [Fact]
-    public void RegisterTask_AndUnregisterTask_KeepUnconditionalBehavior()
+    public void RegisterTask_RefusesDuplicateAndIsMemoryOnly()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var first = manager.CreatePipeline(CreateGoal("goal-first"));
-        var second = manager.CreatePipeline(CreateGoal("goal-second"));
+        manager.CreatePipeline(CreateGoal("goal-second"));
 
         manager.RegisterTask("legacy-task", "goal-first");
         Assert.Same(first, manager.GetByTaskId("legacy-task"));
-        Assert.Equal("goal-first", ReadPersistedGoalId("legacy-task"));
+        // MEMORY-ONLY: the register writes no row even though a store is configured.
+        Assert.Null(ReadPersistedGoalId("legacy-task"));
 
-        // Unconditional overwrite — no ownership check on the legacy path.
+        // THE REFUSAL: TryAdd semantics leave the existing mapping EXACTLY as it is, and the
+        // duplicate is declined SILENTLY — no exception.
         manager.RegisterTask("legacy-task", "goal-second");
-        Assert.Same(second, manager.GetByTaskId("legacy-task"));
-        Assert.Equal("goal-second", ReadPersistedGoalId("legacy-task"));
+        Assert.Same(first, manager.GetByTaskId("legacy-task"));
 
+        // UnregisterTask is unchanged: it still removes memory AND the persisted row.
+        SeedPersistedMapping("legacy-task", "goal-first");
         manager.UnregisterTask("legacy-task");
         Assert.Null(manager.GetByTaskId("legacy-task"));
         Assert.Null(ReadPersistedGoalId("legacy-task"));
+    }
+
+    /// <summary>
+    /// BLANK/NULL INPUT now THROWS on <c>RegisterTask</c> too — validated <c>taskId</c> then
+    /// <c>goalId</c>, BEFORE any mutation, so no blank key can poison the dictionary.
+    /// </summary>
+    /// <remarks>
+    /// THE ORDER-DISCRIMINATING ROWS are the BOTH-INVALID ones at the end. Every single-invalid
+    /// row stays green under a REVERSED validation order (only one argument can be blamed), so
+    /// they alone cannot establish precedence. When BOTH arguments are invalid the observed
+    /// ParamName names whichever argument is checked FIRST: <c>taskId</c> for the shipped order,
+    /// <c>goalId</c> if the two checks were swapped. Those rows are the mutation-killers; the
+    /// single-invalid rows retain null/empty/whitespace coverage for each argument.
+    /// </remarks>
+    [Theory]
+    // Single-invalid rows — null/empty/whitespace coverage per argument.
+    [InlineData(null, "goal-ours", "taskId")]
+    [InlineData("", "goal-ours", "taskId")]
+    [InlineData("   ", "goal-ours", "taskId")]
+    [InlineData("reg-blank", null, "goalId")]
+    [InlineData("reg-blank", "", "goalId")]
+    [InlineData("reg-blank", "  ", "goalId")]
+    // BOTH-invalid rows — these DISCRIMINATE the validation ORDER (taskId is checked first).
+    [InlineData(null, null, "taskId")]
+    [InlineData("", "", "taskId")]
+    [InlineData("   ", "  ", "taskId")]
+    [InlineData(null, "", "taskId")]
+    [InlineData("", null, "taskId")]
+    public void RegisterTask_BlankOrNullArgument_ThrowsBeforeAnyMutation(
+        string? taskId, string? goalId, string expectedParam)
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        manager.CreatePipeline(CreateGoal("goal-ours"));
+
+        var ex = Assert.ThrowsAny<ArgumentException>(() => manager.RegisterTask(taskId!, goalId!));
+
+        Assert.Equal(expectedParam, ex.ParamName);
+        // BEFORE ANY MUTATION: nothing was claimed for the rejected argument.
+        if (taskId is not null)
+            Assert.Null(manager.GetByTaskId(taskId));
+    }
+
+    /// <summary>
+    /// The same ORDER-DISCRIMINATING vector for <see cref="GoalPipelineManager.TryRegisterTask"/>:
+    /// with BOTH arguments invalid the reported ParamName proves <c>taskId</c> is validated first.
+    /// </summary>
+    [Theory]
+    [InlineData(null, null, "taskId")]
+    [InlineData("", "", "taskId")]
+    [InlineData("   ", "  ", "taskId")]
+    [InlineData(null, "", "taskId")]
+    [InlineData("", null, "taskId")]
+    public void TryRegisterTask_BothArgumentsInvalid_NamesTaskIdProvingValidationOrder(
+        string? taskId, string? goalId, string expectedParam)
+    {
+        var counter = new TaskMappingCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        manager.CreatePipeline(CreateGoal("goal-ours"));
+        counter.Start();
+
+        var ex = Assert.ThrowsAny<ArgumentException>(() => manager.TryRegisterTask(taskId!, goalId!));
+
+        // Swapping the two production checks flips this to "goalId" — the order is pinned.
+        Assert.Equal(expectedParam, ex.ParamName);
+        Assert.Empty(counter.Commands);
+        if (taskId is not null)
+            Assert.Null(manager.GetByTaskId(taskId));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -825,6 +1000,7 @@ public sealed class WorkSlotMappingOwnershipTests : IDisposable
             CreateStore(new SentinelThrowingInterceptor(sentinel, "DELETE")), logger);
         manager.CreatePipeline(CreateGoal("goal-ours"));
         manager.RegisterTask("unreg-store-throws", "goal-ours");
+        SeedPersistedMappingRaw("unreg-store-throws", "goal-ours");
 
         var result = manager.TryUnregisterTask("unreg-store-throws", "goal-ours");
 
@@ -1059,6 +1235,17 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     private PipelineStore CreateStore(IInterceptor? interceptor = null) =>
         new(CreateContext(interceptor), NullLogger<PipelineStore>.Instance);
 
+    /// <summary>
+    /// Seeds a DURABLE <c>task_mappings</c> row directly through the store.
+    /// </summary>
+    /// <remarks>
+    /// The registers became MEMORY-ONLY with the admission-atomic-switch, so
+    /// <c>RegisterTask</c>/<c>TryRegisterTask</c> no longer create a row. Fixtures that need a
+    /// persisted row seed it explicitly here.
+    /// </remarks>
+    private void SeedPersistedMapping(string taskId, string goalId) =>
+        CreateStore().SaveTaskMapping(taskId, goalId);
+
     private void ExecuteOnKeeper(string sql)
     {
         using var command = _keeper.CreateCommand();
@@ -1152,6 +1339,9 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(counter), logger);
         var pipeline = CreateActivePipeline(manager, "goal-same", "task-same");
         manager.RegisterTask("task-same", "goal-same");
+        // The register is memory-only now; the persisted row the untouched-claim assertion reads
+        // is seeded explicitly through the store.
+        SeedPersistedMapping("task-same", "goal-same");
 
         counter.Start();
         var result = manager.PersistAdmission(pipeline, "task-same");
@@ -1187,6 +1377,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         var foreign = manager.CreatePipeline(CreateGoal("goal-foreign"));
         var pipeline = CreateActivePipeline(manager, "goal-ours", "task-foreign");
         manager.RegisterTask("task-foreign", "goal-foreign");
+        SeedPersistedMapping("task-foreign", "goal-foreign");
 
         counter.Start();
         var result = manager.PersistAdmission(pipeline, "task-foreign");
@@ -1407,6 +1598,9 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(gate), new TestLogger<GoalPipelineManager>());
         var disjoint = manager.CreatePipeline(CreateGoal("goal-disjoint"));
         manager.RegisterTask("task-disjoint", "goal-disjoint");
+        // The memory-only register writes no row; the durable row the unregister's conditional
+        // DELETE must remove (PersistenceRemoved = true) is seeded explicitly.
+        SeedPersistedMapping("task-disjoint", "goal-disjoint");
         var pipeline = CreateActivePipeline(manager, "goal-serial", "task-serial");
 
         // The gate is inert during setup and armed only now: the vector's own admission is the
@@ -1479,6 +1673,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal("goal-mon"));
         manager.RegisterTask("task-mon", "goal-mon");
+        SeedPersistedMapping("task-mon", "goal-mon");
 
         var field = typeof(GoalPipelineManager).GetField(
             "_mappingLock", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -1535,8 +1730,8 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // (D) RollbackPersistedPointer — the β rollback primitive (no production
-    //     caller this slice; the successor's dispatch flows consume it)
+    // (D) RollbackPersistedPointer — the β rollback primitive, now consumed by
+    //     the production dispatch's enqueue-failure rollback (E3)
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>NULL PIPELINE: the safe no-op — NotMatched, and NO store call at all
@@ -1694,6 +1889,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         var manager = new GoalPipelineManager(CreateStore(), logger);
         var pipeline = CreateActivePipeline(manager, "goal-mc-log", "task-mc-log");
         manager.RegisterTask("task-mc-log", "goal-mc-log");
+        SeedPersistedMapping("task-mc-log", "goal-mc-log");
 
         var result = manager.PersistAdmission(pipeline, "task-mc-log");
 

@@ -647,14 +647,43 @@ public sealed class GoalPipelineManagerPersistenceTests : IAsyncDisposable{
         Assert.Equal("g1", snapshots[0].GoalId);
     }
 
+    /// <summary>
+    /// <c>RegisterTask</c> is MEMORY-ONLY since the admission-atomic-switch: the claim is visible
+    /// through the manager, but NOTHING is written to the store even though one is configured.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: restoring the register's <c>SaveTaskMapping</c> call makes the
+    /// empty-mappings assertion fail. The DURABLE half of the old coverage is preserved by
+    /// <see cref="SaveTaskMapping_PersistsMappingLoadedByLoadActivePipelines"/> below, which seeds
+    /// the row through the store — the writer that still owns persistence outside the admission
+    /// path.
+    /// </remarks>
     [Fact]
-    public void RegisterTask_SavesTaskMappingToStore()
+    public void RegisterTask_ClaimsInMemoryWithoutWritingTheStore()
     {
-        _manager.CreatePipeline(CreateGoal("g1", "Task mapping"));
+        var pipeline = _manager.CreatePipeline(CreateGoal("g1", "Task mapping"));
         _manager.RegisterTask("task-1", "g1");
 
-        var snapshots = _store.LoadActivePipelines();
-        var snap = Assert.Single(snapshots);
+        // The in-memory claim resolves…
+        Assert.Same(pipeline, _manager.GetByTaskId("task-1"));
+
+        // …but nothing was persisted.
+        var snap = Assert.Single(_store.LoadActivePipelines());
+        Assert.DoesNotContain(("task-1", "g1"), snap.TaskMappings);
+    }
+
+    /// <summary>
+    /// The DURABLE mapping path, seeded explicitly through the store: the row round-trips into
+    /// <see cref="PipelineStore.LoadActivePipelines"/>'s snapshot. This retains the persistence
+    /// coverage the memory-only register no longer provides.
+    /// </summary>
+    [Fact]
+    public void SaveTaskMapping_PersistsMappingLoadedByLoadActivePipelines()
+    {
+        _manager.CreatePipeline(CreateGoal("g1", "Task mapping"));
+        _store.SaveTaskMapping("task-1", "g1");
+
+        var snap = Assert.Single(_store.LoadActivePipelines());
         Assert.Contains(("task-1", "g1"), snap.TaskMappings);
     }
 

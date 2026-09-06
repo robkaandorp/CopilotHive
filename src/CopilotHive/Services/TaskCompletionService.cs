@@ -105,6 +105,34 @@ internal sealed class TaskCompletionService
                 throw new InvalidOperationException($"Unhandled AdmissionOutcome: {admission}");
         }
 
+        // THE POINTER RELEASE — the completion path's half of the atomic-claim protocol.
+        //
+        // WHY IT EXISTS: dispatch used to call GoalPipeline.SetActiveTask, which OVERWROTE the
+        // active-task pointer unconditionally, so sequential phase handoff worked implicitly —
+        // the next phase's dispatch simply stamped over the finished phase's task id. The
+        // admission-atomic-switch replaced that with the ownership-refusing
+        // GoalPipeline.TrySetActiveTask, which claims the pointer ONLY when it is null (so two
+        // overlapping dispatches can never both proceed). That refusal is the point of the
+        // slice — but it means the pointer is no longer released implicitly. Without an explicit
+        // release here, EVERY multi-phase goal would fail at its first phase boundary: the drive
+        // below dispatches the next phase, whose claim would find this task's pointer still live
+        // and refuse.
+        //
+        // WHY HERE: this is the first point at which the attempt's claim lifecycle is provably
+        // finished — the admission above has already classified the completion and CLAIMED a
+        // Pending slot, so every stale/duplicate/abandoned completion has returned. It is also
+        // strictly BEFORE the drive, which is mandatory: DriveNextPhaseAsync dispatches the next
+        // phase inline (PipelineDriver.DispatchPhaseAsync → DispatchToRole), so a release placed
+        // after the drive would run too late to unblock that dispatch's claim.
+        //
+        // WHY IT IS SAFE: the clear is OWNERSHIP-CHECKED. It nulls the pointer only while it
+        // still names THIS task; if a newer dispatch has already claimed the pointer for another
+        // task, the call is a no-op and that live claim is preserved. Every guard/early-exit path
+        // above (no pipeline, terminal goal, planning window, stale completion, abandoned or
+        // already-admitted slot) returns before this line and therefore leaves the pointer
+        // exactly as it was.
+        pipeline.ClearActiveTaskIfCurrent(result.TaskId);
+
         _logger.LogInformation("Pipeline {GoalId} task completed (phase={Phase}, status={Status}, model={Model})",
             pipeline.GoalId, pipeline.Phase, result.Status,
             string.IsNullOrEmpty(result.Model) ? "unknown" : result.Model);

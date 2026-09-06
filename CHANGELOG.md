@@ -1,12 +1,19 @@
 ## [Unreleased]
 
+### Added
+
+- **Atomic dispatch admission** — Production admission atomically claims the in-memory active-task pointer with `pipeline.TrySetActiveTask` and persists the task-mapping row plus pipeline row in one database transaction through `PersistAdmission`. The persisted claim includes an immutable, validated active-task snapshot captured at claim time. `PersistAdmission` is the exclusive writer of persisted mapping rows on the production ADMISSION PATH; fixture seeding through `SaveTaskMapping` and other persistence operations are not covered by that exclusivity.
+
 ### Changed
 
 - **Worker TaskId format change** — TaskIds are now attempt-stamped and derived at allocation time through a single atomic in-lock attempt+ID derivation, replacing the previous predicted/external format at the dispatch boundary.
 - **`CompletedPhases` defensive copy** — The pipeline state machine's `CompletedPhases` now returns a point-in-time snapshot instead of a live view.
-- **Orphan-trade note** — If an insert-then-throw occurs, a task may be left admitted with its mapping unregistered; a later assignment hits the existing no-pipeline drop path. This is an accepted, documented trade-off of the admission transaction.
-- **Mapping-ownership migration** — The dispatch admission path now uses the conditional `TryRegisterTask`/`TryUnregisterTask` ownership APIs (conditional persisted upsert/delete with rollback support) instead of the unconditional register/unregister calls.
+- **Mapping registers are memory-only** — `RegisterTask` and `TryRegisterTask` now provide in-memory ownership only and do not perform durable database writes. Dispatch admission uses `PersistAdmission` for the transactional mapping/pipeline write.
 - **SharpCoder 0.19.1 pin** — Both packages pinned at 0.19.1: the gpt-6 family's Responses-endpoint routing fix (models like `gpt-6-astra` no longer fail with `unsupported_api_for_model` through the Composer chat).
+
+### Breaking Changes
+
+- **Mapping register semantics** — The intentional breaking changes are: `RegisterTask` now refuses duplicate registrations silently instead of overwriting or throwing; durable registration through `RegisterTask` is now memory-only; both registers reject blank input with `ArgumentException` (taskId first, then goalId); and `TryRegisterTask` no longer has a store path, while its obsolete result members remain for compatibility. There is no public semantic compatibility guarantee.
 
 ## [0.36.0] — 2026-08-31
 

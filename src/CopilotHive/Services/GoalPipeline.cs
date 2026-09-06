@@ -289,8 +289,10 @@ public sealed class GoalPipeline
     /// canonical branch assigned only when CoderBranch is null).
     /// </summary>
     /// <remarks>
-    /// UNUSED BY PRODUCTION this slice (the dispatch's migration onto it belongs to the successor
-    /// admission-atomic-switch); the existing SetActiveTask callers are untouched.
+    /// THE PRODUCTION DISPATCH'S CLAIM STEP: <c>TaskDispatchService.DispatchToRole</c> calls this
+    /// (after its slot capture and task build) as the ordering point of the admission — the refusal
+    /// is what makes an overlapping dispatch release its slot instead of stealing the pointer. The
+    /// remaining <see cref="SetActiveTask"/> callers are untouched.
     /// </remarks>
     /// <param name="taskId">The task claiming the pointer.</param>
     /// <param name="branch">The branch (the first-assignment semantics of SetActiveTask).</param>

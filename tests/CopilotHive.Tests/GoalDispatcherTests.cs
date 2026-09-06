@@ -4208,6 +4208,9 @@ public sealed class GoalDispatcherResumeTests
         const string staleTaskId = "stale-task-1";
         pipeline.SetActiveTask(staleTaskId);
         manager.RegisterTask(staleTaskId, "resume-stale");
+        // Seeded durably: the register became MEMORY-ONLY with the admission-atomic-switch, so
+        // without this the "stale mapping is gone" assertion below would pass vacuously.
+        store.SaveTaskMapping(staleTaskId, "resume-stale");
         pipeline.AdvanceTo(GoalPhase.Failed);
         manager.PersistFull(pipeline);
 

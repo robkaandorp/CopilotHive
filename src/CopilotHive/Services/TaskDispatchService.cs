@@ -8,6 +8,7 @@ using CopilotHive.Improvement;
 using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -231,7 +232,12 @@ internal sealed class TaskDispatchService
         // ══════════════════════════════════════════════════════════════════════════════════
         //  THE ADMISSION TRANSACTION. Everything above is PREPARATION and touches no shared
         //  state; from here on the dispatch owns a work slot, a task→goal mapping and the
-        //  pipeline's active-task pointer, and every failure vector releases them again.
+        //  pipeline's active-task pointer (in memory AND, when a store exists, persisted), and
+        //  every failure vector releases them again.
+        //
+        //  THE ORDER: (1) capture → (2) build → (3) the atomic pointer claim → (4) the
+        //  admission commit (mapping row + pointer row, one transaction) → (5) enqueue. The
+        //  claim is the ordering point: two overlapping dispatches cannot both hold it.
         //
         //  LOCK ORDER: this path NEVER acquires the state machine's private lock. The captured
         //  snapshot APIs (CaptureDispatchPosition and friends) own that monitor internally.
@@ -313,41 +319,108 @@ internal sealed class TaskDispatchService
                 task.Metadata["compaction_max_tokens"] = ctx.ToString();
         }
 
-        // (3) THE MAPPING. The ownership-checked registration is the only writer of the
-        // task→goal mapping on this path: it refuses rather than stealing a mapping that
-        // already belongs to someone else, and it carries the store exception when the
-        // persisted write threw. Both refusal causes release the slot; the thrown
-        // InvalidOperationException keeps the two DISTINGUISHABLE at the exception level —
-        // a duplicate mapping has a NULL inner exception, a persistence failure carries it.
-        var registration = _pipelineManager.TryRegisterTask(taskId, pipeline.GoalId);
-        if (!registration.Success)
+        // (3) THE CLAIM. The atomic active-task claim comes FIRST and is the ONE ordering
+        // point of the admission: TrySetActiveTask assigns the pointer IFF it is currently
+        // null, so two overlapping dispatches for the same pipeline can never both proceed —
+        // exactly one claims, the other is REFUSED here and releases its captured slot.
+        //
+        // The claim deliberately happens AFTER the capture (1) and the build (2): a refusal
+        // must release a slot this dispatch already owns, which is only possible once the
+        // slot exists.
+        if (!pipeline.TrySetActiveTask(taskId, task.BranchInfo?.FeatureBranch))
         {
             pipeline.AbandonSlot(taskId);
             LogAbandonedRegistration(pipeline.GoalId, taskId, slot.Position);
             throw new InvalidOperationException(
-                $"Task mapping registration failed for {taskId} (goal {pipeline.GoalId}) — the mapping is occupied or the persistence failed",
-                registration.PersistenceException);
+                $"Task mapping registration failed for {taskId} (goal {pipeline.GoalId}) — the pipeline already has an active task (an overlapping dispatch refused)");
         }
 
-        // (4) THE POINTER. Non-fallible by contract (a sealed, lock-guarded assignment).
-        pipeline.SetActiveTask(task.TaskId, task.BranchInfo?.FeatureBranch);
+        // THE TEST SEAM, deliberately OUTSIDE every try block: it is the deterministic
+        // synchronization point between the claim and the admission, never a failure
+        // injector. Because it sits outside the try, a throw from here would NOT be caught by
+        // the admission's catch at all — it would escape past PersistAdmission and its entire
+        // cleanup (no slot release, no unregister, no pointer clear), leaving the claim
+        // stranded. That is why a sentinel must never be thrown from the gate. The
+        // escaped-validation flow is instead reached by having the gate MUTATE state (clearing
+        // the pointer), so PersistAdmission's own argument validation throws from INSIDE the
+        // try and the catch below runs.
+        AdmissionGateForTest?.Invoke(pipeline, taskId);
+
+        // (4) THE ADMISSION. PersistAdmission is the exclusive writer of the task→goal
+        // mapping on this path: it takes the in-memory claim and — when a store exists —
+        // commits the task_mappings row AND the pipelines row's active_task_id pointer in
+        // ONE database transaction, using the pointer snapshot validated at claim time.
+        //
+        // THE ACCEPTED CoderBranch RESIDUE. A successful TrySetActiveTask may have assigned
+        // CoderBranch (first-assignment semantics) even when the admission below refuses and
+        // the pointer is cleared again. That residue is INTENTIONALLY LEFT IN PLACE:
+        // BranchCoordinator.GetFeatureBranch derives the branch deterministically as
+        // copilothive/{goalId} and every later attempt for the SAME goal derives the SAME
+        // value, so the retained branch is already correct — not stale. Restoring it would
+        // add a mutation (and a race against a concurrent dispatch) for no benefit.
+        AdmissionCommitResult admission;
+        try
+        {
+            admission = _pipelineManager.PersistAdmission(pipeline, taskId);
+        }
+        catch (Exception)
+        {
+            // An ESCAPED VALIDATION (the pointer moved between the claim and the call, so the
+            // active-task equality check threw) — release everything we took, then rethrow the
+            // ORIGINAL exception BARE: never wrapped, never reconstructed.
+            pipeline.AbandonSlot(taskId);
+            _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
+            pipeline.ClearActiveTaskIfCurrent(taskId);
+            LogAbandonedRegistration(pipeline.GoalId, taskId, slot.Position);
+            throw;
+        }
+
+        if (admission.Status is AdmissionCommitStatus.Committed or AdmissionCommitStatus.NoStore)
+        {
+            // ADMITTED — the claim stands (with a committed row, or in memory alone when no
+            // store is configured). Fall through to the enqueue step (5).
+        }
+        else
+        {
+            // REFUSED (MemoryConflict / PersistConflict / PersistenceFailed) — the exact
+            // R1–R5 rollback sequence.
+            pipeline.AbandonSlot(taskId);                                    // R1
+
+            // R2 — remove the mapping ONLY when THIS invocation claimed it. On MemoryConflict
+            // a pre-existing claim (identical or foreign) is NOT ours to remove; on
+            // PersistConflict/PersistenceFailed the admission already rolled our claim back,
+            // so the ownership-checked unregister is a no-op.
+            if (admission.ClaimedThisInvocation)
+                _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
+
+            pipeline.ClearActiveTaskIfCurrent(taskId);                        // R3
+            LogAbandonedRegistration(pipeline.GoalId, taskId, slot.Position); // R4
+
+            // R5 — the refusal causes stay DISTINGUISHABLE at the exception level: a
+            // persistence failure carries the store's original exception as the inner
+            // exception; every other refusal status has a NULL inner exception.
+            throw new InvalidOperationException(
+                $"Task mapping registration failed for {taskId} (goal {pipeline.GoalId}) — the mapping is occupied or the persistence failed",
+                admission.Status == AdmissionCommitStatus.PersistenceFailed ? admission.PersistenceException : null);
+        }
 
         // (5) THE ENQUEUE. The catch spans the TaskQueue.Enqueue call ONLY — the direct-push
         // path below stays OUTSIDE it, because the delivery transaction (a later goal) owns
         // that path and must not be pre-empted by this rollback.
         //
         // THE ORPHAN EDGE (accepted trade). An insert-then-throw inside Enqueue may leave the
-        // task admitted to the queue while this rollback unregisters its mapping. The later
-        // assignment then finds no pipeline for the task and hits the existing no-pipeline
-        // drop — an orphaned queue entry, never a double-assigned slot.
+        // task admitted to the queue while this rollback unregisters its mapping and rolls the
+        // persisted pointer back. The later assignment then finds no pipeline for the task and
+        // hits the existing no-pipeline drop — an orphaned queue entry, never a double-assigned
+        // slot.
         try
         {
             _taskQueue.Enqueue(task);
         }
         catch (Exception)
         {
-            // THE BEST-EFFORT ROLLBACK, in exact order: slot → mapping → pointer → warning →
-            // rethrow of the ORIGINAL exception (never a wrapper).
+            // THE BEST-EFFORT ROLLBACK, in exact order: slot → mapping → persisted pointer →
+            // in-memory pointer → warning → rethrow of the ORIGINAL exception (never a wrapper).
 
             // (a) Release the slot. Belt-and-braces: the call is sealed, non-virtual and has no
             // feasible failure vector, but a throw here must not abort the remaining rollback.
@@ -380,6 +453,17 @@ internal sealed class TaskDispatchService
             {
                 // TryUnregisterTask promises never to throw; an escape is a contract violation.
                 LogRollbackFailure(pipeline.GoalId, taskId, "unregister", ex);
+            }
+
+            // (b2) Roll the PERSISTED pointer back — ONLY when THIS dispatch committed it.
+            // On NoStore nothing was persisted, so there is nothing to undo. The store's
+            // clear is ownership-checked (a newer pointer is never erased) and never throws;
+            // a Failed outcome is recorded as a rollback failure and the cleanup continues.
+            if (admission.CommittedThisInvocation)
+            {
+                var pointerRollback = _pipelineManager.RollbackPersistedPointer(pipeline, taskId);
+                if (pointerRollback == PointerRollbackResult.Failed)
+                    LogRollbackFailure(pipeline.GoalId, taskId, "pointer-rollback", null);
             }
 
             // (c) Clear the pointer ONLY when it still names this task — a newer dispatch's
@@ -795,7 +879,8 @@ internal sealed class TaskDispatchService
 
     /// <summary>
     /// Logs a failed rollback step. <paramref name="step"/> is one of
-    /// <c>abandon</c>, <c>pointer</c>, <c>unregister</c>, <c>unregister-persist</c>.
+    /// <c>abandon</c>, <c>pointer</c>, <c>pointer-rollback</c>, <c>unregister</c>,
+    /// <c>unregister-persist</c>.
     /// </summary>
     private void LogRollbackFailure(string goalId, string taskId, string step, Exception? ex) =>
         LogSafely(() => _logger.LogWarning(

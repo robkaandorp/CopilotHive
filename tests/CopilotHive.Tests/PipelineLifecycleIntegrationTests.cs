@@ -68,9 +68,15 @@ public sealed class PipelineLifecycleIntegrationTests : IAsyncDisposable
         pipelineC.AdvanceTo(GoalPhase.Review);
 
         // ── Register task mappings and persist ───────────────────────────────
+        // The memory claim (what the live manager serves) PLUS the durable row (what a restart
+        // reloads). RegisterTask became MEMORY-ONLY with the admission-atomic-switch, so the row
+        // this restoration test depends on is seeded explicitly through the store.
         manager.RegisterTask("task-a-1", "goal-a");
         manager.RegisterTask("task-b-1", "goal-b");
         manager.RegisterTask("task-c-1", "goal-c");
+        _store.SaveTaskMapping("task-a-1", "goal-a");
+        _store.SaveTaskMapping("task-b-1", "goal-b");
+        _store.SaveTaskMapping("task-c-1", "goal-c");
 
         manager.PersistState(pipelineA);
         manager.PersistState(pipelineB);

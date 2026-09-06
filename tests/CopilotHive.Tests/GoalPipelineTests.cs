@@ -993,6 +993,11 @@ public sealed class GoalPipelineManagerTests
 
         manager.CreatePipeline(CreateGoal("g1", "desc"));
         manager.RegisterTask("task-1", "g1");
+        // The register is MEMORY-ONLY since the admission-atomic-switch, so the durable row is
+        // seeded explicitly — without it the store assertion below would pass VACUOUSLY (nothing
+        // to remove) and would no longer prove that UnregisterTask deletes the row.
+        store.SaveTaskMapping("task-1", "g1");
+        Assert.NotEmpty(store.LoadPipeline("g1")!.TaskMappings);
 
         manager.UnregisterTask("task-1");
 
@@ -1099,6 +1104,10 @@ public sealed class GoalPipelineManagerTests
 
         manager.CreatePipeline(CreateGoal("g-unreg", "Unregister test"));
         manager.RegisterTask("task-unreg", "g-unreg");
+        // Seeded durably (the memory-only register writes nothing) so the DoesNotContain
+        // assertion below proves a real deletion rather than passing vacuously.
+        store.SaveTaskMapping("task-unreg", "g-unreg");
+        Assert.Contains(("task-unreg", "g-unreg"), store.LoadPipeline("g-unreg")!.TaskMappings);
 
         manager.UnregisterTask("task-unreg");
 

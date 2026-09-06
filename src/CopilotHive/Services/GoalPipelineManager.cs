@@ -15,20 +15,29 @@ internal enum TaskRegistrationFailure
     None,
 
     /// <summary>
-    /// The mapping could not be claimed: the argument was blank, this manager already held an
-    /// in-memory entry for the task, or the persisted row belongs to a different goal.
+    /// The mapping could not be claimed because this manager already held an in-memory entry for
+    /// the task. The refusal is NON-THROWING — it is reported through the result. (Blank arguments
+    /// no longer map here: invalid input throws <see cref="ArgumentException"/> before any mutation.)
     /// </summary>
     DuplicateMapping,
 
-    /// <summary>The persisted write threw; the exception is carried on the result.</summary>
+    /// <summary>
+    /// RETAINED FOR COMPATIBILITY, UNREACHABLE from <see cref="GoalPipelineManager.TryRegisterTask"/>.
+    /// The registers are memory-only since admission-atomic-switch removed their store path, so no
+    /// register can produce a store-related outcome and this member is never returned by them. The
+    /// persistence-failure outcome of the production admission path is
+    /// <see cref="AdmissionCommitStatus.PersistenceFailed"/> on <see cref="AdmissionCommitResult"/>.
+    /// </summary>
     PersistenceFailed,
 }
 
-/// <summary>Outcome of an ownership-checked task registration.</summary>
+/// <summary>Outcome of an ownership-checked, MEMORY-ONLY task registration.</summary>
 /// <param name="Success"><c>true</c> only when the mapping is owned by the requesting goal.</param>
-/// <param name="Cause">Why the registration failed, or <see cref="TaskRegistrationFailure.None"/>.</param>
-/// <param name="PersistenceException">The store exception when <see cref="Cause"/> is
-/// <see cref="TaskRegistrationFailure.PersistenceFailed"/>; otherwise <c>null</c>.</param>
+/// <param name="Cause">Why the registration failed, or <see cref="TaskRegistrationFailure.None"/>.
+/// The only reachable failure is <see cref="TaskRegistrationFailure.DuplicateMapping"/>.</param>
+/// <param name="PersistenceException">RETAINED FOR COMPATIBILITY, ALWAYS <c>null</c>: the registers
+/// no longer touch the store, so they can never carry a store exception. The admission path's
+/// store exception is carried on <see cref="AdmissionCommitResult.PersistenceException"/>.</param>
 internal record TaskRegistrationResult(bool Success, TaskRegistrationFailure Cause, Exception? PersistenceException);
 
 /// <summary>Outcome of an ownership-checked task unregistration.</summary>
@@ -61,8 +70,8 @@ internal enum AdmissionCommitStatus
     NoStore,
 }
 
-/// <summary>PersistAdmission's outcome, extended with the cleanup truth for the successor's
-/// dispatch flows.</summary>
+/// <summary>PersistAdmission's outcome, extended with the cleanup truth the production dispatch's
+/// refusal and rollback flows act on.</summary>
 /// <param name="Status">The admission's outcome status (the α enum, unchanged:
 /// Committed, MemoryConflict, PersistConflict, PersistenceFailed, NoStore).</param>
 /// <param name="ClaimedThisInvocation">True IFF THIS call created the in-memory mapping claim
@@ -102,6 +111,27 @@ public sealed class GoalPipelineManager
     /// those methods runs under it, so the WRITERS are serialized: a memory claim and its persisted
     /// counterpart can no longer be interleaved by a second mapping-surface call.
     /// <para>
+    /// MEMORY-ONLY OWNERSHIP OF THE REGISTERS (admission-atomic-switch). <see cref="RegisterTask"/>
+    /// and <see cref="TryRegisterTask"/> guard <see cref="_taskToGoal"/> ONLY — they no longer
+    /// perform ANY store write, and they REFUSE rather than OVERWRITE an existing mapping. Four
+    /// intentional BREAKING PUBLIC-API changes came with that conversion:
+    /// <list type="number">
+    ///   <item><description><see cref="RegisterTask"/>'s unconditional overwrite became a silent,
+    ///     non-throwing refusal (TryAdd semantics).</description></item>
+    ///   <item><description><see cref="RegisterTask"/>'s durable registration became memory-only —
+    ///     its <c>SaveTaskMapping</c> call is removed.</description></item>
+    ///   <item><description>Both registers now reject blank <c>taskId</c>/<c>goalId</c> with
+    ///     <see cref="ArgumentException"/>, validated BEFORE any mutation, instead of silently
+    ///     no-op'ing (TryRegisterTask) or poisoning the dictionary (RegisterTask).</description></item>
+    ///   <item><description><see cref="TryRegisterTask"/>'s entire store path is removed; its
+    ///     store-related result members (<see cref="TaskRegistrationFailure.PersistenceFailed"/>,
+    ///     <see cref="TaskRegistrationResult.PersistenceException"/>) are retained for
+    ///     compatibility but are UNREACHABLE from it.</description></item>
+    /// </list>
+    /// The persisted <c>task_mappings</c> row is written on the production ADMISSION PATH
+    /// exclusively by <see cref="PersistAdmission"/>.
+    /// </para>
+    /// <para>
     /// The results and functional contracts are unchanged; the log lines are GUARDED — a throwing
     /// logger is swallowed and the outcome returned (the β-PREP-2 hardening). For non-throwing
     /// loggers (the production wiring) nothing observable changes. The ONLY observable change is
@@ -134,7 +164,8 @@ public sealed class GoalPipelineManager
     ///   <item><description><see cref="PipelineStore"/> — every method (<c>SavePipeline</c>,
     ///     <c>SavePipelineState</c>, <c>SaveTaskMapping</c>, <c>TrySaveTaskMappingIfUnowned</c>,
     ///     <c>DeleteTaskMapping</c>, <c>DeleteTaskMappingIfForGoal</c>, <c>RemovePipeline</c>,
-    ///     <c>LoadPipeline</c>, <c>LoadActivePipelines</c>, <c>SaveAdmissionWithPointer</c>) is
+    ///     <c>LoadPipeline</c>, <c>LoadActivePipelines</c>, <c>SaveAdmissionWithPointer</c>,
+    ///     <c>ClearActiveTaskIdIfMatches</c>) is
     ///     synchronous EF Core work over a per-operation context; none holds a reference to
     ///     <see cref="GoalPipelineManager"/>, none raises events or invokes callbacks into it, and
     ///     none blocks on another thread. Its only injectable seams —
@@ -191,13 +222,47 @@ public sealed class GoalPipelineManager
     public GoalPipeline? GetByTaskId(string taskId) =>
         _taskToGoal.TryGetValue(taskId, out var goalId) ? GetByGoalId(goalId) : null;
 
-    /// <summary>Register a mapping from taskId → goalId so we can look up pipelines by task.</summary>
+    /// <summary>
+    /// Registers an IN-MEMORY mapping from taskId → goalId so pipelines can be looked up by task.
+    /// </summary>
+    /// <remarks>
+    /// BREAKING PUBLIC-API CHANGES (intentional, admission-atomic-switch):
+    /// <list type="number">
+    ///   <item><description>OVERWRITE BECOMES REFUSAL. The call used to assign the dictionary slot
+    ///     unconditionally (<c>_taskToGoal[taskId] = goalId</c>), silently re-pointing a mapping that
+    ///     already belonged to another goal. It now uses TryAdd semantics: an existing mapping — for
+    ///     ANY goal, including the same one — is left EXACTLY as it is. The duplicate is declined
+    ///     SILENTLY: no exception is thrown and no log record is added (this method introduces no
+    ///     logging contract; the duplicate warning lives on
+    ///     <see cref="TryRegisterTask"/>, where it already applied).</description></item>
+    ///   <item><description>DURABLE REGISTRATION BECOMES MEMORY-ONLY. The store write
+    ///     (<c>SaveTaskMapping</c>) is REMOVED. Even with a store configured, this method persists
+    ///     NOTHING: the persisted <c>task_mappings</c> row is written on the production admission
+    ///     path exclusively by <see cref="PersistAdmission"/>. Callers that relied on this method to
+    ///     make a mapping durable must call the admission path (or the store directly, e.g. fixture
+    ///     seeding via <c>PipelineStore.SaveTaskMapping</c>).</description></item>
+    ///   <item><description>BLANK INPUT NOW THROWS. A null/blank <paramref name="taskId"/> or
+    ///     <paramref name="goalId"/> raises <see cref="ArgumentException"/> instead of poisoning the
+    ///     dictionary with a blank key. Validation runs BEFORE any mutation.</description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="taskId">The worker task id to map; must be non-blank.</param>
+    /// <param name="goalId">The goal that claims the task; must be non-blank.</param>
+    /// <exception cref="ArgumentException"><paramref name="taskId"/> or <paramref name="goalId"/> is
+    /// null, empty or whitespace.</exception>
     public void RegisterTask(string taskId, string goalId)
     {
+        // VALIDATION FIRST, taskId then goalId — no mutation may precede a rejected argument.
+        ArgumentException.ThrowIfNullOrWhiteSpace(taskId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
+
         lock (_mappingLock)
         {
-            _taskToGoal[taskId] = goalId;
-            _store?.SaveTaskMapping(taskId, goalId);
+            // TryAdd semantics: an existing mapping — for ANY goal — is NEVER overwritten. The
+            // duplicate is declined SILENTLY: no exception, and no new logging contract is
+            // introduced here (the duplicate warning belongs to TryRegisterTask, where it
+            // already applies).
+            _taskToGoal.TryAdd(taskId, goalId);
         }
     }
 
@@ -250,42 +315,51 @@ public sealed class GoalPipelineManager
     }
 
     /// <summary>
-    /// Ownership-checked registration of a task → goal mapping: claims the mapping in memory AND
-    /// (when a store is present) in the persisted <c>task_mappings</c> row, refusing rather than
-    /// stealing a mapping that already belongs to someone else.
+    /// Ownership-checked registration of an IN-MEMORY task → goal mapping: claims the mapping in
+    /// this manager's dictionary, refusing rather than stealing a mapping that already belongs to
+    /// someone else. MEMORY-ONLY — nothing is persisted, with or without a store.
     /// </summary>
     /// <remarks>
     /// The algorithm, in order:
     /// <list type="number">
-    ///   <item><description>Blank argument → a safe no-op refusal. No memory write, no SQL.</description></item>
-    ///   <item><description>This manager already holds an entry for the task → refusal. The SQL is NEVER executed on this path.</description></item>
-    ///   <item><description>No store → in-memory-only success.</description></item>
-    ///   <item><description>The conditional write claims (or re-claims) the row → success.</description></item>
-    ///   <item><description>The row belongs to another goal → PAIR-BASED rollback of our own in-memory
-    ///     entry, leaving the competing row INTACT.</description></item>
-    ///   <item><description>The write threw → pair-based rollback, and the exception is CARRIED on the result.</description></item>
+    ///   <item><description>Blank <paramref name="taskId"/>, then blank <paramref name="goalId"/> →
+    ///     <see cref="ArgumentException"/>, thrown BEFORE any mutation.</description></item>
+    ///   <item><description>TryAdd. Success → the mapping is ours, an in-memory-only success.</description></item>
+    ///   <item><description>An entry already exists (any goal) → refusal with
+    ///     <see cref="TaskRegistrationFailure.DuplicateMapping"/>; the existing entry is left INTACT.</description></item>
     /// </list>
-    /// NOTE: no cross-manager reconciliation is performed or claimed. The real system has exactly
-    /// ONE manager (the singleton); a second manager observing the same database is a test-fixture
-    /// artifact, and all this method promises there is that OUR memory matches OUR refusal.
+    /// <para>
+    /// BREAKING PUBLIC-API CHANGE (intentional, admission-atomic-switch): THE ENTIRE STORE PATH IS
+    /// REMOVED — the store-null early-out, the <c>TrySaveTaskMappingIfUnowned</c> conditional write,
+    /// the store-conflict in-memory rollback, the carried persistence exception and their log lines
+    /// are gone. This method is genuinely memory-only EVEN WHEN A STORE EXISTS, so it can no longer
+    /// return <see cref="TaskRegistrationFailure.PersistenceFailed"/> and never populates
+    /// <c>PersistenceException</c>. Those result members are RETAINED for source compatibility only
+    /// (see their own remarks). The persisted <c>task_mappings</c> row is written on the production
+    /// admission path exclusively by <see cref="PersistAdmission"/>.
+    /// </para>
+    /// <para>
+    /// A duplicate refusal is NON-THROWING (it is reported through the result); only INVALID INPUT
+    /// throws. NOTE: no cross-manager reconciliation is performed or claimed. The real system has
+    /// exactly ONE manager (the singleton); all this method promises is that OUR memory matches OUR
+    /// refusal.
+    /// </para>
     /// </remarks>
-    /// <param name="taskId">The worker task id to map.</param>
-    /// <param name="goalId">The goal that claims the task.</param>
-    /// <returns>The registration outcome.</returns>
+    /// <param name="taskId">The worker task id to map; must be non-blank.</param>
+    /// <param name="goalId">The goal that claims the task; must be non-blank.</param>
+    /// <returns>The registration outcome — success, or a DuplicateMapping refusal.</returns>
+    /// <exception cref="ArgumentException"><paramref name="taskId"/> or <paramref name="goalId"/> is
+    /// null, empty or whitespace.</exception>
     internal TaskRegistrationResult TryRegisterTask(string taskId, string goalId)
     {
+        // VALIDATION FIRST, taskId then goalId — no mutation may precede a rejected argument.
+        ArgumentException.ThrowIfNullOrWhiteSpace(taskId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
+
         lock (_mappingLock)
         {
-            if (string.IsNullOrWhiteSpace(taskId) || string.IsNullOrWhiteSpace(goalId))
-            {
-                _logger?.LogDebug(
-                    "TryRegisterTask called with blank taskId or goalId — no-op refusal (taskId='{TaskId}', goalId='{GoalId}')",
-                    taskId, goalId);
-                return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
-            }
-
-            // The in-memory claim comes FIRST: a task this manager already tracks is refused before a
-            // single statement reaches the database.
+            // TryAdd semantics: a task this manager already tracks is refused, and the existing
+            // entry is left EXACTLY as it is — never stolen, never re-pointed.
             if (!_taskToGoal.TryAdd(taskId, goalId))
             {
                 _logger?.LogWarning(
@@ -294,32 +368,7 @@ public sealed class GoalPipelineManager
                 return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
             }
 
-            if (_store is null)
-                return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
-
-            bool persisted;
-            try
-            {
-                persisted = _store.TrySaveTaskMappingIfUnowned(taskId, goalId);
-            }
-            catch (Exception ex)
-            {
-                // Pair-based rollback removes OUR entry only — never another goal's.
-                _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
-                _logger?.LogError(ex, "Failed to persist task mapping {TaskId} → {GoalId}", taskId, goalId);
-                return new TaskRegistrationResult(false, TaskRegistrationFailure.PersistenceFailed, ex);
-            }
-
-            if (persisted)
-                return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
-
-            // The persisted row is another goal's. Roll our own in-memory entry back so this manager's
-            // memory agrees with the refusal; the competing row stays INTACT.
-            _taskToGoal.TryRemove(KeyValuePair.Create(taskId, goalId));
-            _logger?.LogWarning(
-                "Task mapping {TaskId} is already owned by another goal in the store; refusing registration for goal {GoalId}",
-                taskId, goalId);
-            return new TaskRegistrationResult(false, TaskRegistrationFailure.DuplicateMapping, null);
+            return new TaskRegistrationResult(true, TaskRegistrationFailure.None, null);
         }
     }
 
@@ -424,16 +473,39 @@ public sealed class GoalPipelineManager
 
     /// <summary>
     /// Admits a task attempt: the in-memory mapping claim plus the persisted mapping+pointer rows
-    /// (the E2a-i transaction). GUARANTEE (the honest wording): the mapping WRITERS are serialized
-    /// (every _taskToGoal mutation under _mappingLock) and the DATABASE commit is atomic. NOT a
-    /// single linearizable memory-plus-database event: lock-free readers may observe the transient
-    /// claim before the commit resolves, and the claim may roll back — the honesty stated.
+    /// (the E2a-i transaction). THE PRODUCTION DISPATCH'S ADMISSION STEP — <c>TaskDispatchService</c>
+    /// calls this immediately after its atomic <c>TrySetActiveTask</c> claim.
     /// </summary>
     /// <remarks>
-    /// The API remains uncalled in production (the successor admission-atomic-switch migrates the
-    /// dispatch onto it); the outcome record carries ClaimedThisInvocation and
-    /// CommittedThisInvocation — the cleanup truths for the successor's Flow-A/Flow-B handling
-    /// (the field semantics per the record's param docs).
+    /// <para>
+    /// QUALIFIED EXCLUSIVITY. This method is the EXCLUSIVE writer of persisted <c>task_mappings</c>
+    /// rows ON THE PRODUCTION ADMISSION PATH. That is NOT a claim of exclusivity over the table or
+    /// over persistence generally: <c>PipelineStore.SaveTaskMapping</c>,
+    /// <c>TrySaveTaskMappingIfUnowned</c>, <c>DeleteTaskMapping(IfForGoal)</c>,
+    /// <c>RemovePipeline</c> and the restore paths still write/remove rows, and fixture seeding
+    /// commonly uses <c>SaveTaskMapping</c> directly.
+    /// </para>
+    /// <para>
+    /// THE GUARANTEES (the honest wording): the mapping WRITERS are serialized (every
+    /// <see cref="_taskToGoal"/> mutation runs under <see cref="_mappingLock"/>) and the DATABASE
+    /// commit is ATOMIC — the <c>task_mappings</c> row and the pipelines row's <c>active_task_id</c>
+    /// pointer land in ONE transaction (<c>SaveAdmissionWithPointer</c>) or neither does. The
+    /// persisted pointer is the IMMUTABLE SNAPSHOT validated at claim time (the taskId argument is
+    /// passed through as the store's <c>activeTaskIdOverride</c>), never a later live-pointer
+    /// re-read, so a concurrent pointer change can never be persisted by this commit.
+    /// </para>
+    /// <para>
+    /// NO-STORE BEHAVIOR: with no store configured the in-memory claim ALONE is the admission —
+    /// nothing is persisted and the result is <see cref="AdmissionCommitStatus.NoStore"/> with
+    /// <c>CommittedThisInvocation == false</c>.
+    /// </para>
+    /// <para>
+    /// THERE IS NO SINGLE LINEARIZABLE MEMORY-PLUS-DATABASE EVENT: lock-free readers may observe the
+    /// transient in-memory claim before the commit resolves, and the claim may subsequently roll
+    /// back. The outcome record carries ClaimedThisInvocation and CommittedThisInvocation — the
+    /// cleanup truths the dispatch's refusal and enqueue-rollback sequences act on (the field
+    /// semantics per the record's param docs).
+    /// </para>
     /// </remarks>
     /// <param name="pipeline">The pipeline claiming the task; its <c>ActiveTaskId</c> MUST equal
     /// <paramref name="taskId"/>.</param>
@@ -585,14 +657,18 @@ public sealed class GoalPipelineManager
     /// <summary>Rolls back the PERSISTED pipeline pointer (the pipelines row's active_task_id) for a
     /// failed admission's task: the ownership-checked store clear under <see cref="_mappingLock"/>.
     /// THE IN-MEMORY pointer is NOT touched (the caller's own ownership-checked clear owns it — the
-    /// successor's dispatch Flow-B step).</summary>
-    /// <remarks>CONTRACT: a null pipeline or a null/blank taskId → PointerRollbackResult.NotMatched
+    /// dispatch's <c>ClearActiveTaskIfCurrent</c> step).</summary>
+    /// <remarks>ITS CALLER IS THE PRODUCTION DISPATCH: <c>TaskDispatchService</c>'s enqueue-failure
+    /// rollback invokes this when — and only when — its admission actually committed the rows
+    /// (<c>CommittedThisInvocation</c>). CONTRACT: a null pipeline or a null/blank taskId →
+    /// PointerRollbackResult.NotMatched
     /// (the safe no-op — no store call); a null store → NotMatched (nothing persisted to roll back);
     /// the store's NotMatched → the correct completion (the row absent or its pointer unmatched —
     /// the ownership-check invariant held; nothing further to undo); the store's Cleared → the
     /// persisted pointer is NULL; the store's Failed → the store's (a) WARNING surfaced, this method
     /// returns Failed (the row's state unknown — the durable-reconciliation successor owns the
-    /// residue; the successor's Flow-B treats Failed as its reconciliation trigger). NEVER PROPAGATES
+    /// residue; the dispatch records it as a <c>pointer-rollback</c> rollback failure and continues).
+    /// NEVER PROPAGATES
     /// store or logging failures (the store's guards; this method performs no logging of its own) —
     /// ordinary runtime failures (a thread abort mid-lock, out-of-memory) remain outside every
     /// method's practical guarantee and are not claimed away.</remarks>

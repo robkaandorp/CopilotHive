@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 
 using CopilotHive.Agents;
 using CopilotHive.Configuration;
@@ -105,6 +106,13 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     private PipelineStore CreateStore(IInterceptor? interceptor = null) =>
         new(CreateContext(interceptor), NullLogger<PipelineStore>.Instance);
 
+    /// <summary>
+    /// Seeds a DURABLE <c>task_mappings</c> row directly through the store — the registers became
+    /// MEMORY-ONLY with the admission-atomic-switch and no longer write one.
+    /// </summary>
+    private void SeedPersistedMapping(string taskId, string goalId) =>
+        CreateStore().SaveTaskMapping(taskId, goalId);
+
     /// <summary>Reads the persisted goal id for a task RAW — no EF Core, no change tracker.</summary>
     private string? ReadPersistedGoalId(string taskId)
     {
@@ -115,6 +123,44 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         parameter.Value = taskId;
         command.Parameters.Add(parameter);
         return command.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// Reads the PERSISTED <c>pipelines.active_task_id</c> column RAW — no EF Core, no change
+    /// tracker, so a stale tracked entity can never mask the durable truth. This is the column
+    /// the dispatch's E3 step (<c>RollbackPersistedPointer</c>) clears, and it is DISTINCT from
+    /// the in-memory <see cref="GoalPipeline.ActiveTaskId"/> pointer.
+    /// </summary>
+    private string? ReadPersistedActiveTaskId(string goalId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "SELECT active_task_id FROM pipelines WHERE goal_id = $goalId";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "$goalId";
+        parameter.Value = goalId;
+        command.Parameters.Add(parameter);
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value as string;
+    }
+
+    /// <summary>
+    /// Forces the persisted <c>pipelines.active_task_id</c> to <paramref name="taskId"/> RAW,
+    /// bypassing EF entirely — used to arrange a durable pointer owned by a DIFFERENT task so the
+    /// ownership-checked E3 clear must decline it.
+    /// </summary>
+    private void ForcePersistedActiveTaskId(string goalId, string? taskId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "UPDATE pipelines SET active_task_id = $taskId WHERE goal_id = $goalId";
+        var taskParameter = command.CreateParameter();
+        taskParameter.ParameterName = "$taskId";
+        taskParameter.Value = (object?)taskId ?? DBNull.Value;
+        command.Parameters.Add(taskParameter);
+        var goalParameter = command.CreateParameter();
+        goalParameter.ParameterName = "$goalId";
+        goalParameter.Value = goalId;
+        command.Parameters.Add(goalParameter);
+        command.ExecuteNonQuery();
     }
 
     private const string GoalId = "goal-wiring";
@@ -235,14 +281,15 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// capture → build (verbatim, attempt-stamped task ID) → TryRegisterTask → SetActiveTask →
-    /// enqueue. Nothing is abandoned and no WorkSlotIntegrity warning is emitted.
+    /// capture → build (verbatim, attempt-stamped task ID) → TrySetActiveTask (the atomic claim)
+    /// → PersistAdmission → enqueue. Nothing is abandoned and no WorkSlotIntegrity warning is
+    /// emitted.
     /// </summary>
     /// <remarks>
     /// THE ORDERING PROOF lives in the enqueue callback, not in the post-hoc assertions: the
     /// callback runs synchronously INSIDE <see cref="TaskQueue.Enqueue"/>, so whatever it observes
     /// was already true when Enqueue was ENTERED. Capturing the slot state, the mapping owner and
-    /// the active pointer there pins the pre-enqueue ordering — moving <c>SetActiveTask</c> (or the
+    /// the active pointer there pins the pre-enqueue ordering — moving <c>TrySetActiveTask</c> (or the
     /// registration, or the capture) to AFTER the enqueue makes the corresponding entry observation
     /// null and fails this test.
     /// </remarks>
@@ -289,7 +336,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // (3) THE MAPPING was already ours, in memory AND in the store.
         Assert.Equal(GoalId, mappedGoalAtEntry);
         Assert.Equal(GoalId, persistedGoalAtEntry);
-        // (4) THE POINTER already named this task — SetActiveTask precedes the enqueue.
+        // (4) THE POINTER already named this task — the TrySetActiveTask claim precedes the enqueue.
         Assert.Equal(expectedTaskId, pointerAtEntry);
 
         // And the admission still stands after a successful dispatch.
@@ -468,9 +515,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Arrange(pipeline, GoalPhase.Coding);
 
         var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
-        // Another goal already owns the mapping the capture is about to claim.
+        // Another goal already owns the IN-MEMORY mapping the admission is about to claim, so
+        // PersistAdmission refuses with MemoryConflict — the register is memory-only now, so the
+        // persisted row is seeded separately for the untouched-competitor assertion below.
         manager.CreatePipeline(CreateGoal("goal-other"));
         manager.RegisterTask(taskId, "goal-other");
+        SeedPersistedMapping(taskId, "goal-other");
 
         var queue = new TaskQueue();
         var logger = new TestLogger<TaskDispatchService>();
@@ -498,6 +548,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// A PERSISTENCE failure refuses with the SAME message but CARRIES the store's exception as
     /// the inner — so the two causes stay distinguishable at the exception level.
     /// </summary>
+    /// <remarks>
+    /// THE PATH CHANGED: the failure now comes from the ADMISSION (PersistAdmission's
+    /// SaveAdmissionWithPointer transaction), not from the removed register store path. EF wraps
+    /// the interceptor's sentinel in a <c>DbUpdateException</c>, and R5 carries THAT wrapper —
+    /// <c>admission.PersistenceException</c> — verbatim. The identity assertion therefore pins the
+    /// carried instance to the admission result's own exception, with the injected sentinel proven
+    /// to be its inner cause: the runtime identity of the injected failure stays observable.
+    /// </remarks>
     [Fact]
     public async Task Dispatch_RegistrationPersistenceFails_ThrowsExactMessageCarryingStoreException()
     {
@@ -519,7 +577,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Equal(
             $"Task mapping registration failed for {taskId} (goal {GoalId}) — the mapping is occupied or the persistence failed",
             ex.Message);
-        Assert.Same(sentinel, ex.InnerException);
+
+        // THE INNER-EXCEPTION RULE: PersistenceFailed carries the store's exception (the EF
+        // wrapper), and the INJECTED sentinel is reachable as its cause.
+        Assert.NotNull(ex.InnerException);
+        Assert.IsType<DbUpdateException>(ex.InnerException);
+        Assert.Same(sentinel, ex.InnerException!.InnerException);
 
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(pipeline.ActiveTaskId);
@@ -695,6 +758,11 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
                 .SingleOrDefault(s => s.Slot.TaskId == task.TaskId)?.State;
 
             // (ii) Only THEN does the competitor steal the mapping, and the enqueue fails.
+            // THE STEAL, restated for the memory-only TryAdd register: RegisterTask now REFUSES a
+            // duplicate instead of overwriting it, so a genuine steal must first release our claim
+            // and then take it — which is exactly what a real competitor's
+            // unregister-then-register sequence does.
+            manager.UnregisterTask(task.TaskId);
             manager.RegisterTask(task.TaskId, "goal-other");
             throw sentinel;
         };
@@ -810,6 +878,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // TryUnregisterTask is not ours → (false, false)), (ii) the ORIGINAL sentinel throw.
         queue.OnEnqueue = task =>
         {
+            // THE STEAL, restated for the memory-only TryAdd register (see the ownership-race test
+            // above): release our claim first, then take it, so the rollback's ownership-checked
+            // TryUnregisterTask genuinely finds a mapping that is not ours → (false, false).
+            manager.UnregisterTask(task.TaskId);
             manager.RegisterTask(task.TaskId, "goal-other");
             throw sentinel;
         };
@@ -879,6 +951,251 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // The newer pointer survives; our own slot and mapping are still released.
         Assert.Equal("newer-task", pipeline.ActiveTaskId);
         var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (8b) E3 — the PERSISTED pointer rollback, at DISPATCH level
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // These vectors assert the DURABLE pipelines.active_task_id column (read RAW through the
+    // keeper connection), NOT the in-memory pointer that section (8) covers. E3 is the enqueue
+    // catch's step (b2): it runs ONLY when this dispatch actually committed the rows, is
+    // ownership-checked in the store's WHERE clause, and reports a Failed outcome as the
+    // step=pointer-rollback record while the remaining cleanup continues.
+
+    /// <summary>
+    /// E3 CLEARS THE PERSISTED POINTER. The admission commits mapping + pointer in one
+    /// transaction; the enqueue then throws, and the rollback nulls the DURABLE
+    /// <c>pipelines.active_task_id</c> column — not merely the in-memory pointer.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: deleting the dispatch's E3 block leaves the committed pointer
+    /// durably set, so the persisted-column assertion fails while every in-memory assertion in
+    /// section (8) still passes — which is exactly the gap this vector closes.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EnqueueThrows_ClearsPersistedActiveTaskId()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // OBSERVED INSIDE Enqueue: the admission has committed, so the DURABLE pointer names this
+        // task at the moment the rollback is about to run. This makes the post-hoc null assertion
+        // a real state CHANGE rather than a value that was never set.
+        string? persistedPointerAtEnqueue = null;
+        queue.OnEnqueue = _ =>
+        {
+            persistedPointerAtEnqueue = ReadPersistedActiveTaskId(GoalId);
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        // THE COMMIT REALLY HAPPENED (the E3 precondition CommittedThisInvocation was true).
+        Assert.Equal(taskId, persistedPointerAtEnqueue);
+
+        // E3'S EFFECT: the DURABLE column is NULL.
+        Assert.Null(ReadPersistedActiveTaskId(GoalId));
+
+        // The rest of the rollback still ran, and no rollback-failure was recorded.
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(ReadPersistedGoalId(taskId));
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// E3 IS OWNERSHIP-PRESERVING. When the DURABLE pointer has moved on to a different task, the
+    /// store's <c>WHERE active_task_id = $task</c> declines the clear (NotMatched) and the newer
+    /// durable pointer survives — a live dispatch is never made to look idle.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EnqueueThrowsWithDifferentPersistedPointer_LeavesPersistedPointerIntact()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // THE RACE, arranged deterministically INSIDE Enqueue: a competing attempt takes over the
+        // DURABLE pointer after our admission committed but before the rollback runs.
+        queue.OnEnqueue = _ =>
+        {
+            ForcePersistedActiveTaskId(GoalId, "newer-durable-task");
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        // THE OWNERSHIP CHECK HELD: the competitor's durable pointer is untouched.
+        Assert.Equal("newer-durable-task", ReadPersistedActiveTaskId(GoalId));
+
+        // NotMatched is the correct completion, NOT a failure — no pointer-rollback record.
+        Assert.DoesNotContain(
+            Warnings(logger), m => m == RollbackFailureMessage(GoalId, taskId, "pointer-rollback"));
+
+        // Our own slot and mapping are still released.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+    }
+
+    /// <summary>
+    /// E3 FAILURE: the persisted-pointer UPDATE throws, so
+    /// <see cref="PointerRollbackResult.Failed"/> is reported. The dispatch records
+    /// <c>step=pointer-rollback</c>, CONTINUES the remaining cleanup, and rethrows the ORIGINAL
+    /// enqueue exception.
+    /// </summary>
+    /// <remarks>
+    /// The interceptor targets <c>UPDATE ... pipelines</c> ONLY, so the admission's INSERTs commit
+    /// normally and only E3's clear fails — the narrow injection that isolates this step.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EnqueueThrowsAndPersistedPointerRollbackFails_LogsPointerRollbackAndContinues()
+    {
+        var updateSentinel = new InvalidOperationException("pointer-update-sentinel");
+        var manager = new GoalPipelineManager(
+            CreateStore(new PipelinesUpdateThrowingInterceptor(updateSentinel)),
+            new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue { OnEnqueue = _ => throw enqueueSentinel };
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL enqueue failure leaves the dispatch — never the pointer sentinel, and
+        // never a wrapper.
+        Assert.Same(enqueueSentinel, thrown);
+        Assert.NotSame(updateSentinel, thrown);
+
+        // THE RECORD, rendered verbatim at WARNING.
+        Assert.Contains(
+            Warnings(logger), m => m == RollbackFailureMessage(GoalId, taskId, "pointer-rollback"));
+
+        // THE CLEANUP CONTINUED PAST THE FAILED STEP: E4's in-memory clear and E5's
+        // abandoned-registration record both still happened.
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
+
+        // The durable residue is honestly left behind — the E2b successor owns reconciling it.
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(GoalId));
+    }
+
+    /// <summary>
+    /// THE E2 → E3 → E4 ORDER, observed rather than assumed. Each step's OWN observable is
+    /// captured at the moment the NEXT step's seam runs, so the three are pinned in sequence:
+    /// E2 (mapping removal) is already done when E3's UPDATE is issued, and E3 is already done
+    /// when E4 clears the in-memory pointer.
+    /// </summary>
+    /// <remarks>
+    /// THE SEAM: the store's UPDATE against <c>pipelines</c> is E3 itself, so an interceptor that
+    /// records state at that statement observes the world strictly BETWEEN E2 and E4. Moving E3
+    /// above E2 makes the mapping still present; moving it below E4 makes the in-memory pointer
+    /// already null — either mutation flips one of the two assertions.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EnqueueThrows_RunsE3BetweenMappingRemovalAndPointerClear()
+    {
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
+        var logger = new TestLogger<TaskDispatchService>();
+
+        // The observation runs INSIDE E3's own statement, so whatever it sees is the state
+        // between E2 and E4 by construction.
+        GoalPipeline? pipeline = null;
+        string? mappingOwnerDuringE3 = null;
+        string? memoryPointerDuringE3 = null;
+        var e3Observed = false;
+        var observer = new PipelinesPointerUpdateObserver(() =>
+        {
+            e3Observed = true;
+            mappingOwnerDuringE3 = ReadPersistedGoalId(taskId);
+            memoryPointerDuringE3 = pipeline!.ActiveTaskId;
+        });
+
+        var manager = new GoalPipelineManager(
+            CreateStore(observer), new TestLogger<GoalPipelineManager>());
+        pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+        var service = CreateService(manager, queue, logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        // E3 REALLY RAN (the vacuity guard: without it both observations stay null).
+        Assert.True(e3Observed, "E3's persisted-pointer UPDATE must have been issued");
+
+        // E2 PRECEDED E3: the mapping row was already gone when E3's UPDATE ran.
+        Assert.Null(mappingOwnerDuringE3);
+
+        // E4 FOLLOWED E3: the in-memory pointer still named this task when E3's UPDATE ran.
+        Assert.Equal(taskId, memoryPointerDuringE3);
+
+        // …and E4 did eventually run.
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Null(ReadPersistedActiveTaskId(GoalId));
+    }
+
+    /// <summary>
+    /// THE NO-STORE SKIP is preserved: with no store there is nothing to roll back, so E3 issues
+    /// no statement and records nothing, while the rest of the rollback runs normally.
+    /// </summary>
+    /// <remarks>
+    /// The admission returns <c>NoStore</c> with <c>CommittedThisInvocation == false</c>, which is
+    /// precisely the condition E3 is gated on — the same gate the β-PREP-2 fixture relies on.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EnqueueThrowsWithNoStore_SkipsPersistedPointerRollback()
+    {
+        var manager = new GoalPipelineManager(store: null, new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        // NO pointer-rollback record: the step was skipped, not attempted and failed.
+        Assert.DoesNotContain(
+            Warnings(logger), m => m == RollbackFailureMessage(GoalId, taskId, "pointer-rollback"));
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
+
+        // The rest of the rollback is unchanged.
+        Assert.Null(pipeline.ActiveTaskId);
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(manager.GetByTaskId(taskId));
     }
@@ -1098,8 +1415,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             l.Message.Contains("No pipeline found for completed task") &&
             l.Message.Contains(firstTaskId));
 
-        // THE REPLACEMENT flows: a fresh dispatch in the restarted round registers its mapping
-        // (memory + persisted), and the replacement's completion resolves the pipeline.
+        // THE REPLACEMENT flows: a fresh dispatch in the restarted round claims its mapping IN
+        // MEMORY (the register is memory-only since the admission-atomic-switch; persistence
+        // belongs to the admission path), and the replacement's completion resolves the pipeline.
         const string replacementTaskId = "goal-wiring-coder-001-01-002";
         restartedManager.RegisterTask(replacementTaskId, GoalId);
         await restartedCompletion.HandleTaskCompletionAsync(
@@ -2147,5 +2465,50 @@ public sealed class WorkSlotPipelineManagerLoggerRegistrationTests
         var logger = loggerField!.GetValue(manager);
         Assert.NotNull(logger);
         Assert.IsAssignableFrom<ILogger<GoalPipelineManager>>(logger);
+    }
+}
+
+/// <summary>
+/// Invokes a callback at the moment the persisted-pointer clear's statement is issued — the
+/// dispatch's E3 step — WITHOUT altering its outcome. The statement proceeds normally, so the
+/// observation lands strictly between E2 (the mapping removal) and E4 (the in-memory clear).
+/// </summary>
+/// <remarks>
+/// Targets <c>UPDATE ... pipelines ... active_task_id</c> only, so EF's own pipeline-row writes
+/// (the admission's INSERT/UPDATE through the change tracker) are never mistaken for E3.
+/// The callback performs read-only work and no re-entrant store call.
+/// </remarks>
+internal sealed class PipelinesPointerUpdateObserver : DbCommandInterceptor
+{
+    private readonly Action _onPointerUpdate;
+
+    public PipelinesPointerUpdateObserver(Action onPointerUpdate) => _onPointerUpdate = onPointerUpdate;
+
+    private void ObserveIfTargeted(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("pipelines", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("active_task_id", StringComparison.OrdinalIgnoreCase))
+        {
+            _onPointerUpdate();
+        }
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        ObserveIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        ObserveIfTargeted(command);
+        return ValueTask.FromResult(result);
     }
 }

@@ -640,8 +640,9 @@ public sealed class PipelineStore : IAsyncDisposable
     /// phase guarded, the acquisition included).
     /// </summary>
     /// <remarks>
-    /// UNUSED BY DESIGN in this slice: the API is complete and tested, but no production caller
-    /// exists yet — the dispatch path's migration onto it belongs to the successor slice.
+    /// ITS USE: <c>GoalPipelineManager.RollbackPersistedPointer</c> is this method's caller, and it
+    /// is reached from the production dispatch — <c>TaskDispatchService</c>'s enqueue-failure
+    /// rollback clears the pointer it committed moments earlier. It is NOT an unused/future API.
     /// </remarks>
     internal PointerRollbackResult ClearActiveTaskIdIfMatches(string goalId, string taskId)
     {
@@ -766,7 +767,9 @@ public sealed class PipelineStore : IAsyncDisposable
         entity.MaxIterations = pipeline.MaxIterations;
         // THE OVERRIDE: null (the ordinary paths) → the existing LATE read at this point — the
         // behavior IDENTICAL under all concurrency (the capture point unchanged); non-null (the
-        // admission's validated snapshot — the successor's caller) → the immutable value.
+        // admission's validated snapshot, passed through by SaveAdmissionWithPointer from
+        // GoalPipelineManager.PersistAdmission on the production dispatch path) → the immutable
+        // value.
         entity.ActiveTaskId = activeTaskIdOverride ?? pipeline.ActiveTaskId;
         entity.CoderBranch = pipeline.CoderBranch;
         entity.PlanJson = pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : null;
