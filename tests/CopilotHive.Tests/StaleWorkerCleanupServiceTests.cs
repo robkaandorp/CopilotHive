@@ -506,11 +506,18 @@ public sealed class StaleWorkerCleanupServiceTests
     [Fact]
     public async Task Reclaim_PersistenceRemovalDoesNotConfirm_ExactWarningAndContinuation()
     {
-        var manager = new GoalPipelineManager(
-            CreateStoreForCleanup(new InvalidOperationException("delete-sentinel")),
-            new TestLogger<GoalPipelineManager>());
+        // Memory-only RegisterTask no longer persists a task_mappings row, so the durable
+        // mapping for this test's throwing-DELETE scenario is seeded explicitly here.
+        var store = CreateStoreForCleanup(new InvalidOperationException("delete-sentinel"));
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
         var (pipeline, slot) = ArrangeAdmission(manager, "goal-d2-unconfirmed", "d2-unused");
         var taskId = slot.TaskId;
+        store.SaveTaskMapping(taskId, pipeline.GoalId);
+
+        // PRECONDITION: the durable mapping actually exists with the expected identity.
+        var seeded = store.LoadPipeline(pipeline.GoalId);
+        Assert.NotNull(seeded);
+        Assert.Contains((taskId, pipeline.GoalId), seeded.TaskMappings);
 
         var queue = new TaskQueue();
         var dispatcher = CreateDispatcher(manager, queue);
