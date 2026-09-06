@@ -32,7 +32,11 @@
 //
 //  SCOPE: the grep matches exactly 18 files (enumerated below and independently confirmed by
 //  the reviewer). PipelineStoreEfCoreIntegrationTests.cs is an ADDITIONAL named audit target
-//  with ZERO register calls — it is dispositioned separately as entry 19, not as a grep match.
+//  with ZERO register calls — it is dispositioned separately as entry 6, not as a grep match.
+//
+//  CATEGORY TOTALS (corrected in β′; they must add up): the 18 grep-match files are
+//  RED-FIXED (5, entries 1-5) + SEMANTIC-FIXED (2, entries 7-8) + UNAFFECTED (11, entries 9-19)
+//  = 18. Entry 6 is the additional NON-grep verification target, giving 19 dispositioned files.
 //
 //  ITERATION-4 RE-VERIFICATION: every entry below was re-checked against the current tree after
 //  iteration 3. Iteration 3 changed the caller surface only in comment / strengthened-assertion
@@ -41,7 +45,7 @@
 //  ClaimRefusedNoMutation) is a test-observation change and adds no register caller.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-//  RED-FIXED (6) — failed under the new semantics and were migrated
+//  RED-FIXED (5) — failed under the new semantics and were migrated
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 //  1. TaskDispatchServiceTests.cs — RED-FIXED. Two vectors preseeded a live pointer via
 //     SetActiveTask, which the atomic claim now refuses; migrated to seed CoderBranch directly
@@ -61,12 +65,19 @@
 //  5. PipelineLifecycleIntegrationTests.cs — RED-FIXED. The durable-register assumption was
 //     replaced by a memory claim PLUS explicit _store.SaveTaskMapping seeding for all three
 //     goals (lines 77-79); the restart/restoration assertions are preserved intact.
-//  6. PipelineStoreEfCoreIntegrationTests.cs — RED-FIXED (pointer-snapshot expectations; ZERO
-//     register calls, so it is not one of the 18 grep matches). Its admission assertions pin the
-//     PREP-3 immutable-snapshot behaviour this goal consumes unchanged: line ~702 asserts
-//     pipelines WHERE goal_id='goal-commit' AND active_task_id='task-commit' after
-//     SaveAdmissionWithPointer; line ~897 seeds a pipelines row directly. No register-durability
-//     or overwrite assumption is present anywhere in the file. Verified green.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//  ADDITIONAL VERIFICATION TARGET (1) — NOT a grep match, NOT migrated by this goal
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//  6. PipelineStoreEfCoreIntegrationTests.cs — UNCHANGED / VERIFIED READ-ONLY. (Reclassified in
+//     β′: the original record labelled this RED-FIXED, but that was a bookkeeping error — its own
+//     rationale, and the 4a85897 merge diff, show the file was NOT touched by the
+//     admission-atomic-switch. Its PREP-3 immutable-snapshot coverage was CONSUMED UNCHANGED.)
+//     ZERO register calls, so it is not one of the 18 grep matches. Its admission assertions pin
+//     the pointer-snapshot behaviour this goal consumes: line ~702 asserts pipelines WHERE
+//     goal_id='goal-commit' AND active_task_id='task-commit' after SaveAdmissionWithPointer;
+//     line ~897 seeds a pipelines row directly. No register-durability or overwrite assumption is
+//     present anywhere in the file. Verified green.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 //  SEMANTIC-FIXED (2 files, 3 tests) — still GREEN under the new semantics, but VACUOUS
@@ -90,9 +101,14 @@
 //     (resume-stale, store-backed) asserted "the stale mapping is gone" from
 //     snapshot.TaskMappings — vacuous without a row, so it now seeds via store.SaveTaskMapping
 //     (L4213) first. No blank/null arguments.
+//     ⚠ COUNT CORRECTED IN β′ (C): "18 sites" is a MISCOUNT in this historical entry — the true
+//     figure is 17 executable invocations, at 4a85897 AND at the current baseline alike. The
+//     caller surface did not change; only the record was wrong. The per-site findings above
+//     (the L1603/L1604 distinct pair, the L1653 phase-only store assertion, the seeded L4210
+//     resume-stale vector) were re-verified and STAND. See β′ (C) for the line mapping.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-//  UNAFFECTED (10) — audited call-site by call-site, no change needed
+//  UNAFFECTED (11) — audited call-site by call-site, no change needed
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 //   9. DashboardNotifierWiringTests.cs — UNAFFECTED. 2 sites (L201, L253) in two separate
 //      fixture helpers, each `$"task-{Guid.NewGuid():N}"` on its own storeless
@@ -130,6 +146,10 @@
 //      "…-coder-001-01-002" while ArrangeAdmission registered "…-001-01-001" on the same manager
 //      — DISTINCT ids, so no duplicate refusal. The two probe hits (L502, L543) are COMMENTS
 //      describing an interceptor, not persistence assertions.
+//      ⚠ CORRECTED IN β′ (F): "all storeless managers" is FALSE — the
+//      Reclaim_PersistenceRemovalDoesNotConfirm vector uses a STORE-BACKED manager, and it
+//      carries the audit's one outstanding finding (tracking issue
+//      cleanup-persistence-removal-fixture-passes-without-exercising-a-persisted-mapping).
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 //  COMPLETION-FIX REMOVAL / CONCURRENCY VERIFICATION (TaskCompletionService.cs)
@@ -154,6 +174,175 @@
 //  CONCURRENCY CLASS RE-RUN (iteration 4): WorkSlotAdmissionCommitTests,
 //  WorkSlotMappingOwnershipTests, ProgressDocumentTests, TaskCompletion* and StaleWorkerCleanup*
 //  → 190 passed, 0 failed.
+//
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  β′ ADDENDUM — INDEPENDENT RE-VERIFICATION OF THE ABOVE TABLE
+//  ⚠ OUTSTANDING FINDING (one; see (F) below). Reported, NOT repaired — repair is a separate goal.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+//  (A) BASELINE. Inspected commit: aa23c674f59c2c293ca6d8f909e5d95a54480357
+//      ("guard-transport-completion-pipeline-mutations"). Everything ABOVE this addendum is a
+//      HISTORICAL record whose baseline is 4a85897 (admission-atomic-switch); line numbers and
+//      per-file dispositions in the table are stated AS OF 4a85897 and are not silently rewritten
+//      to the current tree — the deltas are recorded here instead.
+//      ANCESTRY/CAPABILITY CHECK (not a "latest N commits" or exact-HEAD gate): 4a85897, 503abdb
+//      (admission-snapshot-plumbing, the prerequisite) and aa23c67 are all ancestors of the
+//      inspected commit (`git merge-base --is-ancestor` → true for each). The corresponding
+//      CAPABILITIES are present in the baseline: transport's pre-admission pipeline write is gone
+//      (HiveOrchestratorService's ClearActiveTask/WorkerOutput block replaced by the
+//      mutation-ownership comment) and the admitted no-brain output copy exists in
+//      TaskCompletionService. So the two preceding fixes are in the baseline by ancestry AND by
+//      observable behaviour, regardless of where HEAD later moves.
+//
+//  (B) CALLER ENUMERATION AT THIS BASELINE (counted now, NOT asserted to equal the historical 18).
+//      `grep -rn "RegisterTask\|TryRegisterTask" tests/` → 117 raw hits in 18 files. Separating
+//      EXECUTABLE invocations from non-invocations:
+//        • Executable `…RegisterTask(` / `…TryRegisterTask(` call sites, by file:
+//          WorkSlotMappingOwnershipTests 30 (incl. the TryRegisterTask vectors), GoalDispatcher-
+//          Tests 17, GoalPipelineTests 5, TaskDispatchServiceTests 4 (self), WorkSlotDispatch-
+//          WiringTests 4, StaleWorkerCleanupServiceTests 4, HonestPlanningWindowTests 3,
+//          GoalDispatcherCancelTests 3, PipelineLifecycleIntegrationTests 3, DashboardNotifier-
+//          WiringTests 2, PlanRejectContractTests 2, PremiumModelSelectionTests 2,
+//          PipelineStoreTests 2, PipelineDriverTests 1, HiveOrchestratorIssueToolTests 1,
+//          HiveOrchestratorNarrativeToolTests 1, Services/EventBusProducerTests 1,
+//          StaleWorkerCleanupServiceIntegrationTests 1.
+//        • NON-invocations excluded: `<see cref="GoalPipelineManager.TryRegisterTask"/>` doc refs
+//          and `<c>RegisterTask</c>` prose, `#region RegisterTask / GetByTaskId`, TEST-METHOD
+//          DECLARATIONS whose names begin with RegisterTask_/TryRegisterTask_ (they are
+//          declarations, and their bodies' calls are counted separately), and the quoted audit
+//          text in THIS header. A multiline-formatting probe (`RegisterTask\s*\($`) found ZERO
+//          split call sites — every invocation is single-line. Unrelated similarly named methods
+//          (RegisterWorker, TryUnregisterTask, RegisterPipeline*, SaveTaskMapping) are excluded.
+//        • HELPER-MEDIATED sites are single call sites reached from many tests and are counted
+//          ONCE each, with their fan-out read: HiveOrchestratorIssueToolTests.CreatePipelineForTask
+//          (L58; 6 callers, all literal "task-1" but each on a FRESH manager from CreateService),
+//          Services/EventBusProducerTests.CreatePipelineForTool (L810; 1 caller),
+//          HiveOrchestratorNarrativeToolTests (L53), HonestPlanningWindowTests.CreateHarness
+//          (L1073), StaleWorkerCleanupServiceTests.ArrangeAdmission (L616; 6 callers, each with
+//          its own manager), GoalDispatcherTests.SlotGuardFixture (L1748; ~20 callers, each
+//          building its own manager and a GUID task id).
+//      The file COUNT is unchanged at 18, but that is an observation, not an acceptance condition.
+//
+//  (C) DELTAS vs. THE 4a85897 TABLE.
+//      • NO new register-caller FILE and NO removed one, and NO test file was ADDED between
+//        4a85897 and this baseline: `git diff --name-status 4a85897..aa23c67` reports exactly
+//        four paths, ALL status M (two src/, DashboardNotifierWorkerWiringTests.cs,
+//        GoalDispatcherTests.cs) — no A and no D entries. `git diff 4a85897..HEAD -- tests/`
+//        shows zero added/removed lines containing RegisterTask.
+//      • GoalDispatcherTests.cs: 17 call sites, and 17 is ALSO the true count at 4a85897 — the
+//        file's caller surface did NOT change. HISTORICAL BOOKKEEPING CORRECTION: entry 8 above
+//        records "18 sites"; that entry MISCOUNTED. Direct inspection of both commits
+//        (`git show <rev>:…/GoalDispatcherTests.cs | grep -E '(RegisterTask|TryRegisterTask)\('`)
+//        yields exactly 17 executable invocations at 4a85897 AND at aa23c67. This is a correction
+//        to the historical RECORD, not a caller being added or removed — no register call site
+//        was introduced, deleted or migrated between the two commits.
+//        LINE SHIFT ONLY: SIX sites moved, each by exactly +354 — GoalDispatcherTests.cs's OWN
+//        insertions (`git diff --numstat 4a85897..aa23c67` → 354/0 for this file). The 674/0 in
+//        the same commit belongs to DashboardNotifierWorkerWiringTests.cs and shifts nothing
+//        here. Mapped by CONTAINING-METHOD IDENTITY resolved from the source via brace matching
+//        at BOTH baselines (not by the nearest preceding `public async Task` header, which
+//        misattributes helper-mediated sites), the historical → current pairs are:
+//          L2101 → L2455  GoalDispatcherPushFailureLoggingTests.
+//                         HandleTaskCompletionAsync_LogsWarning_WhenFilesChangedButNotPushed
+//          L2153 → L2507  GoalDispatcherPushFailureLoggingTests.
+//                         HandleTaskCompletionAsync_NoWarning_WhenPushedSuccessfully
+//          L2203 → L2557  GoalDispatcherPushFailureLoggingTests.RunPushFailureAsync  [HELPER]
+//          L2911 → L3265  GoalDispatcherIterationShaTests.CreateDispatcherInCodingPhase [HELPER]
+//          L3265 → L3619  GoalDispatcherDocWritingPhaseTests.
+//                         DocWritingPhase_AfterTestingSucceeds_CallsBrainCraftPromptWithDocWritingPhase
+//          L4210 → L4564  GoalDispatcherResumeTests.ResumeGoalAsync_StaleTaskMapping_RemovedFromStore
+//        (Two corrections to an earlier draft of this addendum, retracted here rather than
+//        silently overwritten: it mapped historical L2911 to L3619 — wrong, L2911 lands on L3265
+//        and the historical L3265 is what lands on L3619; and it labelled the two [HELPER] rows
+//        with the nearest preceding [Fact] name — L2203/L2557 as …_NoWarning_WhenPushedSuccessfully
+//        and L2911/L3265 as GetGoalsByRelease_ReturnsCorrectGoals. Both are wrong: those two
+//        registrations are HELPER-MEDIATED, sitting inside RunPushFailureAsync and
+//        CreateDispatcherInCodingPhase respectively, each reached from several [Fact] methods that
+//        get a FRESH manager per call. That distinction is material to a caller audit, so the
+//        labels now name the actual containing member. It also said "moved five"; six moved.)
+//        The other ELEVEN sites (L118, L1202, L1287, L1329, L1380, L1504, L1556, L1603, L1604,
+//        L1653, L1748) are unmoved — 6 + 11 = 17, the full count at both baselines.
+//        FIVE of the six shifted sites use fresh `task-{Guid}` ids on storeless managers; the
+//        SIXTH is the store-backed resume-stale vector (now L4564), whose id is the literal
+//        "stale-task-1" and which still seeds durably via store.SaveTaskMapping (L4567) before
+//        asserting the mapping is gone — verified NON-vacuous.
+//      • EXISTING FILE EXTENDED since 4a85897: DashboardNotifierWorkerWiringTests.cs. (Corrected
+//        in this round: an earlier draft of this addendum called it a NEW file added by aa23c67.
+//        That was WRONG and is retracted — no file addition ever occurred. The file already
+//        existed at 4a85897 with 1,124 lines; aa23c67 MODIFIED it (`--name-status` M), adding 674
+//        lines and deleting none (`--numstat` → 674/0).) Its DISPOSITION is unchanged and still
+//        holds for the extended file: NOT a register caller — it contains ZERO RegisterTask/
+//        TryRegisterTask invocations, before or after the extension. Its RealTransportHarness
+//        drives the REAL dispatch service, so every mapping it relies on is written by the
+//        PRODUCTION admission path; its `PipelineManager.GetByTaskId(taskA)` retention assertion
+//        (L1144) therefore reads an admission-written mapping, not a test-registered one, and is
+//        unaffected by all three breaking changes. Its manager is storeless. No audit action
+//        required.
+//      • Iteration-4 dispositions 9–19 were re-read call site by call site at this baseline and
+//        are CORROBORATED unchanged, with one correction in (F).
+//
+//  (D) RE-VERIFICATION METHOD APPLIED TO EVERY CALLER (helpers read, not just grepped):
+//      task-ID expressions, same-manager reuse, store-backedness, blank/null inputs, and whether
+//      any assertion depends on overwrite behaviour or on an IMPLICIT durable mapping write.
+//      RESULTS: (1) OVERWRITE→REFUSAL is observable nowhere accidentally. The only same-manager
+//      task-id pairs are GoalDispatcherTests L1603/L1604 ("task-old-phase" vs "task-current-phase",
+//      DISTINCT), StaleWorkerCleanupServiceTests L871 vs ArrangeAdmission's L616 (attempt-stamped
+//      …-01-002 vs …-01-001, DISTINCT), HonestPlanningWindowTests L811/L840 vs the harness GUID
+//      (DISTINCT), and the INTENTIONAL duplicate vectors in WorkSlotMappingOwnershipTests
+//      (RegisterTask_RefusesDuplicateAndIsMemoryOnly L812/L819 and
+//      TryRegisterTask_InMemoryDuplicate_RefusesWithoutExecutingSql L521/L525) plus the
+//      unregister-then-register steals in WorkSlotDispatchWiringTests (L766, L885) — all of which
+//      PIN the new semantics deliberately rather than depending on the old ones.
+//      (3) BLANK/NULL inputs occur ONLY in the intentional validation Theories
+//      (WorkSlotMappingOwnershipTests L451/L479/L855/L879), which assert the ArgumentException
+//      and the taskId-before-goalId ParamName order. No other caller passes blank/null.
+//      (2) DURABLE→MEMORY-ONLY: every store-backed caller whose assertion needs a durable row was
+//      re-read to confirm the row is SEEDED and its existence ESTABLISHED before the act —
+//      GoalPipelineTests L999/L1109 (both seed via store.SaveTaskMapping and assert
+//      NotEmpty/Contains first), GoalDispatcherTests L4567, PipelineLifecycleIntegrationTests
+//      L77-79, PipelineStoreTests (the memory-only claim and the durable
+//      SaveTaskMapping_PersistsMappingLoadedByLoadActivePipelines are now two separate tests),
+//      WorkSlotMappingOwnershipTests (SeedPersistedMapping / SeedPersistedMappingRaw at every
+//      durable fixture), WorkSlotDispatchWiringTests (SeedPersistedMapping at L523). Store-backed
+//      managers whose probe hits are pipeline-row/PHASE checks rather than mapping checks are
+//      confirmed benign: PlanRejectContractTests L699/L752 (LoadPipeline → Phase, and neither
+//      manager registers), GoalDispatcherTests L1653 (LoadPipeline → Phase),
+//      GoalDispatcherCancelTests L1199-region (store-backed manager that never registers).
+//
+//  (E) TARGETED RE-RUN AT THIS BASELINE: StaleWorkerCleanupServiceTests → 24 passed, 0 failed.
+//      Read-only verification of PipelineStoreEfCoreIntegrationTests.cs is RETAINED as entry 6:
+//      it is untouched by 4a85897 and by this audit, has zero register calls, and its
+//      SaveAdmissionWithPointer pointer-snapshot assertions remain valid and unrelied-upon by the
+//      register contract.
+//
+//  (F) OUTSTANDING FINDING — one accidental old-semantic dependency, REPORTED NOT REPAIRED.
+//      TRACKING ISSUE (durable reference, raised in the review round):
+//        cleanup-persistence-removal-fixture-passes-without-exercising-a-persisted-mapping
+//      Repair is owned by that issue and is a SEPARATE goal; this audit's obligation is the
+//      accurate report recorded here.
+//      FILE/TEST: StaleWorkerCleanupServiceTests.cs →
+//      Reclaim_PersistenceRemovalDoesNotConfirm_ExactWarningAndContinuation (~L508).
+//      CORRECTION TO THE TABLE: entry 19 states StaleWorkerCleanupServiceTests uses "all storeless
+//      managers". That is FALSE at both baselines — this vector's manager is STORE-BACKED
+//      (CreateStoreForCleanup, a DELETE-throwing interceptor). The audit's store-backedness step
+//      was mis-recorded for this file.
+//      OFFENDING ASSUMPTION: the fixture registers ONLY through ArrangeAdmission's memory-only
+//      RegisterTask, so NO task_mappings row is ever written; the persistenceRemoved=False
+//      outcome it asserts is therefore produced by the interceptor's throw over an EMPTY table —
+//      the same False would arise from a 0-row delete. The test's stated intent ("an interceptor
+//      forces the DELETE … to throw") is not what the assertion discriminates.
+//      EVIDENCE (mutation, run at this baseline): removing the interceptor from
+//      CreateStoreForCleanup leaves the test GREEN (1 passed) — a clean mutant it fails to kill.
+//      PROPOSED SMALLEST FIX (validated, then reverted; NOT applied here): hoist the store into a
+//      local and seed the durable row after ArrangeAdmission —
+//        var expStore = CreateStoreForCleanup(new InvalidOperationException("delete-sentinel"));
+//        var manager  = new GoalPipelineManager(expStore, new TestLogger<GoalPipelineManager>());
+//        …
+//        expStore.SaveTaskMapping(taskId, "goal-d2-unconfirmed");
+//      With this seed the interceptor-removed mutant FAILS (the warning is absent because the
+//      delete now succeeds → persistenceRemoved=True) and the unmutated test stays GREEN.
+//      SCOPE NOTE: this is a defect in an existing test's arrangement, not in production code, and
+//      it is NOT weakened or fixed by this audit goal — see the tracking issue named above.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
 using System.Collections.Concurrent;
