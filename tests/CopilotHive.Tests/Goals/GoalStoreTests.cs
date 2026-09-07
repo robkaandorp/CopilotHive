@@ -751,6 +751,60 @@ public sealed class GoalStoreWorkerOutputTests : IDisposable
         Assert.Equal("Reviewer: Missing null checks.", s.PhaseOutputs["reviewer-1"]);
     }
 
+    /// <summary>
+    /// A LONG Testing <see cref="PhaseResult.WorkerOutput"/> (the full tester report, > 4,000
+    /// chars) survives actual SQLite persistence and <see cref="GoalStore.GetIterationsAsync"/>
+    /// readback with NO truncation — the reviewer handoff depends on the complete report.
+    /// </summary>
+    [Fact]
+    public async Task GoalStore_LongTestingWorkerOutput_SurvivesGetIterationsReadback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _store.CreateGoalAsync(MakeGoal("long-testing-goal"), ct);
+
+        // Realistic full tester report: distinctive evidence beyond char 4,000 and at the end.
+        var fullReport = """
+            ## Test Report — iteration 1
+            Build: success. Tests: 636 passed, 0 failed. Coverage: 78%.
+
+            """;
+        while (fullReport.Length < 4_100)
+            fullReport += "Filler analysis line with stable content for realistic report shape.\n";
+        fullReport += "MUTATION-KILL-EVIDENCE-BEYOND-4000: mutant truncation removed → suite red.\n";
+        while (fullReport.Length < 7_500)
+            fullReport += "Further section detail — metrics table rows and issue enumeration.\n";
+        fullReport += "TRAILING-EVIDENCE-AT-END: all 636 tests green.";
+        Assert.True(fullReport.Length > 4_000);
+
+        var summary = new IterationSummary
+        {
+            Iteration = 2,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 120.0,
+                    WorkerOutput = fullReport,
+                },
+            ],
+        };
+
+        await _store.AddIterationAsync("long-testing-goal", summary, ct);
+
+        var iterations = await _store.GetIterationsAsync("long-testing-goal", ct);
+        Assert.Single(iterations);
+        var s = iterations[0];
+        var entry = Assert.Single(s.Phases);
+        Assert.Equal(GoalPhase.Testing, entry.Name);
+        // EXACT equality — the full report must survive the SQLite JSON round-trip untouched.
+        Assert.Equal(fullReport, entry.WorkerOutput);
+        Assert.Equal(fullReport.Length, entry.WorkerOutput!.Length);
+        Assert.Contains("MUTATION-KILL-EVIDENCE-BEYOND-4000", entry.WorkerOutput);
+        Assert.EndsWith("TRAILING-EVIDENCE-AT-END: all 636 tests green.", entry.WorkerOutput);
+    }
+
     [Fact]
     public async Task CreateGoal_WithScope_PersistsAndReadsBack()
     {

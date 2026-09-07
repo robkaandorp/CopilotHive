@@ -135,6 +135,191 @@ public sealed class PipelineDriverWorkerOutputTests
         Assert.True(workerOutput!.Length < 5000);
     }
 
+    // ── Testing phase: FULL report preservation (no truncation, no suffix) ──
+
+    [Theory]
+    [InlineData(3999)]  // below the legacy cap
+    [InlineData(4000)]  // exactly at the legacy cap
+    [InlineData(4001)]  // just above the legacy cap
+    [InlineData(8_500)] // realistic tester report size
+    public async Task DriveNextPhaseAsync_WhenTestingSummary_PreservesFullSummaryExactly(int length)
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        // Distinctive evidence in every region: head, past char 4000, and the very end.
+        var summary = "HEAD:" + new string('S', length - 10) + "TAIL:";
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw",
+            Metrics = new TaskMetrics
+            {
+                Verdict = "PASS",
+                Summary = summary,
+            },
+        }, TestContext.Current.CancellationToken);
+
+        // EXACT equality — not prefix, not length, not merely absence of the suffix.
+        Assert.Equal(summary, pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal(length, pipeline.PhaseLog[0].WorkerOutput!.Length);
+    }
+
+    [Theory]
+    [InlineData(3999)]
+    [InlineData(4000)]
+    [InlineData(4001)]
+    [InlineData(8_500)]
+    public async Task DriveNextPhaseAsync_WhenTestingRawOutputFallback_PreservesFullRawOutputExactly(int length)
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        var rawOutput = "HEAD:" + new string('O', length - 10) + "TAIL:";
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "FAIL" }, // no Summary
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal(length, pipeline.PhaseLog[0].WorkerOutput!.Length);
+    }
+
+    /// <summary>
+    /// A realistic 6–10KB tester report with distinctive mutation evidence beyond character
+    /// 4,000 and at the very end must survive EXACTLY — this is the incident: mutation evidence
+    /// past 4,000 chars was being cut off, forcing reviewer clarification.
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenTestingRealisticReport_PreservesEvidencePast4000AndTrailing()
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        var report = BuildRealisticTesterReport();
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "PASS",
+            Metrics = new TaskMetrics
+            {
+                Verdict = "PASS",
+                Summary = report,
+            },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(report, pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Contains("MUTATION-KILL-EVIDENCE-BEYOND-4000", pipeline.PhaseLog[0].WorkerOutput);
+        Assert.EndsWith("TRAILING-EVIDENCE-AT-END: all 636 tests green.", pipeline.PhaseLog[0].WorkerOutput);
+        Assert.DoesNotContain("chars total", pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    /// <summary>
+    /// Null/empty/whitespace summary and absent metrics fall back to the raw output during
+    /// Testing, and the raw output is preserved in full.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task DriveNextPhaseAsync_WhenTestingSummaryAbsentOrWhitespace_PreservesFullRawOutput(string? summary)
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        var rawOutput = new string('O', 6000) + "\nTAIL-EVIDENCE";
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = summary is null
+                ? null
+                : new TaskMetrics { Verdict = "FAIL", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    /// <summary>
+    /// A FAILED Testing completion preserves the full report too — verdict must not gate the
+    /// preservation.
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenTestingFails_PreservesFullReport()
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        var report = BuildRealisticTesterReport();
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "FAIL",
+            Metrics = new TaskMetrics
+            {
+                Verdict = "FAIL",
+                Summary = report,
+            },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(report, pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    /// <summary>
+    /// A nonblank summary still wins over a DIFFERENT raw output in Testing (selection
+    /// semantics unchanged — only the truncation was removed).
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenTestingNonBlankSummaryStillWinsOverRawOutput()
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
+        AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        var summary = "Summary with distinctive content: " + new string('S', 5000);
+        var rawOutput = "DIFFERENT raw text entirely";
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(summary, pipeline.PhaseLog[0].WorkerOutput);
+        Assert.NotEqual(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    /// <summary>
+    /// Builds a realistic ~8KB tester report with structured sections, newlines, and mutation
+    /// evidence both just past char 4,000 and at the very end.
+    /// </summary>
+    private static string BuildRealisticTesterReport()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("## Test Report — iteration 1");
+        sb.AppendLine("Build: success. Tests: 636 passed, 0 failed. Coverage: 78%.");
+        while (sb.Length < 4_100)
+            sb.AppendLine("Filler analysis line with stable content for realistic report shape.");
+        sb.AppendLine("MUTATION-KILL-EVIDENCE-BEYOND-4000: mutant PipelineDriver.TruncateTesting removed → suite red.");
+        while (sb.Length < 7_800)
+            sb.AppendLine("Further section detail — metrics table rows and issue enumeration.");
+        sb.Append("TRAILING-EVIDENCE-AT-END: all 636 tests green.");
+        return sb.ToString();
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     /// <summary>

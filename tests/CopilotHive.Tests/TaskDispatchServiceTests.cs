@@ -352,6 +352,8 @@ using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
+using CopilotHive.Tests.Worker;
+using CopilotHive.Worker;
 using CopilotHive.Workers;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -1250,6 +1252,399 @@ public sealed class TaskDispatchServiceTests
         Assert.Equal("All 50 tests passed.", capturedTask.Metadata["tester_report"]);
     }
 
+    // ── Tester-report handoff through the REAL completion chain ───────────
+
+    /// <summary>
+    /// THE FULL CHAIN under the fix: an admitted tester task under a valid plan completes
+    /// through the REAL <see cref="TaskCompletionService"/> → <see cref="PipelineDriver"/>, the
+    /// driver advances Testing → Review, and the reviewer <see cref="WorkTask"/> captured from
+    /// the queue carries the ENTIRE tester report in its tester_report metadata. The expected
+    /// report is never constructed independently of the chain — it is the same string fed in as
+    /// the tester's Metrics.Summary, and both the completed Testing entry's WorkerOutput and the
+    /// reviewer task's metadata are asserted to equal it EXACTLY (beyond the legacy 4,000-char
+    /// truncation that previously clipped mutation evidence).
+    /// </summary>
+    [Fact]
+    public async Task TestingCompletion_FullReport_SurvivesToReviewerTaskMetadata()
+    {
+        var config = CreateConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+
+        var (service, pipeline, taskQueue, pipelineManager) = CreateServiceWithPipelineAndManager(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        var report = """
+            ## Test Report — iteration 1
+            Build: success. Tests: 636 passed, 0 failed. Coverage: 78%.
+
+            """;
+        while (report.Length < 4_100)
+            report += "Filler analysis line with stable content for realistic report shape.\n";
+        report += "MUTATION-KILL-EVIDENCE-BEYOND-4000: mutant truncation removed → suite red.\n";
+        while (report.Length < 7_800)
+            report += "Further section detail — metrics table rows and issue enumeration.\n";
+        report += "TRAILING-EVIDENCE-AT-END: all 636 tests green.";
+
+        // The tester task must be admitted so the completion path accepts the result.
+        var testerTaskId = $"{pipeline.GoalId}-tester-001-01-001";
+        pipeline.CoderBranch = "feature/test-branch"; // seed so the tester task has BranchInfo
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var dispatchedTesterId = Assert.Single(dispatched).TaskId;
+        Assert.Equal(testerTaskId, dispatchedTesterId);
+
+        // The current Testing phase entry (created by the real dispatch path, or seeded here when
+        // the fixture dispatched manually): DriveNextPhaseAsync writes the WorkerOutput onto the
+        // CURRENT entry, so it must exist for iteration 1 before the completion runs.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            StartedAt = DateTime.UtcNow,
+        });
+
+        // THE COMPLETION — the REAL TaskCompletionService, whose driver advances Testing → Review
+        // and re-enters the REAL DispatchToRole for the reviewer phase.
+        var completionService = CreateCompletionService(pipelineManager, service, config, pipeline.Goal);
+        await completionService.HandleTaskCompletionAsync(
+            new TaskResult
+            {
+                TaskId = dispatchedTesterId,
+                Status = TaskOutcome.Completed,
+                Output = "PASS",
+                Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+            },
+            TestContext.Current.CancellationToken);
+
+        // Phase advanced to Review with the Testing entry carrying the FULL report.
+        Assert.Equal(GoalPhase.Review, pipeline.Phase);
+        var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
+        Assert.Equal(report, testingEntry.WorkerOutput);
+
+        // The reviewer task dispatched by the driver carries the same FULL report verbatim.
+        var reviewerTask = dispatched.Single(t => t.TaskId.EndsWith("reviewer-001-01-001"));
+        Assert.Equal(WorkerRole.Reviewer, reviewerTask.Role);
+        Assert.True(reviewerTask.Metadata.ContainsKey("tester_report"));
+        Assert.Equal(report, reviewerTask.Metadata["tester_report"]);
+    }
+
+    /// <summary>
+    /// A FAILED Testing completion through the same real chain must still hand the FULL report
+    /// to the reviewer — verdict must not gate the report's size.
+    /// </summary>
+    [Fact]
+    public async Task TestingCompletion_FailVerdict_FullReportStillSurvivesToReviewerMetadata()
+    {        var config = CreateConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+
+        var (service, pipeline, taskQueue, pipelineManager) = CreateServiceWithPipelineAndManager(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        var report = new string('F', 6_500) + "TAIL-FAIL-EVIDENCE";
+
+        pipeline.CoderBranch = "feature/test-branch";
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var dispatchedTesterId = Assert.Single(dispatched).TaskId;
+
+        // The current Testing phase entry (see the PASS test above): must exist for iteration 1.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Fail,
+            Iteration = pipeline.Iteration,
+            StartedAt = DateTime.UtcNow,
+        });
+
+        var completionService = CreateCompletionService(pipelineManager, service, config, pipeline.Goal);
+        await completionService.HandleTaskCompletionAsync(
+            new TaskResult
+            {
+                TaskId = dispatchedTesterId,
+                Status = TaskOutcome.Completed,
+                Output = "FAIL",
+                Metrics = new TaskMetrics { Verdict = "FAIL", Summary = report },
+            },
+            TestContext.Current.CancellationToken);
+
+        // Under a FAIL verdict the state machine opens a re-plan (NewIteration) — the pipeline
+        // phase may be Planning/Testing-again — but the completed Testing entry MUST still carry
+        // the FULL report (verdict must not gate report preservation).
+        var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
+        Assert.Equal(report, testingEntry.WorkerOutput);
+
+        var reviewerTask = dispatched.FirstOrDefault(t => t.TaskId.EndsWith("reviewer-001-01-001"));
+        if (reviewerTask is not null)
+            Assert.Equal(report, reviewerTask.Metadata["tester_report"]);
+    }
+
+    // ── Tester-report SELECTION: latest current-iteration non-null wins ────
+
+    /// <summary>
+    /// THE SELECTION REGRESSION (AC4). The dispatch picks the LATEST Testing entry of the
+    /// CURRENT iteration that has a non-null <see cref="PhaseResult.WorkerOutput"/>. This test
+    /// populates every competing shape at once — an OLDER-iteration report, an EARLIER
+    /// current-iteration report, the LATEST current-iteration report, and a later NULL entry —
+    /// and asserts the dispatched metadata equals the latest current non-null report EXACTLY.
+    /// </summary>
+    /// <remarks>
+    /// EACH DECOY KILLS A DISTINCT MUTANT:
+    /// <list type="bullet">
+    ///   <item><description>drop the <c>e.Iteration == pipeline.Iteration</c> filter → an older
+    ///     iteration's report could be selected (it is the FIRST entry, so a First-based
+    ///     selection also lands on it);</description></item>
+    ///   <item><description>swap <c>LastOrDefault</c> for <c>FirstOrDefault</c> → the EARLIER
+    ///     current-iteration report wins;</description></item>
+    ///   <item><description>drop the <c>WorkerOutput is not null</c> predicate → the trailing
+    ///     null entry becomes the selection and the key is dropped (a silent
+    ///     clearing).</description></item>
+    /// </list>
+    /// </remarks>
+    [Fact]
+    public async Task DispatchToRole_WhenMultipleTestingOutputs_SelectsLatestCurrentIterationNonNullReport()
+    {
+        var config = CreateConfig();
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Review, config, ModelTier.Default);
+
+        // Move to iteration 2 so "older iteration" entries are genuinely addressable.
+        Assert.True(pipeline.IterationBudget.TryConsume());
+        var currentIteration = pipeline.Iteration;
+        var olderIteration = currentIteration - 1;
+        Assert.Equal(2, currentIteration);
+
+        const string OlderReport = "OLDER-ITERATION-REPORT: iteration 1 tester output.";
+        const string EarlierCurrentReport = "EARLIER-CURRENT-REPORT: first Testing round of iteration 2.";
+        const string LatestCurrentReport = "LATEST-CURRENT-REPORT: second Testing round of iteration 2.";
+
+        // (1) An OLDER iteration's Testing report — must never be selected.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = olderIteration,
+            Occurrence = 1,
+            WorkerOutput = OlderReport,
+        });
+
+        // (2) An EARLIER Testing occurrence of the CURRENT iteration — superseded below.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Fail,
+            Iteration = currentIteration,
+            Occurrence = 1,
+            WorkerOutput = EarlierCurrentReport,
+        });
+
+        // (3) THE WINNER: the latest current-iteration Testing entry with a non-null output.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 2,
+            WorkerOutput = LatestCurrentReport,
+        });
+
+        // (4) A LATER null entry (a Testing phase that started but has not reported yet).
+        // It must be SKIPPED, not treated as a clearing of the winner above.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = currentIteration,
+            Occurrence = 3,
+            WorkerOutput = null,
+        });
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Reviewer, "Review it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(capturedTask!.Metadata.ContainsKey("tester_report"),
+            "the trailing null entry must be skipped, never clear the latest non-null report");
+        Assert.Equal(LatestCurrentReport, capturedTask.Metadata["tester_report"]);
+        Assert.DoesNotContain("OLDER-ITERATION-REPORT", capturedTask.Metadata["tester_report"]);
+        Assert.DoesNotContain("EARLIER-CURRENT-REPORT", capturedTask.Metadata["tester_report"]);
+    }
+
+    /// <summary>
+    /// When ONLY older iterations produced Testing output, the current iteration's reviewer gets
+    /// NO tester_report at all — a previous iteration's report must never leak forward.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenOnlyOlderIterationTesterOutput_DoesNotSetTesterReport()
+    {
+        var config = CreateConfig();
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Review, config, ModelTier.Default);
+
+        Assert.True(pipeline.IterationBudget.TryConsume());
+        var olderIteration = pipeline.Iteration - 1;
+
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = olderIteration,
+            Occurrence = 1,
+            WorkerOutput = "OLDER-ITERATION-REPORT: stale, must not be handed to this iteration.",
+        });
+
+        // A current-iteration Testing entry exists but has produced NO output yet.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            WorkerOutput = null,
+        });
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Reviewer, "Review it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.False(capturedTask!.Metadata.ContainsKey("tester_report"));
+    }
+
+    // ── THE CONTINUOUS FULL CHAIN: dispatch → completion → worker → tool ──
+
+    /// <summary>
+    /// THE ONE UNBROKEN PROOF (AC2–3). A single test carries ONE synthetic tester report through
+    /// EVERY real hop of the handoff, never re-stating the expectation from an independently
+    /// constructed value:
+    /// <list type="number">
+    ///   <item><description>the REAL <see cref="TaskDispatchService"/> dispatches an ADMITTED
+    ///     tester task under a valid plan with configured tester/reviewer models and a current
+    ///     Testing phase entry;</description></item>
+    ///   <item><description>the REAL <see cref="TaskCompletionService"/> → <see cref="PipelineDriver"/>
+    ///     completes it (the report enters ONLY as the tester's <c>Metrics.Summary</c>), stores it
+    ///     on the Testing phase entry and advances the pipeline to Review;</description></item>
+    ///   <item><description>the reviewer <see cref="WorkTask"/> is CAPTURED FROM THE QUEUE — the
+    ///     production dispatch built its tester_report metadata, the test never writes
+    ///     it;</description></item>
+    ///   <item><description>that captured task round-trips through the REAL
+    ///     <see cref="GrpcMapper"/> (<c>ToGrpc</c> → <c>ToDomain</c>), the orchestrator↔worker
+    ///     transport;</description></item>
+    ///   <item><description>the round-tripped task runs through the REAL
+    ///     <see cref="TaskExecutor"/> with fake Git and no live provider, whose runner is the
+    ///     test-only adapter around a REAL <see cref="SharpCoderRunner"/>;</description></item>
+    ///   <item><description>the ACTUAL <c>get_test_report</c> AIFunction invoked DURING
+    ///     <c>SendPromptAsync</c> returns the complete report — trailing evidence
+    ///     included.</description></item>
+    /// </list>
+    /// </summary>
+    /// <remarks>
+    /// WHY THE OBSERVED INVOCATION MATTERS. The final assertion reads
+    /// <c>ObservedGetTestReportResults</c>, which is appended ONLY inside the adapter's
+    /// <c>SendPromptAsync</c>. <see cref="TaskExecutor"/> catches its own exceptions and returns
+    /// a Failed <see cref="TaskResult"/>, so an executor that blew up before the prompt would
+    /// produce an EMPTY list. Asserting both <c>TaskOutcome.Completed</c> AND exactly one
+    /// observed invocation therefore makes a swallowed executor error impossible to pass.
+    /// <para>
+    /// NOTHING IS BYPASSED: the expected string is the same <c>report</c> local that was handed
+    /// to the tester's completion metrics. It is never placed into metadata or worker state by
+    /// the test — every intermediate value is read back out of production structures.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task TesterReport_FullChain_ReachesGetTestReportToolIntact()
+    {
+        var config = CreateConfig();
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+        config.Workers["reviewer"] = new WorkerConfig { Model = "reviewer-model" };
+
+        var (service, pipeline, taskQueue, pipelineManager) = CreateServiceWithPipelineAndManager(
+            GoalPhase.Testing, config, ModelTier.Default);
+
+        // The ONE report — a synthetic ~8KB tester report with distinctive evidence beyond
+        // character 4,000 and at the very end (shared with the worker-side vectors).
+        var report = TaskExecutorTesterReportTests.BuildRealisticReport();
+        Assert.True(report.Length > 4_000);
+
+        pipeline.CoderBranch = "feature/test-branch"; // seed so the tester task has BranchInfo
+
+        var dispatched = new List<WorkTask>();
+        taskQueue.OnEnqueue = t => dispatched.Add(t);
+
+        // ── HOP 1: the REAL dispatch admits the tester task ──────────────
+        await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+        var testerTaskId = Assert.Single(dispatched).TaskId;
+        Assert.Equal($"{pipeline.GoalId}-tester-001-01-001", testerTaskId);
+
+        // The CURRENT Testing phase entry the driver writes its WorkerOutput onto.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        });
+
+        // ── HOP 2: the REAL completion chain stores the report and advances ──
+        var completionService = CreateCompletionService(pipelineManager, service, config, pipeline.Goal);
+        await completionService.HandleTaskCompletionAsync(
+            new TaskResult
+            {
+                TaskId = testerTaskId,
+                Status = TaskOutcome.Completed,
+                Output = "PASS",
+                Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+            },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(GoalPhase.Review, pipeline.Phase);
+        var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
+        Assert.Equal(report, testingEntry.WorkerOutput);
+
+        // ── HOP 3: the ACTUAL reviewer task, captured from the queue ─────
+        var reviewerTask = dispatched.Single(t => t.Role == WorkerRole.Reviewer);
+        Assert.True(reviewerTask.Metadata.ContainsKey("tester_report"),
+            "the production dispatch must have attached the tester report — the test never writes it");
+        Assert.Equal(report, reviewerTask.Metadata["tester_report"]);
+
+        // ── HOP 4: the REAL gRPC transport round-trip ────────────────────
+        var roundTripped = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(reviewerTask));
+        Assert.Equal(WorkerRole.Reviewer, roundTripped.Role);
+        Assert.Equal(report, roundTripped.Metadata["tester_report"]);
+
+        // ── HOPS 5–6: the REAL TaskExecutor + REAL SharpCoderRunner tool ─
+        await using var runner = new TesterReportRunner();
+        runner.WireRole(WorkerRole.Reviewer); // role wiring precedes report injection (it clears the field)
+        var executor = new TaskExecutor(runner, gitOperations: new NoOpTesterReportGit());
+
+        var executionResult = await executor.ExecuteAsync(roundTripped, TestContext.Current.CancellationToken);
+
+        // The run SUCCEEDED (TaskExecutor swallows its own exceptions into a Failed result)…
+        Assert.Equal(TaskOutcome.Completed, executionResult.Status);
+
+        // …AND the tool really ran, so a pre-prompt failure cannot masquerade as a pass.
+        var modelFacingResult = Assert.Single(runner.ObservedGetTestReportResults);
+        Assert.Equal(report, modelFacingResult);
+        Assert.EndsWith(TaskExecutorTesterReportTests.TrailingEvidence, modelFacingResult);
+        Assert.Contains(TaskExecutorTesterReportTests.Beyond4000Marker, modelFacingResult);
+    }
+
     [Fact]
     public async Task DispatchToRole_WhenReviewerRoleButNoTesterOutput_DoesNotSetTesterReport()
     {
@@ -1659,12 +2054,21 @@ public sealed class TaskDispatchServiceTests
     /// <summary>
     /// A real <see cref="TaskCompletionService"/> whose driver re-enters
     /// <paramref name="dispatchService"/> — the production completion → drive → dispatch chain.
+    /// <para>
+    /// The goal manager here is backed by a REAL <see cref="InMemoryGoalStore"/> containing the
+    /// goal (not the throwaway <see cref="DispatchTestGoalSource"/>): the completion chain can
+    /// take lifecycle branches that call <see cref="GoalLifecycleService.MarkGoalFailedAsync"/>,
+    /// whose persistence requires an <see cref="IGoalStore"/>-capable source, and a source
+    /// without one throws mid-drive and masks the actual outcome.
+    /// </para>
     /// </summary>
     private static TaskCompletionService CreateCompletionService(
         GoalPipelineManager pipelineManager, TaskDispatchService dispatchService, HiveConfigFile config, Goal goal)
     {
         var goalManager = new GoalManager();
-        goalManager.AddSource(new DispatchTestGoalSource(goal));
+        var goalStore = new InMemoryGoalStore();
+        goalStore.CreateGoalAsync(goal).GetAwaiter().GetResult();
+        goalManager.AddSource(goalStore);
         goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
         var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
 
