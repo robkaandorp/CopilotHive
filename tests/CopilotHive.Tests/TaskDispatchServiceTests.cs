@@ -1178,6 +1178,96 @@ public sealed class TaskDispatchServiceTests
         Assert.False(capturedTask!.Metadata.ContainsKey("compaction_model"));
     }
 
+    // ── DispatchToRole: compaction model raw-value spectrum ────────────────
+
+    /// <summary>
+    /// Verifies that an EMPTY-STRING compaction model is omitted from task metadata:
+    /// the dispatch gating (<c>IsNullOrEmpty</c>) treats empty exactly like null. The
+    /// value is installed via <see cref="HiveConfigFile.SetCompactionModel"/> so it flows
+    /// through the synchronized accessor the production read now uses.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenCompactionModelEmptyString_DoesNotSetCompactionMetadata()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
+        config.SetCompactionModel(string.Empty);
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.False(capturedTask!.Metadata.ContainsKey("compaction_model"));
+        Assert.False(capturedTask.Metadata.ContainsKey("compaction_max_tokens"));
+    }
+
+    /// <summary>
+    /// Verifies that a WHITESPACE-ONLY compaction model is treated as nonempty: it is
+    /// propagated verbatim into <c>compaction_model</c> with no trimming, and (with no
+    /// matching context-window entry) no <c>compaction_max_tokens</c> is emitted — the
+    /// positive-only rule.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenCompactionModelWhitespace_TreatsAsNonempty()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
+        config.Models = new ModelsConfig
+        {
+            CompactionModel = "   ",
+            AvailableModels =
+            [
+                new ModelEntry { Name = "standard-coder-model" },
+            ],
+        };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(capturedTask!.Metadata.ContainsKey("compaction_model"));
+        Assert.Equal("   ", capturedTask.Metadata["compaction_model"]);
+        Assert.False(capturedTask.Metadata.ContainsKey("compaction_max_tokens"));
+    }
+
+    /// <summary>
+    /// Verifies that a configured compaction model set AFTER service construction — via the
+    /// synchronized <see cref="HiveConfigFile.SetCompactionModel"/> writer — is observed by
+    /// the dispatch path through <see cref="HiveConfigFile.GetCompactionModel"/> and flows
+    /// into the task metadata of a subsequent dispatch.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_WhenCompactionModelSetAfterConstruction_PropagatesConfiguredValue()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "standard-coder-model" };
+
+        var (service, pipeline, taskQueue) = CreateServiceWithPipeline(
+            GoalPhase.Coding, config, ModelTier.Default);
+
+        // Set AFTER the service was constructed with this config instance.
+        config.SetCompactionModel("gpt-mini-late");
+
+        WorkTask? capturedTask = null;
+        taskQueue.OnEnqueue = t => capturedTask = t;
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Work on it", TestContext.Current.CancellationToken);
+
+        Assert.NotNull(capturedTask);
+        Assert.True(capturedTask!.Metadata.ContainsKey("compaction_model"));
+        Assert.Equal("gpt-mini-late", capturedTask.Metadata["compaction_model"]);
+    }
+
     // ── DispatchToRole: iteration SHA metadata ────────────────────────────
 
     [Fact]

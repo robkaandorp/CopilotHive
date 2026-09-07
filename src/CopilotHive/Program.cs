@@ -435,7 +435,7 @@ public sealed class Program
                         sp.GetService<IBrainRepoManager>(),
                         stateDir,
                         sp.GetRequiredService<IGoalStore>(),
-                        compactionModel: config.Models?.CompactionModel,
+                        compactionModel: config.GetCompactionModel(),
                         knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                         hiveConfig: config,
                         sessionRegistry: sp.GetService<LlmSessionRegistry>(),
@@ -589,7 +589,7 @@ public sealed class Program
                     config,
                     sp.GetService<ConfigRepoManager>(),
                     availableModels,
-                    compactionModel: config.Models?.CompactionModel,
+                    compactionModel: config.GetCompactionModel(),
                     knowledgeGraph: sp.GetService<KnowledgeGraph>(),
                     goalReviewService: sp.GetService<GoalReviewService>(),
                     sessionRegistry: sp.GetService<LlmSessionRegistry>(),
@@ -628,7 +628,7 @@ public sealed class Program
 
                 return new LlmConnectionCoordinator(
                     composerInstance?.StartupDefaultModel,
-                    config.Models?.CompactionModel,
+                    config.GetCompactionModel(),
                     authEnabled,
                     composerInstance is null ? null : composerInstance.ConnectAsync,
                     SharpCoder.Providers.ChatClientFactory.IsTokenAvailable,

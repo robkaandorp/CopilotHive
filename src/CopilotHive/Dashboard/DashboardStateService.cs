@@ -317,7 +317,7 @@ public sealed class DashboardStateService : IDisposable
             RoleModels = roleModels,
             BrainModel = RenderModel(_brain?.GetStats()?.Model),
             ComposerModel = RenderModel(_composer?.GetStats()?.Model),
-            CompactionModel = _config?.Models?.CompactionModel,
+            CompactionModel = _config?.GetCompactionModel(),
             BrainReasoningEffort = ParseLenient(_config?.Orchestrator?.ReasoningEffort),
             ComposerReasoningEffort = ParseLenient(
                 !string.IsNullOrWhiteSpace(_config?.Composer?.ReasoningEffort)

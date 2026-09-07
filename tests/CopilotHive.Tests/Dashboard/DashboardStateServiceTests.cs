@@ -1275,6 +1275,71 @@ public sealed class DashboardStateServiceTests : IDisposable
         Assert.Null(info.CompactionModel);
     }
 
+    /// <summary>
+    /// Verifies that an EMPTY-STRING compaction model flows through the synchronized
+    /// accessor into the <see cref="OrchestratorInfo.CompactionModel"/> projection
+    /// verbatim (no normalization to null), matching the raw-scalar contract of
+    /// <see cref="HiveConfigFile.GetCompactionModel"/>.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_EmptyString_PropagatesVerbatim()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+        };
+        config.SetCompactionModel(string.Empty);
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal(string.Empty, info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that a WHITESPACE-ONLY compaction model flows through the synchronized
+    /// accessor into the <see cref="OrchestratorInfo.CompactionModel"/> projection
+    /// verbatim — no trimming or validation is applied to the raw scalar.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_Whitespace_PropagatesVerbatim()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+        };
+        config.SetCompactionModel("   ");
+
+        using var service = BuildService(config);
+        var info = service.GetOrchestratorInfo();
+
+        Assert.Equal("   ", info.CompactionModel);
+    }
+
+    /// <summary>
+    /// Verifies that a synchronized <see cref="HiveConfigFile.SetCompactionModel"/> change
+    /// made AFTER the service was constructed is reflected in a FRESH read of the
+    /// <see cref="CopilotHive.Dashboard.DashboardStateService.GetOrchestratorInfo"/>
+    /// projection: the projection reads through the live
+    /// config reference at call time, not a construction-time snapshot.
+    /// </summary>
+    [Fact]
+    public void GetOrchestratorInfo_CompactionModel_SetAfterConstruction_ReflectedInFreshRead()
+    {
+        var config = new HiveConfigFile
+        {
+            Repositories = [],
+            // No Models section initially — the projection reads null at construction.
+        };
+
+        using var service = BuildService(config);
+        Assert.Null(service.GetOrchestratorInfo().CompactionModel);
+
+        config.SetCompactionModel("copilot/gpt-5.4-mini-late");
+
+        Assert.Equal("copilot/gpt-5.4-mini-late", service.GetOrchestratorInfo().CompactionModel);
+    }
+
     // ── OrchestratorInfo reasoning effort fields ────────────────────────────
 
     /// <summary>

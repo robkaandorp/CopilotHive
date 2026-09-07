@@ -354,7 +354,7 @@ internal sealed class TaskDispatchService
         }
 
         // Propagate compaction model to the worker so it creates a separate IChatClient for context compaction.
-        var compactionModel = _config?.Models?.CompactionModel;
+        var compactionModel = _config?.GetCompactionModel();
         if (!string.IsNullOrEmpty(compactionModel))
         {
             var compactionCtx = _config?.TryGetContextWindowForModel(compactionModel);
