@@ -435,7 +435,469 @@ public class ConfigRepoManagerTests : IDisposable
         var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
         var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
 
-        Assert.Same(first, second);
+        // Detached identities: each load returns its own instance and graph (the private
+        // cache is never aliased to callers)...
+        Assert.NotSame(first, second);
+        Assert.NotSame(first.Repositories, second.Repositories);
+        Assert.NotSame(first.Repositories[0], second.Repositories[0]);
+        // ...with equal cached values.
+        Assert.Equal(first.Version, second.Version);
+        Assert.Equal(first.Repositories[0].Name, second.Repositories[0].Name);
+        Assert.Equal(first.Repositories[0].Url, second.Repositories[0].Url);
+
+        // A cache hit must NOT reparse the YAML: an external disk edit is invisible until
+        // an invalidation (SyncRepoAsync) drops the cache.
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            """
+            version: "2.0"
+            repositories:
+              - name: edited-repo
+                url: https://github.com/test/edited.git
+            """,
+            TestContext.Current.CancellationToken);
+        var third = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("1.0", third.Version);
+        Assert.Equal("cached-repo", third.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/test/cached.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/test/edited.git"));
+    }
+
+    // ── Cache ownership: mutation isolation ──────────────────────────────────
+
+    /// <summary>
+    /// Compact representative disk fixture for cache-ownership regressions: covers
+    /// repositories with a nested release section, workers, orchestrator, the global
+    /// available-model catalog plus the curated sub-agent catalog, and Composer settings
+    /// (including a nested event-notifications list) — one fixture, not a case matrix.
+    /// </summary>
+    private const string RepresentativeConfigYaml = """
+        version: "1.0"
+        repositories:
+          - name: my-app
+            url: https://github.com/org/my-app.git
+            default_branch: develop
+            release:
+              merge_to: main
+              tag_branch: v1
+          - name: bare-repo
+            url: https://github.com/org/bare.git
+        workers:
+          coder:
+            model: coder-model
+            premium_model: coder-premium
+          tester:
+            model: tester-model
+        orchestrator:
+          model: brain-model
+          max_iterations: 7
+        models:
+          compaction_model: compactor
+          available_models:
+            - name: model-a
+              context_window: 200000
+            - name: model-b
+              context_window: 1000
+          sub_agent_models:
+            - name: sub-1
+              context_window: 500
+        composer:
+          model: composer-model
+          max_steps: 7
+          event_notifications:
+            mode: active
+            active_events:
+              - goal_completed
+              - ci_failed
+            throttle_seconds: 45
+        """;
+
+    /// <summary>
+    /// A caller mutating a returned config — every reachable collection, entry, and nested
+    /// section — must not affect another load of the SAME cached generation, nor the cached
+    /// allow-list membership.
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_MutatingReturnedConfig_DoesNotAffectCachedGeneration()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            RepresentativeConfigYaml,
+            TestContext.Current.CancellationToken);
+
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.True(first.IsConfigured);
+
+        // Mutate everything reachable on the returned copy.
+        first.Repositories[0].Url = "https://github.com/evil/mutated.git";
+        first.Repositories[0].Release!.MergeTo = "evil";
+        first.Repositories[0].Release!.TagBranch = "evil";
+        first.Repositories[1].Url = "https://github.com/evil/bare.git";
+        first.Workers["coder"].Model = "evil";
+        first.Workers["coder"].PremiumModel = "evil";
+        first.Orchestrator.Model = "evil";
+        first.Models!.CompactionModel = "evil";
+        first.Models!.AvailableModels![0].Name = "evil";
+        first.Models!.AvailableModels![1].ContextWindow = -999;
+        first.Models!.SubAgentModels![0].Name = "evil";
+        first.Composer!.Model = "evil";
+        first.Composer!.EventNotifications!.ActiveEvents!.Clear();
+        first.Composer!.EventNotifications!.ThrottleSeconds = -1;
+
+        // Another load of the SAME cached generation is unaffected.
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.NotSame(first, second);
+        Assert.Equal("1.0", second.Version);
+        Assert.Equal("my-app", second.Repositories[0].Name);
+        Assert.Equal("https://github.com/org/my-app.git", second.Repositories[0].Url);
+        Assert.Equal("main", second.Repositories[0].Release!.MergeTo);
+        Assert.Equal("v1", second.Repositories[0].Release!.TagBranch);
+        Assert.Equal("https://github.com/org/bare.git", second.Repositories[1].Url);
+        Assert.Equal("coder-model", second.Workers["coder"].Model);
+        Assert.Equal("coder-premium", second.Workers["coder"].PremiumModel);
+        Assert.Equal("brain-model", second.Orchestrator.Model);
+        Assert.Equal("compactor", second.Models!.CompactionModel);
+        Assert.Equal("model-a", second.Models!.AvailableModels![0].Name);
+        Assert.Equal(200000, second.Models!.AvailableModels![0].ContextWindow);
+        Assert.Equal("model-b", second.Models!.AvailableModels![1].Name);
+        Assert.Equal(1000, second.Models!.AvailableModels![1].ContextWindow);
+        Assert.Equal("sub-1", second.Models!.SubAgentModels![0].Name);
+        Assert.Equal(500, second.Models!.SubAgentModels![0].ContextWindow);
+        Assert.Equal("composer-model", second.Composer!.Model);
+        Assert.Equal(
+            ["goal_completed", "ci_failed"],
+            second.Composer!.EventNotifications!.ActiveEvents);
+        Assert.Equal(45, second.Composer!.EventNotifications!.ThrottleSeconds);
+
+        // Mutate collection containers and entries on a CACHE-HIT return too, then prove a
+        // third load of the same generation remains detached and complete.
+        second.Repositories.Clear();
+        second.Workers.Clear();
+        second.Orchestrator.Model = "cache-hit-mutated";
+        second.Models!.AvailableModels!.Clear();
+        second.Models!.SubAgentModels![0].ContextWindow = -1;
+        second.Composer!.EventNotifications!.ActiveEvents!.Clear();
+
+        var third = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(2, third.Repositories.Count);
+        Assert.Equal("my-app", third.Repositories[0].Name);
+        Assert.Equal("coder-model", third.Workers["coder"].Model);
+        Assert.Equal("brain-model", third.Orchestrator.Model);
+        Assert.Equal(["model-a", "model-b"], third.Models!.AvailableModels!.Select(m => m.Name));
+        Assert.Equal(500, third.Models!.SubAgentModels![0].ContextWindow);
+        Assert.Equal(
+            ["goal_completed", "ci_failed"],
+            third.Composer!.EventNotifications!.ActiveEvents);
+
+        // Cached allow-list membership is unchanged by either mutated copy.
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/my-app.git"));
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/bare.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/evil/mutated.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/evil/bare.git"));
+    }
+
+    /// <summary>
+    /// After a successful write, mutating the ORIGINAL input must not affect subsequent
+    /// loads, the persisted disk content, or the allow-list membership — all stay at the
+    /// written state.
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_MutatingInputAfterWrite_DoesNotChangeCacheOrDisk()
+    {
+        var config = new HiveConfigFile
+        {
+            Version = "1.0",
+            Repositories =
+            [
+                new RepositoryConfig
+                {
+                    Name = "written-repo",
+                    Url = "https://github.com/org/written.git",
+                    Release = new ReleaseRepoConfig { MergeTo = "main", TagBranch = "v1" }
+                }
+            ],
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new() { Model = "written-coder" }
+            },
+            Orchestrator = new OrchestratorConfig { Model = "written-brain" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "written-model", ContextWindow = 123 }]
+            },
+            Composer = new ComposerConfig { Model = "written-composer" }
+        };
+
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+
+        // Mutate the original input after the write succeeded.
+        config.Repositories[0].Url = "https://github.com/evil/mutated.git";
+        config.Repositories[0].Release!.MergeTo = "evil";
+        config.Workers["coder"].Model = "evil";
+        config.Orchestrator.Model = "evil";
+        config.Models!.AvailableModels![0].Name = "evil";
+        config.Composer!.Model = "evil";
+
+        // Subsequent loads stay at the written state.
+        var loaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("written-brain", loaded.Orchestrator.Model);
+        Assert.Equal("https://github.com/org/written.git", loaded.Repositories[0].Url);
+        Assert.Equal("main", loaded.Repositories[0].Release!.MergeTo);
+        Assert.Equal("written-coder", loaded.Workers["coder"].Model);
+        Assert.Equal("written-model", loaded.Models!.AvailableModels![0].Name);
+        Assert.Equal(123, loaded.Models!.AvailableModels![0].ContextWindow);
+        Assert.Equal("written-composer", loaded.Composer!.Model);
+
+        // Disk content is at the written state too.
+        var disk = await ReadWrittenYamlAsync(manager);
+        var parsed = ConfigRepoManager.ParseConfig(disk);
+        Assert.Equal("written-brain", parsed.Orchestrator.Model);
+        Assert.Equal("https://github.com/org/written.git", parsed.Repositories[0].Url);
+
+        // Allow-list membership is at the written state.
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/written.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/evil/mutated.git"));
+
+        // A returned copy from the post-write cache is detached too.
+        loaded.Repositories.Clear();
+        loaded.Workers.Clear();
+        loaded.Models!.AvailableModels!.Clear();
+        var reloaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Single(reloaded.Repositories);
+        Assert.Equal("https://github.com/org/written.git", reloaded.Repositories[0].Url);
+        Assert.Equal("written-coder", reloaded.Workers["coder"].Model);
+        Assert.Equal("written-model", Assert.Single(reloaded.Models!.AvailableModels!).Name);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/written.git"));
+    }
+
+    /// <summary>
+    /// Null/missing sections and runtime nulls survive the detached copy on BOTH the disk
+    /// load path and repeated cache-hit loads.
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_NullAndMissingSections_SurviveTheCopy()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            """
+            version: "1.0"
+            repositories:
+              - name: only-repo
+                url: https://github.com/org/only.git
+            """,
+            TestContext.Current.CancellationToken);
+
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Null(first.Models);
+        Assert.Null(first.Composer);
+        Assert.Null(first.Repositories[0].Release);
+        Assert.True(first.IsConfigured);
+
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Null(second.Models);
+        Assert.Null(second.Composer);
+        Assert.Null(second.Repositories[0].Release);
+        Assert.True(second.IsConfigured);
+
+        // Runtime nulls on nominally non-null top-level members and nested catalog lists are
+        // preserved by the post-write cache materialization as well.
+        var runtimeNulls = new HiveConfigFile
+        {
+            Version = null!,
+            Repositories = null!,
+            Workers = null!,
+            Orchestrator = null!,
+            Models = new ModelsConfig { AvailableModels = null, SubAgentModels = null },
+            Composer = null,
+            IsConfigured = false
+        };
+        await manager.WriteConfigAsync(runtimeNulls, TestContext.Current.CancellationToken);
+
+        var postWrite = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Null(postWrite.Version);
+        Assert.Null(postWrite.Repositories);
+        Assert.Null(postWrite.Workers);
+        Assert.Null(postWrite.Orchestrator);
+        Assert.NotNull(postWrite.Models);
+        Assert.Null(postWrite.Models.AvailableModels);
+        Assert.Null(postWrite.Models.SubAgentModels);
+        Assert.Null(postWrite.Composer);
+        Assert.False(postWrite.IsConfigured);
+    }
+
+    /// <summary>
+    /// Post-write cached values preserve the CALLER's raw fields — including raw blank
+    /// model values (no ParseConfig re-normalization) and IsConfigured both true and false.
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_CachesRawCallerValues_IncludingBlankModelsAndIsConfigured()
+    {
+        var configured = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "   " },
+            Workers = new Dictionary<string, WorkerConfig>
+            {
+                ["coder"] = new() { Model = "\t" }
+            },
+            IsConfigured = true
+        };
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        await manager.WriteConfigAsync(configured, TestContext.Current.CancellationToken);
+
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.True(first.IsConfigured);
+        Assert.Equal("   ", first.Orchestrator.Model);
+        Assert.Equal("\t", first.Workers["coder"].Model);
+
+        // IsConfigured = false is preserved explicitly from the caller too.
+        var unconfigured = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig { Model = "raw-model" }
+        };
+        await manager.WriteConfigAsync(unconfigured, TestContext.Current.CancellationToken);
+
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.False(second.IsConfigured);
+        Assert.Equal("raw-model", second.Orchestrator.Model);
+    }
+
+    // ── Cache refresh semantics (sync invalidation, failed retention) ────────
+
+    /// <summary>
+    /// A successful sync invalidates the cache: allow-list membership is DENIED in the
+    /// temporary unloaded window, the next load reads the FRESH disk content, and the new
+    /// generation is detached from the previous one.
+    /// </summary>
+    [Fact]
+    public async Task SyncRepoAsync_Success_InvalidatesCache_AndDeniesUntilReload()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            """
+            version: "1.0"
+            repositories:
+              - name: old-repo
+                url: https://github.com/org/old.git
+            """,
+            TestContext.Current.CancellationToken);
+
+        // A .git directory routes SyncRepoAsync through the pull path; the GitRunner seam
+        // stubs the git invocation (no real network, no credentials).
+        Directory.CreateDirectory(Path.Combine(_tempDir, ".git"));
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir)
+        {
+            GitRunner = (_, _, _) => Task.FromResult(new ConfigRepoManager.GitRunResult(0, "", ""))
+        };
+
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/old.git"));
+
+        // The remote "pulled" newer disk content.
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            """
+            version: "2.0"
+            repositories:
+              - name: new-repo
+                url: https://github.com/org/new.git
+            """,
+            TestContext.Current.CancellationToken);
+
+        await manager.SyncRepoAsync(TestContext.Current.CancellationToken);
+
+        // Temporary unloaded-denial window: the cache was invalidated, so membership is
+        // denied until the next load repopulates it.
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/old.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/new.git"));
+
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.NotSame(first, second);
+        Assert.Equal("2.0", second.Version);
+        Assert.Equal("new-repo", second.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/new.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/old.git"));
+    }
+
+    /// <summary>
+    /// A failed sync retains the existing cache: membership and loads keep serving the
+    /// previously cached generation.
+    /// </summary>
+    [Fact]
+    public async Task SyncRepoAsync_Failure_RetainsExistingCache()
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"),
+            """
+            version: "1.0"
+            repositories:
+              - name: retained-repo
+                url: https://github.com/org/retained.git
+            """,
+            TestContext.Current.CancellationToken);
+
+        Directory.CreateDirectory(Path.Combine(_tempDir, ".git"));
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir)
+        {
+            // Every git invocation fails (exit 1) — the pull fails, the best-effort
+            // merge --abort fails too, and SyncRepoAsync rethrows.
+            GitRunner = (_, _, _) => Task.FromResult(new ConfigRepoManager.GitRunResult(1, "", "boom"))
+        };
+
+        var first = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/retained.git"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.SyncRepoAsync(TestContext.Current.CancellationToken));
+
+        // Failed-sync retention: the cache is still loaded and serving the old generation.
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/retained.git"));
+        var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("retained-repo", second.Repositories[0].Name);
+        Assert.NotSame(first.Repositories, second.Repositories);
+    }
+
+    /// <summary>
+    /// A failed (here: directory-missing) write must not replace an existing cache — the
+    /// previously cached generation keeps serving loads and allow-list membership.
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_FailedWrite_RetainsExistingCache()
+    {
+        var configDir = Path.Combine(_tempDir, "cfg");
+        Directory.CreateDirectory(configDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(configDir, "hive-config.yaml"),
+            """
+            version: "1.0"
+            repositories:
+              - name: kept-repo
+                url: https://github.com/org/kept.git
+            """,
+            TestContext.Current.CancellationToken);
+
+        var manager = new ConfigRepoManager("https://example.com/config.git", configDir);
+        _ = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/kept.git"));
+
+        // Remove the directory so the write's File.WriteAllTextAsync fails.
+        Directory.Delete(configDir, recursive: true);
+
+        await Assert.ThrowsAsync<DirectoryNotFoundException>(
+            () => manager.WriteConfigAsync(
+                new HiveConfigFile
+                {
+                    Repositories = [new RepositoryConfig { Name = "evil", Url = "https://github.com/org/evil.git" }]
+                },
+                TestContext.Current.CancellationToken));
+
+        // Failed-write retention: the old cache is untouched.
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/kept.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/evil.git"));
+        var loaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("kept-repo", loaded.Repositories[0].Name);
     }
 
     // ── WriteConfigAsync tests ────────────────────────────────────────────────

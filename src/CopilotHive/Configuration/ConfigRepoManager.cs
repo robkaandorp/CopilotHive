@@ -258,20 +258,51 @@ public class ConfigRepoManager
 
     /// <summary>
     /// Loads and parses hive-config.yaml from the config repo root.
+    /// <para>
+    /// <b>Cache ownership.</b> The parsed config is cached privately; every call — cache hit
+    /// or miss — returns a DETACHED deep copy of the cached graph (via
+    /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/>), so a caller mutating a returned
+    /// instance can never corrupt the cache, and <see cref="IsRepositoryAllowed"/> membership
+    /// stays stable until the cache is explicitly replaced. Disk is read ONLY on a cache miss;
+    /// a cache hit never reparses the YAML. Runtime nulls (null/missing sections) survive the
+    /// copy, and <see cref="HiveConfigFile.IsConfigured"/> is carried over explicitly.
+    /// </para>
     /// </summary>
     public async Task<HiveConfigFile> LoadConfigAsync(CancellationToken ct = default)
     {
-        if (_cachedConfig is not null)
-            return _cachedConfig;
+        // One local capture: field reads can straddle invalidation by SyncRepoAsync.
+        var cached = _cachedConfig;
+        if (cached is null)
+        {
+            var configPath = Path.Combine(_localPath, "hive-config.yaml");
+            if (!File.Exists(configPath))
+                throw new FileNotFoundException("Config file not found in config repo.", configPath);
 
-        var configPath = Path.Combine(_localPath, "hive-config.yaml");
-        if (!File.Exists(configPath))
-            throw new FileNotFoundException("Config file not found in config repo.", configPath);
+            var yaml = await File.ReadAllTextAsync(configPath, ct);
+            cached = ParseConfig(yaml);
+            _cachedConfig = cached;
+        }
 
-        var yaml = await File.ReadAllTextAsync(configPath, ct);
-        _cachedConfig = ParseConfig(yaml);
-        return _cachedConfig;
+        return MaterializeDetached(cached.CaptureConfigSnapshot(), cached.IsConfigured);
     }
+
+    /// <summary>
+    /// Materializes a detached <see cref="HiveConfigFile"/> from an ALREADY-DETACHED
+    /// <see cref="HiveConfigSnapshot"/> by transferring the snapshot's top-level properties and
+    /// setting <see cref="HiveConfigFile.IsConfigured"/> explicitly from the caller's value
+    /// (the snapshot deliberately excludes it). This is the single materialization helper for
+    /// both cache-fill paths — no second cloner, no serialization round-trip.
+    /// </summary>
+    private static HiveConfigFile MaterializeDetached(HiveConfigSnapshot snapshot, bool isConfigured) => new()
+    {
+        Version = snapshot.Version!,
+        Repositories = snapshot.Repositories!,
+        Workers = snapshot.Workers!,
+        Orchestrator = snapshot.Orchestrator!,
+        Models = snapshot.Models,
+        Composer = snapshot.Composer,
+        IsConfigured = isConfigured
+    };
 
     /// <summary>
     /// Parses a YAML string into a <see cref="HiveConfigFile"/>.
@@ -354,18 +385,35 @@ public class ConfigRepoManager
     /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/> — never from the live instance — so
     /// synchronized catalog mutations and <see cref="HiveConfigFile.ReloadFrom"/> that interleave
     /// with the serializer's traversal cannot tear the written file. The snapshot is coherent
-    /// relative to participating synchronized writers only; the in-memory cache is updated with
-    /// the ORIGINAL <paramref name="config"/> instance after a successful write.
+    /// relative to participating synchronized writers only.
+    /// </para>
+    /// <para>
+    /// <b>Cache ownership.</b> That SAME single snapshot is reused as the post-write cache
+    /// (materialized detached, with <see cref="HiveConfigFile.IsConfigured"/> carried over
+    /// explicitly — the snapshot excludes it), so the cache never aliases the caller's mutable
+    /// object graph and the serialized bytes and cached values cannot diverge. The new graph is
+    /// built BEFORE publication; the cache field is replaced only AFTER the file write
+    /// succeeds — a failed or cancelled write never replaces an existing cache, and the
+    /// live config is never re-read after the await.
     /// </para>
     /// </summary>
     /// <param name="config">The updated configuration to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task WriteConfigAsync(HiveConfigFile config, CancellationToken ct = default)
     {
-        var yaml = YamlSerializer.Serialize(config.CaptureConfigSnapshot());
+        // ONE snapshot: serialized to YAML AND used as the post-write cache — the written
+        // bytes and the cached values are the same detached generation by construction.
+        // IsConfigured is not part of the snapshot; it is carried explicitly from the caller.
+        var snapshot = config.CaptureConfigSnapshot();
+        var cached = MaterializeDetached(snapshot, config.IsConfigured);
+
+        var yaml = YamlSerializer.Serialize(snapshot);
         var configPath = Path.Combine(_localPath, "hive-config.yaml");
         await File.WriteAllTextAsync(configPath, yaml, ct);
-        _cachedConfig = config;
+
+        // Publish only after the write succeeded: a failed or cancelled write must never
+        // replace an existing cache.
+        _cachedConfig = cached;
     }
 
     /// <summary>
@@ -384,14 +432,21 @@ public class ConfigRepoManager
     /// <summary>
     /// Checks whether a repository URL is in the allowed list.
     /// Compares normalized URLs (trimmed, case-insensitive, trailing-slash-insensitive).
+    /// <para>
+    /// The cache is read into ONE local reference — a mid-method invalidation by
+    /// <see cref="SyncRepoAsync"/> cannot straddle the null check and the membership scan.
+    /// Because the cache never aliases a caller-owned graph (all publications are detached
+    /// copies), mutating a previously returned config cannot silently change cached membership.
+    /// </para>
     /// </summary>
     public bool IsRepositoryAllowed(string repoUrl)
     {
-        if (_cachedConfig is null)
+        var cached = _cachedConfig;
+        if (cached is null)
             return false;
 
         var normalized = NormalizeUrl(repoUrl);
-        return _cachedConfig.Repositories.Exists(r => NormalizeUrl(r.Url) == normalized);
+        return cached.Repositories.Exists(r => NormalizeUrl(r.Url) == normalized);
     }
 
     /// <summary>
