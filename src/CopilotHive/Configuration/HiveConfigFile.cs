@@ -98,11 +98,18 @@ public sealed class HiveConfigFile
     /// <summary>
     /// Resolves <paramref name="candidate"/> against the GLOBAL <see cref="ModelsConfig.AvailableModels"/>
     /// entry names via <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/>.
+    /// <para>
+    /// The catalog is read as a detached <see cref="GetAvailableModelsSnapshot"/> deep copy instead of
+    /// the live list, so the enumeration cannot observe a concurrent mutation by
+    /// <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs. The enumerable
+    /// overload remains the matching primitive: locking it cannot protect an arbitrary caller-owned
+    /// collection.
+    /// </para>
     /// </summary>
     /// <param name="candidate">The model name to resolve.</param>
     /// <returns>The trimmed canonical name from the global catalog, or <c>null</c>.</returns>
     public string? ResolveAvailableModel(string? candidate) =>
-        ResolveAvailableModel(Models?.AvailableModels?.Select(m => m.Name), candidate);
+        ResolveAvailableModel(GetAvailableModelsSnapshot()?.Select(m => m.Name), candidate);
 
     /// <summary>
     /// Resolves the Composer's default model: <see cref="ComposerConfig.Model"/> normalized against
@@ -111,24 +118,56 @@ public sealed class HiveConfigFile
     /// when unset, absent from the catalog, or no global catalog exists. Delegates to
     /// <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/> — no duplicated matching logic.
     /// </summary>
-    public string? ResolveComposerDefaultModel() => ResolveAvailableModel(Composer?.Model);
+    /// <remarks>
+    /// <see cref="ComposerConfig.Model"/> and the available-model catalog are captured in ONE short
+    /// region of the instance's catalog lock — a single lock region reads them consistently relative
+    /// to <see cref="ReloadFrom(HiveConfigFile)"/>, whose top-level replacement cannot interleave
+    /// between the two reads. The snapshot methods are reentrant on the same lock, so
+    /// <see cref="GetAvailableModelsSnapshot"/> is called inside the region. Matching itself then
+    /// runs outside the lock on the detached capture. This synchronizes ONLY this composer/catalog
+    /// pair — other scalar settings access is not synchronized by this change, and the matching
+    /// itself is not atomic across an entire validation or reload operation.
+    /// </remarks>
+    public string? ResolveComposerDefaultModel()
+    {
+        string? composerModel;
+        IReadOnlyList<ModelEntry>? available;
+        lock (_catalogLock)
+        {
+            composerModel = Composer?.Model;
+            available = GetAvailableModelsSnapshot();
+        }
+
+        return ResolveAvailableModel(available?.Select(m => m.Name), composerModel);
+    }
 
     /// <summary>
     /// Looks up the model in <see cref="ModelsConfig.AvailableModels"/> and returns its
-    /// <see cref="ModelEntry.ContextWindow"/> if set and greater than 0.
+    /// <see cref="ModelEntry.ContextWindow"/> as stored — INCLUDING zero and negative values.
+    /// (Positivity filtering happens in <c>GetContextWindowForRole</c>, not here.)
     /// Name matching routes through <see cref="ResolveAvailableModel(IEnumerable{string}?, string?)"/>:
     /// trim + ordinal-ignore-case, FIRST-wins on normalized duplicates — so a trimmed canonical
     /// model resolves a catalog entry whose stored name carries surrounding whitespace.
     /// </summary>
     /// <param name="modelName">Model identifier to look up.</param>
-    /// <returns>The configured context window, or <c>null</c> if the model is not found or has no value set.</returns>
+    /// <returns>
+    /// The stored context window, or <c>null</c> if the model is not found or has no value set.
+    /// </returns>
+    /// <remarks>
+    /// Canonical-name resolution and the context-window lookup both read the SAME
+    /// <see cref="GetAvailableModelsSnapshot"/> capture: one detached copy taken once, so the two
+    /// steps are internally consistent with respect to concurrent writers using
+    /// <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs — no live re-read
+    /// and no second capture in between.
+    /// </remarks>
     public int? TryGetContextWindowForModel(string? modelName)
     {
-        var canonical = ResolveAvailableModel(modelName);
+        var snapshot = GetAvailableModelsSnapshot();
+        var canonical = ResolveAvailableModel(snapshot?.Select(m => m.Name), modelName);
         if (canonical is null)
             return null;
 
-        var entry = Models?.AvailableModels?.FirstOrDefault(
+        var entry = snapshot?.FirstOrDefault(
             m => string.Equals(m.Name?.Trim(), canonical, StringComparison.OrdinalIgnoreCase));
         return entry?.ContextWindow;
     }
@@ -160,16 +199,22 @@ public sealed class HiveConfigFile
     /// dropped, ordinal-ignore-case duplicates collapsed to the FIRST. There is NO
     /// composer-local fall-through and NO fabricated fallback: an empty global list yields an
     /// empty catalog.
+    /// <para>
+    /// Normalization runs on ONE detached <see cref="GetAvailableModelsSnapshot"/> capture rather
+    /// than the live list, so the result cannot observe a concurrent mutation by
+    /// <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs.
+    /// </para>
     /// </summary>
     /// <returns>The normalized list of selectable model identifiers (possibly empty).</returns>
     public List<string> GetComposerAvailableModels()
     {
         var result = new List<string>();
-        if (Models?.AvailableModels is null)
+        var snapshot = GetAvailableModelsSnapshot();
+        if (snapshot is null)
             return result;
 
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in Models.AvailableModels)
+        foreach (var entry in snapshot)
         {
             var name = entry.Name?.Trim();
             if (string.IsNullOrEmpty(name))
@@ -183,41 +228,68 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Returns the curated sub-agent model list. When <see cref="ModelsConfig.SubAgentModels"/>
-    /// is non-empty, it is returned; otherwise falls back to <see cref="ModelsConfig.AvailableModels"/>.
-    /// Returns an empty list when neither is configured.
+    /// is non-empty, a merged copy of it is returned; otherwise falls back to
+    /// <see cref="ModelsConfig.AvailableModels"/>. Returns an empty list when neither is configured.
     /// </summary>
+    /// <remarks>
+    /// Both catalogs are captured inside ONE shared region of the instance's catalog lock —
+    /// two independently locked snapshots could mix <see cref="ReloadFrom(HiveConfigFile)"/>
+    /// generations — by calling the reentrant <see cref="GetAvailableModelsSnapshot"/> /
+    /// <see cref="GetSubAgentModelsSnapshot"/> inside the region. Fallback/merge then run OUTSIDE
+    /// the lock on the detached entries. The returned entries are always detached deep copies
+    /// (never live <see cref="ModelEntry"/> or list aliases); this helper-return detachment does
+    /// NOT change the <see cref="ModelsConfig"/> property getter/setter semantics, which stay live.
+    /// <para>
+    /// Merge semantics (curated path, matching the live-catalog behavior it replaces): available
+    /// names are indexed LAST-wins by case-insensitive name WITHOUT trimming; curated order and
+    /// names are preserved as stored (including null/whitespace names); <see cref="ModelEntry.ContextWindow"/>,
+    /// <see cref="ModelEntry.Description"/> and <see cref="ModelEntry.SupportsVision"/> are inherited
+    /// ONLY when the curated value is null (explicit empty strings, zero/negative and explicit-false
+    /// values are preserved as stored); <see cref="ModelEntry.ReasoningEffort"/> is NEVER inherited
+    /// from the available catalog — it is an explicit per-entry assignment on sub_agent_models.
+    /// </para>
+    /// </remarks>
     public IReadOnlyList<ModelEntry> GetSubAgentModels()
     {
-        if (Models?.SubAgentModels is not { Count: > 0 })
+        IReadOnlyList<ModelEntry>? available;
+        IReadOnlyList<ModelEntry>? curated;
+        lock (_catalogLock)
         {
-            if (Models?.AvailableModels is { Count: > 0 } available)
+            available = GetAvailableModelsSnapshot();
+            curated = GetSubAgentModelsSnapshot();
+        }
+
+        if (curated is not { Count: > 0 })
+        {
+            // Detached clones from the available snapshot — never live aliases.
+            if (available is { Count: > 0 })
                 return available;
             return [];
         }
 
-        var curated = Models.SubAgentModels;
-        // Last-wins by name (case-insensitive): duplicate names in available_models must
-        // not crash the merge path.
+        // Last-wins by name (case-insensitive, no trimming — matching semantics on this path
+        // differ from the resolver): duplicate names in available_models must not crash the
+        // merge path.
         var availableByName = new Dictionary<string, ModelEntry>(StringComparer.OrdinalIgnoreCase);
-        if (Models.AvailableModels is { Count: > 0 } availableModels)
+        if (available is { Count: > 0 })
         {
-            foreach (var a in availableModels)
+            foreach (var a in available)
                 availableByName[a.Name] = a;
         }
 
         List<ModelEntry> merged = new(curated.Count);
         foreach (var entry in curated)
         {
-            var available = availableByName.GetValueOrDefault(entry.Name);
+            var availableEntry = availableByName.GetValueOrDefault(entry.Name);
             merged.Add(new ModelEntry
             {
                 Name = entry.Name,
-                ContextWindow = entry.ContextWindow ?? available?.ContextWindow,
+                ContextWindow = entry.ContextWindow ?? availableEntry?.ContextWindow,
                 // Reasoning effort is never inherited from available_models — it is an
                 // explicit per-entry assignment on sub_agent_models.
                 ReasoningEffort = entry.ReasoningEffort,
-                Description = entry.Description ?? available?.Description,
-                SupportsVision = entry.SupportsVision ?? available?.SupportsVision
+                Description = entry.Description ?? availableEntry?.Description,
+                SupportsVision = entry.SupportsVision ?? availableEntry?.SupportsVision
             });
         }
 
@@ -282,10 +354,16 @@ public sealed class HiveConfigFile
         // composer.reasoning_effort is required ONLY when the composer's model resolves to a
         // valid effective default in the global available_models catalog. A set-but-absent
         // composer.model ⇒ no effective default ⇒ reasoning_effort NOT required.
+        // ResolveComposerDefaultModel reads Composer.Model and the catalog in one synchronized
+        // catalog-lock region; the rest of this validation is not claimed atomic.
         if (Composer is not null && ResolveComposerDefaultModel() is not null)
             Check(Composer.ReasoningEffort, "composer.reasoning_effort");
 
-        if (Models?.SubAgentModels is { Count: > 0 } subAgentModels)
+        // Iterate a detached snapshot instead of the live curated list: the enumeration cannot
+        // observe a concurrent mutation by ReloadFrom or the synchronized catalog APIs. Snapshot
+        // indices preserve list positions (including null entries), so the original
+        // models.sub_agent_models[N] numbering is reported unchanged.
+        if (GetSubAgentModelsSnapshot() is { Count: > 0 } subAgentModels)
         {
             for (var i = 0; i < subAgentModels.Count; i++)
             {

@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 
 using CopilotHive.Configuration;
 using CopilotHive.Services;
@@ -1366,5 +1368,618 @@ public sealed class HiveConfigFileCatalogSafetyTests
         Assert.Null(target.Orchestrator);
         Assert.Null(target.Workers);
         Assert.Null(target.Repositories);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Reader migration (checkpoint 2): paired-catalog and composer locked-pair
+    // consistency across ReloadFrom
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The paired-catalog capture in <see cref="HiveConfigFile.GetSubAgentModels"/> (available +
+    /// curated in ONE catalog-lock region) yields internally consistent observations across a
+    /// <see cref="HiveConfigFile.ReloadFrom"/>: a result taken before the reload stays stable and
+    /// self-consistent (merge fields all from the SAME generation), while the next call reflects
+    /// the reloaded catalogs — proving the two catalogs cannot mix reload generations.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_ReloadBetweenCalls_GenerationsDoNotMix()
+    {
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        target.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [MakeEntry("m", 100, description: "gen1-desc")],
+                SubAgentModels = [MakeEntry("m", null, reasoningEffort: "low")]
+            }
+        });
+
+        var before = Assert.Single(target.GetSubAgentModels());
+        Assert.Equal(100, before.ContextWindow);
+        Assert.Equal("gen1-desc", before.Description);
+        Assert.Equal("low", before.ReasoningEffort);
+
+        // Reload to a completely different generation (different available + curated catalogs).
+        target.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [MakeEntry("m", 200, description: "gen2-desc")],
+                SubAgentModels = [MakeEntry("m", 250, reasoningEffort: "high")]
+            }
+        });
+
+        // The prior result is a frozen generation: unchanged despite the reload.
+        Assert.Equal(100, before.ContextWindow);
+        Assert.Equal("gen1-desc", before.Description);
+        Assert.Equal("low", before.ReasoningEffort);
+
+        // The next observation is fully from the NEW generation — no mixed fields.
+        var after = Assert.Single(target.GetSubAgentModels());
+        Assert.Equal(250, after.ContextWindow);   // curated value wins (not available's 200)
+        Assert.Equal("high", after.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.ResolveComposerDefaultModel"/> reads <c>Composer.Model</c> and the
+    /// available catalog in one catalog-lock region: a reload replacing BOTH top-level sections
+    /// cannot interleave between the composer-model read and the catalog read. A result captured
+    /// before the reload stays null/stable per the old generation, and the next call resolves
+    /// against the new generation's composer model and catalog.
+    /// </summary>
+    [Fact]
+    public void ResolveComposerDefaultModel_ReloadOfComposerAndCatalog_PairsStayConsistent()
+    {
+        var target = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        target.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "gen1-model" },
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("gen1-model")] }
+        });
+
+        var before = target.ResolveComposerDefaultModel();
+        Assert.Equal("gen1-model", before);
+
+        // New generation: composer model AND catalog change together.
+        target.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "gen2-model" },
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("gen2-model")] }
+        });
+
+        // The next resolution is consistent with the NEW generation on BOTH sides: the composer
+        // model resolves against the reloaded catalog (not the previous one).
+        Assert.Equal("gen2-model", target.ResolveComposerDefaultModel());
+
+        // And a mismatched generation would NOT resolve: absent composer model ⇒ null.
+        target.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "gen1-model" },
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("gen2-model")] }
+        });
+        Assert.Null(target.ResolveComposerDefaultModel());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Reader migration (checkpoint 2): bounded reader/locked-writer proofs
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The reflection-based handle for the instance's catalog monitor, resolved once and reused.
+    /// This is test-only access to a private field; if the field is renamed/removed the test
+    /// fails at setup rather than silently passing.
+    /// </summary>
+    private static readonly FieldInfo CatalogLockField = typeof(HiveConfigFile)
+        .GetField("_catalogLock", BindingFlags.NonPublic | BindingFlags.Instance)
+        ?? throw new InvalidOperationException("HiveConfigFile._catalogLock field not found — test setup is stale.");
+
+    /// <summary>
+    /// Bound for the must-SUCCEED observation that a started thread actually reached the catalog
+    /// monitor and is blocked on it. Exceeding the bound FAILS the test (it is not a
+    /// "still running after N ms therefore blocked" proof — the observation itself is positive
+    /// and state-based, and a reader that completes without contending fails immediately).
+    /// </summary>
+    private static readonly TimeSpan ContentionObservationBound = TimeSpan.FromSeconds(30);
+
+    /// <summary>Bound for every thread join/drain, including on the failure path.</summary>
+    private static readonly TimeSpan ThreadJoinBound = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// A dedicated synchronous thread whose body cannot escape an exception into the runtime:
+    /// faults are captured and marshaled back to the test thread via
+    /// <see cref="ThrowIfFaulted"/> after a bounded join. Also exposes the bounded, positive
+    /// "is actually blocked on a monitor" observation used by the contention tests.
+    /// </summary>
+    private sealed class CapturedThread
+    {
+        private readonly Thread _thread;
+        private readonly ManualResetEventSlim _done = new(false);
+        private Exception? _fault;
+
+        public CapturedThread(string name, Action body)
+        {
+            _thread = new Thread(() =>
+            {
+                try
+                {
+                    body();
+                }
+                catch (Exception ex)
+                {
+                    // Captured, never rethrown on this thread: an unhandled thread exception
+                    // would tear down the whole test process.
+                    _fault = ex;
+                }
+                finally
+                {
+                    _done.Set();
+                }
+            })
+            {
+                IsBackground = true,
+                Name = name
+            };
+        }
+
+        /// <summary>Whether <see cref="Start"/> succeeded (a non-started thread must not be joined).</summary>
+        public bool Started { get; private set; }
+
+        public void Start()
+        {
+            _thread.Start();
+            Started = true;
+        }
+
+        /// <summary>
+        /// Bounded POSITIVE observation of actual monitor contention: waits until the thread is
+        /// observed in <see cref="System.Threading.ThreadState.WaitSleepJoin"/> — the state the
+        /// CLR assigns to a thread blocked inside <c>Monitor.Enter</c>. The exercised reader/writer
+        /// paths contain no other blocking construct, so this state can only mean the thread
+        /// reached the catalog monitor. Returns <c>null</c> when contention was observed, otherwise
+        /// a failure reason: completing without ever blocking (the lock-removal regression) fails
+        /// immediately rather than after a fixed duration.
+        /// </summary>
+        public string? WaitUntilBlockedOnMonitor(TimeSpan bound)
+        {
+            var deadline = Environment.TickCount64 + (long)bound.TotalMilliseconds;
+            while (Environment.TickCount64 < deadline)
+            {
+                if (_done.IsSet)
+                    return $"Thread '{_thread.Name}' COMPLETED while the catalog monitor was held — it never contended for _catalogLock.";
+
+                if ((_thread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0)
+                    return null;   // observed actually blocked on the monitor
+
+                Thread.Yield();
+            }
+
+            return $"Thread '{_thread.Name}' was never observed blocked on the catalog monitor within {bound}.";
+        }
+
+        /// <summary>Bounded join; a never-started thread counts as drained.</summary>
+        public bool JoinBounded(TimeSpan bound) => !Started || _thread.Join(bound);
+
+        /// <summary>Rethrows a captured body exception on the calling (test) thread, preserving its stack.</summary>
+        public void ThrowIfFaulted()
+        {
+            if (_fault is not null)
+                ExceptionDispatchInfo.Capture(_fault).Throw();
+        }
+
+        /// <summary>
+        /// Releases the completion event only once the body is provably done with it — never
+        /// while a thread that timed out its join could still signal a disposed event.
+        /// </summary>
+        public void DisposeIfCompleted()
+        {
+            if (_done.IsSet)
+                _done.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Shared bounded contention scenario for a single migrated reader.
+    /// <para>
+    /// Evidence chain (no fixed-duration non-completion assertion anywhere):
+    /// (1) the test thread ENTERS the instance's catalog monitor;
+    /// (2) a dedicated synchronous reader thread starts and is POSITIVELY observed blocked on
+    /// that monitor (a reader that does not take the lock completes instead and fails the check);
+    /// (3) while the reader is provably parked at the monitor, a synchronized writer commits a
+    /// distinguishing change BEHIND it (reentrant on the held monitor);
+    /// (4) the monitor is released and the reader's own returned value — its post-acquisition
+    /// effect — must reflect the change committed behind it, which is only possible if the reader
+    /// read the catalog after acquiring the monitor.
+    /// </para>
+    /// Monitor entry and thread start happen inside the protected region; the monitor is released
+    /// and the thread is boundedly joined in <c>finally</c> even when an assertion or setup fails.
+    /// </summary>
+    private static T AssertReaderBlocksOnCatalogMonitor<T>(
+        HiveConfigFile config, Func<T> reader, Action commitBehindBlockedReader)
+    {
+        var monitor = CatalogLockField.GetValue(config)!;
+        Assert.Same(monitor, CatalogLockField.GetValue(config));
+
+        T observed = default!;
+        var readerThread = new CapturedThread("catalog-monitor-reader", () => observed = reader());
+
+        string? contentionFailure = null;
+        var committed = false;
+        var monitorEntered = false;
+        bool joined;
+        try
+        {
+            Monitor.Enter(monitor);
+            monitorEntered = true;
+            readerThread.Start();
+
+            contentionFailure = readerThread.WaitUntilBlockedOnMonitor(ContentionObservationBound);
+            if (contentionFailure is null)
+            {
+                // Committed while the reader is parked at the monitor: the reader can only see
+                // this state by acquiring the monitor AFTER this write.
+                commitBehindBlockedReader();
+                committed = true;
+            }
+        }
+        finally
+        {
+            if (monitorEntered && Monitor.IsEntered(monitor))
+                Monitor.Exit(monitor);
+
+            joined = readerThread.JoinBounded(ThreadJoinBound);
+            readerThread.DisposeIfCompleted();
+        }
+
+        // Establish termination first, then marshal any body fault BEFORE the contention/value
+        // assertions. Otherwise a generic "completed without contending" assertion could mask the
+        // reader's real exception instead of reporting it on the test thread.
+        Assert.True(joined, "Reader thread did not finish within its join bound after the monitor was released.");
+        readerThread.ThrowIfFaulted();
+        Assert.True(contentionFailure is null, contentionFailure);
+        Assert.True(committed, "The distinguishing write behind the blocked reader was never committed.");
+        return observed;
+    }
+
+    /// <summary>
+    /// Bounded reader/locked-writer proof for <see cref="HiveConfigFile.TryGetContextWindowForModel"/>.
+    /// The reader is positively observed BLOCKED on the instance's <c>_catalogLock</c> monitor,
+    /// a synchronized writer then commits a new context window behind it, and the reader's own
+    /// returned value must be the post-commit one — a post-acquisition observation, not a
+    /// fixed-duration non-completion proxy.
+    /// </summary>
+    [Fact]
+    public void TryGetContextWindowForModel_ReaderWaitsForHeldCatalogMonitor()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("m", 42)] }
+        };
+
+        var observed = AssertReaderBlocksOnCatalogMonitor(
+            config,
+            () => config.TryGetContextWindowForModel("m"),
+            () => Assert.True(config.TryUpdateAvailableModel("m", new AvailableModelRequest("ignored", 99, null, null))));
+
+        // 42 was the value at the moment the reader was started and blocked; 99 was committed
+        // behind it. Observing 99 proves the read happened after acquiring the monitor.
+        Assert.Equal(99, observed);
+    }
+
+    /// <summary>
+    /// Same bounded contention proof for <see cref="HiveConfigFile.GetSubAgentModels"/> on the
+    /// AVAILABLE-ONLY fallback path (curated absent): the reader is observed blocked on the
+    /// monitor, a synchronized writer commits new entry fields behind it, and the reader's
+    /// detached result carries the post-commit values on every field.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_AvailableOnlyFallback_ReaderWaitsForHeldCatalogMonitor()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("m", 10, description: "pre", supportsVision: true)] }
+        };
+
+        var observed = AssertReaderBlocksOnCatalogMonitor(
+            config,
+            config.GetSubAgentModels,
+            () => Assert.True(config.TryUpdateAvailableModel("m", new AvailableModelRequest("ignored", 20, "post", false))));
+
+        var entry = Assert.Single(observed);
+        Assert.Equal(new EntryTuple("m", 20, null, "post", false), TupleOf(entry));
+    }
+
+    /// <summary>
+    /// Same bounded contention proof for <see cref="HiveConfigFile.ResolveComposerDefaultModel"/>:
+    /// the composer model is initially ABSENT from the catalog (resolution would be <c>null</c>),
+    /// and the entry is added by a synchronized writer only while the reader is provably parked
+    /// at the monitor. A non-null resolution is therefore only possible post-acquisition.
+    /// </summary>
+    [Fact]
+    public void ResolveComposerDefaultModel_ReaderWaitsForHeldCatalogMonitor()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "m" },
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("other", 1)] }
+        };
+
+        // Pre-condition: before the contention window the composer model does NOT resolve.
+        Assert.Null(config.ResolveComposerDefaultModel());
+
+        var observed = AssertReaderBlocksOnCatalogMonitor(
+            config,
+            config.ResolveComposerDefaultModel,
+            () => Assert.True(config.TryAddAvailableModel(new AvailableModelRequest("m", 100, null, null))));
+
+        Assert.Equal("m", observed);
+    }
+
+    /// <summary>
+    /// Reader AND synchronized writer both gated through the same monitor: both dedicated threads
+    /// are POSITIVELY observed blocked on the instance's <c>_catalogLock</c> while the test holds
+    /// it, then the monitor is released. The writer's commit succeeds under the lock, and the
+    /// reader's result must be an internally consistent WHOLE observation (pre- or post-commit
+    /// generation — never torn, never a stale live alias); after the release the two threads race
+    /// legitimately, so ordering is not asserted. All monitors released and BOTH threads joined
+    /// boundedly in <c>finally</c>, with thread faults marshaled back to the test thread.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_ReaderObservesWriterChangeCommittedUnderMonitor()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [MakeEntry("m", 1)] }
+        };
+
+        var monitor = CatalogLockField.GetValue(config)!;
+
+        IReadOnlyList<ModelEntry>? observed = null;
+        var writerSucceeded = false;
+
+        var readerThread = new CapturedThread("catalog-monitor-reader", () => observed = config.GetSubAgentModels());
+        // The writer MUST run on its own thread: the synchronized APIs re-enter the SAME monitor,
+        // so a write from the test thread (which holds it) is reentrant and could not be gated.
+        var writerThread = new CapturedThread(
+            "catalog-monitor-writer",
+            () => writerSucceeded = config.TryUpdateAvailableModel("m", new AvailableModelRequest("ignored", 2, "post", null)));
+
+        string? readerContentionFailure = null;
+        string? writerContentionFailure = null;
+        var monitorEntered = false;
+        bool readerJoined;
+        bool writerJoined;
+        try
+        {
+            Monitor.Enter(monitor);
+            monitorEntered = true;
+
+            readerThread.Start();
+            writerThread.Start();
+
+            // Positive, bounded observation that BOTH threads actually reached the monitor.
+            readerContentionFailure = readerThread.WaitUntilBlockedOnMonitor(ContentionObservationBound);
+            writerContentionFailure = writerThread.WaitUntilBlockedOnMonitor(ContentionObservationBound);
+        }
+        finally
+        {
+            if (monitorEntered && Monitor.IsEntered(monitor))
+                Monitor.Exit(monitor);
+
+            // Drain BOTH started threads even when the observations above failed.
+            readerJoined = readerThread.JoinBounded(ThreadJoinBound);
+            writerJoined = writerThread.JoinBounded(ThreadJoinBound);
+            readerThread.DisposeIfCompleted();
+            writerThread.DisposeIfCompleted();
+        }
+
+        // Establish termination and marshal body faults BEFORE contention assertions so a real
+        // reader/writer exception cannot be hidden behind a generic completion-state failure.
+        Assert.True(readerJoined, "Reader thread did not finish within its join bound.");
+        readerThread.ThrowIfFaulted();
+        Assert.True(writerJoined, "Writer thread did not finish within its join bound.");
+        writerThread.ThrowIfFaulted();
+        Assert.True(readerContentionFailure is null, readerContentionFailure);
+        Assert.True(writerContentionFailure is null, writerContentionFailure);
+
+        Assert.True(writerSucceeded, "Synchronized writer failed to update the entry.");
+
+        var entry = Assert.Single(observed!);
+        Assert.True(
+            new EntryTuple("m", 1, null, null, null).Equals(TupleOf(entry))
+            || new EntryTuple("m", 2, null, "post", null).Equals(TupleOf(entry)),
+            $"Reader observed a torn/foreign state: {TupleOf(entry)}.");
+
+        // The commit is visible to a subsequent read regardless of which side won the race.
+        Assert.Equal(new EntryTuple("m", 2, null, "post", null), TupleOf(Assert.Single(config.GetSubAgentModels())));
+    }
+
+    /// <summary>
+    /// Supplemental STRESS (not deterministic removal proof): concurrent locked writers
+    /// (ReloadFrom + synchronized CRUD) racing dedicated synchronous readers of ALL migrated
+    /// readers. Invariants for every observation: (a) zero exceptions, including no
+    /// <see cref="InvalidOperationException"/> from live-list enumeration; (b) context-window
+    /// lookups resolve only against WHOLE generations (a name resolves ⇒ the lookup finds it in
+    /// the same capture); (c) sub-agent results carry coherent merge fields. Bounded joins/drains
+    /// with timeouts even on failure.
+    /// </summary>
+    [Fact]
+    public async Task MigratedReaders_ConcurrentLockedWriters_NeverThrowAndNeverTear()
+    {
+        const int readerThreads = 4;
+        const int iterationsPerReader = 300;
+
+        var stateA = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "shared" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [MakeEntry("shared", 100, description: "a", supportsVision: true)],
+                SubAgentModels = [MakeEntry("shared", null, reasoningEffort: "low")]
+            }
+        };
+        var stateB = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "other" },
+            Models = new ModelsConfig
+            {
+                AvailableModels = [MakeEntry("other", 200, description: "b", supportsVision: false)],
+                SubAgentModels = [MakeEntry("other", null, reasoningEffort: "high")]
+            }
+        };
+
+        var target = new HiveConfigFile();
+        target.ReloadFrom(stateA);
+        var source = new HiveConfigFile();
+        source.ReloadFrom(stateA);
+
+        var exceptions = new ConcurrentBag<Exception>();
+        var failures = new ConcurrentBag<string>();
+        using var done = new CountdownEvent(readerThreads + 1);
+
+        // Reader role: exercises every migrated reader against the same instance.
+        var readerTasks = Enumerable.Range(0, readerThreads).Select(_ => Task.Factory.StartNew(() =>
+        {
+            try
+            {
+                for (var i = 0; i < iterationsPerReader; i++)
+                {
+                    // Per-call value-domain invariants: each reader call observes ONE whole
+                    // generation (A: shared=100/desc-a/vision-true; B: other=200/desc-b/
+                    // vision-false) plus the legal transient churn entry (5000, committed under
+                    // the lock between the synchronized add and remove). A torn single-snapshot
+                    // capture would produce out-of-domain values (e.g. 'shared' resolving with
+                    // gen-B's 200 context).
+                    var ctxShared = target.TryGetContextWindowForModel("shared");
+                    var ctxOther = target.TryGetContextWindowForModel("other");
+                    var ctxChurn = target.TryGetContextWindowForModel("churn");
+                    var resolvedShared = target.ResolveAvailableModel("shared");
+                    var resolvedOther = target.ResolveAvailableModel("other");
+                    var composerDefault = target.ResolveComposerDefaultModel();
+
+                    if (ctxShared is { } v && v != 100)
+                        failures.Add($"TryGetContextWindowForModel(shared) returned foreign context {v}.");
+                    if (ctxOther is { } v2 && v2 != 200)
+                        failures.Add($"TryGetContextWindowForModel(other) returned foreign context {v2}.");
+                    if (ctxChurn is { } v3 && v3 != 5000)
+                        failures.Add($"Churn entry context mutated under lock: {v3}.");
+                    if (resolvedShared is not null && resolvedShared != "shared")
+                        failures.Add($"ResolveAvailableModel(shared) returned '{resolvedShared}'.");
+                    if (resolvedOther is not null && resolvedOther != "other")
+                        failures.Add($"ResolveAvailableModel(other) returned '{resolvedOther}'.");
+                    // Composer.Model is reloaded as 'shared' or 'other' and resolved against the
+                    // SAME generation's catalog (one lock region) — 'churn' can never appear.
+                    if (composerDefault is not null && composerDefault != "shared" && composerDefault != "other")
+                        failures.Add($"ResolveComposerDefaultModel returned foreign model '{composerDefault}'.");
+
+                    // (c) Coherent merge observations. WITHIN one merged result, a curated entry
+                    // inheriting from the available catalog must carry fields from the SAME
+                    // generation: a merge of curated gen-A 'shared' against gen-B available (no
+                    // 'shared') would yield a null ContextWindow/Description — a mixed-generation
+                    // observation that fails below. 'churn' never exists in the curated catalog,
+                    // so it can only appear via the available-only fallback path.
+                    foreach (var entry in target.GetSubAgentModels())
+                    {
+                        switch (entry.Name)
+                        {
+                            case "shared":
+                                if (entry.ReasoningEffort != "low")
+                                    failures.Add($"Curated 'shared' reasoning mutated: {entry.ReasoningEffort}.");
+                                else if (entry.ContextWindow != 100 || entry.Description != "a" || entry.SupportsVision != true)
+                                    failures.Add(
+                                        $"Merged 'shared' entry mixed generations: ctx={entry.ContextWindow}, desc={entry.Description}, vision={entry.SupportsVision}.");
+                                break;
+                            case "other":
+                                if (entry.ReasoningEffort != "high")
+                                    failures.Add($"Curated 'other' reasoning mutated: {entry.ReasoningEffort}.");
+                                else if (entry.ContextWindow != 200 || entry.Description != "b" || entry.SupportsVision != false)
+                                    failures.Add(
+                                        $"Merged 'other' entry mixed generations: ctx={entry.ContextWindow}, desc={entry.Description}, vision={entry.SupportsVision}.");
+                                break;
+                            case "churn":
+                                if (entry.ReasoningEffort != "medium" || entry.ContextWindow is not (null or 5000))
+                                    failures.Add(
+                                        $"Churn merged entry incoherent: ctx={entry.ContextWindow}, effort={entry.ReasoningEffort}.");
+                                break;
+                            default:
+                                failures.Add($"GetSubAgentModels returned foreign entry '{entry.Name}'.");
+                                break;
+                        }
+                    }
+
+                    // Composer catalog normalization: only whole-generation names (base
+                    // generation names plus the legal transient churn entry).
+                    foreach (var name in target.GetComposerAvailableModels())
+                    {
+                        if (name is "shared" or "other" or "churn")
+                            continue;
+                        failures.Add($"GetComposerAvailableModels returned foreign model '{name}'.");
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+            finally
+            {
+                done.Signal();
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+
+        // Writer role: alternates the source and reloads the target (locked writer), plus churn
+        // via the synchronized CRUD APIs that PRESERVE the two known generations' name sets.
+        var writerTask = Task.Factory.StartNew(() =>
+        {
+            try
+            {
+                var flip = false;
+                for (var i = 0; i < iterationsPerReader; i++)
+                {
+                    flip = !flip;
+                    source.ReloadFrom(flip ? stateB : stateA);
+                    target.ReloadFrom(source);
+
+                    // Churn entry via synchronized APIs: add + remove leaves the catalog in one
+                    // of the two known states, but exercises the CRUD writers' lock sections.
+                    target.TryAddAvailableModel(new AvailableModelRequest("churn", 5000, null, null));
+                    target.TryRemoveAvailableModel("churn");
+                    target.TryAddSubAgentModel(new SubAgentModelRequest("churn", null, ReasoningEffort.Medium, null, null));
+                    target.TryRemoveSubAgentModel("churn");
+                }
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+            finally
+            {
+                done.Signal();
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        // Bounded drain even when a reader fails: the CountdownEvent completes when all roles
+        // exit (their finally blocks signal it regardless of exceptions).
+        Assert.True(done.Wait(TimeSpan.FromSeconds(120), TestContext.Current.CancellationToken),
+            "Concurrency test did not drain within its bound.");
+
+        await Task.WhenAll(readerTasks.Append(writerTask))
+            .WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        Assert.True(exceptions.IsEmpty,
+            "Exceptions under concurrency: " + string.Join(" | ", exceptions.Select(e => e.GetType().Name + ": " + e.Message)));
+        Assert.True(failures.IsEmpty, string.Join(Environment.NewLine, failures.Take(3)));
     }
 }

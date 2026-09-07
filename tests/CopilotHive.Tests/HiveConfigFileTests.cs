@@ -1,5 +1,8 @@
 using CopilotHive.Configuration;
 using CopilotHive.Services;
+
+using Microsoft.Extensions.AI;
+
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -1686,6 +1689,608 @@ public sealed class HiveConfigFileTests
         Assert.Equal(976000, result.ContextWindow);
         Assert.Equal("low", result.ReasoningEffort);
         Assert.Equal("merged desc", result.Description);
+    }
+
+    // ── GetSubAgentModels: synchronized-snapshot reader migration (detachment) ──
+
+    /// <summary>
+    /// The available-only fallback path returns DETACHED clones: mutating the returned entries
+    /// must never affect the live <see cref="ModelsConfig.AvailableModels"/> catalog (the old
+    /// live-alias return is a regression).
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_AvailableOnlyFallback_ReturnsDetachedEntries()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "a", ContextWindow = 10, Description = "d", SupportsVision = true }]
+            }
+        };
+
+        var returned = config.GetSubAgentModels();
+        var entry = Assert.Single(returned);
+
+        // Mutate the returned entry where its concrete type permits it.
+        entry.ContextWindow = 999;
+        entry.Description = "MUTATED";
+        entry.SupportsVision = false;
+
+        var live = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal(10, live.ContextWindow);
+        Assert.Equal("d", live.Description);
+        Assert.True(live.SupportsVision);
+
+        // A subsequent call observes the unchanged source state again (no cached snapshot).
+        var fresh = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(10, fresh.ContextWindow);
+        Assert.Equal("d", fresh.Description);
+        Assert.True(fresh.SupportsVision);
+    }
+
+    /// <summary>
+    /// The available-only fallback path returns a detached LIST, not just detached entries:
+    /// structural mutation of the returned list (add / remove / replace) must leave the source
+    /// <see cref="ModelsConfig.AvailableModels"/> list unchanged in count, order and contents.
+    /// The old live-alias return would corrupt the catalog through any of these operations.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_AvailableOnlyFallback_ReturnedListStructureIsDetached()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "a", ContextWindow = 1 },
+                    new ModelEntry { Name = "b", ContextWindow = 2 }
+                ]
+            }
+        };
+
+        var returned = config.GetSubAgentModels();
+        Assert.Equal(2, returned.Count);
+
+        // The helper's returned instance is a mutable List<ModelEntry>; mutate its STRUCTURE.
+        var mutable = Assert.IsType<List<ModelEntry>>(returned);
+        mutable.Add(new ModelEntry { Name = "injected", ContextWindow = 999 });
+        mutable.RemoveAt(0);
+        mutable[0] = new ModelEntry { Name = "replaced", ContextWindow = 888 };
+
+        // The source catalog list is structurally unchanged: same count, order and entries.
+        var live = config.Models!.AvailableModels!;
+        Assert.Equal(2, live.Count);
+        Assert.Equal("a", live[0].Name);
+        Assert.Equal(1, live[0].ContextWindow);
+        Assert.Equal("b", live[1].Name);
+        Assert.Equal(2, live[1].ContextWindow);
+        Assert.DoesNotContain(live, e => e.Name is "injected" or "replaced");
+
+        // And a fresh call still yields the original two entries.
+        var fresh = config.GetSubAgentModels();
+        Assert.Equal(2, fresh.Count);
+        Assert.Equal("a", fresh[0].Name);
+        Assert.Equal("b", fresh[1].Name);
+    }
+
+    /// <summary>
+    /// The curated-merge path likewise returns a detached LIST: structural mutation of the
+    /// returned list leaves BOTH source catalogs (<see cref="ModelsConfig.SubAgentModels"/> and
+    /// <see cref="ModelsConfig.AvailableModels"/>) unchanged in count, order and contents.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_CuratedMerge_ReturnedListStructureIsDetached()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "x", ContextWindow = 10, Description = "avail-x" },
+                    new ModelEntry { Name = "y", ContextWindow = 20, Description = "avail-y" }
+                ],
+                SubAgentModels =
+                [
+                    new ModelEntry { Name = "x", ReasoningEffort = "low" },
+                    new ModelEntry { Name = "y", ReasoningEffort = "high" }
+                ]
+            }
+        };
+
+        var returned = config.GetSubAgentModels();
+        Assert.Equal(2, returned.Count);
+
+        var mutable = Assert.IsType<List<ModelEntry>>(returned);
+        mutable.Add(new ModelEntry { Name = "injected", ReasoningEffort = "medium" });
+        mutable.RemoveAt(0);
+        mutable[0] = new ModelEntry { Name = "replaced" };
+        mutable.Clear();
+        Assert.Empty(mutable);
+
+        // Curated source list: structurally intact.
+        var liveCurated = config.Models!.SubAgentModels!;
+        Assert.Equal(2, liveCurated.Count);
+        Assert.Equal("x", liveCurated[0].Name);
+        Assert.Equal("low", liveCurated[0].ReasoningEffort);
+        Assert.Equal("y", liveCurated[1].Name);
+        Assert.Equal("high", liveCurated[1].ReasoningEffort);
+
+        // Available source list: structurally intact.
+        var liveAvailable = config.Models.AvailableModels!;
+        Assert.Equal(2, liveAvailable.Count);
+        Assert.Equal("x", liveAvailable[0].Name);
+        Assert.Equal(10, liveAvailable[0].ContextWindow);
+        Assert.Equal("y", liveAvailable[1].Name);
+        Assert.Equal(20, liveAvailable[1].ContextWindow);
+
+        // A fresh call reproduces the full merged result.
+        var fresh = config.GetSubAgentModels();
+        Assert.Equal(2, fresh.Count);
+        Assert.Equal("x", fresh[0].Name);
+        Assert.Equal(10, fresh[0].ContextWindow);
+        Assert.Equal("low", fresh[0].ReasoningEffort);
+        Assert.Equal("y", fresh[1].Name);
+        Assert.Equal(20, fresh[1].ContextWindow);
+        Assert.Equal("high", fresh[1].ReasoningEffort);
+    }
+
+    /// <summary>
+    /// The curated-merge path returns DETACHED entries for BOTH merge sources: mutating returned
+    /// entries (including inherited fields) leaves the live curated and available catalogs
+    /// unchanged.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_CuratedMerge_ReturnsDetachedEntries()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 10, Description = "avail-desc", SupportsVision = true }],
+                SubAgentModels = [new ModelEntry { Name = "m", ReasoningEffort = "high" }]
+            }
+        };
+
+        var returned = config.GetSubAgentModels();
+        var entry = Assert.Single(returned);
+        Assert.Equal(10, entry.ContextWindow);      // inherited from available
+        Assert.Equal("avail-desc", entry.Description); // inherited
+        Assert.True(entry.SupportsVision);             // inherited
+
+        entry.ContextWindow = 999;
+        entry.Description = "MUTATED";
+        entry.ReasoningEffort = "MUTATED";
+
+        var liveCurated = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("high", liveCurated.ReasoningEffort);
+        Assert.Null(liveCurated.ContextWindow);
+        Assert.Null(liveCurated.Description);
+
+        var liveAvailable = Assert.Single(config.Models.AvailableModels!);
+        Assert.Equal(10, liveAvailable.ContextWindow);
+        Assert.Equal("avail-desc", liveAvailable.Description);
+
+        // A subsequent call sees the unchanged stored state again.
+        var fresh = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(10, fresh.ContextWindow);
+        Assert.Equal("high", fresh.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// Synchronized-writer compatibility: results captured BEFORE a synchronized CRUD update /
+    /// <see cref="HiveConfigFile.ReloadFrom"/> remain unchanged (stale-but-internally-consistent),
+    /// while a subsequent call observes the new state — proving the reader is snapshot-based, not
+    /// cached and not live-aliased.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_SynchronizedWriterChanges_PriorResultStable_SubsequentCallSeesNewState()
+    {
+        var config = new HiveConfigFile();
+        config.TryAddAvailableModel(new AvailableModelRequest("m", 10, "old-desc", true));
+
+        var before = Assert.Single(config.GetSubAgentModels());   // fallback path
+        Assert.Equal(10, before.ContextWindow);
+
+        // Synchronized CRUD update.
+        Assert.True(config.TryUpdateAvailableModel("m", new AvailableModelRequest("ignored", 20, "new-desc", false)));
+
+        Assert.Equal(10, before.ContextWindow);                  // prior result unchanged
+        Assert.Equal("old-desc", before.Description);
+        var afterUpdate = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(20, afterUpdate.ContextWindow);             // subsequent call sees new state
+        Assert.Equal("new-desc", afterUpdate.Description);
+
+        // ReloadFrom with a different catalog: prior result still stable, next call sees reload.
+        var source = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "r", ContextWindow = 30 }] }
+        };
+        config.ReloadFrom(source);
+
+        Assert.Equal(10, before.ContextWindow);                  // prior result STILL unchanged
+        Assert.Equal(20, afterUpdate.ContextWindow);
+        var afterReload = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("r", afterReload.Name);
+        Assert.Equal(30, afterReload.ContextWindow);
+    }
+
+    /// <summary>
+    /// A retained <see cref="HiveConfigFile.GetSubAgentModels"/> result stays FROZEN across
+    /// synchronized CURATED CRUD (<c>TryUpdateSubAgentModel</c> / <c>TryAddSubAgentModel</c> /
+    /// <c>TryRemoveSubAgentModel</c>) on every <see cref="ModelEntry"/> field, while a fresh call
+    /// observes the new state. Complements the available-catalog and ReloadFrom retention tests:
+    /// the curated catalog is the second half of the paired capture.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_SynchronizedCuratedCrud_RetainedResultFrozen_FreshCallSeesNewState()
+    {
+        var config = new HiveConfigFile();
+        config.TryAddAvailableModel(new AvailableModelRequest("m", 100, "avail-desc", true));
+        config.TryAddSubAgentModel(new SubAgentModelRequest("m", null, ReasoningEffort.Low));
+
+        var retained = config.GetSubAgentModels();
+        var retainedEntry = Assert.Single(retained);
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(100, retainedEntry.ContextWindow);       // inherited
+        Assert.Equal("low", retainedEntry.ReasoningEffort);   // curated only
+        Assert.Equal("avail-desc", retainedEntry.Description);
+        Assert.True(retainedEntry.SupportsVision);
+
+        // Synchronized curated UPDATE: every mergeable field changes explicitly.
+        Assert.True(config.TryUpdateSubAgentModel(
+            "m", new SubAgentModelRequest("ignored", 55, ReasoningEffort.High, "curated-desc", false)));
+
+        // Retained result frozen on ALL fields.
+        Assert.Single(retained);
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(100, retainedEntry.ContextWindow);
+        Assert.Equal("low", retainedEntry.ReasoningEffort);
+        Assert.Equal("avail-desc", retainedEntry.Description);
+        Assert.True(retainedEntry.SupportsVision);
+
+        // Fresh call observes the new curated state on all fields (including the original name:
+        // the update request's "ignored" Name must not rename the stored entry).
+        var afterUpdate = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("m", afterUpdate.Name);
+        Assert.Equal(55, afterUpdate.ContextWindow);
+        Assert.Equal("high", afterUpdate.ReasoningEffort);
+        Assert.Equal("curated-desc", afterUpdate.Description);
+        Assert.False(afterUpdate.SupportsVision);
+
+        // Synchronized curated ADD: retained result stays frozen on every field; a fresh call
+        // grows and exposes both complete entries.
+        Assert.True(config.TryAddSubAgentModel(new SubAgentModelRequest("second", 7, ReasoningEffort.Medium)));
+        Assert.Single(retained);
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(100, retainedEntry.ContextWindow);
+        Assert.Equal("low", retainedEntry.ReasoningEffort);
+        Assert.Equal("avail-desc", retainedEntry.Description);
+        Assert.True(retainedEntry.SupportsVision);
+
+        var afterAdd = config.GetSubAgentModels();
+        Assert.Equal(2, afterAdd.Count);
+        Assert.Equal("m", afterAdd[0].Name);
+        Assert.Equal(55, afterAdd[0].ContextWindow);
+        Assert.Equal("high", afterAdd[0].ReasoningEffort);
+        Assert.Equal("curated-desc", afterAdd[0].Description);
+        Assert.False(afterAdd[0].SupportsVision);
+        Assert.Equal("second", afterAdd[1].Name);
+        Assert.Equal(7, afterAdd[1].ContextWindow);
+        Assert.Equal("medium", afterAdd[1].ReasoningEffort);
+        Assert.Null(afterAdd[1].Description);
+        Assert.Null(afterAdd[1].SupportsVision);
+
+        // Synchronized curated REMOVE of the original entry: retained result is still frozen on
+        // every field, while the fresh call exposes the complete remaining entry.
+        Assert.True(config.TryRemoveSubAgentModel("m"));
+        Assert.Single(retained);
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(100, retainedEntry.ContextWindow);
+        Assert.Equal("low", retainedEntry.ReasoningEffort);
+        Assert.Equal("avail-desc", retainedEntry.Description);
+        Assert.True(retainedEntry.SupportsVision);
+
+        var afterRemove = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("second", afterRemove.Name);
+        Assert.Equal(7, afterRemove.ContextWindow);
+        Assert.Equal("medium", afterRemove.ReasoningEffort);
+        Assert.Null(afterRemove.Description);
+        Assert.Null(afterRemove.SupportsVision);
+    }
+
+    /// <summary>
+    /// A retained <see cref="HiveConfigFile.GetSubAgentModels"/> result stays FROZEN across the
+    /// synchronized reasoning-effort API (<c>SetSubAgentModelReasoningEfforts</c>) — the retained
+    /// entries are detached clones, not aliases of the mutated curated entries — while a fresh
+    /// call observes the applied efforts.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_SynchronizedReasoningUpdate_RetainedResultFrozen_FreshCallSeesNewState()
+    {
+        var config = new HiveConfigFile();
+        config.TryAddAvailableModel(new AvailableModelRequest("m", 100, "avail-desc", true));
+        config.TryAddSubAgentModel(new SubAgentModelRequest("m", 40, ReasoningEffort.Low, "curated-desc", false));
+
+        var retained = config.GetSubAgentModels();
+        var retainedEntry = Assert.Single(retained);
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(40, retainedEntry.ContextWindow);
+        Assert.Equal("low", retainedEntry.ReasoningEffort);
+        Assert.Equal("curated-desc", retainedEntry.Description);
+        Assert.False(retainedEntry.SupportsVision);
+
+        // Synchronized reasoning-effort application (case-insensitive name match).
+        config.SetSubAgentModelReasoningEfforts(new Dictionary<string, ReasoningEffort?> { ["M"] = ReasoningEffort.ExtraHigh });
+
+        // Retained result frozen on ALL fields — especially the reasoning effort.
+        Assert.Equal("m", retainedEntry.Name);
+        Assert.Equal(40, retainedEntry.ContextWindow);
+        Assert.Equal("low", retainedEntry.ReasoningEffort);
+        Assert.Equal("curated-desc", retainedEntry.Description);
+        Assert.False(retainedEntry.SupportsVision);
+
+        // Fresh call observes the applied effort, with every other field unchanged.
+        var fresh = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("m", fresh.Name);
+        Assert.Equal(40, fresh.ContextWindow);
+        Assert.Equal("extra_high", fresh.ReasoningEffort);
+        Assert.Equal("curated-desc", fresh.Description);
+        Assert.False(fresh.SupportsVision);
+    }
+
+    /// <summary>
+    /// Compatibility guard: the public <see cref="ModelsConfig"/> getters remain LIVE — mutating
+    /// the property-referenced lists directly affects subsequent reader calls, and the readers do
+    /// not cache. (Do not prematurely flip the public getters to detached semantics.)
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_PublicModelsConfigGetters_RemainLive()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+
+        // First call: nothing configured → empty.
+        Assert.Empty(config.GetSubAgentModels());
+
+        // Direct public mutation is observed by the reader — no cached snapshot.
+        config.Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "live-a" }] };
+        Assert.Equal("live-a", Assert.Single(config.GetSubAgentModels()).Name);
+
+        config.Models!.SubAgentModels = [new ModelEntry { Name = "live-b", ReasoningEffort = "low" }];
+        Assert.Equal("live-b", Assert.Single(config.GetSubAgentModels()).Name);
+    }
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.TryGetContextWindowForModel"/> returns the STORED nullable integer
+    /// including zero and negative values (positivity filtering belongs to
+    /// <c>GetContextWindowForRole</c>) — pinning the corrected XML-doc behavior.
+    /// </summary>
+    [Fact]
+    public void TryGetContextWindowForModel_ReturnsStoredZeroAndNegativeValues()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "zero-ctx", ContextWindow = 0 },
+                    new ModelEntry { Name = "negative-ctx", ContextWindow = -5 }
+                ]
+            }
+        };
+
+        Assert.Equal(0, config.TryGetContextWindowForModel("zero-ctx"));
+        Assert.Equal(-5, config.TryGetContextWindowForModel("negative-ctx"));
+    }
+
+    // ── Reader migration (checkpoint 2): single-snapshot + live-getter + composer-pair ──
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.TryGetContextWindowForModel"/> captures ONE available-model
+    /// snapshot used for BOTH canonical-name resolution and context lookup: a retained result
+    /// from before a synchronized catalog change stays stable, while a call after the change
+    /// resolves against the new catalog — the two steps cannot read different generations.
+    /// </summary>
+    [Fact]
+    public void TryGetContextWindowForModel_ChangeBetweenCalls_RetainedResultStable_NextObservesChange()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 100 }]
+            }
+        };
+
+        var before = config.TryGetContextWindowForModel("m");
+        Assert.Equal(100, before);
+
+        // Synchronized catalog change: context window AND the resolvable name change together.
+        Assert.True(config.TryUpdateAvailableModel("m", new AvailableModelRequest("ignored", 250, "desc", null)));
+        // The retained result from before the update stays stable (its own generation).
+        Assert.Equal(100, before);
+
+        // A subsequent lookup observes the new state through the SAME single-snapshot path.
+        Assert.Equal(250, config.TryGetContextWindowForModel("m"));
+
+        // Removing the entry via the synchronized API detaches resolution and lookup together:
+        // after removal the model does not resolve (null), never a partial (name resolves but
+        // lookup misses) observation.
+        Assert.True(config.TryRemoveAvailableModel("m"));
+        Assert.Null(config.TryGetContextWindowForModel("m"));
+
+        // ReloadFrom to a different generation, then the next call reflects it.
+        config.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "m2", ContextWindow = 77 }] }
+        });
+        Assert.Null(config.TryGetContextWindowForModel("m"));     // old name gone entirely
+        Assert.Equal(77, config.TryGetContextWindowForModel("m2"));
+    }
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.GetSubAgentModels"/>' paired-catalog capture is internally
+    /// consistent: when a synchronized writer replaces BOTH catalogs between calls, a retained
+    /// merged result stays frozen at its own generation (all merge fields from the same
+    /// generation) while the next call reflects the new state on every field.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_SynchronizedCatalogReplacement_MergedFieldsStaySameGeneration()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        config.TryAddAvailableModel(new AvailableModelRequest("m", 100, "avail-1", true));
+        config.TryAddSubAgentModel(new SubAgentModelRequest("m", null, ReasoningEffort.Low));
+
+        var before = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("m", before.Name);
+        Assert.Equal(100, before.ContextWindow);        // inherited from available
+        Assert.Equal("avail-1", before.Description);    // inherited from available
+        Assert.True(before.SupportsVision);             // inherited from available
+        Assert.Equal("low", before.ReasoningEffort);    // never inherited — curated only
+
+        // Synchronized replacement of BOTH catalogs (same names, different generation).
+        config.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 200, Description = "avail-2", SupportsVision = false }],
+                SubAgentModels = [new ModelEntry { Name = "m", ReasoningEffort = "high" }]
+            }
+        });
+
+        // Retained result: frozen at generation 1 on EVERY field.
+        Assert.Equal("m", before.Name);
+        Assert.Equal(100, before.ContextWindow);
+        Assert.Equal("avail-1", before.Description);
+        Assert.True(before.SupportsVision);
+        Assert.Equal("low", before.ReasoningEffort);
+
+        // Next call: fully generation 2 on every field.
+        var after = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(200, after.ContextWindow);
+        Assert.Equal("avail-2", after.Description);
+        Assert.False(after.SupportsVision);             // explicit false overrides null-curated
+        Assert.Equal("high", after.ReasoningEffort);
+    }
+
+    /// <summary>
+    /// Curated-merge inheritance preserves EXPLICIT curated values that must never be overwritten
+    /// by available-catalog values: explicit empty strings, zero/negative context windows and
+    /// explicit-false vision flags stay as stored; reasoning effort is never inherited.
+    /// </summary>
+    [Fact]
+    public void GetSubAgentModels_CuratedMerge_PreservesExplicitEmptyZeroNegativeAndFalse()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                AvailableModels =
+                [
+                    new ModelEntry { Name = "m", ContextWindow = 100, Description = "avail-desc", SupportsVision = true, ReasoningEffort = "high" }
+                ],
+                SubAgentModels =
+                [
+                    new ModelEntry { Name = "m", ContextWindow = 0, Description = "", SupportsVision = false }
+                ]
+            }
+        };
+
+        var result = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(0, result.ContextWindow);          // explicit zero stays (not 100)
+        Assert.Equal("", result.Description);           // explicit empty string stays
+        Assert.False(result.SupportsVision);            // explicit false stays (not true)
+        Assert.Null(result.ReasoningEffort);            // never inherited from available's "high"
+
+        // Negative curated context windows are likewise preserved.
+        config.Models!.SubAgentModels = [new ModelEntry { Name = "m", ContextWindow = -7 }];
+        var negative = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(-7, negative.ContextWindow);
+    }
+
+    /// <summary>
+    /// <see cref="HiveConfigFile.ResolveComposerDefaultModel"/> reads <c>Composer.Model</c> and the
+    /// available catalog in ONE synchronized region: the method's own lookup cannot mix a
+    /// pre-reload composer model with a post-reload catalog (or vice versa). A result captured
+    /// before the reload stays stable; every subsequent call is consistent with the CURRENT
+    /// generation on both sides.
+    /// </summary>
+    [Fact]
+    public void ResolveComposerDefaultModel_ComposerModelAndCatalogResolveConsistentlyAcrossReload()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        config.TryAddAvailableModel(new AvailableModelRequest("gen1-model", 100, null, null));
+        config.Composer = new ComposerConfig { Model = "gen1-model" };
+
+        var before = config.ResolveComposerDefaultModel();
+        Assert.Equal("gen1-model", before);
+
+        // Generation 2: composer model and catalog swapped together.
+        config.ReloadFrom(new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Composer = new ComposerConfig { Model = "gen2-model" },
+            Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "gen2-model", ContextWindow = 200 }] }
+        });
+
+        // Retained resolution stays per its own generation.
+        Assert.Equal("gen1-model", before);
+        // The next resolution is consistent with generation 2 on BOTH sides: the new composer
+        // model resolves against the new catalog, and the OLD composer model does not resolve
+        // against the new catalog (no stale-catalog mixing).
+        Assert.Equal("gen2-model", config.ResolveComposerDefaultModel());
+    }
+
+    /// <summary>
+    /// Compatibility guard: the public <see cref="ModelsConfig"/> getters remain LIVE — two
+    /// successive synchronized catalog changes are observed by successive reader reads (not a
+    /// cached snapshot), and the property-referenced list is the one the synchronized writers
+    /// mutated. Guards against prematurely detaching the public getters.
+    /// </summary>
+    [Fact]
+    public void PublicModelsConfigGetters_RemainLive_TwoSuccessiveChangesObserved()
+    {
+        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+
+        // Read 1: no catalog yet.
+        Assert.Null(config.Models?.AvailableModels);
+        Assert.Empty(config.GetSubAgentModels());
+
+        // Change 1 (synchronized writer) — the public getter must immediately observe it.
+        config.TryAddAvailableModel(new AvailableModelRequest("first", 1, null, null));
+        var read1 = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("first", read1.Name);
+        Assert.Equal(1, read1.ContextWindow);
+
+        // Change 2 (synchronized writer) — the same public getter must observe the SECOND change
+        // (proving no snapshot caching between reads).
+        config.TryUpdateAvailableModel("first", new AvailableModelRequest("ignored", 2, "second-desc", null));
+        var read2 = Assert.Single(config.Models!.AvailableModels!);
+        Assert.Equal("first", read2.Name);
+        Assert.Equal(2, read2.ContextWindow);
+        Assert.Equal("second-desc", read2.Description);
+
+        // Read via GetSubAgentModels too: successive reads observe both changes (no caching).
+        Assert.Equal(2, Assert.Single(config.GetSubAgentModels()).ContextWindow);
+
+        // Change 3: reasoning-effort synchronized update observed by the public curated getter.
+        config.TryAddSubAgentModel(new SubAgentModelRequest("sub", null, ReasoningEffort.Low));
+        config.SetSubAgentModelReasoningEfforts(new Dictionary<string, ReasoningEffort?> { ["sub"] = ReasoningEffort.High });
+        var curatedRead = Assert.Single(config.Models!.SubAgentModels!);
+        Assert.Equal("high", curatedRead.ReasoningEffort);
     }
 
     // ── SupportsVision YAML round-trip (tri-state: true, false, null) ──────────
