@@ -938,9 +938,19 @@ public sealed class ComposerActorTests
 
         // Gate completed when saveSession is called, which only happens inside the
         // ComposerStreamingCompleteMessage mailbox handler (not the finally or shutdown
-        // path). This deterministically signals the completion handler ran to completion.
+        // path). This signals that the save callback was INVOKED — it does NOT prove the
+        // completion handler ran to completion: callbacks later in the terminal sequence
+        // (the transition callback, the session save's downstream effects) may still be in
+        // flight when this gate settles.
         var completedGate = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var idleGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Barrier for the terminal streaming-transition callback itself. RunTerminalSequence
+        // publishes the "idle" registry status BEFORE invoking the false/terminal transition
+        // callback, so neither the save callback nor the idle callback is a completion
+        // barrier for the transition callback's effects (the finishedCalls increment). Only
+        // a signal raised inside the terminal callback after that increment establishes the
+        // happens-before edge the assertions below need.
+        var terminalGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var actor = CreateActor(
             service,
             ct =>
@@ -959,7 +969,17 @@ public sealed class ComposerActorTests
             },
             content => streamContents.Add(content),
             () => { },
-            (_, keepStreaming) => { if (!keepStreaming) Interlocked.Increment(ref finishedCalls); },
+            (_, keepStreaming) =>
+            {
+                if (!keepStreaming)
+                {
+                    Interlocked.Increment(ref finishedCalls);
+                    // Signalled AFTER the finishedCalls increment inside the SAME terminal
+                    // callback, so awaiting this gate establishes that the increment's
+                    // effects are visible before any subsequent assertion runs.
+                    terminalGate.TrySetResult(true);
+                }
+            },
             _ => { },
             () => { });
 
@@ -968,14 +988,25 @@ public sealed class ComposerActorTests
             actor.Start();
             Assert.True(actor.Tell(new ComposerSendMessageMessage("hello", NewReply<bool>())));
 
-            // The save-session callback fires inside the mailbox's completion handler,
-            // so this gate deterministically signals the handler has run.
+            // The save-session callback fires inside the mailbox's completion handler;
+            // this gate signals the save callback was invoked (ordering only, not that
+            // later terminal-sequence callbacks have run).
             await completedGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
             Assert.Equal(1, saveSessionCalls);
 
-            // The "idle" status is published by the same terminal sequence, so this gate
-            // deterministically signals the streaming state transition completed.
+            // The "idle" status is published by the same terminal sequence, but
+            // RunTerminalSequence publishes it BEFORE the terminal transition callback, so
+            // this gate alone is NOT a completion barrier for that callback's effects.
             await idleGate.Task.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+            // Bounded observation of the terminal transition callback itself, using the
+            // timeout-only WaitAsync overload (no caller cancellation token): if the
+            // callback never fires, this fails with a diagnostic TimeoutException — caller
+            // cancellation must never surface instead, because a cancelled token would
+            // mask the absent terminal callback as cancellation and let the test pass.
+#pragma warning disable xUnit1051 // Timeout-only by design: a token would manufacture OperationCanceledException instead of the diagnostic TimeoutException.
+            await terminalGate.Task.WaitAsync(Timeout);
+#pragma warning restore xUnit1051
 
             // Exactly ONE terminal handling per stream: the mailbox completion handler owns
             // the terminal sequence, and the streaming task's finally fallback must NOT also
@@ -984,7 +1015,9 @@ public sealed class ComposerActorTests
             lock (registryStatuses) Assert.Equal(["streaming", "idle"], registryStatuses);
             Assert.Equal(1, finishedCalls);
 
-            // Streaming content accumulated the text delta.
+            // Streaming content accumulated the text delta. (These assertions observe
+            // callback effects that happen-before the terminalGate signal, not internal
+            // work the actor may still perform after that callback.)
             Assert.NotEmpty(streamContents);
             Assert.Contains("Hello world", streamContents[^1]);
 
