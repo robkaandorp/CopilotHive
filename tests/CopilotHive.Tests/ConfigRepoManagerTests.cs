@@ -537,13 +537,47 @@ public class ConfigRepoManagerTests : IDisposable
         first.Workers["coder"].Model = "evil";
         first.Workers["coder"].PremiumModel = "evil";
         first.Orchestrator.Model = "evil";
-        first.Models!.CompactionModel = "evil";
-        first.Models!.AvailableModels![0].Name = "evil";
-        first.Models!.AvailableModels![1].ContextWindow = -999;
-        first.Models!.SubAgentModels![0].Name = "evil";
         first.Composer!.Model = "evil";
         first.Composer!.EventNotifications!.ActiveEvents!.Clear();
         first.Composer!.EventNotifications!.ThrottleSeconds = -1;
+        // In-place alias probe: the returned config is itself an owner, so the compaction model
+        // and the entry field edits go through its synchronized APIs and land on its ACTUAL
+        // storage under either Models property contract. Unrelated stored fields are preserved
+        // (model-b carries no description/vision in the fixture YAML).
+        first.SetCompactionModel("evil");
+        Assert.True(first.TryUpdateAvailableModel("model-b", new AvailableModelRequest("model-b", -999)));
+
+        // Positive control: the in-place edits really landed on the mutated returned owner.
+        Assert.Equal("evil", first.GetCompactionModel());
+        var firstAvailableAfterInPlace = first.GetAvailableModelsSnapshot()!;
+        Assert.Equal(-999, firstAvailableAfterInPlace[1].ContextWindow);
+
+        // Pre-replacement isolation checkpoint: with ONLY the in-place owner edits applied (no
+        // Models reassignment yet), a load of the SAME cached generation is already unaffected.
+        var preReplacementCached = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.NotSame(first, preReplacementCached);
+        Assert.Equal("compactor", preReplacementCached.Models!.CompactionModel);
+        Assert.Equal("model-a", preReplacementCached.Models!.AvailableModels![0].Name);
+        Assert.Equal(200000, preReplacementCached.Models!.AvailableModels![0].ContextWindow);
+        Assert.Equal("model-b", preReplacementCached.Models!.AvailableModels![1].Name);
+        Assert.Equal(1000, preReplacementCached.Models!.AvailableModels![1].ContextWindow);
+        Assert.Equal("sub-1", preReplacementCached.Models!.SubAgentModels![0].Name);
+        Assert.Equal(500, preReplacementCached.Models!.SubAgentModels![0].ContextWindow);
+
+        // Generation-replacement probe: the raw renames cannot be expressed by the update APIs,
+        // so capture Models, edit the local, and reassign — AFTER the complete in-place phase
+        // above (owner mutation + fresh owner reads + cached-generation checkpoint).
+        var firstModels = first.Models;
+        firstModels!.AvailableModels![0].Name = "evil";
+        firstModels.SubAgentModels![0].Name = "evil";
+        first.Models = firstModels;
+
+        // Positive control: the mutated returned owner really changed.
+        Assert.Equal("evil", first.GetCompactionModel());
+        var firstAvailable = first.GetAvailableModelsSnapshot()!;
+        Assert.Equal("evil", firstAvailable[0].Name);
+        Assert.Equal(-999, firstAvailable[1].ContextWindow);
+        Assert.Equal("evil", Assert.Single(first.GetSubAgentModelsSnapshot()!).Name);
 
         // Another load of the SAME cached generation is unaffected.
         var second = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
@@ -575,9 +609,18 @@ public class ConfigRepoManagerTests : IDisposable
         second.Repositories.Clear();
         second.Workers.Clear();
         second.Orchestrator.Model = "cache-hit-mutated";
-        second.Models!.AvailableModels!.Clear();
-        second.Models!.SubAgentModels![0].ContextWindow = -1;
+        // In-place alias probe on the cache-hit owner: emptying the available catalog and
+        // shrinking the curated entry go through the synchronized APIs, so both land on the
+        // returned owner's ACTUAL storage. The curated update preserves the entry's other
+        // stored values (sub-1 has no reasoning effort/description/vision in the fixture).
+        Assert.True(second.TryRemoveAvailableModel("model-a"));
+        Assert.True(second.TryRemoveAvailableModel("model-b"));
+        Assert.True(second.TryUpdateSubAgentModel("sub-1", new SubAgentModelRequest("sub-1", -1, null)));
         second.Composer!.EventNotifications!.ActiveEvents!.Clear();
+
+        // Positive control: the cache-hit copy really changed before the next load.
+        Assert.Empty(second.GetAvailableModelsSnapshot()!);
+        Assert.Equal(-1, Assert.Single(second.GetSubAgentModelsSnapshot()!).ContextWindow);
 
         var third = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
         Assert.Equal(2, third.Repositories.Count);
@@ -637,8 +680,34 @@ public class ConfigRepoManagerTests : IDisposable
         config.Repositories[0].Release!.MergeTo = "evil";
         config.Workers["coder"].Model = "evil";
         config.Orchestrator.Model = "evil";
-        config.Models!.AvailableModels![0].Name = "evil";
         config.Composer!.Model = "evil";
+        // In-place alias probe: the input config is an owner, so this entry edit lands on its
+        // ACTUAL storage — if the write had retained the same ModelsConfig/entry instances, the
+        // cache and disk assertions below would observe it. Unrelated fields stay as written.
+        Assert.True(config.TryUpdateAvailableModel("written-model", new AvailableModelRequest("written-model", -777)));
+
+        // Fresh source control: the in-place edit really landed on the input owner.
+        var inPlaceMutatedInput = Assert.Single(config.GetAvailableModelsSnapshot()!);
+        Assert.Equal("written-model", inPlaceMutatedInput.Name);
+        Assert.Equal(-777, inPlaceMutatedInput.ContextWindow);
+
+        // Pre-replacement isolation checkpoint: with ONLY the in-place owner edit applied (no
+        // Models reassignment yet), a load of the post-write cache is already unaffected.
+        var preReplacementLoaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
+        Assert.Equal("written-model", preReplacementLoaded.Models!.AvailableModels![0].Name);
+        Assert.Equal(123, preReplacementLoaded.Models!.AvailableModels![0].ContextWindow);
+
+        // Generation-replacement probe: the rename cannot be expressed by the update API, so
+        // capture Models, edit the local, and reassign — AFTER the complete in-place phase above
+        // (owner mutation + fresh source read + cached-generation checkpoint).
+        var inputModels = config.Models;
+        inputModels!.AvailableModels![0].Name = "evil";
+        config.Models = inputModels;
+
+        // Fresh source control: the input owner really carries the mutated model state.
+        var mutatedInput = Assert.Single(config.GetAvailableModelsSnapshot()!);
+        Assert.Equal("evil", mutatedInput.Name);
+        Assert.Equal(-777, mutatedInput.ContextWindow);
 
         // Subsequent loads stay at the written state.
         var loaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
@@ -655,6 +724,8 @@ public class ConfigRepoManagerTests : IDisposable
         var parsed = ConfigRepoManager.ParseConfig(disk);
         Assert.Equal("written-brain", parsed.Orchestrator.Model);
         Assert.Equal("https://github.com/org/written.git", parsed.Repositories[0].Url);
+        Assert.Equal("written-model", parsed.Models!.AvailableModels![0].Name);
+        Assert.Equal(123, parsed.Models!.AvailableModels![0].ContextWindow);
 
         // Allow-list membership is at the written state.
         Assert.True(manager.IsRepositoryAllowed("https://github.com/org/written.git"));
@@ -663,12 +734,17 @@ public class ConfigRepoManagerTests : IDisposable
         // A returned copy from the post-write cache is detached too.
         loaded.Repositories.Clear();
         loaded.Workers.Clear();
-        loaded.Models!.AvailableModels!.Clear();
+        // List-clear attack through the synchronized removal API, so it empties the returned
+        // owner's ACTUAL catalog storage.
+        Assert.True(loaded.TryRemoveAvailableModel("written-model"));
+        Assert.Empty(loaded.GetAvailableModelsSnapshot()!);
+
         var reloaded = await manager.LoadConfigAsync(TestContext.Current.CancellationToken);
         Assert.Single(reloaded.Repositories);
         Assert.Equal("https://github.com/org/written.git", reloaded.Repositories[0].Url);
         Assert.Equal("written-coder", reloaded.Workers["coder"].Model);
         Assert.Equal("written-model", Assert.Single(reloaded.Models!.AvailableModels!).Name);
+        Assert.Equal(123, Assert.Single(reloaded.Models!.AvailableModels!).ContextWindow);
         Assert.True(manager.IsRepositoryAllowed("https://github.com/org/written.git"));
     }
 

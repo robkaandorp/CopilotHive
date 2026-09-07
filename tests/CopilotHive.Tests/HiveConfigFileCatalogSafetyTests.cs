@@ -666,9 +666,37 @@ public sealed class HiveConfigFileCatalogSafetyTests
         var subAgentSnapshot = config.GetSubAgentModelsSnapshot();
 
         // Mutate the LIVE catalog after the snapshots were taken.
-        config.Models!.AvailableModels![0].Description = "LIVE-MUTATED";
-        config.Models.AvailableModels[0].Name = "renamed";
-        config.Models.AvailableModels.Add(MakeEntry("extra", 1));
+        // In-place alias probe: the description change and the added entry go through the
+        // owner's synchronized APIs, so they hit the ACTUAL storage under either Models
+        // property contract. The update preserves the entry's other stored values.
+        Assert.True(config.TryUpdateAvailableModel("api-a", new AvailableModelRequest("api-a", 10, "LIVE-MUTATED", true)));
+        Assert.True(config.TryAddAvailableModel(new AvailableModelRequest("extra", 1)));
+
+        // Positive control: the owner really changed, checked before the frozen snapshots.
+        var liveAfterUpdate = config.GetAvailableModelsSnapshot();
+        Assert.NotNull(liveAfterUpdate);
+        Assert.Equal(2, liveAfterUpdate!.Count);
+        Assert.Equal(new EntryTuple("api-a", 10, null, "LIVE-MUTATED", true), TupleOf(liveAfterUpdate[0]));
+        Assert.Equal("extra", liveAfterUpdate[1].Name);
+
+        // Pre-replacement isolation checkpoint: with ONLY the in-place owner edits applied (no
+        // Models reassignment yet), the previously returned snapshots must still be frozen at
+        // the values captured before the mutations.
+        Assert.NotNull(availableSnapshot);
+        Assert.NotNull(subAgentSnapshot);
+        Assert.Equal(new EntryTuple("api-a", 10, null, "avail-desc", true),
+            TupleOf(Assert.Single(availableSnapshot!)));
+        Assert.Equal(new EntryTuple("sub-a", 20, "medium", "sub-desc", false),
+            TupleOf(Assert.Single(subAgentSnapshot!)));
+
+        // Generation-replacement probe: the rename is not expressible through the update API
+        // (which never renames), so capture Models, edit the local, and reassign the whole
+        // property. This runs AFTER the complete in-place phase above (owner mutation + fresh
+        // owner reads + isolation checkpoint) and complements it.
+        var liveModels = config.Models;
+        liveModels!.AvailableModels![0].Name = "renamed";
+        config.Models = liveModels;
+        Assert.Equal("renamed", config.GetAvailableModelsSnapshot()![0].Name);
 
         Assert.NotNull(availableSnapshot);
         Assert.NotNull(subAgentSnapshot);
@@ -677,11 +705,16 @@ public sealed class HiveConfigFileCatalogSafetyTests
         var subEntry = Assert.Single(subAgentSnapshot!);
         Assert.Equal(new EntryTuple("sub-a", 20, "medium", "sub-desc", false), TupleOf(subEntry!));
 
-        // And mutations of the snapshots do not affect the live catalog either.
+        // And mutations of the RETURNED snapshot list/entries do not affect the live catalog either.
         ((List<ModelEntry>)availableSnapshot!).Add(MakeEntry("snapshot-extra"));
         availableSnapshot[0].Description = "SNAPSHOT-MUTATION";
         Assert.Equal(2, config.Models!.AvailableModels!.Count);
         Assert.Equal("LIVE-MUTATED", config.Models.AvailableModels[0].Description);
+
+        // Same conclusion read through the owner's accessor: unchanged by the snapshot-side attacks.
+        var ownerAfterSnapshotMutation = config.GetAvailableModelsSnapshot();
+        Assert.Equal(2, ownerAfterSnapshotMutation!.Count);
+        Assert.Equal("LIVE-MUTATED", ownerAfterSnapshotMutation[0].Description);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1123,11 +1156,41 @@ public sealed class HiveConfigFileCatalogSafetyTests
         target.ReloadFrom(source);
 
         // Mutate the source AFTER the reload — through BOTH the locked API and direct mutations.
-        source.TryAddAvailableModel(new AvailableModelRequest("post-reload-extra", 300, null, null));
-        source.Models!.AvailableModels![0].Name = "MUTATED";
-        source.Models.AvailableModels[0].Description = "MUTATED-DESC";
-        source.Models.SubAgentModels![0].ContextWindow = -5;
+        Assert.True(source.TryAddAvailableModel(new AvailableModelRequest("post-reload-extra", 300, null, null)));
+        // In-place alias probe: the description/context edits go through the owner's
+        // synchronized update APIs, so they hit the ACTUAL source storage under either Models
+        // property contract. Unrelated stored fields are carried through unchanged.
+        Assert.True(source.TryUpdateAvailableModel("orig-a", new AvailableModelRequest("orig-a", 100, "MUTATED-DESC", true)));
+        Assert.True(source.TryUpdateSubAgentModel(
+            "orig-sub", new SubAgentModelRequest("orig-sub", -5, ReasoningEffort.Medium, "orig-sub-desc", null)));
         source.SetCompactionModel("mutated-cm");
+
+        // Positive control on the SOURCE, before any target assertion.
+        var sourceAvailableAfterUpdate = source.GetAvailableModelsSnapshot()!;
+        Assert.Equal(2, sourceAvailableAfterUpdate.Count);
+        Assert.Equal(new EntryTuple("orig-a", 100, null, "MUTATED-DESC", true), TupleOf(sourceAvailableAfterUpdate[0]));
+        Assert.Equal("post-reload-extra", sourceAvailableAfterUpdate[1].Name);
+        Assert.Equal(new EntryTuple("orig-sub", -5, "medium", "orig-sub-desc", null),
+            TupleOf(Assert.Single(source.GetSubAgentModelsSnapshot()!)));
+        Assert.Equal("mutated-cm", source.GetCompactionModel());
+
+        // Pre-replacement isolation checkpoint: with ONLY the in-place owner edits applied (no
+        // Models reassignment yet), fresh target reads must still hold the pre-reload state.
+        var preReplacementTargetAvailable = target.GetAvailableModelsSnapshot()!;
+        Assert.Equal(new EntryTuple("orig-a", 100, null, "orig-desc", true),
+            TupleOf(Assert.Single(preReplacementTargetAvailable)));
+        Assert.Equal(new EntryTuple("orig-sub", 200, "medium", "orig-sub-desc", null),
+            TupleOf(Assert.Single(target.GetSubAgentModelsSnapshot()!)));
+        Assert.Equal("orig-cm", target.GetCompactionModel());
+
+        // Generation-replacement probe: the raw rename cannot be expressed by the update API
+        // (it never renames), so capture Models, edit the local, and reassign the whole
+        // property. This comes AFTER the complete in-place phase above (owner mutation + fresh
+        // source reads + isolation checkpoint) and complements it.
+        var sourceModels = source.Models;
+        sourceModels!.AvailableModels![0].Name = "MUTATED";
+        source.Models = sourceModels;
+        Assert.Equal("MUTATED", source.GetAvailableModelsSnapshot()![0].Name);
 
         // The target is unaffected: it holds its own deep copy of the pre-reload state.
         var targetAvailable = target.GetAvailableModelsSnapshot()!;

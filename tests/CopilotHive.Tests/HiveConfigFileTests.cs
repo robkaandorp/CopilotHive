@@ -414,8 +414,18 @@ public sealed class HiveConfigFileTests
         source.Repositories.Add(new RepositoryConfig { Name = "new-repo", Url = "https://github.com/org/new", DefaultBranch = "dev" });
         source.Workers["coder"].Model = "mutated-model";
         source.Orchestrator.Model = "mutated-orchestrator";
-        source.Models!.AvailableModels!.Add(new ModelEntry { Name = "new-model-entry", ContextWindow = 99999 });
+        // In-place alias probe: the append goes through the owner's synchronized catalog API, so
+        // it mutates the ACTUAL source storage (not a detached getter result or a retained
+        // initializer list) regardless of the Models property contract.
+        Assert.True(source.TryAddAvailableModel(new AvailableModelRequest("new-model-entry", 99999)));
         source.Composer!.Model = "mutated-composer-model";
+
+        // Positive control: the source list really grew (otherwise the receiver assertions below
+        // would pass vacuously).
+        var sourceAvailableAfterAdd = source.GetAvailableModelsSnapshot();
+        Assert.NotNull(sourceAvailableAfterAdd);
+        Assert.Equal(2, sourceAvailableAfterAdd!.Count);
+        Assert.Equal("new-model-entry", sourceAvailableAfterAdd[1].Name);
 
         // Assert — receiver is NOT affected by any source mutations
         Assert.Equal(receiverRepoCount, receiver.Repositories.Count);
@@ -1484,16 +1494,67 @@ public sealed class HiveConfigFileTests
         Assert.NotSame(sourceAvailable, copiedAvailable);
         Assert.NotSame(sourceCurated, copiedCurated);
 
-        // Mutate EVERY field on both source entries in place.
-        sourceAvailable.Name = "mutated-a";
-        sourceAvailable.ContextWindow = 999;
-        sourceAvailable.ReasoningEffort = "extra_high";
-        sourceAvailable.Description = "changed-a";
+        // Mutate EVERY field on both source entries — through the owner, not through the
+        // retained initializer references.
+        //
+        // In-place alias probe: the fields the synchronized APIs express (context window,
+        // description, and the curated reasoning effort) are updated on the ACTUAL owner
+        // entries. Unrelated fields are preserved: SupportsVision stays null on both entries,
+        // and TryUpdateAvailableModel deliberately keeps the available entry's reasoning effort.
+        Assert.True(source.TryUpdateAvailableModel("a", new AvailableModelRequest("a", 999, "changed-a", null)));
+        Assert.True(source.TryUpdateSubAgentModel(
+            "b", new SubAgentModelRequest("b", 888, ReasoningEffort.ExtraHigh, "changed-b", null)));
 
-        sourceCurated.Name = "mutated-b";
-        sourceCurated.ContextWindow = 888;
-        sourceCurated.ReasoningEffort = "extra_high";
-        sourceCurated.Description = "changed-b";
+        // Fresh source reads prove the owner really changed, BEFORE looking at the frozen copies.
+        var freshSourceAvailable = Assert.Single(source.GetAvailableModelsSnapshot()!);
+        Assert.Equal("a", freshSourceAvailable.Name);
+        Assert.Equal(999, freshSourceAvailable.ContextWindow);
+        Assert.Equal("low", freshSourceAvailable.ReasoningEffort); // preserved by the update API
+        Assert.Equal("changed-a", freshSourceAvailable.Description);
+        var freshSourceCurated = Assert.Single(source.GetSubAgentModelsSnapshot()!);
+        Assert.Equal("b", freshSourceCurated.Name);
+        Assert.Equal(888, freshSourceCurated.ContextWindow);
+        Assert.Equal("extra_high", freshSourceCurated.ReasoningEffort);
+        Assert.Equal("changed-b", freshSourceCurated.Description);
+
+        // Pre-replacement isolation checkpoint: with ONLY the in-place owner edits applied (no
+        // Models reassignment yet), the frozen captured entries and fresh target reads must still
+        // hold the pre-reload values. A shared-entry defect would surface here.
+        Assert.Equal("a", copiedAvailable.Name);
+        Assert.Equal(100, copiedAvailable.ContextWindow);
+        Assert.Equal("low", copiedAvailable.ReasoningEffort);
+        Assert.Equal("desc-a", copiedAvailable.Description);
+        Assert.Equal("b", copiedCurated.Name);
+        Assert.Equal(200, copiedCurated.ContextWindow);
+        Assert.Equal("medium", copiedCurated.ReasoningEffort);
+        Assert.Equal("desc-b", copiedCurated.Description);
+
+        var preReplacementTargetAvailable = Assert.Single(target.GetAvailableModelsSnapshot()!);
+        Assert.Equal("a", preReplacementTargetAvailable.Name);
+        Assert.Equal(100, preReplacementTargetAvailable.ContextWindow);
+        Assert.Equal("low", preReplacementTargetAvailable.ReasoningEffort);
+        Assert.Equal("desc-a", preReplacementTargetAvailable.Description);
+        var preReplacementTargetCurated = Assert.Single(target.GetSubAgentModelsSnapshot()!);
+        Assert.Equal("b", preReplacementTargetCurated.Name);
+        Assert.Equal(200, preReplacementTargetCurated.ContextWindow);
+        Assert.Equal("medium", preReplacementTargetCurated.ReasoningEffort);
+        Assert.Equal("desc-b", preReplacementTargetCurated.Description);
+
+        // Generation-replacement probe: the raw renames and the available entry's reasoning
+        // effort are not expressible through the synchronized APIs, so capture the current
+        // Models, edit the local, and reassign the whole property. This runs AFTER the complete
+        // in-place phase above (owner mutation + fresh source reads + isolation checkpoint) and
+        // complements it — it never substitutes for it.
+        var sourceModels = source.Models;
+        sourceModels!.AvailableModels![0].Name = "mutated-a";
+        sourceModels.AvailableModels[0].ReasoningEffort = "extra_high";
+        sourceModels.SubAgentModels![0].Name = "mutated-b";
+        source.Models = sourceModels;
+
+        var renamedSourceAvailable = Assert.Single(source.GetAvailableModelsSnapshot()!);
+        Assert.Equal("mutated-a", renamedSourceAvailable.Name);
+        Assert.Equal("extra_high", renamedSourceAvailable.ReasoningEffort);
+        Assert.Equal("mutated-b", Assert.Single(source.GetSubAgentModelsSnapshot()!).Name);
 
         // The reloaded target must retain the original values in BOTH collections.
         Assert.Equal("a", copiedAvailable.Name);
@@ -1505,6 +1566,18 @@ public sealed class HiveConfigFileTests
         Assert.Equal(200, copiedCurated.ContextWindow);
         Assert.Equal("medium", copiedCurated.ReasoningEffort);
         Assert.Equal("desc-b", copiedCurated.Description);
+
+        // Fresh target reads agree with the captured entries — nothing leaked across.
+        var freshTargetAvailable = Assert.Single(target.GetAvailableModelsSnapshot()!);
+        Assert.Equal("a", freshTargetAvailable.Name);
+        Assert.Equal(100, freshTargetAvailable.ContextWindow);
+        Assert.Equal("low", freshTargetAvailable.ReasoningEffort);
+        Assert.Equal("desc-a", freshTargetAvailable.Description);
+        var freshTargetCurated = Assert.Single(target.GetSubAgentModelsSnapshot()!);
+        Assert.Equal("b", freshTargetCurated.Name);
+        Assert.Equal(200, freshTargetCurated.ContextWindow);
+        Assert.Equal("medium", freshTargetCurated.ReasoningEffort);
+        Assert.Equal("desc-b", freshTargetCurated.Description);
     }
 
     [Fact]
@@ -2405,12 +2478,29 @@ public sealed class HiveConfigFileTests
         Assert.True(copiedAvailable.SupportsVision);
         Assert.False(copiedCurated.SupportsVision);
 
-        // Mutate source — receiver must be unaffected
-        sourceAvailable.SupportsVision = false;
-        sourceCurated.SupportsVision = true;
+        // Mutate source — receiver must be unaffected.
+        // In-place alias probe: flip SupportsVision on the ACTUAL owner entries through the
+        // synchronized update APIs (rather than the retained initializer references), preserving
+        // every other stored value on each entry.
+        Assert.True(source.TryUpdateAvailableModel("a", new AvailableModelRequest("a", 100, null, false)));
+        Assert.True(source.TryUpdateSubAgentModel("b", new SubAgentModelRequest("b", 200, null, null, true)));
+
+        // Fresh source reads prove the flip landed on the owner before checking the copies.
+        var freshSourceAvailable = Assert.Single(source.GetAvailableModelsSnapshot()!);
+        Assert.Equal("a", freshSourceAvailable.Name);
+        Assert.Equal(100, freshSourceAvailable.ContextWindow);
+        Assert.False(freshSourceAvailable.SupportsVision);
+        var freshSourceCurated = Assert.Single(source.GetSubAgentModelsSnapshot()!);
+        Assert.Equal("b", freshSourceCurated.Name);
+        Assert.Equal(200, freshSourceCurated.ContextWindow);
+        Assert.True(freshSourceCurated.SupportsVision);
 
         Assert.True(copiedAvailable.SupportsVision);
         Assert.False(copiedCurated.SupportsVision);
+
+        // Fresh target reads still carry the original vision flags.
+        Assert.True(Assert.Single(target.GetAvailableModelsSnapshot()!).SupportsVision);
+        Assert.False(Assert.Single(target.GetSubAgentModelsSnapshot()!).SupportsVision);
     }
 
     // ── GetSubAgentModels merge: SupportsVision preserve-null (regression) ─────
