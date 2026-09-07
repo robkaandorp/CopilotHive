@@ -675,6 +675,32 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         }
     }
 
+    // ---------- Slash-bearing branch names through CreateBranchWithCommit ----------
+
+    [Theory]
+    [InlineData("release/1.0")]
+    [InlineData("copilothive/my-goal")]
+    public void CreateBranchWithCommit_SlashBearingBranchName_CreatesExactRefWithContent(string newBranch)
+    {
+        var (remoteDir, _, _) = SetupRepo("slash-branch-repo");
+
+        var fileName = "slash-branch.txt";
+        var content = "slash branch content";
+        CreateBranchWithCommit(remoteDir, "main", newBranch, fileName, content);
+
+        // The EXACT ref, using the original unsanitized branch name, must exist on the remote.
+        // If the ref is absent, rev-parse prints nothing on stdout, so the SHA-format assertion
+        // fails substantively (we do not rely on the helper's unchecked exit code).
+        var resolvedSha = GitOutput(remoteDir, "rev-parse", "--verify", $"refs/heads/{newBranch}").Trim();
+        Assert.Matches("^[0-9a-f]{40}$", resolvedSha);
+
+        // Reading the committed file through that exact ref returns the expected content.
+        // An empty GitOutput (missing file/ref) fails the NotEmpty assertion first.
+        var fileContent = GitOutput(remoteDir, "show", $"refs/heads/{newBranch}:{fileName}");
+        Assert.NotEmpty(fileContent);
+        Assert.Equal(content + "\n", fileContent);
+    }
+
     // ---------- Symlink containment ----------
 
     [Fact]
@@ -961,11 +987,15 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
 
     /// <summary>
     /// Creates a new branch off <paramref name="baseBranch"/> on the remote with a single new
-    /// commit adding <paramref name="fileName"/>, using a throwaway staging clone.
+    /// commit adding <paramref name="fileName"/>, using a throwaway staging clone. The staging
+    /// directory name must NOT embed the branch name: slash-bearing branch names (e.g.
+    /// "release/1.0") would otherwise create a nested staging path while the clone destination
+    /// uses only the final path segment, and the identity configuration would run in a
+    /// nonexistent directory.
     /// </summary>
     private void CreateBranchWithCommit(string remoteDir, string baseBranch, string newBranch, string fileName, string content)
     {
-        var staging = Path.Combine(_tempDir, $"stg-{newBranch}-{Path.GetRandomFileName()}");
+        var staging = Path.Combine(_tempDir, $"stg-{Path.GetRandomFileName()}");
         Git(_tempDir, "clone", remoteDir, Path.GetFileName(staging));
         ConfigureIdentity(staging);
         Git(staging, "checkout", "-b", newBranch, $"origin/{baseBranch}");
