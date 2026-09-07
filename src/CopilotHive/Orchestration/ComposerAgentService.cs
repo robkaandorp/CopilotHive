@@ -228,35 +228,38 @@ internal sealed class ComposerAgentService(
 
     /// <summary>
     /// Captures ONE immutable snapshot of the Composer's selectable catalog: when
-    /// <c>_hiveConfig</c> is non-null the RAW mutable <c>_hiveConfig.Models.AvailableModels</c>
-    /// list is enumerated (reference captured first, then enumerated); when <c>_hiveConfig</c>
-    /// is null the constructor-provided <c>_startupAvailableModels</c> is enumerated. Every
-    /// entry is normalized in the single pass: name trimmed, empty/whitespace names dropped,
-    /// ordinal-ignore-case duplicates collapsed to the FIRST, and the entry's
-    /// <c>ContextWindow</c> scalar copied INTO the immutable <see cref="CatalogEntry"/> (the
-    /// context window is never resolved via a second per-entry lookup afterwards). For the
-    /// null-config seam <see cref="CatalogEntry.ContextWindow"/> is <c>null</c> for every entry
-    /// (explicit rule).
+    /// <c>_hiveConfig</c> is non-null the catalog is read as ONE detached
+    /// <see cref="HiveConfigFile.GetAvailableModelsSnapshot"/> deep copy (never the live
+    /// <c>Models.AvailableModels</c> list, whose enumeration could observe a concurrent
+    /// mutation by <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/> or the synchronized
+    /// catalog APIs); when <c>_hiveConfig</c> is null the constructor-provided
+    /// <c>_startupAvailableModels</c> is enumerated. Normalization (name trimmed,
+    /// empty/whitespace names dropped, ordinal-ignore-case duplicates collapsed to the FIRST)
+    /// and the immutable <see cref="CatalogEntry"/> projection (name and
+    /// <c>ContextWindow</c> scalar copied together from the same captured entry — the context
+    /// window is never resolved via a second per-entry lookup afterwards) run OUTSIDE the
+    /// snapshot acquisition, on that detached capture. For the null-config seam
+    /// <see cref="CatalogEntry.ContextWindow"/> is <c>null</c> for every entry (explicit rule).
     /// </summary>
     private IReadOnlyList<CatalogEntry> CaptureCatalogSnapshot()
     {
         if (_hiveConfig is not null)
         {
-            // Capture the list REFERENCE first, then enumerate — a config reload replaces the
-            // Models instance wholesale, so the reference fixates the list being enumerated.
-            var raw = _hiveConfig.Models?.AvailableModels;
-            if (raw is null)
+            var snapshot = _hiveConfig.GetAvailableModelsSnapshot();
+            if (snapshot is null)
                 return [];
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var entries = new List<CatalogEntry>(raw.Count);
-            foreach (var entry in raw)
+            var entries = new List<CatalogEntry>(snapshot.Count);
+            foreach (var entry in snapshot)
             {
-                var name = entry?.Name?.Trim();
+                if (entry is null)
+                    continue;
+                var name = entry.Name?.Trim();
                 if (string.IsNullOrEmpty(name))
                     continue;
                 if (seen.Add(name))
-                    entries.Add(new CatalogEntry(name, entry!.ContextWindow));
+                    entries.Add(new CatalogEntry(name, entry.ContextWindow));
             }
 
             return entries;

@@ -279,39 +279,48 @@ public sealed class ConfigFacade : IConfigFacade
             return new(false, null, "Config repo not configured.", FacadeErrorKind.NotFound);
         }
 
+        // ONE detached capture of the whole configuration graph under the config's catalog
+        // lock: every DTO field below is projected from this single snapshot, so the response
+        // can never mix reload generations — a concurrent ReloadFrom or synchronized catalog
+        // mutation commits only BETWEEN captures, never between the fields of one response.
+        // Deliberately NOT GetSubAgentModels: its curated/available fallback-merge semantics
+        // would change this raw-configuration response (the DTO must show the curated entries
+        // exactly as stored).
+        var snapshot = config.CaptureConfigSnapshot();
+
         // Reasoning effort is stored as string? in the YAML-bound config classes but is
         // projected here as the ReasoningEffort enum. The global JsonStringEnumConverter
         // renders it snake_case (e.g. "extra_high"). A value a dynamic reload left
         // unrecognised degrades to null rather than failing the whole response.
         return new(true, new ModelsConfigDto(
-            Orchestrator: config.Orchestrator.Model,
-            Composer: config.Composer?.Model,
-            Compaction: config.Models?.CompactionModel,
-            Workers: config.Workers.ToDictionary(
+            Orchestrator: snapshot.Orchestrator!.Model,
+            Composer: snapshot.Composer?.Model,
+            Compaction: snapshot.Models?.CompactionModel,
+            Workers: snapshot.Workers!.ToDictionary(
                 kv => kv.Key,
-                kv => new WorkerModelsDto(kv.Value.Model, kv.Value.PremiumModel)),
-            OrchestratorReasoningEffort: ConfigModelService.ParseLenient(config.Orchestrator.ReasoningEffort),
-            ComposerReasoningEffort: ConfigModelService.ParseLenient(config.Composer?.ReasoningEffort),
-            WorkerReasoningEffort: config.Workers.ToDictionary(
+                kv => new WorkerModelsDto(kv.Value!.Model, kv.Value!.PremiumModel)),
+            OrchestratorReasoningEffort: ConfigModelService.ParseLenient(snapshot.Orchestrator!.ReasoningEffort),
+            ComposerReasoningEffort: ConfigModelService.ParseLenient(snapshot.Composer?.ReasoningEffort),
+            WorkerReasoningEffort: snapshot.Workers!.ToDictionary(
                 kv => kv.Key,
-                kv => ConfigModelService.ParseLenient(kv.Value.ReasoningEffort)),
-            WorkerPremiumReasoningEffort: config.Workers.ToDictionary(
+                kv => ConfigModelService.ParseLenient(kv.Value!.ReasoningEffort)),
+            WorkerPremiumReasoningEffort: snapshot.Workers!.ToDictionary(
                 kv => kv.Key,
-                kv => ConfigModelService.ParseLenient(kv.Value.PremiumReasoningEffort)),
-            SubAgentModelReasoning: config.Models?.SubAgentModels?
+                kv => ConfigModelService.ParseLenient(kv.Value!.PremiumReasoningEffort)),
+            SubAgentModelReasoning: snapshot.Models?.SubAgentModels?
                 .Where(m => !string.IsNullOrEmpty(m.Name))
                 .GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
                     g => ConfigModelService.ParseLenient(g.First().ReasoningEffort)),
-            AvailableModels: config.Models?.AvailableModels?
+            AvailableModels: snapshot.Models?.AvailableModels?
                 .Select(m => new AvailableModelDto(m.Name, m.ContextWindow, m.Description, m.SupportsVision))
                 .ToList(),
             // Projected entry-by-entry rather than returned as raw ModelEntry objects:
             // ModelEntry.ReasoningEffort is deliberately string? at the YAML boundary, so
             // serializing the entity directly would leak a raw string (and an unrecognised
             // stored value such as "turbo" verbatim) into an otherwise enum-typed response.
-            SubAgentModels: config.Models?.SubAgentModels?
+            SubAgentModels: snapshot.Models?.SubAgentModels?
                 .Select(m => new ConfigSubAgentModelDto(
                     m.Name,
                     m.ContextWindow,

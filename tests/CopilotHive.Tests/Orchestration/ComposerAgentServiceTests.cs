@@ -1,9 +1,11 @@
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Orchestration;
+using CopilotHive.Services;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -3839,7 +3841,384 @@ public sealed class ComposerAgentServiceTests
         }
     }
 
-    // ── Utility ──
+    // ── Snapshot migration: retained selection across synchronized mutations/reload ──
+
+    /// <summary>
+    /// Retained selection through the REAL internal <see cref="ComposerAgentService.ValidateAvailableModel"/> /
+    /// <see cref="ComposerAgentService.ApplyModelScalars"/> methods: validate A, then
+    /// remove the entry and reload to distinguishable state B through the SYNCHRONIZED
+    /// catalog APIs; the applied selection keeps its original context/reasoning/caller
+    /// spelling, while a fresh validation sees the new catalog (the removed model is gone, the
+    /// reloaded one resolves with ITS context window).
+    /// </summary>
+    [Fact]
+    public async Task ValidateThenApply_RetainedSelection_SynchronizedRemovalAndReload_OriginalScalarsRemain()
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? service = null;
+        try
+        {
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels = [new ModelEntry { Name = "model-a", ContextWindow = 32768 }]
+                }
+            };
+
+            service = CreateService(
+                stateDir,
+                hiveConfig: config,
+                model: "model-a",
+                maxContextTokens: 64000,
+                configuredReasoningEffort: ReasoningEffort.Low);
+
+            // Validate A (caller spelling differs from the stored catalog spelling).
+            var selection = service.ValidateAvailableModel("MODEL-A", ReasoningEffort.Medium);
+            Assert.Equal("MODEL-A", selection.Model);
+            Assert.Equal(ReasoningEffort.Medium, selection.ReasoningEffort);
+            Assert.Equal(32768, selection.ContextWindow);
+
+            // Mutate/remove through the SYNCHRONIZED APIs, then reload to state B.
+            Assert.True(config.TryRemoveAvailableModel("model-a"));
+            var stateB = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels = [new ModelEntry { Name = "model-b", ContextWindow = 128_000 }]
+                }
+            };
+            config.ReloadFrom(stateB);
+
+            // Apply the RETAINED selection: original context/reasoning/spelling remain — a
+            // re-validation against the reloaded catalog would have thrown or resolved 128_000.
+            service.ApplyModelScalars(selection);
+            Assert.Equal("MODEL-A", service.Model);
+            Assert.Equal(ReasoningEffort.Medium, service.ReasoningEffort);
+            Assert.Equal(ReasoningEffort.Medium, GetField<ReasoningEffort?>(service, "_configuredReasoningEffort"));
+            Assert.Equal(32768, service.MaxContextTokens);
+
+            // A FRESH validation sees the new catalog: 'model-a' is gone (removal observed)…
+            var ex = Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("model-a", ReasoningEffort.Medium));
+            Assert.Equal("newModel", ex.ParamName);
+            Assert.Contains(
+                "Model 'model-a' is not available. Available models: model-b.",
+                ex.Message.Replace(" (Parameter 'newModel')", ""));
+
+            // …and 'model-b' resolves with ITS context window from the reloaded snapshot.
+            var fresh = service.ValidateAvailableModel("model-b", ReasoningEffort.High);
+            Assert.Equal("model-b", fresh.Model);
+            Assert.Equal(128_000, fresh.ContextWindow);
+        }
+        finally
+        {
+            if (service is not null)
+                await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Configured-empty versus nonempty startup fallback: when a config IS present with
+    /// missing <c>Models</c> (or a null/empty available list), the validated catalog is EMPTY —
+    /// every candidate fails membership even though a startup catalog was provided (no
+    /// fallback). The null-config seam (covered by
+    /// <see cref="ValidateAvailableModel_NullConfig_UsesStartupCatalog_NormalizedNullContextWindow"/>)
+    /// is the only path that reads the startup catalog.
+    /// </summary>
+    [Fact]
+    public async Task ValidateAvailableModel_ConfiguredMissingOrNullCatalog_EmptySelection_NeverStartupFallback()
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? svcNoModels = null;
+        ComposerAgentService? svcNullCatalog = null;
+        ComposerAgentService? svcEmpty = null;
+        try
+        {
+            var startupModels = new List<string> { "fallback-model" }.AsReadOnly();
+
+            // Config present, Models null entirely.
+            var noModels = new HiveConfigFile();
+            svcNoModels = CreateService(
+                stateDir, hiveConfig: noModels, model: "test-model",
+                startupAvailableModels: startupModels);
+            var exNoModels = Assert.Throws<ArgumentException>(
+                () => svcNoModels.ValidateAvailableModel("fallback-model", ReasoningEffort.High));
+            Assert.Contains("Available models: .", exNoModels.Message);
+
+            // Config present, Models with a NULL available list.
+            var nullCatalog = new HiveConfigFile { Models = new ModelsConfig { AvailableModels = null } };
+            svcNullCatalog = CreateService(
+                stateDir, hiveConfig: nullCatalog, model: "test-model",
+                startupAvailableModels: startupModels);
+            var exNull = Assert.Throws<ArgumentException>(
+                () => svcNullCatalog.ValidateAvailableModel("fallback-model", ReasoningEffort.High));
+            Assert.Contains("Available models: .", exNull.Message);
+
+            // Config present, available list EMPTY.
+            var emptyCatalog = new HiveConfigFile { Models = new ModelsConfig { AvailableModels = [] } };
+            svcEmpty = CreateService(
+                stateDir, hiveConfig: emptyCatalog, model: "test-model",
+                startupAvailableModels: startupModels);
+            var exEmpty = Assert.Throws<ArgumentException>(
+                () => svcEmpty.ValidateAvailableModel("fallback-model", ReasoningEffort.High));
+            Assert.Contains("Available models: .", exEmpty.Message);
+        }
+        finally
+        {
+            // Every created service is disposed independently: a disposal failure on one must
+            // not leak the others.
+            if (svcNoModels is not null)
+                await svcNoModels.DisposeAsync();
+            if (svcNullCatalog is not null)
+                await svcNullCatalog.DisposeAsync();
+            if (svcEmpty is not null)
+                await svcEmpty.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    /// <summary>
+    /// Normalization with conflicting duplicate context values across a reload: after
+    /// <see cref="HiveConfigFile.ReloadFrom"/> swaps in a catalog whose duplicate-case pair
+    /// carries CONFLICTING context windows, the FIRST entry's context wins — both via the
+    /// duplicate's stored spelling and the canonical candidate spelling.
+    /// </summary>
+    [Fact]
+    public async Task ValidateAvailableModel_AfterReload_ConflictingDuplicateContexts_FirstWins()
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? service = null;
+        try
+        {
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels = [new ModelEntry { Name = "old", ContextWindow = 1 }]
+                }
+            };
+            service = CreateService(stateDir, hiveConfig: config, model: "old");
+
+            // Before the reload the old generation is authoritative.
+            var before = service.ValidateAvailableModel("old", ReasoningEffort.Medium);
+            Assert.Equal(1, before.ContextWindow);
+
+            // Reload to a catalog whose duplicate-case pair CONFLICTS on the context window:
+            // first entry 1111, second entry 2222 — FIRST wins including its context.
+            config.ReloadFrom(new HiveConfigFile
+            {
+                Models = new ModelsConfig
+                {
+                    AvailableModels =
+                    [
+                        new ModelEntry { Name = "  dup  ", ContextWindow = 1111 },
+                        new ModelEntry { Name = "DUP", ContextWindow = 2222 },
+                    ]
+                }
+            });
+
+            var viaStoredSpelling = service.ValidateAvailableModel("dup", ReasoningEffort.Medium);
+            Assert.Equal("dup", viaStoredSpelling.Model);
+            Assert.Equal(1111, viaStoredSpelling.ContextWindow);
+
+            var viaCanonical = service.ValidateAvailableModel("DUP", ReasoningEffort.Medium);
+            Assert.Equal("DUP", viaCanonical.Model);
+            Assert.Equal(1111, viaCanonical.ContextWindow);
+
+            // The old generation's entry is gone from the fresh catalog.
+            Assert.Throws<ArgumentException>(
+                () => service.ValidateAvailableModel("old", ReasoningEffort.Medium));
+        }
+        finally
+        {
+            if (service is not null)
+                await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
+
+    // ── Lock-participation proofs (reader-thread pattern from HiveConfigFileCatalogSafetyTests) ──
+
+    /// <summary>
+    /// Reflection-based handle for the instance's catalog monitor, resolved once and reused.
+    /// Test-only access to a private field: a rename/removal fails at setup, not silently.
+    /// </summary>
+    private static readonly FieldInfo HiveCatalogLockField = typeof(HiveConfigFile)
+        .GetField("_catalogLock", BindingFlags.NonPublic | BindingFlags.Instance)
+        ?? throw new InvalidOperationException("HiveConfigFile._catalogLock field not found — test setup is stale.");
+
+    /// <summary>Bound for the must-SUCCEED observation that a reader parked on the monitor.</summary>
+    private static readonly TimeSpan ContentionObservationBound = TimeSpan.FromSeconds(30);
+
+    /// <summary>Bound for every thread join/drain, including on the failure path.</summary>
+    private static readonly TimeSpan ThreadJoinBound = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Dedicated synchronous reader thread with marshaled faults and a bounded, POSITIVE
+    /// "is actually blocked on a monitor" observation (mirrors the established
+    /// HiveConfigFileCatalogSafetyTests pattern with minimal local helpers).
+    /// </summary>
+    private sealed class CapturedThread
+    {
+        private readonly Thread _thread;
+        private readonly ManualResetEventSlim _done = new(false);
+        private Exception? _fault;
+
+        public CapturedThread(string name, Action body)
+        {
+            _thread = new Thread(() =>
+            {
+                try { body(); }
+                catch (Exception ex) { _fault = ex; }
+                finally { _done.Set(); }
+            })
+            { IsBackground = true, Name = name };
+        }
+
+        public bool Started { get; private set; }
+
+        public void Start()
+        {
+            _thread.Start();
+            Started = true;
+        }
+
+        /// <summary>
+        /// Bounded POSITIVE contention observation: the reader is exercised only through paths
+        /// whose ONLY blocking construct is the catalog monitor, so
+        /// <see cref="System.Threading.ThreadState.WaitSleepJoin"/> can only mean the reader
+        /// reached it. Completing without blocking (a lock-removal regression) fails immediately.
+        /// </summary>
+        public string? WaitUntilBlockedOnMonitor(TimeSpan bound)
+        {
+            var deadline = Environment.TickCount64 + (long)bound.TotalMilliseconds;
+            while (Environment.TickCount64 < deadline)
+            {
+                if (_done.IsSet)
+                    return $"Thread '{_thread.Name}' COMPLETED while the catalog monitor was held — it never contended for _catalogLock.";
+                if ((_thread.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0)
+                    return null;
+                Thread.Yield();
+            }
+            return $"Thread '{_thread.Name}' was never observed blocked on the catalog monitor within {bound}.";
+        }
+
+        public bool JoinBounded(TimeSpan bound) => !Started || _thread.Join(bound);
+
+        public void ThrowIfFaulted()
+        {
+            if (_fault is not null)
+                ExceptionDispatchInfo.Capture(_fault).Throw();
+        }
+
+        public void DisposeIfCompleted()
+        {
+            if (_done.IsSet)
+                _done.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Shared bounded contention scenario (mirrors HiveConfigFileCatalogSafetyTests): the test
+    /// thread ENTERS the instance's catalog monitor, the dedicated reader thread is POSITIVELY
+    /// observed parked on it, a synchronized writer commits a distinguishing change BEHIND it,
+    /// and the reader's own post-acquisition result must reflect that change. Monitor entry and
+    /// thread start are protected; release and bounded join happen in <c>finally</c>; faults are
+    /// marshaled; the monitor is released before joining.
+    /// </summary>
+    private static T AssertReaderBlocksOnCatalogMonitor<T>(
+        HiveConfigFile config, Func<T> reader, Action commitBehindBlockedReader)
+    {
+        var monitor = HiveCatalogLockField.GetValue(config)!;
+        Assert.Same(monitor, HiveCatalogLockField.GetValue(config));
+
+        T observed = default!;
+        var readerThread = new CapturedThread("composer-catalog-monitor-reader", () => observed = reader());
+
+        string? contentionFailure = null;
+        var committed = false;
+        var monitorEntered = false;
+        bool joined;
+        try
+        {
+            Monitor.Enter(monitor);
+            monitorEntered = true;
+            readerThread.Start();
+
+            contentionFailure = readerThread.WaitUntilBlockedOnMonitor(ContentionObservationBound);
+            if (contentionFailure is null)
+            {
+                commitBehindBlockedReader();
+                committed = true;
+            }
+        }
+        finally
+        {
+            if (monitorEntered && Monitor.IsEntered(monitor))
+                Monitor.Exit(monitor);
+
+            joined = readerThread.JoinBounded(ThreadJoinBound);
+            readerThread.DisposeIfCompleted();
+        }
+
+        Assert.True(joined, "Reader thread did not finish within its join bound after the monitor was released.");
+        readerThread.ThrowIfFaulted();
+        Assert.True(contentionFailure is null, contentionFailure);
+        Assert.True(committed, "The distinguishing write behind the blocked reader was never committed.");
+        return observed;
+    }
+
+    /// <summary>
+    /// Lock-participation proof for the Composer catalog path
+    /// (<see cref="ComposerAgentService.ValidateAvailableModel"/> → its private
+    /// <c>CaptureCatalogSnapshot</c> →
+    /// <see cref="HiveConfigFile.GetAvailableModelsSnapshot"/>): the reader is positively
+    /// observed BLOCKED on the instance's <c>_catalogLock</c> monitor, a synchronized writer
+    /// then commits a new context window behind it, and the returned selection must carry the
+    /// POST-commit value — a post-acquisition observation proving the composer reads the
+    /// catalog through the locked snapshot, not the live graph. The service and config are
+    /// created BEFORE the reader thread starts; the reader body contains no host, LLM, or
+    /// unrelated wait.
+    /// </summary>
+    [Fact]
+    public async Task ValidateAvailableModel_ReaderWaitsForHeldCatalogMonitor_PostAcquisitionContextOnly()
+    {
+        var stateDir = CreateTempDir();
+        ComposerAgentService? service = null;
+        try
+        {
+            // Setup lives INSIDE the protected region: a failure while building the config or
+            // the service still runs the cleanup below.
+            var config = new HiveConfigFile
+            {
+                Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "m", ContextWindow = 1 }] }
+            };
+            service = CreateService(stateDir, hiveConfig: config, model: "m");
+            var reader = service;
+
+            // The helper is fully SYNCHRONOUS: it releases the monitor and boundedly joins the
+            // reader thread before returning, so the awaited disposal in the finally below can
+            // never run while the monitor is held (no Monitor held across await).
+            var observed = AssertReaderBlocksOnCatalogMonitor(
+                config,
+                () => reader.ValidateAvailableModel("m", ReasoningEffort.Medium),
+                () => Assert.True(config.TryUpdateAvailableModel(
+                    "m", new AvailableModelRequest("ignored", 99, null, null))));
+
+            // 1 was the value when the reader started and parked; 99 was committed BEHIND it.
+            // Observing 99 proves the snapshot was taken after acquiring the monitor.
+            Assert.Equal(99, observed.ContextWindow);
+            Assert.Equal("m", observed.Model);
+        }
+        finally
+        {
+            if (service is not null)
+                await service.DisposeAsync();
+            TryDeleteDir(stateDir);
+        }
+    }
 
     /// <summary>
     /// Forces creation of the lazily-created <see cref="SubAgentManager"/> on a
