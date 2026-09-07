@@ -3881,6 +3881,10 @@ file sealed class FakeBrainRepoManager : IBrainRepoManager
         Task.FromResult(false);
     public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
         Task.FromResult(false);
+    /// <summary>Compatibility stub for the managed-fetch member; unused by this fake.</summary>
+    public Task<BrainFetchResult> FetchOriginAsync(string repoName, string? branch = null, CancellationToken ct = default) =>
+        Task.FromResult(new BrainFetchResult(true, string.Empty, null));
+
     public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
         Task.FromResult(new List<string>());
 }

@@ -296,9 +296,27 @@ public sealed class Program
             builder.Services.AddSingleton(sp =>
                 new MetricsTracker(metricsDir, sp.GetRequiredService<ILogger<MetricsTracker>>()));
 
-            // Brain repo manager: persistent read-only clones for Brain file access
+            // Brain repo manager: persistent read-only clones for Brain file access.
+            //
+            // The two credential lookups below are LIVE per-call functions, deliberately NOT
+            // startup snapshots:
+            //   • the token lookup resolves the UserService and asks it for the CURRENT active
+            //     access token on every call, so a token rotation is picked up immediately;
+            //   • the configured-URL lookup reads the LIVE HiveConfigFile.Repositories list at
+            //     call time, so a configuration reload (ReloadFrom) or a repository added/updated
+            //     through ConfigModelService is visible without a restart.
+            // Neither delegate caches a token or a URL, and neither writes anything.
             builder.Services.AddSingleton<IBrainRepoManager>(sp =>
-                new BrainRepoManager(stateDir, sp.GetRequiredService<ILogger<BrainRepoManager>>()));
+                new BrainRepoManager(
+                    stateDir,
+                    sp.GetRequiredService<ILogger<BrainRepoManager>>(),
+                    gitRunner: null,
+                    tokenLookup: ct => sp.GetRequiredService<UserService>().GetActiveAccessTokenAsync(ct),
+                    configuredUrlLookup: repoName => sp.GetService<HiveConfigFile>()
+                        ?.Repositories
+                        ?.FirstOrDefault(r => r is not null
+                            && string.Equals(r.Name, repoName, StringComparison.OrdinalIgnoreCase))
+                        ?.Url));
 
             // Composer attachments: singleton store for chat file attachments
             builder.Services.AddSingleton(sp =>
@@ -1011,8 +1029,12 @@ public sealed class Program
                 {
                     try
                     {
-                        var url = PipelineHelpers.InjectTokenIntoUrl(repo.Url);
-                        await repoManager.EnsureCloneAsync(repo.Name, url, repo.DefaultBranch);
+                        // The CONFIGURED URL is passed through unchanged: the manager itself
+                        // resolves the stored OAuth admin credential (falling back to the
+                        // GH_TOKEN/GITHUB_TOKEN environment chain) and authenticates the clone.
+                        // Pre-injecting an environment credential here would bypass OAuth-only
+                        // installations entirely.
+                        await repoManager.EnsureCloneAsync(repo.Name, repo.Url, repo.DefaultBranch);
                         logger.LogInformation("Cloned/updated repo '{RepoName}' at startup", repo.Name);
                     }
                     catch (Exception ex)

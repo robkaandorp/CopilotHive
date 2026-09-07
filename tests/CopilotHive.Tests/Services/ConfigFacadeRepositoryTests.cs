@@ -519,6 +519,10 @@ internal sealed class FakeBranchRepoManager(Func<string, Task<List<string>>> lis
 {
     public string WorkDirectory => "/fake/work";
 
+    /// <summary>Compatibility stub for the managed-fetch member; unused by this fake.</summary>
+    public Task<BrainFetchResult> FetchOriginAsync(string repoName, string? branch = null, CancellationToken ct = default) =>
+        Task.FromResult(new BrainFetchResult(true, string.Empty, null));
+
     public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default)
         => list(repoName);
 

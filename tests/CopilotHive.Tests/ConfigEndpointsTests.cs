@@ -567,6 +567,10 @@ public class ConfigEndpointsTests
 
         public string WorkDirectory => "/fake/work";
 
+        /// <summary>Compatibility stub for the managed-fetch member; unused by this fake.</summary>
+        public Task<BrainFetchResult> FetchOriginAsync(string repoName, string? branch = null, CancellationToken ct = default) =>
+            Task.FromResult(new BrainFetchResult(true, string.Empty, null));
+
         public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default)
         {
             if (ValidateNames && (string.IsNullOrWhiteSpace(repoName) || repoName.Contains('/') || repoName.Contains("\\") || repoName.Contains("..")))

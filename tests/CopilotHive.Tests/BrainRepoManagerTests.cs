@@ -412,6 +412,309 @@ public sealed class BrainRepoManagerTests : IDisposable
         return repoDir;
     }
 
+    // ── FetchOriginAsync: the managed refresh+fetch API ──────────────────────
+
+    /// <summary>
+    /// A real clone with a real (local) origin: the managed fetch succeeds and actually updates
+    /// the remote-tracking refs, so it is a genuine replacement for a raw `git fetch origin`.
+    /// </summary>
+    [Fact]
+    public async Task FetchOriginAsync_RealClone_FetchesAndUpdatesTrackingRefs()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, manager) = SetupFetchRepo("fetch-repo");
+
+        // Advance the remote by one commit through a separate staging clone.
+        AddRemoteCommit(remoteDir, "staging-fetch", "extra.txt", "extra");
+
+        var result = await manager.FetchOriginAsync("fetch-repo", null, ct);
+
+        Assert.True(result.Success, result.Error);
+        Assert.Null(result.Error);
+        var remoteHead = GitOutput(remoteDir, "rev-parse", "main").Trim();
+        var trackedHead = GitOutput(clonePath, "rev-parse", "origin/main").Trim();
+        Assert.Equal(remoteHead, trackedHead);
+    }
+
+    /// <summary>
+    /// The branch overload uses the FORCED refspec, so a rewound (non-fast-forward) remote branch
+    /// still updates the tracking ref instead of being rejected.
+    /// </summary>
+    [Fact]
+    public async Task FetchOriginAsync_WithBranch_ForceUpdatesTrackingRefOnNonFastForward()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, manager) = SetupFetchRepo("force-repo");
+
+        var firstSha = GitOutput(remoteDir, "rev-list", "--max-parents=0", "main").Trim();
+        AddRemoteCommit(remoteDir, "staging-force", "second.txt", "second");
+
+        var forward = await manager.FetchOriginAsync("force-repo", "main", ct);
+        Assert.True(forward.Success, forward.Error);
+
+        // Rewind the remote branch — a NON-fast-forward change.
+        Git(remoteDir, "update-ref", "refs/heads/main", firstSha);
+
+        var rewound = await manager.FetchOriginAsync("force-repo", "main", ct);
+
+        Assert.True(rewound.Success, rewound.Error);
+        Assert.Equal(firstSha, GitOutput(clonePath, "rev-parse", "origin/main").Trim());
+    }
+
+    [Fact]
+    public async Task FetchOriginAsync_MissingClone_Throws()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            manager.FetchOriginAsync("nonexistent", null, ct));
+
+        Assert.Contains("not cloned", ex.Message);
+    }
+
+    [Fact]
+    public async Task FetchOriginAsync_InvalidRepoName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => manager.FetchOriginAsync("../evil", null, ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => manager.FetchOriginAsync("a/b", null, ct));
+    }
+
+    [Fact]
+    public async Task FetchOriginAsync_InvalidBranchName_ThrowsArgumentException()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (_, _, manager) = SetupFetchRepo("badbranch-repo");
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => manager.FetchOriginAsync("badbranch-repo", "--upload-pack=evil", ct));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => manager.FetchOriginAsync("badbranch-repo", "bad@{branch}", ct));
+    }
+
+    [Fact]
+    public async Task FetchOriginAsync_UnknownBranch_ReturnsFailureInsteadOfThrowing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (_, _, manager) = SetupFetchRepo("nobranch-repo");
+
+        var result = await manager.FetchOriginAsync("nobranch-repo", "does-not-exist", ct);
+
+        Assert.False(result.Success);
+        Assert.NotNull(result.Error);
+        Assert.Empty(result.Output);
+    }
+
+    [Fact]
+    public async Task FetchOriginAsync_CancelledToken_Throws()
+    {
+        var (_, _, manager) = SetupFetchRepo("cancel-fetch-repo");
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.FetchOriginAsync("cancel-fetch-repo", null, cts.Token));
+    }
+
+    /// <summary>
+    /// A LOCAL (non-eligible) origin is never given a credential: the managed fetch behaves
+    /// exactly like the plain fetch it replaces even with both lookups wired up.
+    /// </summary>
+    [Fact]
+    public async Task FetchOriginAsync_LocalOrigin_NeverAttachesACredential()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var remoteDir = Path.Combine(_tempDir, "local-origin-remote");
+        CreateRemote(remoteDir);
+
+        var manager = new BrainRepoManager(
+            _tempDir,
+            NullLogger<BrainRepoManager>.Instance,
+            gitRunner: null,
+            tokenLookup: _ => Task.FromResult<string?>("gho_should_never_be_used"),
+            configuredUrlLookup: _ => remoteDir);
+
+        var clonePath = manager.GetClonePath("local-origin-repo");
+        Git(_tempDir, "clone", remoteDir, clonePath);
+
+        var result = await manager.FetchOriginAsync("local-origin-repo", null, ct);
+
+        Assert.True(result.Success, result.Error);
+        // The persisted origin is still the bare local path — no credential was injected.
+        var origin = GitOutput(clonePath, "remote", "get-url", "origin").Trim();
+        Assert.DoesNotContain("gho_should_never_be_used", origin);
+        Assert.DoesNotContain("x-access-token", origin);
+    }
+
+    // ── FIX 3: fetch-branch validation matches git, not the stricter tag rules ─
+
+    /// <summary>
+    /// Branch names <c>git check-ref-format --branch</c> ACCEPTS must not be rejected by the
+    /// additive fetch path. The stricter <c>ValidateBranchOrTagName</c> rejects a lone <c>@</c>
+    /// component and any component ending in <c>.</c>, but git allows both — so reusing it here
+    /// would reject branches every other Composer git tool happily handles.
+    /// </summary>
+    /// <remarks>
+    /// Each case is verified against the REAL <c>git check-ref-format --branch</c> first, so this
+    /// test asserts parity with git itself rather than against a hand-copied list.
+    /// </remarks>
+    [Theory]
+    [InlineData("topic/@/work")]
+    [InlineData("topic./work")]
+    [InlineData("x/@")]
+    [InlineData("@")]
+    [InlineData("a/@/@/b")]
+    [InlineData("a.locks")]
+    [InlineData("feature/JIRA-123")]
+    [InlineData("release/1.0")]
+    [InlineData("a@b")]
+    [InlineData("a{b")]
+    public void ValidateFetchBranchName_AcceptsEveryNameGitAccepts(string branch)
+    {
+        // Parity guard: git really does accept this name.
+        Assert.True(GitAcceptsBranch(branch), $"Test premise broken: git rejects '{branch}'.");
+
+        // The additive fetch path must accept it too.
+        BrainRepoManager.ValidateFetchBranchName(branch);
+    }
+
+    /// <summary>Names git REJECTS are still rejected, so validation was not simply removed.</summary>
+    [Theory]
+    [InlineData("feature.lock")]
+    [InlineData("a/b.lock")]
+    [InlineData("a/.b")]
+    [InlineData(".a")]
+    [InlineData("a..b")]
+    [InlineData("ref@{0}")]
+    [InlineData("a b")]
+    [InlineData("a~b")]
+    [InlineData("a^b")]
+    [InlineData("a:b")]
+    [InlineData("a?b")]
+    [InlineData("a*b")]
+    [InlineData("a[b")]
+    [InlineData("a//b")]
+    [InlineData("/a")]
+    [InlineData("a/")]
+    [InlineData("a.")]
+    [InlineData("a/b.")]
+    [InlineData("-leading-dash")]
+    public void ValidateFetchBranchName_RejectsEveryNameGitRejects(string branch)
+    {
+        // Parity guard: git really does reject this name.
+        Assert.False(GitAcceptsBranch(branch), $"Test premise broken: git accepts '{branch}'.");
+
+        Assert.Throws<ArgumentException>(() => BrainRepoManager.ValidateFetchBranchName(branch));
+    }
+
+    /// <summary>
+    /// End-to-end against a REAL local repository: a branch git accepts but the tag validator
+    /// rejects can actually be fetched through the managed origin path.
+    /// </summary>
+    [Theory]
+    [InlineData("topic/@/work")]
+    [InlineData("topic./work")]
+    public async Task FetchOriginAsync_BranchGitAcceptsButTagRulesReject_IsFetched(string branch)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, manager) = SetupFetchRepo("odd-branch-repo");
+
+        // Create the awkward branch on the remote.
+        Git(remoteDir, "branch", branch, "main");
+
+        var result = await manager.FetchOriginAsync("odd-branch-repo", branch, ct);
+
+        Assert.True(result.Success, result.Error);
+        // The tracking ref really was created.
+        var tracked = GitOutput(clonePath, "rev-parse", $"origin/{branch}").Trim();
+        Assert.False(string.IsNullOrWhiteSpace(tracked));
+    }
+
+    /// <summary>The stricter tag validator really would have rejected those same names.</summary>
+    [Theory]
+    [InlineData("topic/@/work")]
+    [InlineData("topic./work")]
+    public async Task TagOperations_StillApplyTheStricterTagRules(string name)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (_, _, manager) = SetupFetchRepo("strict-tag-repo");
+
+        // CreateTagAsync/DeleteTagAsync keep using ValidateBranchOrTagName — unchanged behaviour.
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => manager.DeleteTagAsync("strict-tag-repo", name, ct));
+    }
+
+    /// <summary>Runs the REAL git ref-format check so the theories above assert parity with git.</summary>
+    private static bool GitAcceptsBranch(string branch)
+    {
+        var psi = new ProcessStartInfo("git")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("check-ref-format");
+        psi.ArgumentList.Add("--branch");
+        psi.ArgumentList.Add(branch);
+
+        using var p = Process.Start(psi)!;
+        p.StandardOutput.ReadToEnd();
+        p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        return p.ExitCode == 0;
+    }
+
+    // ── Fetch-test helpers ───────────────────────────────────────────────────
+
+    /// <summary>Creates a bare-style remote with one commit on <c>main</c>.</summary>
+    private void CreateRemote(string remoteDir)
+    {
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "main");
+
+        var seed = Path.Combine(_tempDir, Path.GetRandomFileName());
+        Directory.CreateDirectory(seed);
+        Git(seed, "init", "-b", "main");
+        Git(seed, "config", "user.email", "test@test.com");
+        Git(seed, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(seed, "README.md"), "seed\n");
+        Git(seed, "add", "README.md");
+        Git(seed, "commit", "-m", "Initial commit");
+        Git(seed, "remote", "add", "origin", remoteDir);
+        Git(seed, "push", "origin", "main");
+    }
+
+    /// <summary>Creates a remote plus a clone of it registered under <paramref name="repoName"/>.</summary>
+    private (string RemoteDir, string ClonePath, BrainRepoManager Manager) SetupFetchRepo(string repoName)
+    {
+        var remoteDir = Path.Combine(_tempDir, repoName + "-remote");
+        CreateRemote(remoteDir);
+
+        var manager = new BrainRepoManager(_tempDir, NullLogger<BrainRepoManager>.Instance);
+        var clonePath = manager.GetClonePath(repoName);
+        Git(_tempDir, "clone", remoteDir, clonePath);
+        Git(clonePath, "config", "user.email", "test@test.com");
+        Git(clonePath, "config", "user.name", "Test");
+
+        return (remoteDir, clonePath, manager);
+    }
+
+    /// <summary>Pushes one new commit to <paramref name="remoteDir"/>'s <c>main</c>.</summary>
+    private void AddRemoteCommit(string remoteDir, string stagingName, string fileName, string content)
+    {
+        var staging = Path.Combine(_tempDir, stagingName);
+        Git(_tempDir, "clone", remoteDir, staging);
+        Git(staging, "config", "user.email", "test@test.com");
+        Git(staging, "config", "user.name", "Test");
+        File.WriteAllText(Path.Combine(staging, fileName), content);
+        Git(staging, "add", fileName);
+        Git(staging, "commit", "-m", $"Add {fileName}");
+        Git(staging, "push", "origin", "main");
+    }
+
     private static void Git(string workDir, params string[] args)
     {
         var psi = new ProcessStartInfo("git")

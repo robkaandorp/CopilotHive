@@ -857,6 +857,108 @@ public sealed class BrainRepoManagerReleaseOpsTests : IDisposable
         return (remoteDir, clonePath, manager);
     }
 
+    // ---------- Release callers benefit through the manager (no per-caller auth) ----------
+
+    /// <summary>
+    /// End-to-end proof for the RELEASE callers (merge / tag / delete): each one goes through the
+    /// manager, which resolves the credential itself. The callers pass NOTHING credential-related —
+    /// they hand over a repo name only — yet every operation still authenticates and succeeds.
+    /// <para>
+    /// The origin here is a LOCAL path, so it is deliberately ineligible: the manager must leave it
+    /// completely alone and the operation must behave exactly as it always did. That is the
+    /// "no per-caller auth patches" contract: the SAME call sites work whether or not a credential
+    /// applies, because credential handling lives entirely inside the manager.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ReleaseCallers_MergeTagDelete_SucceedThroughTheManagerWithNoCallerAuth()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (remoteDir, clonePath, _) = SetupRepo("release-callers-repo");
+
+        var tokenLookups = 0;
+        // A manager wired exactly like production DI: live token + live configured-URL lookups.
+        var manager = new BrainRepoManager(
+            _tempDir,
+            NullLogger<BrainRepoManager>.Instance,
+            gitRunner: null,
+            tokenLookup: _ => { Interlocked.Increment(ref tokenLookups); return Task.FromResult<string?>("gho_release_token"); },
+            configuredUrlLookup: name => name == "release-callers-repo" ? remoteDir : null);
+
+        CreateBranchWithCommit(remoteDir, "main", "release-1.0", "rel.txt", "release content");
+
+        // 1) Merge — the ReleaseExecutionService call shape, with no auth argument.
+        var mergeSha = await manager.MergeBranchAsync("release-callers-repo", "release-1.0", "main", ct);
+        Assert.NotNull(mergeSha);
+
+        // 2) Tag — likewise.
+        var tagged = await manager.CreateTagAsync("release-callers-repo", "v1.0.0", "main", "Release 1.0.0", ct);
+        Assert.True(tagged);
+
+        // 3) Delete tag — likewise.
+        var deleted = await manager.DeleteTagAsync("release-callers-repo", "v1.0.0", ct);
+        Assert.True(deleted);
+
+        // 4) Delete remote branch — likewise.
+        var branchDeleted = await manager.DeleteRemoteBranchAsync("release-callers-repo", "release-1.0", ct);
+        Assert.Equal(BranchDeleteResult.Success, branchDeleted);
+
+        // A LOCAL origin is ineligible, so no OAuth lookup happened and the origin is untouched.
+        Assert.Equal(0, Volatile.Read(ref tokenLookups));
+        var origin = GitOutput(clonePath, "remote", "get-url", "origin").Trim();
+        Assert.Equal(remoteDir, origin);
+        Assert.DoesNotContain("x-access-token", origin);
+    }
+
+    /// <summary>
+    /// The ConfigModelService add/update shape: a RAW configured URL is handed to
+    /// <c>EnsureCloneAsync</c> with no token pre-injection, and the manager both clones it and
+    /// keeps working on the follow-up (update) call against the same clone.
+    /// </summary>
+    [Fact]
+    public async Task ConfigModelServiceShape_RawUrlAddThenUpdate_WorksThroughTheManager()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var remoteDir = Path.Combine(_tempDir, "cms-remote.git");
+        Directory.CreateDirectory(remoteDir);
+        Git(remoteDir, "init", "--bare", "-b", "main");
+
+        var stagingDir = Path.Combine(_tempDir, "cms-staging");
+        Directory.CreateDirectory(stagingDir);
+        Git(stagingDir, "init", "-b", "main");
+        ConfigureIdentity(stagingDir);
+        File.WriteAllText(Path.Combine(stagingDir, "README.md"), "# CMS\n");
+        Git(stagingDir, "add", "README.md");
+        Git(stagingDir, "commit", "-m", "Initial commit");
+        Git(stagingDir, "remote", "add", "origin", remoteDir);
+        Git(stagingDir, "push", "origin", "main");
+
+        // The LIVE configuration list the DI delegate reads per call.
+        var configured = new List<(string Name, string Url)>();
+        var manager = new BrainRepoManager(
+            _tempDir,
+            NullLogger<BrainRepoManager>.Instance,
+            gitRunner: null,
+            tokenLookup: _ => Task.FromResult<string?>("gho_cms_token"),
+            configuredUrlLookup: name => configured
+                .Where(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase))
+                .Select(r => r.Url)
+                .FirstOrDefault());
+
+        // AddRepositoryAsync: config is written first, THEN the clone runs with the RAW url.
+        configured.Add(("cms-repo", remoteDir));
+        var clonePath = await manager.EnsureCloneAsync("cms-repo", remoteDir, "main", ct);
+        Assert.True(Directory.Exists(Path.Combine(clonePath, ".git")));
+
+        // UpdateRepositoryAsync: the same raw url again, now against an EXISTING clone.
+        var again = await manager.EnsureCloneAsync("cms-repo", remoteDir, "main", ct);
+        Assert.Equal(clonePath, again);
+
+        // No credential was ever injected into the local (ineligible) origin.
+        var origin = GitOutput(clonePath, "remote", "get-url", "origin").Trim();
+        Assert.DoesNotContain("gho_cms_token", origin);
+    }
+
     /// <summary>
     /// Creates a new branch off <paramref name="baseBranch"/> on the remote with a single new
     /// commit adding <paramref name="fileName"/>, using a throwaway staging clone.

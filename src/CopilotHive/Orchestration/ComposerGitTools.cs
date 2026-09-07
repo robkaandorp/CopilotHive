@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using CopilotHive.Git;
+using CopilotHive.Services;
 using SharpCoder;
 
 namespace CopilotHive.Orchestration;
@@ -378,6 +379,60 @@ public sealed partial class Composer
             var rejection = ValidateCheckRefFormatResult(branch, refExit, refStdout, refStderr);
             if (rejection is not null)
                 return rejection;
+        }
+
+        // ORIGIN goes through the manager's LOCKED refresh+fetch so the stored OAuth admin
+        // credential is applied to the very fetch it authenticates — never refresh-then-unlocked-
+        // fetch, which a concurrent operation could slip between. Any OTHER configured remote name
+        // stays on the local runner and is NEVER given the admin credential.
+        if (string.Equals(remote, "origin", StringComparison.Ordinal))
+        {
+            BrainFetchResult fetch;
+            try
+            {
+                // The manager already redacts Output/Error with the operation's own credential,
+                // and applies its own credential-aware boundary to anything it THROWS.
+                fetch = await _repoManager.FetchOriginAsync(repository, branch, cancellationToken);
+            }
+            catch (ArgumentException ex)
+            {
+                // The manager applies its own repo/branch validation. Surface a rejection as a
+                // tool ERROR STRING — this tool never throws for bad input.
+                return $"❌ {GitUrlRedactor.Redact(ex.Message)}";
+            }
+            catch (OperationCanceledException ex)
+            {
+                // Cancellation must keep propagating AS cancellation (callers and the agent host
+                // rely on it), but an arbitrary IBrainRepoManager can throw an OCE whose message or
+                // inner chain embeds a credential. Rethrowing it verbatim would let that payload
+                // escape into logs and agent traces, so a fresh, credential-free OCE carrying the
+                // same token — and NO inner exception — is thrown in its place.
+                throw new OperationCanceledException(
+                    "git fetch origin was cancelled.", ex.CancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // This text becomes tool OUTPUT handed straight to the model, and the Composer
+                // does NOT know the manager's selected credential — so it cannot redact a BARE
+                // token the way the manager can. A URL scanner only removes userinfo from
+                // well-formed URLs, which a bare token is not.
+                //
+                // The exception MESSAGE is therefore never echoed. Only the exception TYPE name is
+                // reported: a type name is structurally incapable of carrying a credential, and it
+                // still tells the model what kind of failure occurred. The real
+                // BrainRepoManager already sanitizes what it throws; this boundary additionally
+                // contains any other IBrainRepoManager implementation.
+                return $"git fetch {remote} failed ({ex.GetType().Name}). "
+                     + "See the orchestrator logs for details.";
+            }
+
+            if (!fetch.Success)
+                return fetch.Error ?? $"git fetch {remote} failed.";
+
+            if (string.IsNullOrWhiteSpace(fetch.Output))
+                return $"Fetched from {remote}. Use git_branch or git_show to inspect fetched refs.";
+
+            return fetch.Output;
         }
 
         string[] args = !string.IsNullOrWhiteSpace(branch)

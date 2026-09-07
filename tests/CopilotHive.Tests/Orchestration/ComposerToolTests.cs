@@ -5053,6 +5053,590 @@ public sealed class ComposerToolTests : IDisposable
         }
     }
 
+    // ── git_fetch: origin routes through the manager's LOCKED refresh+fetch ──
+    //
+    // The ORIGIN fetch must not be a bare local `git fetch` any more: it goes through
+    // IBrainRepoManager.FetchOriginAsync so the credential refresh and the fetch it authenticates
+    // share ONE acquisition of the per-repository lock. Non-origin remotes stay on the local
+    // runner and are never handed the stored admin credential.
+
+    /// <summary>
+    /// Records exactly how the Composer routed a fetch, and lets a test script the outcome.
+    /// Every other member is a compatibility stub — this fake only exists to observe routing.
+    /// </summary>
+    private sealed class RoutingRepoManager(string workDirectory) : IBrainRepoManager
+    {
+        /// <summary>Every (repository, branch) pair passed to <c>FetchOriginAsync</c>, in order.</summary>
+        public List<(string Repo, string? Branch)> FetchCalls { get; } = [];
+
+        /// <summary>The result handed back to the Composer.</summary>
+        public BrainFetchResult Result { get; set; } = new(true, string.Empty, null);
+
+        public string WorkDirectory { get; } = workDirectory;
+
+        public Task<BrainFetchResult> FetchOriginAsync(
+            string repoName, string? branch = null, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            FetchCalls.Add((repoName, branch));
+            return Task.FromResult(Result);
+        }
+
+        public string GetClonePath(string repoName) => Path.Combine(WorkDirectory, repoName);
+
+        public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.FromResult(GetClonePath(repoName));
+        public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+            Task.FromResult(string.Empty);
+        public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+            Task.FromResult(BranchDeleteResult.NotFound);
+        public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult(new List<string>());
+    }
+
+    /// <summary>Builds a Composer over a routing fake whose clone directory really exists.</summary>
+    private (Composer Composer, RoutingRepoManager Manager) CreateRoutingComposer(string tmpDir)
+    {
+        InitTempGitRepo(tmpDir);
+        var barePath = Path.Combine(tmpDir, "remote.git");
+        SetupOriginRemote(tmpDir, barePath);
+
+        var manager = new RoutingRepoManager(Path.Combine(tmpDir, "repos"));
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            repoManager: manager,
+            stateDir: tmpDir);
+
+        return (composer, manager);
+    }
+
+    [Fact]
+    public async Task GitFetch_DefaultOrigin_RoutesThroughTheManagersLockedFetch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+            var call = Assert.Single(manager.FetchCalls);
+            Assert.Equal("test-repo", call.Repo);
+            Assert.Null(call.Branch);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_ExplicitOrigin_RoutesThroughTheManagersLockedFetch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+
+            await composer.GitFetchAsync("test-repo", remote: "origin", cancellationToken: ct);
+
+            Assert.Single(manager.FetchCalls);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>The branch is forwarded so the manager can apply the FORCED tracking refspec.</summary>
+    [Fact]
+    public async Task GitFetch_OriginWithBranch_ForwardsTheBranchToTheManager()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+
+            await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+
+            var call = Assert.Single(manager.FetchCalls);
+            Assert.Equal("main", call.Branch);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// A NON-origin named remote stays on the local runner: the manager's credentialed path is
+    /// never invoked, so the stored admin credential can never reach a foreign remote.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_NonOriginRemote_DoesNotUseTheCredentialedManagerPath()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            // Add a SECOND remote pointing at the same bare repo, under a different name.
+            var repoDir = Path.Combine(tmpDir, "repos", "test-repo");
+            var psi = new System.Diagnostics.ProcessStartInfo("git")
+            {
+                WorkingDirectory = repoDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in new[] { "remote", "add", "upstream", barePath })
+                psi.ArgumentList.Add(a);
+            using (var p = System.Diagnostics.Process.Start(psi)!)
+                await p.WaitForExitAsync(ct);
+
+            var manager = new RoutingRepoManager(Path.Combine(tmpDir, "repos"));
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: manager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", remote: "upstream", cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+            // The credentialed manager path was NOT used for this non-origin remote.
+            Assert.Empty(manager.FetchCalls);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The manager's already-redacted failure text is surfaced verbatim — and a token embedded in
+    /// it by a hostile remote is not re-introduced by the tool.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_OriginFailure_SurfacesTheManagersRedactedError()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+            manager.Result = new BrainFetchResult(
+                false, string.Empty,
+                "git fetch origin failed (exit 128): fatal: unable to access 'https://github.com/acme/widgets.git/': 403");
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.Contains("403", result);
+            Assert.DoesNotContain("x-access-token", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    [Fact]
+    public async Task GitFetch_OriginSuccessWithNoOutput_ReturnsTheFriendlyNotice()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, _) = CreateRoutingComposer(tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.Contains("Fetched from origin", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Routing happens AFTER validation: a rejected remote/branch/repository never reaches the
+    /// manager, so validation cannot be bypassed through the new path.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_RejectedInput_NeverReachesTheManager()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, manager) = CreateRoutingComposer(tmpDir);
+
+            Assert.Contains("❌", await composer.GitFetchAsync("test-repo", remote: "https://evil.com/x", cancellationToken: ct));
+            Assert.Contains("❌", await composer.GitFetchAsync("test-repo", remote: "origin:evil", cancellationToken: ct));
+            Assert.Contains("❌", await composer.GitFetchAsync("test-repo", remote: "nonexistent", cancellationToken: ct));
+            Assert.Contains("❌", await composer.GitFetchAsync("test-repo", branch: "@{-1}", cancellationToken: ct));
+            Assert.Contains("❌", await composer.GitFetchAsync("../etc", cancellationToken: ct));
+            Assert.Contains("❌", await composer.GitFetchAsync("", cancellationToken: ct));
+
+            Assert.Empty(manager.FetchCalls);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// The manager applies its own (stricter) validation. A rejection surfaces as a tool ERROR
+    /// STRING — this tool never throws for bad input, even through the new routing path.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_ManagerRejectsInput_ReturnsAnErrorStringRatherThanThrowing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            // The REAL manager, whose ValidateBranchOrTagName rejects a trailing ".lock".
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", branch: "feature.lock", cancellationToken: ct);
+
+            Assert.Contains("❌", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Cancellation still propagates through the new routing path rather than being swallowed
+    /// into an error string.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_OriginRouting_PropagatesCancellation()
+    {
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            var (composer, _) = CreateRoutingComposer(tmpDir);
+
+            using var cts = new CancellationTokenSource();
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => composer.GitFetchAsync("test-repo", cancellationToken: cts.Token));
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// End-to-end through the REAL manager against a local origin: the routed fetch really does
+    /// update the remote-tracking refs, so routing did not regress the tool's actual behaviour.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_RealManagerOriginRouting_StillUpdatesTrackingRefs()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            // A manager wired exactly like production DI. The origin is a LOCAL path, so it is
+            // ineligible and the credential is never attached — but routing is fully exercised.
+            var repoManager = new BrainRepoManager(
+                tmpDir,
+                NullLogger<BrainRepoManager>.Instance,
+                gitRunner: null,
+                tokenLookup: _ => Task.FromResult<string?>("gho_never_used"),
+                configuredUrlLookup: _ => barePath);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var fetchResult = await composer.GitFetchAsync("test-repo", branch: "main", cancellationToken: ct);
+            Assert.DoesNotContain("❌", fetchResult);
+
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.Contains("origin/main", branches);
+            Assert.DoesNotContain("gho_never_used", fetchResult);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    // ── FIX 2 / FIX 3: throwing managers and git-accepted branches ──
+
+    /// <summary>
+    /// A manager whose fetch THROWS must not let the exception reach the model. The tool output
+    /// is asserted to be free of the credential in every form, and the tool must not itself throw.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_ManagerThrows_ToolOutputCarriesNoCredential()
+    {
+        const string Token = "gho_composer_leak_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            var manager = new ThrowingFetchRepoManager(
+                Path.Combine(tmpDir, "repos"),
+                new InvalidOperationException(
+                    $"transport failed for https://x-access-token:{Token}@github.com/acme/w.git "
+                    + $"(bare {Token})",
+                    new InvalidOperationException($"inner detail carrying {Token}")));
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: manager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+            // Still a useful diagnostic rather than an empty string.
+            Assert.Contains("failed", result, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// Through the REAL manager with a THROWING git-runner seam: the whole stack — manager
+    /// boundary plus the Composer's own construction boundary — keeps the credential out of the
+    /// tool output the model sees.
+    /// </summary>
+    [Fact]
+    public async Task GitFetch_RealManagerWithThrowingRunner_ToolOutputCarriesNoCredential()
+    {
+        const string Token = "gho_real_manager_leak_token";
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+
+            // A seam that answers the LOCAL inspection queries and then THROWS on the fetch,
+            // carrying the credential the manager just selected.
+            var repoManager = new BrainRepoManager(
+                tmpDir,
+                NullLogger<BrainRepoManager>.Instance,
+                gitRunner: request =>
+                {
+                    var a = request.Arguments;
+                    if (a.Count >= 2 && a[0] == "remote" && a[1] == "get-url")
+                        return new BrainGitResult(0, "https://github.com/acme/widgets.git", "");
+                    if (a.Count >= 2 && a[0] == "config" && a[1] == "--get-all")
+                        return new BrainGitResult(1, string.Empty, string.Empty);
+                    if (a.Contains("fetch"))
+                        throw new InvalidOperationException(
+                            $"transport exploded with {Token} embedded");
+                    return new BrainGitResult(0, string.Empty, string.Empty);
+                },
+                tokenLookup: _ => Task.FromResult<string?>(Token),
+                configuredUrlLookup: _ => "https://github.com/acme/widgets.git");
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", cancellationToken: ct);
+
+            Assert.DoesNotContain(Token, result);
+            Assert.DoesNotContain("x-access-token", result);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>
+    /// FIX 3 regression, LOCAL repository, ORIGIN remote: a branch the Composer's own
+    /// <c>check-ref-format</c> validation accepts must actually be fetched through the managed
+    /// origin path rather than rejected by over-strict manager-side validation.
+    /// </summary>
+    [Theory]
+    [InlineData("topic/@/work")]
+    [InlineData("topic./work")]
+    public async Task GitFetch_OriginWithGitAcceptedAwkwardBranch_Succeeds(string branch)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+            CreateBranchOnRemote(barePath, branch);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync("test-repo", branch: branch, cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.Contains($"origin/{branch}", branches);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>The NON-origin path accepts the same git-valid branches — unchanged behaviour.</summary>
+    [Theory]
+    [InlineData("topic/@/work")]
+    [InlineData("topic./work")]
+    public async Task GitFetch_NonOriginWithGitAcceptedAwkwardBranch_Succeeds(string branch)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        try
+        {
+            InitTempGitRepo(tmpDir);
+            var barePath = Path.Combine(tmpDir, "remote.git");
+            SetupOriginRemote(tmpDir, barePath);
+            CreateBranchOnRemote(barePath, branch);
+            AddNamedRemote(tmpDir, "upstream", barePath);
+
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir);
+
+            var result = await composer.GitFetchAsync(
+                "test-repo", remote: "upstream", branch: branch, cancellationToken: ct);
+
+            Assert.DoesNotContain("❌", result);
+
+            var branches = await composer.GitBranchAsync("test-repo", remote: true, cancellationToken: ct);
+            Assert.Contains($"upstream/{branch}", branches);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(tmpDir);
+        }
+    }
+
+    /// <summary>Creates <paramref name="branch"/> on the bare remote, pointing at its HEAD.</summary>
+    private static void CreateBranchOnRemote(string barePath, string branch)
+        => RunPlainGit(barePath, "branch", branch, "HEAD");
+
+    /// <summary>Adds a second remote to the test-repo clone.</summary>
+    private static void AddNamedRemote(string tmpDir, string name, string url)
+        => RunPlainGit(Path.Combine(tmpDir, "repos", "test-repo"), "remote", "add", name, url);
+
+    private static void RunPlainGit(string workDir, params string[] args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        p.StandardOutput.ReadToEnd();
+        p.StandardError.ReadToEnd();
+        p.WaitForExit();
+    }
+
+    /// <summary>An <see cref="IBrainRepoManager"/> whose managed fetch always throws.</summary>
+    private sealed class ThrowingFetchRepoManager(string workDirectory, Exception failure) : IBrainRepoManager
+    {
+        public string WorkDirectory { get; } = workDirectory;
+
+        public Task<BrainFetchResult> FetchOriginAsync(
+            string repoName, string? branch = null, CancellationToken ct = default) => throw failure;
+
+        public string GetClonePath(string repoName) => Path.Combine(WorkDirectory, repoName);
+
+        public Task<string> EnsureCloneAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.FromResult(GetClonePath(repoName));
+        public Task<string> MergeFeatureBranchAsync(string repoName, string featureBranch, string defaultBranch, string commitMessage, CancellationToken ct = default) =>
+            Task.FromResult(string.Empty);
+        public Task<BranchDeleteResult> DeleteRemoteBranchAsync(string repoName, string branchName, CancellationToken ct = default) =>
+            Task.FromResult(BranchDeleteResult.NotFound);
+        public Task<string?> GetHeadShaAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<string?> MergeBranchAsync(string repoName, string sourceBranch, string targetBranch, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<bool> CreateTagAsync(string repoName, string tag, string branch, string message, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<bool> DeleteTagAsync(string repoName, string tag, CancellationToken ct = default) =>
+            Task.FromResult(false);
+        public Task<List<string>> ListRemoteBranchesAsync(string repoName, CancellationToken ct = default) =>
+            Task.FromResult(new List<string>());
+    }
+
     // ── system prompt — repo injection ──
 
     [Fact]
