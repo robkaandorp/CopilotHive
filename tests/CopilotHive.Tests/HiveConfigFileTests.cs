@@ -2216,7 +2216,10 @@ public sealed class HiveConfigFileTests
         Assert.Null(result.ReasoningEffort);            // never inherited from available's "high"
 
         // Negative curated context windows are likewise preserved.
-        config.Models!.SubAgentModels = [new ModelEntry { Name = "m", ContextWindow = -7 }];
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.SubAgentModels = [new ModelEntry { Name = "m", ContextWindow = -7 }];
+        config.Models = models;
         var negative = Assert.Single(config.GetSubAgentModels());
         Assert.Equal(-7, negative.ContextWindow);
     }
@@ -2784,12 +2787,15 @@ public sealed class HiveConfigFileTests
     public void ValidateReasoningEffort_SubAgentModelMissingReasoning_ReturnsErrorPerEntry()
     {
         var config = ValidReasoningConfig();
-        config.Models!.SubAgentModels =
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.SubAgentModels =
         [
             new ModelEntry { Name = "sub-a", ReasoningEffort = "high" },
             new ModelEntry { Name = "sub-b", ReasoningEffort = null },
             new ModelEntry { Name = "sub-c", ReasoningEffort = "bogus" }
         ];
+        config.Models = models;
 
         var errors = config.ValidateReasoningEffort();
 
@@ -2802,12 +2808,15 @@ public sealed class HiveConfigFileTests
     public void ValidateReasoningEffort_DoesNotValidateCompactionOrAvailableModelsList()
     {
         var config = ValidReasoningConfig();
-        config.Models!.CompactionModel = "compaction-model";
-        config.Models.AvailableModels =
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.CompactionModel = "compaction-model";
+        models.AvailableModels =
         [
             new ModelEntry { Name = "available-a", ReasoningEffort = null },
             new ModelEntry { Name = "available-b", ReasoningEffort = "bogus" }
         ];
+        config.Models = models;
         config.Composer!.Model = "composer-model";
 
         Assert.Empty(config.ValidateReasoningEffort());
@@ -2849,7 +2858,10 @@ public sealed class HiveConfigFileTests
     public void ValidateReasoningEffort_ComposerModelSetButAbsentFromCatalog_NoReasoningRequired()
     {
         var config = ValidReasoningConfig();
-        config.Models!.AvailableModels = [new ModelEntry { Name = "other-model" }];
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.AvailableModels = [new ModelEntry { Name = "other-model" }];
+        config.Models = models;
         config.Composer!.ReasoningEffort = null;
 
         Assert.Empty(config.ValidateReasoningEffort());
@@ -2863,7 +2875,10 @@ public sealed class HiveConfigFileTests
     public void ValidateReasoningEffort_ComposerModelSetButNoGlobalCatalog_NoReasoningRequired()
     {
         var config = ValidReasoningConfig();
-        config.Models!.AvailableModels = null;
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.AvailableModels = null;
+        config.Models = models;
         config.Composer!.ReasoningEffort = null;
 
         Assert.Empty(config.ValidateReasoningEffort());

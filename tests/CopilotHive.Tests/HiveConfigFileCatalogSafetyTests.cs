@@ -560,7 +560,10 @@ public sealed class HiveConfigFileCatalogSafetyTests
             config.TryAddAvailableModel(new AvailableModelRequest("a2", 2000, "desc-a2", null));
             // Duplicate multiplicity is part of the preserved state: an exact duplicate pair.
             config.TryAddAvailableModel(new AvailableModelRequest("a-dup", 3000, "dup-1", false));
-            config.Models!.AvailableModels!.Add(MakeEntry("a-dup", 3000, null, "dup-2", true));
+            // Seed via local capture + whole-property reassign (fixture-seeding migration).
+            var models = config.Models;
+            models!.AvailableModels!.Add(MakeEntry("a-dup", 3000, null, "dup-2", true));
+            config.Models = models;
             config.TryAddSubAgentModel(new SubAgentModelRequest("sa1", 4000, ReasoningEffort.High, "sub-a1", null));
             config.TryAddSubAgentModel(new SubAgentModelRequest("sa2", 5000, ReasoningEffort.Low, "sub-a2", false));
             config.SetCompactionModel("cm-a");
@@ -815,7 +818,10 @@ public sealed class HiveConfigFileCatalogSafetyTests
     {
         var config = new HiveConfigFile();
         config.TryAddAvailableModel(new AvailableModelRequest("Target", 1, "old-desc", null));
-        config.Models!.AvailableModels!.Add(MakeEntry("target", 2, "keep-me", "dup-desc", null));
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.AvailableModels!.Add(MakeEntry("target", 2, "keep-me", "dup-desc", null));
+        config.Models = models;
 
         Assert.True(config.TryUpdateAvailableModel(
             "TARGET", new AvailableModelRequest("ignored-name", 77, "new-desc", false)));
@@ -834,7 +840,10 @@ public sealed class HiveConfigFileCatalogSafetyTests
     {
         var config = new HiveConfigFile();
         config.TryAddSubAgentModel(new SubAgentModelRequest("Target", 1, ReasoningEffort.Low, null, null));
-        config.Models!.SubAgentModels!.Add(MakeEntry("target", 2, "high", "dup-desc", null));
+        // Seed via local capture + whole-property reassign (fixture-seeding migration).
+        var models = config.Models;
+        models!.SubAgentModels!.Add(MakeEntry("target", 2, "high", "dup-desc", null));
+        config.Models = models;
 
         Assert.True(config.TryUpdateSubAgentModel(
             "TARGET", new SubAgentModelRequest("ignored-name", 88, ReasoningEffort.None, "new-desc", true)));
