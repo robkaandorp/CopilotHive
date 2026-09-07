@@ -5515,6 +5515,13 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("topic./work")]
     public async Task GitFetch_OriginWithGitAcceptedAwkwardBranch_Succeeds(string branch)
     {
+        // Windows/NTFS refuses to create a directory whose name ends in '.' (e.g. "topic."), so a
+        // loose ref for this branch can't be materialized as a local git ref on Windows even though
+        // git's own check-ref-format validation accepts the name. Covered on Linux, where the
+        // orchestrator/workers actually run.
+        if (OperatingSystem.IsWindows() && HasWindowsIncompatibleRefSegment(branch))
+            Assert.Skip("Windows/NTFS can't create a directory segment ending in '.'; covered on Linux.");
+
         var ct = TestContext.Current.CancellationToken;
         var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         try
@@ -5551,6 +5558,13 @@ public sealed class ComposerToolTests : IDisposable
     [InlineData("topic./work")]
     public async Task GitFetch_NonOriginWithGitAcceptedAwkwardBranch_Succeeds(string branch)
     {
+        // Windows/NTFS refuses to create a directory whose name ends in '.' (e.g. "topic."), so a
+        // loose ref for this branch can't be materialized as a local git ref on Windows even though
+        // git's own check-ref-format validation accepts the name. Covered on Linux, where the
+        // orchestrator/workers actually run.
+        if (OperatingSystem.IsWindows() && HasWindowsIncompatibleRefSegment(branch))
+            Assert.Skip("Windows/NTFS can't create a directory segment ending in '.'; covered on Linux.");
+
         var ct = TestContext.Current.CancellationToken;
         var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         try
@@ -5586,6 +5600,21 @@ public sealed class ComposerToolTests : IDisposable
     /// <summary>Creates <paramref name="branch"/> on the bare remote, pointing at its HEAD.</summary>
     private static void CreateBranchOnRemote(string barePath, string branch)
         => RunPlainGit(barePath, "branch", branch, "HEAD");
+
+    /// <summary>
+    /// True when any path segment of <paramref name="branch"/> ends with '.' — Windows/NTFS refuses
+    /// to create a directory with a trailing dot, so such a branch can't be created as a local loose
+    /// ref on Windows even though git's ref-name validation accepts it.
+    /// </summary>
+    private static bool HasWindowsIncompatibleRefSegment(string branch)
+    {
+        foreach (var segment in branch.Split('/'))
+        {
+            if (segment.EndsWith('.'))
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>Adds a second remote to the test-repo clone.</summary>
     private static void AddNamedRemote(string tmpDir, string name, string url)

@@ -619,6 +619,13 @@ public sealed class BrainRepoManagerTests : IDisposable
     [InlineData("topic./work")]
     public async Task FetchOriginAsync_BranchGitAcceptsButTagRulesReject_IsFetched(string branch)
     {
+        // Windows/NTFS refuses to create a directory whose name ends in '.' (e.g. "topic."), so a
+        // loose ref for this branch can't be materialized as a local git ref on Windows even though
+        // git's own check-ref-format validation accepts the name. Covered on Linux, where the
+        // orchestrator/workers actually run.
+        if (OperatingSystem.IsWindows() && HasWindowsIncompatibleRefSegment(branch))
+            Assert.Skip("Windows/NTFS can't create a directory segment ending in '.'; covered on Linux.");
+
         var ct = TestContext.Current.CancellationToken;
         var (remoteDir, clonePath, manager) = SetupFetchRepo("odd-branch-repo");
 
@@ -645,6 +652,21 @@ public sealed class BrainRepoManagerTests : IDisposable
         // CreateTagAsync/DeleteTagAsync keep using ValidateBranchOrTagName — unchanged behaviour.
         await Assert.ThrowsAsync<ArgumentException>(
             () => manager.DeleteTagAsync("strict-tag-repo", name, ct));
+    }
+
+    /// <summary>
+    /// True when any path segment of <paramref name="branch"/> ends with '.' — Windows/NTFS refuses
+    /// to create a directory with a trailing dot, so such a branch can't be created as a local loose
+    /// ref on Windows even though git's ref-name validation accepts it.
+    /// </summary>
+    private static bool HasWindowsIncompatibleRefSegment(string branch)
+    {
+        foreach (var segment in branch.Split('/'))
+        {
+            if (segment.EndsWith('.'))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Runs the REAL git ref-format check so the theories above assert parity with git.</summary>
