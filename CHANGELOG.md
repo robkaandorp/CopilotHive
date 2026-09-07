@@ -1,19 +1,33 @@
 ## [Unreleased]
 
+## [0.37.0] — 2026-09-07
+
 ### Added
 
-- **Atomic dispatch admission** — Production admission atomically claims the in-memory active-task pointer with `pipeline.TrySetActiveTask` and persists the task-mapping row plus pipeline row in one database transaction through `PersistAdmission`. The persisted claim includes an immutable, validated active-task snapshot captured at claim time. `PersistAdmission` is the exclusive writer of persisted mapping rows on the production ADMISSION PATH; fixture seeding through `SaveTaskMapping` and other persistence operations are not covered by that exclusivity.
+- **Failure-informed resume** — Failed goals can resume from persisted failure context while preserving their existing feature branches, so replanning can target the failure rather than restart blindly. This explicit failed-goal resume is distinct from surviving a live orchestrator restart; unfinished worker-local work is not guaranteed to be preserved.
+- **Work-slot identity and admission** — Dispatch now allocates attempt-stamped task identities and captures slot ownership and lifecycle state. For registered slots, the registry governs completion claim/admission/record handling and rejects abandoned or duplicate completions; legacy `NoSlot` completions still pass through, and accepted no-Brain completions do not record a slot. Cleanup retires slots and schedules replacements safely.
 
 ### Changed
 
-- **Worker TaskId format change** — TaskIds are now attempt-stamped and derived at allocation time through a single atomic in-lock attempt+ID derivation, replacing the previous predicted/external format at the dispatch boundary.
-- **`CompletedPhases` defensive copy** — The pipeline state machine's `CompletedPhases` now returns a point-in-time snapshot instead of a live view.
-- **Mapping registers are memory-only** — `RegisterTask` and `TryRegisterTask` now provide in-memory ownership only and do not perform durable database writes. Dispatch admission uses `PersistAdmission` for the transactional mapping/pipeline write.
-- **SharpCoder 0.19.1 pin** — Both packages pinned at 0.19.1: the gpt-6 family's Responses-endpoint routing fix (models like `gpt-6-astra` no longer fail with `unsupported_api_for_model` through the Composer chat).
+- **Planning and pipeline state integrity** — Replanning remains honestly in `Planning`; repeated phases persist coherent phase/occurrence pairs; state-machine position claims are synchronized; and completed-phase data is returned as a defensive snapshot.
+- **Delivery transaction and admission** — Delivery recovery requeues cancellation before activation, while ambiguous busy/send failures preserve assignment state; separately, dispatch admission validates an immutable pointer snapshot, atomically claims the in-memory pointer, and persists the mapping plus pipeline pointer in one database transaction. Rollback is ownership-checked and logging is guarded. The database transaction does not make memory plus database one linearizable event, and it does not provide durable exactly-once completion or restart safety. The persisted-mapping exclusive-writer rule applies to the production admission path, not direct fixture seeding or other persistence operations.
+- **Completion-owned phase progression** — Sequential-phase pointer release is owned by accepted completion. Transport no longer mutates pipeline pointers or outputs before admission; no-Brain output can be accepted; and a rejected duplicate completion preserves successor state.
+- **SharpCoder dependencies** — SharpCoder and SharpCoder.Providers are both pinned to final 0.19.1, superseding the interim 0.19.0 pin. The Responses routing improvement comes from that dependency; CopilotHive added no provider implementation.
+- **Brain model-tier prompt** — Planning prompts now enumerate valid model-tier values, and stale model comments were removed.
+- **Dispatch preparation maintenance** — Dispatch preparation was extracted into focused internal helpers without changing its public role.
+
+### Fixed
+
+- **Test reliability and coverage** — SQLite fixtures now isolate and dispose cleanly; streaming-status and disposal tests are deterministic, with `ComposerActor` publishing registry `idle` before the final transition callback on all terminal paths; brittle documentation/version-coupling assertions were removed; the independent register-fixture audit was corrected; and the durable-row seeding repair makes cleanup persistence-failure coverage explicit.
 
 ### Breaking Changes
 
-- **Mapping register semantics** — The intentional breaking changes are: `RegisterTask` now refuses duplicate registrations silently instead of overwriting or throwing; durable registration through `RegisterTask` is now memory-only; both registers reject blank input with `ArgumentException` (taskId first, then goalId); and `TryRegisterTask` no longer has a store path, while its obsolete result members remain for compatibility. There is no public semantic compatibility guarantee.
+- **Attempt-stamped worker task IDs** — Worker task IDs now include the attempt identity, but are not guaranteed to be unique across orchestrator restarts.
+- **Mapping register semantics** — `RegisterTask` silently refuses duplicate registration rather than overwriting; register state is memory-only; and both `RegisterTask` and `TryRegisterTask` reject blank input with `ArgumentException`. `TryRegisterTask` no longer has a store path, while its retained result members remain for compatibility. These are intentional public semantic changes despite retained signatures.
+
+### Limitations and upgrade note
+
+- v0.37.0 does not deliver non-destructive orchestrator restart, complete durable reconciliation, or atomic worker reservation. Persisted pipeline progress does not mean live worker attempts or results survive a restart safely. For a planned restart or upgrade, allow active goals and tasks to finish and prevent new work from being dispatched during the maintenance window; no drain command, flag, endpoint, or automatic safety guarantee is provided.
 
 ## [0.36.0] — 2026-08-31
 
