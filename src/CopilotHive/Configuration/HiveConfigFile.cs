@@ -27,8 +27,20 @@ public sealed class HiveConfigFile
     public Dictionary<string, WorkerConfig> Workers { get; set; } = [];
     /// <summary>Orchestrator-level configuration.</summary>
     public OrchestratorConfig Orchestrator { get; set; } = new();
+    /// <summary>
+    /// Internal storage for <see cref="Models"/>. Preparatory refactor: the public property is a
+    /// transparent live get/set over this field (same type, name, null default, and YAML binding);
+    /// owner-internal catalog code reads and writes this field directly. Not YAML-serialized
+    /// directly — the property remains the single YAML-bound surface.
+    /// </summary>
+    private ModelsConfig? _models;
+
     /// <summary>Model-level configuration (compaction model, etc.).</summary>
-    public ModelsConfig? Models { get; set; }
+    public ModelsConfig? Models
+    {
+        get => _models;
+        set => _models = value;
+    }
     /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
     public ComposerConfig? Composer { get; set; }
 
@@ -404,7 +416,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            return Models?.AvailableModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
+            return _models?.AvailableModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
         }
     }
 
@@ -417,7 +429,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            return Models?.SubAgentModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
+            return _models?.SubAgentModels?.Select(e => e is null ? null! : CloneModelEntry(e)).ToList();
         }
     }
 
@@ -433,13 +445,13 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            Models ??= new ModelsConfig();
-            Models.AvailableModels ??= new List<ModelEntry>();
+            _models ??= new ModelsConfig();
+            _models.AvailableModels ??= new List<ModelEntry>();
 
-            if (Models.AvailableModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+            if (_models.AvailableModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
                 return false;
 
-            Models.AvailableModels.Add(new ModelEntry
+            _models.AvailableModels.Add(new ModelEntry
             {
                 Name = request.Name,
                 ContextWindow = request.ContextWindow,
@@ -464,7 +476,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            var entry = Models?.AvailableModels?.FirstOrDefault(
+            var entry = _models?.AvailableModels?.FirstOrDefault(
                 m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
@@ -486,7 +498,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            var list = Models?.AvailableModels;
+            var list = _models?.AvailableModels;
             if (list is null)
                 return false;
 
@@ -510,13 +522,13 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            Models ??= new ModelsConfig();
-            Models.SubAgentModels ??= new List<ModelEntry>();
+            _models ??= new ModelsConfig();
+            _models.SubAgentModels ??= new List<ModelEntry>();
 
-            if (Models.SubAgentModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+            if (_models.SubAgentModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
                 return false;
 
-            Models.SubAgentModels.Add(new ModelEntry
+            _models.SubAgentModels.Add(new ModelEntry
             {
                 Name = request.Name,
                 ContextWindow = request.ContextWindow,
@@ -540,7 +552,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            var entry = Models?.SubAgentModels?.FirstOrDefault(
+            var entry = _models?.SubAgentModels?.FirstOrDefault(
                 m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
@@ -563,7 +575,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            var list = Models?.SubAgentModels;
+            var list = _models?.SubAgentModels;
             if (list is null)
                 return false;
 
@@ -587,7 +599,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            if (efforts is null || Models?.SubAgentModels is not { } subAgentModels)
+            if (efforts is null || _models?.SubAgentModels is not { } subAgentModels)
                 return;
 
             foreach (var entry in subAgentModels)
@@ -607,7 +619,7 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            return Models?.CompactionModel;
+            return _models?.CompactionModel;
         }
     }
 
@@ -619,8 +631,8 @@ public sealed class HiveConfigFile
     {
         lock (_catalogLock)
         {
-            Models ??= new ModelsConfig();
-            Models.CompactionModel = value;
+            _models ??= new ModelsConfig();
+            _models.CompactionModel = value;
         }
     }
 
@@ -651,7 +663,7 @@ public sealed class HiveConfigFile
             Repositories = snapshot.Repositories!;
             Workers = snapshot.Workers!;
             Orchestrator = snapshot.Orchestrator!;
-            Models = snapshot.Models;
+            _models = snapshot.Models;
             Composer = snapshot.Composer;
         }
     }
@@ -679,7 +691,7 @@ public sealed class HiveConfigFile
                         kv => kv.Key,
                         kv => kv.Value is null ? null! : CloneWorker(kv.Value)),
                 Orchestrator = Orchestrator is null ? null : CloneOrchestrator(Orchestrator),
-                Models = Models is null ? null : CloneModels(Models),
+                Models = _models is null ? null : CloneModels(_models),
                 Composer = Composer is null ? null : CloneComposer(Composer)
             };
         }

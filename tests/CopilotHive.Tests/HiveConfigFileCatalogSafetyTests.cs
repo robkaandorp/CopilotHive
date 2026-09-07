@@ -1184,6 +1184,100 @@ public sealed class HiveConfigFileCatalogSafetyTests
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Preparatory _models backing-field refactor: sequential regression
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Preparatory-stage regression for the internal <c>_models</c> backing field: after a WHOLE
+    /// <see cref="HiveConfigFile.Models"/> replacement (and after initialization from
+    /// <see cref="HiveConfigFile.Models"/> = <c>null</c>), the synchronized catalog and compaction
+    /// operations act on the NEW storage and the owner's authoritative accessors
+    /// (<see cref="HiveConfigFile.GetAvailableModelsSnapshot"/>,
+    /// <see cref="HiveConfigFile.GetSubAgentModelsSnapshot"/>,
+    /// <see cref="HiveConfigFile.GetCompactionModel"/>, <see cref="HiveConfigFile.CaptureConfigSnapshot"/>)
+    /// reflect the resulting state, including across a <see cref="HiveConfigFile.ReloadFrom"/>.
+    /// <para>
+    /// The live-identity assertions at the end are SCOPED TO THIS PREPARATORY STAGE ONLY: they pin
+    /// the current transparent get/set (no locking/cloning/normalization in the property). They are
+    /// NOT a permanent promise and must be revisited/removed when the public ownership of
+    /// <see cref="HiveConfigFile.Models"/> changes in a future goal.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void ModelsReplacementThenSynchronizedOperations_BothCatalogsAndCompaction_UseNewStorage()
+    {
+        var config = new HiveConfigFile();
+
+        // ── Initialization from Models = null via the synchronized APIs. ──────
+        Assert.Null(config.GetCompactionModel());
+        Assert.Null(config.GetAvailableModelsSnapshot());
+        Assert.Null(config.GetSubAgentModelsSnapshot());
+
+        Assert.True(config.TryAddAvailableModel(new AvailableModelRequest("avail-a", 100, "desc-a", true)));
+        Assert.True(config.TryAddSubAgentModel(new SubAgentModelRequest("sub-a", 200, ReasoningEffort.Medium, "sub-desc", null)));
+        config.SetCompactionModel("cm-init");
+
+        Assert.Single(config.GetAvailableModelsSnapshot()!);
+        Assert.Single(config.GetSubAgentModelsSnapshot()!);
+        Assert.Equal("cm-init", config.GetCompactionModel());
+
+        // ── WHOLE Models replacement: the synchronized operations must follow the new storage. ──
+        var replacement = new ModelsConfig
+        {
+            CompactionModel = "cm-new",
+            AvailableModels = [MakeEntry("avail-b", 300, null, "desc-b", false)],
+            SubAgentModels = [MakeEntry("sub-b", 400, "high", "sub-desc-b", true)],
+        };
+        config.Models = replacement;
+
+        // Synchronized operations on BOTH catalogs + compaction against the replacement.
+        Assert.True(config.TryAddAvailableModel(new AvailableModelRequest("avail-c", 500, null, null)));
+        Assert.True(config.TryUpdateSubAgentModel("sub-b", new SubAgentModelRequest("ignored", 450, ReasoningEffort.Low, null, null)));
+        config.SetCompactionModel("cm-set-after-replacement");
+
+        // Authoritative owner state reflects the NEW storage only.
+        var availableAfter = config.GetAvailableModelsSnapshot()!;
+        Assert.Equal(2, availableAfter.Count);
+        Assert.Equal(new EntryTuple("avail-b", 300, null, "desc-b", false), TupleOf(availableAfter[0]));
+        Assert.Equal(new EntryTuple("avail-c", 500, null, null, null), TupleOf(availableAfter[1]));
+        Assert.Equal(new EntryTuple("sub-b", 450, "low", null, null),
+            TupleOf(config.GetSubAgentModelsSnapshot()!.Single()));
+        Assert.Equal("cm-set-after-replacement", config.GetCompactionModel());
+
+        // And the replacement instance itself was mutated in place (no copy-on-write redirection).
+        Assert.Equal(2, replacement.AvailableModels!.Count);
+        Assert.Equal("cm-set-after-replacement", replacement.CompactionModel);
+
+        // ── ReloadFrom: the destination adopts the snapshot's Models wholesale. ─────────────
+        var source = new HiveConfigFile();
+        source.TryAddAvailableModel(new AvailableModelRequest("reloaded-avail", 600, null, true));
+        source.TryAddSubAgentModel(new SubAgentModelRequest("reloaded-sub", 700, ReasoningEffort.High, null, false));
+        source.SetCompactionModel("cm-reloaded");
+
+        config.ReloadFrom(source);
+
+        Assert.Null(config.GetAvailableModelsSnapshot()!.OfType<ModelEntry>()
+            .FirstOrDefault(e => e.Name is "avail-b" or "avail-c"));
+        Assert.Equal(new EntryTuple("reloaded-avail", 600, null, null, true),
+            TupleOf(config.GetAvailableModelsSnapshot()!.Single()));
+        Assert.Equal(new EntryTuple("reloaded-sub", 700, "high", null, false),
+            TupleOf(config.GetSubAgentModelsSnapshot()!.Single()));
+        Assert.Equal("cm-reloaded", config.GetCompactionModel());
+        Assert.Equal("cm-reloaded", config.CaptureConfigSnapshot().Models!.CompactionModel);
+
+        // ── PREPARATORY-STAGE-ONLY live-identity assertions (not a permanent promise). ──────
+        var assigned = new ModelsConfig { CompactionModel = "identity-cm" };
+        config.Models = assigned;
+        Assert.Same(assigned, config.Models);                       // setter is transparent
+        config.SetCompactionModel("identity-final");
+        Assert.Equal("identity-final", assigned.CompactionModel);   // writes land on the live instance
+        config.Models = null;
+        Assert.Null(config.GetCompactionModel());
+        Assert.Null(config.GetAvailableModelsSnapshot());
+        Assert.Null(config.GetSubAgentModelsSnapshot());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // SetSubAgentModelReasoningEfforts semantics
     // ═══════════════════════════════════════════════════════════════════════
 
