@@ -386,7 +386,7 @@ else
                             <div style="flex:1;overflow-y:auto;max-height:60vh">
                                 @if (_discoveredModels.Count == 0)
                                 {
-                                    <p style="color:var(--text-muted);font-style:italic">No models discovered. Check provider credentials (GH_TOKEN, OLLAMA_API_KEY/OLLAMA_URL).</p>
+                                    <p style="color:var(--text-muted);font-style:italic">No models discovered. For Copilot models, sign in with GitHub (stored OAuth) or set GH_TOKEN/GITHUB_TOKEN. For Ollama models, set OLLAMA_API_KEY or OLLAMA_URL.</p>
                                 }
                                 else
                                 {

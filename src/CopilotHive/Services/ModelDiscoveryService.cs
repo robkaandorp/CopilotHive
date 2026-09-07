@@ -1,6 +1,8 @@
 using System.Net.Http.Headers;
 using System.Text.Json;
 
+using CopilotHive.Shared;
+
 namespace CopilotHive.Services;
 
 /// <summary>
@@ -23,37 +25,96 @@ public sealed record DiscoveredModel(
 /// </summary>
 public sealed class ModelDiscoveryService
 {
+    /// <summary>
+    /// Fixed, credential-free warning used whenever the stored-OAuth token lookup fails
+    /// for a non-cancellation reason. Exception details are deliberately never logged
+    /// because a lookup exception message can carry credential-bearing data.
+    /// </summary>
+    internal const string OAuthLookupFailedWarning =
+        "Stored GitHub OAuth token lookup failed — falling back to GH_TOKEN/GITHUB_TOKEN environment variables for Copilot model discovery.";
+
     private readonly ILogger<ModelDiscoveryService> _logger;
     private readonly IHttpClientFactory? _httpClientFactory;
+    private readonly Func<CancellationToken, Task<string?>>? _storedTokenLookup;
 
     /// <summary>
     /// Initialises a new <see cref="ModelDiscoveryService"/>.
     /// </summary>
     /// <param name="logger">Logger instance.</param>
     /// <param name="httpClientFactory">Optional HTTP client factory. When null, a new <see cref="HttpClient"/> is created per request.</param>
+    /// <param name="getStoredAccessTokenAsync">
+    /// Optional async lookup of the stored GitHub OAuth access token (e.g.
+    /// <see cref="UserService.GetActiveAccessTokenAsync"/>). When null, only the
+    /// GH_TOKEN/GITHUB_TOKEN environment variables are considered. The lookup is invoked
+    /// PER DISCOVERY CALL — never at construction — so token rotation/removal between calls
+    /// is always observed.
+    /// </param>
     public ModelDiscoveryService(
         ILogger<ModelDiscoveryService> logger,
-        IHttpClientFactory? httpClientFactory = null)
+        IHttpClientFactory? httpClientFactory = null,
+        Func<CancellationToken, Task<string?>>? getStoredAccessTokenAsync = null)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
+        _storedTokenLookup = getStoredAccessTokenAsync;
     }
 
     private HttpClient CreateClient() =>
         _httpClientFactory is not null ? _httpClientFactory.CreateClient() : new HttpClient();
 
     /// <summary>
+    /// Resolves the Copilot credential for ONE discovery invocation, per call:
+    /// first non-whitespace of the stored OAuth token (via the injected lookup),
+    /// then <c>GH_TOKEN</c>, then <c>GITHUB_TOKEN</c>. Selection goes through
+    /// <see cref="GitCredentialResolver.Resolve"/>, which returns the chosen candidate
+    /// UNCHANGED (never trimmed). Null when every source is absent or whitespace.
+    /// </summary>
+    /// <param name="ct">Cancellation token propagated into the stored-token lookup.</param>
+    private async Task<string?> ResolveCopilotCredentialAsync(CancellationToken ct)
+    {
+        string? stored = null;
+        if (_storedTokenLookup is not null)
+        {
+            try
+            {
+                stored = await _storedTokenLookup(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // A non-cancellation lookup failure degrades to the environment chain. The
+                // exception itself is never logged — its message could contain credentials.
+                _logger.LogWarning(OAuthLookupFailedWarning);
+            }
+        }
+
+        return GitCredentialResolver.Resolve(
+            stored,
+            Environment.GetEnvironmentVariable("GH_TOKEN"),
+            Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
+    }
+
+    /// <summary>
     /// Discovers models available via the GitHub Copilot models API.
+    /// The credential is resolved per call (stored OAuth, then GH_TOKEN, then GITHUB_TOKEN).
     /// Returns an empty list if no token is configured or on any failure.
+    /// A caller cancellation is ALWAYS propagated — never swallowed.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
     public async Task<List<DiscoveredModel>> DiscoverCopilotModelsAsync(CancellationToken ct = default)
     {
-        var token = Environment.GetEnvironmentVariable("GH_TOKEN")
-                    ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        ct.ThrowIfCancellationRequested();
+
+        var token = await ResolveCopilotCredentialAsync(ct);
+
+        // Cancellation observed DURING the lookup must terminate the caller even when the
+        // lookup itself answered "no token" (returned null/blank, or failed for a
+        // non-cancellation reason after the token was cancelled). Without this check a
+        // cancelled call with no environment fallback would silently return an empty list.
+        ct.ThrowIfCancellationRequested();
+
         if (string.IsNullOrWhiteSpace(token))
         {
-            _logger.LogWarning("No GH_TOKEN or GITHUB_TOKEN set — skipping Copilot model discovery.");
+            _logger.LogWarning("No stored GitHub OAuth token, GH_TOKEN or GITHUB_TOKEN set — skipping Copilot model discovery.");
             return [];
         }
 
@@ -110,6 +171,12 @@ public sealed class ModelDiscoveryService
                         Enabled: enabled));
                 }
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller cancellation is never a "discovery failed" answer — it must terminate
+            // the caller rather than be swallowed into an empty list.
+            throw;
         }
         catch (Exception ex)
         {
@@ -177,6 +244,12 @@ public sealed class ModelDiscoveryService
                         Enabled: true));
                 }
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller cancellation is never a "discovery failed" answer — it must terminate
+            // the caller rather than be swallowed into an empty list.
+            throw;
         }
         catch (Exception ex)
         {

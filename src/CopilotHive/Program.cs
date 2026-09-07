@@ -169,6 +169,26 @@ public sealed class Program
         return true;
     }
 
+    /// <summary>
+    /// Registers <see cref="ModelDiscoveryService"/> with an async token lookup wired to
+    /// <see cref="UserService.GetActiveAccessTokenAsync"/>. Extracted as a named helper so the
+    /// production wiring is verifiable without booting the host; tests can assert the seam by
+    /// invoking this method against a test service provider.
+    /// </summary>
+    /// <remarks>
+    /// The lookup lambda defers to the provider at INVOKE time — the service resolves the token
+    /// per discovery call, so OAuth rotation/removal between calls is always observed. No token
+    /// is captured at registration or singleton construction.
+    /// </remarks>
+    /// <param name="services">The service collection to register into.</param>
+    internal static void AddModelDiscovery(IServiceCollection services)
+    {
+        services.AddSingleton(sp => new ModelDiscoveryService(
+            sp.GetRequiredService<ILogger<ModelDiscoveryService>>(),
+            sp.GetService<IHttpClientFactory>(),
+            ct => sp.GetRequiredService<UserService>().GetActiveAccessTokenAsync(ct)));
+    }
+
     private static async Task<int> Main(string[] args)
     {
         // ── Server mode (only mode) ──────────────────────────────────────────────────
@@ -325,7 +345,7 @@ public sealed class Program
                 builder.Services.AddSingleton<KnowledgeDocumentCleanupService>();
 
                 builder.Services.AddSingleton<ConfigModelService>();
-                builder.Services.AddSingleton<ModelDiscoveryService>();
+                AddModelDiscovery(builder.Services);
                 builder.Services.AddSingleton(sp => new ReleaseExecutionService(
                     sp.GetRequiredService<IGoalStore>(), hiveConfigFile,
                     sp.GetRequiredService<IBrainRepoManager>(),
