@@ -19,10 +19,27 @@ public sealed class ConfigModelService
     private readonly IBrainRepoManager? _repoManager;
 
     /// <summary>
-    /// Serialises the authoritative read-modify-write-commit transaction in
-    /// <see cref="SaveModelConfigAsync"/>. The shared <see cref="HiveConfigFile"/> singleton is the
-    /// runtime source of truth, so concurrent PATCH requests must not interleave validation,
-    /// mutation, file writes, commits or the live Brain update.
+    /// Serialises the authoritative read-modify-write-commit transactions of this service. The
+    /// shared <see cref="HiveConfigFile"/> singleton is the runtime source of truth, so concurrent
+    /// requests must not interleave validation, mutation, file writes, commits or the live Brain
+    /// update.
+    /// <para>
+    /// Eight substantive participants hold this semaphore: the six catalog CRUD writers
+    /// (<see cref="AddAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
+    /// <see cref="UpdateAvailableModelAsync(string,int?,string?,bool?,CancellationToken)"/>,
+    /// <see cref="RemoveAvailableModelAsync"/>,
+    /// <see cref="AddSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>,
+    /// <see cref="UpdateSubAgentModelAsync(string,int?,ReasoningEffort?,string?,bool?,CancellationToken)"/>
+    /// and <see cref="RemoveSubAgentModelAsync"/>), plus <see cref="SaveModelConfigAsync"/> and
+    /// <see cref="UpdateComposerSettingsAsync"/>. The compatibility overloads delegate to their
+    /// full-arity counterparts and must NEVER acquire the semaphore themselves — a nested
+    /// acquisition would deadlock.
+    /// </para>
+    /// <para>
+    /// Lock order: this semaphore is always acquired BEFORE any <see cref="HiveConfigFile"/>
+    /// catalog operation. Those APIs take their own internal monitor for the duration of a single
+    /// synchronous mutation only; that monitor is never held across async file, git or Brain calls.
+    /// </para>
     /// </summary>
     private readonly SemaphoreSlim _saveLock = new(1, 1);
 
@@ -139,7 +156,7 @@ public sealed class ConfigModelService
     /// <param name="update">The pending model configuration update.</param>
     private void ValidateReasoningEfforts(ModelConfigUpdate update)
     {
-        var knownSubAgentNames = _config.Models?.SubAgentModels?
+        var knownSubAgentNames = _config.GetSubAgentModelsSnapshot()?
             .Select(m => m.Name)
             .Where(n => !string.IsNullOrEmpty(n))
             .ToList() ?? [];
@@ -242,15 +259,11 @@ public sealed class ConfigModelService
                 }
             }
 
-            if (update.SubAgentModelReasoning is not null && _config.Models?.SubAgentModels is { } subAgentModels)
-            {
-                foreach (var entry in subAgentModels)
-                {
-                    if (!TryGetIgnoreCase(update.SubAgentModelReasoning, entry.Name, out var value) || value is null)
-                        continue;
-                    entry.ReasoningEffort = ReasoningEffortConverter.Format(value);
-                }
-            }
+            // Unknown names are ignored and null values are no-ops; case-insensitive duplicate
+            // keys for known names were already rejected by ValidateReasoningEfforts above, so
+            // no mutation can depend on JSON property order.
+            if (update.SubAgentModelReasoning is not null)
+                _config.SetSubAgentModelReasoningEfforts(update.SubAgentModelReasoning);
 
             // ── Step 3: persist (write + commit) ────────────────────────────
             var message = $"chore: update model configuration — {update.Description}";
@@ -332,26 +345,22 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        _config.Models ??= new ModelsConfig();
-        _config.Models.AvailableModels ??= new List<ModelEntry>();
-
-        if (_config.Models.AvailableModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"Model '{name}' already exists in available_models");
-
-        _config.Models.AvailableModels.Add(new ModelEntry
+        await _saveLock.WaitAsync(ct);
+        try
         {
-            Name = name,
-            ContextWindow = contextWindow,
-            ReasoningEffort = null,
-            Description = description,
-            SupportsVision = supportsVision
-        });
+            if (!_config.TryAddAvailableModel(new AvailableModelRequest(name, contextWindow, description, supportsVision)))
+                throw new InvalidOperationException($"Model '{name}' already exists in available_models");
 
-        var message = $"chore: add available model '{name}'";
-        _logger.LogInformation("Adding available model: {Name}", name);
+            var message = $"chore: add available model '{name}'";
+            _logger.LogInformation("Adding available model: {Name}", name);
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>
@@ -376,20 +385,22 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateAvailableModelAsync(string name, int? contextWindow, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        var model = _config.Models?.AvailableModels?
-            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (model is null)
-            throw new InvalidOperationException($"Model '{name}' not found in available_models");
+        await _saveLock.WaitAsync(ct);
+        try
+        {
+            if (!_config.TryUpdateAvailableModel(name, new AvailableModelRequest(name, contextWindow, description, supportsVision)))
+                throw new InvalidOperationException($"Model '{name}' not found in available_models");
 
-        model.ContextWindow = contextWindow;
-        model.Description = description;
-        model.SupportsVision = supportsVision;
+            var message = $"chore: update available model '{name}'";
+            _logger.LogInformation("Updating available model: {Name}", name);
 
-        var message = $"chore: update available model '{name}'";
-        _logger.LogInformation("Updating available model: {Name}", name);
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>
@@ -399,19 +410,23 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task<bool> RemoveAvailableModelAsync(string name, CancellationToken ct = default)
     {
-        var model = _config.Models?.AvailableModels?
-            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (model is null)
-            return false;
+        await _saveLock.WaitAsync(ct);
+        try
+        {
+            if (!_config.TryRemoveAvailableModel(name))
+                return false;
 
-        _config.Models!.AvailableModels!.Remove(model);
+            var message = $"chore: remove available model '{name}'";
+            _logger.LogInformation("Removing available model: {Name}", name);
 
-        var message = $"chore: remove available model '{name}'";
-        _logger.LogInformation("Removing available model: {Name}", name);
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
-        return true;
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            return true;
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>
@@ -438,31 +453,27 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task AddSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        _config.Models ??= new ModelsConfig();
-        _config.Models.SubAgentModels ??= new List<ModelEntry>();
-
-        // Reasoning effort comes exclusively from the explicit request field (already a validated
-        // enum — the JSON layer rejects unknown wire values); the model name is stored plain.
-        // ModelEntry is YAML-bound and stays string?, so the enum is formatted to its wire form.
-        var effectiveReasoningEffort = ReasoningEffortConverter.Format(reasoningEffort);
-
-        if (_config.Models.SubAgentModels.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"Model '{name}' already exists in sub_agent_models");
-
-        _config.Models.SubAgentModels.Add(new ModelEntry
+        await _saveLock.WaitAsync(ct);
+        try
         {
-            Name = name,
-            ContextWindow = contextWindow,
-            ReasoningEffort = effectiveReasoningEffort,
-            Description = description,
-            SupportsVision = supportsVision
-        });
+            // Reasoning effort comes exclusively from the explicit request field (already a validated
+            // enum — the JSON layer rejects unknown wire values); the model name is stored plain.
+            // ModelEntry is YAML-bound and stays string?, so the catalog API formats the enum to its
+            // canonical wire form.
+            if (!_config.TryAddSubAgentModel(
+                    new SubAgentModelRequest(name, contextWindow, reasoningEffort, description, supportsVision)))
+                throw new InvalidOperationException($"Model '{name}' already exists in sub_agent_models");
 
-        var message = $"chore: add sub-agent model '{name}'";
-        _logger.LogInformation("Adding sub-agent model: {Name}", name);
+            var message = $"chore: add sub-agent model '{name}'";
+            _logger.LogInformation("Adding sub-agent model: {Name}", name);
 
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>
@@ -488,22 +499,25 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task UpdateSubAgentModelAsync(string name, int? contextWindow, ReasoningEffort? reasoningEffort, string? description, bool? supportsVision, CancellationToken ct = default)
     {
-        var model = _config.Models?.SubAgentModels?
-            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (model is null)
-            throw new InvalidOperationException($"Model '{name}' not found in sub_agent_models");
+        await _saveLock.WaitAsync(ct);
+        try
+        {
+            // ModelEntry stays YAML-bound (string?): the catalog API formats the enum to its
+            // canonical wire form, and a null effort clears the stored value.
+            if (!_config.TryUpdateSubAgentModel(
+                    name, new SubAgentModelRequest(name, contextWindow, reasoningEffort, description, supportsVision)))
+                throw new InvalidOperationException($"Model '{name}' not found in sub_agent_models");
 
-        model.ContextWindow = contextWindow;
-        // ModelEntry stays YAML-bound (string?): format the enum to its canonical wire form.
-        model.ReasoningEffort = ReasoningEffortConverter.Format(reasoningEffort);
-        model.Description = description;
-        model.SupportsVision = supportsVision;
+            var message = $"chore: update sub-agent model '{name}'";
+            _logger.LogInformation("Updating sub-agent model: {Name}", name);
 
-        var message = $"chore: update sub-agent model '{name}'";
-        _logger.LogInformation("Updating sub-agent model: {Name}", name);
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>
@@ -513,19 +527,23 @@ public sealed class ConfigModelService
     /// <param name="ct">Cancellation token.</param>
     public async Task<bool> RemoveSubAgentModelAsync(string name, CancellationToken ct = default)
     {
-        var model = _config.Models?.SubAgentModels?
-            .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (model is null)
-            return false;
+        await _saveLock.WaitAsync(ct);
+        try
+        {
+            if (!_config.TryRemoveSubAgentModel(name))
+                return false;
 
-        _config.Models!.SubAgentModels!.Remove(model);
+            var message = $"chore: remove sub-agent model '{name}'";
+            _logger.LogInformation("Removing sub-agent model: {Name}", name);
 
-        var message = $"chore: remove sub-agent model '{name}'";
-        _logger.LogInformation("Removing sub-agent model: {Name}", name);
-
-        await _configRepo.WriteConfigAsync(_config, ct);
-        await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
-        return true;
+            await _configRepo.WriteConfigAsync(_config, ct);
+            await _configRepo.CommitFileAsync("hive-config.yaml", message, ct);
+            return true;
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
 
     /// <summary>

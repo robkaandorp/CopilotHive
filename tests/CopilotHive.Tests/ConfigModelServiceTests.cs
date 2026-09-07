@@ -1784,38 +1784,48 @@ public sealed class ConfigModelServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task UpdateComposerSettingsAsync_ServiceLockSerializes()
+    public async Task UpdateComposerSettingsAsync_WaitsBehindCatalogCrudOnSharedServiceLock()
     {
-        var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
+        var config = CreateCatalogConcurrencyConfig();
         var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        // First call enters the lock and parks inside CommitFileAsync until we release it.
-        var first = svc.UpdateComposerSettingsAsync(
-            new ComposerSettingsUpdate(EventNotificationsMode: "active"),
-            TestContext.Current.CancellationToken);
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        // Cleanup protection is established BEFORE the holder starts and before any gate-entry
+        // or YAML read is awaited, so a timeout in setup can never strand the gate.
+        try
+        {
+            var crud = pending.Track("crud", svc.AddAvailableModelAsync(
+                "composer-holder-model", 64000, "holder", supportsVision: false,
+                TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
 
-        await repo.CommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            var composer = pending.Track("composer", svc.UpdateComposerSettingsAsync(
+                new ComposerSettingsUpdate(MaxSteps: 77),
+                TestContext.Current.CancellationToken));
 
-        // Second call must block on the save lock — it cannot mutate or commit yet.
-        var second = svc.UpdateComposerSettingsAsync(
-            new ComposerSettingsUpdate(EventNotificationsMode: "off"),
-            TestContext.Current.CancellationToken);
+            Assert.False(composer.IsCompleted);
+            Assert.Null(config.Composer);
+            Assert.Equal(1, repo.CommitCalls);
 
-        var completedEarly = await Task.WhenAny(second, Task.Delay(500, TestContext.Current.CancellationToken));
-        Assert.NotSame(second, completedEarly);
-        Assert.False(second.IsCompleted, "Second UpdateComposerSettingsAsync must block until the first releases the lock.");
-        Assert.Equal(1, repo.CommitCalls);
-        // Without the lock the second caller would already have overwritten the singleton here.
-        Assert.Equal("active", config.Composer!.EventNotifications!.Mode);
+            var parkedYaml = await ReadWrittenYamlAsync();
+            Assert.Contains("composer-holder-model", parkedYaml, StringComparison.Ordinal);
+            Assert.DoesNotContain("max_steps: 77", parkedYaml, StringComparison.Ordinal);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
 
-        // Release the first call; only then may the second proceed.
-        repo.Release();
-        await first.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        await second.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-
-        Assert.Equal(2, repo.CommitCalls);
-        Assert.Equal("off", config.Composer!.EventNotifications!.Mode);
+        AssertDrainedCleanly(drained);
+        Assert.Equal(77, config.Composer!.MaxSteps);
+        Assert.Contains("max_steps: 77", await ReadWrittenYamlAsync(), StringComparison.Ordinal);
+        Assert.Collection(
+            repo.CommitObservations,
+            first => Assert.Contains("add available model 'composer-holder-model'", first.Message, StringComparison.Ordinal),
+            second => Assert.Contains("update composer settings", second.Message, StringComparison.Ordinal));
     }
 
     // ── Clone-triggering tests ─────────────────────────────────────────────────
@@ -2679,15 +2689,13 @@ public sealed class ConfigModelServiceTests : IDisposable
         var saveTask = svc.SaveModelConfigAsync(update, cts.Token);
 
         // Wait for the commit to be entered (persistence has started).
-        await repo.CommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
 
         // Cancel the live token while the commit is blocked on the gate.
         await cts.CancelAsync();
 
-#pragma warning disable xUnit1051 // Timeout-only WaitAsync is intentional: a timeout must surface as TimeoutException, not OCE
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => saveTask.WaitAsync(TimeSpan.FromSeconds(10)));
-#pragma warning restore xUnit1051
+        // Timeout-only WaitAsync is intentional: a timeout must surface as TimeoutException, not OCE.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(saveTask));
 
         Assert.Equal(0, brain.UpdateModelCalls);
         Assert.Empty(repo.Commits);
@@ -2707,12 +2715,15 @@ public sealed class ConfigModelServiceTests : IDisposable
         var saveTask = svc.SaveModelConfigAsync(update, cts.Token);
 
         // Wait for the live Brain update to be entered (persistence already succeeded).
-        await brain.UpdateEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await brain.UpdateEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
 
         // Cancel the live token while the brain update is blocked.
         await cts.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => saveTask);
+        // Bounded timeout-only: if the Brain update stops honouring the live token the wait
+        // fails with TimeoutException rather than hanging, and the bound can never manufacture
+        // the OperationCanceledException this assertion demands.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Bounded(saveTask));
 
         // Persistence completed; the OCE from the brain update propagated.
         Assert.Equal(1, brain.UpdateModelCalls);
@@ -2946,32 +2957,40 @@ public sealed class ConfigModelServiceTests : IDisposable
         var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
-        // First call enters the lock and parks inside CommitFileAsync until we release it.
-        var first = svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
-            TestContext.Current.CancellationToken);
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var first = pending.Track("first", svc.SaveModelConfigAsync(
+                new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
+                TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
 
-        await repo.CommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            var firstYaml = await ReadWrittenYamlAsync();
+            var second = pending.Track("second", svc.SaveModelConfigAsync(
+                new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.Low),
+                TestContext.Current.CancellationToken));
 
-        // Second call must block on the save lock — it cannot mutate or commit yet.
-        var second = svc.SaveModelConfigAsync(
-            new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.Low),
-            TestContext.Current.CancellationToken);
+            Assert.False(second.IsCompleted);
+            Assert.Equal("high", config.Orchestrator.ReasoningEffort);
+            Assert.Equal(firstYaml, await ReadWrittenYamlAsync());
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
 
-        var completedEarly = await Task.WhenAny(second, Task.Delay(500, TestContext.Current.CancellationToken));
-        Assert.NotSame(second, completedEarly);
-        Assert.False(second.IsCompleted, "Second SaveModelConfigAsync must block until the first releases the lock.");
-        Assert.Equal(1, repo.CommitCalls);
-        // Without the lock the second caller would already have overwritten the singleton here.
-        Assert.Equal("high", config.Orchestrator.ReasoningEffort);
-
-        // Release the first call; only then may the second proceed.
-        repo.Release();
-        await first.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        await second.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-
-        Assert.Equal(2, repo.CommitCalls);
+        AssertDrainedCleanly(drained);
         Assert.Equal("low", config.Orchestrator.ReasoningEffort);
+        Assert.Equal("low", ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync()).Orchestrator.ReasoningEffort);
+        Assert.Collection(
+            repo.CommitObservations,
+            firstCommit => Assert.Contains("orchestrator reasoning→high", firstCommit.Message, StringComparison.Ordinal),
+            secondCommit => Assert.Contains("orchestrator reasoning→low", secondCommit.Message, StringComparison.Ordinal));
+        Assert.Contains("reasoning_effort: high", repo.CommitObservations[0].Yaml, StringComparison.Ordinal);
+        Assert.Contains("reasoning_effort: low", repo.CommitObservations[1].Yaml, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2991,10 +3010,11 @@ public sealed class ConfigModelServiceTests : IDisposable
                 }),
             TestContext.Current.CancellationToken));
 
-        // The finally block must have released the semaphore.
-        await svc.SaveModelConfigAsync(
+        // The finally block must have released the semaphore. Bounded timeout-only so an
+        // omitted release fails with a TimeoutException instead of hanging the run.
+        await Bounded(svc.SaveModelConfigAsync(
             new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
-            TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            TestContext.Current.CancellationToken));
 
         Assert.Equal("high", config.Orchestrator.ReasoningEffort);
     }
@@ -3082,6 +3102,677 @@ public sealed class ConfigModelServiceTests : IDisposable
         Assert.Equal("low", reloaded.Workers["coder"].PremiumReasoningEffort);
         Assert.Equal("low", reloaded.Models!.SubAgentModels![0].ReasoningEffort);
     }
+
+    // ── Catalog writer serialization ──────────────────────────────────────────
+
+    [Theory]
+    [InlineData(CatalogCrudPath.AddAvailable)]
+    [InlineData(CatalogCrudPath.UpdateAvailable)]
+    [InlineData(CatalogCrudPath.RemoveAvailable)]
+    [InlineData(CatalogCrudPath.AddSubAgent)]
+    [InlineData(CatalogCrudPath.UpdateSubAgent)]
+    [InlineData(CatalogCrudPath.RemoveSubAgent)]
+    public async Task CatalogCrudAsync_WaitsBehindModelSave_WithoutMutationOrPersistence(CatalogCrudPath path)
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var save = pending.Track("save", svc.SaveModelConfigAsync(
+                new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
+                TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+            var parkedYaml = await ReadWrittenYamlAsync();
+
+            var crud = pending.Track("crud", InvokeCatalogCrudAsync(svc, path, TestContext.Current.CancellationToken));
+
+            Assert.False(crud.IsCompleted);
+            AssertCrudNotApplied(config, path);
+            Assert.Equal(parkedYaml, await ReadWrittenYamlAsync());
+            AssertCrudNotApplied(ConfigRepoManager.ParseConfig(parkedYaml), path);
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
+
+        AssertDrainedCleanly(drained);
+        AssertCrudApplied(config, path);
+        AssertCrudApplied(ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync()), path);
+        Assert.Collection(
+            repo.CommitObservations,
+            first =>
+            {
+                Assert.Contains("update model configuration", first.Message, StringComparison.Ordinal);
+                AssertCrudNotApplied(ConfigRepoManager.ParseConfig(first.Yaml), path);
+            },
+            second =>
+            {
+                Assert.Contains(ExpectedCommitFragment(path), second.Message, StringComparison.Ordinal);
+                AssertCrudApplied(ConfigRepoManager.ParseConfig(second.Yaml), path);
+            });
+    }
+
+    [Fact]
+    public async Task SaveModelConfigAsync_WaitsBehindCatalogCrud_AndCommitsSecondSnapshot()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var crud = pending.Track("crud", InvokeCatalogCrudAsync(
+                svc, CatalogCrudPath.UpdateAvailable, TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+            var parkedYaml = await ReadWrittenYamlAsync();
+
+            var save = pending.Track("save", svc.SaveModelConfigAsync(
+                new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
+                TestContext.Current.CancellationToken));
+
+            Assert.False(save.IsCompleted);
+            AssertCrudApplied(config, CatalogCrudPath.UpdateAvailable);
+            Assert.Equal("low", config.Orchestrator.ReasoningEffort);
+            Assert.Equal(parkedYaml, await ReadWrittenYamlAsync());
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
+
+        AssertDrainedCleanly(drained);
+        Assert.Equal("high", config.Orchestrator.ReasoningEffort);
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        AssertCrudApplied(persisted, CatalogCrudPath.UpdateAvailable);
+        Assert.Equal("high", persisted.Orchestrator.ReasoningEffort);
+        Assert.Collection(
+            repo.CommitObservations,
+            first => Assert.Contains(ExpectedCommitFragment(CatalogCrudPath.UpdateAvailable), first.Message, StringComparison.Ordinal),
+            second => Assert.Contains("update model configuration", second.Message, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CatalogCrudAsync_WaitsBehindOtherCatalogCrud_AndPreservesCommitOrder()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var first = pending.Track("first", InvokeCatalogCrudAsync(
+                svc, CatalogCrudPath.RemoveAvailable, TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+            var parkedYaml = await ReadWrittenYamlAsync();
+
+            var second = pending.Track("second", InvokeCatalogCrudAsync(
+                svc, CatalogCrudPath.UpdateSubAgent, TestContext.Current.CancellationToken));
+
+            Assert.False(second.IsCompleted);
+            AssertCrudApplied(config, CatalogCrudPath.RemoveAvailable);
+            AssertCrudNotApplied(config, CatalogCrudPath.UpdateSubAgent);
+            Assert.Equal(parkedYaml, await ReadWrittenYamlAsync());
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
+
+        AssertDrainedCleanly(drained);
+        AssertCrudApplied(config, CatalogCrudPath.RemoveAvailable);
+        AssertCrudApplied(config, CatalogCrudPath.UpdateSubAgent);
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        AssertCrudApplied(persisted, CatalogCrudPath.RemoveAvailable);
+        AssertCrudApplied(persisted, CatalogCrudPath.UpdateSubAgent);
+        Assert.Collection(
+            repo.CommitObservations,
+            firstCommit => Assert.Contains(ExpectedCommitFragment(CatalogCrudPath.RemoveAvailable), firstCommit.Message, StringComparison.Ordinal),
+            secondCommit => Assert.Contains(ExpectedCommitFragment(CatalogCrudPath.UpdateSubAgent), secondCommit.Message, StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConcurrentDuplicateCatalogAdds_StoreAndPersistExactlyOneEntry(bool subAgent)
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            _ = pending.Track("first", subAgent
+                ? svc.AddSubAgentModelAsync("duplicate-model", 111000, ReasoningEffort.High, "winner", true, TestContext.Current.CancellationToken)
+                : svc.AddAvailableModelAsync("duplicate-model", 111000, "winner", true, TestContext.Current.CancellationToken));
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+
+            var duplicate = pending.Track("duplicate", subAgent
+                ? svc.AddSubAgentModelAsync("DUPLICATE-MODEL", 222000, ReasoningEffort.Low, "loser", false, TestContext.Current.CancellationToken)
+                : svc.AddAvailableModelAsync("DUPLICATE-MODEL", 222000, "loser", false, TestContext.Current.CancellationToken));
+
+            Assert.False(duplicate.IsCompleted);
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
+
+        // Every task was drained before any of them is adjudicated, so a fault on one never
+        // skips the others.
+        AssertDrainedCleanly(drained, "duplicate");
+        var duplicateError = Assert.IsType<InvalidOperationException>(DrainErrorFor(drained, "duplicate"));
+        Assert.Contains("already exists", duplicateError.Message, StringComparison.Ordinal);
+        var entries = subAgent ? config.Models!.SubAgentModels! : config.Models!.AvailableModels!;
+        var stored = Assert.Single(entries, m => string.Equals(m.Name, "duplicate-model", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(111000, stored.ContextWindow);
+        Assert.Equal("winner", stored.Description);
+        Assert.True(stored.SupportsVision);
+        Assert.Single(repo.CommitObservations);
+
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        var persistedEntries = subAgent ? persisted.Models!.SubAgentModels! : persisted.Models!.AvailableModels!;
+        Assert.Single(persistedEntries, m => string.Equals(m.Name, "duplicate-model", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain("loser", await ReadWrittenYamlAsync(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(CatalogCrudPath.AddAvailable)]
+    [InlineData(CatalogCrudPath.UpdateAvailable)]
+    [InlineData(CatalogCrudPath.RemoveAvailable)]
+    [InlineData(CatalogCrudPath.AddSubAgent)]
+    [InlineData(CatalogCrudPath.UpdateSubAgent)]
+    [InlineData(CatalogCrudPath.RemoveSubAgent)]
+    public async Task CatalogCrudAsync_PreCancelled_DoesNotMutateWriteCommitOrLeakPermit(CatalogCrudPath path)
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => InvokeCatalogCrudAsync(svc, path, cts.Token));
+
+        AssertCrudNotApplied(config, path);
+        Assert.False(File.Exists(Path.Combine(_tempDir, "hive-config.yaml")));
+        Assert.Equal(0, repo.CommitCalls);
+        // Bounded timeout-only: a leaked permit must fail as a TimeoutException, never hang.
+        Assert.False(await Bounded(
+            svc.RemoveAvailableModelAsync("missing", TestContext.Current.CancellationToken)));
+    }
+
+    [Fact]
+    public async Task CatalogCrudAsync_CancelledWaiter_DoesNotMutateOrReleaseHoldersPermit()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+        using var waiterCts = new CancellationTokenSource();
+
+        var pending = new PendingOperations();
+        IReadOnlyList<DrainObservation> drained;
+        try
+        {
+            var holder = pending.Track("holder", svc.SaveModelConfigAsync(
+                new ModelConfigUpdate(null, null, null, null, null, OrchestratorReasoningEffort: ReasoningEffort.High),
+                TestContext.Current.CancellationToken));
+            Assert.False(holder.IsCompleted);
+            await repo.CommitEntered.Task.WaitAsync(ObservationTimeout, TestContext.Current.CancellationToken);
+
+            var cancelledWaiter = pending.Track("cancelledWaiter",
+                InvokeCatalogCrudAsync(svc, CatalogCrudPath.AddAvailable, waiterCts.Token));
+
+            await waiterCts.CancelAsync();
+
+            // Timeout-only observation: the bound throws TimeoutException, so it can never
+            // manufacture the OperationCanceledException this assertion demands. If the CRUD
+            // acquisition stops honouring its token the waiter stays blocked behind the still
+            // gated holder and the test fails with a timeout instead of hanging forever.
+            var waiterOutcome = await ObserveAsync(cancelledWaiter);
+            Assert.True(
+                waiterOutcome is OperationCanceledException,
+                "The cancelled waiter must observe its token and fail with OperationCanceledException; observed: "
+                + (waiterOutcome is null ? "successful completion" : $"{waiterOutcome.GetType().Name}: {waiterOutcome.Message}"));
+
+            AssertCrudNotApplied(config, CatalogCrudPath.AddAvailable);
+            Assert.Equal(1, repo.CommitCalls);
+
+            var subsequent = pending.Track("subsequent", InvokeCatalogCrudAsync(
+                svc, CatalogCrudPath.AddSubAgent, TestContext.Current.CancellationToken));
+            Assert.False(subsequent.IsCompleted);
+            AssertCrudNotApplied(config, CatalogCrudPath.AddSubAgent);
+            Assert.Equal(1, repo.CommitCalls);
+        }
+        finally
+        {
+            repo.Release();
+            drained = await pending.DrainAllAsync();
+        }
+
+        // The cancelled waiter's OperationCanceledException is part of the scenario; every other
+        // tracked operation must have completed cleanly.
+        AssertDrainedCleanly(drained, "cancelledWaiter");
+        Assert.IsAssignableFrom<OperationCanceledException>(DrainErrorFor(drained, "cancelledWaiter"));
+
+        AssertCrudApplied(config, CatalogCrudPath.AddSubAgent);
+        AssertCrudNotApplied(config, CatalogCrudPath.AddAvailable);
+        Assert.Equal(2, repo.CommitCalls);
+    }
+
+    [Fact]
+    public async Task CatalogCrudAsync_EarlyReturnsAndExceptions_ReleasePermitForLaterWriters()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", _tempDir);
+        repo.Release();
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        // Every wait below is bounded timeout-only: each call can only acquire the semaphore if
+        // the PREVIOUS call released it, so an omitted release surfaces as a TimeoutException
+        // (a failed assertion with a clear message) instead of hanging the test run.
+        Assert.False(await Bounded(svc.RemoveAvailableModelAsync("missing", TestContext.Current.CancellationToken)));
+        // Depends on RemoveAvailableModelAsync's missing-entry early return having released.
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Bounded(svc.AddAvailableModelAsync("AVAILABLE-UPDATE", null, ct: TestContext.Current.CancellationToken)));
+        // Depends on AddAvailableModelAsync's duplicate-add throw having released.
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Bounded(svc.UpdateSubAgentModelAsync("missing", null, null, ct: TestContext.Current.CancellationToken)));
+
+        await Bounded(svc.AddSubAgentModelAsync(
+            "after-errors", 42000, ReasoningEffort.Medium, ct: TestContext.Current.CancellationToken));
+
+        Assert.Contains(config.Models!.SubAgentModels!, m => m.Name == "after-errors");
+        Assert.Single(repo.CommitObservations);
+    }
+
+    [Fact]
+    public async Task CatalogCrudAsync_WriteFailure_ReleasesPermitAndKeepsDocumentedMemoryMutation()
+    {
+        var invalidTarget = Path.Combine(_tempDir, "not-a-directory");
+        await File.WriteAllTextAsync(invalidTarget, "sentinel", TestContext.Current.CancellationToken);
+        var config = CreateCatalogConcurrencyConfig();
+        var repo = new GatedConfigRepoManager("https://example.com/config.git", invalidTarget);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Assert.ThrowsAnyAsync<IOException>(() =>
+            Bounded(svc.AddAvailableModelAsync("write-failed-model", 1234, ct: TestContext.Current.CancellationToken)));
+        Assert.Contains(config.Models!.AvailableModels!, m => m.Name == "write-failed-model");
+        Assert.Equal(0, repo.CommitCalls);
+
+        File.Delete(invalidTarget);
+        Directory.CreateDirectory(invalidTarget);
+        repo.Release();
+        // Bounded timeout-only: an omitted release after the write failure fails here with a
+        // TimeoutException rather than hanging.
+        await Bounded(svc.AddSubAgentModelAsync(
+            "after-write-failure", 5678, ReasoningEffort.Low, ct: TestContext.Current.CancellationToken));
+
+        var persisted = ConfigRepoManager.ParseConfig(
+            await File.ReadAllTextAsync(Path.Combine(invalidTarget, "hive-config.yaml"), TestContext.Current.CancellationToken));
+        Assert.Contains(persisted.Models!.AvailableModels!, m => m.Name == "write-failed-model");
+        Assert.Contains(persisted.Models!.SubAgentModels!, m => m.Name == "after-write-failure");
+        Assert.Single(repo.CommitObservations);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CatalogCrudAsync_CommitFailureOrCancellation_ReleasesPermit(bool cancellation)
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        Exception failure = cancellation
+            ? new OperationCanceledException("scripted commit cancellation")
+            : new IOException("scripted commit failure");
+        var repo = new ThrowOnceConfigRepoManager("https://example.com/config.git", _tempDir, failure);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        if (cancellation)
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                Bounded(svc.AddAvailableModelAsync("failed-commit-model", 1234, ct: TestContext.Current.CancellationToken)));
+        }
+        else
+        {
+            await Assert.ThrowsAsync<IOException>(() =>
+                Bounded(svc.AddAvailableModelAsync("failed-commit-model", 1234, ct: TestContext.Current.CancellationToken)));
+        }
+
+        // Bounded timeout-only: an omitted release after the commit failure fails here with a
+        // TimeoutException rather than hanging.
+        await Bounded(svc.AddSubAgentModelAsync(
+            "after-commit-failure", 5678, ReasoningEffort.High, ct: TestContext.Current.CancellationToken));
+
+        Assert.Equal(2, repo.CommitAttempts);
+        Assert.Single(repo.SuccessfulCommits);
+        Assert.Contains(config.Models!.AvailableModels!, m => m.Name == "failed-commit-model");
+        Assert.Contains(config.Models!.SubAgentModels!, m => m.Name == "after-commit-failure");
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        Assert.Contains(persisted.Models!.AvailableModels!, m => m.Name == "failed-commit-model");
+        Assert.Contains(persisted.Models!.SubAgentModels!, m => m.Name == "after-commit-failure");
+    }
+
+    [Fact]
+    public async Task CatalogUpdates_UpdateOnlyFirstCaseInsensitiveMatch_AndPreserveFields()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        config.Models!.AvailableModels =
+        [
+            new ModelEntry { Name = "duplicate", ContextWindow = 1, ReasoningEffort = "keep", Description = "first", SupportsVision = false },
+            new ModelEntry { Name = "DUPLICATE", ContextWindow = 2, ReasoningEffort = "second", Description = "second", SupportsVision = true }
+        ];
+        config.Models.SubAgentModels =
+        [
+            new ModelEntry { Name = "sub-duplicate", ContextWindow = 3, ReasoningEffort = "low", Description = "first", SupportsVision = false },
+            new ModelEntry { Name = "SUB-DUPLICATE", ContextWindow = 4, ReasoningEffort = "medium", Description = "second", SupportsVision = true }
+        ];
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        await Bounded(svc.UpdateAvailableModelAsync("DuPlIcAtE", 10, "updated", true, TestContext.Current.CancellationToken));
+        await Bounded(svc.UpdateSubAgentModelAsync("SuB-DuPlIcAtE", 30, ReasoningEffort.High, "updated-sub", false, TestContext.Current.CancellationToken));
+
+        Assert.Equal((10, "keep", "updated", true),
+            (config.Models.AvailableModels[0].ContextWindow, config.Models.AvailableModels[0].ReasoningEffort,
+             config.Models.AvailableModels[0].Description, config.Models.AvailableModels[0].SupportsVision));
+        Assert.Equal((2, "second", "second", true),
+            (config.Models.AvailableModels[1].ContextWindow, config.Models.AvailableModels[1].ReasoningEffort,
+             config.Models.AvailableModels[1].Description, config.Models.AvailableModels[1].SupportsVision));
+        Assert.Equal((30, "high", "updated-sub", false),
+            (config.Models.SubAgentModels[0].ContextWindow, config.Models.SubAgentModels[0].ReasoningEffort,
+             config.Models.SubAgentModels[0].Description, config.Models.SubAgentModels[0].SupportsVision));
+        Assert.Equal((4, "medium", "second", true),
+            (config.Models.SubAgentModels[1].ContextWindow, config.Models.SubAgentModels[1].ReasoningEffort,
+             config.Models.SubAgentModels[1].Description, config.Models.SubAgentModels[1].SupportsVision));
+    }
+
+    [Fact]
+    public async Task CatalogRemovals_RemoveOnlyFirstCaseInsensitiveMatch()
+    {
+        var config = CreateCatalogConcurrencyConfig();
+        config.Models!.AvailableModels = [new ModelEntry { Name = "duplicate" }, new ModelEntry { Name = "DUPLICATE" }];
+        config.Models.SubAgentModels = [new ModelEntry { Name = "sub-duplicate" }, new ModelEntry { Name = "SUB-DUPLICATE" }];
+        var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
+
+        Assert.True(await Bounded(svc.RemoveAvailableModelAsync("DuPlIcAtE", TestContext.Current.CancellationToken)));
+        Assert.True(await Bounded(svc.RemoveSubAgentModelAsync("SuB-DuPlIcAtE", TestContext.Current.CancellationToken)));
+
+        Assert.Equal("DUPLICATE", Assert.Single(config.Models.AvailableModels).Name);
+        Assert.Equal("SUB-DUPLICATE", Assert.Single(config.Models.SubAgentModels).Name);
+        var persisted = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync());
+        Assert.Equal("DUPLICATE", Assert.Single(persisted.Models!.AvailableModels!).Name);
+        Assert.Equal("SUB-DUPLICATE", Assert.Single(persisted.Models.SubAgentModels!).Name);
+    }
+
+    public enum CatalogCrudPath
+    {
+        AddAvailable,
+        UpdateAvailable,
+        RemoveAvailable,
+        AddSubAgent,
+        UpdateSubAgent,
+        RemoveSubAgent
+    }
+
+    private static HiveConfigFile CreateCatalogConcurrencyConfig() => new()
+    {
+        Orchestrator = new OrchestratorConfig { Model = "orch-model", ReasoningEffort = "low" },
+        Models = new ModelsConfig
+        {
+            AvailableModels =
+            [
+                new ModelEntry { Name = "available-update", ContextWindow = 1000, ReasoningEffort = "preserved", Description = "old available", SupportsVision = false },
+                new ModelEntry { Name = "available-remove", ContextWindow = 2000 }
+            ],
+            SubAgentModels =
+            [
+                new ModelEntry { Name = "sub-update", ContextWindow = 3000, ReasoningEffort = "low", Description = "old sub", SupportsVision = true },
+                new ModelEntry { Name = "sub-remove", ContextWindow = 4000, ReasoningEffort = "medium" }
+            ]
+        }
+    };
+
+    private static async Task InvokeCatalogCrudAsync(
+        ConfigModelService svc, CatalogCrudPath path, CancellationToken ct)
+    {
+        switch (path)
+        {
+            case CatalogCrudPath.AddAvailable:
+                await svc.AddAvailableModelAsync("available-added", 11000, "new available", true, ct);
+                break;
+            case CatalogCrudPath.UpdateAvailable:
+                await svc.UpdateAvailableModelAsync("AVAILABLE-UPDATE", 12000, "updated available", true, ct);
+                break;
+            case CatalogCrudPath.RemoveAvailable:
+                Assert.True(await svc.RemoveAvailableModelAsync("AVAILABLE-REMOVE", ct));
+                break;
+            case CatalogCrudPath.AddSubAgent:
+                await svc.AddSubAgentModelAsync("sub-added", 13000, ReasoningEffort.Medium, "new sub", false, ct);
+                break;
+            case CatalogCrudPath.UpdateSubAgent:
+                await svc.UpdateSubAgentModelAsync("SUB-UPDATE", 14000, ReasoningEffort.High, "updated sub", false, ct);
+                break;
+            case CatalogCrudPath.RemoveSubAgent:
+                Assert.True(await svc.RemoveSubAgentModelAsync("SUB-REMOVE", ct));
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown catalog CRUD path: {path}");
+        }
+    }
+
+    private static string ExpectedCommitFragment(CatalogCrudPath path) => path switch
+    {
+        CatalogCrudPath.AddAvailable => "add available model 'available-added'",
+        CatalogCrudPath.UpdateAvailable => "update available model 'AVAILABLE-UPDATE'",
+        CatalogCrudPath.RemoveAvailable => "remove available model 'AVAILABLE-REMOVE'",
+        CatalogCrudPath.AddSubAgent => "add sub-agent model 'sub-added'",
+        CatalogCrudPath.UpdateSubAgent => "update sub-agent model 'SUB-UPDATE'",
+        CatalogCrudPath.RemoveSubAgent => "remove sub-agent model 'SUB-REMOVE'",
+        _ => throw new InvalidOperationException($"Unknown catalog CRUD path: {path}")
+    };
+
+    private static void AssertCrudNotApplied(HiveConfigFile config, CatalogCrudPath path)
+    {
+        var available = config.Models?.AvailableModels ?? [];
+        var subAgents = config.Models?.SubAgentModels ?? [];
+        switch (path)
+        {
+            case CatalogCrudPath.AddAvailable:
+                Assert.DoesNotContain(available, m => m.Name == "available-added");
+                break;
+            case CatalogCrudPath.UpdateAvailable:
+                var availableUpdate = Assert.Single(available, m => m.Name == "available-update");
+                Assert.Equal((1000, "preserved", "old available", false),
+                    (availableUpdate.ContextWindow, availableUpdate.ReasoningEffort, availableUpdate.Description, availableUpdate.SupportsVision));
+                break;
+            case CatalogCrudPath.RemoveAvailable:
+                Assert.Contains(available, m => m.Name == "available-remove");
+                break;
+            case CatalogCrudPath.AddSubAgent:
+                Assert.DoesNotContain(subAgents, m => m.Name == "sub-added");
+                break;
+            case CatalogCrudPath.UpdateSubAgent:
+                var subUpdate = Assert.Single(subAgents, m => m.Name == "sub-update");
+                Assert.Equal((3000, "low", "old sub", true),
+                    (subUpdate.ContextWindow, subUpdate.ReasoningEffort, subUpdate.Description, subUpdate.SupportsVision));
+                break;
+            case CatalogCrudPath.RemoveSubAgent:
+                Assert.Contains(subAgents, m => m.Name == "sub-remove");
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown catalog CRUD path: {path}");
+        }
+    }
+
+    private static void AssertCrudApplied(HiveConfigFile config, CatalogCrudPath path)
+    {
+        var available = config.Models?.AvailableModels ?? [];
+        var subAgents = config.Models?.SubAgentModels ?? [];
+        switch (path)
+        {
+            case CatalogCrudPath.AddAvailable:
+                var availableAdded = Assert.Single(available, m => m.Name == "available-added");
+                Assert.Equal((11000, null, "new available", true),
+                    (availableAdded.ContextWindow, availableAdded.ReasoningEffort, availableAdded.Description, availableAdded.SupportsVision));
+                break;
+            case CatalogCrudPath.UpdateAvailable:
+                var availableUpdate = Assert.Single(available, m => m.Name == "available-update");
+                Assert.Equal((12000, "preserved", "updated available", true),
+                    (availableUpdate.ContextWindow, availableUpdate.ReasoningEffort, availableUpdate.Description, availableUpdate.SupportsVision));
+                break;
+            case CatalogCrudPath.RemoveAvailable:
+                Assert.DoesNotContain(available, m => m.Name == "available-remove");
+                break;
+            case CatalogCrudPath.AddSubAgent:
+                var subAdded = Assert.Single(subAgents, m => m.Name == "sub-added");
+                Assert.Equal((13000, "medium", "new sub", false),
+                    (subAdded.ContextWindow, subAdded.ReasoningEffort, subAdded.Description, subAdded.SupportsVision));
+                break;
+            case CatalogCrudPath.UpdateSubAgent:
+                var subUpdate = Assert.Single(subAgents, m => m.Name == "sub-update");
+                Assert.Equal((14000, "high", "updated sub", false),
+                    (subUpdate.ContextWindow, subUpdate.ReasoningEffort, subUpdate.Description, subUpdate.SupportsVision));
+                break;
+            case CatalogCrudPath.RemoveSubAgent:
+                Assert.DoesNotContain(subAgents, m => m.Name == "sub-remove");
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown catalog CRUD path: {path}");
+        }
+    }
+
+    /// <summary>
+    /// Bound applied to every wait whose completion depends on the service honouring a
+    /// cancellation token or actually releasing its semaphore. A regression in either must
+    /// surface as a timeout failure with a clear message, never as a hung test run.
+    /// </summary>
+    private static readonly TimeSpan ObservationTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Bounds <paramref name="task"/> with <see cref="ObservationTimeout"/>. The wait is
+    /// deliberately timeout-only — no cancellation token is supplied — so the bound can never
+    /// manufacture the <see cref="OperationCanceledException"/> an assertion is looking for.
+    /// An operation that never completes surfaces as <see cref="TimeoutException"/> instead.
+    /// </summary>
+    private static Task Bounded(Task task)
+    {
+#pragma warning disable xUnit1051 // Timeout-only by design: a token would manufacture OperationCanceledException.
+        return task.WaitAsync(ObservationTimeout);
+#pragma warning restore xUnit1051
+    }
+
+    /// <inheritdoc cref="Bounded(Task)"/>
+    private static Task<T> Bounded<T>(Task<T> task)
+    {
+#pragma warning disable xUnit1051 // Timeout-only by design: a token would manufacture OperationCanceledException.
+        return task.WaitAsync(ObservationTimeout);
+#pragma warning restore xUnit1051
+    }
+
+    /// <summary>One drained operation together with the error (if any) observed while draining it.</summary>
+    private sealed record DrainObservation(string Name, Exception? Error);
+
+    /// <summary>
+    /// Observes <paramref name="task"/> under <see cref="ObservationTimeout"/> and returns the
+    /// exception it produced, or <c>null</c> when it completed successfully. The bound is
+    /// timeout-only, so a task that never completes yields a <see cref="TimeoutException"/> —
+    /// the observer can never manufacture an <see cref="OperationCanceledException"/> on the
+    /// operation's behalf.
+    /// </summary>
+    private static async Task<Exception?> ObserveAsync(Task task)
+    {
+        try
+        {
+            await Bounded(task);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// Records every gated operation a serialization test starts so cleanup can drain all of
+    /// them, no matter where in the test body — including its setup — an exception was raised.
+    /// Operations are tracked from the moment they start, before any gate-entry wait or YAML
+    /// read is awaited.
+    /// </summary>
+    private sealed class PendingOperations
+    {
+        private readonly List<(string Name, Task Task)> _started = [];
+
+        /// <summary>Tracks a freshly started operation and returns it for use by the test body.</summary>
+        public T Track<T>(string name, T task) where T : Task
+        {
+            _started.Add((name, task));
+            return task;
+        }
+
+        /// <summary>
+        /// Drains every tracked operation with an independent bounded wait. A fault or timeout on
+        /// one operation never prevents the remaining ones from being drained; all outcomes are
+        /// returned in start order so the caller can report them after everything has settled.
+        /// </summary>
+        public async Task<IReadOnlyList<DrainObservation>> DrainAllAsync()
+        {
+            var observations = new List<DrainObservation>(_started.Count);
+            foreach (var (name, task) in _started)
+            {
+                try
+                {
+                    await Bounded(task);
+                    observations.Add(new DrainObservation(name, null));
+                }
+                catch (Exception ex)
+                {
+                    observations.Add(new DrainObservation(name, ex));
+                }
+            }
+            return observations;
+        }
+    }
+
+    /// <summary>
+    /// Asserts that every drained operation except the explicitly named ones completed cleanly.
+    /// All failures are reported together, after every operation has been drained.
+    /// </summary>
+    /// <param name="observations">Outcomes returned by <see cref="PendingOperations.DrainAllAsync"/>.</param>
+    /// <param name="expectedToFail">Names of operations whose failure is part of the scenario.</param>
+    private static void AssertDrainedCleanly(
+        IReadOnlyList<DrainObservation> observations, params string[] expectedToFail)
+    {
+        var unexpected = observations
+            .Where(o => o.Error is not null && !expectedToFail.Contains(o.Name, StringComparer.Ordinal))
+            .Select(o => $"{o.Name} → {o.Error!.GetType().Name}: {o.Error.Message}")
+            .ToList();
+
+        Assert.True(
+            unexpected.Count == 0,
+            "Pending operations did not complete cleanly: " + string.Join(" | ", unexpected));
+    }
+
+    /// <summary>Returns the error observed while draining the named operation, or <c>null</c>.</summary>
+    private static Exception? DrainErrorFor(IReadOnlyList<DrainObservation> observations, string name)
+        => observations.Single(o => string.Equals(o.Name, name, StringComparison.Ordinal)).Error;
 }
 
 /// <summary>
@@ -3284,33 +3975,68 @@ file sealed class GatedBrain : IDistributedBrain
 }
 
 /// <summary>
-/// Config repo fake whose first <see cref="CommitFileAsync"/> call parks until explicitly
-/// released, used to prove <see cref="ConfigModelService.SaveModelConfigAsync"/> serialises
-/// concurrent callers. The commit happens inside the save transaction, so while the first
-/// caller is parked the second caller must still be waiting on the save lock.
+/// Config repo seam whose first <see cref="CommitFileAsync"/> call parks until explicitly
+/// released. Production <see cref="ConfigRepoManager.WriteConfigAsync"/> remains in use; each
+/// commit entry copies the real YAML file so tests can prove snapshot and commit ordering.
 /// </summary>
 file sealed class GatedConfigRepoManager(string url, string path) : ConfigRepoManager(url, path)
 {
     private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _observationsLock = new();
+    private readonly List<CommitObservation> _commitObservations = [];
     private int _commitCalls;
 
-    /// <summary>Completes as soon as the first commit call has entered the critical section.</summary>
     public TaskCompletionSource CommitEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Number of commit calls observed.</summary>
     public int CommitCalls => Volatile.Read(ref _commitCalls);
 
-    /// <summary>Unblocks the parked first commit call.</summary>
+    public IReadOnlyList<CommitObservation> CommitObservations
+    {
+        get
+        {
+            lock (_observationsLock)
+                return _commitObservations.OrderBy(o => o.Call).ToList();
+        }
+    }
+
     public void Release() => _gate.TrySetResult();
 
     public override async Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
     {
         var call = Interlocked.Increment(ref _commitCalls);
+        var yaml = await File.ReadAllTextAsync(Path.Combine(LocalPath, filePath), CancellationToken.None);
+        lock (_observationsLock)
+            _commitObservations.Add(new CommitObservation(call, filePath, commitMessage, yaml));
+
         if (call == 1)
         {
             CommitEntered.TrySetResult();
             await _gate.Task.WaitAsync(ct);
         }
+    }
+}
+
+file sealed record CommitObservation(int Call, string File, string Message, string Yaml);
+
+/// <summary>
+/// Uses real YAML writes and fails only the first virtual commit, allowing the same service
+/// instance to prove that its semaphore is released after commit failure or cancellation.
+/// </summary>
+file sealed class ThrowOnceConfigRepoManager(string url, string path, Exception firstFailure)
+    : ConfigRepoManager(url, path)
+{
+    private int _commitAttempts;
+
+    public int CommitAttempts => Volatile.Read(ref _commitAttempts);
+    public List<(string File, string Message)> SuccessfulCommits { get; } = [];
+
+    public override Task CommitFileAsync(string filePath, string commitMessage, CancellationToken ct = default)
+    {
+        if (Interlocked.Increment(ref _commitAttempts) == 1)
+            throw firstFailure;
+
+        SuccessfulCommits.Add((filePath, commitMessage));
+        return Task.CompletedTask;
     }
 }
 
