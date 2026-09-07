@@ -3473,16 +3473,18 @@ public sealed class ConfigModelServiceTests : IDisposable
     public async Task CatalogUpdates_UpdateOnlyFirstCaseInsensitiveMatch_AndPreserveFields()
     {
         var config = CreateCatalogConcurrencyConfig();
-        config.Models!.AvailableModels =
+        var models = config.Models!;
+        models.AvailableModels =
         [
             new ModelEntry { Name = "duplicate", ContextWindow = 1, ReasoningEffort = "keep", Description = "first", SupportsVision = false },
             new ModelEntry { Name = "DUPLICATE", ContextWindow = 2, ReasoningEffort = "second", Description = "second", SupportsVision = true }
         ];
-        config.Models.SubAgentModels =
+        models.SubAgentModels =
         [
             new ModelEntry { Name = "sub-duplicate", ContextWindow = 3, ReasoningEffort = "low", Description = "first", SupportsVision = false },
             new ModelEntry { Name = "SUB-DUPLICATE", ContextWindow = 4, ReasoningEffort = "medium", Description = "second", SupportsVision = true }
         ];
+        config.Models = models;
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 
@@ -3507,8 +3509,10 @@ public sealed class ConfigModelServiceTests : IDisposable
     public async Task CatalogRemovals_RemoveOnlyFirstCaseInsensitiveMatch()
     {
         var config = CreateCatalogConcurrencyConfig();
-        config.Models!.AvailableModels = [new ModelEntry { Name = "duplicate" }, new ModelEntry { Name = "DUPLICATE" }];
-        config.Models.SubAgentModels = [new ModelEntry { Name = "sub-duplicate" }, new ModelEntry { Name = "SUB-DUPLICATE" }];
+        var models = config.Models!;
+        models.AvailableModels = [new ModelEntry { Name = "duplicate" }, new ModelEntry { Name = "DUPLICATE" }];
+        models.SubAgentModels = [new ModelEntry { Name = "sub-duplicate" }, new ModelEntry { Name = "SUB-DUPLICATE" }];
+        config.Models = models;
         var repo = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
         var svc = new ConfigModelService(config, repo, NullLogger<ConfigModelService>.Instance);
 

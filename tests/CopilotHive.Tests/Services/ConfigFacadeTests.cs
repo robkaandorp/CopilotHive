@@ -290,7 +290,11 @@ public class ConfigFacadeTests
     public async Task AddAvailableModelAsync_DuplicateName_ReturnsConflictWithServiceMessage()
     {
         var (config, service, dir) = CreateRealService(cfg =>
-            cfg.Models!.AvailableModels = [new ModelEntry { Name = "dup-model" }]);
+        {
+            var models = cfg.Models!;
+            models.AvailableModels = [new ModelEntry { Name = "dup-model" }];
+            cfg.Models = models;
+        });
         try
         {
             using var factory = new FacadeFactory(config, service);
@@ -358,7 +362,11 @@ public class ConfigFacadeTests
     public async Task RemoveAvailableModelAsync_ExistingName_ReturnsSuccessAndRemoves()
     {
         var (config, service, dir) = CreateRealService(cfg =>
-            cfg.Models!.AvailableModels = [new ModelEntry { Name = "gone-model" }]);
+        {
+            var models = cfg.Models!;
+            models.AvailableModels = [new ModelEntry { Name = "gone-model" }];
+            cfg.Models = models;
+        });
         try
         {
             using var factory = new FacadeFactory(config, service);
@@ -384,7 +392,11 @@ public class ConfigFacadeTests
     public async Task AddSubAgentModelAsync_DuplicateName_ReturnsConflictWithServiceMessage()
     {
         var (config, service, dir) = CreateRealService(cfg =>
-            cfg.Models!.SubAgentModels = [new ModelEntry { Name = "sa-dup" }]);
+        {
+            var models = cfg.Models!;
+            models.SubAgentModels = [new ModelEntry { Name = "sa-dup" }];
+            cfg.Models = models;
+        });
         try
         {
             using var factory = new FacadeFactory(config, service);
@@ -457,7 +469,11 @@ public class ConfigFacadeTests
     public async Task SaveModelsAsync_DuplicateCaseInsensitiveReasoningKeys_ReturnsBadRequest()
     {
         var (config, service, dir) = CreateRealService(cfg =>
-            cfg.Models!.SubAgentModels = [new ModelEntry { Name = "sa-save" }]);
+        {
+            var models = cfg.Models!;
+            models.SubAgentModels = [new ModelEntry { Name = "sa-save" }];
+            cfg.Models = models;
+        });
         try
         {
             using var factory = new FacadeFactory(config, service);

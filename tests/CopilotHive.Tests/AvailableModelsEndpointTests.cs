@@ -345,8 +345,10 @@ public class AvailableModelsEndpointTests : IDisposable
     [InlineData("EXTRA_HIGH", "extra_high")]
     public async Task GetModels_SubAgentModelsReasoningEffort_IsSnakeCaseEnum(string stored, string expected)
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
             [new ModelEntry { Name = "sa-enum-model", ReasoningEffort = stored }];
+        _factory.Config.Models = models;
 
         var reasoning = await GetSubAgentReasoningElementAsync("sa-enum-model");
 
@@ -364,8 +366,10 @@ public class AvailableModelsEndpointTests : IDisposable
     [Fact]
     public async Task GetModels_SubAgentModelsExtraHigh_UsesSnakeCaseNeverPascalCase()
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
             [new ModelEntry { Name = "sa-extra-high", ReasoningEffort = "Extra_High" }];
+        _factory.Config.Models = models;
 
         var reasoning = await GetSubAgentReasoningElementAsync("sa-extra-high");
 
@@ -379,8 +383,10 @@ public class AvailableModelsEndpointTests : IDisposable
     [Fact]
     public async Task GetModels_SubAgentModelsNullReasoningEffort_IsNull()
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
             [new ModelEntry { Name = "sa-null-reasoning", ReasoningEffort = null }];
+        _factory.Config.Models = models;
 
         var reasoning = await GetSubAgentReasoningElementAsync("sa-null-reasoning");
 
@@ -400,8 +406,10 @@ public class AvailableModelsEndpointTests : IDisposable
     [InlineData("1")]
     public async Task GetModels_SubAgentModelsInvalidStoredReasoning_DegradesToNull(string stored)
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
             [new ModelEntry { Name = "sa-invalid-reasoning", ReasoningEffort = stored }];
+        _factory.Config.Models = models;
 
         var reasoning = await GetSubAgentReasoningElementAsync("sa-invalid-reasoning");
 
@@ -422,8 +430,10 @@ public class AvailableModelsEndpointTests : IDisposable
     [InlineData("High")]
     public async Task GetModels_SubAgentEntryAndDictionaryReasoning_Agree(string? stored)
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
             [new ModelEntry { Name = "sa-agree-model", ReasoningEffort = stored }];
+        _factory.Config.Models = models;
 
         var response = await _client.GetAsync("/api/config/models", TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
@@ -449,7 +459,8 @@ public class AvailableModelsEndpointTests : IDisposable
     [Fact]
     public async Task GetModels_SubAgentModelsProjection_PreservesAllOtherFields()
     {
-        _factory.Config.Models!.SubAgentModels =
+        var models = _factory.Config.Models!;
+        models.SubAgentModels =
         [
             new ModelEntry
             {
@@ -460,6 +471,7 @@ public class AvailableModelsEndpointTests : IDisposable
                 SupportsVision = true
             }
         ];
+        _factory.Config.Models = models;
 
         var entry = await FindSubAgentModelAsync("sa-full-model");
         Assert.NotNull(entry);

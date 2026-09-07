@@ -159,9 +159,14 @@ public class BrainSubAgentPromptTests
             // Connecting creates the BrainActor with the snapshot captured at construction.
             await brain.ConnectAsync(TestContext.Current.CancellationToken);
 
-            // Simulate a config reload that mutates the live collection in place.
-            config.Models!.AvailableModels!.Clear();
-            config.Models.AvailableModels.Add(new ModelEntry { Name = "copilot/mutated", ContextWindow = 1_000 });
+            // Simulate a config reload that replaces the model list on the owner.
+            var mutatedModels = config.Models!;
+            mutatedModels.AvailableModels!.Clear();
+            mutatedModels.AvailableModels.Add(new ModelEntry { Name = "copilot/mutated", ContextWindow = 1_000 });
+            config.Models = mutatedModels;
+
+            // Positive control: the live owner's fresh snapshot really contains the replacement.
+            Assert.Contains(config.Models!.AvailableModels!, m => m.Name == "copilot/mutated");
 
             // (a) The prompt still carries the sub-agent planning guidance.
             Assert.Contains(PlanningSentence, SystemPrompt(brain), StringComparison.Ordinal);

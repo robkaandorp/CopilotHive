@@ -1109,7 +1109,12 @@ public sealed class ComposerAgentServiceTests
 
             // MUTATE the live config between validation and application: a live re-read would
             // now resolve 50000 — the applied value must come from the ORIGINAL snapshot.
-            hiveConfig.Models!.AvailableModels![0].ContextWindow = 50000;
+            var mutatedModels = hiveConfig.Models!;
+            mutatedModels.AvailableModels![0].ContextWindow = 50000;
+            hiveConfig.Models = mutatedModels;
+
+            // Positive control: the live owner's fresh snapshot really carries the new value.
+            Assert.Equal(50000, hiveConfig.Models!.AvailableModels![0].ContextWindow);
 
             service.ApplyModelScalars(selection);
 
@@ -2580,7 +2585,12 @@ public sealed class ComposerAgentServiceTests
             Assert.Equal("model-b", subAgentsBefore.AvailableModels[1].Id);
 
             // MUTATE the live hiveConfig — clear all models.
-            hiveConfig.Models!.AvailableModels.Clear();
+            var mutatedModels = hiveConfig.Models!;
+            mutatedModels.AvailableModels.Clear();
+            hiveConfig.Models = mutatedModels;
+
+            // Positive control: the live owner's fresh catalog really became empty.
+            Assert.Empty(hiveConfig.Models!.AvailableModels!);
 
             // Recreate the agent — BuildSubAgentOptions should use the snapshot, not the
             // now-empty mutable config. If it reads from _hiveConfig, SubAgents would be null.

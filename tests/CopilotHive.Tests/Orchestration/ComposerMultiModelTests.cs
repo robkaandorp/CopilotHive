@@ -544,7 +544,12 @@ public sealed class ComposerMultiModelTests : IDisposable
         Assert.Contains("gpt-4", ex.Message);
 
         // Act 2: mutate the global config to add "gpt-4"
-        liveConfig.Models!.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
+        var mutatedModels = liveConfig.Models!;
+        mutatedModels.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
+        liveConfig.Models = mutatedModels;
+
+        // Positive control: the live owner's fresh snapshot really contains "gpt-4".
+        Assert.Contains(liveConfig.Models!.AvailableModels!, m => m.Name == "gpt-4");
 
         // Act 3: "gpt-4" is now in the global list → should succeed
         await composer.SwitchModelAsync("gpt-4", ReasoningEffort.Medium, TestContext.Current.CancellationToken);
@@ -1283,7 +1288,12 @@ public sealed class ComposerHubTests : IAsyncLifetime
         Assert.Equal(2, models1.GetArrayLength());
 
         // Act 2: mutate the global config by adding a new model
-        globalConfig.Models!.AvailableModels!.Add(new ModelEntry { Name = "gamma" });
+        var mutatedModels = globalConfig.Models!;
+        mutatedModels.AvailableModels!.Add(new ModelEntry { Name = "gamma" });
+        globalConfig.Models = mutatedModels;
+
+        // Positive control: the live owner's fresh snapshot really contains "gamma".
+        Assert.Contains(globalConfig.Models!.AvailableModels!, m => m.Name == "gamma");
 
         // Act 3: request again — must reflect the mutated list
         var response2 = await fixture.Client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
@@ -1322,7 +1332,12 @@ public sealed class ComposerHubTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.BadRequest, response1.StatusCode);
 
         // Act 2: mutate config to add "gpt-4" to the global list
-        globalConfig.Models!.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
+        var mutatedModels = globalConfig.Models!;
+        mutatedModels.AvailableModels!.Add(new ModelEntry { Name = "gpt-4" });
+        globalConfig.Models = mutatedModels;
+
+        // Positive control: the live owner's fresh snapshot really contains "gpt-4".
+        Assert.Contains(globalConfig.Models!.AvailableModels!, m => m.Name == "gpt-4");
 
         // Act 3: "gpt-4" IS now in the global list → should succeed
         var response2 = await fixture.Client.PostAsync("/api/composer/models/switch?model=gpt-4&reasoning=medium", null, TestContext.Current.CancellationToken);
@@ -1840,7 +1855,12 @@ public sealed class ComposerHubCompositeModelTests
         Assert.Equal("claude-sonnet-4", json1.RootElement.GetProperty("models").EnumerateArray().First().GetString());
 
         // Mutate: add reasoning effort
-        config.Models!.AvailableModels![0].ReasoningEffort = "high";
+        var mutatedModels = config.Models!;
+        mutatedModels.AvailableModels![0].ReasoningEffort = "high";
+        config.Models = mutatedModels;
+
+        // Positive control: the live owner's fresh snapshot really carries the raw reasoning.
+        Assert.Equal("high", config.Models!.AvailableModels![0].ReasoningEffort);
 
         // The exposed name must stay plain.
         var response2 = await fixture.Client.GetAsync("/api/composer/models", TestContext.Current.CancellationToken);
