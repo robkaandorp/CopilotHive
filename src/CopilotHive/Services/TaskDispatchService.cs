@@ -9,6 +9,7 @@ using CopilotHive.Knowledge;
 using CopilotHive.Metrics;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Shared;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -37,6 +38,36 @@ internal sealed class TaskDispatchService
     /// </summary>
     internal Action<GoalPipeline, string>? AdmissionGateForTest;
 
+    /// <summary>
+    /// THE STORED-CREDENTIAL LOOKUP SEAM: the live, asynchronous stored admin OAuth token
+    /// lookup (production: <c>UserService.GetActiveAccessTokenAsync</c>). Null when no user
+    /// service is available — the dispatch then resolves the environment chain alone.
+    /// </summary>
+    private readonly Func<CancellationToken, Task<string?>>? _storedCredentialLookup;
+
+    /// <summary>
+    /// THE FIXED, CREDENTIAL-FREE DIAGNOSTIC for a failed stored-OAuth lookup. The lookup's own
+    /// exception message is deliberately NEVER rendered: it can quote the credential it failed to
+    /// hand back (a connection string, a token echoed in a provider error), and this record goes
+    /// to the ordinary orchestrator log.
+    /// </summary>
+    internal const string StoredCredentialLookupFailedTemplate =
+        "Stored OAuth credential lookup failed for goal {GoalId} (exceptionType={ExceptionType}); falling back to the environment credential chain — the lookup's own message is withheld because it can carry the credential";
+
+    /// <summary>
+    /// THE FIXED, CREDENTIAL-FREE CANCELLATION MESSAGE for the assignment-credential boundary.
+    /// </summary>
+    /// <remarks>
+    /// A cancellation raised by (or observed around) the stored-credential lookup must never
+    /// carry the provider's own message or inner exception: downstream sinks RENDER them —
+    /// <c>PipelineDriver</c>'s improve-phase catch logs <c>ex.Message</c> and copies it into the
+    /// phase verdict AND the goal-update notes — so a provider message quoting a connection
+    /// string or an echoed token would be persisted in plain sight. This message is a constant,
+    /// so it can never interpolate anything.
+    /// </remarks>
+    internal const string StoredCredentialLookupCancelledMessage =
+        "The dispatch was cancelled while resolving the assignment credential; no work was admitted.";
+
     public TaskDispatchService(
         TaskQueue taskQueue,
         IWorkerGateway workerGateway,
@@ -45,7 +76,8 @@ internal sealed class TaskDispatchService
         ILogger<TaskDispatchService> logger,
         GoalPipelineManager pipelineManager,
         GoalLifecycleService lifecycleService,
-        DispatcherMaintenance maintenance)
+        DispatcherMaintenance maintenance,
+        Func<CancellationToken, Task<string?>>? storedCredentialLookup = null)
     {
         _taskQueue = taskQueue;
         _workerGateway = workerGateway;
@@ -55,6 +87,7 @@ internal sealed class TaskDispatchService
         _pipelineManager = pipelineManager;
         _lifecycleService = lifecycleService;
         _maintenance = maintenance;
+        _storedCredentialLookup = storedCredentialLookup;
     }
 
     /// <summary>
@@ -214,10 +247,13 @@ internal sealed class TaskDispatchService
         // PHASE 1 of the preparation. The missing-model refusal propagates from here UNCAUGHT.
         var head = BuildDispatchContext(pipeline, role, prompt);
 
-        List<TargetRepository> repositories;
+        // PHASE 1b — THE REPOSITORY CONFIGURATION, resolved FIRST. The AUTHORITATIVE configured
+        // URLs are what the credential injection below rebuilds from, so a previously tokenized
+        // URL can never be appended to: every dispatch starts from hive-config.yaml's value.
+        List<RepositoryConfig> repositoryConfigs;
         try
         {
-            repositories = ResolveRepositories(pipeline.Goal);
+            repositoryConfigs = ResolveRepositoryConfigs(pipeline.Goal);
         }
         catch (InvalidOperationException ex)
         {
@@ -225,6 +261,15 @@ internal sealed class TaskDispatchService
             await _lifecycleService.MarkGoalFailedAsync(pipeline, ex.Message, ct);
             return;
         }
+
+        // PHASE 1c — THE ASSIGNMENT CREDENTIAL, resolved ONCE per assignment and STILL inside the
+        // preparation: no work slot is captured, no pointer is claimed, nothing is admitted or
+        // enqueued yet, so a cancellation observed here leaves NOTHING to roll back.
+        var credential = await ResolveAssignmentCredentialAsync(pipeline.GoalId, ct);
+
+        // The assignment's OWN repository list. HiveConfigFile's RepositoryConfig instances are
+        // never written back to — the credential lives only on these freshly allocated objects.
+        var repositories = BuildAssignmentRepositories(repositoryConfigs, credential);
 
         // PHASE 2 of the preparation.
         var tail = BuildDispatchTail(head);
@@ -892,6 +937,13 @@ internal sealed class TaskDispatchService
     /// Resolves the list of <see cref="TargetRepository"/> instances for the given goal by looking
     /// up each repository name in the hive configuration.
     /// </summary>
+    /// <remarks>
+    /// THE SYNCHRONOUS LEGACY CONTRACT, unchanged: the pipeline-metadata delegates
+    /// (<c>PipelineDriver.resolveRepositories</c> and friends) are synchronous and must never
+    /// block on the asynchronous stored-OAuth lookup, so this path keeps the ENVIRONMENT-only
+    /// fallback of <see cref="PipelineHelpers.InjectTokenIntoUrl(string)"/>. The DISPATCH path
+    /// does NOT use it — see <see cref="ResolveAssignmentCredentialAsync"/>.
+    /// </remarks>
     /// <param name="goal">The goal whose <see cref="Goal.RepositoryNames"/> are to be resolved.</param>
     /// <returns>A list of resolved <see cref="TargetRepository"/> objects with injected credentials.</returns>
     /// <exception cref="InvalidOperationException">
@@ -901,28 +953,191 @@ internal sealed class TaskDispatchService
     {
         var repos = new List<TargetRepository>();
 
+        foreach (var repoConfig in ResolveRepositoryConfigs(goal))
+        {
+            var url = PipelineHelpers.InjectTokenIntoUrl(repoConfig.Url);
+            repos.Add(new TargetRepository
+            {
+                Name = repoConfig.Name,
+                Url = url,
+                DefaultBranch = repoConfig.DefaultBranch,
+            });
+        }
+
+        return repos;
+    }
+
+    /// <summary>
+    /// Resolves each of the goal's repository names to its AUTHORITATIVE
+    /// <see cref="RepositoryConfig"/> from hive-config.yaml, in the goal's own order.
+    /// </summary>
+    /// <remarks>
+    /// The returned instances are the CONFIGURATION's own objects and are never mutated by any
+    /// caller: the credential injection always allocates fresh assignment data.
+    /// </remarks>
+    /// <param name="goal">The goal whose repository names are resolved.</param>
+    /// <returns>The matching configuration entries.</returns>
+    /// <exception cref="InvalidOperationException">A referenced repository is not configured.</exception>
+    private List<RepositoryConfig> ResolveRepositoryConfigs(Goal goal)
+    {
+        var configs = new List<RepositoryConfig>();
+
         foreach (var repoName in goal.RepositoryNames)
         {
             var repoConfig = _config?.Repositories.FirstOrDefault(
                 r => r.Name.Equals(repoName, StringComparison.OrdinalIgnoreCase));
 
-            if (repoConfig is not null)
-            {
-                var url = PipelineHelpers.InjectTokenIntoUrl(repoConfig.Url);
-                repos.Add(new TargetRepository
-                {
-                    Name = repoConfig.Name,
-                    Url = url,
-                    DefaultBranch = repoConfig.DefaultBranch,
-                });
-            }
-            else
+            if (repoConfig is null)
             {
                 throw new InvalidOperationException(
                     $"Goal '{goal.Id}' references repository '{repoName}' which is not defined in hive-config.yaml. Add it to the repositories section or remove it from the goal.");
             }
+
+            configs.Add(repoConfig);
+        }
+
+        return configs;
+    }
+
+    /// <summary>
+    /// Builds the assignment's OWN repository list from the authoritative configured URLs,
+    /// injecting <paramref name="credential"/> into every eligible one.
+    /// </summary>
+    /// <remarks>
+    /// REBUILD, NEVER APPEND: the injection always starts from
+    /// <see cref="RepositoryConfig.Url"/>, so a credential is REPLACED rather than accumulated,
+    /// and the configuration objects themselves are never written to.
+    /// </remarks>
+    /// <param name="repositoryConfigs">The resolved configuration entries.</param>
+    /// <param name="credential">The assignment credential, or <c>null</c> when none resolved.</param>
+    /// <returns>Freshly allocated target repositories for this assignment only.</returns>
+    private static List<TargetRepository> BuildAssignmentRepositories(
+        IReadOnlyList<RepositoryConfig> repositoryConfigs, string? credential)
+    {
+        var repos = new List<TargetRepository>(repositoryConfigs.Count);
+        foreach (var repoConfig in repositoryConfigs)
+        {
+            repos.Add(new TargetRepository
+            {
+                Name = repoConfig.Name,
+                Url = PipelineHelpers.InjectTokenIntoUrl(repoConfig.Url, credential),
+                DefaultBranch = repoConfig.DefaultBranch,
+            });
         }
 
         return repos;
     }
+
+    /// <summary>
+    /// Resolves THE ASSIGNMENT CREDENTIAL once: the CURRENT stored admin OAuth token (when a
+    /// lookup is wired), then <c>GH_TOKEN</c>, then <c>GITHUB_TOKEN</c> — the first non-blank
+    /// candidate, selected by <see cref="GitCredentialResolver.Resolve"/> and returned UNCHANGED.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The lookup runs on EVERY dispatch (never cached), so a token rotated between two
+    /// dispatches is observed by the second one.
+    /// </para>
+    /// <para>
+    /// A CALLER CANCELLATION propagates: this runs entirely inside the preparation, before the
+    /// work-slot capture, so nothing has been admitted, claimed or enqueued that would need
+    /// rolling back. Any OTHER lookup failure degrades to the environment-only chain and is
+    /// recorded with the FIXED, credential-free
+    /// <see cref="StoredCredentialLookupFailedTemplate"/> — never the raw exception message.
+    /// </para>
+    /// <para>
+    /// <b>THE THREE CANCELLATION OBSERVATION POINTS</b>, all of them BEFORE the work-slot
+    /// capture, so every one of them leaves NOTHING to roll back:
+    /// <list type="number">
+    /// <item>the ENTRY check — a pre-cancelled caller never even reaches the lookup;</item>
+    /// <item>the lookup's OWN cancellation — sanitized (see below) and rethrown;</item>
+    /// <item>THE POST-LOOKUP RECHECK — the one that closes the window in which the caller is
+    /// cancelled WHILE the lookup runs but the lookup itself neither observes nor reports it
+    /// (it returns a token normally, or it faults with a NON-cancellation exception that the
+    /// environment fallback swallows). Without it such a dispatch would sail on into the
+    /// capture, the claim, the admission and the enqueue.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>THE SANITIZED CANCELLATION BOUNDARY.</b> The lookup's own
+    /// <see cref="OperationCanceledException"/> is NEVER rethrown as-is: its message and inner
+    /// exception come from the credential provider and can quote the credential (a connection
+    /// string, a token echoed by a provider error). Downstream sinks render exactly those —
+    /// <c>PipelineDriver</c>'s improve-phase catch logs <c>ex.Message</c> AND copies it into the
+    /// phase verdict and the goal-update notes — so a fresh, fixed-message exception carrying
+    /// the CALLER'S TOKEN and NO inner exception is raised instead.
+    /// </para>
+    /// </remarks>
+    /// <param name="goalId">The dispatching goal, for the diagnostic.</param>
+    /// <param name="ct">The caller's cancellation token.</param>
+    /// <returns>The resolved credential, or <c>null</c> when no candidate is present.</returns>
+    /// <exception cref="OperationCanceledException">
+    /// The caller cancelled before, during or across the lookup. Always credential-free.
+    /// </exception>
+    private async Task<string?> ResolveAssignmentCredentialAsync(string goalId, CancellationToken ct)
+    {
+        // (1) THE ENTRY CHECK. Observed here — before the work-slot capture — a cancellation
+        // costs nothing: no slot, no mapping, no pointer, no queue entry.
+        ThrowSanitizedIfCancelled(ct);
+
+        string? storedToken = null;
+        if (_storedCredentialLookup is not null)
+        {
+            try
+            {
+                storedToken = await _storedCredentialLookup(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // (2) THE LOOKUP'S OWN CANCELLATION. A CALLER cancellation is not a lookup
+                // failure — it propagates, but SANITIZED: the provider's exception is dropped
+                // entirely (message AND inner) so nothing credential-bearing can reach a
+                // downstream log, verdict or goal note.
+                throw NewSanitizedCancellation(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(StoredCredentialLookupFailedTemplate, goalId, ex.GetType().Name);
+                storedToken = null;
+            }
+        }
+
+        // (3) THE POST-LOOKUP RECHECK — reached on BOTH non-cancelling outcomes: the lookup
+        // RETURNED NORMALLY, or it FAULTED with a non-cancellation exception and fell back to
+        // the environment chain. Either way the caller may have been cancelled while the lookup
+        // was in flight, and that cancellation must refuse the dispatch HERE — still before the
+        // capture, the claim, the admission and the enqueue.
+        ThrowSanitizedIfCancelled(ct);
+
+        return GitCredentialResolver.Resolve(
+            storedToken,
+            Environment.GetEnvironmentVariable("GH_TOKEN"),
+            Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
+    }
+
+    /// <summary>
+    /// Throws the SANITIZED cancellation when <paramref name="ct"/> is cancelled; otherwise a
+    /// no-op. Used instead of <see cref="CancellationToken.ThrowIfCancellationRequested"/> at the
+    /// credential boundary so every exception leaving it has ONE fixed, credential-free shape.
+    /// </summary>
+    /// <param name="ct">The caller's cancellation token.</param>
+    private static void ThrowSanitizedIfCancelled(CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            throw NewSanitizedCancellation(ct);
+    }
+
+    /// <summary>
+    /// Builds THE SANITIZED CANCELLATION: a fresh <see cref="OperationCanceledException"/> with
+    /// the fixed <see cref="StoredCredentialLookupCancelledMessage"/>, carrying the CALLER'S
+    /// token and — deliberately — NO inner exception.
+    /// </summary>
+    /// <remarks>
+    /// Dropping the provider exception is the whole point: retaining it as an inner exception
+    /// would re-open the leak, because downstream renderers walk or format the chain.
+    /// </remarks>
+    /// <param name="ct">The caller's cancellation token, carried on the exception.</param>
+    /// <returns>The credential-free cancellation to throw.</returns>
+    private static OperationCanceledException NewSanitizedCancellation(CancellationToken ct) =>
+        new(StoredCredentialLookupCancelledMessage, ct);
 }

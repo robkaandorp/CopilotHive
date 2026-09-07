@@ -83,6 +83,13 @@ public sealed class GoalDispatcher : BackgroundService
     /// <param name="goalReadyNotifier">Optional notifier used to wake the dispatcher when a goal becomes pending.</param>
     /// <param name="eventBus">Optional event bus for publishing system events.</param>
     /// <param name="ciMonitor">Optional CI monitor service for post-merge CI status tracking.</param>
+    /// <param name="userService">
+    /// Optional user service supplying THE LIVE STORED-OAUTH LOOKUP
+    /// (<see cref="UserService.GetActiveAccessTokenAsync"/>) to the task dispatch service, so a
+    /// worker assignment carries the CURRENT stored admin token rather than only the
+    /// environment credential. Optional so both DI (registered BY TYPE) and the existing direct
+    /// constructions keep working; when null, the dispatch resolves the environment chain alone.
+    /// </param>
     public GoalDispatcher(
         GoalManager goalManager,
         GoalPipelineManager pipelineManager,
@@ -106,7 +113,8 @@ public sealed class GoalDispatcher : BackgroundService
         DashboardNotifier? dashboardNotifier = null,
         GoalReadyNotifier? goalReadyNotifier = null,
         IEventBus? eventBus = null,
-        CiMonitorService? ciMonitor = null)
+        CiMonitorService? ciMonitor = null,
+        UserService? userService = null)
     {
         _repoManager = repoManager ?? throw new ArgumentNullException(nameof(repoManager));
         _goalManager = goalManager;
@@ -139,9 +147,18 @@ public sealed class GoalDispatcher : BackgroundService
             config: config,
             goalReadyNotifier: goalReadyNotifier);
 
+        // THE STORED-OAUTH WIRING: the live async lookup is handed to the dispatch service as a
+        // DELEGATE (no global registration, no sync-over-async). It is bound as a METHOD GROUP so
+        // the delegate's Target IS the UserService and its Method IS
+        // UserService.GetActiveAccessTokenAsync — the wiring is directly inspectable. Null when no
+        // UserService is available; the dispatch then resolves the environment chain alone.
+        Func<CancellationToken, Task<string?>>? storedCredentialLookup =
+            userService is null ? null : userService.GetActiveAccessTokenAsync;
+
         _taskDispatchService = new TaskDispatchService(
             _taskQueue, _workerGateway, _taskBuilder, _config,
-            NullLogger<TaskDispatchService>.Instance, _pipelineManager, _lifecycleService, _maintenance);
+            NullLogger<TaskDispatchService>.Instance, _pipelineManager, _lifecycleService, _maintenance,
+            storedCredentialLookup: storedCredentialLookup);
 
         _pipelineDriver = new PipelineDriver(
             brain: brain,

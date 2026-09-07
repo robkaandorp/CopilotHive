@@ -1,4 +1,5 @@
 using CopilotHive.Goals;
+using CopilotHive.Shared;
 using CopilotHive.Workers;
 
 namespace CopilotHive.Services;
@@ -165,17 +166,80 @@ internal static class PipelineHelpers
     }
 
     /// <summary>
-    /// Injects the environment credential into a GitHub URL for authenticated operations.
-    /// <c>GH_TOKEN</c> takes precedence; <c>GITHUB_TOKEN</c> is the fallback when it is absent.
+    /// Injects the ENVIRONMENT credential into a GitHub URL for authenticated operations —
+    /// THE LEGACY OVERLOAD, kept for the synchronous callers that cannot await a stored-OAuth
+    /// lookup (<see cref="TaskDispatchService.ResolveRepositories"/> and the startup path).
+    /// <para>
+    /// The candidate chain is <c>GH_TOKEN</c> then <c>GITHUB_TOKEN</c>, selected by
+    /// <see cref="GitCredentialResolver.Resolve"/> — so it is BLANK-AWARE: an empty or
+    /// whitespace-only value falls through to the next candidate, and a chain that resolves to
+    /// nothing leaves the URL unchanged.
+    /// </para>
     /// </summary>
+    /// <param name="url">The repository URL.</param>
+    /// <returns>The credential-bearing URL, or <paramref name="url"/> unchanged.</returns>
     internal static string InjectTokenIntoUrl(string url)
     {
-        var token = Environment.GetEnvironmentVariable("GH_TOKEN")
-                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        if (string.IsNullOrEmpty(token) || !url.StartsWith("https://github.com/"))
+        var token = GitCredentialResolver.Resolve(
+            Environment.GetEnvironmentVariable("GH_TOKEN"),
+            Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
+        if (string.IsNullOrWhiteSpace(token) || !url.StartsWith("https://github.com/", StringComparison.Ordinal))
             return url;
 
         return url.Replace("https://github.com/", $"https://x-access-token:{token}@github.com/");
+    }
+
+    /// <summary>
+    /// THE EXPLICIT-CREDENTIAL OVERLOAD: injects <paramref name="credential"/> into an HTTPS
+    /// GitHub URL. Purely parameter-driven — it NEVER reads the environment, so the caller owns
+    /// the whole credential-precedence decision.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Eligibility.</b> The URL must PARSE as an absolute URI whose scheme is <c>https</c>,
+    /// whose host is EXACTLY <c>github.com</c> (case-insensitive whole-host comparison — never a
+    /// substring match, so <c>github.com.evil.test</c> and <c>notgithub.com</c> are ineligible)
+    /// and whose EFFECTIVE port is 443. SSH, local paths, plain HTTP, non-GitHub hosts and
+    /// explicit non-443 ports are all returned UNCHANGED.
+    /// </para>
+    /// <para>
+    /// <b>Replacement, not appending.</b> Any userinfo already present on the URL is REPLACED,
+    /// so a previously tokenized URL never accumulates credentials. The credential is
+    /// URI-escaped; the repository identity (path, query, fragment) is preserved verbatim.
+    /// </para>
+    /// <para>
+    /// A <c>null</c>, empty or whitespace-only credential leaves the URL unchanged.
+    /// </para>
+    /// </remarks>
+    /// <param name="url">The repository URL (the authoritative configured URL).</param>
+    /// <param name="credential">The resolved credential, or <c>null</c>/blank for no injection.</param>
+    /// <returns>The credential-bearing URL, or <paramref name="url"/> unchanged.</returns>
+    internal static string InjectTokenIntoUrl(string url, string? credential)
+    {
+        if (string.IsNullOrWhiteSpace(credential))
+            return url;
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return url;
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return url;
+
+        // EXACT host comparison, case-insensitive — deliberately NOT Contains/StartsWith.
+        if (!string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
+            return url;
+
+        // The EFFECTIVE port: an https URL with no explicit port reports 443 here.
+        if (uri.Port != 443)
+            return url;
+
+        var builder = new UriBuilder(uri)
+        {
+            UserName = "x-access-token",
+            Password = Uri.EscapeDataString(credential),
+        };
+
+        return builder.Uri.AbsoluteUri;
     }
 
     /// <summary>

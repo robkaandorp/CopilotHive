@@ -6,6 +6,8 @@ using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -5282,6 +5284,174 @@ public sealed class GoalDispatcherDiagnosticLoggingTests
             $"Expected 'verified goal ... InProgress' info log. Logs: {string.Join("\n", logger.Logs.Select(l => $"[{l.Level}] {l.Message}"))}");
     }
 
+}
+
+/// <summary>
+/// THE STORED-OAUTH CONSTRUCTOR WIRING: <see cref="GoalDispatcher"/> takes an OPTIONAL
+/// <see cref="UserService"/> and hands its
+/// <see cref="UserService.GetActiveAccessTokenAsync"/> to the <see cref="TaskDispatchService"/>
+/// it actually constructs, so a worker assignment can carry the CURRENT stored admin token.
+/// </summary>
+/// <remarks>
+/// The parameter is OPTIONAL and LAST, so every existing direct construction keeps compiling and
+/// DI (which registers <see cref="GoalDispatcher"/> BY TYPE) can still activate it. The
+/// production-DI half of the evidence lives in
+/// <c>GoalDispatcherStoredOAuthProductionWiringTests</c>.
+/// </remarks>
+public sealed class GoalDispatcherStoredOAuthWiringTests
+{
+    private static object GetTaskDispatchService(GoalDispatcher dispatcher)
+    {
+        var field = typeof(GoalDispatcher).GetField(
+            "_taskDispatchService",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        var service = field!.GetValue(dispatcher);
+        Assert.NotNull(service);
+        return service!;
+    }
+
+    private static Delegate? GetStoredCredentialLookup(object taskDispatchService)
+    {
+        var field = taskDispatchService.GetType().GetField(
+            "_storedCredentialLookup",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(field);
+        return (Delegate?)field!.GetValue(taskDispatchService);
+    }
+
+    private static GoalDispatcher CreateDispatcher(UserService? userService)
+    {
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new FakeGoalSource(new Goal { Id = "setup-goal", Description = "Setup" }));
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        return new GoalDispatcher(
+            goalManager,
+            new GoalPipelineManager(),
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            userService: userService);
+    }
+
+    /// <summary>
+    /// A supplied <see cref="UserService"/> is wired through as the stored-credential lookup, and
+    /// the delegate's target/method ARE that service's
+    /// <see cref="UserService.GetActiveAccessTokenAsync"/> — not some other resolver.
+    /// </summary>
+    [Fact]
+    public void Constructor_WithUserService_WiresGetActiveAccessTokenAsyncIntoTaskDispatchService()
+    {
+        using var factory = new StoredOAuthDbFactory();
+        var userService = new UserService(factory, NullLogger<UserService>.Instance);
+
+        var dispatcher = CreateDispatcher(userService);
+
+        var lookup = GetStoredCredentialLookup(GetTaskDispatchService(dispatcher));
+        Assert.NotNull(lookup);
+        Assert.Same(userService, lookup!.Target);
+        Assert.Equal(nameof(UserService.GetActiveAccessTokenAsync), lookup.Method.Name);
+    }
+
+    /// <summary>
+    /// The parameter is OPTIONAL: omitting it (every pre-existing direct construction) leaves the
+    /// lookup NULL, and the dispatch then resolves the environment chain alone.
+    /// </summary>
+    [Fact]
+    public void Constructor_WithoutUserService_LeavesTheLookupNull()
+    {
+        var dispatcher = CreateDispatcher(userService: null);
+
+        Assert.Null(GetStoredCredentialLookup(GetTaskDispatchService(dispatcher)));
+    }
+
+    /// <summary>
+    /// THE LIVE ROUND-TRIP: the wired delegate really returns the STORED admin token, so the
+    /// wiring is functional and not merely shape-correct.
+    /// </summary>
+    [Fact]
+    public async Task Constructor_WiredLookup_ReturnsTheStoredAdminToken()
+    {
+        using var factory = new StoredOAuthDbFactory();
+        var userService = new UserService(factory, NullLogger<UserService>.Instance);
+        await userService.CreateOrUpdateUserAsync(
+            "42", "octocat", "The Octocat", "https://avatar/octocat.png",
+            "octocat@example.com", "stored-oauth-token", refreshToken: null, tokenExpiresAt: null,
+            TestContext.Current.CancellationToken);
+
+        var dispatcher = CreateDispatcher(userService);
+        var lookup = (Func<CancellationToken, Task<string?>>)GetStoredCredentialLookup(GetTaskDispatchService(dispatcher))!;
+
+        Assert.Equal("stored-oauth-token", await lookup(TestContext.Current.CancellationToken));
+    }
+
+    /// <summary>
+    /// An <see cref="IDbContextFactory{TContext}"/> over one open in-memory SQLite connection.
+    /// </summary>
+    private sealed class StoredOAuthDbFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly Microsoft.Data.Sqlite.SqliteConnection _connection;
+
+        public StoredOAuthDbFactory()
+        {
+            _connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+            _connection.Open();
+            using var context = CreateDbContext();
+            context.Database.EnsureCreated();
+        }
+
+        public CopilotHiveDbContext CreateDbContext() =>
+            new(new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(_connection).Options);
+
+        public void Dispose() => _connection.Dispose();
+    }
+}
+
+/// <summary>
+/// THE PRODUCTION-DI EVIDENCE: the REAL host activates <see cref="GoalDispatcher"/> by type, and
+/// the resulting instance's <see cref="TaskDispatchService"/> carries the live stored-OAuth lookup
+/// bound to the container's own <see cref="UserService"/> singleton.
+/// </summary>
+/// <remarks>
+/// This is what makes the optional parameter more than a compile-time convenience: DI's
+/// constructor selection actually supplies the registered <see cref="UserService"/>, so the
+/// production dispatch resolves the stored token without any registration edit in Program.cs.
+/// </remarks>
+[Collection("HiveIntegration")]
+public sealed class GoalDispatcherStoredOAuthProductionWiringTests
+{
+    private readonly HiveTestFactory _factory;
+
+    public GoalDispatcherStoredOAuthProductionWiringTests(HiveTestFactory factory) => _factory = factory;
+
+    [Fact]
+    public void ProductionGoalDispatcher_TaskDispatchService_CarriesTheUserServiceLookup()
+    {
+        var dispatcher = _factory.Services.GetService<GoalDispatcher>();
+        Assert.NotNull(dispatcher);
+
+        var dispatchServiceField = typeof(GoalDispatcher).GetField(
+            "_taskDispatchService",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(dispatchServiceField);
+        var dispatchService = dispatchServiceField!.GetValue(dispatcher);
+        Assert.NotNull(dispatchService);
+
+        var lookupField = dispatchService!.GetType().GetField(
+            "_storedCredentialLookup",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(lookupField);
+        var lookup = (Delegate?)lookupField!.GetValue(dispatchService);
+
+        // THE WIRING: bound to the container's own UserService singleton and to its
+        // GetActiveAccessTokenAsync method — no global token registration anywhere.
+        Assert.NotNull(lookup);
+        Assert.Same(_factory.Services.GetRequiredService<UserService>(), lookup!.Target);
+        Assert.Equal(nameof(UserService.GetActiveAccessTokenAsync), lookup.Method.Name);
+    }
 }
 
 /// <summary>

@@ -1680,6 +1680,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// (1) before (2) is an index comparison, (2) before (3) is "the Role was still the ASSIGNED
     /// value when the guard line was written", and (3) before (4) is "the Role was already the
     /// PRE-MUTATION value when the failure line was written". Moving any step fails the test.
+    /// <para>
+    /// THE CANCELLATION TRIGGER is the gateway's <c>CancelAtDeliveryStart</c> gate at stage G —
+    /// deterministically AFTER the admission committed and enqueued, which is the boundary this
+    /// recovery is defined at. (A pre-cancelled caller token is refused by the preparation's
+    /// credential resolution before ANY admission, so it can never reach the requeue.)
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Delivery_CancelledBeforeCheck_RequeuesRestoresRoleLogsInOrderAndPropagates()
@@ -1694,14 +1700,16 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         queue.OnEnqueue = t => events.Add($"enqueue:{t.TaskId}");
 
         var logger = new DeliveryProbingLogger<TaskDispatchService>(events, () => worker.Role);
-        var gateway = new DeliveryWorkerGateway(worker);
-        var service = CreateService(manager, queue, logger, workerGateway: gateway);
-
         using var cts = new CancellationTokenSource();
-        await cts.CancelAsync();
+        var gateway = new DeliveryWorkerGateway(worker) { CancelAtDeliveryStart = cts };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        // The delivery transaction really was entered — the cancellation happened AT its boundary,
+        // not before the admission.
+        Assert.Equal(1, gateway.IdleWorkerProbes);
 
         var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var guardLine = DeliveryRecoveryMessage(GoalId, taskId);
@@ -1750,6 +1758,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// <c>delivery-rollback-failure step=re-enqueue</c> record is THE record, the guard line is NOT
     /// emitted, the Role restore still runs, and the ORIGINAL cancellation is rethrown.
     /// </summary>
+    /// <remarks>
+    /// THE CANCELLATION TRIGGER is the gateway's stage-G gate, so the admission has already
+    /// completed and the recovery genuinely operates on ADMITTED work.
+    /// </remarks>
     [Fact]
     public async Task Delivery_CancelledAndRecoveryEnqueueThrows_SkipsGuardLineAndContinuesRollback()
     {
@@ -1769,14 +1781,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         var worker = CreateIdleWorker(role: WorkerRole.Tester);
         var logger = new TestLogger<TaskDispatchService>();
-        var gateway = new DeliveryWorkerGateway(worker);
-        var service = CreateService(manager, queue, logger, workerGateway: gateway);
-
         using var cts = new CancellationTokenSource();
-        await cts.CancelAsync();
+        var gateway = new DeliveryWorkerGateway(worker) { CancelAtDeliveryStart = cts };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        Assert.Equal(1, gateway.IdleWorkerProbes);
 
         var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
 
@@ -1815,6 +1827,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// nothing more. The <c>step=role-model-restore</c> catch has NO runtime vector at all:
     /// <see cref="ConnectedWorker.Role"/> is a plain auto-property on a sealed class, so that catch
     /// is a CODE-REVIEW CRITERION (the belt-and-braces structure), not a testable path.
+    /// <para>
+    /// THE CANCELLATION TRIGGER is the gateway's stage-G gate — after the admission, at the
+    /// delivery boundary the recovery is defined at.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Delivery_CancelledAfterConcurrentRoleReassignment_SkipsTheRestore()
@@ -1834,13 +1850,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         };
 
         var logger = new TestLogger<TaskDispatchService>();
-        var service = CreateService(manager, queue, logger, workerGateway: new DeliveryWorkerGateway(worker));
-
         using var cts = new CancellationTokenSource();
-        await cts.CancelAsync();
+        var gateway = new DeliveryWorkerGateway(worker) { CancelAtDeliveryStart = cts };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        Assert.Equal(1, gateway.IdleWorkerProbes);
 
         // The competitor's value SURVIVES: the restore refused to write over it.
         Assert.Equal(WorkerRole.Reviewer, worker.Role);
@@ -2275,13 +2292,38 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>When set, <see cref="SendAgentsUpdateAsync"/> throws it (stage A).</summary>
         public Exception? AgentsUpdateThrows { get; init; }
 
+        /// <summary>
+        /// THE DELIVERY-BOUNDARY GATE. When set, <see cref="GetIdleWorker"/> — stage G, the FIRST
+        /// step of the delivery transaction and therefore strictly AFTER the whole admission
+        /// (capture → build → claim → PersistAdmission → enqueue) — cancels this source.
+        /// </summary>
+        /// <remarks>
+        /// This is what makes the cancel-check vectors exercise the ADMITTED-WORK recovery they
+        /// assert. Pre-cancelling the caller's token before <c>DispatchToRole</c> no longer
+        /// reaches this transaction at all: the preparation's stored-credential resolution
+        /// observes the cancellation first and refuses BEFORE any admission, so nothing would be
+        /// enqueued to requeue. The gate is a synchronous callback on the dispatch's own thread —
+        /// deterministic, with no sleep and no race.
+        /// </remarks>
+        public CancellationTokenSource? CancelAtDeliveryStart { get; init; }
+
+        /// <summary>Number of idle-worker probes — the proof the delivery transaction was entered.</summary>
+        public int IdleWorkerProbes { get; private set; }
+
         public List<string> MarkedBusyTaskIds { get; } = [];
         public List<string> SentTaskIds { get; } = [];
 
         /// <summary>Number of agents-md sends attempted — the proof that stage A really ran.</summary>
         public int AgentsUpdateAttempts { get; private set; }
 
-        public ConnectedWorker? GetIdleWorker() => _worker;
+        public ConnectedWorker? GetIdleWorker()
+        {
+            IdleWorkerProbes++;
+            // The admission is COMPLETE by the time stage G runs; cancelling here is observed at
+            // the cancel-check, the one provably-safe recovery point.
+            CancelAtDeliveryStart?.Cancel();
+            return _worker;
+        }
 
         public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [_worker];
 

@@ -167,24 +167,136 @@ public sealed class PipelineHelpersTests
     [Fact]
     public void InjectTokenIntoUrl_EmptyGhToken_FallsBackToGithubToken()
     {
-        // An EMPTY GH_TOKEN is indistinguishable from unset for the ?? chain only when it is
-        // null; an empty string wins the ?? and is then rejected by the IsNullOrEmpty gate.
-        // The gate stays IsNullOrEmpty (NOT whitespace-aware) — assert that documented shape.
+        // An EMPTY GH_TOKEN is a BLANK candidate: the legacy overload now selects its candidates
+        // through GitCredentialResolver.Resolve, which skips null/empty/whitespace values, so the
+        // valid GITHUB_TOKEN is selected and INJECTED. (Previously the empty string won the ??
+        // chain and was then rejected by the IsNullOrEmpty gate, leaving the URL unchanged — that
+        // blank-swallows-the-fallback shape is exactly what this now pins as fixed.)
         WithTokens(string.Empty, "github-token", () =>
+            Assert.Equal(
+                "https://x-access-token:github-token@github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrl_WhitespaceGithubTokenFallback_IsNotInjected()
+    {
+        // The gate is blank-AWARE: a whitespace-only credential is treated as ABSENT, so no
+        // userinfo is injected and the URL is returned unchanged. A whitespace token could never
+        // authenticate — injecting it only produced a corrupt URL.
+        WithTokens(null, " ", () =>
             Assert.Equal(
                 "https://github.com/owner/repo.git",
                 PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
     }
 
+    // ── InjectTokenIntoUrl(url, credential): THE EXPLICIT-CREDENTIAL OVERLOAD ────
+
     [Fact]
-    public void InjectTokenIntoUrl_WhitespaceGithubTokenFallback_IsStillInjected()
+    public void InjectTokenIntoUrlWithCredential_HttpsGitHub_InjectsEscapedCredential()
     {
-        // The gate is IsNullOrEmpty, NOT IsNullOrWhiteSpace — a whitespace token is injected.
-        // Pinning the existing (deliberately unchanged) behaviour.
-        WithTokens(null, " ", () =>
+        Assert.Equal(
+            "https://x-access-token:oauth-token@github.com/owner/repo.git",
+            PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git", "oauth-token"));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrlWithCredential_NeverReadsTheEnvironment()
+    {
+        // BOTH aliases are set and the explicit credential is absent: the overload must still
+        // leave the URL unchanged. A regression that consulted the environment would inject.
+        WithTokens("gh-token", "github-token", () =>
+        {
             Assert.Equal(
-                "https://x-access-token: @github.com/owner/repo.git",
-                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git")));
+                "https://github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git", null));
+            Assert.Equal(
+                "https://github.com/owner/repo.git",
+                PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git", "   "));
+        });
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void InjectTokenIntoUrlWithCredential_MissingCredential_ReturnsOriginal(string? credential)
+    {
+        Assert.Equal(
+            "https://github.com/owner/repo.git",
+            PipelineHelpers.InjectTokenIntoUrl("https://github.com/owner/repo.git", credential));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrlWithCredential_AlreadyTokenizedUrl_ReplacesUserInfoRatherThanAppending()
+    {
+        var result = PipelineHelpers.InjectTokenIntoUrl(
+            "https://x-access-token:stale-token@github.com/owner/repo.git", "fresh-token");
+
+        Assert.Equal("https://x-access-token:fresh-token@github.com/owner/repo.git", result);
+        Assert.DoesNotContain("stale-token", result, StringComparison.Ordinal);
+        // Exactly ONE userinfo separator — nothing was appended to the previous credential.
+        Assert.Equal(1, result.Count(c => c == '@'));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrlWithCredential_CredentialWithReservedCharacters_IsUriEscaped()
+    {
+        var result = PipelineHelpers.InjectTokenIntoUrl(
+            "https://github.com/owner/repo.git", "p@ss/wo rd:1");
+
+        // The RAW credential never appears verbatim — it is escaped so the URL still parses,
+        // and the repository identity (host + path) survives intact.
+        Assert.DoesNotContain("p@ss/wo rd:1", result, StringComparison.Ordinal);
+        var parsed = new Uri(result);
+        Assert.Equal("github.com", parsed.Host);
+        Assert.Equal("/owner/repo.git", parsed.AbsolutePath);
+        Assert.StartsWith("x-access-token:", parsed.UserInfo, StringComparison.Ordinal);
+        Assert.Equal("p@ss/wo rd:1", Uri.UnescapeDataString(parsed.UserInfo["x-access-token:".Length..]));
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrlWithCredential_HostComparisonIsCaseInsensitiveNotSubstring()
+    {
+        // Case-insensitive EXACT host: an upper-case host IS eligible…
+        Assert.Equal(
+            "https://x-access-token:tok@github.com/owner/repo.git",
+            PipelineHelpers.InjectTokenIntoUrl("https://GitHub.COM/owner/repo.git", "tok"));
+    }
+
+    [Theory]
+    // …while every host that merely CONTAINS "github.com" is NOT.
+    [InlineData("https://github.com.evil.test/owner/repo.git")]
+    [InlineData("https://notgithub.com/owner/repo.git")]
+    [InlineData("https://github.company.test/owner/repo.git")]
+    [InlineData("https://gitlab.com/owner/repo.git")]
+    // Non-HTTPS transports and non-443 ports.
+    [InlineData("http://github.com/owner/repo.git")]
+    [InlineData("https://github.com:8443/owner/repo.git")]
+    [InlineData("ssh://git@github.com/owner/repo.git")]
+    [InlineData("git@github.com:owner/repo.git")]
+    [InlineData("/srv/local/repo.git")]
+    [InlineData("../relative/repo.git")]
+    public void InjectTokenIntoUrlWithCredential_IneligibleUrl_ReturnsOriginalUnchanged(string url)
+    {
+        var result = PipelineHelpers.InjectTokenIntoUrl(url, "oauth-token");
+
+        Assert.Equal(url, result);
+        Assert.DoesNotContain("oauth-token", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void InjectTokenIntoUrlWithCredential_ExplicitDefaultPort_IsEligible()
+    {
+        // An EXPLICIT :443 is the DEFAULT port for https — eligible, and the normalized result
+        // keeps the repository identity.
+        var result = PipelineHelpers.InjectTokenIntoUrl("https://github.com:443/owner/repo.git", "tok");
+
+        var parsed = new Uri(result);
+        Assert.Equal("x-access-token:tok", parsed.UserInfo);
+        Assert.Equal("github.com", parsed.Host);
+        Assert.Equal("/owner/repo.git", parsed.AbsolutePath);
     }
 
     // ── GetLastCraftPromptFromConversation ───────────────────────────────────

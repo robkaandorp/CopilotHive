@@ -2826,6 +2826,727 @@ public sealed class TaskDispatchServiceTests
             Task.CompletedTask;
     }
 }
+
+/// <summary>
+/// THE STORED-OAUTH ASSIGNMENT CREDENTIAL: <see cref="TaskDispatchService.DispatchToRole"/>
+/// resolves the CURRENT stored admin OAuth token → <c>GH_TOKEN</c> → <c>GITHUB_TOKEN</c> ONCE per
+/// assignment, DURING the preparation (before the work-slot capture), and rebuilds the task's
+/// repository URLs from the AUTHORITATIVE configured URLs.
+/// </summary>
+/// <remarks>
+/// Every vector asserts against the ACTUAL queued/built <see cref="WorkTask"/>'s repository URLs,
+/// captured through the <see cref="TaskQueue.OnEnqueue"/> seam — never against a helper's return
+/// value. All credentials are fake and no network call is made; the environment is mutated only
+/// inside the serialized <c>EnvVarMutation</c> collection and is always restored.
+/// </remarks>
+[Collection("EnvVarMutation")]
+public sealed class TaskDispatchCredentialTests
+{
+    private const string RepoName = "cred-repo";
+    private const string ConfiguredUrl = "https://github.com/org/cred-repo.git";
+
+    // ── fixture ──────────────────────────────────────────────────────────────
+
+    /// <summary>Runs <paramref name="body"/> with both aliases set, restoring BOTH afterwards.</summary>
+    private static async Task WithTokensAsync(string? ghToken, string? githubToken, Func<Task> body)
+    {
+        var originalGh = Environment.GetEnvironmentVariable("GH_TOKEN");
+        var originalGithub = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        try
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", ghToken);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", githubToken);
+            await body();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_TOKEN", originalGh);
+            Environment.SetEnvironmentVariable("GITHUB_TOKEN", originalGithub);
+        }
+    }
+
+    private static HiveConfigFile CreateConfig(string url = ConfiguredUrl)
+    {
+        var config = new HiveConfigFile();
+        config.Repositories.Add(new RepositoryConfig
+        {
+            Name = RepoName,
+            Url = url,
+            DefaultBranch = "develop",
+        });
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        return config;
+    }
+
+    private sealed class CredentialGoalSource : IGoalSource
+    {
+        private readonly Goal _goal;
+        public CredentialGoalSource(Goal goal) => _goal = goal;
+        public string Name => "credential-test-fake";
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([_goal]);
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+            Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Builds a real <see cref="TaskDispatchService"/> wired exactly as <c>GoalDispatcher</c>
+    /// wires it, plus the caller's stored-credential lookup delegate.
+    /// </summary>
+    private static (TaskDispatchService Service, GoalPipeline Pipeline, TaskQueue Queue, GoalPipelineManager Manager, HiveConfigFile Config)
+        CreateFixture(
+            Func<CancellationToken, Task<string?>>? storedCredentialLookup,
+            ILogger<TaskDispatchService>? logger = null,
+            HiveConfigFile? config = null)
+    {
+        config ??= CreateConfig();
+        logger ??= NullLogger<TaskDispatchService>.Instance;
+
+        var queue = new TaskQueue();
+        var manager = new GoalPipelineManager();
+        var workerGateway = new GrpcWorkerGateway(new WorkerPool());
+
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Credential goal",
+            RepositoryNames = [RepoName],
+        };
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new CredentialGoalSource(goal));
+        goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
+
+        var pipeline = manager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        var plan = IterationPlan.Default(includeImprove: true);
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.StartIteration(plan.Phases);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, pipeline.Phase);
+
+        var lifecycleService = new GoalLifecycleService(goalManager, logger);
+        var maintenance = new DispatcherMaintenance(
+            manager, goalManager, queue, workerGateway,
+            brain: null, agentsManager: null, configRepo: null,
+            new ConcurrentQueue<string>(), logger, config: config);
+
+        var service = new TaskDispatchService(
+            queue, workerGateway, new TaskBuilder(new BranchCoordinator()), config,
+            logger, manager, lifecycleService, maintenance,
+            storedCredentialLookup: storedCredentialLookup);
+
+        return (service, pipeline, queue, manager, config);
+    }
+
+    /// <summary>Dispatches once and returns the ACTUAL enqueued task.</summary>
+    private static async Task<WorkTask> DispatchAndCaptureAsync(
+        TaskDispatchService service, GoalPipeline pipeline, TaskQueue queue)
+    {
+        WorkTask? captured = null;
+        queue.OnEnqueue = t => captured = t;
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+        Assert.NotNull(captured);
+        return captured!;
+    }
+
+    private static string SingleRepoUrl(WorkTask task) => Assert.Single(task.Repositories).Url;
+
+    // ── (1) OAuth-only ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A stored OAuth token with NO environment alias present: the ACTUAL queued task's URL
+    /// carries the OAuth credential in usable form.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_OAuthOnly_QueuedTaskUrlCarriesTheStoredToken()
+    {
+        await WithTokensAsync(null, null, async () =>
+        {
+            var (service, pipeline, queue, _, config) = CreateFixture(_ => Task.FromResult<string?>("oauth-token"));
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal("https://x-access-token:oauth-token@github.com/org/cred-repo.git", SingleRepoUrl(task));
+            // THE CONFIGURED URL IS UNTOUCHED — the credential lives only on the assignment.
+            Assert.Equal(ConfiguredUrl, Assert.Single(config.Repositories).Url);
+            // AND THE PROCESS ENVIRONMENT IS UNTOUCHED: no token was written back to an alias.
+            Assert.Null(Environment.GetEnvironmentVariable("GH_TOKEN"));
+            Assert.Null(Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
+        });
+    }
+
+    // ── (2) OAuth outranks BOTH aliases ──────────────────────────────────────
+
+    /// <summary>
+    /// With a stored OAuth token AND both aliases set, the OAuth token WINS and neither alias
+    /// value appears anywhere in the assignment.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_OAuthAndBothAliases_OAuthOutranksBoth()
+    {
+        await WithTokensAsync("gh-alias-token", "github-alias-token", async () =>
+        {
+            var (service, pipeline, queue, _, _) = CreateFixture(_ => Task.FromResult<string?>("oauth-token"));
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+            var url = SingleRepoUrl(task);
+
+            Assert.Equal("https://x-access-token:oauth-token@github.com/org/cred-repo.git", url);
+            Assert.DoesNotContain("gh-alias-token", url, StringComparison.Ordinal);
+            Assert.DoesNotContain("github-alias-token", url, StringComparison.Ordinal);
+            // The aliases themselves are unchanged.
+            Assert.Equal("gh-alias-token", Environment.GetEnvironmentVariable("GH_TOKEN"));
+            Assert.Equal("github-alias-token", Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
+        });
+    }
+
+    /// <summary>
+    /// A BLANK stored OAuth token falls through to <c>GH_TOKEN</c>; a blank <c>GH_TOKEN</c> falls
+    /// through to <c>GITHUB_TOKEN</c> — the whitespace-is-absent rule at EVERY step.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "gh-alias-token", "github-alias-token", "gh-alias-token")]
+    [InlineData("", "gh-alias-token", "github-alias-token", "gh-alias-token")]
+    [InlineData("   ", "gh-alias-token", "github-alias-token", "gh-alias-token")]
+    [InlineData(null, "  ", "github-alias-token", "github-alias-token")]
+    [InlineData("\t", null, "github-alias-token", "github-alias-token")]
+    public async Task Dispatch_BlankCandidatesFallThroughInOrder(
+        string? oauthToken, string? ghToken, string? githubToken, string expectedCredential)
+    {
+        await WithTokensAsync(ghToken, githubToken, async () =>
+        {
+            var (service, pipeline, queue, _, _) = CreateFixture(_ => Task.FromResult(oauthToken));
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal(
+                $"https://x-access-token:{expectedCredential}@github.com/org/cred-repo.git",
+                SingleRepoUrl(task));
+        });
+    }
+
+    // ── (3) blank/missing OAuth AND blank/missing aliases ────────────────────
+
+    /// <summary>
+    /// EVERY candidate blank or absent: the assignment carries the CONFIGURED URL verbatim — no
+    /// userinfo, no empty credential artefact.
+    /// </summary>
+    [Theory]
+    [InlineData(null, null, null)]
+    [InlineData("", "", "")]
+    [InlineData("   ", " ", "\t")]
+    public async Task Dispatch_NoUsableCredentialAnywhere_QueuedTaskUrlIsTheConfiguredUrl(
+        string? oauthToken, string? ghToken, string? githubToken)
+    {
+        await WithTokensAsync(ghToken, githubToken, async () =>
+        {
+            var (service, pipeline, queue, _, _) = CreateFixture(_ => Task.FromResult(oauthToken));
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal(ConfiguredUrl, SingleRepoUrl(task));
+            Assert.DoesNotContain("@", SingleRepoUrl(task), StringComparison.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// NO lookup wired at all (the direct-construction / no-UserService case): the environment
+    /// chain alone is resolved and the dispatch still succeeds.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_NoLookupWired_UsesEnvironmentChainAlone()
+    {
+        await WithTokensAsync(null, "github-alias-token", async () =>
+        {
+            var (service, pipeline, queue, _, _) = CreateFixture(storedCredentialLookup: null);
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal(
+                "https://x-access-token:github-alias-token@github.com/org/cred-repo.git",
+                SingleRepoUrl(task));
+        });
+    }
+
+    // ── (4) lookup failure → environment fallback + credential-free diagnostic ──
+
+    /// <summary>
+    /// A THROWING lookup degrades to the environment chain, the dispatch still succeeds, and the
+    /// warning is the FIXED, credential-free diagnostic: the lookup's own (credential-bearing)
+    /// message never reaches the log, and no logged line quotes any credential.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_LookupThrows_FallsBackToEnvironmentAndRedactsTheDiagnostic()
+    {
+        const string secret = "super-secret-oauth-token";
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            var logger = new TestLogger<TaskDispatchService>();
+            var (service, pipeline, queue, _, _) = CreateFixture(
+                _ => throw new InvalidOperationException($"db failure while reading token '{secret}'"),
+                logger);
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            // (i) THE FALLBACK: the assignment still has a usable credential — from the alias.
+            Assert.Equal(
+                "https://x-access-token:gh-alias-token@github.com/org/cred-repo.git",
+                SingleRepoUrl(task));
+
+            // (ii) THE FIXED DIAGNOSTIC fired, naming only the goal and the exception TYPE.
+            var warning = Assert.Single(
+                logger.LogEntries,
+                e => e.LogLevel == LogLevel.Warning && e.Message.Contains("Stored OAuth credential lookup failed", StringComparison.Ordinal));
+            Assert.Contains(pipeline.GoalId, warning.Message, StringComparison.Ordinal);
+            Assert.Contains(nameof(InvalidOperationException), warning.Message, StringComparison.Ordinal);
+
+            // (iii) THE REDACTION: no logged message (nor a captured exception) carries the raw
+            // lookup message or any credential.
+            Assert.All(logger.LogEntries, e =>
+            {
+                Assert.DoesNotContain(secret, e.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain("gh-alias-token", e.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain("db failure while reading token", e.Message, StringComparison.Ordinal);
+                Assert.Null(e.Exception);
+            });
+        });
+    }
+
+    /// <summary>
+    /// With NO alias to fall back to, a throwing lookup still leaves the dispatch working —
+    /// the assignment simply carries the CONFIGURED URL and nothing is leaked.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_LookupThrowsAndNoAliases_UrlIsUnchangedAndNothingIsLeaked()
+    {
+        await WithTokensAsync(null, null, async () =>
+        {
+            var logger = new TestLogger<TaskDispatchService>();
+            var (service, pipeline, queue, _, _) = CreateFixture(
+                _ => throw new InvalidOperationException("token='leaky-value'"), logger);
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal(ConfiguredUrl, SingleRepoUrl(task));
+            Assert.All(logger.LogEntries, e =>
+                Assert.DoesNotContain("leaky-value", e.Message, StringComparison.Ordinal));
+        });
+    }
+
+    // ── (5) two dispatches observe rotation ──────────────────────────────────
+
+    /// <summary>
+    /// THE ROTATION VECTOR: the lookup is invoked ONCE PER ASSIGNMENT and is never cached, so a
+    /// token rotated between two dispatches is observed by the SECOND one.
+    /// </summary>
+    /// <remarks>
+    /// The two dispatches are two DIFFERENT phases of the same pipeline — the ordinary production
+    /// sequence — so no admission invariant is bent to reach the second assignment.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_TwoDispatches_ObserveTokenRotation()
+    {
+        await WithTokensAsync(null, null, async () =>
+        {
+            var config = CreateConfig();
+            config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+            var tokens = new Queue<string?>(["token-v1", "token-v2"]);
+            var lookupCalls = 0;
+            var (service, pipeline, queue, _, _) = CreateFixture(
+                _ =>
+                {
+                    lookupCalls++;
+                    return Task.FromResult(tokens.Dequeue());
+                },
+                config: config);
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+            // Advance to the next worker phase exactly as the completion path does: the pointer is
+            // released through the ownership-checked clear and the pipeline moves on.
+            pipeline.ClearActiveTaskIfCurrent(pipeline.ActiveTaskId!);
+            var plan = pipeline.Plan!;
+            pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
+            pipeline.AdvanceTo(GoalPhase.Testing);
+
+            await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, lookupCalls);
+            Assert.Equal(2, enqueued.Count);
+            Assert.Equal(
+                "https://x-access-token:token-v1@github.com/org/cred-repo.git", SingleRepoUrl(enqueued[0]));
+            Assert.Equal(
+                "https://x-access-token:token-v2@github.com/org/cred-repo.git", SingleRepoUrl(enqueued[1]));
+            // THE REBUILD PROOF: the second URL was built from the CONFIGURED url, not from the
+            // first (already tokenized) one — no accumulation.
+            Assert.DoesNotContain("token-v1", SingleRepoUrl(enqueued[1]), StringComparison.Ordinal);
+            Assert.Equal(1, SingleRepoUrl(enqueued[1]).Count(c => c == '@'));
+        });
+    }
+
+    // ── ineligible URLs keep existing behaviour ──────────────────────────────
+
+    /// <summary>
+    /// An INELIGIBLE configured URL (SSH, local path, plain HTTP, non-GitHub host, non-443 port)
+    /// receives NO newly resolved token: the assignment carries the configured URL verbatim.
+    /// </summary>
+    [Theory]
+    [InlineData("git@github.com:org/repo.git")]
+    [InlineData("ssh://git@github.com/org/repo.git")]
+    [InlineData("/srv/local/repo.git")]
+    [InlineData("http://github.com/org/repo.git")]
+    [InlineData("https://gitlab.com/org/repo.git")]
+    [InlineData("https://github.com.evil.test/org/repo.git")]
+    [InlineData("https://github.com:8443/org/repo.git")]
+    public async Task Dispatch_IneligibleConfiguredUrl_ReceivesNoToken(string url)
+    {
+        await WithTokensAsync("gh-alias-token", "github-alias-token", async () =>
+        {
+            var (service, pipeline, queue, _, _) = CreateFixture(
+                _ => Task.FromResult<string?>("oauth-token"), config: CreateConfig(url));
+
+            var task = await DispatchAndCaptureAsync(service, pipeline, queue);
+
+            Assert.Equal(url, SingleRepoUrl(task));
+            Assert.DoesNotContain("oauth-token", SingleRepoUrl(task), StringComparison.Ordinal);
+        });
+    }
+
+    // ── (6) preparation cancellation — NO admission, NO enqueue ──────────────
+
+    /// <summary>
+    /// A PRE-CANCELLED token is observed in the PREPARATION: the dispatch propagates the
+    /// cancellation having captured no slot, claimed no pointer, registered no mapping and
+    /// enqueued nothing — and the lookup is never even invoked.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_PreCancelled_PropagatesWithNoAdmissionAndNoEnqueue()
+    {
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            var lookupCalls = 0;
+            var (service, pipeline, queue, manager, _) = CreateFixture(_ =>
+            {
+                lookupCalls++;
+                return Task.FromResult<string?>("oauth-token");
+            });
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            using var cts = new CancellationTokenSource();
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+            Assert.Equal(0, lookupCalls);
+            AssertNoAdmission(pipeline, queue, manager, enqueued);
+        });
+    }
+
+    /// <summary>
+    /// A cancellation arriving DURING the lookup itself — triggered deterministically from inside
+    /// the lookup delegate, no timing sleep — takes the same no-mutation path.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_CancelledDuringLookup_PropagatesWithNoAdmissionAndNoEnqueue()
+    {
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            using var cts = new CancellationTokenSource();
+            var lookupEntered = false;
+
+            var (service, pipeline, queue, manager, _) = CreateFixture(async ct =>
+            {
+                lookupEntered = true;
+                // THE GATE: the cancellation becomes observable while the lookup is in flight,
+                // then the lookup observes the token it was HANDED — a genuine caller-token OCE.
+                await cts.CancelAsync();
+                ct.ThrowIfCancellationRequested();
+                return "never-reached";
+            });
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+            Assert.True(lookupEntered, "the lookup must actually have been entered");
+            Assert.Equal(cts.Token, thrown.CancellationToken);
+            AssertNoAdmission(pipeline, queue, manager, enqueued);
+        });
+    }
+
+    /// <summary>
+    /// THE NO-MUTATION GUARANTEE of the preparation: no slot, no pointer (in memory), no
+    /// task→goal mapping, nothing pending in the queue.
+    /// </summary>
+    private static void AssertNoAdmission(
+        GoalPipeline pipeline, TaskQueue queue, GoalPipelineManager manager, List<WorkTask> enqueued)
+    {
+        Assert.Empty(pipeline.GetSlotsForTest());
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Empty(enqueued);
+        Assert.Null(queue.TryDequeueAny());
+        var expectedTaskId = $"{pipeline.GoalId}-coder-001-01-001";
+        Assert.Null(manager.GetByTaskId(expectedTaskId));
+    }
+
+    // ── (7) THE POST-LOOKUP RECHECK — the cancellation the lookup never reports ──
+
+    /// <summary>The bound every gate await carries, so a hang fails fast instead of stalling.</summary>
+    private static readonly TimeSpan GateTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// A deterministic two-phase gate around the lookup: the lookup signals it has been ENTERED
+    /// and then blocks until the test RELEASES it. That lets the test cancel the caller's token
+    /// at a precisely known instant — while the lookup is in flight — with no timing sleep.
+    /// </summary>
+    private sealed class LookupGate
+    {
+        private readonly TaskCompletionSource _entered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Number of times the gated lookup was invoked.</summary>
+        public int Invocations { get; private set; }
+
+        /// <summary>Called FROM the lookup: announce entry, then wait for the release.</summary>
+        public async Task EnterAndWaitAsync()
+        {
+            Invocations++;
+            _entered.TrySetResult();
+            await _release.Task.WaitAsync(GateTimeout);
+        }
+
+        /// <summary>Awaited BY the test: completes once the lookup has actually been entered.</summary>
+        public Task WaitUntilEnteredAsync() => _entered.Task.WaitAsync(GateTimeout);
+
+        /// <summary>Lets the blocked lookup proceed to its outcome.</summary>
+        public void Release() => _release.TrySetResult();
+    }
+
+    /// <summary>
+    /// THE REMOVAL PROOF FOR PATH (a): the caller is cancelled WHILE the lookup runs, and the
+    /// lookup then RETURNS A TOKEN NORMALLY — it never observes nor reports the cancellation. The
+    /// dispatch must still refuse: no slot, no pointer, no mapping, no enqueue.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL PROOF: delete the post-lookup <c>ThrowSanitizedIfCancelled(ct)</c> in
+    /// <c>ResolveAssignmentCredentialAsync</c> and this test goes RED — the dispatch proceeds
+    /// through the capture, the claim, the admission and the enqueue (and, with no idle worker,
+    /// even completes successfully). The gate makes the race deterministic: the cancellation is
+    /// requested at a known instant with the lookup provably in flight, with no sleep.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_CancelledDuringLookupThatReturnsNormally_MakesNoAdmissionAndNoEnqueue()
+    {
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            using var cts = new CancellationTokenSource();
+            var gate = new LookupGate();
+
+            var (service, pipeline, queue, manager, _) = CreateFixture(async _ =>
+            {
+                await gate.EnterAndWaitAsync();
+                // THE POINT: a perfectly successful lookup. It neither observes the token nor
+                // throws — the cancellation is invisible to it.
+                return "oauth-token";
+            });
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            var dispatch = service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token);
+
+            // The lookup is provably IN FLIGHT; cancel exactly here, then let it finish.
+            await gate.WaitUntilEnteredAsync();
+            await cts.CancelAsync();
+            gate.Release();
+
+            var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => dispatch);
+
+            Assert.Equal(1, gate.Invocations);
+            Assert.Equal(cts.Token, thrown.CancellationToken);
+            AssertNoAdmission(pipeline, queue, manager, enqueued);
+        });
+    }
+
+    /// <summary>
+    /// THE REMOVAL PROOF FOR PATH (b): the caller is cancelled WHILE the lookup runs, and the
+    /// lookup then faults with a NON-cancellation exception. The environment fallback swallows
+    /// that failure — so the cancellation is again invisible to the lookup — and the dispatch
+    /// must still refuse with no admission and no enqueue.
+    /// </summary>
+    /// <remarks>
+    /// This is the second, independent vector the post-lookup recheck closes: the fallback path.
+    /// Without the recheck the dispatch would proceed on the ALIAS credential and enqueue.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_CancelledDuringLookupThatFaultsNonCancellation_MakesNoAdmissionAndNoEnqueue()
+    {
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            using var cts = new CancellationTokenSource();
+            var gate = new LookupGate();
+            var logger = new TestLogger<TaskDispatchService>();
+
+            var (service, pipeline, queue, manager, _) = CreateFixture(
+                async _ =>
+                {
+                    await gate.EnterAndWaitAsync();
+                    // A NON-cancellation fault: the environment fallback handles it, so nothing
+                    // about the cancellation surfaces from the lookup itself.
+                    throw new InvalidOperationException("provider unavailable");
+                },
+                logger);
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            var dispatch = service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token);
+
+            await gate.WaitUntilEnteredAsync();
+            await cts.CancelAsync();
+            gate.Release();
+
+            var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => dispatch);
+
+            Assert.Equal(1, gate.Invocations);
+            Assert.Equal(cts.Token, thrown.CancellationToken);
+            // The fallback really ran (its credential-free warning fired) — and the dispatch was
+            // STILL refused afterwards.
+            Assert.Contains(
+                logger.LogEntries,
+                e => e.LogLevel == LogLevel.Warning &&
+                     e.Message.Contains("Stored OAuth credential lookup failed", StringComparison.Ordinal));
+            AssertNoAdmission(pipeline, queue, manager, enqueued);
+        });
+    }
+
+    // ── (8) THE SANITIZED CANCELLATION BOUNDARY ──────────────────────────────
+
+    /// <summary>
+    /// A lookup cancellation whose exception carries SECRETS in BOTH its message AND its inner
+    /// exception must never escape as-is: the dispatch raises a FRESH, credential-free
+    /// cancellation carrying the caller's token and NO inner exception.
+    /// </summary>
+    /// <remarks>
+    /// WHY THE INNER EXCEPTION MATTERS: downstream sinks render the whole chain.
+    /// <c>PipelineDriver</c>'s improve-phase catch logs the exception AND <c>ex.Message</c>, and
+    /// copies that message into the phase VERDICT and the goal-update NOTES — so a retained
+    /// provider message or inner exception would be persisted in plain sight. Asserting on
+    /// <c>ToString()</c> covers every renderer that walks the chain, not just <c>Message</c>.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_LookupCancellationCarryingSecrets_PropagatesSanitizedCancellation()
+    {
+        const string messageSecret = "ghp_message_secret_token";
+        const string innerSecret = "ghp_inner_secret_token";
+
+        await WithTokensAsync("gh-alias-token", null, async () =>
+        {
+            using var cts = new CancellationTokenSource();
+            var logger = new TestLogger<TaskDispatchService>();
+
+            var (service, pipeline, queue, manager, _) = CreateFixture(
+                async ct =>
+                {
+                    await cts.CancelAsync();
+                    // A CANCELLATION exception whose message AND inner exception both quote a
+                    // credential — exactly what a provider error can look like.
+                    throw new OperationCanceledException(
+                        $"cancelled while using token '{messageSecret}'",
+                        new InvalidOperationException($"connection string password={innerSecret}"),
+                        ct);
+                },
+                logger);
+
+            var enqueued = new List<WorkTask>();
+            queue.OnEnqueue = enqueued.Add;
+
+            var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+            // (i) IT IS A CANCELLATION, and it carries the CALLER'S token.
+            Assert.Equal(cts.Token, thrown.CancellationToken);
+            // (ii) THE PROVIDER EXCEPTION IS DROPPED ENTIRELY — no inner chain to render.
+            Assert.Null(thrown.InnerException);
+            // (iii) THE FIXED MESSAGE, and NO secret anywhere in the escaping exception —
+            // Message or the full ToString() a chain-walking renderer would emit.
+            Assert.Equal(TaskDispatchService.StoredCredentialLookupCancelledMessage, thrown.Message);
+            foreach (var secret in new[] { messageSecret, innerSecret })
+            {
+                Assert.DoesNotContain(secret, thrown.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(secret, thrown.ToString(), StringComparison.Ordinal);
+            }
+
+            // (iv) NO DOWNSTREAM DIAGNOSTIC SURFACE carries a secret either — and a cancellation
+            // is not a lookup FAILURE, so the fallback warning must not fire.
+            Assert.All(logger.LogEntries, e =>
+            {
+                Assert.DoesNotContain(messageSecret, e.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(innerSecret, e.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain("gh-alias-token", e.Message, StringComparison.Ordinal);
+            });
+            Assert.DoesNotContain(
+                logger.LogEntries,
+                e => e.Message.Contains("Stored OAuth credential lookup failed", StringComparison.Ordinal));
+
+            // (v) AND NOTHING WAS ADMITTED.
+            AssertNoAdmission(pipeline, queue, manager, enqueued);
+        });
+    }
+
+    /// <summary>
+    /// The SAME sanitization applies to the RESULT surface a downstream sink would persist: the
+    /// escaping exception's message is what <c>PipelineDriver</c> copies into a phase verdict and
+    /// a goal note, so rendering it exactly as that sink does must yield no secret.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_LookupCancellationCarryingSecrets_RenderedVerdictAndNotesAreSecretFree()
+    {
+        const string secret = "ghp_verdict_secret_token";
+
+        await WithTokensAsync(null, null, async () =>
+        {
+            using var cts = new CancellationTokenSource();
+            var (service, pipeline, queue, _, _) = CreateFixture(async ct =>
+            {
+                await cts.CancelAsync();
+                throw new OperationCanceledException(
+                    $"provider failure token={secret}",
+                    new InvalidOperationException($"inner {secret}"),
+                    ct);
+            });
+
+            queue.OnEnqueue = _ => { };
+
+            var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+            // The EXACT downstream renderings: PipelineDriver's improve catch builds
+            // $"Improver failed: {ex.Message}" for the verdict and
+            // $"Improver skipped: {ex.Message}" for the goal note.
+            var verdict = $"Improver failed: {thrown.Message}";
+            var note = $"Improver skipped: {thrown.Message}";
+
+            Assert.DoesNotContain(secret, verdict, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, note, StringComparison.Ordinal);
+            Assert.Contains(TaskDispatchService.StoredCredentialLookupCancelledMessage, verdict, StringComparison.Ordinal);
+        });
+    }
+}
+
 /// <summary>
 /// Minimal Brain for the sequential-phase handoff test: it supplies the default plan and a
 /// phase-labelled prompt so <c>PipelineDriver</c> advances Coding → Testing and re-dispatches.
