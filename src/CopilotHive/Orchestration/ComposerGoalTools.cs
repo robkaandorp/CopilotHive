@@ -236,9 +236,9 @@ public sealed partial class Composer
         return $"✅ Goal '{id}' has been cancelled.";
     }
 
-    [Description("Extend the iteration budget for a goal that has exhausted or is close to exhausting its max iterations.")]
+    [Description(Composer.ExtendGoalIterationsToolDescription)]
     internal async Task<string> ExtendGoalIterationsAsync(
-        [Description("Goal ID to extend")] string id,
+        [Description("Goal ID to resume with additional iterations")] string id,
         [Description("Number of additional iterations to grant (1-100, default 5)")] int additionalIterations = 5)
     {
         var error = Shared.ToolValidation.Check(
@@ -248,14 +248,14 @@ public sealed partial class Composer
 
         var goalDispatcher = _serviceProvider?.GetService<GoalDispatcher>();
         if (goalDispatcher is null)
-            return "❌ Goal dispatcher is not available — cannot extend iterations.";
+            return "❌ Goal dispatcher is not available — cannot resume the goal.";
 
         var success = await goalDispatcher.ResumeGoalAsync(id, additionalIterations);
         if (!success)
-            return $"❌ Goal '{id}' or its pipeline not found, or goal is not eligible for iteration extension.";
+            return $"❌ Goal '{id}' or its failed pipeline not found, or the goal is not eligible to be resumed.";
 
-        _logger.LogInformation("Composer extended iteration budget for goal '{GoalId}' by {AdditionalIterations}", id, additionalIterations);
-        return $"✅ Extended iteration budget for goal '{id}' by {additionalIterations}.";
+        _logger.LogInformation("Composer resumed goal '{GoalId}' with {AdditionalIterations} additional iterations", id, additionalIterations);
+        return $"✅ Resumed failed goal '{id}' with {additionalIterations} additional iteration(s). The goal restarts through planning.";
     }
 
     [Description("Trigger a pre-execution review on a Draft goal. Returns the review verdict, issues, and recommendations.")]

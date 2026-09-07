@@ -12,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
+using System.ComponentModel;
 using System.Net;
 using System.Text.Json;
 
@@ -2351,7 +2352,7 @@ public sealed class ComposerToolTests : IDisposable
             var result = await composer.ExtendGoalIterationsAsync("extend-iterations", 5);
 
             Assert.Contains("✅", result);
-            Assert.Contains("Extended", result);
+            Assert.Contains("Resumed", result);
             Assert.Contains("extend-iterations", result);
             Assert.Contains("5", result);
         }
@@ -2398,6 +2399,10 @@ public sealed class ComposerToolTests : IDisposable
         {
             var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
             var goalManager = new GoalManager();
+            // The dispatcher's goal store resolves via GoalManager sources; without a source the
+            // false result would come from an unavailable store, not a missing goal. Register the
+            // real store so this genuinely exercises a MISSING goal.
+            goalManager.AddSource(_store);
             var pipelineManager = new GoalPipelineManager();
             var dispatcher = new GoalDispatcher(
                 goalManager,
@@ -2406,7 +2411,8 @@ public sealed class ComposerToolTests : IDisposable
                 new GrpcWorkerGateway(new WorkerPool()),
                 new TaskCompletionNotifier(),
                 NullLogger<GoalDispatcher>.Instance,
-                repoManager);
+                repoManager,
+                goalStore: _store);
 
             var composer = new Composer(
                 "test-model",
@@ -2420,6 +2426,7 @@ public sealed class ComposerToolTests : IDisposable
 
             Assert.Contains("❌", result);
             Assert.Contains("not found", result);
+            Assert.Contains("not eligible", result);
         }
         finally
         {
@@ -2455,6 +2462,329 @@ public sealed class ComposerToolTests : IDisposable
         var tools = _composer.BuildComposerTools();
         var names = tools.Select(t => t.Name).ToList();
         Assert.Contains("extend_goal_iterations", names);
+    }
+
+    // ── extend_goal_iterations — wording discovery across all three runtime surfaces ──
+
+    /// <summary>
+    /// Phrases the tool descriptions must contain so both recovery paths are discoverable:
+    /// (a) branch-backed restart through planning into Coding reusing the feature branch,
+    /// (b) branchless iteration-exhaustion eligibility.
+    /// </summary>
+    private static readonly string[] RequiredResumeWordingFragments =
+    [
+        "Resume",                          // the tool resumes, not merely extends budget
+        "FAILED",                          // eligible failed pipelines only
+        "feature branch",                  // path (a): branch-backed restart
+        "planning",                        // restart goes through planning
+        "Coding",                          // restart re-enters at Coding
+        "iteration-exhaustion",            // path (b): branchless exhaustion eligibility
+        "user-cancelled",                  // cancelled goals are excluded
+        "eligible",                        // eligibility is explicit
+    ];
+
+    /// <summary>
+    /// Phrases that must NEVER appear: they misrepresent the behavior (topping up active or
+    /// near-exhausted running goals, or resuming at an arbitrary exact failed phase).
+    /// </summary>
+    private static readonly string[] ForbiddenResumeWordingFragments =
+    [
+        "close to exhausting",
+        "exhausted or is close",
+        "top up",
+        "topping up",
+    ];
+
+    private static string GetMethodDescription()
+    {
+        var method = typeof(Composer).GetMethod(
+            "ExtendGoalIterationsAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(method);
+        var attribute = method!.GetCustomAttributes(typeof(DescriptionAttribute), inherit: false)
+            .Cast<DescriptionAttribute>()
+            .Single();
+        return attribute.Description;
+    }
+
+    [Fact]
+    public void ExtendGoalIterations_RegistrationDescription_CoversBothRecoveryPaths()
+    {
+        var tools = _composer.BuildComposerTools();
+        var extend = tools.OfType<AIFunction>().Single(t => t.Name == "extend_goal_iterations");
+        var description = extend.Description;
+
+        Assert.NotNull(description);
+        foreach (var fragment in RequiredResumeWordingFragments)
+            Assert.Contains(fragment, description, StringComparison.OrdinalIgnoreCase);
+
+        foreach (var fragment in ForbiddenResumeWordingFragments)
+            Assert.DoesNotContain(fragment, description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ExtendGoalIterations_MethodAttribute_MatchesRegisteredToolDescription()
+    {
+        var methodDescription = GetMethodDescription();
+
+        foreach (var fragment in RequiredResumeWordingFragments)
+            Assert.Contains(fragment, methodDescription, StringComparison.OrdinalIgnoreCase);
+
+        foreach (var fragment in ForbiddenResumeWordingFragments)
+            Assert.DoesNotContain(fragment, methodDescription, StringComparison.OrdinalIgnoreCase);
+
+        // All three surfaces stay consistent: the runtime attribute equals the registered description.
+        var tools = _composer.BuildComposerTools();
+        var extend = tools.OfType<AIFunction>().Single(t => t.Name == "extend_goal_iterations");
+        Assert.Equal(extend.Description, methodDescription);
+    }
+
+    [Fact]
+    public void ExtendGoalIterations_SystemPromptDocumentsResumeBehavior()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("extend_goal_iterations", prompt);
+        // Both recovery paths must be discoverable in the prompt bullet.
+        Assert.Contains("Resume", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("iteration-exhaustion", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("feature branch", prompt, StringComparison.OrdinalIgnoreCase);
+        // The old extension-only wording must be gone.
+        Assert.DoesNotContain("Extend the iteration budget", prompt, StringComparison.OrdinalIgnoreCase);
+        // Misleading claims must be absent.
+        Assert.DoesNotContain("close to exhausting", prompt, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ExtendGoalIterations_Surfaces_NeverClaimActiveGoalTopUpOrExactPhase()
+    {
+        var tools = _composer.BuildComposerTools();
+        var registeredDescription = tools.OfType<AIFunction>().Single(t => t.Name == "extend_goal_iterations").Description!;
+        var methodDescription = GetMethodDescription();
+        var prompt = _composer.GetSystemPrompt();
+
+        foreach (var surface in new[] { registeredDescription, methodDescription, prompt })
+        {
+            Assert.DoesNotContain("close to exhausting", surface, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("top up", surface, StringComparison.OrdinalIgnoreCase);
+            // No arbitrary exact failed phase is advertised as the resume point.
+            Assert.DoesNotContain("resume at the Testing phase", surface, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("resume at the Review phase", surface, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("resume at the DocWriting phase", surface, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    // ── extend_goal_iterations — real-dispatcher integration (both recovery paths) ──
+
+    /// <summary>
+    /// Brain stub for the resume integration tests: planning succeeds with a default plan
+    /// (which starts with Coding, satisfying the branch-backed plan-shape check) and prompt
+    /// crafting succeeds, so the resumed goal stays InProgress without any network access.
+    /// </summary>
+    private sealed class ResumePlanningBrain : IDistributedBrain
+    {
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(
+            GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult("summary");
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public BrainStats? GetStats() => null;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public bool GoalSessionExists(string goalId) => false;
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Worker gateway that always reports one idle worker so the resumed dispatch can enqueue
+    /// and deliver its task locally — no real workers or network involved.
+    /// </summary>
+    private sealed class ResumeWorkerGateway : IWorkerGateway
+    {
+        private readonly ConnectedWorker _worker = new()
+        {
+            Id = "resume-integration-worker",
+            Role = WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+
+        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public ConnectedWorker? GetIdleWorker() => _worker;
+
+        public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [_worker];
+
+        public void MarkBusy(string workerId, string taskId) { }
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_BranchlessIterationExhaustion_Resumes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Failed goal with an iteration-exhaustion reason and NO recorded coder branch.
+            await _composer.CreateGoalAsync("resume-branchless", "Branchless exhaustion goal");
+            var goal = await _store.GetGoalAsync("resume-branchless", ct);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            goal.FailureReason = "Exceeded max iterations";
+            await _store.UpdateGoalAsync(goal, ct);
+
+            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new FakeGoalSource(goal, _store));
+            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+            while (pipeline.IterationBudget.TryConsume()) { }
+            pipeline.AdvanceTo(GoalPhase.Failed);
+            pipelineManager.PersistFull(pipeline);
+
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new ResumeWorkerGateway(),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager,
+                brain: new ResumePlanningBrain(),
+                goalStore: _store);
+            dispatcher.ResumeTimeout = TimeSpan.FromMilliseconds(50);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                serviceProvider: BuildServiceProvider(dispatcher));
+
+            var result = await composer.ExtendGoalIterationsAsync("resume-branchless", 5);
+
+            // The branchless exhaustion path (variant B) must resume without a recorded branch.
+            Assert.Contains("✅", result);
+            Assert.Contains("resume-branchless", result);
+            Assert.Contains("5", result);
+
+            var resumed = await _store.GetGoalAsync("resume-branchless", ct);
+            Assert.NotNull(resumed);
+            Assert.Equal(GoalStatus.InProgress, resumed!.Status);
+            Assert.Null(resumed.FailureReason);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExtendGoalIterations_BranchBackedNonExhaustionFailure_Resumes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tmpDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            // Eligible non-exhaustion failure (a review/test issue) WITH a canonical feature branch.
+            await _composer.CreateGoalAsync("resume-branch-backed", "Branch-backed review failure", repositories: "test-repo");
+            var goal = await _store.GetGoalAsync("resume-branch-backed", ct);
+            Assert.NotNull(goal);
+            goal!.Status = GoalStatus.Failed;
+            goal.FailureReason = "Review rejected the changes and testing failed";
+            await _store.UpdateGoalAsync(goal, ct);
+
+            await using var pipelineStore = new PipelineStore(CopilotHiveDbContext.CreateInMemory(), NullLogger<PipelineStore>.Instance);
+            var repoManager = new BrainRepoManager(tmpDir, NullLogger<BrainRepoManager>.Instance);
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new FakeGoalSource(goal, _store));
+            var pipelineManager = new GoalPipelineManager(pipelineStore);
+            var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 3);
+            while (pipeline.IterationBudget.TryConsume()) { }
+            pipeline.CoderBranch = $"copilothive/{goal.Id}";
+            pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, 1, 1));
+            pipeline.AdvanceTo(GoalPhase.Failed);
+            pipelineManager.PersistFull(pipeline);
+
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                new TaskQueue(),
+                new ResumeWorkerGateway(),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                repoManager,
+                brain: new ResumePlanningBrain(),
+                goalStore: _store);
+            dispatcher.ResumeTimeout = TimeSpan.FromMilliseconds(50);
+
+            var composer = new Composer(
+                "test-model",
+                NullLogger<Composer>.Instance,
+                _store,
+                repoManager: repoManager,
+                stateDir: tmpDir,
+                serviceProvider: BuildServiceProvider(dispatcher));
+
+            var result = await composer.ExtendGoalIterationsAsync("resume-branch-backed", 5);
+
+            // The branch-backed path (variant A) accepts a non-exhaustion failure.
+            Assert.Contains("✅", result);
+            Assert.Contains("resume-branch-backed", result);
+            Assert.Contains("5", result);
+
+            var resumed = await _store.GetGoalAsync("resume-branch-backed", ct);
+            Assert.NotNull(resumed);
+            Assert.Equal(GoalStatus.InProgress, resumed!.Status);
+            Assert.Null(resumed.FailureReason);
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, recursive: true);
+        }
     }
 
     // ── get_goal — iteration detail format ──

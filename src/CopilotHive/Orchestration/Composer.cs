@@ -195,6 +195,17 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
     /// <summary>Raised when the Composer asks a new question so the UI can re-render.</summary>
     public event Action? OnQuestionAsked;
 
+    /// <summary>
+    /// The shared extend_goal_iterations description used by both the registered tool
+    /// (BuildComposerTools) and the runtime [Description] attribute on the
+    /// ExtendGoalIterationsAsync tool method, so all surfaces stay consistent.
+    /// </summary>
+    internal const string ExtendGoalIterationsToolDescription =
+        "Resume an eligible FAILED goal with additional iteration budget. An eligible failed pipeline " +
+        "is required — user-cancelled goals are excluded. With a recorded feature branch, any " +
+        "non-cancellation failure restarts through planning into Coding, reusing the feature branch " +
+        "where available; without a recorded coder branch, only iteration-exhaustion failures are eligible.";
+
     private const string DefaultSystemPrompt = """
         You are the Composer — a strategic advisor for the CopilotHive multi-agent system.
         You help the user decompose high-level intent into well-scoped, actionable goals.
@@ -209,7 +220,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Update existing goals (update_goal) — description, priority, scope, repositories, target_repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
         - Delete draft or failed goals (delete_goal)
         - Cancel InProgress or Pending goals (cancel_goal)
-        - Extend the iteration budget for failed goals that exhausted their max iterations (extend_goal_iterations)
+        - Resume eligible failed goals with additional iteration budget (extend_goal_iterations) — with a recorded feature branch, any non-cancellation failure restarts through planning into Coding, reusing the branch where available; without a recorded coder branch, only iteration-exhaustion failures are eligible; user-cancelled goals are excluded
         - Manage issues reported by the user or discovered during execution (create_issue, list_issues, get_issue, update_issue)
         - create_issue — create a new issue when the user reports a bug, code quality problem, suggestion, concern, or workflow issue
         - list_issues — list and filter issues
@@ -1012,7 +1023,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             AIFunctionFactory.Create(CancelGoalAsync, "cancel_goal",
                 "Cancel an InProgress or Pending goal, stopping its execution."),
             AIFunctionFactory.Create(ExtendGoalIterationsAsync, "extend_goal_iterations",
-                "Extend the iteration budget for a goal that has exhausted or is close to exhausting its max iterations."),
+                ExtendGoalIterationsToolDescription),
             AIFunctionFactory.Create(GitLogAsync, "git_log",
                 "View commit history for a repository branch or path."),
             AIFunctionFactory.Create(GitDiffAsync, "git_diff",
