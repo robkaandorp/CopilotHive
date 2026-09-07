@@ -6125,36 +6125,6 @@ public sealed class ComposerActorTests
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
-    /// <summary>
-    /// Chat-client factory that BLOCKS on first use, giving a test a deterministic
-    /// "connect has entered client creation" rendezvous. Used to prove the
-    /// <c>onValidatedAboutToConnect</c> callback fires strictly BEFORE the connect path runs:
-    /// the assertion is made while the connect is still parked inside client creation.
-    /// </summary>
-    private sealed class GatedChatClientFactory(Func<string, IChatClient> inner)
-    {
-        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int _invocations;
-
-        /// <summary>Completes once client creation has been ENTERED (connect path reached).</summary>
-        internal Task Entered => _entered.Task;
-
-        /// <summary>Number of client-creation calls.</summary>
-        internal int Invocations => Volatile.Read(ref _invocations);
-
-        /// <summary>Lets the parked connect proceed.</summary>
-        internal void Release() => _release.TrySetResult();
-
-        internal Func<string, IChatClient> Delegate => modelId =>
-        {
-            Interlocked.Increment(ref _invocations);
-            _entered.TrySetResult();
-            _release.Task.GetAwaiter().GetResult();
-            return inner(modelId);
-        };
-    }
-
     /// <summary>Logger that throws when the formatted message contains a fragment.</summary>
     private sealed class FragmentThrowingLogger(string messageFragment, Exception failure) : ILogger
     {
