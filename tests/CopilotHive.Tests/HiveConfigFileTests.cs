@@ -1721,6 +1721,12 @@ public sealed class HiveConfigFileTests
         Assert.Null(result.Description);
     }
 
+    /// <summary>
+    /// The merge must not mutate the source lists: the caller-held inputs stay at their ORIGINAL
+    /// values, the merged result is detached, and a fresh owner snapshot carries the original
+    /// stored state (curated nullable fields stay null, available inherited source fields stay
+    /// original) — proving the merge reads the real owner storage without writing through it.
+    /// </summary>
     [Fact]
     public void GetSubAgentModels_DoesNotMutateSourceLists()
     {
@@ -1736,10 +1742,21 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        config.GetSubAgentModels();
+        var merged = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal(976000, merged.ContextWindow);   // merged result carries the inherited value
 
+        // The caller-held initializer entries keep their ORIGINAL field values.
         Assert.Null(curated.ContextWindow);
         Assert.Equal(976000, available.ContextWindow);
+
+        // Fresh owner snapshots agree: curated nullable fields stay null, available inherited
+        // source fields stay original.
+        var ownerCurated = Assert.Single(config.GetSubAgentModelsSnapshot()!);
+        Assert.Null(ownerCurated.ContextWindow);
+        Assert.Equal("m", ownerCurated.Name);
+        var ownerAvailable = Assert.Single(config.GetAvailableModelsSnapshot()!);
+        Assert.Equal(976000, ownerAvailable.ContextWindow);
+        Assert.Equal("m", ownerAvailable.Name);
     }
 
     [Fact]
@@ -2120,24 +2137,48 @@ public sealed class HiveConfigFileTests
     }
 
     /// <summary>
-    /// Compatibility guard: the public <see cref="ModelsConfig"/> getters remain LIVE — mutating
-    /// the property-referenced lists directly affects subsequent reader calls, and the readers do
-    /// not cache. (Do not prematurely flip the public getters to detached semantics.)
+    /// Ownership boundary at <see cref="HiveConfigFile.Models"/>: whole assignment is observed by
+    /// the reader, but a direct getter-side curated-list mutation is a NEGATIVE attack — the
+    /// owner/helper stays unchanged until an EXPLICIT reassignment or a synchronized update.
+    /// Then fresh helper results DO observe that real update (non-caching behavior preserved).
     /// </summary>
     [Fact]
-    public void GetSubAgentModels_PublicModelsConfigGetters_RemainLive()
+    public void GetSubAgentModels_PublicModelsConfigGetters_DetachedUntilExplicitReassignment()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
 
         // First call: nothing configured → empty.
         Assert.Empty(config.GetSubAgentModels());
 
-        // Direct public mutation is observed by the reader — no cached snapshot.
+        // Whole assignment: the reader observes the new storage — no cached snapshot.
         config.Models = new ModelsConfig { AvailableModels = [new ModelEntry { Name = "live-a" }] };
         Assert.Equal("live-a", Assert.Single(config.GetSubAgentModels()).Name);
 
-        config.Models!.SubAgentModels = [new ModelEntry { Name = "live-b", ReasoningEffort = "low" }];
+        // Negative attack: mutating a getter-returned DTO (curated-list reassignment) must NOT
+        // affect the owner or the helper — the getter clones.
+        config.Models!.SubAgentModels = [new ModelEntry { Name = "attack-b", ReasoningEffort = "low" }];
+        // Fresh owner read: the curated catalog is still absent.
+        Assert.Null(config.Models!.SubAgentModels);
+        Assert.Equal("live-a", Assert.Single(config.GetSubAgentModels()).Name);
+
+        // Explicit reassignment of the WHOLE Models property publishes the curated list.
+        var withCurated = config.Models;
+        withCurated!.SubAgentModels = [new ModelEntry { Name = "live-b", ReasoningEffort = "low" }];
+        config.Models = withCurated;
         Assert.Equal("live-b", Assert.Single(config.GetSubAgentModels()).Name);
+
+        // A synchronized update is a REAL owner mutation: fresh helper results observe it
+        // (the curated entry is updated through the owner, and the fallback-catalog entry
+        // "live-a" is updated too).
+        Assert.True(config.TryUpdateAvailableModel("live-a", new AvailableModelRequest("ignored", 99, null, null)));
+        Assert.True(config.TryUpdateSubAgentModel(
+            "live-b", new SubAgentModelRequest("ignored", 55, ReasoningEffort.High, "sync-desc", null)));
+        var fresh = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("live-b", fresh.Name);    // curated still wins
+        Assert.Equal(55, fresh.ContextWindow); // explicit curated value (not inherited 99)
+        Assert.Equal("sync-desc", fresh.Description);
+        // The fallback catalog (curated non-empty, so not returned) really changed too.
+        Assert.Equal(99, Assert.Single(config.GetAvailableModelsSnapshot()!).ContextWindow);
     }
 
     /// <summary>
@@ -2331,13 +2372,14 @@ public sealed class HiveConfigFileTests
     }
 
     /// <summary>
-    /// Compatibility guard: the public <see cref="ModelsConfig"/> getters remain LIVE — two
-    /// successive synchronized catalog changes are observed by successive reader reads (not a
-    /// cached snapshot), and the property-referenced list is the one the synchronized writers
-    /// mutated. Guards against prematurely detaching the public getters.
+    /// Ownership boundary at <see cref="HiveConfigFile.Models"/>: OLD returned available AND
+    /// curated lists/entries — retained BEFORE each synchronized change — stay frozen while fresh
+    /// owner values change; the retained pre-update and post-update list/entry identities differ
+    /// (deep clone per read, non-caching). Direct attacks on held curated outputs and on the
+    /// retained SETTER INPUT leave the owner's authoritative state intact.
     /// </summary>
     [Fact]
-    public void PublicModelsConfigGetters_RemainLive_TwoSuccessiveChangesObserved()
+    public void PublicModelsConfigGetters_DeepDetached_TwoSuccessiveChangesObserved()
     {
         var config = new HiveConfigFile { Orchestrator = new OrchestratorConfig() };
 
@@ -2345,28 +2387,108 @@ public sealed class HiveConfigFileTests
         Assert.Null(config.Models?.AvailableModels);
         Assert.Empty(config.GetSubAgentModels());
 
-        // Change 1 (synchronized writer) — the public getter must immediately observe it.
-        config.TryAddAvailableModel(new AvailableModelRequest("first", 1, null, null));
-        var read1 = Assert.Single(config.Models!.AvailableModels!);
+        // ── Setter input retained for a later input-side attack. ───────────────────────────
+        var setterInput = new ModelsConfig
+        {
+            CompactionModel = "input-cm",
+            AvailableModels = [new ModelEntry { Name = "first", ContextWindow = 1 }],
+            SubAgentModels = [new ModelEntry { Name = "sub", ReasoningEffort = "low" }]
+        };
+        config.Models = setterInput;
+
+        // Change 1 (synchronized writer) — the fresh owner DTO observes it. The ACTUAL held
+        // pre-update lists/entries for BOTH catalogs are retained here, before any update.
+        var heldPreUpdateModels = config.Models!;
+        var heldPreUpdateAvailableList = heldPreUpdateModels.AvailableModels!;
+        var read1 = Assert.Single(heldPreUpdateAvailableList);
+        var heldPreUpdateCuratedList = heldPreUpdateModels.SubAgentModels!;
+        var curatedRead1 = Assert.Single(heldPreUpdateCuratedList);
         Assert.Equal("first", read1.Name);
         Assert.Equal(1, read1.ContextWindow);
+        Assert.Equal("sub", curatedRead1.Name);
+        Assert.Equal("low", curatedRead1.ReasoningEffort);
 
-        // Change 2 (synchronized writer) — the same public getter must observe the SECOND change
-        // (proving no snapshot caching between reads).
+        // Change 2 (synchronized writer) — a second owner DTO observes the SECOND change
+        // (proving no snapshot caching between reads) at a DIFFERENT list AND entry identity.
         config.TryUpdateAvailableModel("first", new AvailableModelRequest("ignored", 2, "second-desc", null));
-        var read2 = Assert.Single(config.Models!.AvailableModels!);
+        var heldPostUpdateModels = config.Models!;
+        var heldPostUpdateAvailableList = heldPostUpdateModels.AvailableModels!;
+        var read2 = Assert.Single(heldPostUpdateAvailableList);
         Assert.Equal("first", read2.Name);
         Assert.Equal(2, read2.ContextWindow);
         Assert.Equal("second-desc", read2.Description);
+        // Identity comparison of the ACTUAL held pre-update vs post-update lists and entries
+        // (not two fresh getters compared against each other).
+        Assert.NotSame(heldPreUpdateAvailableList, heldPostUpdateAvailableList);
+        Assert.NotSame(read1, read2);
+        // ...and the retained PRE-update values are frozen at generation 1.
+        Assert.Equal(1, read1.ContextWindow);
+        Assert.Null(read1.Description);
 
-        // Read via GetSubAgentModels too: successive reads observe both changes (no caching).
-        Assert.Equal(2, Assert.Single(config.GetSubAgentModels()).ContextWindow);
+        // Read via GetSubAgentModels too: successive reads observe the current state (no
+        // caching). The curated catalog is non-empty, so it wins over the available fallback;
+        // "sub" does not name-match "first", so nothing is inherited (fields stay null).
+        var mergedAfterChange2 = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("sub", mergedAfterChange2.Name);
+        Assert.Equal("low", mergedAfterChange2.ReasoningEffort);
+        Assert.Null(mergedAfterChange2.ContextWindow);
+        // The available catalog really carries change 2 (read through the owner's accessor).
+        Assert.Equal(2, Assert.Single(config.GetAvailableModelsSnapshot()!).ContextWindow);
 
-        // Change 3: reasoning-effort synchronized update observed by the public curated getter.
-        config.TryAddSubAgentModel(new SubAgentModelRequest("sub", null, ReasoningEffort.Low));
+        // Change 3: reasoning-effort synchronized update. The curated OLD list/entry were
+        // retained BEFORE this update (above); the NEW ones are read after it.
         config.SetSubAgentModelReasoningEfforts(new Dictionary<string, ReasoningEffort?> { ["sub"] = ReasoningEffort.High });
-        var curatedRead = Assert.Single(config.Models!.SubAgentModels!);
-        Assert.Equal("high", curatedRead.ReasoningEffort);
+        var heldPostReasoningModels = config.Models!;
+        var heldPostReasoningCuratedList = heldPostReasoningModels.SubAgentModels!;
+        var curatedRead2 = Assert.Single(heldPostReasoningCuratedList);
+        Assert.Equal("high", curatedRead2.ReasoningEffort);
+        // Curated OLD vs NEW: identities differ AND the old values are frozen at "low".
+        Assert.NotSame(heldPreUpdateCuratedList, heldPostReasoningCuratedList);
+        Assert.NotSame(curatedRead1, curatedRead2);
+        Assert.Equal("low", curatedRead1.ReasoningEffort);
+        Assert.Equal("sub", curatedRead1.Name);
+
+        // ── Direct attack on the held CURATED list/entry from the getter. ──────────────────
+        heldPostReasoningCuratedList.Add(new ModelEntry { Name = "curated-attack", ReasoningEffort = "none" });
+        curatedRead2.ReasoningEffort = "CURATED-ENTRY-ATTACK";
+        curatedRead2.Name = "CURATED-NAME-ATTACK";
+        // Authoritative fresh owner reads: unchanged by the curated attack.
+        var ownerCuratedAfterAttack = config.GetSubAgentModelsSnapshot()!;
+        Assert.Single(ownerCuratedAfterAttack);
+        Assert.Equal("sub", ownerCuratedAfterAttack[0].Name);
+        Assert.Equal("high", ownerCuratedAfterAttack[0].ReasoningEffort);
+
+        // ── Direct attack on the held AVAILABLE list/entry from the getter. ────────────────
+        read1.ContextWindow = 777;                              // attack on held output
+        heldPostUpdateAvailableList.Add(new ModelEntry { Name = "held-attack", ContextWindow = 5 });
+        var ownerAfterAttacks = config.Models!.AvailableModels!;
+        Assert.Single(ownerAfterAttacks);                       // list + entries detached
+        Assert.Equal(2, ownerAfterAttacks[0].ContextWindow);    // owner's ORIGINAL value survives
+        Assert.Equal("second-desc", ownerAfterAttacks[0].Description);  // real owner state
+
+        // ── Retained SETTER-INPUT attack: mutate the object passed to the setter AFTER the
+        // assignment; the owner must be unaffected (authoritative checks). ────────────────
+        setterInput.CompactionModel = "INPUT-ATTACK-CM";
+        setterInput.AvailableModels!.Add(new ModelEntry { Name = "input-attack", ContextWindow = 42 });
+        setterInput.AvailableModels[0].ContextWindow = -99;
+        setterInput.SubAgentModels!.Clear();
+
+        // The owner keeps the value it cloned at assignment time — the input attack never lands.
+        Assert.Equal("input-cm", config.GetCompactionModel());
+        var ownerAvailableAfterInputAttack = config.GetAvailableModelsSnapshot()!;
+        Assert.Single(ownerAvailableAfterInputAttack);
+        Assert.Equal("first", ownerAvailableAfterInputAttack[0].Name);
+        Assert.Equal(2, ownerAvailableAfterInputAttack[0].ContextWindow);
+        var ownerCuratedAfterInputAttack = config.GetSubAgentModelsSnapshot()!;
+        Assert.Single(ownerCuratedAfterInputAttack);
+        Assert.Equal("sub", ownerCuratedAfterInputAttack[0].Name);
+        Assert.Equal("high", ownerCuratedAfterInputAttack[0].ReasoningEffort);
+
+        // ... and fresh reads still observe the real owner state (not any attacked DTO).
+        var freshCurated = Assert.Single(config.GetSubAgentModels());
+        Assert.Equal("sub", freshCurated.Name);
+        Assert.Equal("high", freshCurated.ReasoningEffort);
+        Assert.Equal(2, Assert.Single(config.GetAvailableModelsSnapshot()!).ContextWindow);
     }
 
     // ── SupportsVision YAML round-trip (tri-state: true, false, null) ──────────
@@ -2596,6 +2718,11 @@ public sealed class HiveConfigFileTests
         Assert.Equal(vision, result.SupportsVision);
     }
 
+    /// <summary>
+    /// The merge must not mutate the source SupportsVision flags: the caller-held inputs keep
+    /// their ORIGINAL tri-state values, the merged result inherits correctly, and fresh owner
+    /// snapshots (curated null stays null, available true stays true) prove the read-only merge.
+    /// </summary>
     [Fact]
     public void GetSubAgentModels_DoesNotMutateSourceSupportsVision()
     {
@@ -2611,10 +2738,17 @@ public sealed class HiveConfigFileTests
             }
         };
 
-        config.GetSubAgentModels();
+        var merged = Assert.Single(config.GetSubAgentModels());
+        Assert.True(merged.SupportsVision);   // inherited into the MERGED result only
 
+        // The caller-held initializer entries keep their ORIGINAL tri-state values.
         Assert.Null(curated.SupportsVision);
         Assert.True(available.SupportsVision);
+
+        // Fresh owner snapshots agree: curated nullable fields stay null, available inherited
+        // source fields stay original.
+        Assert.Null(Assert.Single(config.GetSubAgentModelsSnapshot()!).SupportsVision);
+        Assert.True(Assert.Single(config.GetAvailableModelsSnapshot()!).SupportsVision);
     }
 
     // ── Reasoning effort: YAML round-trip of the new config fields ─────────────

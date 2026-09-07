@@ -4,6 +4,7 @@ using System.Runtime.ExceptionServices;
 using CopilotHive.Configuration;
 using CopilotHive.Services;
 using CopilotHive.Workers;
+using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -267,6 +268,623 @@ public class ConfigRepoManagerTests : IDisposable
 
         var ex = Assert.Throws<YamlDotNet.Core.YamlException>(() => ConfigRepoManager.ParseConfig(yaml));
         Assert.Contains("composer.models", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ── Models subtree YAML compatibility (ownership boundary at HiveConfigFile.Models) ──
+
+    /// <summary>
+    /// Omitted / explicit-null / empty / populated Models sections keep value semantics through
+    /// <see cref="ConfigRepoManager.ParseConfig"/> and the disk round trip: omitted stays null,
+    /// an explicit <c>models: null</c> stays null, an empty models mapping stays a non-null empty
+    /// ModelsConfig, and a populated section carries compaction model and BOTH catalogs.
+    /// Ownership is at <see cref="HiveConfigFile.Models"/>: each parsed instance gets its own
+    /// detached subtree.
+    /// </summary>
+    [Theory]
+    [InlineData("omitted")]
+    [InlineData("explicitNull")]
+    [InlineData("empty")]
+    [InlineData("populated")]
+    public void ParseConfig_ModelsSectionVariants_KeepValueSemantics(string variant)
+    {
+        var yaml = variant switch
+        {
+            "omitted" => """
+                version: "1.0"
+                orchestrator:
+                  model: orch-model
+                """,
+            // Explicit null node (distinct from an omitted key): value semantics must keep it null.
+            "explicitNull" => """
+                version: "1.0"
+                models: null
+                orchestrator:
+                  model: orch-model
+                """,
+            "empty" => """
+                version: "1.0"
+                models: {}
+                """,
+            _ => """
+                version: "1.0"
+                models:
+                  compaction_model: compactor
+                  available_models:
+                    - name: model-a
+                      context_window: 1000
+                      description: first
+                      supports_vision: true
+                    - name: model-b
+                """,
+        };
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        if (variant is "omitted" or "explicitNull")
+        {
+            // Null stays null on BOTH the omitted and the explicit-null input.
+            Assert.Null(config.Models);
+            Assert.Null(config.GetCompactionModel());
+            Assert.Null(config.GetAvailableModelsSnapshot());
+            Assert.Null(config.GetSubAgentModelsSnapshot());
+            Assert.Empty(config.GetSubAgentModels());
+            // The rest of the document still parsed (the null models node is not fatal).
+            Assert.Equal("orch-model", config.Orchestrator.Model);
+            return;
+        }
+
+        Assert.NotNull(config.Models);
+        if (variant == "empty")
+        {
+            Assert.Null(config.Models!.CompactionModel);
+            Assert.Null(config.Models.AvailableModels);
+            Assert.Null(config.Models.SubAgentModels);
+            Assert.Null(config.GetCompactionModel());
+            return;
+        }
+
+        Assert.Equal("compactor", config.Models!.CompactionModel);
+        var available = config.GetAvailableModelsSnapshot()!;
+        Assert.Equal(2, available.Count);
+        Assert.Equal("model-a", available[0].Name);
+        Assert.Equal(1000, available[0].ContextWindow);
+        Assert.Equal("first", available[0].Description);
+        Assert.True(available[0].SupportsVision);
+        Assert.Equal("model-b", available[1].Name);
+        Assert.Null(available[1].ContextWindow);
+        Assert.Null(available[1].Description);
+        Assert.Null(available[1].SupportsVision);
+        Assert.Null(config.GetSubAgentModelsSnapshot());
+    }
+
+    /// <summary>
+    /// Catalog list variants keep value semantics: null lists stay null, empty lists stay empty,
+    /// and null entries inside a list are preserved in position (with their null fields).
+    /// </summary>
+    [Theory]
+    [InlineData("nullLists")]
+    [InlineData("emptyLists")]
+    [InlineData("nullEntries")]
+    public void ParseConfig_ModelsListVariants_KeepValueSemantics(string variant)
+    {
+        var yaml = variant switch
+        {
+            "nullLists" => """
+                version: "1.0"
+                models:
+                  compaction_model: cm
+                  available_models:
+                  sub_agent_models:
+                """,
+            "emptyLists" => """
+                version: "1.0"
+                models:
+                  available_models: []
+                  sub_agent_models: []
+                """,
+            _ => """
+                version: "1.0"
+                models:
+                  available_models:
+                    - name: real-a
+                    -
+                    - name: real-b
+                  sub_agent_models:
+                    - name: sub-a
+                    -
+                """,
+        };
+
+        var config = ConfigRepoManager.ParseConfig(yaml);
+
+        Assert.NotNull(config.Models);
+        if (variant == "nullLists")
+        {
+            Assert.Null(config.Models!.AvailableModels);
+            Assert.Null(config.Models.SubAgentModels);
+            Assert.Equal("cm", config.GetCompactionModel());
+            return;
+        }
+
+        if (variant == "emptyLists")
+        {
+            Assert.NotNull(config.Models!.AvailableModels);
+            Assert.Empty(config.Models.AvailableModels);
+            Assert.NotNull(config.Models.SubAgentModels);
+            Assert.Empty(config.Models.SubAgentModels);
+            return;
+        }
+
+        // null entries: positions and neighbors preserved exactly as stored.
+        var avail = config.Models!.AvailableModels!;
+        Assert.Equal(3, avail.Count);
+        Assert.Equal("real-a", avail[0].Name);
+        Assert.Null(avail[1]);
+        Assert.Equal("real-b", avail[2].Name);
+        var sub = config.Models.SubAgentModels!;
+        Assert.Equal(2, sub.Count);
+        Assert.Equal("sub-a", sub[0].Name);
+        Assert.Null(sub[1]);
+    }
+
+    /// <summary>
+    /// Backward-anchor YAML with a real <c>&amp;anchor</c> on an available entry that the curated
+    /// list references via a real <c>*alias</c> node. Pinned YamlDotNet 18.1.0 behavior (validated
+    /// here, not by reading upstream source): an aliased mapping binds to the SAME CLR instance in
+    /// both catalogs, and every field value is carried across the alias.
+    /// </summary>
+    private const string EntryAnchorYaml = """
+        version: "1.0"
+        models:
+          compaction_model: compactor
+          available_models:
+            - &shared
+              name: shared-model
+              context_window: 976000
+              reasoning_effort: medium
+              description: shared-desc
+              supports_vision: true
+            - name: solo-avail
+              context_window: 4096
+              reasoning_effort: low
+              description: solo-desc
+              supports_vision: false
+          sub_agent_models:
+            - *shared
+            - name: curated-solo
+              context_window: 2048
+              reasoning_effort: high
+              description: curated-desc
+              supports_vision: false
+        """;
+
+    /// <summary>
+    /// The SAME document as <see cref="EntryAnchorYaml"/> with the alias node replaced by a
+    /// duplicated mapping carrying identical content. Used as the mechanism-observability control:
+    /// the parsed VALUES are identical, but the alias binding (shared instance) is not present, so
+    /// a test that only compared values could not distinguish real alias binding from plain
+    /// content duplication.
+    /// </summary>
+    private const string EntryAnchorDuplicatedYaml = """
+        version: "1.0"
+        models:
+          compaction_model: compactor
+          available_models:
+            - name: shared-model
+              context_window: 976000
+              reasoning_effort: medium
+              description: shared-desc
+              supports_vision: true
+            - name: solo-avail
+              context_window: 4096
+              reasoning_effort: low
+              description: solo-desc
+              supports_vision: false
+          sub_agent_models:
+            - name: shared-model
+              context_window: 976000
+              reasoning_effort: medium
+              description: shared-desc
+              supports_vision: true
+            - name: curated-solo
+              context_window: 2048
+              reasoning_effort: high
+              description: curated-desc
+              supports_vision: false
+        """;
+
+    /// <summary>
+    /// The second required alias shape: one whole catalog LIST carries the <c>&amp;anchor</c> and
+    /// the other catalog is a real <c>*alias</c> reference to it.
+    /// </summary>
+    private const string ListAnchorYaml = """
+        version: "1.0"
+        models:
+          compaction_model: list-compactor
+          available_models: &catalog
+            - name: list-a
+              context_window: 111
+              reasoning_effort: low
+              description: list-a-desc
+              supports_vision: true
+            - name: list-b
+              context_window: 222
+              reasoning_effort: high
+              description: list-b-desc
+              supports_vision: false
+          sub_agent_models: *catalog
+        """;
+
+    /// <summary>
+    /// Asserts the COMPLETE ordered field values of a catalog list: name, context window,
+    /// reasoning effort, description and supports-vision, in list order.
+    /// </summary>
+    private static void AssertOrderedEntries(
+        IReadOnlyList<ModelEntry>? actual,
+        params (string Name, int? ContextWindow, string? ReasoningEffort, string? Description, bool? SupportsVision)[] expected)
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(expected.Length, actual!.Count);
+        for (var i = 0; i < expected.Length; i++)
+        {
+            Assert.Equal(expected[i].Name, actual[i].Name);
+            Assert.Equal(expected[i].ContextWindow, actual[i].ContextWindow);
+            Assert.Equal(expected[i].ReasoningEffort, actual[i].ReasoningEffort);
+            Assert.Equal(expected[i].Description, actual[i].Description);
+            Assert.Equal(expected[i].SupportsVision, actual[i].SupportsVision);
+        }
+    }
+
+    /// <summary>
+    /// The <c>models:</c> subtree of <see cref="EntryAnchorYaml"/> — identical anchor/alias
+    /// content, bound directly to a plain <see cref="ModelsConfig"/> DTO so the raw alias
+    /// binding is observable without the ownership boundary's cloning in the way.
+    /// </summary>
+    private const string EntryAnchorModelsYaml = """
+        compaction_model: compactor
+        available_models:
+          - &shared
+            name: shared-model
+            context_window: 976000
+            reasoning_effort: medium
+            description: shared-desc
+            supports_vision: true
+          - name: solo-avail
+            context_window: 4096
+            reasoning_effort: low
+            description: solo-desc
+            supports_vision: false
+        sub_agent_models:
+          - *shared
+          - name: curated-solo
+            context_window: 2048
+            reasoning_effort: high
+            description: curated-desc
+            supports_vision: false
+        """;
+
+    /// <summary>The duplicated-content control for <see cref="EntryAnchorModelsYaml"/> (no alias).</summary>
+    private const string EntryAnchorDuplicatedModelsYaml = """
+        compaction_model: compactor
+        available_models:
+          - name: shared-model
+            context_window: 976000
+            reasoning_effort: medium
+            description: shared-desc
+            supports_vision: true
+          - name: solo-avail
+            context_window: 4096
+            reasoning_effort: low
+            description: solo-desc
+            supports_vision: false
+        sub_agent_models:
+          - name: shared-model
+            context_window: 976000
+            reasoning_effort: medium
+            description: shared-desc
+            supports_vision: true
+          - name: curated-solo
+            context_window: 2048
+            reasoning_effort: high
+            description: curated-desc
+            supports_vision: false
+        """;
+
+    /// <summary>The <c>models:</c> subtree of <see cref="ListAnchorYaml"/> (whole-list alias).</summary>
+    private const string ListAnchorModelsYaml = """
+        compaction_model: list-compactor
+        available_models: &catalog
+          - name: list-a
+            context_window: 111
+            reasoning_effort: low
+            description: list-a-desc
+            supports_vision: true
+          - name: list-b
+            context_window: 222
+            reasoning_effort: high
+            description: list-b-desc
+            supports_vision: false
+        sub_agent_models: *catalog
+        """;
+
+    /// <summary>
+    /// A real YAML backward ANCHOR/ALIAS on an available ENTRY referenced by the curated list,
+    /// routed through <see cref="ConfigRepoManager.ParseConfig"/> AND the disk round trip
+    /// (WriteConfigAsync → read file → ParseConfig). Every field of BOTH catalogs is asserted in
+    /// order. Subsequent owner isolation is proven against values retained BEFORE any owner
+    /// update: parsed results are mutated (list, entry, fields) and the owner is unaffected, then
+    /// owner mutations are made and the retained parsed results are unaffected.
+    /// <para>
+    /// MECHANISM-OBSERVABLE: <see cref="EntryAnchorDuplicatedYaml"/> is the same document with the
+    /// alias replaced by a duplicated mapping. The alias document binds ONE shared CLR instance
+    /// across the two catalogs while the duplicated document binds two distinct instances — the
+    /// assertions below distinguish the two, so this is genuine alias binding, not merely equal
+    /// content. Both documents yield identical VALUES (no data is lost through the alias).
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ParseConfig_ModelsEntryAnchorAlias_OrderedFieldValues_AndOwnerIsolation()
+    {
+        var config = ConfigRepoManager.ParseConfig(EntryAnchorYaml);
+
+        // ── Complete ordered field values for BOTH catalogs, straight from ParseConfig. ─────
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("solo-avail", 4096, "low", "solo-desc", false));
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            // The aliased entry carries EVERY field across the alias — nothing is lost.
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 2048, "high", "curated-desc", false));
+        Assert.Equal("compactor", config.GetCompactionModel());
+
+        // ── MECHANISM OBSERVABILITY: the alias really binds, and is not merely equal content. ──
+        // (i) At the YAML representation layer: the alias document makes the first curated entry
+        // THE SAME NODE as the first available entry; the duplicated-content control does not.
+        Assert.True(CuratedFirstEntryIsAvailableFirstEntryNode(EntryAnchorYaml),
+            "The anchor document did not bind the curated entry to the available entry — the alias is not a real YAML alias node.");
+        Assert.False(CuratedFirstEntryIsAvailableFirstEntryNode(EntryAnchorDuplicatedYaml),
+            "The duplicated-content control unexpectedly shares a node — the scratch copy is not a plain duplication.");
+        // (ii) At the object-binding layer, into a plain DTO (no ownership boundary in the way):
+        // the alias yields ONE shared ModelEntry instance across the two catalogs, while the
+        // duplicated control yields two distinct instances. A test that only compared values
+        // could not tell these apart.
+        var aliasBound = RawDeserializeModels(EntryAnchorModelsYaml);
+        var duplicatedBound = RawDeserializeModels(EntryAnchorDuplicatedModelsYaml);
+        Assert.Same(aliasBound.AvailableModels![0], aliasBound.SubAgentModels![0]);
+        Assert.NotSame(duplicatedBound.AvailableModels![0], duplicatedBound.SubAgentModels![0]);
+        // ...and both bindings carry identical VALUES (the alias loses no data).
+        AssertOrderedEntries(
+            duplicatedBound.SubAgentModels,
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 2048, "high", "curated-desc", false));
+        AssertOrderedEntries(
+            aliasBound.SubAgentModels,
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 2048, "high", "curated-desc", false));
+
+        // ── Disk round trip: write the parsed config, read the file back, re-parse. ─────────
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+        var disk = await ReadWrittenYamlAsync(manager);
+        var fromDisk = ConfigRepoManager.ParseConfig(disk);
+        AssertOrderedEntries(
+            fromDisk.GetAvailableModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("solo-avail", 4096, "low", "solo-desc", false));
+        AssertOrderedEntries(
+            fromDisk.GetSubAgentModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 2048, "high", "curated-desc", false));
+        Assert.Equal("compactor", fromDisk.GetCompactionModel());
+
+        // ── Owner isolation, verified against retained PRE-UPDATE values. ───────────────────
+        // Retain actual parsed results BEFORE any owner update.
+        var retainedModels = config.Models!;
+        var retainedAvailableList = retainedModels.AvailableModels!;
+        var retainedAvailableEntry = retainedAvailableList[0];
+        var retainedCuratedList = retainedModels.SubAgentModels!;
+        var retainedCuratedEntry = retainedCuratedList[0];
+
+        // (1) Mutating the parsed results (list, entry, fields) must NOT reach the owner.
+        retainedAvailableList.Add(new ModelEntry { Name = "parsed-attack", ContextWindow = 1 });
+        retainedAvailableList.RemoveAt(1);
+        retainedAvailableEntry.ContextWindow = -1;
+        retainedAvailableEntry.Description = "PARSED-ATTACK";
+        retainedCuratedList.Clear();
+        retainedCuratedEntry.ReasoningEffort = "PARSED-ATTACK-EFFORT";
+        retainedModels.CompactionModel = "PARSED-ATTACK-CM";
+
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("solo-avail", 4096, "low", "solo-desc", false));
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 2048, "high", "curated-desc", false));
+        Assert.Equal("compactor", config.GetCompactionModel());
+
+        // (2) Owner mutations must NOT reach the retained parsed results. The retained values
+        // are compared against what they held BEFORE the owner update (i.e. the attack values
+        // from step (1) — proving nothing new leaked in from the owner side either).
+        Assert.True(config.TryUpdateAvailableModel(
+            "shared-model", new AvailableModelRequest("shared-model", 111, "OWNER-DESC", false)));
+        Assert.True(config.TryUpdateSubAgentModel(
+            "curated-solo",
+            new SubAgentModelRequest(
+                "curated-solo", 333, Microsoft.Extensions.AI.ReasoningEffort.None, "OWNER-CURATED", true)));
+        config.SetCompactionModel("owner-cm");
+
+        // Fresh owner reads carry the update on every field, in order.
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("shared-model", 111, "medium", "OWNER-DESC", false),
+            ("solo-avail", 4096, "low", "solo-desc", false));
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("curated-solo", 333, "none", "OWNER-CURATED", true));
+        Assert.Equal("owner-cm", config.GetCompactionModel());
+
+        // The retained parsed graph is frozen at its own (attacked) generation — no owner value
+        // leaked in.
+        Assert.Equal("PARSED-ATTACK-CM", retainedModels.CompactionModel);
+        Assert.Equal(2, retainedAvailableList.Count);
+        Assert.Equal("shared-model", retainedAvailableEntry.Name);
+        Assert.Equal(-1, retainedAvailableEntry.ContextWindow);
+        Assert.Equal("PARSED-ATTACK", retainedAvailableEntry.Description);
+        Assert.Equal("parsed-attack", retainedAvailableList[1].Name);
+        Assert.Empty(retainedCuratedList);
+        Assert.Equal("PARSED-ATTACK-EFFORT", retainedCuratedEntry.ReasoningEffort);
+        // The disk-parsed instance is its own owner too: unaffected by the other instance.
+        AssertOrderedEntries(
+            fromDisk.GetAvailableModelsSnapshot(),
+            ("shared-model", 976000, "medium", "shared-desc", true),
+            ("solo-avail", 4096, "low", "solo-desc", false));
+    }
+
+    /// <summary>
+    /// The second required alias shape: one whole catalog LIST anchored and referenced by the
+    /// other catalog through a real <c>*alias</c>, routed through
+    /// <see cref="ConfigRepoManager.ParseConfig"/> and the disk round trip, with complete ordered
+    /// field values for both catalogs and subsequent owner isolation against retained pre-update
+    /// values.
+    /// <para>
+    /// MECHANISM-OBSERVABLE: the raw deserializer binds the SAME list instance to both catalogs
+    /// under the alias. The owner boundary must nevertheless produce independent catalogs — a
+    /// synchronized mutation of one catalog must not appear in the other, which is exactly what a
+    /// shared-list alias would cause if the ownership boundary did not clone.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ParseConfig_ModelsListAnchorAlias_OrderedFieldValues_AndOwnerIsolation()
+    {
+        var config = ConfigRepoManager.ParseConfig(ListAnchorYaml);
+
+        // Complete ordered field values: the aliased list carries every field into BOTH catalogs.
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+        Assert.Equal("list-compactor", config.GetCompactionModel());
+
+        // MECHANISM OBSERVABILITY: this is a real whole-LIST alias — the two catalog list nodes
+        // are the SAME node, and a plain DTO bind shares one list instance (and its entries)
+        // between the catalogs. The entry-anchor document, by contrast, shares only an entry.
+        Assert.True(CatalogListNodesAreSame(ListAnchorYaml),
+            "The list-anchor document did not bind both catalogs to one list node.");
+        Assert.False(CatalogListNodesAreSame(EntryAnchorYaml),
+            "The entry-anchor document unexpectedly shares whole list nodes.");
+        var rawBound = RawDeserializeModels(ListAnchorModelsYaml);
+        Assert.Same(rawBound.AvailableModels, rawBound.SubAgentModels);
+        Assert.Same(rawBound.AvailableModels![0], rawBound.SubAgentModels![0]);
+
+        // Disk round trip.
+        var manager = new FakeConfigRepoManager("https://example.com/config.git", _tempDir);
+        await manager.WriteConfigAsync(config, TestContext.Current.CancellationToken);
+        var fromDisk = ConfigRepoManager.ParseConfig(await ReadWrittenYamlAsync(manager));
+        AssertOrderedEntries(
+            fromDisk.GetAvailableModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+        AssertOrderedEntries(
+            fromDisk.GetSubAgentModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+
+        // ── Owner isolation against retained PRE-UPDATE values. ────────────────────────────
+        var retainedModels = config.Models!;
+        var retainedAvailable = retainedModels.AvailableModels!;
+        var retainedCurated = retainedModels.SubAgentModels!;
+
+        // The owner's two catalogs must be INDEPENDENT despite the shared-list alias in YAML:
+        // updating the available catalog must not change the curated catalog.
+        Assert.True(config.TryUpdateAvailableModel(
+            "list-a", new AvailableModelRequest("list-a", 999, "AVAIL-ONLY", false)));
+
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("list-a", 999, "low", "AVAIL-ONLY", false),
+            ("list-b", 222, "high", "list-b-desc", false));
+        // The curated catalog is untouched by the available-catalog update.
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+
+        // Retained pre-update parsed results are frozen at their original values.
+        AssertOrderedEntries(
+            retainedAvailable,
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+        AssertOrderedEntries(
+            retainedCurated,
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+
+        // Mutating the retained parsed lists/entries does not reach the owner either.
+        retainedAvailable[0].ContextWindow = -5;
+        retainedCurated.Clear();
+        AssertOrderedEntries(
+            config.GetAvailableModelsSnapshot(),
+            ("list-a", 999, "low", "AVAIL-ONLY", false),
+            ("list-b", 222, "high", "list-b-desc", false));
+        AssertOrderedEntries(
+            config.GetSubAgentModelsSnapshot(),
+            ("list-a", 111, "low", "list-a-desc", true),
+            ("list-b", 222, "high", "list-b-desc", false));
+    }
+
+    /// <summary>
+    /// The production deserializer settings, used ONLY to observe YamlDotNet's raw alias binding
+    /// into a plain DTO (no ownership boundary in the way). Mirrors
+    /// <see cref="ConfigRepoManager"/>'s configuration (underscored naming, ignore unmatched).
+    /// </summary>
+    private static ModelsConfig RawDeserializeModels(string modelsYaml) =>
+        new DeserializerBuilder()
+            .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .IgnoreUnmatchedProperties()
+            .Build()
+            .Deserialize<ModelsConfig>(modelsYaml)!;
+
+    /// <summary>Loads the <c>models:</c> mapping of a document as a raw YAML representation node.</summary>
+    private static YamlMappingNode ModelsNode(string yaml)
+    {
+        using var reader = new StringReader(yaml);
+        var stream = new YamlStream();
+        stream.Load(reader);
+        var root = (YamlMappingNode)stream.Documents[0].RootNode;
+        return (YamlMappingNode)root[new YamlScalarNode("models")];
+    }
+
+    /// <summary>
+    /// Whether the first curated entry node IS the first available entry node — true only when
+    /// the document binds them through a real YAML alias, false for duplicated content.
+    /// </summary>
+    private static bool CuratedFirstEntryIsAvailableFirstEntryNode(string yaml)
+    {
+        var models = ModelsNode(yaml);
+        var available = (YamlSequenceNode)models[new YamlScalarNode("available_models")];
+        var curated = (YamlSequenceNode)models[new YamlScalarNode("sub_agent_models")];
+        return ReferenceEquals(available.Children[0], curated.Children[0]);
+    }
+
+    /// <summary>
+    /// Whether the two catalog LIST nodes are the same node — true only for a real whole-list
+    /// alias.
+    /// </summary>
+    private static bool CatalogListNodesAreSame(string yaml)
+    {
+        var models = ModelsNode(yaml);
+        return ReferenceEquals(
+            models[new YamlScalarNode("available_models")],
+            models[new YamlScalarNode("sub_agent_models")]);
     }
 
     // ── IsRepositoryAllowed ──────────────────────────────────────────────────

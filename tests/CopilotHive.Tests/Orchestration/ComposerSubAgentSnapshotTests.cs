@@ -10,6 +10,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using Moq;
+using CopilotHive.Services;
 
 namespace CopilotHive.Tests.Orchestration;
 
@@ -45,6 +46,14 @@ public sealed class ComposerSubAgentSnapshotTests : IDisposable
             .GetValue(agentService)!;
     }
 
+    /// <summary>
+    /// The Composer takes a genuine deep-copy snapshot at construction. The sourceEntry edits are
+    /// INPUT attacks (the retained initializer entry, not the owner), the owner stays unchanged
+    /// by them, and a REAL owner mutation through the synchronized API changes the source while
+    /// the captured Composer snapshot stays frozen — checked BEFORE any raw
+    /// name/reasoning replacement. Raw owner edits that the synchronized APIs cannot express are
+    /// handled afterward through an explicit local capture + whole-property reassignment.
+    /// </summary>
     [Fact]
     public async Task Composer_SubAgentSnapshot_IsDeepCopy_NotSharedWithLiveConfig()
     {
@@ -75,13 +84,53 @@ public sealed class ComposerSubAgentSnapshotTests : IDisposable
         var snapshotEntry = Assert.Single(snapshot);
         Assert.NotSame(sourceEntry, snapshotEntry);
 
-        // Mutate the live config entry in place — exactly what ConfigModelService does.
+        // ── INPUT attacks: mutate the retained initializer entry. The owner must be unchanged. ──
         sourceEntry.Name = "mutated";
         sourceEntry.ContextWindow = 999;
         sourceEntry.Description = "changed";
         sourceEntry.ReasoningEffort = "high";
 
-        // The construction-time snapshot must be unaffected.
+        // Positive owner control: fresh owner reads carry the ORIGINAL values (the setter cloned
+        // the input; the attack never reached the owner).
+        var ownerAfterInputAttack = Assert.Single(hiveConfig.GetAvailableModelsSnapshot()!);
+        Assert.Equal("test-model", ownerAfterInputAttack.Name);
+        Assert.Equal(200000, ownerAfterInputAttack.ContextWindow);
+        Assert.Equal("Original desc", ownerAfterInputAttack.Description);
+        Assert.Null(ownerAfterInputAttack.ReasoningEffort);
+
+        // The construction-time snapshot must be unaffected by the input attacks.
+        Assert.Equal("test-model", snapshotEntry.Name);
+        Assert.Equal(200000, snapshotEntry.ContextWindow);
+        Assert.Equal("Original desc", snapshotEntry.Description);
+        Assert.Null(snapshotEntry.ReasoningEffort);
+
+        // ── REAL owner mutation (context window + description) through the synchronized API,
+        // checked BEFORE any raw name/reasoning replacement. ────────────────────────────────
+        Assert.True(hiveConfig.TryUpdateAvailableModel(
+            "test-model", new AvailableModelRequest("test-model", 555, "OWNER-CHANGED", null)));
+
+        var ownerAfterRealMutation = Assert.Single(hiveConfig.GetAvailableModelsSnapshot()!);
+        Assert.Equal("test-model", ownerAfterRealMutation.Name);
+        Assert.Equal(555, ownerAfterRealMutation.ContextWindow);
+        Assert.Equal("OWNER-CHANGED", ownerAfterRealMutation.Description);
+
+        // The frozen Composer capture predates the real mutation.
+        Assert.Equal("test-model", snapshotEntry.Name);
+        Assert.Equal(200000, snapshotEntry.ContextWindow);
+        Assert.Equal("Original desc", snapshotEntry.Description);
+        Assert.Null(snapshotEntry.ReasoningEffort);
+
+        // ── Raw owner edits (rename + reasoning effort) are not expressible through the update
+        // API, so capture the current Models, edit the local, and reassign the whole property —
+        // strictly AFTER the in-place alias probe above (never a substitute for it). ────────
+        var ownerModels = hiveConfig.Models;
+        ownerModels!.AvailableModels![0].Name = "raw-renamed";
+        ownerModels.AvailableModels[0].ReasoningEffort = "high";
+        hiveConfig.Models = ownerModels;
+
+        Assert.Equal("raw-renamed", Assert.Single(hiveConfig.GetAvailableModelsSnapshot()!).Name);
+
+        // The Composer capture is still frozen at the original values.
         Assert.Equal("test-model", snapshotEntry.Name);
         Assert.Equal(200000, snapshotEntry.ContextWindow);
         Assert.Equal("Original desc", snapshotEntry.Description);

@@ -28,18 +28,46 @@ public sealed class HiveConfigFile
     /// <summary>Orchestrator-level configuration.</summary>
     public OrchestratorConfig Orchestrator { get; set; } = new();
     /// <summary>
-    /// Internal storage for <see cref="Models"/>. Preparatory refactor: the public property is a
-    /// transparent live get/set over this field (same type, name, null default, and YAML binding);
-    /// owner-internal catalog code reads and writes this field directly. Not YAML-serialized
-    /// directly — the property remains the single YAML-bound surface.
+    /// Internal storage for <see cref="Models"/>. OWNERSHIP BOUNDARY (public): the public
+    /// getter/setter are synchronized on <c>_catalogLock</c> and BOTH clone — the getter returns
+    /// a detached deep copy (never the live storage), the setter stores a detached deep copy
+    /// (never caller-owned lists/entries). Owner-internal catalog code reads and writes this
+    /// field directly. Not YAML-serialized directly — the property remains the single
+    /// YAML-bound surface (YamlDotNet reads/writes through the cloning getter/setter; value
+    /// semantics are preserved, identity is not).
     /// </summary>
     private ModelsConfig? _models;
 
-    /// <summary>Model-level configuration (compaction model, etc.).</summary>
+    /// <summary>
+    /// Model-level configuration (compaction model, etc.).
+    /// <para>
+    /// VALUE SEMANTICS: the getter and setter are synchronized on <c>_catalogLock</c> and BOTH
+    /// deep-copy via <see cref="CloneModels"/> — nested writes through a returned
+    /// <see cref="ModelsConfig"/> (or mutations of a retained setter input) no longer mutate the
+    /// owner; ownership of the Models subtree is located HERE. Null stays null and empty stays
+    /// empty; compaction, both catalogs, entry order and duplicates, null entries, raw strings
+    /// and nullable/nonpositive/vision values are preserved. Standalone
+    /// <see cref="ModelsConfig"/>/<see cref="ModelEntry"/> instances remain mutable DTOs.
+    /// Mutations of the owner's catalog must use the synchronized catalog APIs
+    /// (<c>TryAdd/TryUpdate/TryRemove…</c>, <c>SetCompactionModel</c>, <see cref="ReloadFrom"/>).
+    /// </para>
+    /// </summary>
     public ModelsConfig? Models
     {
-        get => _models;
-        set => _models = value;
+        get
+        {
+            lock (_catalogLock)
+            {
+                return _models is null ? null : CloneModels(_models);
+            }
+        }
+        set
+        {
+            lock (_catalogLock)
+            {
+                _models = value is null ? null : CloneModels(value);
+            }
+        }
     }
     /// <summary>Composer agent configuration. When set, the Composer is enabled.</summary>
     public ComposerConfig? Composer { get; set; }
@@ -250,7 +278,10 @@ public sealed class HiveConfigFile
     /// <see cref="GetSubAgentModelsSnapshot"/> inside the region. Fallback/merge then run OUTSIDE
     /// the lock on the detached entries. The returned entries are always detached deep copies
     /// (never live <see cref="ModelEntry"/> or list aliases); this helper-return detachment does
-    /// NOT change the <see cref="ModelsConfig"/> property getter/setter semantics, which stay live.
+    /// NOT change the <see cref="ModelsConfig"/> property getter/setter semantics, which are
+/// synchronized on <c>_catalogLock</c> and deep-copying: a returned DTO or a retained setter
+/// input is detached from the owner (ownership of the Models subtree is located at
+/// <see cref="HiveConfigFile.Models"/>).
     /// <para>
     /// Merge semantics (curated path, matching the live-catalog behavior it replaces): available
     /// names are indexed LAST-wins by case-insensitive name WITHOUT trimming; curated order and
@@ -648,9 +679,12 @@ public sealed class HiveConfigFile
     /// <para>
     /// The replacement is atomic: ONE complete detached snapshot of <paramref name="source"/> is
     /// captured first, then the entire top-level replacement happens under this instance's catalog
-    /// lock. The checkpoint-1 guarantee (readers never observe a torn catalog) holds only when
-    /// concurrent catalog writers use <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized
-    /// catalog APIs — direct public-list mutations are excluded from the invariant.
+    /// lock. The torn-catalog guarantee (readers never observe a torn catalog) holds when
+    /// concurrent catalog writers use <see cref="ReloadFrom(HiveConfigFile)"/>, the synchronized
+    /// catalog APIs, or the <see cref="Models"/> property (all synchronized on this lock).
+    /// Ownership of the Models subtree is located at <see cref="HiveConfigFile.Models"/> — a
+    /// returned <see cref="ModelsConfig"/> DTO is detached, so nested writes through it cannot
+    /// mutate the owner at all.
     /// </para>
     /// </summary>
     public void ReloadFrom(HiveConfigFile source)
@@ -670,10 +704,12 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Captures a complete detached deep copy of every property EXCEPT <see cref="IsConfigured"/>.
-    /// The capture is atomic with respect to this instance's catalog lock. The checkpoint-1
-    /// guarantee (the snapshot never observes a torn catalog) holds only when concurrent catalog
-    /// writers use <see cref="ReloadFrom(HiveConfigFile)"/> or the synchronized catalog APIs —
-    /// direct public-list mutations are excluded from the invariant.
+    /// The capture is atomic with respect to this instance's catalog lock. The torn-catalog
+    /// guarantee (the snapshot never observes a torn catalog) holds when concurrent catalog
+    /// writers use <see cref="ReloadFrom(HiveConfigFile)"/>, the synchronized catalog APIs, or the
+    /// <see cref="Models"/> property (all synchronized on this lock) — and since the
+    /// <see cref="Models"/> getter clones, a returned <see cref="ModelsConfig"/> DTO can never
+    /// leak live references into any reader.
     /// </summary>
     internal HiveConfigSnapshot CaptureConfigSnapshot()
     {

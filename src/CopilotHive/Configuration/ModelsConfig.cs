@@ -42,10 +42,12 @@ public sealed class ModelsConfig
     /// Enumerated models available for selection in the UI. When set, dropdowns use this list
     /// instead of free-text input.
     /// <para>
-    /// Today these lists are live and mutable — direct mutation affects the catalog. A planned
-    /// checkpoint will make getters return detached copies; mutation sites must then use the
-    /// synchronized APIs on <see cref="HiveConfigFile"/>. This comment will be updated when the
-    /// flip lands.
+    /// The lists are mutable DTOs on a standalone <see cref="ModelsConfig"/>, but when the
+    /// instance is owned by a <see cref="HiveConfigFile"/>, the
+    /// <see cref="HiveConfigFile.Models"/> getter/setter are synchronized and deep-copying:
+    /// mutating a <see cref="ModelsConfig"/> obtained from <see cref="HiveConfigFile.Models"/>
+    /// does NOT affect the owner, and the stored copy is detached from the input at assignment.
+    /// Mutation sites must use the synchronized APIs on <see cref="HiveConfigFile"/>.
     /// </para>
     /// </summary>
     public List<ModelEntry>? AvailableModels { get; set; }
@@ -54,10 +56,10 @@ public sealed class ModelsConfig
     /// Curated list of models for sub-agent selection. When null or empty,
     /// falls back to <see cref="AvailableModels"/>.
     /// <para>
-    /// Today these lists are live and mutable — direct mutation affects the catalog. A planned
-    /// checkpoint will make getters return detached copies; mutation sites must then use the
-    /// synchronized APIs on <see cref="HiveConfigFile"/>. This comment will be updated when the
-    /// flip lands.
+    /// Same ownership rule as <see cref="AvailableModels"/>: when the
+    /// <see cref="ModelsConfig"/> is owned by a <see cref="HiveConfigFile"/>, mutations must go
+    /// through the synchronized APIs on <see cref="HiveConfigFile"/> — the
+    /// <see cref="HiveConfigFile.Models"/> getter/setter clone (deep-copy) on both sides.
     /// </para>
     /// </summary>
     public List<ModelEntry>? SubAgentModels { get; set; }

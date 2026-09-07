@@ -14,20 +14,24 @@ using YamlDotNet.Serialization.NamingConventions;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Checkpoint-1 catalog-safety tests for <see cref="HiveConfigFile"/>: the atomic catalog API,
+/// Catalog-safety tests for <see cref="HiveConfigFile"/>: the atomic catalog API,
 /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/>/<c>HiveConfigSnapshot</c>, the CompactionModel
-/// get/set APIs, and the rewritten <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>.
+/// get/set APIs, the rewritten <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>, and the
+/// public ownership boundary at <see cref="HiveConfigFile.Models"/> (synchronized cloning
+/// getter/setter).
 /// <para>
-/// SCOPE (checkpoint 1): the lock coordinates ONLY <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>
-/// and the new synchronized APIs. Direct public-list mutations are NOT synchronized in this
-/// checkpoint and are therefore EXCLUDED from the concurrency test's invariants — they appear
-/// only in single-threaded SETUP and in the dedicated detachment tests.
+/// SCOPE: the lock coordinates <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>, the
+/// synchronized APIs, AND the <see cref="HiveConfigFile.Models"/> getter/setter — the Models
+/// subtree is fully detached from external callers (returned DTOs and retained inputs are
+/// clones), so direct list mutations through a returned DTO cannot occur at all.
 /// </para>
 /// <para>
 /// Removal-proofing: the concurrency/atomicity tests fail if the lock is removed from
 /// <c>TryAddAvailableModel</c>/<see cref="HiveConfigFile.CaptureConfigSnapshot"/>; the
 /// post-reload source-mutation test fails if the snapshot-then-replace ordering (or the deep
-/// copy) is removed from <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>.
+/// copy) is removed from <see cref="HiveConfigFile.ReloadFrom(HiveConfigFile)"/>; the lock-
+/// participation tests fail if the Models getter/setter stop acquiring <c>_catalogLock</c>; the
+/// detachment tests fail if the Models getter/setter stop cloning.
 /// </para>
 /// </summary>
 public sealed class HiveConfigFileCatalogSafetyTests
@@ -583,15 +587,16 @@ public sealed class HiveConfigFileCatalogSafetyTests
     }
 
     /// <summary>
-    /// DETACHED DEEP copy: post-snapshot mutations — including of the caller-held lists used to
-    /// construct the config — must not affect an already-captured snapshot, and mutations of the
-    /// snapshot must not leak back into the live catalog. <see cref="ModelEntry.Description"/> is
-    /// included in the deep copy.
+    /// DETACHED DEEP copy: inputs and getter results are detached from the owner, and
+    /// post-snapshot mutations of the caller-held lists used to construct the config must not
+    /// affect an already-captured snapshot, and mutations of the snapshot must not leak back into
+    /// the live catalog. <see cref="ModelEntry.Description"/> is included in the deep copy.
     /// </summary>
     [Fact]
     public void CaptureConfigSnapshot_IsDetachedDeepCopy_IncludingCallerHeldListsAndDescription()
     {
-        // Construct the config with caller-held lists (public property setters, checkpoint-1 live).
+        // Construct the config with caller-held lists (the setter clones; the input stays
+        // caller-owned and mutable as a standalone DTO).
         var heldAvailable = new List<ModelEntry>
         {
             MakeEntry("held-a", 111, null, "held-desc-a", true),
@@ -611,6 +616,17 @@ public sealed class HiveConfigFileCatalogSafetyTests
             }
         };
 
+        // ── Setter-side detachment: mutating the RETAINED input does not change the owner. ──
+        heldAvailable.Add(MakeEntry("input-c", 555));
+        heldSubAgent[0].ContextWindow = 777;
+        var ownerAfterInputAttack = config.GetAvailableModelsSnapshot();
+        Assert.NotNull(ownerAfterInputAttack);
+        Assert.Equal(2, ownerAfterInputAttack!.Count);
+        Assert.Equal(new EntryTuple("held-a", 111, null, "held-desc-a", true), TupleOf(ownerAfterInputAttack[0]));
+        Assert.Equal(new EntryTuple("held-b", 222, null, null, null), TupleOf(ownerAfterInputAttack[1]));
+        Assert.Equal(new EntryTuple("held-sub", 333, "high", "held-sub-desc", false),
+            TupleOf(Assert.Single(config.GetSubAgentModelsSnapshot()!)));
+
         var snapshot = config.CaptureConfigSnapshot();
         var snapshotAvailable = snapshot.Models!.AvailableModels!;
         var snapshotSubAgents = snapshot.Models.SubAgentModels!;
@@ -622,6 +638,31 @@ public sealed class HiveConfigFileCatalogSafetyTests
         Assert.NotSame(heldSubAgent[0], snapshotSubAgents[0]);
         Assert.Equal("cm-1", snapshot.Models.CompactionModel);
 
+        // ── Getter-side compaction attack: a Models DTO from the getter is detached. ──────
+        var fromGetter = config.Models;
+        Assert.NotNull(fromGetter);
+        fromGetter!.CompactionModel = "GETTER-ATTACK";
+        fromGetter.AvailableModels!.Add(MakeEntry("getter-attack", 1));
+        fromGetter.AvailableModels[0].Description = "GETTER-ENTRY-ATTACK";
+        // Direct getter-derived CURATED list/entry attack (the curated half of the boundary).
+        var fromGetterCurated = fromGetter.SubAgentModels!;
+        fromGetterCurated.Add(MakeEntry("getter-curated-attack", 7, "none"));
+        fromGetterCurated[0].Name = "GETTER-CURATED-NAME";
+        fromGetterCurated[0].ContextWindow = -321;
+        Assert.NotSame(fromGetter, config.Models);   // fresh clone each read
+
+        // Fresh owner reads: ORIGINAL values on BOTH catalogs, untouched by the getter attacks.
+        var ownerAfterGetterAttack = config.GetAvailableModelsSnapshot();
+        Assert.NotNull(ownerAfterGetterAttack);
+        Assert.Equal(2, ownerAfterGetterAttack!.Count);
+        Assert.Equal(new EntryTuple("held-a", 111, null, "held-desc-a", true),
+            TupleOf(ownerAfterGetterAttack[0]));
+        Assert.Equal(new EntryTuple("held-b", 222, null, null, null),
+            TupleOf(ownerAfterGetterAttack[1]));
+        Assert.Equal(new EntryTuple("held-sub", 333, "high", "held-sub-desc", false),
+            TupleOf(Assert.Single(config.GetSubAgentModelsSnapshot()!)));
+        Assert.Equal("cm-1", config.GetCompactionModel());
+
         // ── Post-snapshot mutations of the caller-held lists must NOT affect the snapshot. ──
         heldAvailable.Add(MakeEntry("held-c", 444));
         heldAvailable.RemoveAt(0);
@@ -629,7 +670,6 @@ public sealed class HiveConfigFileCatalogSafetyTests
         heldAvailable[0].ContextWindow = 999999;
         heldSubAgent[0].Name = "MUTATED-NAME";
         heldSubAgent[0].Description = "MUTATED-SUB-DESC";
-        config.Models!.CompactionModel = "MUTATED-CM";
 
         Assert.Equal(2, snapshotAvailable.Count);
         Assert.Equal(new EntryTuple("held-a", 111, null, "held-desc-a", true), TupleOf(snapshotAvailable[0]));
@@ -637,16 +677,40 @@ public sealed class HiveConfigFileCatalogSafetyTests
         Assert.Equal("cm-1", snapshot.Models.CompactionModel);
         Assert.Equal(new EntryTuple("held-sub", 333, "high", "held-sub-desc", false), TupleOf(snapshotSubAgents[0]));
 
+        // ── Real synchronized owner mutations, BEFORE any generation replacement. ──────────
+        // Positive: the owner's fresh source state really changed; the original snapshot and the
+        // getter-derived DTO stay frozen.
+        Assert.True(config.TryUpdateAvailableModel(
+            "held-a", new AvailableModelRequest("held-a", 321, "OWNER-MUTATED", false)));
+        config.SetCompactionModel("OWNER-CM");
+
+        var ownerAfterRealMutation = config.GetAvailableModelsSnapshot();
+        Assert.NotNull(ownerAfterRealMutation);
+        Assert.Equal(2, ownerAfterRealMutation!.Count);
+        Assert.Equal(new EntryTuple("held-a", 321, null, "OWNER-MUTATED", false),
+            TupleOf(ownerAfterRealMutation[0]));
+        Assert.Equal("OWNER-CM", config.GetCompactionModel());
+
+        // The captured snapshot is frozen at its pre-mutation generation.
+        Assert.Equal(2, snapshotAvailable.Count);
+        Assert.Equal(new EntryTuple("held-a", 111, null, "held-desc-a", true), TupleOf(snapshotAvailable[0]));
+        Assert.Equal("cm-1", snapshot.Models.CompactionModel);
+        // The earlier getter-derived DTO is likewise frozen.
+        Assert.Equal("GETTER-ATTACK", fromGetter.CompactionModel);
+        Assert.Equal(3, fromGetter.AvailableModels!.Count);
+
         // ── Mutations of the SNAPSHOT must not leak back into the live catalog. ─────────────
         ((List<ModelEntry>)snapshotAvailable).Add(MakeEntry("snapshot-extra"));
         snapshotAvailable[0].Description = "SNAPSHOT-SIDE-MUTATION";
         snapshot.Models.CompactionModel = "SNAPSHOT-CM";
 
-        Assert.Equal(2, config.Models!.AvailableModels!.Count); // 1 + the "held-c" added above
-        Assert.Equal(new EntryTuple("held-b", 999999, null, "MUTATED-DESC", null),
-            TupleOf(config.Models.AvailableModels[0]));
-        Assert.Equal("MUTATED-NAME", config.Models.SubAgentModels![0].Name);
-        Assert.Equal("MUTATED-CM", config.GetCompactionModel());
+        // The owner is unchanged by the snapshot-side attacks (fresh authoritative reads).
+        var ownerAfterSnapshotAttack = config.GetAvailableModelsSnapshot();
+        Assert.NotNull(ownerAfterSnapshotAttack);
+        Assert.Equal(2, ownerAfterSnapshotAttack!.Count);
+        Assert.Equal(new EntryTuple("held-a", 321, null, "OWNER-MUTATED", false),
+            TupleOf(ownerAfterSnapshotAttack[0]));
+        Assert.Equal("OWNER-CM", config.GetCompactionModel());
     }
 
     /// <summary>
@@ -1260,7 +1324,7 @@ public sealed class HiveConfigFileCatalogSafetyTests
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Preparatory-stage regression for the internal <c>_models</c> backing field: after a WHOLE
+    /// Regression for the internal <c>_models</c> backing field: after a WHOLE
     /// <see cref="HiveConfigFile.Models"/> replacement (and after initialization from
     /// <see cref="HiveConfigFile.Models"/> = <c>null</c>), the synchronized catalog and compaction
     /// operations act on the NEW storage and the owner's authoritative accessors
@@ -1269,10 +1333,20 @@ public sealed class HiveConfigFileCatalogSafetyTests
     /// <see cref="HiveConfigFile.GetCompactionModel"/>, <see cref="HiveConfigFile.CaptureConfigSnapshot"/>)
     /// reflect the resulting state, including across a <see cref="HiveConfigFile.ReloadFrom"/>.
     /// <para>
-    /// The live-identity assertions at the end are SCOPED TO THIS PREPARATORY STAGE ONLY: they pin
-    /// the current transparent get/set (no locking/cloning/normalization in the property). They are
-    /// NOT a permanent promise and must be revisited/removed when the public ownership of
-    /// <see cref="HiveConfigFile.Models"/> changes in a future goal.
+    /// The old temporary live-identity assertions are replaced by DEEP DETACHMENT: the retained
+    /// assigned/replacement DTOs stay at their original values while the owner's APIs update the
+    /// private <c>_models</c> storage. Returned-object and input attacks plus authoritative owner
+    /// checks prove the ownership boundary at <see cref="HiveConfigFile.Models"/>.
+    /// </para>
+    /// <para>
+    /// HELD-GETTER ordering: the <c>getterDto</c> captured from the getter is asserted frozen —
+    /// by concrete values, against authoritative fresh owner reads — across the
+    /// <see cref="HiveConfigFile.ReloadFrom"/> AND across the SECOND explicit replacement
+    /// (<c>config.Models = assigned</c>), which the capture strictly precedes. A post-replacement
+    /// mutation of the held DTO verifies it is not re-aliased to the replaced owner. The
+    /// ReloadFrom retention proof stands on its own (capture → reload → assert); the
+    /// capture → replace → assert ordering below additionally establishes the explicit-replacement
+    /// retention proof.
     /// </para>
     /// </summary>
     [Fact]
@@ -1316,9 +1390,36 @@ public sealed class HiveConfigFileCatalogSafetyTests
             TupleOf(config.GetSubAgentModelsSnapshot()!.Single()));
         Assert.Equal("cm-set-after-replacement", config.GetCompactionModel());
 
-        // And the replacement instance itself was mutated in place (no copy-on-write redirection).
-        Assert.Equal(2, replacement.AvailableModels!.Count);
-        Assert.Equal("cm-set-after-replacement", replacement.CompactionModel);
+        // And the replacement INPUT is detached from the owner: synchronized operations after
+        // the assignment did NOT mutate the retained replacement instance — the owner clones at
+        // the setter boundary and mutates only its private storage.
+        Assert.Single(replacement.AvailableModels!);
+        Assert.Equal(new EntryTuple("avail-b", 300, null, "desc-b", false),
+            TupleOf(replacement.AvailableModels![0]));
+        Assert.Equal("cm-new", replacement.CompactionModel);
+
+        // Getter-side attack: a DTO from the getter is detached; mutating it does not reach the
+        // owner (authoritative fresh read below). Its ATTACKED values are recorded here so the
+        // held DTO can be re-checked after the replacement/reload phases below.
+        var getterDto = config.Models;
+        Assert.NotNull(getterDto);
+        var getterDtoCuratedList = getterDto!.SubAgentModels!;
+        var getterDtoCuratedEntry = Assert.Single(getterDtoCuratedList);
+        getterDto.CompactionModel = "GETTER-ATTACK-CM";
+        getterDto.AvailableModels!.Add(MakeEntry("getter-attack", 1));
+        // Direct getter-derived CURATED list/entry attack.
+        getterDtoCuratedList.Add(MakeEntry("getter-curated-attack", 9, "none"));
+        getterDtoCuratedEntry.ReasoningEffort = "GETTER-CURATED-EFFORT";
+        Assert.NotSame(getterDto, config.Models);
+
+        // Authoritative owner state after the getter-side attack: unchanged on BOTH catalogs.
+        var availableAfterGetterAttack = config.GetAvailableModelsSnapshot()!;
+        Assert.Equal(2, availableAfterGetterAttack.Count);
+        Assert.Equal(new EntryTuple("avail-b", 300, null, "desc-b", false),
+            TupleOf(availableAfterGetterAttack[0]));
+        Assert.Equal(new EntryTuple("sub-b", 450, "low", null, null),
+            TupleOf(Assert.Single(config.GetSubAgentModelsSnapshot()!)));
+        Assert.Equal("cm-set-after-replacement", config.GetCompactionModel());
 
         // ── ReloadFrom: the destination adopts the snapshot's Models wholesale. ─────────────
         var source = new HiveConfigFile();
@@ -1337,16 +1438,75 @@ public sealed class HiveConfigFileCatalogSafetyTests
         Assert.Equal("cm-reloaded", config.GetCompactionModel());
         Assert.Equal("cm-reloaded", config.CaptureConfigSnapshot().Models!.CompactionModel);
 
-        // ── PREPARATORY-STAGE-ONLY live-identity assertions (not a permanent promise). ──────
+        // The HELD getter value survived BOTH the whole replacement and the ReloadFrom at its
+        // own (attacked) values — no owner generation leaked into it.
+        Assert.Equal("GETTER-ATTACK-CM", getterDto.CompactionModel);
+        Assert.Equal(3, getterDto.AvailableModels!.Count);
+        Assert.Equal(new EntryTuple("avail-b", 300, null, "desc-b", false),
+            TupleOf(getterDto.AvailableModels[0]));
+        Assert.Equal("getter-attack", getterDto.AvailableModels[2].Name);
+        Assert.Equal(2, getterDtoCuratedList.Count);
+        Assert.Equal("GETTER-CURATED-EFFORT", getterDtoCuratedEntry.ReasoningEffort);
+        Assert.Equal("getter-curated-attack", getterDtoCuratedList[1].Name);
+        // ...and the held getter list/entries are not the owner's post-reload generation.
+        Assert.DoesNotContain(getterDto.AvailableModels, e => e.Name == "reloaded-avail");
+        Assert.DoesNotContain(getterDtoCuratedList, e => e.Name == "reloaded-sub");
+
+        // ── Held getter value across a SECOND explicit replacement (execution-order proof). ──
+        // `getterDto` was captured from the getter BEFORE the ReloadFrom above — and therefore
+        // also BEFORE the explicit replacement that follows — so retaining it across THAT
+        // replacement is established by this ordering: first capture (1394), then replace
+        // (below), then assert frozen held values alongside authoritative NEW owner values.
         var assigned = new ModelsConfig { CompactionModel = "identity-cm" };
         config.Models = assigned;
-        Assert.Same(assigned, config.Models);                       // setter is transparent
+        // The setter clones: the owner's DTO is NOT the caller's instance, and the caller's
+        // instance stays at its original value through owner mutations.
+        Assert.NotSame(assigned, config.Models);
+
+        // Authoritative fresh reads: the owner now carries the NEW assignment's values...
+        Assert.Equal("identity-cm", config.GetCompactionModel());
+        Assert.Null(config.GetAvailableModelsSnapshot());
+        Assert.Null(config.GetSubAgentModelsSnapshot());
+        // ...while the HELD getter DTO stays at its OLD (pre-replacement, attacked) values —
+        // concrete values on compaction, both catalogs and their entries.
+        Assert.Equal("GETTER-ATTACK-CM", getterDto.CompactionModel);
+        Assert.Equal(3, getterDto.AvailableModels!.Count);
+        Assert.Equal(new EntryTuple("avail-b", 300, null, "desc-b", false),
+            TupleOf(getterDto.AvailableModels[0]));
+        Assert.Equal("getter-attack", getterDto.AvailableModels[2].Name);
+        Assert.Equal(2, getterDtoCuratedList.Count);
+        Assert.Equal(new EntryTuple("sub-b", 450, "GETTER-CURATED-EFFORT", null, null),
+            TupleOf(getterDtoCuratedList[0]));
+        Assert.Equal("getter-curated-attack", getterDtoCuratedList[1].Name);
+
+        // Post-replacement attack on the HELD DTO: mutating it still leaves the NEW owner
+        // storage untouched (the held DTO is detached from the replaced owner, not re-aliased).
+        getterDto.CompactionModel = "POST-REPLACEMENT-ATTACK";
+        getterDto.AvailableModels!.Add(MakeEntry("post-replacement-attack", 1));
+        Assert.Equal("identity-cm", config.GetCompactionModel());
+        Assert.Null(config.GetAvailableModelsSnapshot());
+        Assert.Null(config.GetSubAgentModelsSnapshot());
+
         config.SetCompactionModel("identity-final");
-        Assert.Equal("identity-final", assigned.CompactionModel);   // writes land on the live instance
+        Assert.Equal("identity-cm", assigned.CompactionModel);      // retained input unchanged
+        Assert.Equal("identity-final", config.GetCompactionModel());
+        Assert.Equal("identity-final", config.CaptureConfigSnapshot().Models!.CompactionModel);
+
+        // Getter-side attack on the newly assigned DTO: detached, owner unaffected.
+        var assignedGetterDto = config.Models;
+        assignedGetterDto!.CompactionModel = "GETTER-ATTACK";
+        Assert.Equal("identity-final", config.GetCompactionModel());
+
+        // Input-side attack: mutating the retained assigned DTO still leaves the owner alone.
+        assigned.AvailableModels = [MakeEntry("input-attack", 1)];
+        Assert.Null(config.GetAvailableModelsSnapshot());
+
+        // Null reset semantics preserved.
         config.Models = null;
         Assert.Null(config.GetCompactionModel());
         Assert.Null(config.GetAvailableModelsSnapshot());
         Assert.Null(config.GetSubAgentModelsSnapshot());
+        Assert.Null(config.Models);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1836,6 +1996,87 @@ public sealed class HiveConfigFileCatalogSafetyTests
         // 42 was the value at the moment the reader was started and blocked; 99 was committed
         // behind it. Observing 99 proves the read happened after acquiring the monitor.
         Assert.Equal(99, observed);
+    }
+
+    /// <summary>
+    /// The <see cref="HiveConfigFile.Models"/> GETTER participates in <c>_catalogLock</c>: a
+    /// dedicated thread calling the getter is POSITIVELY observed blocked on the instance's
+    /// catalog monitor, a synchronized writer then commits a distinguishing owner change behind
+    /// it, and the getter's returned DTO must carry the post-commit value — a post-acquisition
+    /// observation, not a fixed-duration non-completion proxy.
+    /// </summary>
+    [Fact]
+    public void ModelsGetter_ReaderWaitsForHeldCatalogMonitor()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig
+            {
+                CompactionModel = "pre-cm",
+                AvailableModels = [MakeEntry("m", 42)]
+            }
+        };
+
+        var observed = AssertReaderBlocksOnCatalogMonitor(
+            config,
+            () => config.Models,   // the getter under test
+            () => config.SetCompactionModel("post-cm"));   // distinguishing owner change behind the blocked reader
+
+        // The getter cloned AFTER acquiring the monitor: it carries the post-commit value.
+        Assert.NotNull(observed);
+        Assert.Equal("post-cm", observed!.CompactionModel);
+        Assert.Equal(new EntryTuple("m", 42, null, null, null), TupleOf(Assert.Single(observed.AvailableModels!)));
+        // And the owner is consistent with the observed generation.
+        Assert.Equal("post-cm", config.GetCompactionModel());
+    }
+
+    /// <summary>
+    /// The <see cref="HiveConfigFile.Models"/> SETTER participates in <c>_catalogLock</c>: a
+    /// dedicated thread running a synchronous assignment is POSITIVELY observed blocked on the
+    /// instance's catalog monitor, a distinguishing owner update is made while the monitor is
+    /// still held (before the setter can acquire it), and after release/join the setter's own
+    /// assignment is authoritative — proving the setter only published after acquiring the
+    /// monitor. The supplied input object is NOT concurrently mutated during the setter's
+    /// capture (the assignment is the callback; the input is built beforehand).
+    /// </summary>
+    [Fact]
+    public void ModelsSetter_WaitsForHeldCatalogMonitor_PublishesAfterAcquisition()
+    {
+        var config = new HiveConfigFile
+        {
+            Orchestrator = new OrchestratorConfig(),
+            Models = new ModelsConfig { CompactionModel = "initial-cm" }
+        };
+
+        // The input is complete BEFORE the contention window: the setter clones it under the
+        // lock; no concurrent mutation of the input occurs during capture.
+        var replacement = new ModelsConfig
+        {
+            CompactionModel = "setter-cm",
+            AvailableModels = [MakeEntry("setter-entry", 7)]
+        };
+
+        // The setter as a synchronous Func<bool> completion marker: assignment succeeded.
+        bool Setter() { config.Models = replacement; return true; }
+        var observed = AssertReaderBlocksOnCatalogMonitor(
+            config,
+            Setter,   // contention reader: the setter under test
+            () => config.SetCompactionModel("held-by-monitor-cm"));   // distinguishing change made WHILE the monitor is held
+
+        // The setter ran to completion (its marker returned true).
+        Assert.True(observed, "The Models setter did not complete its assignment.");
+
+        // While the monitor was held, the distinguishing update was visible through the owner's
+        // synchronized accessor. The setter's publication happened strictly AFTER that update
+        // (it had to acquire the monitor behind it), so the FINAL state is the setter's.
+        Assert.Equal("setter-cm", config.GetCompactionModel());
+        var stored = Assert.Single(config.GetAvailableModelsSnapshot()!);
+        Assert.Equal(new EntryTuple("setter-entry", 7, null, null, null), TupleOf(stored));
+
+        // Value semantics of the setter boundary: the input stays caller-owned and unchanged.
+        Assert.Equal("setter-cm", replacement.CompactionModel);
+        Assert.Single(replacement.AvailableModels!);
     }
 
     /// <summary>
