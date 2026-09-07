@@ -349,12 +349,20 @@ public class ConfigRepoManager
     /// Serializes <paramref name="config"/> to YAML and writes it to <c>hive-config.yaml</c>
     /// in the local config repo path, then updates the in-memory cache.
     /// Call <see cref="CommitFileAsync"/> afterward to commit and push the change.
+    /// <para>
+    /// The YAML is produced from a DETACHED snapshot taken via
+    /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/> — never from the live instance — so
+    /// synchronized catalog mutations and <see cref="HiveConfigFile.ReloadFrom"/> that interleave
+    /// with the serializer's traversal cannot tear the written file. The snapshot is coherent
+    /// relative to participating synchronized writers only; the in-memory cache is updated with
+    /// the ORIGINAL <paramref name="config"/> instance after a successful write.
+    /// </para>
     /// </summary>
     /// <param name="config">The updated configuration to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task WriteConfigAsync(HiveConfigFile config, CancellationToken ct = default)
     {
-        var yaml = YamlSerializer.Serialize(config);
+        var yaml = YamlSerializer.Serialize(config.CaptureConfigSnapshot());
         var configPath = Path.Combine(_localPath, "hive-config.yaml");
         await File.WriteAllTextAsync(configPath, yaml, ct);
         _cachedConfig = config;
