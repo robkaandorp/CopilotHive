@@ -4199,6 +4199,555 @@ public class ConfigRepoManagerTests : IDisposable
         }
     }
 
+    // ── Conservative cache invalidation (ResetToRemoteAsync + push recovery) ──
+
+    private const string InvalConfigA = """
+        version: "1.0-A"
+        repositories:
+          - name: repo-a
+            url: https://github.com/org/inval-a.git
+        """;
+
+    private const string InvalConfigB = """
+        version: "2.0-B"
+        repositories:
+          - name: repo-b
+            url: https://github.com/org/inval-b.git
+        """;
+
+    private const string InvalConfigC = """
+        version: "3.0-C"
+        repositories:
+          - name: repo-c
+            url: https://github.com/org/inval-c.git
+        """;
+
+    private const string InvalUrlA = "https://github.com/org/inval-a.git";
+    private const string InvalUrlB = "https://github.com/org/inval-b.git";
+    private const string InvalUrlC = "https://github.com/org/inval-c.git";
+
+    /// <summary>
+    /// A REAL <see cref="ConfigRepoManager"/> (never <see cref="FakeConfigRepoManager"/>, whose
+    /// overridden <see cref="ConfigRepoManager.CommitFileAsync"/> does not execute the recovery
+    /// path) driven through the existing <c>GitRunner</c> seam — no network, no real git. The
+    /// fixture gets a <c>.git</c> directory so the pull/clone routing exists, and a null
+    /// <c>TokenResolver</c> keeps credentials deterministic (no <c>GH_TOKEN</c> interference).
+    /// </summary>
+    private (ConfigRepoManager Manager, RecordingRunner Runner) CreateInvalidationManager(
+        string urlSuffix, Func<string[], int> exitFor)
+    {
+        Directory.CreateDirectory(Path.Combine(_tempDir, ".git"));
+        var runner = new RecordingRunner(exitFor);
+        var manager = new ConfigRepoManager($"https://example.com/{urlSuffix}/config.git", _tempDir)
+        {
+            TokenResolver = _ => Task.FromResult<string?>(null),
+            GitRunner = runner.RunAsync
+        };
+        return (manager, runner);
+    }
+
+    private async Task WriteConfigFileAsync(string yaml)
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(_tempDir, "hive-config.yaml"), yaml, TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>A GitRunner result with an exit code and empty output.</summary>
+    private static ConfigRepoManager.GitRunResult Exit(int code) =>
+        new(code, "", code == 0 ? "" : "boom");
+
+    /// <summary>
+    /// A scripted GitRunner: records every git invocation (full argument string) and resolves the
+    /// exit code per command via the configured selector at call time. Unplanned commands exit 0.
+    /// The optional <see cref="OnCommand"/> hook may only write fixture files or signal gates —
+    /// it runs while the manager holds its lock, so it must NEVER call
+    /// <see cref="ConfigRepoManager.LoadConfigAsync"/>.
+    /// </summary>
+    private sealed class RecordingRunner
+    {
+        private readonly Func<string[], int> _exitFor;
+
+        public RecordingRunner(Func<string[], int> exitFor) => _exitFor = exitFor;
+
+        public List<string> Commands { get; } = [];
+
+        public Func<string, CancellationToken, Task>? OnCommand { get; set; }
+
+        public async Task<ConfigRepoManager.GitRunResult> RunAsync(
+            string workingDir, string[] args, CancellationToken ct)
+        {
+            var command = string.Join(' ', args);
+            Commands.Add(command);
+            if (OnCommand is not null)
+                await OnCommand(command, ct);
+            return Exit(_exitFor(args));
+        }
+    }
+
+    /// <summary>Dispatches to the real commit entry point by name.</summary>
+    private static async Task InvokeCommitEntryPointAsync(
+        ConfigRepoManager manager, string entryPoint, CancellationToken ct)
+    {
+        switch (entryPoint)
+        {
+            case "CommitFileAsync":
+                await manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct);
+                break;
+            case "DeleteFileAsync":
+                await manager.DeleteFileAsync("hive-config.yaml", "invalidation probe", ct);
+                break;
+            case "DeleteFilesAsync":
+                await manager.DeleteFilesAsync(["hive-config.yaml"], "invalidation probe", ct);
+                break;
+            case "CommitAllChangesAsync":
+                await manager.CommitAllChangesAsync("invalidation probe", ct);
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown entry point '{entryPoint}'.");
+        }
+    }
+
+    /// <summary>
+    /// (a) A successful <see cref="ConfigRepoManager.ResetToRemoteAsync"/> invalidates the cache
+    /// BEFORE the best-effort merge abort, under the acquired lock. The cache is primed with A,
+    /// the simulated working-tree command (the abort callback) itself rewrites disk to B as part
+    /// of the operation, and the real entry point runs. Proof: membership is already DENIED while
+    /// the abort callback executes (the cache is empty at that point — the existing no-cache
+    /// contract) and BEFORE the callback writes B, membership stays denied after the reset, the
+    /// next load rereads disk and returns B (never stale A), and a later load returns a detached
+    /// copy.
+    /// </summary>
+    [Fact]
+    public async Task ResetToRemoteAsync_Success_InvalidatesCache_BeforeAbortChangesDisk()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (manager, runner) = CreateInvalidationManager("reset-inval", _ => 0);
+
+        // The invalidation must ALREADY be in effect while merge --abort runs (it happens before
+        // TryAbortMergeAsync inside the acquired lock). IsRepositoryAllowed takes no lock, so the
+        // observation is safe inside the callback. The SAME callback then performs the operation's
+        // working-tree rewrite (A → B) as part of the command itself.
+        var allowedDuringAbort = true;
+        runner.OnCommand = (command, _) =>
+        {
+            if (command == "merge --abort")
+            {
+                allowedDuringAbort = manager.IsRepositoryAllowed(InvalUrlA);
+                return WriteConfigFileAsync(InvalConfigB);
+            }
+            return Task.CompletedTask;
+        };
+
+        await WriteConfigFileAsync(InvalConfigA);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+
+        await manager.ResetToRemoteAsync(ct);
+
+        // The reset really ran the abort path.
+        Assert.Contains("merge --abort", runner.Commands);
+        Assert.Contains("fetch origin", runner.Commands);
+        Assert.Contains("reset --hard origin/HEAD", runner.Commands);
+
+        // Ordering proof: the cache was ALREADY empty while the abort ran.
+        Assert.False(allowedDuringAbort,
+            "The cache was still populated when merge --abort ran — invalidation must precede the abort.");
+
+        // (i) The cache is EMPTY after the reset: membership DENIED for everything (existing
+        // no-cache contract denies while the cache is empty).
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlA));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlC));
+
+        // (ii) The next load rereads disk → B, never stale A; membership is repopulated from it.
+        var reloaded = await manager.LoadConfigAsync(ct);
+        Assert.Equal("2.0-B", reloaded.Version);
+        Assert.Equal("repo-b", reloaded.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlB));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlA));
+
+        // (iii) A later load returns a detached copy of the repopulated cache.
+        var again = await manager.LoadConfigAsync(ct);
+        Assert.Equal("2.0-B", again.Version);
+        Assert.NotSame(reloaded, again);
+        Assert.NotSame(reloaded.Repositories, again.Repositories);
+        Assert.NotSame(reloaded.Repositories[0], again.Repositories[0]);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// (b) Commit-side pull invalidation through all FOUR entry points, as one compact theory.
+    /// The staged diff exits 1 (difference found) so <c>PushWithConflictRecoveryAsync</c> runs,
+    /// and the simulated initial-pull callback itself rewrites disk to B (A → B) as part of the
+    /// operation. Proof of at-entry invalidation: membership is already DENIED inside the
+    /// initial-pull callback BEFORE the callback writes B, stays denied after the operation, the
+    /// next load rereads disk (B), never stale A, and a later load returns a detached copy of the
+    /// repopulated cache. Distinct manager URLs keep each case's membership space isolated.
+    /// </summary>
+    [Theory]
+    [InlineData("CommitFileAsync")]
+    [InlineData("DeleteFileAsync")]
+    [InlineData("DeleteFilesAsync")]
+    [InlineData("CommitAllChangesAsync")]
+    public async Task CommitEntryPoints_WithStagedDiff_InvalidatesCacheAtRecoveryEntry(string entryPoint)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (manager, runner) = CreateInvalidationManager($"diff1-{entryPoint}", args =>
+            args[0] switch
+            {
+                // diff --cached --quiet: exit 1 = difference found → reaches the recovery helper.
+                "diff" => 1,
+                _ => 0,
+            });
+
+        var allowedDuringPull = true;
+        runner.OnCommand = (command, _) =>
+        {
+            if (command == "pull")
+            {
+                allowedDuringPull = manager.IsRepositoryAllowed(InvalUrlA);
+                return WriteConfigFileAsync(InvalConfigB);
+            }
+            return Task.CompletedTask;
+        };
+
+        await WriteConfigFileAsync(InvalConfigA);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+
+        await InvokeCommitEntryPointAsync(manager, entryPoint, ct);
+
+        // Command semantics: the diff exit 1 really reached the recovery path (pull + push ran).
+        Assert.Contains("diff --cached --quiet", runner.Commands);
+        Assert.Contains("pull", runner.Commands);
+        Assert.Contains("push", runner.Commands);
+
+        // At-entry invalidation: the cache was already empty when the initial pull ran.
+        Assert.False(allowedDuringPull,
+            "The cache was still populated when the initial pull ran — invalidation must precede it.");
+
+        // Membership denied while the cache is empty, then repopulated from disk (B).
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlA));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+        var loaded = await manager.LoadConfigAsync(ct);
+        Assert.Equal("2.0-B", loaded.Version);
+        Assert.Equal("repo-b", loaded.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlB));
+
+        // A later load returns a detached copy of the repopulated cache: a NEW object graph,
+        // never the first loaded instance, while all values remain equal.
+        var again = await manager.LoadConfigAsync(ct);
+        Assert.NotSame(loaded, again);
+        Assert.Equal(loaded.Version, again.Version);
+        Assert.Equal(loaded.IsConfigured, again.IsConfigured);
+        Assert.NotSame(loaded.Repositories, again.Repositories);
+        Assert.Equal(loaded.Repositories.Count, again.Repositories.Count);
+        Assert.NotSame(loaded.Repositories[0], again.Repositories[0]);
+        Assert.Equal(loaded.Repositories[0].Name, again.Repositories[0].Name);
+        Assert.Equal(loaded.Repositories[0].Url, again.Repositories[0].Url);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// (c) Representative failure vectors, each asserting the cache is invalidated after the
+    /// operation and the next <see cref="ConfigRepoManager.LoadConfigAsync"/> returns the known
+    /// valid disk content — never stale A. The disk content is always a VALID config written by
+    /// the test (or by the simulated pull/reset callback); conflicted YAML is never assumed
+    /// parseable.
+    /// </summary>
+    [Theory]
+    [InlineData("abortChangesDiskThenFetchFails")]
+    [InlineData("initialPullChangesDiskThenCallerCancellation")]
+    [InlineData("plainPullFailsThenRebaseSucceeds")]
+    [InlineData("rebaseFailsThenFinalResetSucceeds")]
+    [InlineData("pullSucceedsThenPushFails")]
+    public async Task FailureVectors_LeaveCacheInvalidated_NextLoadRereadsDisk(string vector)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        using var cts = new CancellationTokenSource();
+        var allowedDuringAbort = true;
+        var allowedDuringPull = true;
+
+        var (manager, runner) = CreateInvalidationManager($"vec-{vector}", args =>
+            vector switch
+            {
+                // Reset: abort succeeds (and rewrites the tree), fetch fails.
+                "abortChangesDiskThenFetchFails" => args[0] == "fetch" ? 1 : 0,
+                // Commit path: diff exit 1 reaches the recovery helper; the pull rewrites the
+                // file via the callback, then the caller cancels.
+                "initialPullChangesDiskThenCallerCancellation" => args[0] == "diff" ? 1 : 0,
+                // Plain pull fails (conflict); the rebase pull succeeds.
+                "plainPullFailsThenRebaseSucceeds" => args[0] switch
+                {
+                    "diff" => 1,
+                    "pull" when !args.Contains("--rebase") => 1,
+                    _ => 0,
+                },
+                // Both the plain pull AND the rebase pull fail; the final reset succeeds.
+                "rebaseFailsThenFinalResetSucceeds" => args[0] switch
+                {
+                    "diff" => 1,
+                    "pull" => 1,
+                    _ => 0,
+                },
+                // Everything succeeds until the final push.
+                "pullSucceedsThenPushFails" => args[0] switch
+                {
+                    "diff" => 1,
+                    "push" => 1,
+                    _ => 0,
+                },
+                _ => throw new InvalidOperationException($"Unknown vector '{vector}'."),
+            });
+
+        runner.OnCommand = async (command, token) =>
+        {
+            if (vector == "abortChangesDiskThenFetchFails" && command == "merge --abort")
+            {
+                // The abort is best-effort and may change the working tree — membership must
+                // already be denied at that point (invalidation precedes the abort).
+                allowedDuringAbort = manager.IsRepositoryAllowed(InvalUrlA);
+                await File.WriteAllTextAsync(configPath, InvalConfigC, CancellationToken.None);
+            }
+
+            if (vector == "initialPullChangesDiskThenCallerCancellation" && command == "pull")
+            {
+                allowedDuringPull = manager.IsRepositoryAllowed(InvalUrlA);
+                // The pull rewrites the file to C, then the caller cancels mid-operation.
+                await File.WriteAllTextAsync(configPath, InvalConfigC, CancellationToken.None);
+                cts.Cancel();
+                throw new OperationCanceledException(token);
+            }
+        };
+
+        await WriteConfigFileAsync(InvalConfigA);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+        // External edit the cache deliberately hides until invalidation.
+        await WriteConfigFileAsync(InvalConfigB);
+
+        switch (vector)
+        {
+            case "abortChangesDiskThenFetchFails":
+                await Assert.ThrowsAsync<InvalidOperationException>(() => manager.ResetToRemoteAsync(ct));
+                Assert.Contains("merge --abort", runner.Commands);
+                Assert.Contains("fetch origin", runner.Commands);
+                // The fetch failed, so the trailing reset never ran.
+                Assert.DoesNotContain("reset --hard origin/HEAD", runner.Commands);
+                Assert.False(allowedDuringAbort,
+                    "The cache was still populated when merge --abort ran.");
+                break;
+
+            case "initialPullChangesDiskThenCallerCancellation":
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                    () => manager.CommitFileAsync("hive-config.yaml", "invalidation probe", cts.Token));
+                Assert.Contains("pull", runner.Commands);
+                // Cancellation propagated WITHOUT recovery: no abort/reset/rebase/push afterwards.
+                Assert.DoesNotContain("merge --abort", runner.Commands);
+                Assert.DoesNotContain("reset --hard HEAD", runner.Commands);
+                Assert.DoesNotContain("pull --rebase", runner.Commands);
+                Assert.DoesNotContain("rebase --abort", runner.Commands);
+                Assert.DoesNotContain("push", runner.Commands);
+                Assert.False(allowedDuringPull,
+                    "The cache was still populated when the initial pull ran.");
+                break;
+
+            case "plainPullFailsThenRebaseSucceeds":
+                await manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct);
+                Assert.Contains("pull", runner.Commands);
+                Assert.Contains("merge --abort", runner.Commands);
+                Assert.Contains("reset --hard HEAD", runner.Commands);
+                Assert.Contains("pull --rebase", runner.Commands);
+                Assert.Contains("push", runner.Commands);
+                break;
+
+            case "rebaseFailsThenFinalResetSucceeds":
+                await manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct);
+                Assert.Contains("pull --rebase", runner.Commands);
+                Assert.Contains("rebase --abort", runner.Commands);
+                Assert.Contains("reset --hard HEAD", runner.Commands);
+                Assert.Contains("push", runner.Commands);
+                break;
+
+            case "pullSucceedsThenPushFails":
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct));
+                Assert.Contains("pull", runner.Commands);
+                Assert.Contains("push", runner.Commands);
+                Assert.DoesNotContain("merge --abort", runner.Commands);
+                break;
+        }
+
+        // In ALL vectors the cache is invalidated: membership denied while it is empty...
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlA));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlC));
+
+        // ...and the next load rereads disk, returning the known valid content there — never
+        // stale A. Vectors 1–2 rewrote disk to C mid-operation; the rest read the external B.
+        var (expectedVersion, expectedRepo, expectedUrl) = vector is "abortChangesDiskThenFetchFails"
+            or "initialPullChangesDiskThenCallerCancellation"
+            ? ("3.0-C", "repo-c", InvalUrlC)
+            : ("2.0-B", "repo-b", InvalUrlB);
+        var loaded = await manager.LoadConfigAsync(ct);
+        Assert.Equal(expectedVersion, loaded.Version);
+        Assert.Equal(expectedRepo, loaded.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed(expectedUrl));
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// (d) Retention on the no-diff path for all FOUR callers: the staged diff exits 0 so the
+    /// shared recovery helper (and its invalidation) is never entered — the push-only path (or,
+    /// for <see cref="ConfigRepoManager.CommitAllChangesAsync"/>, the early return) completes and
+    /// the cache RETAINS A, still hiding the externally changed B on disk. The failed-PushOnly
+    /// row proves retention also survives a push failure on that path.
+    /// </summary>
+    [Theory]
+    [InlineData("CommitFileAsync", 0)]
+    [InlineData("DeleteFileAsync", 0)]
+    [InlineData("DeleteFilesAsync", 0)]
+    [InlineData("CommitAllChangesAsync", 0)]
+    [InlineData("CommitFileAsync", 1)]
+    public async Task CommitEntryPoints_NoDiffPath_RetainsCache(
+        string entryPoint, int pushExitCode)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (manager, runner) = CreateInvalidationManager($"nodiff-{entryPoint}-{pushExitCode}", args =>
+            args[0] == "push" ? pushExitCode : 0);
+
+        await WriteConfigFileAsync(InvalConfigA);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+        await WriteConfigFileAsync(InvalConfigB);
+
+        if (pushExitCode == 0)
+            await InvokeCommitEntryPointAsync(manager, entryPoint, ct);
+        else
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct));
+
+        // No-diff semantics: the recovery helper never ran, so no pull ever happened.
+        Assert.DoesNotContain("pull", runner.Commands);
+        Assert.DoesNotContain("merge --abort", runner.Commands);
+        if (entryPoint != "CommitAllChangesAsync")
+            Assert.Contains("push", runner.Commands);
+
+        // RETENTION: the cache still serves A — membership unchanged — and a cache-hit load
+        // returns A even though disk holds the external B edit (the cache hides outside edits
+        // until an invalidation drops it).
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+        var cached = await manager.LoadConfigAsync(ct);
+        Assert.Equal("1.0-A", cached.Version);
+        Assert.Equal("repo-a", cached.Repositories[0].Name);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// (d) Pre-helper failure retention: a staging failure (<c>git add</c> exits 1) aborts
+    /// <see cref="ConfigRepoManager.CommitFileAsync"/> BEFORE the shared recovery helper is
+    /// entered — no pull, no invalidation — so the cache retains A and keeps hiding the external
+    /// B edit on disk.
+    /// </summary>
+    [Fact]
+    public async Task CommitFileAsync_PreHelperStagingFailure_RetainsCache()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (manager, runner) = CreateInvalidationManager("prehelper-add-fail", args =>
+            args[0] == "add" ? 1 : 0);
+
+        await WriteConfigFileAsync(InvalConfigA);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+        await WriteConfigFileAsync(InvalConfigB);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => manager.CommitFileAsync("hive-config.yaml", "invalidation probe", ct));
+
+        // The staging failure happened before the shared helper: no pull, no recovery commands.
+        Assert.DoesNotContain("pull", runner.Commands);
+        Assert.DoesNotContain("diff --cached --quiet", runner.Commands);
+
+        // RETENTION: the cache still serves A and hides the external B edit.
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+        Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+        var cached = await manager.LoadConfigAsync(ct);
+        Assert.Equal("1.0-A", cached.Version);
+        Assert.Equal("repo-a", cached.Repositories[0].Name);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// (e) Cancellation while <see cref="ConfigRepoManager.ResetToRemoteAsync"/> waits behind a
+    /// held sync (the existing gated real <see cref="ConfigRepoManager.SyncRepoAsync"/> seam).
+    /// The cancelled reset settles while the sync still holds the lock — asserted MID-WAIT,
+    /// before the sync's own invalidation: the cache is unchanged (same instance, same state)
+    /// and membership still serves A. After the gate is released the sync's own invalidation
+    /// applies. All gates are released in <c>finally</c> and all tasks awaited.
+    /// </summary>
+    [Fact]
+    public async Task ResetToRemoteAsync_CancelledWhileWaitingForHeldSync_LeavesCacheUntouched()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await WriteConfigFileAsync(InvalConfigA);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, InvalConfigB);
+        var gitLock = GetGitLock(manager);
+
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        Task? pendingReset = null;
+        try
+        {
+            // The pull runs INSIDE the semaphore region: entering it proves the sync owns the lock.
+            await AwaitGateAsync(pullEntered.Task);
+
+            var expectedCache = CaptureCacheState(manager);
+
+            using var resetCts = new CancellationTokenSource();
+            pendingReset = manager.ResetToRemoteAsync(resetCts.Token);
+            await resetCts.CancelAsync();
+
+            // The reset settles (faults) while the sync still holds the lock and the pull gate
+            // is still closed — no timing involved: the gate holds the sync in place.
+            var fault = await CaptureFaultAsync(pendingReset);
+
+            // ── MID-WAIT invariants (gate closed, sync still holds the permit) ────────────
+            Assert.Equal(0, GetGitLock(manager).CurrentCount);
+            AssertCacheUnchanged(
+                expectedCache, manager,
+                "A cancelled reset waiting behind a held sync must not invalidate the cache.");
+            Assert.True(manager.IsRepositoryAllowed(InvalUrlA));
+            Assert.False(manager.IsRepositoryAllowed(InvalUrlB));
+            Assert.True(fault is not null, "The cancelled reset COMPLETED instead of failing at acquisition.");
+            Assert.IsAssignableFrom<OperationCanceledException>(fault);
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+
+            // ── Recovery: the sync's own invalidation applies ──────────────────────────────
+            Assert.Equal(1, GetGitLock(manager).CurrentCount);
+            Assert.False(manager.IsRepositoryAllowed(InvalUrlA));
+            var loaded = await manager.LoadConfigAsync(ct);
+            Assert.Equal("2.0-B", loaded.Version);
+            Assert.Equal("repo-b", loaded.Repositories[0].Name);
+            Assert.True(manager.IsRepositoryAllowed(InvalUrlB));
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+            await DrainPendingAsync(pendingReset);
+        }
+    }
+
     // ── Git helper for tests ──────────────────────────────────────────────────
 
     private static SemaphoreSlim GetGitLock(ConfigRepoManager manager)

@@ -471,7 +471,8 @@ public class ConfigRepoManager
     /// Compares normalized URLs (trimmed, case-insensitive, trailing-slash-insensitive).
     /// <para>
     /// The cache is read into ONE local reference — a mid-method invalidation by
-    /// <see cref="SyncRepoAsync"/> cannot straddle the null check and the membership scan.
+    /// <see cref="SyncRepoAsync"/>, <see cref="ResetToRemoteAsync"/> or the push recovery path
+    /// cannot straddle the null check and the membership scan.
     /// Because the cache never aliases a caller-owned graph (all publications are detached
     /// copies), mutating a previously returned config cannot silently change cached membership.
     /// </para>
@@ -641,12 +642,26 @@ public class ConfigRepoManager
     /// </param>
     /// <param name="ct">Cancellation token.</param>
     /// <remarks>
+    /// <b>Cache invalidation.</b> <c>_cachedConfig</c> is cleared at method ENTRY, before the
+    /// initial pull: the pull may rewrite <c>hive-config.yaml</c> (e.g. fast-forward to a
+    /// remote change), so every subsequent <see cref="LoadConfigAsync"/> must reread disk.
+    /// The invalidation is sticky — it stays null on success, on partial recovery failure,
+    /// and on caller cancellation after entry; the old cached graph is never restored. All
+    /// callers (<see cref="CommitFileAsync"/>, <see cref="DeleteFileAsync"/>,
+    /// <see cref="DeleteFilesAsync"/>, <see cref="CommitAllChangesAsync"/>) already hold
+    /// <c>_gitLock</c>, so the field write is synchronized without any new locking.
+    /// </remarks>
+    /// <remarks>
     /// Neither catch may classify a CALLER cancellation as a merge/rebase conflict: an
     /// <see cref="OperationCanceledException"/> raised while <paramref name="ct"/> is cancelled
     /// propagates immediately, so no recovery command and no push runs after it.
     /// </remarks>
     private async Task PushWithConflictRecoveryAsync(string? credential, CancellationToken ct)
     {
+        // The pull below can rewrite hive-config.yaml (or leave the tree changed on a
+        // recovery path). Invalidate up front and keep it invalidated — even a failure that
+        // happens not to change YAML must never resurrect the stale cached graph.
+        _cachedConfig = null;
         try
         {
             await RunGitAsync(_localPath, ["pull"], credential, ct);
@@ -680,12 +695,24 @@ public class ConfigRepoManager
     /// <summary>
     /// Resets the local config repo clone to match the remote, discarding any local changes.
     /// Used for recovery when the repo is stuck in a conflicted state.
+    /// <para>
+    /// <b>Cache invalidation.</b> <c>_cachedConfig</c> is cleared FIRST — before the merge
+    /// abort — under the manager's <c>_gitLock</c>: even the best-effort abort may alter the
+    /// working tree before any later credential/fetch/reset step runs, so every subsequent
+    /// <see cref="LoadConfigAsync"/> must reread disk. The invalidation is sticky: a partial
+    /// failure or caller cancellation after this point never restores the old cached graph.
+    /// A failed or cancelled lock acquisition touches nothing and releases nothing.
+    /// </para>
     /// </summary>
     public async Task ResetToRemoteAsync(CancellationToken ct = default)
     {
         await _gitLock.WaitAsync(ct);
         try
         {
+            // Reset rewrites hive-config.yaml (or leaves the working tree changed). Clear the
+            // cache BEFORE the abort: even the abort may change the working tree, so any
+            // later failure must still leave the stale graph invalidated (never restored).
+            _cachedConfig = null;
             // merge --abort is local and best-effort; the fetch is the first network command,
             // so the origin refresh runs immediately before it.
             await TryAbortMergeAsync(_localPath, credential: null, ct);
