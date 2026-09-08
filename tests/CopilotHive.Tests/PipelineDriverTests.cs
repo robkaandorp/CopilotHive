@@ -1351,3 +1351,607 @@ public sealed class PipelineDriverMergeFailurePersistenceTests
         public BrainStats? GetStats() => null;
     }
 }
+
+/// <summary>
+/// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/>'s failed-worker early-exit
+/// branch preserves the FULL raw crash diagnostic on the matching phase entry, marks the
+/// execution failed (<see cref="PhaseOutcome.Fail"/> + <c>CompletedAt</c>), and keeps the
+/// existing terminal-failure behavior (single <c>"Worker failed: ..."</c> summary update,
+/// no retry/dispatch) — before <see cref="GoalLifecycleService.MarkGoalFailedAsync"/>
+/// finalizes the iteration.
+/// </summary>
+public sealed class PipelineDriverFailedWorkerTests
+{
+    // ── Test 1: end-to-end raw-diagnostic retention through the SQLite chain ──
+
+    /// <summary>
+    /// Real admitted-completion → lifecycle finalization → GoalStore.GetIterationsAsync chain:
+    /// the multiline diagnostic (evidence beyond chars 300 AND 4,000, distinguishing content at
+    /// the very end) must survive EXACTLY in the persisted phase report, with a different
+    /// structured Metrics.Summary proving raw diagnostics win on the failed path.
+    /// </summary>
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenWorkerFails_PersistsFullRawDiagnosticToGoalStore()
+    {
+        // Arrange: real SQLite-backed goal store with the goal registered as a source.
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-failed-worker-{Guid.NewGuid():N}",
+            Description = "Retain failed-worker diagnostic evidence",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        // Register the goal in the source map first (Pending, as GoalDispatchService would see
+        // it), then mirror GoalDispatchService's InProgress write so the later terminal Failed
+        // update transitions the stored status correctly.
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken))?.Id);
+        await goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        // The phase entry the failed completion must land on (StartedAt must be preserved).
+        var startedAt = DateTime.UtcNow.AddMinutes(-5);
+        var testingEntry = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = startedAt,
+        };
+        pipeline.PhaseLog.Add(testingEntry);
+
+        var taskId = $"task-failed-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        Assert.True(pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, GoalPhase.Testing, 1),
+            attempt: 1,
+            WorkSlotState.Pending));
+
+        var logger = new CapturingLogger<GoalDispatcher>();
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: new FailedWorkerDispatcherFakeBrain(),
+            config: BuildFailedWorkerDispatcherConfig());
+
+        // Multiline diagnostic with distinctive content past chars 300 AND 4,000 and at the very
+        // end — plus a DIFFERENT structured summary proving raw diagnostics win on this path.
+        const string crashHead = "HEAD: unhandled exception in worker\r\n";
+        const string crashBeyond4000 = "\nSTACK-EVIDENCE-BEYOND-4000: mutation detail survives only if output is stored verbatim.\n";
+        const string crashTail = "\nTAIL-EVIDENCE-AT-END: exit code 137 (OOMKilled)";
+        var diagnostic = crashHead + new string('X', 4_500 - crashHead.Length) + crashBeyond4000
+            + new string('Y', 4_500) + crashTail;
+        Assert.True(diagnostic.Length > 300);
+        Assert.True(diagnostic.Length > 4_000);
+        Assert.Contains("STACK-EVIDENCE-BEYOND-4000", diagnostic);
+        Assert.EndsWith(crashTail, diagnostic);
+        const string structuredSummary = "STRUCTURED-SUMMARY-THAT-MUST-NOT-WIN: reviewer said all fine.";
+
+        // Act
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = structuredSummary },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: goal terminalized as Failed by the existing lifecycle path. The lifecycle
+        // persists through the store (which the dispatcher's goal instance mirrors lazily), so
+        // assert on the re-read DB state.
+        var persistedGoal = await goalStore.GetGoalAsync(goal.Id, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+        Assert.StartsWith("Worker failed: ", persistedGoal.FailureReason);
+
+        // Assert: phase entry got the EXACT raw diagnostic (not the summary, not truncated).
+        Assert.Equal(PhaseOutcome.Fail, testingEntry.Result);
+        Assert.Equal(diagnostic, testingEntry.WorkerOutput);
+        Assert.NotEqual(structuredSummary, testingEntry.WorkerOutput);
+        Assert.Equal(startedAt, testingEntry.StartedAt);
+        Assert.Equal(GoalPhase.Testing, testingEntry.Name);
+        Assert.Equal(1, testingEntry.Iteration);
+        Assert.Equal(1, testingEntry.Occurrence);
+        Assert.NotNull(testingEntry.CompletedAt);
+
+        // Assert: the failed reason is exactly "Worker failed: " + the 300-char preview.
+        var expectedPreview = diagnostic.Length > 300 ? diagnostic[..300] + "..." : diagnostic;
+        Assert.Equal($"Worker failed: {expectedPreview}", persistedGoal.FailureReason);
+
+        // Assert through the real persistence chain: GetIterationsAsync returns the terminal
+        // summary from FinalizeGoalAsync with the phase report preserved EXACTLY.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(goal.Id, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        var persistedPhase = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Testing);
+        Assert.Equal(PhaseOutcome.Fail, persistedPhase.Result);
+        Assert.Equal(diagnostic, persistedPhase.WorkerOutput); // EXACT raw-output equality
+        Assert.Equal(diagnostic, persisted.PhaseOutputs["tester-1"]);
+        Assert.Equal(diagnostic, persisted.PhaseOutputs["tester-1-1"]);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    // ── Test 2: selection boundaries ─────────────────────────────────────
+
+    [Fact]
+    public async Task FailedWorker_LastMatchingOccurrenceWins_EarlierOccurrenceAndOtherIterationsUntouched()
+    {
+        var (driver, pipeline, _, goal) = CreateFailedWorkerDriver(GoalPhase.Coding);
+
+        // Older iteration's entry (must stay untouched).
+        var olderIterationEntry = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = 0,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            CompletedAt = DateTime.UtcNow.AddMinutes(-9),
+            WorkerOutput = "older iteration output",
+        };
+        pipeline.PhaseLog.Add(olderIterationEntry);
+
+        // First occurrence of the current iteration (must stay untouched).
+        var firstOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            CompletedAt = DateTime.UtcNow.AddMinutes(-1),
+            WorkerOutput = "first occurrence output",
+        };
+        pipeline.PhaseLog.Add(firstOccurrence);
+
+        // LAST occurrence of the current iteration (the target).
+        var lastOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 2,
+            StartedAt = DateTime.UtcNow.AddSeconds(-30),
+        };
+        pipeline.PhaseLog.Add(lastOccurrence);
+
+        // Unrelated trailing phase entry (must stay untouched).
+        var unrelatedTrailing = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddSeconds(-20),
+            WorkerOutput = "unrelated trailing output",
+        };
+        pipeline.PhaseLog.Add(unrelatedTrailing);
+
+        const string diagnostic = "crash in second coding attempt";
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-failed-occ",
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+        }, TestContext.Current.CancellationToken);
+
+        // The LAST matching occurrence was mutated.
+        Assert.Equal(PhaseOutcome.Fail, lastOccurrence.Result);
+        Assert.Equal(diagnostic, lastOccurrence.WorkerOutput);
+        Assert.NotNull(lastOccurrence.CompletedAt);
+
+        // Older iteration, earlier occurrence, and unrelated trailing entry untouched.
+        Assert.Equal(PhaseOutcome.Pass, olderIterationEntry.Result);
+        Assert.Equal("older iteration output", olderIterationEntry.WorkerOutput);
+        Assert.Equal(PhaseOutcome.Pass, firstOccurrence.Result);
+        Assert.Equal("first occurrence output", firstOccurrence.WorkerOutput);
+        Assert.NotNull(firstOccurrence.CompletedAt);
+        Assert.Equal(PhaseOutcome.Pass, unrelatedTrailing.Result);
+        Assert.Equal("unrelated trailing output", unrelatedTrailing.WorkerOutput);
+
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+    }
+
+    [Fact]
+    public async Task FailedWorker_EmptyDiagnostic_StoresEmptyStringAndFails()
+    {
+        var (driver, pipeline, _, goal) = CreateFailedWorkerDriver(GoalPhase.Review);
+        var reviewEntry = new PhaseResult
+        {
+            Name = GoalPhase.Review,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        };
+        pipeline.PhaseLog.Add(reviewEntry);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-failed-empty",
+            Status = TaskOutcome.Failed,
+            Output = "",
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PhaseOutcome.Fail, reviewEntry.Result);
+        Assert.Equal("", reviewEntry.WorkerOutput);
+        Assert.NotNull(reviewEntry.CompletedAt);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+    }
+
+    [Fact]
+    public async Task FailedWorker_NoMatchingEntry_PreservesTerminalBehaviorWithoutSyntheticEntry()
+    {
+        var (driver, pipeline, _, goal) = CreateFailedWorkerDriver(GoalPhase.Coding);
+
+        // Only an unrelated-phase entry exists — no Coding entry for the current iteration.
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        });
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-failed-nomatch",
+            Status = TaskOutcome.Failed,
+            Output = "crash with no matching entry",
+        }, TestContext.Current.CancellationToken);
+
+        // NO synthetic phase entry was created — count unchanged.
+        Assert.Equal(phaseLogCountBefore, pipeline.PhaseLog.Count);
+
+        // Existing terminal-failure behavior preserved exactly.
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal("Worker failed: crash with no matching entry", goal.FailureReason);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    // ── Test 3: branch-preservation proof (one terminal update, no retry/dispatch) ──
+
+    [Fact]
+    public async Task FailedWorker_ExactlyOneTerminalStatusUpdate_NoRetryOrDispatch()
+    {
+        var dispatchCalls = 0;
+        var (driver, pipeline, goalStore, goal) = CreateFailedWorkerDriver(
+            GoalPhase.Testing,
+            dispatchToRole: (_, _, _, _) =>
+            {
+                dispatchCalls++;
+                return Task.CompletedTask;
+            });
+        var testingEntry = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        };
+        pipeline.PhaseLog.Add(testingEntry);
+
+        var diagnostic = "fatal: " + new string('Z', 400);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-failed-branch",
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "misleading summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // Exactly ONE status update — the terminal Failed one. An upserting goal store could
+        // hide duplicate calls, so the recording store counts them.
+        var update = Assert.Single(goalStore.StatusUpdates);
+        Assert.Equal(GoalStatus.Failed, update.Status);
+
+        // The failure reason still uses the "Worker failed: " + 300-char preview format.
+        var expectedFailureReason = $"Worker failed: {diagnostic[..300]}...";
+        Assert.Equal(expectedFailureReason, update.Metadata?.FailureReason);
+
+        // No retry/dispatch happened.
+        Assert.Equal(0, dispatchCalls);
+
+        // No new phase entry, no new iteration, no retry consumption.
+        Assert.Single(pipeline.PhaseLog);
+        Assert.Equal(1, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        // Only the terminal summary from FinalizeGoalAsync exists — the driver added none.
+        var summary = Assert.Single(pipeline.CompletedIterationSummaries);
+        Assert.Equal(PhaseOutcome.Fail,
+            Assert.Single(summary.Phases, p => p.Name == GoalPhase.Testing).Result);
+        Assert.Equal(diagnostic, Assert.Single(summary.Phases, p => p.Name == GoalPhase.Testing).WorkerOutput);
+
+        Assert.Equal(PhaseOutcome.Fail, testingEntry.Result);
+        Assert.Equal(diagnostic, testingEntry.WorkerOutput);
+        Assert.NotNull(testingEntry.CompletedAt);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    private static HiveConfigFile BuildFailedWorkerDispatcherConfig() => new()
+    {
+        Repositories =
+        [
+            new RepositoryConfig
+            {
+                Name = "CopilotHive",
+                Url = "https://example.invalid/CopilotHive.git",
+                DefaultBranch = "main",
+            },
+        ],
+        Workers =
+        {
+            ["coder"] = new WorkerConfig { Model = "test-coder-model" },
+            ["tester"] = new WorkerConfig { Model = "test-tester-model" },
+            ["reviewer"] = new WorkerConfig { Model = "test-reviewer-model" },
+            ["docwriter"] = new WorkerConfig { Model = "test-docwriter-model" },
+            ["improver"] = new WorkerConfig { Model = "test-improver-model" },
+        },
+    };
+
+    private static (PipelineDriver Driver, GoalPipeline Pipeline, CountingGoalStore Store, Goal Goal)
+        CreateFailedWorkerDriver(
+            GoalPhase phase,
+            Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task>? dispatchToRole = null)
+    {
+        var goal = new Goal
+        {
+            Id = $"goal-failed-{Guid.NewGuid():N}",
+            Description = "Failed-worker evidence-retention test",
+            RepositoryNames = ["CopilotHive"],
+        };
+        var goalStore = new CountingGoalStore(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        pipeline.SetPlan(IterationPlan.Default());
+        pipeline.AdvanceTo(phase);
+
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var driver = new PipelineDriver(
+            brain: new FailedWorkerFakeBrain(),
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: dispatchToRole ?? ((_, _, _, _) => Task.CompletedTask),
+            resolvePrompt: (_, _, _, _) => Task.FromResult("prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return (driver, pipeline, goalStore, goal);
+    }
+
+    /// <summary>
+    /// In-memory <see cref="IGoalStore"/> that records every status update so tests can prove
+    /// EXACTLY ONE terminal update happened (a single row alone is insufficient because an
+    /// upsert would hide duplicate calls).
+    /// </summary>
+    private sealed class CountingGoalStore(Goal goal) : IGoalStore
+    {
+        internal List<(GoalStatus Status, GoalUpdateMetadata? Metadata)> StatusUpdates { get; } = [];
+
+        public string Name => "failed-worker-counting-store";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>(goal.Status == GoalStatus.Pending ? [goal] : []);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+        {
+            StatusUpdates.Add((status, metadata));
+            goal.Status = status;
+            if (metadata?.FailureReason is not null)
+                goal.FailureReason = metadata.FailureReason;
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+            Task.FromResult(goalId == goal.Id ? goal : null);
+
+        public Task<Goal> CreateGoalAsync(Goal goalToCreate, CancellationToken ct = default) => Task.FromResult(goalToCreate);
+
+        public Task UpdateGoalAsync(Goal goalToUpdate, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => Task.FromResult(false);
+
+        public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
+            string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+        public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+            Task.FromResult(release);
+
+        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+            Task.FromResult<Release?>(null);
+
+        public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Release>>([]);
+
+        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult(false);
+
+        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([]);
+
+        public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(
+            string goalId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+        public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
+            int? limit = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
+    }
+
+    /// <summary>Minimal brain stub that returns the default plan.</summary>
+    private sealed class FailedWorkerFakeBrain : IDistributedBrain
+    {
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(
+            GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(
+            string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public bool GoalSessionExists(string goalId) => false;
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+        public BrainStats? GetStats() => null;
+    }
+
+    /// <summary>
+    /// In-memory goal source that records status updates onto the shared goal instance so
+    /// tests can observe the lifecycle's terminal write.
+    /// </summary>
+    private sealed class FailedWorkerGoalSource(
+        Goal goal,
+        Action<GoalStatus, GoalUpdateMetadata?> onStatusUpdate) : IGoalSource
+    {
+        public string Name => "failed-worker-goal-source";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+        {
+            onStatusUpdate(status, metadata);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>Minimal brain stub for the failed-worker end-to-end dispatcher test.</summary>
+    private sealed class FailedWorkerDispatcherFakeBrain : IDistributedBrain
+    {
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<PlanResult> PlanIterationAsync(
+            GoalPipeline pipeline, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PlanResult.Success(IterationPlan.Default()));
+
+        public Task<PromptResult> CraftPromptAsync(
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
+            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+        public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task EnsureBrainRepoAsync(
+            string repoName, string repoUrl, string defaultBranch, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectOrchestratorInstructionsAsync(string instructions, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task InjectSystemNoteAsync(GoalPipeline pipeline, string note, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task<BrainResponse> AskQuestionAsync(
+            string goalId, int iteration, string phase, string workerRole, string question, CancellationToken ct = default) =>
+            Task.FromResult(BrainResponse.Answer("proceed"));
+
+        public Task ResetSessionAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task ForkSessionForGoalAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task DeleteGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task RegisterExistingGoalSessionAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public bool GoalSessionExists(string goalId) => false;
+
+        public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
+            Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
+
+        public BrainStats? GetStats() => null;
+    }
+}

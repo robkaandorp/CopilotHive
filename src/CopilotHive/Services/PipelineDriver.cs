@@ -138,10 +138,33 @@ internal sealed class PipelineDriver
     {
         // Early-exit guard: a crashed/failed worker should not continue through the pipeline.
         // Recording the crash output as normal output would pollute iteration data.
+        // Before terminal finalization, preserve the full raw diagnostic on the matching phase
+        // entry and record the failed execution — mirroring the no-op retry path's bookkeeping
+        // (Result = Fail, CompletedAt, WorkerOutput) but with the verbatim diagnostic instead of
+        // a canned string. The raw failure diagnostic is authoritative on this path even when
+        // result.Metrics.Summary contains different text: a crashed task's metrics/report
+        // verdicts must never be consulted or treated as a successful result. MarkGoalFailedAsync
+        // remains the single owner of the terminal summary/status write.
         if (result.Status == TaskOutcome.Failed)
         {
             var truncatedOutput = result.Output.Length > 300 ? result.Output[..300] + "..." : result.Output;
             _logger.LogError("Worker for goal {GoalId} failed with output: {Output}", pipeline.GoalId, result.Output);
+
+            // Select the LAST entry matching the pre-terminal phase and current iteration —
+            // same idiom as the no-op retry path. The pipeline phase is still the phase that
+            // was executing (no Failed advance has happened yet). The null guard preserves the
+            // existing terminal-failure behavior when no entry matches (no synthetic entry).
+            var failedEntry = pipeline.PhaseLog
+                .LastOrDefault(e => e.Name == pipeline.Phase && e.Iteration == pipeline.Iteration);
+            if (failedEntry is not null)
+            {
+                // Store the raw diagnostic verbatim — no cap, no trimming, no prefix, and never
+                // metrics-derived text. StartedAt/Name/Iteration/Occurrence/prompts stay untouched.
+                failedEntry.WorkerOutput = result.Output;
+                failedEntry.Result = PhaseOutcome.Fail;
+                failedEntry.CompletedAt = DateTime.UtcNow;
+            }
+
             await _lifecycleService.MarkGoalFailedAsync(pipeline, $"Worker failed: {truncatedOutput}", ct);
             return;
         }
