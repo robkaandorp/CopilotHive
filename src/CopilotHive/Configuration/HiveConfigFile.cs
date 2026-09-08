@@ -467,7 +467,8 @@ public sealed class HiveConfigFile
     /// <summary>
     /// Atomically adds a model to <see cref="ModelsConfig.AvailableModels"/>. Returns
     /// <c>false</c> when a case-insensitive duplicate of <paramref name="request"/>'s name
-    /// already exists; the catalog is left unchanged in that case.
+    /// already exists among the non-null entries; the catalog is left unchanged in that case.
+    /// Null list elements (preserved placeholders) never match and are left untouched.
     /// </summary>
     /// <param name="request">The model to add. <see cref="AvailableModelRequest.Name"/> is the
     /// stored name; the reasoning effort is unset for available models.</param>
@@ -479,7 +480,7 @@ public sealed class HiveConfigFile
             _models ??= new ModelsConfig();
             _models.AvailableModels ??= new List<ModelEntry>();
 
-            if (_models.AvailableModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+            if (_models.AvailableModels.Any(m => m is not null && string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
                 return false;
 
             _models.AvailableModels.Add(new ModelEntry
@@ -496,9 +497,10 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Atomically updates the FIRST case-insensitive match of <paramref name="name"/> in
-    /// <see cref="ModelsConfig.AvailableModels"/>. The entry's existing
+    /// <see cref="ModelsConfig.AvailableModels"/> among the non-null entries. The entry's existing
     /// <see cref="ModelEntry.ReasoningEffort"/> is preserved. <see cref="AvailableModelRequest.Name"/>
     /// is ignored — the <paramref name="name"/> argument identifies the entry (no rename behavior).
+    /// Null list elements (preserved placeholders) never match.
     /// </summary>
     /// <param name="name">Route/name of the entry to update.</param>
     /// <param name="request">The new context window, description and vision flag.</param>
@@ -508,7 +510,7 @@ public sealed class HiveConfigFile
         lock (_catalogLock)
         {
             var entry = _models?.AvailableModels?.FirstOrDefault(
-                m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+                m => m is not null && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
 
@@ -521,7 +523,8 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Atomically removes the FIRST case-insensitive match of <paramref name="name"/> from
-    /// <see cref="ModelsConfig.AvailableModels"/>.
+    /// <see cref="ModelsConfig.AvailableModels"/> among the non-null entries.
+    /// Null list elements (preserved placeholders) never match and are never removed.
     /// </summary>
     /// <param name="name">Route/name of the entry to remove.</param>
     /// <returns><c>true</c> when the entry was found and removed; <c>false</c> when missing.</returns>
@@ -533,7 +536,7 @@ public sealed class HiveConfigFile
             if (list is null)
                 return false;
 
-            var entry = list.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            var entry = list.FirstOrDefault(m => m is not null && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
 
@@ -544,7 +547,8 @@ public sealed class HiveConfigFile
     /// <summary>
     /// Atomically adds a model to <see cref="ModelsConfig.SubAgentModels"/>. Returns
     /// <c>false</c> when a case-insensitive duplicate of <paramref name="request"/>'s name
-    /// already exists; the catalog is left unchanged in that case.
+    /// already exists among the non-null entries; the catalog is left unchanged in that case.
+    /// Null list elements (preserved placeholders) never match and are left untouched.
     /// </summary>
     /// <param name="request">The model to add. <see cref="SubAgentModelRequest.Name"/> is the
     /// stored name; the reasoning effort is formatted to its canonical wire form.</param>
@@ -556,7 +560,7 @@ public sealed class HiveConfigFile
             _models ??= new ModelsConfig();
             _models.SubAgentModels ??= new List<ModelEntry>();
 
-            if (_models.SubAgentModels.Any(m => string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
+            if (_models.SubAgentModels.Any(m => m is not null && string.Equals(m.Name, request.Name, StringComparison.OrdinalIgnoreCase)))
                 return false;
 
             _models.SubAgentModels.Add(new ModelEntry
@@ -573,8 +577,10 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Atomically updates the FIRST case-insensitive match of <paramref name="name"/> in
-    /// <see cref="ModelsConfig.SubAgentModels"/>. <see cref="SubAgentModelRequest.Name"/> is
+    /// <see cref="ModelsConfig.SubAgentModels"/> among the non-null entries.
+    /// <see cref="SubAgentModelRequest.Name"/> is
     /// ignored — the <paramref name="name"/> argument identifies the entry (no rename behavior).
+    /// Null list elements (preserved placeholders) never match.
     /// </summary>
     /// <param name="name">Route/name of the entry to update.</param>
     /// <param name="request">The new context window, reasoning effort, description and vision flag.</param>
@@ -584,7 +590,7 @@ public sealed class HiveConfigFile
         lock (_catalogLock)
         {
             var entry = _models?.SubAgentModels?.FirstOrDefault(
-                m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+                m => m is not null && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
 
@@ -598,7 +604,8 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Atomically removes the FIRST case-insensitive match of <paramref name="name"/> from
-    /// <see cref="ModelsConfig.SubAgentModels"/>.
+    /// <see cref="ModelsConfig.SubAgentModels"/> among the non-null entries.
+    /// Null list elements (preserved placeholders) never match and are never removed.
     /// </summary>
     /// <param name="name">Route/name of the entry to remove.</param>
     /// <returns><c>true</c> when the entry was found and removed; <c>false</c> when missing.</returns>
@@ -610,7 +617,7 @@ public sealed class HiveConfigFile
             if (list is null)
                 return false;
 
-            var entry = list.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            var entry = list.FirstOrDefault(m => m is not null && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
                 return false;
 
@@ -620,8 +627,9 @@ public sealed class HiveConfigFile
 
     /// <summary>
     /// Atomically applies per-sub-agent-model reasoning efforts. Matching is case-insensitive
-    /// on the entry name; a <c>null</c> value is a no-op for that entry; unknown names are
-    /// ignored. The method does NOT validate case-insensitive duplicate keys — callers must
+    /// on the entry name among the non-null entries; a <c>null</c> value is a no-op for that
+    /// entry; unknown names are ignored. Null list elements (preserved placeholders) never
+    /// match. The method does NOT validate case-insensitive duplicate keys — callers must
     /// reject those during request validation, mirroring the current
     /// <see cref="ConfigModelService.SaveModelConfigAsync"/> contract for identical inputs.
     /// </summary>
@@ -635,6 +643,8 @@ public sealed class HiveConfigFile
 
             foreach (var entry in subAgentModels)
             {
+                if (entry is null)
+                    continue;
                 if (!TryGetEffortIgnoreCase(efforts, entry.Name, out var value) || value is null)
                     continue;
                 entry.ReasoningEffort = ReasoningEffortConverter.Format(value);

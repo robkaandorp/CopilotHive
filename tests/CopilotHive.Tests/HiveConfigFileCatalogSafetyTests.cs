@@ -2389,4 +2389,546 @@ public sealed class HiveConfigFileCatalogSafetyTests
             "Exceptions under concurrency: " + string.Join(" | ", exceptions.Select(e => e.GetType().Name + ": " + e.Message)));
         Assert.True(failures.IsEmpty, string.Join(Environment.NewLine, failures.Take(3)));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Null-placeholder guards: deterministic sequential regression matrix
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Seeds a fixture through a WHOLE <see cref="HiveConfigFile.Models"/> assignment so null
+    /// entries, duplicates and raw payloads actually reach owner storage (the setter deep-copies
+    /// but preserves null list elements). <paramref name="catalogIsAvailable"/> selects which of
+    /// the two catalogs carries the fixture; the other stays null.
+    /// </summary>
+    private static HiveConfigFile SeedCatalogFixture(
+        bool catalogIsAvailable, IReadOnlyList<ModelEntry?> entries)
+    {
+        var config = new HiveConfigFile();
+        var models = new ModelsConfig();
+        var list = new List<ModelEntry>();
+        foreach (var entry in entries)
+            list.Add(entry!);   // null placeholders intentionally stored as null elements
+        if (catalogIsAvailable)
+            models.AvailableModels = list;
+        else
+            models.SubAgentModels = list;
+        config.Models = models;
+        return config;
+    }
+
+    private static IReadOnlyList<ModelEntry>? SnapshotOf(HiveConfigFile config, bool catalogIsAvailable) =>
+        catalogIsAvailable
+            ? config.GetAvailableModelsSnapshot()
+            : config.GetSubAgentModelsSnapshot();
+
+    /// <summary>
+    /// Asserts ONE slot of a fresh authoritative snapshot. A null <paramref name="expected"/>
+    /// uses an explicit <see cref="Assert.Null"/> — tuple projections conflate null placeholders
+    /// with non-null all-null-field entries, so null positions must be asserted directly.
+    /// </summary>
+    private static void AssertSlot(IReadOnlyList<ModelEntry>? snapshot, int index, ModelEntry? expected)
+    {
+        Assert.NotNull(snapshot);
+        var actual = snapshot![index];
+        if (expected is null)
+            Assert.Null(actual);
+        else
+            Assert.Equal(TupleOf(expected), TupleOf(actual));
+    }
+
+    // ── Distinguishable fixture entries (shared by the theory below) ────────
+
+    /// <summary>First match "Target": distinct metadata; raw reasoning for available updates.</summary>
+    private static ModelEntry FirstTarget(bool catalogIsAvailable) => MakeEntry(
+        "Target", 1000, catalogIsAvailable ? " raw-high " : "low", "first-target", true);
+
+    /// <summary>
+    /// Second case-insensitive duplicate "target": distinct metadata.
+    /// </summary>
+    private static ModelEntry SecondTarget(bool catalogIsAvailable) => MakeEntry(
+        "target", 2000, catalogIsAvailable ? "raw-low" : "high", "second-target", false);
+
+    /// <summary>
+    /// A whitespace-bearing name whose TRIMMED form ("target") is distinct from the stored raw
+    /// form: proves the CRUD predicates match ordinal-ignore-case WITHOUT trimming. Metadata is
+    /// distinct from <see cref="FirstTarget"/>/<see cref="SecondTarget"/>.
+    /// </summary>
+    private static ModelEntry WhitespaceTarget(bool catalogIsAvailable) => MakeEntry(
+        " target ", 1111, catalogIsAvailable ? " ws-raw " : "low", "ws-target", true);
+
+    /// <summary>
+    /// A NON-NULL entry whose <see cref="ModelEntry.Name"/> is null: retained as a real entry;
+    /// valid-name operations must never match it.
+    /// </summary>
+    private static ModelEntry NullNameEntry() => new()
+    {
+        Name = null!,
+        ContextWindow = 3000,
+        ReasoningEffort = "raw-null-name",
+        Description = "null-name-entry",
+        SupportsVision = null
+    };
+
+    private static ModelEntry[] BaseFixture(bool catalogIsAvailable) =>
+    [
+        null!,
+        FirstTarget(catalogIsAvailable),
+        null!,
+        SecondTarget(catalogIsAvailable),
+        NullNameEntry(),
+    ];
+
+    /// <summary>
+    /// Deterministic sequential regression matrix for the six catalog CRUD APIs against
+    /// null placeholders, seeded via a whole <see cref="HiveConfigFile.Models"/> assignment
+    /// (so null entries, duplicates and raw payloads actually reach owner storage). Each
+    /// operation uses a FRESH fixture. For the catalog <c>[null, Target, null, target]</c>
+    /// (plus a non-null null-Name entry and, for the add case, a trailing null slot) with
+    /// distinguishable metadata per entry:
+    /// <list type="bullet">
+    /// <item>duplicate add fails and the entire list is unchanged;</item>
+    /// <item>add of an absent name appends after the existing slots (including trailing null slots);</item>
+    /// <item>update using a case-variant name changes only the FIRST matching non-null entry;</item>
+    /// <item>remove deletes only that match and preserves the remaining null slots and order;</item>
+    /// <item>absent-name update/remove return false with the list unchanged;</item>
+    /// <item>all-null lists allow add but reject update/remove;</item>
+    /// <item>missing-storage update/remove return false unchanged;</item>
+    /// <item>whitespace-bearing raw names match ordinal-ignore-case WITHOUT trimming — the
+    /// trimmed spelling neither matches nor duplicates them (add/update/remove), and stored
+    /// names stay raw after add and update.</item>
+    /// </list>
+    /// Every operation asserts its RETURN VALUE and a fresh authoritative snapshot afterwards —
+    /// never "no exception" and never retained initializer objects — with explicit
+    /// <see cref="Assert.Null"/> at every null slot. Untrimmed names, available raw reasoning,
+    /// the ignored <c>request.Name</c> on updates (no rename), unrelated duplicate metadata and
+    /// the null-Name entry (retained as a real entry, never matched) are all preserved.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // AvailableModels catalog
+    [InlineData(false)]  // SubAgentModels catalog
+    public void CatalogMutationApis_NullPlaceholders_NeverMatchAndPreserveSlots(bool catalogIsAvailable)
+    {
+        // ── A. Duplicate add fails and the ENTIRE list is unchanged. ─────────
+        {
+            var config = SeedCatalogFixture(catalogIsAvailable, BaseFixture(catalogIsAvailable));
+
+            // "TARGET" case-insensitively duplicates BOTH non-null entries; null slots and the
+            // null-Name entry must never match.
+            var added = catalogIsAvailable
+                ? config.TryAddAvailableModel(new AvailableModelRequest("TARGET", 9999, "add-desc", true))
+                : config.TryAddSubAgentModel(new SubAgentModelRequest("TARGET", 9999, ReasoningEffort.ExtraHigh, "add-desc", true));
+            Assert.False(added);
+
+            var snap = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(5, snap!.Count);
+            AssertSlot(snap, 0, null);
+            AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+            AssertSlot(snap, 2, null);
+            AssertSlot(snap, 3, SecondTarget(catalogIsAvailable));
+            AssertSlot(snap, 4, NullNameEntry());
+        }
+
+        // ── B. Add of an absent name appends after the existing slots, ───────
+        //    including the trailing null slot.
+        {
+            var withTrailingNull = BaseFixture(catalogIsAvailable).Append(null!).ToArray();
+            var config = SeedCatalogFixture(catalogIsAvailable, withTrailingNull);
+
+            var added = catalogIsAvailable
+                ? config.TryAddAvailableModel(new AvailableModelRequest("absent-model", 42, "added-desc", false))
+                : config.TryAddSubAgentModel(new SubAgentModelRequest("absent-model", 42, ReasoningEffort.Medium, "added-desc", false));
+            Assert.True(added);
+
+            var snap = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(7, snap!.Count);
+            AssertSlot(snap, 0, null);
+            AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+            AssertSlot(snap, 2, null);
+            AssertSlot(snap, 3, SecondTarget(catalogIsAvailable));
+            AssertSlot(snap, 4, NullNameEntry());
+            AssertSlot(snap, 5, null);   // the trailing null slot is preserved
+            // The appended entry lands AFTER all existing slots (including the trailing null).
+
+            // Fresh authoritative snapshot: the COMPLETE appended payload carries the request
+            // fields — raw name as requested, context/description/vision from the request,
+            // reasoning null for the available add and canonically formatted ("medium") for
+            // the curated add.
+            var fresh = SnapshotOf(config, catalogIsAvailable)!;
+            AssertSlot(fresh, 6, catalogIsAvailable
+                ? MakeEntry("absent-model", 42, null, "added-desc", false)       // available add: reasoning unset
+                : MakeEntry("absent-model", 42, "medium", "added-desc", false)); // curated add: canonical format
+        }
+
+        // ── C. Update with a case-variant name changes only the FIRST match. ─
+        {
+            var config = SeedCatalogFixture(catalogIsAvailable, BaseFixture(catalogIsAvailable));
+
+            var request = catalogIsAvailable
+                ? null
+                : new SubAgentModelRequest("ignored-name", 42, ReasoningEffort.ExtraHigh, "new-desc", true);
+            var updated = catalogIsAvailable
+                ? config.TryUpdateAvailableModel("tArGeT", new AvailableModelRequest("ignored-name", 42, "new-desc", false))
+                : config.TryUpdateSubAgentModel("tArGeT", request!);
+            Assert.True(updated);
+
+            var snap = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(5, snap!.Count);
+            AssertSlot(snap, 0, null);
+            // FIRST match updated: context/description/vision from the request; the stored name
+            // is NOT renamed (request.Name ignored); the available entry's raw reasoning is
+            // preserved, the curated entry's reasoning becomes the canonical formatted value.
+            AssertSlot(snap, 1, catalogIsAvailable
+                ? MakeEntry("Target", 42, " raw-high ", "new-desc", false)
+                : MakeEntry("Target", 42, "extra_high", "new-desc", true));
+            AssertSlot(snap, 2, null);
+            // The later duplicate is untouched (unrelated duplicate metadata preserved).
+            AssertSlot(snap, 3, SecondTarget(catalogIsAvailable));
+            // The null-Name entry is retained as a real entry and was never matched.
+            AssertSlot(snap, 4, NullNameEntry());
+        }
+
+        // ── D. Remove deletes only that match, preserving null slots/order. ──
+        {
+            var config = SeedCatalogFixture(catalogIsAvailable, BaseFixture(catalogIsAvailable));
+
+            var removed = catalogIsAvailable
+                ? config.TryRemoveAvailableModel("TARGET")
+                : config.TryRemoveSubAgentModel("TARGET");
+            Assert.True(removed);
+
+            var snap = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(4, snap!.Count);
+            AssertSlot(snap, 0, null);   // leading null slot preserved
+            AssertSlot(snap, 1, null);   // the interior null slot shifted into position 1
+            AssertSlot(snap, 2, SecondTarget(catalogIsAvailable));   // later duplicate survives
+            AssertSlot(snap, 3, NullNameEntry());
+        }
+
+        // ── E. Absent-name update returns false on a FRESH owner; list unchanged. ─────
+        {
+            var config = SeedCatalogFixture(catalogIsAvailable, BaseFixture(catalogIsAvailable));
+
+            var updateRequest = catalogIsAvailable
+                ? null
+                : new SubAgentModelRequest("anything", 7, ReasoningEffort.High, "u", null);
+            var updated = catalogIsAvailable
+                ? config.TryUpdateAvailableModel("missing-model", new AvailableModelRequest("anything", 1, "u", true))
+                : config.TryUpdateSubAgentModel("missing-model", updateRequest!);
+            Assert.False(updated);
+
+            // The update's IMMEDIATE postcondition is observed before any other operation.
+            var snapAfterUpdate = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(5, snapAfterUpdate!.Count);
+            AssertSlot(snapAfterUpdate, 0, null);
+            AssertSlot(snapAfterUpdate, 1, FirstTarget(catalogIsAvailable));
+            AssertSlot(snapAfterUpdate, 2, null);
+            AssertSlot(snapAfterUpdate, 3, SecondTarget(catalogIsAvailable));
+            AssertSlot(snapAfterUpdate, 4, NullNameEntry());
+        }
+
+        // ── E2. Absent-name remove returns false on its OWN fresh owner. ──────────────
+        {
+            var config = SeedCatalogFixture(catalogIsAvailable, BaseFixture(catalogIsAvailable));
+
+            var removed = catalogIsAvailable
+                ? config.TryRemoveAvailableModel("missing-model")
+                : config.TryRemoveSubAgentModel("missing-model");
+            Assert.False(removed);
+
+            // The remove's IMMEDIATE postcondition on the required initial state.
+            var snapAfterRemove = SnapshotOf(config, catalogIsAvailable);
+            Assert.Equal(5, snapAfterRemove!.Count);
+            AssertSlot(snapAfterRemove, 0, null);
+            AssertSlot(snapAfterRemove, 1, FirstTarget(catalogIsAvailable));
+            AssertSlot(snapAfterRemove, 2, null);
+            AssertSlot(snapAfterRemove, 3, SecondTarget(catalogIsAvailable));
+            AssertSlot(snapAfterRemove, 4, NullNameEntry());
+        }
+
+        // ── F1. All-null list: add appends after the null slots (fresh owner). ────────
+        {
+            var addConfig = SeedCatalogFixture(catalogIsAvailable, [null!, null!]);
+            var added = catalogIsAvailable
+                ? addConfig.TryAddAvailableModel(new AvailableModelRequest("into-nulls", 5, "d", null))
+                : addConfig.TryAddSubAgentModel(new SubAgentModelRequest("into-nulls", 5, ReasoningEffort.Low, "d", null));
+            Assert.True(added);
+
+            // Immediate postcondition of the add alone.
+            var addedSnap = SnapshotOf(addConfig, catalogIsAvailable);
+            Assert.Equal(3, addedSnap!.Count);
+            AssertSlot(addedSnap, 0, null);
+            AssertSlot(addedSnap, 1, null);
+            AssertSlot(addedSnap, 2, catalogIsAvailable
+                ? MakeEntry("into-nulls", 5, null, "d", null)              // available add: reasoning unset
+                : MakeEntry("into-nulls", 5, "low", "d", null));           // curated add: canonical format
+        }
+
+        // ── F2. All-null list: update rejected on a FRESH all-null owner. ─────────────
+        {
+            var allNullUpdate = SeedCatalogFixture(catalogIsAvailable, [null!, null!]);
+            var updated = catalogIsAvailable
+                ? allNullUpdate.TryUpdateAvailableModel("anything", new AvailableModelRequest("anything", 1, null, null))
+                : allNullUpdate.TryUpdateSubAgentModel("anything", new SubAgentModelRequest("anything", 1, ReasoningEffort.High, null, null));
+            Assert.False(updated);
+
+            var unchangedAfterUpdate = SnapshotOf(allNullUpdate, catalogIsAvailable);
+            Assert.Equal(2, unchangedAfterUpdate!.Count);
+            AssertSlot(unchangedAfterUpdate, 0, null);
+            AssertSlot(unchangedAfterUpdate, 1, null);
+        }
+
+        // ── F3. All-null list: remove rejected on a FRESH all-null owner. ─────────────
+        {
+            var allNullRemove = SeedCatalogFixture(catalogIsAvailable, [null!, null!]);
+            var removed = catalogIsAvailable
+                ? allNullRemove.TryRemoveAvailableModel("anything")
+                : allNullRemove.TryRemoveSubAgentModel("anything");
+            Assert.False(removed);
+
+            var unchangedAfterRemove = SnapshotOf(allNullRemove, catalogIsAvailable);
+            Assert.Equal(2, unchangedAfterRemove!.Count);
+            AssertSlot(unchangedAfterRemove, 0, null);
+            AssertSlot(unchangedAfterRemove, 1, null);
+        }
+
+        // ── G1. Missing storage (no Models): update returns false, storage untouched. ─
+        {
+            var noModelsUpdate = new HiveConfigFile();
+            var updatedNoModels = catalogIsAvailable
+                ? noModelsUpdate.TryUpdateAvailableModel("x", new AvailableModelRequest("x", 1, null, null))
+                : noModelsUpdate.TryUpdateSubAgentModel("x", new SubAgentModelRequest("x", 1, ReasoningEffort.High, null, null));
+            Assert.False(updatedNoModels);
+            Assert.Null(noModelsUpdate.Models);
+        }
+
+        // ── G2. Missing storage (no Models): remove returns false, storage untouched. ─
+        {
+            var noModelsRemove = new HiveConfigFile();
+            var removedNoModels = catalogIsAvailable
+                ? noModelsRemove.TryRemoveAvailableModel("x")
+                : noModelsRemove.TryRemoveSubAgentModel("x");
+            Assert.False(removedNoModels);
+            Assert.Null(noModelsRemove.Models);
+        }
+
+        // ── G3. Null catalog list: update returns false, list stays null. ────────────
+        {
+            var nullListUpdate = new HiveConfigFile { Models = new ModelsConfig() };
+            var updatedNullList = catalogIsAvailable
+                ? nullListUpdate.TryUpdateAvailableModel("x", new AvailableModelRequest("x", 1, null, null))
+                : nullListUpdate.TryUpdateSubAgentModel("x", new SubAgentModelRequest("x", 1, ReasoningEffort.High, null, null));
+            Assert.False(updatedNullList);
+            Assert.Null(SnapshotOf(nullListUpdate, catalogIsAvailable));
+        }
+
+        // ── G4. Null catalog list: remove returns false, list stays null. ─────────────
+        {
+            var nullListRemove = new HiveConfigFile { Models = new ModelsConfig() };
+            var removedNullList = catalogIsAvailable
+                ? nullListRemove.TryRemoveAvailableModel("x")
+                : nullListRemove.TryRemoveSubAgentModel("x");
+            Assert.False(removedNullList);
+            Assert.Null(SnapshotOf(nullListRemove, catalogIsAvailable));
+        }
+
+        // ── H. Whitespace-sensitive matching: ordinal-ignore-case WITHOUT trimming. ────
+        //    A request name equal to the TRIMMED form must NOT match a whitespace-bearing
+        //    entry; a request name equal to the RAW whitespace-bearing form must match it.
+        //    Each operation runs on its own fresh fixture with full immediate postcondition
+        //    assertions, for BOTH catalogs (add/update/remove).
+        {
+            // H1: duplicate add with the TRIMMED name is NOT a duplicate — the add succeeds
+            // alongside the whitespace-bearing entry, whose stored name stays raw. The base
+            // name is distinct from the fixture's other entries so only the trimming theory
+            // is under test.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                [
+                    null!,
+                    FirstTarget(catalogIsAvailable),
+                    MakeEntry(" ws-model ", 2222, catalogIsAvailable ? " ws-effort " : "low", "ws-model-entry", false),
+                ]);
+                var added = catalogIsAvailable
+                    ? config.TryAddAvailableModel(new AvailableModelRequest("ws-model", 44, "trim-desc", null))
+                    : config.TryAddSubAgentModel(new SubAgentModelRequest("ws-model", 44, ReasoningEffort.Low, "trim-desc", null));
+                Assert.True(added);   // trimmed "ws-model" ≠ stored " ws-model " without trimming
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(4, snap.Count);
+                AssertSlot(snap, 0, null);
+                AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+                AssertSlot(snap, 2, MakeEntry(" ws-model ", 2222, catalogIsAvailable ? " ws-effort " : "low", "ws-model-entry", false));
+                // Appended AFTER the whitespace-bearing entry: a distinct raw name, stored raw.
+                AssertSlot(snap, 3, catalogIsAvailable
+                    ? MakeEntry("ws-model", 44, null, "trim-desc", null)         // available add: reasoning unset
+                    : MakeEntry("ws-model", 44, "low", "trim-desc", null));      // curated add: canonical format
+            }
+
+            // H2: duplicate add with the RAW whitespace-bearing name DOES match.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                    [null!, FirstTarget(catalogIsAvailable), WhitespaceTarget(catalogIsAvailable)]);
+                var added = catalogIsAvailable
+                    ? config.TryAddAvailableModel(new AvailableModelRequest(" target ", 44, "ws-desc", null))
+                    : config.TryAddSubAgentModel(new SubAgentModelRequest(" target ", 44, ReasoningEffort.Low, "ws-desc", null));
+                Assert.False(added);
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(3, snap.Count);
+                AssertSlot(snap, 0, null);
+                AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+                AssertSlot(snap, 2, WhitespaceTarget(catalogIsAvailable));   // name stays raw
+            }
+
+            // H3: update via the RAW whitespace-bearing name matches; the trimmed spelling
+            // would not. Stored name remains raw (no rename), other fields take the request.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                    [null!, FirstTarget(catalogIsAvailable), WhitespaceTarget(catalogIsAvailable)]);
+                var updateRequest = catalogIsAvailable
+                    ? null
+                    : new SubAgentModelRequest("ignored-name", 55, ReasoningEffort.High, "ws-new-desc", false);
+                var updated = catalogIsAvailable
+                    ? config.TryUpdateAvailableModel(" target ", new AvailableModelRequest("ignored-name", 111, "ws-new-desc", false))
+                    : config.TryUpdateSubAgentModel(" target ", updateRequest!);
+                Assert.True(updated);
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(3, snap.Count);
+                AssertSlot(snap, 0, null);
+                // First match ("Target") untouched — the trimmed form does not match it and
+                // the raw form matches only the whitespace-bearing entry.
+                AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+                AssertSlot(snap, 2, catalogIsAvailable
+                    ? MakeEntry(" target ", 111, " ws-raw ", "ws-new-desc", false)   // name raw, reasoning preserved
+                    : MakeEntry(" target ", 55, "high", "ws-new-desc", false));      // name raw, canonical effort
+            }
+
+            // H4: update with the TRIMMED name must not match the whitespace-bearing entry.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                    [null!, WhitespaceTarget(catalogIsAvailable)]);
+                var updateRequest = catalogIsAvailable
+                    ? null
+                    : new SubAgentModelRequest("ignored-name", 77, ReasoningEffort.High, "t-new-desc", true);
+                var updated = catalogIsAvailable
+                    ? config.TryUpdateAvailableModel("target", new AvailableModelRequest("ignored-name", 77, "t-new-desc", true))
+                    : config.TryUpdateSubAgentModel("target", updateRequest!);
+                Assert.False(updated);   // trimmed spelling ≠ stored " target " (no trimming)
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(2, snap.Count);
+                AssertSlot(snap, 0, null);
+                AssertSlot(snap, 1, WhitespaceTarget(catalogIsAvailable));   // entirely unchanged
+            }
+
+            // H5: remove with the RAW whitespace-bearing name matches only that entry.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                    [null!, FirstTarget(catalogIsAvailable), WhitespaceTarget(catalogIsAvailable)]);
+                var removed = catalogIsAvailable
+                    ? config.TryRemoveAvailableModel(" target ")
+                    : config.TryRemoveSubAgentModel(" target ");
+                Assert.True(removed);
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(2, snap.Count);
+                AssertSlot(snap, 0, null);
+                // The non-whitespace first match survives; only the raw-named entry was removed.
+                AssertSlot(snap, 1, FirstTarget(catalogIsAvailable));
+            }
+
+            // H6: remove with the TRIMMED name must not match the whitespace-bearing entry.
+            {
+                var config = SeedCatalogFixture(catalogIsAvailable,
+                    [null!, WhitespaceTarget(catalogIsAvailable)]);
+                var removed = catalogIsAvailable
+                    ? config.TryRemoveAvailableModel("target")
+                    : config.TryRemoveSubAgentModel("target");
+                Assert.False(removed);   // trimmed spelling ≠ stored " target " (no trimming)
+
+                var snap = SnapshotOf(config, catalogIsAvailable)!;
+                Assert.Equal(2, snap.Count);
+                AssertSlot(snap, 0, null);
+                AssertSlot(snap, 1, WhitespaceTarget(catalogIsAvailable));   // entirely unchanged
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bulk reasoning (<see cref="HiveConfigFile.SetSubAgentModelReasoningEfforts"/>) with the
+    /// full null-placeholder fixture, seeded through a whole <see cref="HiveConfigFile.Models"/>
+    /// assignment: nulls before and between matching duplicates, a null-valued assignment, an
+    /// unassigned entry and a whitespace-distinct name. BOTH intended duplicates ("Dup"/"dup")
+    /// receive the canonical <c>extra_high</c>; every other field, entry and null slot stays
+    /// unchanged — including the whitespace-distinct " Other " entry (matching is
+    /// ordinal-ignore-case WITHOUT trimming) and the null-valued assignment's target.
+    /// </summary>
+    [Fact]
+    public void SetSubAgentModelReasoningEfforts_NullPlaceholdersAndDuplicates_OnlyMatchingEntriesUpdated()
+    {
+        var config = SeedCatalogFixture(catalogIsAvailable: false,
+        [
+            null!,
+            MakeEntry("Dup", 10, "low", "dup-first", true),
+            null!,
+            MakeEntry("dup", 20, "medium", "dup-second", false),
+            MakeEntry(" Other ", 30, "high", "ws-distinct", null),
+            MakeEntry("unassigned", 40, "none", "unassigned-entry", null),
+            MakeEntry("nullvalued", 50, "high", "null-valued-entry", false),
+        ]);
+
+        config.SetSubAgentModelReasoningEfforts(new Dictionary<string, ReasoningEffort?>
+        {
+            ["DUP"] = ReasoningEffort.ExtraHigh,    // case-insensitive: matches "Dup" AND "dup"
+            ["other"] = ReasoningEffort.Low,        // whitespace-distinct stored name → NO match
+            ["NULLVALUED"] = null,                  // null value → no-op for "nullvalued"
+            ["absent-key"] = ReasoningEffort.High,  // unknown name → ignored
+        });
+
+        var snap = config.GetSubAgentModelsSnapshot()!;
+        Assert.Equal(7, snap.Count);
+        AssertSlot(snap, 0, null);
+        // First duplicate: reasoning updated to canonical extra_high; ALL other fields unchanged.
+        AssertSlot(snap, 1, MakeEntry("Dup", 10, "extra_high", "dup-first", true));
+        AssertSlot(snap, 2, null);
+        // Second duplicate: likewise updated; its own metadata preserved.
+        AssertSlot(snap, 3, MakeEntry("dup", 20, "extra_high", "dup-second", false));
+        // Whitespace-distinct name never matched (no trimming) — entirely unchanged.
+        AssertSlot(snap, 4, MakeEntry(" Other ", 30, "high", "ws-distinct", null));
+        // Unassigned entry unchanged.
+        AssertSlot(snap, 5, MakeEntry("unassigned", 40, "none", "unassigned-entry", null));
+        // Null-valued assignment: the entry's existing effort survives untouched.
+        AssertSlot(snap, 6, MakeEntry("nullvalued", 50, "high", "null-valued-entry", false));
+    }
+
+    /// <summary>
+    /// Bulk reasoning no-op cases: an all-null curated list (no matches; null slots preserved and
+    /// storage untouched), and missing storage (the call returns WITHOUT initializing
+    /// <see cref="HiveConfigFile.Models"/> — fresh fixtures, no retained initializer objects).
+    /// </summary>
+    [Fact]
+    public void SetSubAgentModelReasoningEfforts_AllNullListAndMissingStorage_AreNoOps()
+    {
+        // All-null curated list: nothing matches, null slots preserved, storage not rebuilt.
+        var allNull = SeedCatalogFixture(catalogIsAvailable: false, [null!, null!]);
+        allNull.SetSubAgentModelReasoningEfforts(
+            new Dictionary<string, ReasoningEffort?> { ["dup"] = ReasoningEffort.ExtraHigh });
+        var snap = allNull.GetSubAgentModelsSnapshot()!;
+        Assert.Equal(2, snap.Count);
+        AssertSlot(snap, 0, null);
+        AssertSlot(snap, 1, null);
+
+        // Missing storage entirely: the call must return without initializing Models.
+        var noStorage = new HiveConfigFile();
+        noStorage.SetSubAgentModelReasoningEfforts(
+            new Dictionary<string, ReasoningEffort?> { ["dup"] = ReasoningEffort.ExtraHigh });
+        Assert.Null(noStorage.Models);
+
+        // Models present but the curated list is null: also a no-op, list stays null.
+        var nullList = new HiveConfigFile { Models = new ModelsConfig() };
+        nullList.SetSubAgentModelReasoningEfforts(
+            new Dictionary<string, ReasoningEffort?> { ["dup"] = ReasoningEffort.ExtraHigh });
+        Assert.Null(nullList.GetSubAgentModelsSnapshot());
+    }
 }
