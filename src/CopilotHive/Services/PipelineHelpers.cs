@@ -39,17 +39,14 @@ internal static class PipelineHelpers
             }
         }
 
-        // Include summary from structured metrics when available; fall back to truncated raw output
+        // Include summary from structured metrics when available; fall back to the
+        // complete raw output so full diagnostic tails survive into the conversation.
         var summary = result.Metrics?.Summary;
         if (!string.IsNullOrWhiteSpace(summary))
             parts.Add($"Worker summary:\n{summary}");
         else if (!string.IsNullOrWhiteSpace(result.Output))
         {
-            const int maxOutputChars = 1500;
-            var truncated = result.Output.Length > maxOutputChars
-                ? result.Output[..maxOutputChars] + "..."
-                : result.Output;
-            parts.Add($"Worker output (no summary):\n{truncated}");
+            parts.Add($"Worker output (no summary):\n{result.Output}");
         }
 
         return string.Join("\n", parts);

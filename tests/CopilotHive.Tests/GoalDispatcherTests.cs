@@ -869,20 +869,19 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
     [Fact]
     public void TruncatesLongOutput()
     {
-        var longOutput = new string('x', 3000);
+        // The raw-output fallback now preserves the COMPLETE output — no clipping, no ellipsis.
+        var payload = new string('x', 3000);
         var result = new TaskResult
         {
             TaskId = "t1",
             Status = TaskOutcome.Completed,
-            Output = longOutput,
+            Output = payload,
         };
 
         var summary = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
-        Assert.Contains("Worker output (no summary):", summary);
-        Assert.Contains("...", summary);
-        // Should be significantly shorter than 3000 chars of raw output
-        Assert.True(summary.Length < 2000);
+        var expected = $"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}";
+        Assert.Equal(expected, summary);
     }
 
     [Fact]
@@ -966,25 +965,168 @@ public sealed class GoalDispatcherBuildWorkerOutputSummaryTests
     }
 
     /// <summary>
-    /// Raw output is truncated at 1500 characters when Summary is absent.
+    /// Raw output is preserved IN FULL when Summary is absent — no truncation, no ellipsis.
     /// </summary>
     [Fact]
     public void WithoutMetricsSummary_TruncatesLongRawOutput()
     {
-        var longOutput = new string('x', 3000);
+        var payload = new string('x', 3000);
         var result = new TaskResult
         {
             TaskId = "t1",
             Status = TaskOutcome.Completed,
-            Output = longOutput,
+            Output = payload,
             Metrics = new TaskMetrics { Verdict = "PASS" },
         };
 
         var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
 
-        Assert.Contains("Worker output (no summary):", output);
-        Assert.Contains("...", output);
-        Assert.True(output.Length < 2000, "Output should be significantly shorter than raw 3000 chars");
+        var expected = $"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}";
+        Assert.Equal(expected, output);
+    }
+
+    // ── Boundary vectors at the old 1,500-character cut ─────────────────────
+
+    /// <summary>
+    /// Exactly 1,499 characters — below the old cut — must be returned verbatim.
+    /// </summary>
+    [Fact]
+    public void RawOutput_1499Chars_ReturnedVerbatim()
+    {
+        var payload = new string('a', 1499);
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = payload };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal($"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}", output);
+    }
+
+    /// <summary>
+    /// Exactly 1,500 characters — the old cut boundary — must be returned verbatim.
+    /// </summary>
+    [Fact]
+    public void RawOutput_1500Chars_ReturnedVerbatim()
+    {
+        var payload = new string('b', 1500);
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = payload };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal($"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}", output);
+    }
+
+    /// <summary>
+    /// Exactly 1,501 characters — one past the old cut — must be returned verbatim,
+    /// proving the old slice-and-ellipsis behavior is gone.
+    /// </summary>
+    [Fact]
+    public void RawOutput_1501Chars_ReturnedVerbatim()
+    {
+        var payload = new string('c', 1501);
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = payload };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal($"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}", output);
+    }
+
+    /// <summary>
+    /// A much longer multiline report with distinctive trailing evidence — including a
+    /// literal "..." INSIDE the payload — is returned verbatim, proving no ellipsis is
+    /// appended and the trailing evidence survives.
+    /// </summary>
+    [Fact]
+    public void RawOutput_LongMultilineWithEllipsisInside_ReturnedVerbatim()
+    {
+        var payload = string.Join('\n', new[]
+        {
+            "BEGIN BUILD LOG",
+            "Step 1: restore — ok",
+            "Step 2: compile — warning CS8602 possible null deref (treated as info, dots follow: ...)",
+            new string('=', 1800),
+            "Step 3: test — 42/43 passed",
+            "FAILED TEST: CopilotHive.Tests.MergeBack_Tests.MergePreservesBranchName",
+            "  Expected: refs/heads/target-branch",
+            "  Actual:   <null>",
+            "TRAILING EVIDENCE: exit code 1, artifacts at /tmp/worker-logs/last-run.txt",
+        });
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = payload };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Testing, "FAIL", result);
+
+        var expected = $"Phase Testing completed — verdict: FAIL\nWorker output (no summary):\n{payload}";
+        Assert.Equal(expected, output);
+        Assert.True(payload.Length > 1500, "Test payload must exceed the old cut to be meaningful");
+        Assert.EndsWith("artifacts at /tmp/worker-logs/last-run.txt", output);
+    }
+
+    /// <summary>
+    /// Nonblank structured summary precedence: when a summary is selected, the (long, distinct)
+    /// raw output must NOT be appended after it — the summary is the entire payload.
+    /// </summary>
+    [Fact]
+    public void WithMetricsSummary_LongRawOutput_NotAppended()
+    {
+        var rawOutput = "DISTINCT-RAW-MARKER " + new string('r', 3000) + " TRAILING-RAW-MARKER";
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Summary = "Structured summary payload." },
+        };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        var expected = "Phase Coding completed — verdict: PASS\nWorker summary:\nStructured summary payload.";
+        Assert.Equal(expected, output);
+    }
+
+    /// <summary>
+    /// A null (absent) summary falls back to the complete raw output.
+    /// </summary>
+    [Fact]
+    public void RawOutput_NullSummary_FullOutputReturned()
+    {
+        var payload = "NULL-SUMMARY-FALLBACK complete raw output.";
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = payload };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal($"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}", output);
+    }
+
+    /// <summary>
+    /// A whitespace-only summary falls back to the complete raw output.
+    /// </summary>
+    [Fact]
+    public void RawOutput_BlankSummary_FullOutputReturned()
+    {
+        var payload = "BLANK-SUMMARY-FALLBACK complete raw output.";
+        var result = new TaskResult
+        {
+            TaskId = "t1",
+            Status = TaskOutcome.Completed,
+            Output = payload,
+            Metrics = new TaskMetrics { Summary = "   \t\n  " },
+        };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal($"Phase Coding completed — verdict: PASS\nWorker output (no summary):\n{payload}", output);
+    }
+
+    /// <summary>
+    /// Blank/whitespace output is omitted — unchanged omission behavior.
+    /// </summary>
+    [Fact]
+    public void RawOutput_WhitespaceOnly_OutputSectionOmitted()
+    {
+        var result = new TaskResult { TaskId = "t1", Status = TaskOutcome.Completed, Output = "  \t\n " };
+
+        var output = PipelineHelpers.BuildWorkerOutputSummary(GoalPhase.Coding, "PASS", result);
+
+        Assert.Equal("Phase Coding completed — verdict: PASS", output);
     }
 
     [Fact]
