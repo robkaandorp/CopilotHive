@@ -11,6 +11,29 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CopilotHive.Tests;
 
 /// <summary>
+/// Logger that records the last logged exception so tests can prove a swallowed drive/finalize
+/// error did not occur (namespace-scope so multiple test classes in this file can use it).
+/// </summary>
+internal sealed class PipelineDriverCapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+{
+    internal Exception? LastException { get; private set; }
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        Microsoft.Extensions.Logging.LogLevel logLevel,
+        Microsoft.Extensions.Logging.EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (exception is not null)
+            LastException = exception;
+    }
+}
+
+/// <summary>
 /// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/> preserves the complete
 /// authoritative phase report for every worker phase: a nonblank
 /// <see cref="TaskMetrics.Summary"/> when present, otherwise <see cref="TaskResult.Output"/>.
@@ -465,7 +488,7 @@ public sealed class PipelineDriverWorkerOutputTests
             attempt: 1,
             WorkSlotState.Pending));
 
-        var logger = new CapturingLogger<GoalDispatcher>();
+        var logger = new PipelineDriverCapturingLogger<GoalDispatcher>();
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
@@ -620,25 +643,6 @@ public sealed class PipelineDriverWorkerOutputTests
             Task.CompletedTask;
     }
 
-    private sealed class CapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
-    {
-        internal Exception? LastException { get; private set; }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            Microsoft.Extensions.Logging.LogLevel logLevel,
-            Microsoft.Extensions.Logging.EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
-            if (exception is not null)
-                LastException = exception;
-        }
-    }
-
     /// <summary>Minimal brain stub for pipeline driver tests.</summary>
     private sealed class LocalFakeBrain : IDistributedBrain
     {
@@ -724,9 +728,12 @@ public sealed class PipelineDriverNoOpRetryTests
             GitStatus = new GitChangeSummary { FilesChanged = 0 },
         }, TestContext.Current.CancellationToken);
 
-        // Assert: the Coding PhaseResult was marked failed with the no-op reason.
+        // Assert: the Coding PhaseResult was marked failed with the no-op reason and the
+        // worker's raw report preserved verbatim (raw fallback — no Metrics.Summary).
         Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
-        Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.Equal(
+            "Coder produced no file changes (no-op)\n\nI discussed the changes but made no edits.",
+            codingEntry.WorkerOutput);
         Assert.NotNull(codingEntry.CompletedAt);
 
         // Assert: UpdateGoalStatusAsync was called while pipeline.Iteration was still the
@@ -742,7 +749,9 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Equal(1, summaryUpdate!.Iteration);
         var codingInSummary = Assert.Single(summaryUpdate.Phases, p => p.Name == GoalPhase.Coding);
         Assert.Equal(PhaseOutcome.Fail, codingInSummary.Result);
-        Assert.Equal("Coder produced no file changes (no-op)", codingInSummary.WorkerOutput);
+        Assert.Equal(
+            "Coder produced no file changes (no-op)\n\nI discussed the changes but made no edits.",
+            codingInSummary.WorkerOutput);
 
         // Assert: the summary is also in CompletedIterationSummaries and the retry iteration started.
         var completedSummary = Assert.Single(pipeline.CompletedIterationSummaries, s => s.Iteration == 1);
@@ -789,10 +798,13 @@ public sealed class PipelineDriverNoOpRetryTests
             GitStatus = new GitChangeSummary { FilesChanged = 0 },
         }, TestContext.Current.CancellationToken);
 
-        // Assert: the Coding PhaseResult was marked failed with the no-op reason BEFORE terminal
-        // exit, so FinalizeGoalAsync's summary includes the failed Coding phase.
+        // Assert: the Coding PhaseResult was marked failed with the no-op reason plus the raw
+        // report (raw fallback — no Metrics.Summary on this vector) BEFORE terminal exit, so
+        // FinalizeGoalAsync's summary includes the failed Coding phase with the full report.
         Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
-        Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.Equal(
+            "Coder produced no file changes (no-op)\n\nno changes made",
+            codingEntry.WorkerOutput);
         Assert.NotNull(codingEntry.CompletedAt);
 
         // Assert: goal failed via the terminal path.
@@ -852,7 +864,11 @@ public sealed class PipelineDriverNoOpRetryTests
         var completedSummary = Assert.Single(pipeline.CompletedIterationSummaries, s => s.Iteration == 1);
         var codingInSummary = Assert.Single(completedSummary.Phases, p => p.Name == GoalPhase.Coding);
         Assert.Equal(PhaseOutcome.Fail, codingInSummary.Result);
-        Assert.Contains("no-op", codingInSummary.WorkerOutput);
+        // EXACT full no-op report: the retry's completion ("retry produced changes") must not
+        // have overwritten the failed iteration-1 entry's reason-plus-report.
+        Assert.Equal(
+            "Coder produced no file changes (no-op)\n\nno changes made",
+            codingInSummary.WorkerOutput);
 
         // Assert: the PhaseLog holds two distinct Coding entries — the failed iteration-1 entry
         // and the retry's iteration-2 entry (which the fake dispatch completed as Pass).
@@ -877,7 +893,883 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Same(codingInSummary, failedEntry);
     }
 
+    // ── Test 4: report selection — summary wins over raw output, stored verbatim ──
+
+    /// <summary>
+    /// Realistic 8KB+ multiline coder report with distinct evidence markers past char 500,
+    /// past char 4,000, and at the very tail. The raw <see cref="TaskResult.Output"/> is
+    /// deliberately DIFFERENT, proving summary-wins AND no concatenation; the stored string
+    /// must be exactly the reason + "\n\n" + the verbatim summary (no trimming, no cap).
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SummarySelected_StoresReasonPlusFullSummaryVerbatim()
+    {
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        // Realistic multiline report: evidence beyond char 500, beyond char 4,000, and at the tail.
+        const string reportHead = "NO-OP REPORT HEAD: attempted the change, hit a blocker.\n";
+        const string reportBeyond500 = "EVIDENCE-BEYOND-500: a legacy 500-char preview would lose this marker.\n";
+        const string reportBeyond4000 = "EVIDENCE-BEYOND-4000: a legacy 4,000-char cap would lose this marker.\n";
+        const string reportTail = "TAIL-EVIDENCE-AT-END: root cause analysis concludes the fix needs a config change.";
+        var report = reportHead
+            + new string('a', 500 - reportHead.Length) + reportBeyond500
+            + new string('b', 4_000 - 500 - reportBeyond500.Length) + reportBeyond4000
+            + new string('c', 5_500) + reportTail;
+        Assert.True(report.Length > 8 * 1024);
+        Assert.NotEqual(500, report.IndexOf(reportBeyond500, StringComparison.Ordinal) + reportBeyond500.Length);
+        Assert.Equal(reportTail, report[(report.Length - reportTail.Length)..]);
+
+        // A DIFFERENT raw output — if it were concatenated (or won) the exact assertion fails.
+        const string rawOutput = "DIFFERENT-RAW-OUTPUT: discussed the approach without editing files.";
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-summary",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: EXACT full stored string — reason, blank line, then the verbatim summary.
+        var expected = "Coder produced no file changes (no-op)\n\n" + report;
+        Assert.Equal(expected, codingEntry.WorkerOutput);
+        Assert.StartsWith("Coder produced no file changes (no-op)\n\n" + reportHead, codingEntry.WorkerOutput);
+        Assert.EndsWith(reportTail, codingEntry.WorkerOutput);
+        Assert.Contains("EVIDENCE-BEYOND-500", codingEntry.WorkerOutput);
+        Assert.Contains("EVIDENCE-BEYOND-4000", codingEntry.WorkerOutput);
+        // No concatenation of the competing raw output.
+        Assert.DoesNotContain(rawOutput, codingEntry.WorkerOutput);
+
+        // The persisted pre-consume summary (single InProgress update at iteration 1) carries
+        // the exact same reason-plus-report string.
+        var inProgressUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.InProgress);
+        Assert.Equal(1, inProgressUpdate.IterationAtUpdate);
+        var summaryUpdate = inProgressUpdate.Metadata?.IterationSummary;
+        Assert.NotNull(summaryUpdate);
+        var codingInSummary = Assert.Single(summaryUpdate!.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(expected, codingInSummary.WorkerOutput);
+    }
+
+    /// <summary>Raw fallback: null/empty/whitespace Metrics.Summary → full raw Output verbatim.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task NoOpRetry_SummaryAbsentOrWhitespace_StoresReasonPlusFullRawOutputVerbatim(string? summary)
+    {
+        var (driver, pipeline, _) = CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        // 8KB+ raw output with the same evidence placement as the summary vector.
+        const string rawHead = "NO-OP RAW HEAD: no edits made, only analysis.\n";
+        const string rawBeyond500 = "RAW-EVIDENCE-BEYOND-500: survives only with verbatim storage.\n";
+        const string rawBeyond4000 = "RAW-EVIDENCE-BEYOND-4000: survives only with verbatim storage.\n";
+        const string rawTail = "RAW-TAIL-EVIDENCE-AT-END: recommendation is to raise the timeout.";
+        var rawOutput = rawHead
+            + new string('x', 500 - rawHead.Length) + rawBeyond500
+            + new string('y', 4_000 - 500 - rawBeyond500.Length) + rawBeyond4000
+            + new string('z', 5_500) + rawTail;
+        Assert.True(rawOutput.Length > 8 * 1024);
+        Assert.EndsWith(rawTail, rawOutput);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-raw",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = summary is null
+                ? null
+                : new TaskMetrics { Verdict = "PASS", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: EXACT full stored string — reason, blank line, then the verbatim raw output.
+        var expected = "Coder produced no file changes (no-op)\n\n" + rawOutput;
+        Assert.Equal(expected, codingEntry.WorkerOutput);
+        Assert.EndsWith(rawTail, codingEntry.WorkerOutput);
+        Assert.Contains("RAW-EVIDENCE-BEYOND-500", codingEntry.WorkerOutput);
+        Assert.Contains("RAW-EVIDENCE-BEYOND-4000", codingEntry.WorkerOutput);
+    }
+
+    /// <summary>Empty or whitespace selected report → the reason alone, exactly as before.</summary>
+    [Theory]
+    [InlineData(null, null)]     // no Metrics, no Output
+    [InlineData("", "")]         // empty summary + empty output
+    [InlineData("  ", " \t\n ")] // whitespace summary + whitespace raw output → reason alone
+    [InlineData(null, " \r\n ")] // whitespace raw output with no summary → reason alone
+    public async Task NoOpRetry_EmptyOrWhitespaceReport_StoresReasonAlone(string? summary, string? output)
+    {
+        var (driver, pipeline, _) = CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-empty",
+            Status = TaskOutcome.Completed,
+            Output = output ?? "",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = summary is null
+                ? null
+                : new TaskMetrics { Verdict = "PASS", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: reason alone — no trailing separators, no empty report section.
+        Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
+        Assert.NotNull(codingEntry.CompletedAt);
+
+        // Retry path still ran: budget consumed, fresh retry entry added for iteration 2.
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal(GoalPhase.Coding, pipeline.PhaseLog[1].Name);
+    }
+
+    // ── Test 5: budget-exhausted path preserves the selected report too ──
+
+    [Fact]
+    public async Task NoOpRetry_BudgetExhausted_SummarySelected_StoresReasonPlusFullSummary()
+    {
+        // Arrange: exhaust the iteration budget so the no-op path takes the terminal branch.
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        var report = BuildNoOpReport("SUMMARY-SELECTED-TERMINAL");
+        const string rawOutput = "DIFFERENT-RAW-OUTPUT-TERMINAL: not stored when the summary wins.";
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-terminal-summary",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the failed entry carries reason + verbatim summary (no truncation, no concat).
+        var expected = "Coder produced no file changes (no-op)\n\n" + report;
+        Assert.Equal(expected, codingEntry.WorkerOutput);
+
+        // Assert: goal failed via the terminal path; exactly ONE summary-bearing status update
+        // (the Failed one from FinalizeGoalAsync) — the no-op path added no InProgress summary.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var summaryUpdates = goalStore.StatusUpdates
+            .Where(u => u.Metadata?.IterationSummary is not null)
+            .ToList();
+        var failedUpdate = Assert.Single(summaryUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        var codingInSummary = Assert.Single(
+            failedUpdate.Metadata!.IterationSummary!.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(expected, codingInSummary.WorkerOutput);
+    }
+
+    /// <summary>Raw fallback on the terminal path — the full raw Output is preserved.</summary>
+    [Fact]
+    public async Task NoOpRetry_BudgetExhausted_RawFallback_StoresReasonPlusFullRawOutput()
+    {
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        var rawOutput = BuildNoOpReport("RAW-FALLBACK-TERMINAL");
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-terminal-raw",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "   " },
+        }, TestContext.Current.CancellationToken);
+
+        var expected = "Coder produced no file changes (no-op)\n\n" + rawOutput;
+        Assert.Equal(expected, codingEntry.WorkerOutput);
+
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Metadata?.IterationSummary is not null);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        var codingInSummary = Assert.Single(
+            failedUpdate.Metadata!.IterationSummary!.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(expected, codingInSummary.WorkerOutput);
+    }
+
+    /// <summary>
+    /// The completed summary captured at the no-op iteration is never overwritten when the
+    /// retry completes — full-report equality, not a substring check (extends Test 3).
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_RetryCompletion_CannotOverwriteFullNoOpReportInSummary()
+    {
+        // Arrange: fake dispatch that immediately completes the retry coding task.
+        var (driver, pipeline, _) = CreateNoOpDriver((p, role, prompt, ct) =>
+        {
+            var retryEntry = p.CurrentPhaseEntry!;
+            retryEntry.Result = PhaseOutcome.Pass;
+            retryEntry.CompletedAt = DateTime.UtcNow;
+            retryEntry.WorkerOutput = "retry produced changes";
+            return Task.CompletedTask;
+        });
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        var report = BuildNoOpReport("MUTATION-GUARD");
+        const string rawOutput = "no changes made";
+
+        // Act
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-guard",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the no-op iteration's summary still holds the EXACT reason-plus-summary report.
+        var completedSummary = Assert.Single(pipeline.CompletedIterationSummaries, s => s.Iteration == 1);
+        var codingInSummary = Assert.Single(completedSummary.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, codingInSummary.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, codingInSummary.WorkerOutput);
+
+        // Assert: the retry entry is a distinct object carrying only the retry's output.
+        var retryEntry = pipeline.PhaseLog[1];
+        Assert.Equal(2, retryEntry.Iteration);
+        Assert.Equal("retry produced changes", retryEntry.WorkerOutput);
+        Assert.NotSame(codingInSummary, retryEntry);
+        Assert.Same(codingInSummary, pipeline.PhaseLog[0]);
+    }
+
+    // ── Test 5b: historical entries remain untouched (acceptance criterion 4) ──
+
+    /// <summary>
+    /// Seeds an older-iteration Coding entry, an earlier occurrence of the current iteration,
+    /// and the LAST current-iteration occurrence the no-op path targets, plus an unrelated
+    /// trailing Testing entry. Only the last current-iteration occurrence may receive the exact
+    /// reason-plus-report string (summary-selected form) — every other entry must retain its
+    /// original WorkerOutput/Result/CompletedAt verbatim (retry-available path).
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_HistoricalEntries_RetryPath_LastOccurrenceWins_OthersUntouched()
+    {
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+
+        // Older iteration's entry (must stay untouched).
+        var olderIterationCompletedAt = DateTime.UtcNow.AddMinutes(-9);
+        var olderIterationEntry = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = 0,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            CompletedAt = olderIterationCompletedAt,
+            WorkerPrompt = "older iteration prompt",
+            WorkerOutput = "OLDER-ITERATION-EVIDENCE: previous iteration succeeded",
+        };
+        pipeline.PhaseLog.Add(olderIterationEntry);
+
+        // Earlier occurrence of the current iteration (must stay untouched).
+        var earlierOccurrenceCompletedAt = DateTime.UtcNow.AddMinutes(-1);
+        var earlierOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            CompletedAt = earlierOccurrenceCompletedAt,
+            WorkerPrompt = "first occurrence prompt",
+            WorkerOutput = "FIRST-OCCURRENCE-EVIDENCE: first attempt output",
+        };
+        pipeline.PhaseLog.Add(earlierOccurrence);
+
+        // LAST occurrence of the current iteration — the entry the no-op path targets.
+        var lastOccurrence = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 2);
+        pipeline.PhaseLog.Add(lastOccurrence);
+
+        // Unrelated trailing phase entry (must stay untouched).
+        var unrelatedTrailing = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddSeconds(-20),
+            WorkerOutput = "UNRELATED-TRAILING-EVIDENCE: tester output",
+        };
+        pipeline.PhaseLog.Add(unrelatedTrailing);
+
+        var report = BuildNoOpReport("HISTORICAL-RETRY");
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-historical",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the LAST current-iteration occurrence carries the exact reason-plus-report.
+        Assert.Equal(PhaseOutcome.Fail, lastOccurrence.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, lastOccurrence.WorkerOutput);
+        Assert.NotNull(lastOccurrence.CompletedAt);
+
+        // Assert: the older-iteration entry retains its original state verbatim — including its
+        // seeded CompletedAt, proven with EXACT equality.
+        Assert.Equal(PhaseOutcome.Pass, olderIterationEntry.Result);
+        Assert.Equal("OLDER-ITERATION-EVIDENCE: previous iteration succeeded", olderIterationEntry.WorkerOutput);
+        Assert.Equal("older iteration prompt", olderIterationEntry.WorkerPrompt);
+        Assert.Equal(olderIterationCompletedAt, olderIterationEntry.CompletedAt);
+
+        // Assert: the earlier occurrence retains its original state verbatim (Result, timestamps).
+        Assert.Equal(PhaseOutcome.Pass, earlierOccurrence.Result);
+        Assert.Equal("FIRST-OCCURRENCE-EVIDENCE: first attempt output", earlierOccurrence.WorkerOutput);
+        Assert.Equal("first occurrence prompt", earlierOccurrence.WorkerPrompt);
+        Assert.Equal(earlierOccurrenceCompletedAt, earlierOccurrence.CompletedAt);
+
+        // Assert: the unrelated trailing entry retains its original state verbatim.
+        Assert.Equal(PhaseOutcome.Pass, unrelatedTrailing.Result);
+        Assert.Equal("UNRELATED-TRAILING-EVIDENCE: tester output", unrelatedTrailing.WorkerOutput);
+
+        // Assert: the persisted pre-consume summary (iteration 1) contains ALL FOUR entries —
+        // the three untouched ones with their original outputs and the targeted one with the
+        // reason-plus-report — proving the snapshot reflects the whole historical log, not just
+        // the mutated entry.
+        var inProgressUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.InProgress);
+        var summaryUpdate = inProgressUpdate.Metadata?.IterationSummary;
+        Assert.NotNull(summaryUpdate);
+        Assert.Equal(1, summaryUpdate!.Iteration);
+        var codingInSummary = summaryUpdate.Phases
+            .Where(p => p.Name == GoalPhase.Coding)
+            .ToList();
+        Assert.Equal(2, codingInSummary.Count);
+        Assert.Contains(codingInSummary, p => ReferenceEquals(p, earlierOccurrence) || p.WorkerOutput == earlierOccurrence.WorkerOutput);
+        var summaryLastOccurrence = Assert.Single(
+            codingInSummary, p => p.Occurrence == 2);
+        Assert.Equal(PhaseOutcome.Fail, summaryLastOccurrence.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, summaryLastOccurrence.WorkerOutput);
+        var summaryEarlierOccurrence = Assert.Single(codingInSummary, p => p.Occurrence == 1);
+        Assert.Equal(PhaseOutcome.Pass, summaryEarlierOccurrence.Result);
+        Assert.Equal("FIRST-OCCURRENCE-EVIDENCE: first attempt output", summaryEarlierOccurrence.WorkerOutput);
+    }
+
+    /// <summary>
+    /// Historical-entry preservation on the budget-exhausted TERMINAL path: the same seeding
+    /// shape, with a NONEMPTY summary-selected report on the targeted entry — the mutation-
+    /// sensitive vector (an empty report would produce the identical reason-alone string under
+    /// the old constant-only assignment, making the case structurally mutation-incapable).
+    /// Every other entry must stay verbatim.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_HistoricalEntries_BudgetExhausted_LastOccurrenceWins_OthersUntouched()
+    {
+        // Arrange: exhaust the iteration budget so the no-op path takes the terminal branch.
+        var (driver, pipeline, goalStore) = CreateNoOpDriver();
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        // Older iteration's entry (must stay untouched).
+        var olderIterationCompletedAt = DateTime.UtcNow.AddMinutes(-9);
+        var olderIterationEntry = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = 0,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            CompletedAt = olderIterationCompletedAt,
+            WorkerOutput = "OLDER-ITERATION-EVIDENCE-TERMINAL: previous iteration output",
+        };
+        pipeline.PhaseLog.Add(olderIterationEntry);
+
+        // Earlier occurrence of the current iteration (must stay untouched).
+        var earlierOccurrenceCompletedAt = DateTime.UtcNow.AddMinutes(-1);
+        var earlierOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            CompletedAt = earlierOccurrenceCompletedAt,
+            WorkerOutput = "FIRST-OCCURRENCE-EVIDENCE-TERMINAL: first attempt output",
+        };
+        pipeline.PhaseLog.Add(earlierOccurrence);
+
+        // LAST occurrence of the current iteration — the entry the no-op path targets.
+        var lastOccurrence = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 2);
+        pipeline.PhaseLog.Add(lastOccurrence);
+
+        // Unrelated trailing phase entry (must stay untouched).
+        var unrelatedTrailing = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddSeconds(-20),
+            WorkerOutput = "UNRELATED-TRAILING-EVIDENCE-TERMINAL: tester output",
+        };
+        pipeline.PhaseLog.Add(unrelatedTrailing);
+
+        // Act: NONEMPTY summary-selected report (8KB+ realistic text) — the exact
+        // reason-plus-report assertion on this entry is what fails under the constant-only
+        // mutation; an empty-report vector here would be mutation-incapable.
+        var report = BuildNoOpReport("HISTORICAL-TERMINAL");
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-historical-terminal",
+            Status = TaskOutcome.Completed,
+            Output = "DIFFERENT-RAW-OUTPUT-HISTORICAL-TERMINAL: not stored when the summary wins",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: ONLY the last current-iteration occurrence got the exact reason-plus-report.
+        Assert.Equal(PhaseOutcome.Fail, lastOccurrence.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, lastOccurrence.WorkerOutput);
+        Assert.NotNull(lastOccurrence.CompletedAt);
+
+        // Assert: every other entry retains its original state verbatim — seeded CompletedAt
+        // values proven with EXACT equality.
+        Assert.Equal(PhaseOutcome.Pass, olderIterationEntry.Result);
+        Assert.Equal("OLDER-ITERATION-EVIDENCE-TERMINAL: previous iteration output", olderIterationEntry.WorkerOutput);
+        Assert.Equal(olderIterationCompletedAt, olderIterationEntry.CompletedAt);
+        Assert.Equal(PhaseOutcome.Pass, earlierOccurrence.Result);
+        Assert.Equal("FIRST-OCCURRENCE-EVIDENCE-TERMINAL: first attempt output", earlierOccurrence.WorkerOutput);
+        Assert.Equal(earlierOccurrenceCompletedAt, earlierOccurrence.CompletedAt);
+        Assert.Equal(PhaseOutcome.Pass, unrelatedTrailing.Result);
+        Assert.Equal("UNRELATED-TRAILING-EVIDENCE-TERMINAL: tester output", unrelatedTrailing.WorkerOutput);
+
+        // Assert: goal failed via the terminal path; the terminal summary (the only one, from
+        // FinalizeGoalAsync) carries all four entries — the three untouched ones verbatim and
+        // the targeted one with the exact reason-plus-report string.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Metadata?.IterationSummary is not null);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        var summary = failedUpdate.Metadata!.IterationSummary!;
+        var codingInSummary = summary.Phases
+            .Where(p => p.Name == GoalPhase.Coding)
+            .ToList();
+        Assert.Equal(2, codingInSummary.Count);
+        var summaryLastOccurrence = Assert.Single(codingInSummary, p => p.Occurrence == 2);
+        Assert.Equal(PhaseOutcome.Fail, summaryLastOccurrence.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, summaryLastOccurrence.WorkerOutput);
+        var summaryEarlierOccurrence = Assert.Single(codingInSummary, p => p.Occurrence == 1);
+        Assert.Equal(PhaseOutcome.Pass, summaryEarlierOccurrence.Result);
+        Assert.Equal("FIRST-OCCURRENCE-EVIDENCE-TERMINAL: first attempt output", summaryEarlierOccurrence.WorkerOutput);
+        Assert.Contains(summary.Phases, p => p.Name == GoalPhase.Testing && p.WorkerOutput == "UNRELATED-TRAILING-EVIDENCE-TERMINAL: tester output");
+    }
+
+    // ── Test 6: SQLite end-to-end — retry path ────────────────────────────
+
+    /// <summary>
+    /// Driver-completion → real lifecycle/status persistence → SQLite
+    /// <see cref="GoalStore.GetIterationsAsync"/> chain for the RETRY path: the no-op iteration
+    /// summary (reason + report, summary-selected form) must be persisted by the driver's
+    /// pre-consume InProgress write, exactly once.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_SummarySelected_PersistsReasonPlusReportForRetryIteration()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore) = await CreateSqliteNoOpDriver(dbContext, exhaustBudget: false);
+
+        var report = BuildNoOpReport("SQLITE-RETRY-SUMMARY");
+        const string rawOutput = "DIFFERENT-RAW-OUTPUT-SQLITE-RETRY";
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-sqlite-retry",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: retry state machine advanced to iteration 2.
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
+        // Assert through the REAL persistence chain: GetIterationsAsync returns exactly the
+        // driver's pre-consume summary (no FinalizeGoalAsync summary on the retry path).
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persisted.PhaseOutputs["coder-1"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persisted.PhaseOutputs["coder-1-1"]);
+
+        // The goal is still InProgress (the retry continues) — read through the real store.
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.InProgress, persistedGoal!.Status);
+    }
+
+    /// <summary>SQLite retry path with raw fallback — full raw Output persisted verbatim.</summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_RawFallback_PersistsReasonPlusFullRawOutputForRetryIteration()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore) = await CreateSqliteNoOpDriver(dbContext, exhaustBudget: false);
+
+        var rawOutput = BuildNoOpReport("SQLITE-RETRY-RAW");
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-sqlite-retry-raw",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "   " },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-1"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-1-1"]);
+
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.InProgress, persistedGoal!.Status);
+    }
+
+    /// <summary>
+    /// SQLite retry path with an EMPTY selected report — the reason-ALONE form through the real
+    /// persistence chain: the persisted phase and BOTH compatibility/per-occurrence mappings
+    /// carry exactly "Coder produced no file changes (no-op)" (no separator), with the correct
+    /// iteration and Fail outcome.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_EmptyReport_PersistsReasonAloneForRetryIteration()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore) = await CreateSqliteNoOpDriver(dbContext, exhaustBudget: false);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-sqlite-retry-empty",
+            Status = TaskOutcome.Completed,
+            Output = "",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: retry state machine advanced to iteration 2.
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
+        // Assert through the REAL persistence chain: the reason-alone string is stored in the
+        // phase entry AND in BOTH output mappings, with the correct iteration and Fail outcome.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.Equal("Coder produced no file changes (no-op)", persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)", persisted.PhaseOutputs["coder-1"]);
+        Assert.Equal("Coder produced no file changes (no-op)", persisted.PhaseOutputs["coder-1-1"]);
+
+        // The goal is still InProgress (the retry continues) — read through the real store.
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.InProgress, persistedGoal!.Status);
+    }
+
+    // ── Test 7: SQLite end-to-end — budget-exhausted terminal path ─────────
+
+    /// <summary>
+    /// Budget-exhausted SQLite chain: the terminal summary comes from
+    /// <see cref="GoalLifecycleService.MarkGoalFailedAsync"/> (through a real
+    /// <see cref="GoalDispatcher"/>) — assert the full stored reason-plus-report string there.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_Exhausted_SummarySelected_PersistsReasonPlusReportOnTerminalFailure()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (dispatcher, pipeline, goalStore, _, capturingLogger) = await CreateSqliteNoOpDispatcher(dbContext, exhaustBudget: true);
+
+        var report = BuildNoOpReport("SQLITE-TERMINAL-SUMMARY");
+        const string rawOutput = "DIFFERENT-RAW-OUTPUT-SQLITE-TERMINAL";
+        var taskId = pipeline.ActiveTaskId
+            ?? throw new InvalidOperationException("the seeded task must be the pipeline's active task");
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the drive/finalize path ran without an exception (a swallowed drive error
+        // would leave the goal InProgress and would make the Failed assertions misleading).
+        Assert.Null(capturingLogger.LastException);
+
+        // Assert: terminalized as Failed by the existing lifecycle path.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+        Assert.Equal(
+            "Coder produced no file changes after max iterations (no-op)",
+            persistedGoal.FailureReason);
+
+        // Assert through the REAL persistence chain: the terminal summary from FinalizeGoalAsync
+        // carries the EXACT reason-plus-report string, at the terminal iteration, in BOTH the
+        // compatibility and per-occurrence output mappings.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(5, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persisted.PhaseOutputs["coder-5"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + report, persisted.PhaseOutputs["coder-5-1"]);
+
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    /// <summary>Raw fallback on the budget-exhausted SQLite path — full raw Output persisted.</summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_Exhausted_RawFallback_PersistsReasonPlusFullRawOutputOnTerminalFailure()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (dispatcher, pipeline, goalStore, _, capturingLogger) = await CreateSqliteNoOpDispatcher(dbContext, exhaustBudget: true);
+
+        var rawOutput = BuildNoOpReport("SQLITE-TERMINAL-RAW");
+        var taskId = pipeline.ActiveTaskId
+            ?? throw new InvalidOperationException("the seeded task must be the pipeline's active task");
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "" },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Null(capturingLogger.LastException);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(5, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-5"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-5-1"]);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Builds a realistic 8KB+ multiline no-op report with distinct evidence markers past
+    /// char 500, past char 4,000, and at the very tail.
+    /// </summary>
+    private static string BuildNoOpReport(string markerPrefix)
+    {
+        const string head = "NO-OP REPORT HEAD: analysis only, no file edits.\n";
+        var beyond500 = $"{markerPrefix}-BEYOND-500: a legacy 500-char preview would lose this marker.\n";
+        var beyond4000 = $"{markerPrefix}-BEYOND-4000: a legacy 4,000-char cap would lose this marker.\n";
+        var tail = $"{markerPrefix}-TAIL-EVIDENCE-AT-END: final recommendation text.";
+        return head
+            + new string('a', 500 - head.Length) + beyond500
+            + new string('b', 4_000 - 500 - beyond500.Length) + beyond4000
+            + new string('c', 5_500) + tail;
+    }
+
+    /// <summary>
+    /// Creates a no-op driver wired to a REAL SQLite <see cref="GoalStore"/>: the goal is
+    /// created in the store, registered as a source (mirroring GoalDispatchService's
+    /// GetNextGoalAsync + InProgress write), and the pipeline is positioned in Coding.
+    /// When <paramref name="exhaustBudget"/> is set, the iteration budget is consumed so the
+    /// no-op path takes the terminal branch.
+    /// </summary>
+    private static async Task<(PipelineDriver Driver, GoalPipeline Pipeline, GoalStore Store)>
+        CreateSqliteNoOpDriver(CopilotHiveDbContext dbContext, bool exhaustBudget)
+    {
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-noop-sqlite-{Guid.NewGuid():N}",
+            Description = "No-op report retention SQLite test",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        // Register the goal in the source map first (Pending, as GoalDispatchService would see
+        // it), then mirror GoalDispatchService's InProgress write so the later status
+        // transitions apply to the stored row.
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken))?.Id);
+        await goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, TestContext.Current.CancellationToken);
+
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        // Mirror the production restore path (RestoreActivePipelinesAsync): the state machine
+        // must be positioned in Coding BEFORE AdvanceTo, otherwise the completion is dropped
+        // by the planning-window guard (StateMachine.Phase still Planning).
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        if (exhaustBudget)
+        {
+            for (var i = 0; i < 4; i++)
+                pipeline.IterationBudget.TryConsume();
+            Assert.True(pipeline.IterationBudget.IsExhausted);
+        }
+
+        // The phase entry the no-op completion must land on (the in-memory CreateNoOpDriver
+        // tests seed this themselves; seeding here keeps both SQLite helpers self-contained).
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1));
+
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var driver = new PipelineDriver(
+            brain: new NoOpRetryFakeBrain(),
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("retry with stronger prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ => Task.CompletedTask,
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return (driver, pipeline, goalStore);
+    }
+
+    /// <summary>
+    /// Creates a REAL <see cref="GoalDispatcher"/> over a SQLite <see cref="GoalStore"/> with
+    /// the pipeline seeded for the budget-exhausted no-op path: the completion flows through
+    /// TaskCompletionService → PipelineDriver → GoalLifecycleService.MarkGoalFailedAsync,
+    /// and the terminal summary is persisted by the real store.
+    /// </summary>
+    private static async Task<(GoalDispatcher Dispatcher, GoalPipeline Pipeline, GoalStore Store, GoalPipelineManager PipelineManager, PipelineDriverCapturingLogger<GoalDispatcher> Logger)>
+        CreateSqliteNoOpDispatcher(CopilotHiveDbContext dbContext, bool exhaustBudget)
+    {
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-noop-sqlite-dispatcher-{Guid.NewGuid():N}",
+            Description = "No-op report retention SQLite dispatcher test",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken))?.Id);
+        await goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        // Mirror the production restore path (see CreateSqliteNoOpDriver): the state machine
+        // must be positioned in Coding BEFORE AdvanceTo.
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        if (exhaustBudget)
+        {
+            for (var i = 0; i < 4; i++)
+                pipeline.IterationBudget.TryConsume();
+            Assert.True(pipeline.IterationBudget.IsExhausted);
+        }
+
+        // The phase entry the no-op completion must land on.
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        var taskId = $"task-noop-sqlite-terminal-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        Assert.True(pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, GoalPhase.Coding, 1),
+            attempt: 1,
+            WorkSlotState.Pending));
+
+        var capturingLogger = new PipelineDriverCapturingLogger<GoalDispatcher>();
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            capturingLogger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: new NoOpRetryFakeBrain(),
+            config: BuildNoOpDispatcherConfig());
+
+        return (dispatcher, pipeline, goalStore, pipelineManager, capturingLogger);
+    }
+
+    /// <summary>Dispatcher config for the SQLite no-op dispatcher tests (mirrors the failed-worker pattern).</summary>
+    private static HiveConfigFile BuildNoOpDispatcherConfig() => new()
+    {
+        Repositories =
+        [
+            new RepositoryConfig
+            {
+                Name = "CopilotHive",
+                Url = "https://example.invalid/CopilotHive.git",
+                DefaultBranch = "main",
+            },
+        ],
+        Workers =
+        {
+            ["coder"] = new WorkerConfig { Model = "test-coder-model" },
+            ["tester"] = new WorkerConfig { Model = "test-tester-model" },
+            ["reviewer"] = new WorkerConfig { Model = "test-reviewer-model" },
+            ["docwriter"] = new WorkerConfig { Model = "test-docwriter-model" },
+            ["improver"] = new WorkerConfig { Model = "test-improver-model" },
+        },
+    };
 
     private static (PipelineDriver Driver, GoalPipeline Pipeline, IterationCapturingGoalStore Store) CreateNoOpDriver(
         Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task>? dispatchToRole = null)
@@ -1421,7 +2313,7 @@ public sealed class PipelineDriverFailedWorkerTests
             attempt: 1,
             WorkSlotState.Pending));
 
-        var logger = new CapturingLogger<GoalDispatcher>();
+        var logger = new PipelineDriverCapturingLogger<GoalDispatcher>();
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,

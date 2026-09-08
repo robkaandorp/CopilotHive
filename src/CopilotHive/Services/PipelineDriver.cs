@@ -198,7 +198,16 @@ internal sealed class PipelineDriver
             {
                 codingEntry.Result = PhaseOutcome.Fail;
                 codingEntry.CompletedAt = DateTime.UtcNow;
-                codingEntry.WorkerOutput = "Coder produced no file changes (no-op)";
+                // Store the no-op reason plus the worker's report — selected exactly like the
+                // retry-context below (nonblank Metrics.Summary wins, otherwise the raw Output).
+                // The report is preserved VERBATIM: no trimming, no cap, no concatenation of the
+                // competing output when a summary was selected.
+                var noOpReport = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
+                    ? result.Metrics.Summary
+                    : result.Output;
+                codingEntry.WorkerOutput = string.IsNullOrWhiteSpace(noOpReport)
+                    ? "Coder produced no file changes (no-op)"
+                    : "Coder produced no file changes (no-op)\n\n" + noOpReport;
             }
 
             // If the iteration budget is exhausted there is no retry possible: fail the goal
