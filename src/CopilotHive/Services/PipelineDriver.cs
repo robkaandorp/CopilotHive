@@ -201,11 +201,13 @@ internal sealed class PipelineDriver
                 // Store the no-op reason plus the worker's report — selected exactly like the
                 // retry-context below (nonblank Metrics.Summary wins, otherwise the raw Output).
                 // The report is preserved VERBATIM: no trimming, no cap, no concatenation of the
-                // competing output when a summary was selected.
+                // competing output when a summary was selected. Only an EMPTY (null/zero-length)
+                // selected report falls back to the reason alone; whitespace-only reports are
+                // kept as-is (reason + "\n\n" + the whitespace verbatim).
                 var noOpReport = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
                     ? result.Metrics.Summary
                     : result.Output;
-                codingEntry.WorkerOutput = string.IsNullOrWhiteSpace(noOpReport)
+                codingEntry.WorkerOutput = string.IsNullOrEmpty(noOpReport)
                     ? "Coder produced no file changes (no-op)"
                     : "Coder produced no file changes (no-op)\n\n" + noOpReport;
             }

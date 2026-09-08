@@ -995,13 +995,16 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Contains("RAW-EVIDENCE-BEYOND-4000", codingEntry.WorkerOutput);
     }
 
-    /// <summary>Empty or whitespace selected report → the reason alone, exactly as before.</summary>
+    /// <summary>
+    /// Empty selected report (null or zero-length) → the reason alone, exactly as before.
+    /// This includes the fall-through case where a whitespace-only Metrics.Summary loses to an
+    /// EMPTY raw Output — the selected report is empty, so only the reason is stored.
+    /// </summary>
     [Theory]
-    [InlineData(null, null)]     // no Metrics, no Output
-    [InlineData("", "")]         // empty summary + empty output
-    [InlineData("  ", " \t\n ")] // whitespace summary + whitespace raw output → reason alone
-    [InlineData(null, " \r\n ")] // whitespace raw output with no summary → reason alone
-    public async Task NoOpRetry_EmptyOrWhitespaceReport_StoresReasonAlone(string? summary, string? output)
+    [InlineData(null, null)]     // no Metrics, no Output → selected report is ""
+    [InlineData("", "")]         // empty summary + empty output → selected report is ""
+    [InlineData("  ", "")]       // whitespace summary loses to an EMPTY output → reason alone
+    public async Task NoOpRetry_EmptyReport_StoresReasonAlone(string? summary, string? output)
     {
         var (driver, pipeline, _) = CreateNoOpDriver();
         var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
@@ -1020,6 +1023,47 @@ public sealed class PipelineDriverNoOpRetryTests
 
         // Assert: reason alone — no trailing separators, no empty report section.
         Assert.Equal("Coder produced no file changes (no-op)", codingEntry.WorkerOutput);
+        Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
+        Assert.NotNull(codingEntry.CompletedAt);
+
+        // Retry path still ran: budget consumed, fresh retry entry added for iteration 2.
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal(GoalPhase.Coding, pipeline.PhaseLog[1].Name);
+    }
+
+    /// <summary>
+    /// A nonempty WHITESPACE-ONLY selected report is NOT treated as empty: the reason plus
+    /// two LF characters plus the whitespace VERBATIM — spaces, tabs, LF and CRLF preserved
+    /// exactly, with NO trimming and NO line-ending normalization.
+    /// </summary>
+    [Theory]
+    [InlineData("  ", " \t\n ")]   // whitespace summary loses to whitespace output → stored verbatim
+    [InlineData(null, " \r\n ")]   // whitespace raw output with no summary → stored verbatim
+    [InlineData(null, "\t\t")]     // tabs only → stored verbatim
+    [InlineData(null, "\n")]       // a single LF → stored verbatim
+    [InlineData(null, "\r\n\r\n")] // CRLF pairs → stored verbatim, no normalization to LF
+    public async Task NoOpRetry_WhitespaceOnlyReport_StoresReasonPlusWhitespaceVerbatim(string? summary, string output)
+    {
+        var (driver, pipeline, _) = CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-whitespace",
+            Status = TaskOutcome.Completed,
+            Output = output,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = summary is null
+                ? null
+                : new TaskMetrics { Verdict = "PASS", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: EXACT stored string — reason, blank line, then the whitespace verbatim
+        // (Assert.Equal with an ordinal comparison requires byte-for-byte equality, so any
+        // trimming or CRLF→LF normalization would fail here).
+        Assert.Equal("Coder produced no file changes (no-op)\n\n" + output, codingEntry.WorkerOutput);
         Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
         Assert.NotNull(codingEntry.CompletedAt);
 
@@ -1511,6 +1555,55 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Equal(GoalStatus.InProgress, persistedGoal!.Status);
     }
 
+    /// <summary>
+    /// SQLite retry path with a WHITESPACE-ONLY selected report — the reason plus "\n\n" plus
+    /// the whitespace VERBATIM through the real persistence chain: the persisted phase and
+    /// BOTH compatibility/per-occurrence mappings carry the exact complete string (spaces,
+    /// tabs, LF and CRLF preserved, no line-ending normalization), with the correct iteration
+    /// and Fail outcome and an unchanged InProgress retry outcome.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_WhitespaceOnlyRawFallback_PersistsReasonPlusWhitespaceVerbatimForRetryIteration()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore) = await CreateSqliteNoOpDriver(dbContext, exhaustBudget: false);
+
+        // Whitespace-only raw output with mixed LF and CRLF line endings — stored exactly as returned.
+        const string whitespaceOutput = " \t\n \r\n\r\n\t ";
+        Assert.Equal("", whitespaceOutput.Trim()); // guard: input IS whitespace-only
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-sqlite-retry-whitespace",
+            Status = TaskOutcome.Completed,
+            Output = whitespaceOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "  " },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: retry state machine advanced to iteration 2 (unchanged retry outcome).
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+
+        // Assert through the REAL persistence chain: reason + "\n\n" + whitespace verbatim in
+        // the phase entry AND in BOTH output mappings.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        var expected = "Coder produced no file changes (no-op)\n\n" + whitespaceOutput;
+        Assert.Equal(expected, persistedCoding.WorkerOutput);
+        Assert.Equal(expected, persisted.PhaseOutputs["coder-1"]);
+        Assert.Equal(expected, persisted.PhaseOutputs["coder-1-1"]);
+
+        // The goal is still InProgress (the retry continues) — read through the real store.
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.InProgress, persistedGoal!.Status);
+    }
+
     // ── Test 7: SQLite end-to-end — budget-exhausted terminal path ─────────
 
     /// <summary>
@@ -1602,6 +1695,54 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persistedCoding.WorkerOutput);
         Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-5"]);
         Assert.Equal("Coder produced no file changes (no-op)\n\n" + rawOutput, persisted.PhaseOutputs["coder-5-1"]);
+    }
+
+    /// <summary>
+    /// WHITESPACE-ONLY raw fallback on the budget-exhausted SQLite path — the reason plus
+    /// "\n\n" plus the whitespace VERBATIM persisted through the real terminal chain (spaces,
+    /// tabs, LF and CRLF preserved, no line-ending normalization), with the unchanged
+    /// Failed/terminal outcome.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteChain_Exhausted_WhitespaceOnlyRawFallback_PersistsReasonPlusWhitespaceVerbatimOnTerminalFailure()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (dispatcher, pipeline, goalStore, _, capturingLogger) = await CreateSqliteNoOpDispatcher(dbContext, exhaustBudget: true);
+
+        // Whitespace-only raw output with mixed LF and CRLF line endings — stored exactly as returned.
+        const string whitespaceOutput = "\r\n\t \n  \r\n";
+        Assert.Equal("", whitespaceOutput.Trim()); // guard: input IS whitespace-only
+        var taskId = pipeline.ActiveTaskId
+            ?? throw new InvalidOperationException("the seeded task must be the pipeline's active task");
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = whitespaceOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = " " },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Null(capturingLogger.LastException);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var persistedGoal = await goalStore.GetGoalAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        Assert.NotNull(persistedGoal);
+        Assert.Equal(GoalStatus.Failed, persistedGoal!.Status);
+        Assert.Equal(
+            "Coder produced no file changes after max iterations (no-op)",
+            persistedGoal.FailureReason);
+
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(5, persisted.Iteration);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        var expected = "Coder produced no file changes (no-op)\n\n" + whitespaceOutput;
+        Assert.Equal(expected, persistedCoding.WorkerOutput);
+        Assert.Equal(expected, persisted.PhaseOutputs["coder-5"]);
+        Assert.Equal(expected, persisted.PhaseOutputs["coder-5-1"]);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
