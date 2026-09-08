@@ -533,7 +533,8 @@ public class DistributedBrainShadowTests
         string? systemPrompt = null,
         ReasoningEffort? reasoningEffort = null,
         ILogger<DistributedBrain>? logger = null,
-        LlmSessionRegistry? sessionRegistry = null)
+        LlmSessionRegistry? sessionRegistry = null,
+        IGoalStore? goalStore = null)
     {
         var client = chatClient ?? new TrackingChatClient();
         var brain = new DistributedBrain(
@@ -544,6 +545,7 @@ public class DistributedBrainShadowTests
             stateDir: dir,
             chatClient: client,
             compactionModel: compactionModel,
+            goalStore: goalStore,
             hiveConfig: hiveConfig ?? ActorConfig(),
             sessionRegistry: sessionRegistry);
 
@@ -2549,6 +2551,648 @@ public class DistributedBrainShadowTests
                 Assert.NotNull(stub);
                 Assert.Equal(1, stub!.ToolCallCount);
                 Assert.DoesNotContain(stub.ObservedUserPrompts, p => p.Contains("rejected because"));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    // ── PlanIterationAsync clarification-history wiring ────────────────────
+
+    /// <summary>
+    /// A configurable in-memory goal store that returns caller-supplied iteration summaries and
+    /// records the goal identity it was queried for. Delegates everything else to
+    /// <see cref="InMemoryGoalStore"/> via composition.
+    /// </summary>
+    private sealed class RecordingGoalStore : IGoalStore
+    {
+        private readonly InMemoryGoalStore _inner = new();
+        private readonly IReadOnlyList<IterationSummary> _iterations;
+
+        internal RecordingGoalStore(IReadOnlyList<IterationSummary> iterations) => _iterations = iterations;
+
+        internal List<string> QueriedGoalIds { get; } = [];
+
+        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(
+            string goalId, CancellationToken ct = default)
+        {
+            QueriedGoalIds.Add(goalId);
+            return Task.FromResult(_iterations);
+        }
+
+        public string Name => _inner.Name;
+        public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) => _inner.GetAllGoalsAsync(ct);
+        public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) => _inner.GetGoalAsync(goalId, ct);
+        public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default) => _inner.CreateGoalAsync(goal, ct);
+        public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) => _inner.UpdateGoalAsync(goal, ct);
+        public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => _inner.DeleteGoalAsync(goalId, ct);
+        public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) => _inner.SearchGoalsAsync(query, statusFilter, ct);
+        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) => _inner.GetGoalsByStatusAsync(status, ct);
+        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) => _inner.AddIterationAsync(goalId, summary, ct);
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) => _inner.GetPendingGoalsAsync(ct);
+        public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) => _inner.UpdateGoalStatusAsync(goalId, status, metadata, ct);
+        public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) => _inner.CreateReleaseAsync(release, ct);
+        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.GetReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) => _inner.GetReleasesAsync(ct);
+        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => _inner.UpdateReleaseAsync(release, ct);
+        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) => _inner.UpdateReleaseAsync(releaseId, update, ct);
+        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.DeleteReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.GetGoalsByReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) => _inner.GetPipelineConversationAsync(goalId, ct);
+        public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => _inner.ResetGoalIterationDataAsync(goalId, ct);
+        public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) => _inner.GetAllClarificationsAsync(limit, ct);
+    }
+
+    /// <summary>A goal store whose iteration read fails — the configured-store failure path.</summary>
+    private sealed class ThrowingGoalStore : IGoalStore
+    {
+        private readonly InMemoryGoalStore _inner = new();
+
+        public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(
+            string goalId, CancellationToken ct = default)
+            => throw new InvalidOperationException("store read boom");
+
+        public string Name => _inner.Name;
+        public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) => _inner.GetAllGoalsAsync(ct);
+        public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) => _inner.GetGoalAsync(goalId, ct);
+        public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default) => _inner.CreateGoalAsync(goal, ct);
+        public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) => _inner.UpdateGoalAsync(goal, ct);
+        public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => _inner.DeleteGoalAsync(goalId, ct);
+        public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) => _inner.SearchGoalsAsync(query, statusFilter, ct);
+        public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) => _inner.GetGoalsByStatusAsync(status, ct);
+        public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) => _inner.AddIterationAsync(goalId, summary, ct);
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) => _inner.GetPendingGoalsAsync(ct);
+        public Task UpdateGoalStatusAsync(string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) => _inner.UpdateGoalStatusAsync(goalId, status, metadata, ct);
+        public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) => _inner.CreateReleaseAsync(release, ct);
+        public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.GetReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) => _inner.GetReleasesAsync(ct);
+        public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => _inner.UpdateReleaseAsync(release, ct);
+        public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) => _inner.UpdateReleaseAsync(releaseId, update, ct);
+        public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.DeleteReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) => _inner.GetGoalsByReleaseAsync(releaseId, ct);
+        public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) => _inner.GetPipelineConversationAsync(goalId, ct);
+        public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => _inner.ResetGoalIterationDataAsync(goalId, ct);
+        public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) => _inner.GetAllClarificationsAsync(limit, ct);
+    }
+
+    /// <summary>
+    /// A full PlanIterationAsync run through the fake-client/actor seam: the goal store holds a
+    /// persisted-only iteration-1 record, the live bag is otherwise empty, and one current
+    /// live record exists. The planning prompt must carry ALL records inside the explicitly
+    /// framed clarification-history section — including content that CANNOT survive the
+    /// 2,000-character conversation-history truncation — and the store must be queried for the
+    /// pipeline's own goal identity.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_MergesPersistedAndLiveClarifications_IntoFramedSection()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var longAnswer = new string('p', 2500) + $"\n{PlanIterationTailMarker}\nEND";
+            var persistedRecord = new ClarificationEntry(
+                new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                "goal-clar-1", 1, "Coding", "coder",
+                "Persisted question from iteration 1?", longAnswer, "human")
+            { Occurrence = 1 };
+
+            var store = new RecordingGoalStore(
+            [
+                new IterationSummary
+                {
+                    Iteration = 1,
+                    Phases = [],
+                    Clarifications =
+                    [
+                        new PersistedClarification
+                        {
+                            Timestamp = persistedRecord.Timestamp,
+                            Phase = persistedRecord.Phase,
+                            WorkerRole = persistedRecord.WorkerRole,
+                            Question = persistedRecord.Question,
+                            Answer = persistedRecord.Answer,
+                            AnsweredBy = persistedRecord.AnsweredBy,
+                            Occurrence = persistedRecord.Occurrence,
+                        },
+                    ],
+                },
+            ]);
+
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]),
+                goalStore: store);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-1", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-1", "clarification planning goal");
+                pipeline.IterationBudget.TryConsume(); // pipeline.Iteration == 2
+
+                // Empty live bag for prior records + exactly one current live record.
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    new DateTime(2024, 1, 2, 0, 0, 0, DateTimeKind.Utc),
+                    "goal-clar-1", 2, "Coding", "coder",
+                    "Live current-iteration question?", "Live answer.", "composer")
+                { Occurrence = 2 });
+
+                var result = await brain.PlanIterationAsync(
+                    pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsFailed);
+                Assert.NotNull(result.Plan);
+
+                // The store was queried for THIS pipeline's goal identity — not another goal.
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .FirstOrDefault(p => p.Contains("Plan the workflow for iteration 2"));
+                Assert.NotNull(planningPrompt);
+
+                // The framed section contains the persisted record (complete, including the
+                // tail marker past the 2,000-char conversation cap).
+                var sectionStart = planningPrompt!.IndexOf(
+                    "=== Clarification history (complete, untruncated) ===", StringComparison.Ordinal);
+                var sectionEnd = planningPrompt.IndexOf("=== End clarification history ===", StringComparison.Ordinal);
+                Assert.NotEqual(-1, sectionStart);
+                Assert.NotEqual(-1, sectionEnd);
+                Assert.True(sectionStart < sectionEnd);
+                var section = planningPrompt[sectionStart..(sectionEnd + "=== End clarification history ===".Length)];
+
+                Assert.Contains("Persisted question from iteration 1?", section);
+                Assert.Contains(PlanIterationTailMarker, section);
+                Assert.Contains(longAnswer, section);
+                Assert.Contains("iteration 1, phase Coding, occurrence 1, worker role coder", section);
+                Assert.Contains("answered by: human", section);
+
+                // The current live record is present too.
+                Assert.Contains("Live current-iteration question?", section);
+                Assert.Contains("A: Live answer.", section);
+                Assert.Contains("answered by: composer", section);
+
+                // The long answer is NOT merely surviving in an incidental conversation-history
+                // copy: every occurrence of the tail marker in the whole prompt must come from
+                // the framed clarification-history section (asserted above). The conversation
+                // summary — when present — is capped at 2,000 characters, so it can never
+                // carry the tail of the 2,500-char answer. When the pipeline conversation is
+                // empty, no conversation summary is emitted at all, so the total-count guard
+                // holds in both cases instead of assuming a section an empty conversation
+                // cannot produce.
+                Assert.Equal(1, CountOccurrences(planningPrompt, PlanIterationTailMarker));
+
+                // The store was queried exactly for the pipeline's goal id.
+                Assert.Equal(["goal-clar-1"], store.QueriedGoalIds);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    private const string PlanIterationTailMarker = "PLAN-ITER-TAIL-MARKER-PAST-2000";
+
+    /// <summary>
+    /// An exact persisted/live duplicate appears once, while distinct answers, occurrences,
+    /// and repeated questions are all preserved (never collapsed).
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_DeduplicatesExactDuplicates_PreservesDistinctRecords()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var sharedTimestamp = new DateTime(2024, 5, 5, 0, 0, 0, DateTimeKind.Utc);
+            var duplicated = new PersistedClarification
+            {
+                Timestamp = sharedTimestamp,
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Same question?",
+                Answer = "Same answer.",
+                AnsweredBy = "brain",
+                Occurrence = 1,
+            };
+            var distinctAnswer = new PersistedClarification
+            {
+                Timestamp = sharedTimestamp,
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Same question?",
+                Answer = "A DIFFERENT answer.",
+                AnsweredBy = "human",
+                Occurrence = 1,
+            };
+            var distinctOccurrence = new PersistedClarification
+            {
+                Timestamp = sharedTimestamp,
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Same question?",
+                Answer = "Same answer.",
+                AnsweredBy = "brain",
+                Occurrence = 2,
+            };
+            var repeatedQuestion = new PersistedClarification
+            {
+                Timestamp = sharedTimestamp.AddSeconds(1),
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Same question?",
+                Answer = "Later answer after re-asking.",
+                AnsweredBy = "brain",
+                Occurrence = 1,
+            };
+
+            var store = new RecordingGoalStore(
+            [
+                new IterationSummary { Iteration = 1, Phases = [], Clarifications = [duplicated] },
+                new IterationSummary { Iteration = 2, Phases = [], Clarifications = [distinctAnswer] },
+                new IterationSummary { Iteration = 2, Phases = [], Clarifications = [distinctOccurrence, repeatedQuestion] },
+            ]);
+
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]),
+                goalStore: store);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-dedup", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-dedup");
+                pipeline.IterationBudget.TryConsume(); // iteration 2
+                pipeline.IterationBudget.TryConsume(); // iteration 3
+
+                // Live bag: the exact duplicate of the persisted iteration-1 record plus a
+                // future-iteration record (iteration 4 > current 3 → excluded).
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    sharedTimestamp, "goal-clar-dedup", 1, "Coding", "coder",
+                    "Same question?", "Same answer.", "brain") { Occurrence = 1 });
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    sharedTimestamp, "goal-clar-dedup", 4, "Coding", "coder",
+                    "Future question?", "Future answer.", "human") { Occurrence = 1 });
+
+                await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .First(p => p.Contains("Plan the workflow for iteration 3"));
+                var section = planningPrompt[
+                    planningPrompt.IndexOf("=== Clarification history", StringComparison.Ordinal)..];
+                section = section[..(section.IndexOf("=== End clarification history ===", StringComparison.Ordinal)
+                    + "=== End clarification history ===".Length)];
+
+                // The exact duplicate (persisted iteration-1 + live copy: same iteration,
+                // timestamp, question, answer, answered-by, occurrence) collapses to ONE
+                // record. The rendered record header is the dedup needle — it is unique to
+                // the deduplicated record, unlike the question text shared by all four
+                // surviving records. Four records survive in total: the deduplicated record
+                // plus the three distinct ones (different answer, occurrence 2, repeated
+                // question with a later timestamp/answer).
+                Assert.Equal(4, CountOccurrences(section, "Q: Same question?"));
+                // The deduplicated record's header line appears exactly ONCE — the live
+                // exact duplicate of the persisted record was removed.
+                Assert.Equal(1, CountOccurrences(section,
+                    "[1] iteration 1, phase Coding, occurrence 1, worker role coder, "
+                    + "2024-05-05 00:00:00Z — answered by: brain"));
+                // Distinct answers are NOT collapsed.
+                Assert.Contains("A: Same answer.", section);
+                Assert.Contains("A: A DIFFERENT answer.", section);
+                Assert.Contains("answered by: human", section);
+                // Distinct occurrences are NOT collapsed.
+                Assert.Contains("occurrence 2, worker role coder", section);
+                // The repeated question (different timestamp/answer) is retained.
+                Assert.Contains("Later answer after re-asking.", section);
+                Assert.Equal(1, CountOccurrences(section, "Later answer after re-asking."));
+                // The future-iteration record is excluded.
+                Assert.DoesNotContain("Future question?", section);
+                // Ordering is deterministic: iteration 1 records before iteration 2 records.
+                var iter1Index = section.IndexOf("iteration 1, phase Coding", StringComparison.Ordinal);
+                var iter2Index = section.IndexOf("iteration 2, phase Coding", StringComparison.Ordinal);
+                Assert.True(iter1Index < iter2Index, "Records must be ordered by iteration.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// Records tying on iteration, timestamp, phase, worker role, question, and occurrence are
+    /// ordered by ordinal Answer/AnsweredBy content — never by the unspecified enumeration
+    /// order of the live bag or the caller-supplied store order. The tied pairs are supplied
+    /// in source order REVERSED relative to their content order (both via the persisted store
+    /// list and the live ConcurrentBag), so the expected output holds ONLY when the tie-break
+    /// sort compares field content and fails if the sorter fell back to the source index.
+    /// The records tie on the same iteration, so the weaker iteration-ordering assertion in
+    /// <see cref="PlanIterationAsync_DeduplicatesExactDuplicates_PreservesDistinctRecords"/>
+    /// cannot catch this case — this is a distinct coverage vector.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_TiedRecordsOrderedByAnswerContent_NotSourceOrder()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            var tiedTimestamp = new DateTime(2024, 6, 6, 0, 0, 0, DateTimeKind.Utc);
+
+            // Persisted pair: identical iteration/timestamp/phase/role/question/occurrence,
+            // differing only in Answer and AnsweredBy. Supplied in REVERSE content order.
+            var persistedLate = new PersistedClarification
+            {
+                Timestamp = tiedTimestamp,
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Tied persisted question?",
+                Answer = "Zebra answer.",
+                AnsweredBy = "human",
+                Occurrence = 1,
+            };
+            var persistedEarly = new PersistedClarification
+            {
+                Timestamp = tiedTimestamp,
+                Phase = "Coding",
+                WorkerRole = "coder",
+                Question = "Tied persisted question?",
+                Answer = "Alpha answer.",
+                AnsweredBy = "brain",
+                Occurrence = 1,
+            };
+
+            var store = new RecordingGoalStore(
+            [
+                new IterationSummary
+                {
+                    Iteration = 1,
+                    Phases = [],
+                    Clarifications = [persistedLate, persistedEarly], // source order: Zebra, Alpha
+                },
+            ]);
+
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]),
+                goalStore: store);
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-tiebreak", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-tiebreak");
+                pipeline.IterationBudget.TryConsume(); // iteration 2
+
+                // Live pair: identical iteration (2, the current one), timestamp, phase,
+                // worker role, question, occurrence; differing only in Answer/AnsweredBy.
+                // Added to the live bag in CONTENT order — but ConcurrentBag enumerates in
+                // reverse insertion order (LIFO for a single-threaded producer, verified on
+                // this runtime), so the sorter's input order is Zulu-then-Alpha: the
+                // opposite of the asserted field-content order.
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    tiedTimestamp, "goal-clar-tiebreak", 2, "Coding", "coder",
+                    "Tied live question?", "Alpha live answer.", "composer") { Occurrence = 1 });
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    tiedTimestamp, "goal-clar-tiebreak", 2, "Coding", "coder",
+                    "Tied live question?", "Zulu live answer.", "brain") { Occurrence = 1 });
+
+                var result = await brain.PlanIterationAsync(
+                    pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.False(result.IsFailed);
+                Assert.NotNull(result.Plan);
+
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .First(p => p.Contains("Plan the workflow for iteration 2"));
+                var section = planningPrompt[
+                    planningPrompt.IndexOf("=== Clarification history", StringComparison.Ordinal)..];
+                section = section[..(section.IndexOf("=== End clarification history ===", StringComparison.Ordinal)
+                    + "=== End clarification history ===".Length)];
+
+                // All four tied-but-distinct records are present — none collapsed.
+                Assert.Contains("Tied persisted question?", section);
+                Assert.Contains("Tied live question?", section);
+                Assert.Equal(1, CountOccurrences(section, "A: Alpha answer."));
+                Assert.Equal(1, CountOccurrences(section, "A: Zebra answer."));
+                Assert.Equal(1, CountOccurrences(section, "A: Alpha live answer."));
+                Assert.Equal(1, CountOccurrences(section, "A: Zulu live answer."));
+
+                // Exact deterministic order: within each tied pair, the record whose answer
+                // sorts earlier comes first — regardless of the source (store list vs live
+                // bag) enumeration order, which is deliberately reversed here. With a
+                // source-index fallback the reversed pairs would render in the opposite
+                // (Zebra/Zulu-first) order and this assertion would fail.
+                var alphaPersisted = section.IndexOf("A: Alpha answer.", StringComparison.Ordinal);
+                var zebraPersisted = section.IndexOf("A: Zebra answer.", StringComparison.Ordinal);
+                var alphaLive = section.IndexOf("A: Alpha live answer.", StringComparison.Ordinal);
+                var zuluLive = section.IndexOf("A: Zulu live answer.", StringComparison.Ordinal);
+                Assert.True(alphaPersisted >= 0 && zebraPersisted >= 0 && alphaLive >= 0 && zuluLive >= 0);
+                Assert.True(alphaPersisted < zebraPersisted,
+                    "Tied persisted records must be ordered by answer content, not source order.");
+                Assert.True(alphaLive < zuluLive,
+                    "Tied live records must be ordered by answer content, not ConcurrentBag order.");
+
+                // Iteration grouping still holds: both persisted iteration-1 records before
+                // both live iteration-2 records (the weaker cross-iteration ordering still
+                // holds even though this test's discriminating pairs tie WITHIN an iteration).
+                Assert.True(zebraPersisted < alphaLive, "Iteration 1 records must precede iteration 2 records.");
+                Assert.True(zebraPersisted < zuluLive, "Iteration 1 records must precede iteration 2 records.");
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    private static int CountOccurrences(string text, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) != -1)
+        {
+            count++;
+            index += needle.Length;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Foreign-goal live records are excluded from the clarification history, and records from
+    /// future iterations never reach the planning prompt.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_ForeignGoalAndFutureIterationRecords_Excluded()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-scope", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-scope");
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    DateTime.UtcNow, "goal-clar-scope", 1, "Coding", "coder",
+                    "This goal's question?", "This goal's answer.", "human") { Occurrence = 1 });
+                // A foreign-goal record in the live bag (e.g. cross-goal leakage) — excluded.
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    DateTime.UtcNow, "some-OTHER-goal", 1, "Coding", "coder",
+                    "Foreign goal question?", "Foreign answer.", "human") { Occurrence = 1 });
+                // A future-iteration record — excluded.
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    DateTime.UtcNow, "goal-clar-scope", 9, "Coding", "coder",
+                    "Future iteration question?", "Future answer.", "human") { Occurrence = 1 });
+
+                await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .First(p => p.Contains("Plan the workflow for iteration 1"));
+
+                Assert.Contains("This goal's question?", planningPrompt);
+                Assert.DoesNotContain("Foreign goal question?", planningPrompt);
+                Assert.DoesNotContain("Foreign answer.", planningPrompt);
+                Assert.DoesNotContain("Future iteration question?", planningPrompt);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// With NO configured goal store, planning still includes the in-memory (live bag +
+    /// completed-iteration summaries) records — and never queries any store.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_NoGoalStore_UsesInMemoryRecordsOnly()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-nostore", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-nostore");
+
+                // In-memory completed-iteration summary carrying a prior record.
+                pipeline.CompletedIterationSummaries.Add(new IterationSummary
+                {
+                    Iteration = 1,
+                    Phases = [],
+                    Clarifications =
+                    [
+                        new PersistedClarification
+                        {
+                            Timestamp = new DateTime(2024, 2, 2, 0, 0, 0, DateTimeKind.Utc),
+                            Phase = "Testing",
+                            WorkerRole = "tester",
+                            Question = "In-memory prior question?",
+                            Answer = "In-memory prior answer.",
+                            AnsweredBy = "brain",
+                            Occurrence = 1,
+                        },
+                    ],
+                });
+
+                await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .First(p => p.Contains("Plan the workflow for iteration 1"));
+
+                var sectionStart = planningPrompt.IndexOf(
+                    "=== Clarification history (complete, untruncated) ===", StringComparison.Ordinal);
+                var sectionEnd = planningPrompt.IndexOf("=== End clarification history ===", StringComparison.Ordinal);
+                Assert.NotEqual(-1, sectionStart);
+                var section = planningPrompt[sectionStart..sectionEnd];
+                Assert.Contains("In-memory prior question?", section);
+                Assert.Contains("A: In-memory prior answer.", section);
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// A configured store read failure flows through PlanIterationAsync's explicit failed-plan
+    /// boundary — a Failed result, not a default plan, not a silently degraded prompt.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_StoreReadFailure_ReturnsFailedPlan()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]),
+                goalStore: new ThrowingGoalStore());
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-fail", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-fail");
+                var result = await brain.PlanIterationAsync(
+                    pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.True(result.IsFailed, "A store read failure must fail the plan explicitly.");
+                Assert.Null(result.Plan);
+                Assert.Contains("store read boom", result.FailureReason);
+
+                // The Brain was NEVER asked to plan — no default plan was substituted.
+                Assert.NotNull(stub);
+                Assert.DoesNotContain(
+                    stub!.ObservedUserPrompts, p => p.Contains("Plan the workflow for iteration"));
+            }
+        }
+        finally { DeleteDir(dir); }
+    }
+
+    /// <summary>
+    /// End-to-end: a timeout record in the live bag is rendered as a TIMEOUT OUTCOME in the
+    /// actual planning prompt — never as a human/brain/composer decision.
+    /// </summary>
+    [Fact]
+    public async Task PlanIterationAsync_TimeoutRecord_MarkedAsOutcomeInActualPrompt()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            SequencedPlanStubClient? stub = null;
+            var brain = NewShadowBrain(dir,
+                factoryChatClientFactory: _ => stub = new SequencedPlanStubClient(
+                    ["coding", "testing", "review", "merging"]));
+            await using (brain)
+            {
+                await brain.ConnectAsync(TestContext.Current.CancellationToken);
+                await brain.ForkSessionForGoalAsync("goal-clar-timeout", TestContext.Current.CancellationToken);
+
+                var pipeline = CreatePipeline("goal-clar-timeout");
+                pipeline.Clarifications.Add(new ClarificationEntry(
+                    DateTime.UtcNow, "goal-clar-timeout", 1, "Coding", "coder",
+                    "Timed-out question?", "No answer arrived in time.", "timeout") { Occurrence = 1 });
+
+                await brain.PlanIterationAsync(pipeline, null, TestContext.Current.CancellationToken);
+
+                Assert.NotNull(stub);
+                var planningPrompt = stub!.ObservedUserPrompts
+                    .First(p => p.Contains("Plan the workflow for iteration 1"));
+
+                var sectionStart = planningPrompt.IndexOf(
+                    "=== Clarification history (complete, untruncated) ===", StringComparison.Ordinal);
+                var sectionEnd = planningPrompt.IndexOf("=== End clarification history ===", StringComparison.Ordinal);
+                var section = planningPrompt[sectionStart..sectionEnd];
+
+                Assert.Contains("Timed-out question?", section);
+                Assert.Contains("TIMEOUT OUTCOME (not a decision", section);
+                Assert.Contains("Outcome (timeout — NOT an answer): No answer arrived in time.", section);
+                Assert.DoesNotContain("answered by: timeout", section);
             }
         }
         finally { DeleteDir(dir); }

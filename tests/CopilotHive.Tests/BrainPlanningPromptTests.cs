@@ -510,4 +510,177 @@ public sealed class BrainPlanningPromptTests
         Assert.Contains("Omitted phases use the standard tier", bullet);
         Assert.DoesNotContain("Omitted phases use the default tier", bullet);
     }
+
+    // ── Clarification-history section ─────────────────────────────────────
+
+    /// <summary>A marker that appears only in the tail of a long answer, past the 2,000-character mark.</summary>
+    private const string TailMarker = "TAIL-MARKER-BEYOND-2000-CHARS";
+
+    /// <summary>Builds a pipeline whose conversation is filled with filler long enough to
+    /// overflow the 2,000-character conversation-summary cap.</summary>
+    private static GoalPipeline PipelineWithLongConversation()
+    {
+        var pipeline = new GoalPipeline(new Goal
+        {
+            Id = "test-goal",
+            Description = "Test goal",
+            RepositoryNames = ["repo"],
+        });
+
+        // One long entry: the conversation summary truncates this at 2,000 characters.
+        pipeline.Conversation.Add(new ConversationEntry(
+            "user", new string('x', 5000), 1, "planning"));
+
+        return pipeline;
+    }
+
+    private static ClarificationEntry Clarification(
+        DateTime timestamp, int iteration, string phase, string workerRole,
+        string question, string answer, string answeredBy, int occurrence = 1) =>
+        new(timestamp, "test-goal", iteration, phase, workerRole, question, answer, answeredBy)
+        {
+            Occurrence = occurrence,
+        };
+
+    /// <summary>
+    /// A long multiline Q&amp;A whose answer carries a distinctive marker beyond the
+    /// 2,000-character mark must appear COMPLETE in the clarification-history section —
+    /// the section is never truncated even when the conversation history is.
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_LongAnswerBeyondConversationCap_PreservedWithoutTruncation()
+    {
+        var pipeline = PipelineWithLongConversation();
+
+        var longAnswer = new string('y', 2500) + $"\n{TailMarker}\n" + new string('z', 300);
+        var records = new List<ClarificationEntry>
+        {
+            Clarification(
+                new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), 1, "Coding", "coder",
+                "Should the API be versioned?", longAnswer, "human"),
+        };
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, null, records);
+
+        var sectionIndex = prompt.IndexOf(
+            "=== Clarification history (complete, untruncated) ===", StringComparison.Ordinal);
+        var sectionEndIndex = prompt.IndexOf("=== End clarification history ===", StringComparison.Ordinal);
+
+        Assert.NotEqual(-1, sectionIndex);
+        Assert.NotEqual(-1, sectionEndIndex);
+        Assert.True(sectionIndex < sectionEndIndex);
+
+        // The COMPLETE answer — including the tail marker past 2,000 characters — is present.
+        var section = prompt[sectionIndex..(sectionEndIndex + "=== End clarification history ===".Length)];
+        Assert.Contains(TailMarker, section);
+        Assert.Contains(longAnswer, section);
+
+        // And it really is beyond the conversation cap: the conversation summary was truncated.
+        Assert.Contains("...", prompt[sectionIndex..]);
+    }
+
+    /// <summary>Every answerer category (brain, composer, human) renders with its own label.</summary>
+    [Theory]
+    [InlineData("brain")]
+    [InlineData("composer")]
+    [InlineData("human")]
+    public void BuildPlanningPrompt_AllAnswererCategories_Labeled(string answeredBy)
+    {
+        var pipeline = PipelineWithLongConversation();
+        var records = new List<ClarificationEntry>
+        {
+            Clarification(
+                new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), 1, "Coding", "coder",
+                "Which library?", "Use the standard one.", answeredBy),
+        };
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, null, records);
+
+        Assert.Contains($"answered by: {answeredBy}", prompt);
+        Assert.Contains("A: Use the standard one.", prompt);
+    }
+
+    /// <summary>
+    /// A timeout outcome is visibly NOT a decision: the label and the answer line both say so.
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_TimeoutOutcome_MarkedAsNotADecision()
+    {
+        var pipeline = PipelineWithLongConversation();
+        var records = new List<ClarificationEntry>
+        {
+            Clarification(
+                new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), 1, "Coding", "coder",
+                "Should we change the schema?", "No one answered in time.", "timeout"),
+        };
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, null, records);
+
+        Assert.Contains(
+            "TIMEOUT OUTCOME (not a decision", prompt);
+        Assert.Contains(
+            "Outcome (timeout — NOT an answer): No one answered in time.", prompt);
+        // The timeout record must NOT be presented as an answered record.
+        Assert.DoesNotContain("answered by: timeout", prompt);
+        Assert.DoesNotContain("\nA: No one answered in time.", prompt);
+    }
+
+    /// <summary>Each record carries the full label: iteration, phase, occurrence, role, timestamp, AnsweredBy.</summary>
+    [Fact]
+    public void BuildPlanningPrompt_RecordLabels_CarryAllMetadata()
+    {
+        var pipeline = PipelineWithLongConversation();
+        var records = new List<ClarificationEntry>
+        {
+            Clarification(
+                new DateTime(2024, 3, 4, 5, 6, 7, DateTimeKind.Utc), 1, "Testing", "tester",
+                "Run coverage?", "Yes.", "human", occurrence: 3),
+        };
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, null, records);
+
+        Assert.Contains(
+            "iteration 1, phase Testing, occurrence 3, worker role tester, 2024-03-04 05:06:07Z — answered by: human",
+            prompt);
+        Assert.Contains("Q: Run coverage?", prompt);
+        Assert.Contains("A: Yes.", prompt);
+    }
+
+    /// <summary>With no clarification records, NO clarification section is emitted at all.</summary>
+    [Fact]
+    public void BuildPlanningPrompt_EmptyHistory_NoClarificationSection()
+    {
+        var prompt = BuildPrompt();
+
+        Assert.DoesNotContain("Clarification history", prompt);
+        Assert.DoesNotContain("End clarification history", prompt);
+        Assert.DoesNotContain("Clarification answer", prompt);
+        // No misleading placeholder.
+        Assert.DoesNotContain("(no clarifications", prompt);
+    }
+
+    /// <summary>
+    /// The section is emitted for records from prior iterations, and the existing
+    /// 2,000-character conversation summary is unchanged (regression guard).
+    /// </summary>
+    [Fact]
+    public void BuildPlanningPrompt_ConversationSummary_CapUnchanged()
+    {
+        var pipeline = PipelineWithLongConversation();
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+
+        var summaryIndex = prompt.IndexOf("Conversation history (1 messages): ", StringComparison.Ordinal);
+        Assert.NotEqual(-1, summaryIndex);
+
+        var summary = prompt[summaryIndex..];
+        var summaryEnd = summary.IndexOf('\n');
+        summary = summary[..summaryEnd];
+
+        // Still truncated at exactly 2,000 characters total: the 42-char "Conversation
+        // history (1 messages): [user] " prefix plus 1993 x's plus the "..." suffix.
+        Assert.EndsWith("...", summary);
+        Assert.Equal(
+            "Conversation history (1 messages): [user] " + new string('x', 1993) + "...",
+            summary);
+    }
 }

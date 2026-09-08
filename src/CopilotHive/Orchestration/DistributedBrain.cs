@@ -611,7 +611,8 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             // instead of silently receiving a default plan.
             EnsureConnected();
 
-            var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext);
+            var clarificationHistory = await CollectClarificationHistoryAsync(pipeline, ct);
+            var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline, additionalContext, clarificationHistory);
 
             string currentPrompt = prompt;
 
@@ -725,6 +726,124 @@ public sealed class DistributedBrain : IDistributedBrain, IAsyncDisposable
             pipeline.GoalId, exhaustionReason);
         return PlanResult.Failed(exhaustionReason);
     }
+
+    /// <summary>
+    /// Collects the clarification records that feed the planning prompt's clarification-history
+    /// section, from three sources:
+    /// (1) the configured goal store's persisted iteration summaries for this pipeline's goal,
+    /// (2) the pipeline's in-memory completed-iteration summaries, and
+    /// (3) the pipeline's live clarification bag (including unsaved current-iteration records).
+    /// <para>
+    /// Exact overlapping records (persisted copies vs. live copies) are deduplicated by
+    /// comparing iteration AND every clarification field; distinct answers, occurrences, and
+    /// repeated questions are never collapsed. Records from other goals and from future
+    /// iterations are excluded. The result is ordered deterministically by iteration, then
+    /// timestamp, with deterministic field tie-breaks.
+    /// </para>
+    /// <para>
+    /// With no configured goal store the in-memory sources are used alone. A configured store
+    /// read failure THROWS so the caller's explicit failed-plan error boundary handles it —
+    /// there is no silent omission and no default plan.
+    /// </para>
+    /// </summary>
+    /// <param name="pipeline">The pipeline being planned.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The deduplicated, ordered clarification records (empty list when none).</returns>
+    private async Task<List<ClarificationEntry>> CollectClarificationHistoryAsync(
+        GoalPipeline pipeline, CancellationToken ct)
+    {
+        var records = new List<ClarificationEntry>();
+
+        // (1) Persisted records from the configured store — queried for THIS pipeline's GoalId.
+        // A configured-but-failing store must surface, not silently degrade the prompt.
+        if (_goalStore is { } store)
+        {
+            var summaries = await store.GetIterationsAsync(pipeline.GoalId, ct);
+            foreach (var summary in summaries)
+                records.AddRange(ToLiveRecords(summary.Clarifications, pipeline.GoalId, summary.Iteration));
+        }
+
+        // (2) In-memory completed-iteration summaries.
+        foreach (var summary in pipeline.CompletedIterationSummaries)
+            records.AddRange(ToLiveRecords(summary.Clarifications, pipeline.GoalId, summary.Iteration));
+
+        // (3) The live bag — includes unsaved current-iteration records.
+        foreach (var live in pipeline.Clarifications)
+            records.Add(live);
+
+        return DeduplicateAndOrder(records, pipeline.GoalId, pipeline.Iteration);
+    }
+
+    /// <summary>Converts persisted clarification records to the live record shape.</summary>
+    private static IEnumerable<ClarificationEntry> ToLiveRecords(
+        IEnumerable<PersistedClarification> persisted, string goalId, int iteration) =>
+        persisted.Select(c => new ClarificationEntry(
+            c.Timestamp, goalId, iteration, c.Phase, c.WorkerRole, c.Question, c.Answer, c.AnsweredBy)
+        {
+            Occurrence = c.Occurrence,
+        });
+
+    /// <summary>
+    /// Deduplicates exact overlapping records (all fields equal, modulo the iteration value
+    /// that is reconciled between persisted and live copies) and orders the survivors
+    /// deterministically — by iteration, timestamp, phase, worker role, question, occurrence,
+    /// answer, and answered-by — so records tying on earlier fields are ordered by field
+    /// content and never inherit the unspecified enumeration order of the live
+    /// <see cref="GoalPipeline.Clarifications"/> ConcurrentBag. Filters out records from
+    /// other goals and from future iterations.
+    /// </summary>
+    private static List<ClarificationEntry> DeduplicateAndOrder(
+        List<ClarificationEntry> records, string goalId, int currentIteration)
+    {
+        var seen = new List<ClarificationEntry>();
+        var result = new List<ClarificationEntry>();
+
+        foreach (var record in records)
+        {
+            // Goal and iteration filters: only this goal, only iterations up to the current one.
+            if (!string.Equals(record.GoalId, goalId, StringComparison.Ordinal))
+                continue;
+            if (record.Iteration < 0 || record.Iteration > currentIteration)
+                continue;
+
+            var exactDuplicate = seen.Any(existing => RecordsOverlap(existing, record));
+            if (exactDuplicate)
+                continue;
+
+            seen.Add(record);
+            result.Add(record);
+        }
+
+        return result
+            .Select((r, index) => (r, index))
+            .OrderBy(entry => entry.r.Iteration)
+            .ThenBy(entry => entry.r.Timestamp)
+            .ThenBy(entry => entry.r.Phase, StringComparer.Ordinal)
+            .ThenBy(entry => entry.r.WorkerRole, StringComparer.Ordinal)
+            .ThenBy(entry => entry.r.Question, StringComparer.Ordinal)
+            .ThenBy(entry => entry.r.Occurrence)
+            .ThenBy(entry => entry.r.Answer, StringComparer.Ordinal)
+            .ThenBy(entry => entry.r.AnsweredBy, StringComparer.Ordinal)
+            .ThenBy(entry => entry.index)
+            .Select(entry => entry.r)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Whether two clarification records overlap exactly: same iteration, timestamp, phase,
+    /// occurrence, worker role, question, answer, and AnsweredBy. Distinct answers,
+    /// occurrences, or repeated questions with different content are NOT equal and are
+    /// never collapsed.
+    /// </summary>
+    private static bool RecordsOverlap(ClarificationEntry a, ClarificationEntry b) =>
+        a.Iteration == b.Iteration
+        && a.Timestamp == b.Timestamp
+        && string.Equals(a.Phase, b.Phase, StringComparison.Ordinal)
+        && a.Occurrence == b.Occurrence
+        && string.Equals(a.WorkerRole, b.WorkerRole, StringComparison.Ordinal)
+        && string.Equals(a.Question, b.Question, StringComparison.Ordinal)
+        && string.Equals(a.Answer, b.Answer, StringComparison.Ordinal)
+        && string.Equals(a.AnsweredBy, b.AnsweredBy, StringComparison.Ordinal);
 
     /// <summary>Generates a summary of the completed goal's work and appends it to the master session.</summary>
     public async Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default)

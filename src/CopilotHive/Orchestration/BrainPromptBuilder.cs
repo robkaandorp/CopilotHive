@@ -312,8 +312,16 @@ public static class BrainPromptBuilder
     /// </summary>
     /// <param name="pipeline">The goal pipeline containing iteration state and context.</param>
     /// <param name="additionalContext">Optional extra context prepended to the planning prompt.</param>
+    /// <param name="clarificationHistory">
+    /// Optional deduplicated, chronologically ordered clarification records (from persisted
+    /// iteration summaries, completed-iteration summaries, and the live bag) rendered as a
+    /// separately framed clarification-history section. When null or empty, no clarification
+    /// section is emitted at all.
+    /// </param>
     /// <returns>The fully assembled planning prompt string.</returns>
-    internal static string BuildPlanningPrompt(GoalPipeline pipeline, string? additionalContext = null)
+    internal static string BuildPlanningPrompt(
+        GoalPipeline pipeline, string? additionalContext = null,
+        IReadOnlyList<ClarificationEntry>? clarificationHistory = null)
     {
         var previousIterationContext = BuildPreviousIterationContext(pipeline);
 
@@ -332,6 +340,16 @@ public static class BrainPromptBuilder
               Truncate(string.Join(" | ", pipeline.Conversation.Select(e => $"[{e.Role}] {e.Content}")), Constants.TruncationConversationSummary)
             : "";
 
+        // The clarification history is its own explicitly framed section — it must NOT ride
+        // inside the truncated conversation summary, where records could be cut off
+        // incidentally. Complete question and answer text is preserved verbatim, no
+        // truncation or summarization. Records must have been deduplicated and ordered
+        // deterministically by the caller (see DistributedBrain.PlanIterationAsync).
+        var clarificationSection =
+            clarificationHistory is { Count: > 0 }
+                ? BuildClarificationHistorySection(clarificationHistory)
+                : "";
+
         var planningPrompt = $$"""
             {{(additionalContext is not null ? $"=== Additional context ===\n{additionalContext}\n=== End additional context ===\n\n" : "")}}Plan the workflow for iteration {{pipeline.Iteration}} of goal: {{pipeline.Description}}
 
@@ -340,6 +358,7 @@ public static class BrainPromptBuilder
 
             {{retryContext}}
             {{previousIterationContext}}
+            {{clarificationSection}}
             {{conversationSummary}}
 
             Decide the ordered phases for this iteration. Consider:
@@ -414,6 +433,54 @@ public static class BrainPromptBuilder
         // Normalize to LF so the prompt content sent to the LLM is deterministic across platforms.
         return planningPrompt.ReplaceLineEndings("\n");
     }
+
+    /// <summary>
+    /// Builds the separately framed clarification-history section of the planning prompt.
+    /// Each record is labeled with iteration, phase, occurrence, worker role, timestamp, and
+    /// AnsweredBy; question and answer text are preserved verbatim — no truncation and no
+    /// semantic summarization. Timeout outcomes are explicitly labeled as NOT a decision so
+    /// the Brain never mistakes a timeout fallback message for a human/composer/brain answer.
+    /// </summary>
+    /// <remarks>
+    /// The caller (DistributedBrain.PlanIterationAsync) is responsible for deduplicating
+    /// exact overlapping records, filtering to this goal's records up to the current
+    /// iteration, and ordering deterministically; this method renders what it is given.
+    /// </remarks>
+    /// <param name="records">Deduplicated, ordered clarification records to render.</param>
+    /// <returns>The framed section text (including trailing newline separation).</returns>
+    internal static string BuildClarificationHistorySection(IReadOnlyList<ClarificationEntry> records)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("=== Clarification history (complete, untruncated) ===");
+        sb.AppendLine("Questions workers and the Brain asked during this goal, with the full answers given.");
+        sb.AppendLine("Every answer below is a recorded decision EXCEPT entries marked as a timeout outcome —");
+        sb.AppendLine("a timeout outcome is NOT a decision; no one answered that question.");
+        sb.AppendLine();
+        for (var i = 0; i < records.Count; i++)
+        {
+            var r = records[i];
+            var answeredByLabel = IsTimeoutOutcome(r.AnsweredBy)
+                ? "TIMEOUT OUTCOME (not a decision — the question was never answered)"
+                : $"answered by: {r.AnsweredBy}";
+            sb.AppendLine($"[{i + 1}] iteration {r.Iteration}, phase {r.Phase}, occurrence {r.Occurrence}, "
+                + $"worker role {r.WorkerRole}, {r.Timestamp.ToString("u", System.Globalization.CultureInfo.InvariantCulture)} — {answeredByLabel}");
+            sb.AppendLine($"Q: {r.Question}");
+            sb.AppendLine(IsTimeoutOutcome(r.AnsweredBy)
+                ? $"Outcome (timeout — NOT an answer): {r.Answer}"
+                : $"A: {r.Answer}");
+            sb.AppendLine();
+        }
+        sb.AppendLine("=== End clarification history ===");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The <see cref="ClarificationEntry.AnsweredBy"/> value recorded when a clarification
+    /// expired without a response. Such records carry the timeout fallback message, never a
+    /// human/brain/composer decision.
+    /// </summary>
+    internal static bool IsTimeoutOutcome(string answeredBy) =>
+        string.Equals(answeredBy, "timeout", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Builds the commit message generation prompt for <see cref="DistributedBrain.GenerateCommitMessageAsync"/>.
