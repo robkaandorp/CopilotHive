@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+## [0.38.0] — 2026-09-08
+
+### Added
+
+- **Stored OAuth integration** — Stored GitHub OAuth credentials now participate in Copilot model discovery, worker target-repository assignment, and managed orchestrator target-repository Git, using the blank-aware fallback chain stored OAuth → `GH_TOKEN` → `GITHUB_TOKEN` for eligible HTTPS `github.com` targets.
+- **Complete tester evidence handoff** — New tester reports are preserved through storage and remain available to the reviewer through `get_test_report` after the updated orchestrator is running; previously clipped historical text is not recovered.
+- **Configuration editor preservation** — The editor preserves unset primary model and reasoning assignments instead of materializing orchestrator or default values. Explicit reasoning `None` remains distinct from unset; existing premium/compaction empty-string clearing behavior is retained.
+- **Catalog consistency and ownership** — Catalog readers and writers use detached snapshots, while YAML/cache generation is detached and config load/write/sync operations are serialized per manager. The seven owner catalog mutation methods skip null placeholders without normalizing or removing them. Internal model-storage and compaction-reader migrations, plus consumer/core/model-isolation fixture migrations, preserve meaningful tests under this catalog work rather than representing separate product features.
+
+### Changed
+
+- **Configuration model ownership** — `HiveConfigFile.Models` now deep-copies the entire subtree on both get and set. Cache loads likewise return detached configurations, while standalone `ModelsConfig` and `ModelEntry` DTOs remain mutable and YAML schema/value semantics are unchanged.
+- **Persistence recovery ordering** — Config-file operations are serialized, and configuration cache invalidation occurs before reset/commit pull-recovery, including partial-failure paths.
+- **OAuth repository targeting** — Stored OAuth is applied only to configured eligible HTTPS `github.com` targets for worker assignments and managed orchestrator Git; operator overrides and the separate `GetWorkerConfig` LLM provisioning path remain distinct.
+- **Resume wording and behavior** — Eligible failed goals restart through planning/Coding while preserving their branch; branchless eligibility is iteration exhaustion, and user-cancelled goals are excluded.
+
+### Fixed
+
+- **Reliability repairs** — Fixed a streaming completion test observation race, added a Windows-incompatible ref-name test guard, corrected slash-branch test staging paths, removed an unused gated chat-client factory, aligned Composer resume-tool wording, and completed the catalog null-entry/cache-recovery repairs. The Configuration editor YAML test helpers were simplified as maintenance for the same meaningful test coverage, not as a separate product feature.
+
+### Breaking Changes
+
+- **`HiveConfigFile.Models` ownership boundary** — The getter and setter now deep-copy the complete subtree. Mutating a returned DTO or retained setter input no longer updates the owner. Use the synchronized owner mutation APIs, or deliberately edit a detached copy and assign the entire `Models` property back for replacement; copy/edit/reassign is not an atomic concurrent read-modify-write. This is not a mandatory YAML migration: the YAML schema and value semantics are unchanged, and cache loads return detached configurations rather than shared identities.
+
+### Limitations and upgrade note
+
+- These fixes do not make write+commit or later maintenance snapshot application transactional. Failed-sync freshness, subprocess cancellation lifetime, failed-write disk integrity, other processes/managers, and unrelated mutable configuration sections remain outside this scope. There are no universal cache-freshness, thread-safety, crash-atomicity, or exactly-once guarantees.
+- Non-destructive orchestrator restart and durable in-flight recovery are not delivered. Let active goals/tasks finish and prevent new dispatch before planned maintenance; no drain command is provided.
+
 ## [0.37.0] — 2026-09-07
 
 ### Added
