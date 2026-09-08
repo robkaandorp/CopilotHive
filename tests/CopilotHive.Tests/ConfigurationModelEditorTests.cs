@@ -19,11 +19,15 @@ namespace CopilotHive.Tests;
 /// and <see cref="ModelConfigUpdate"/> construction (<see cref="ConfigurationPage.BuildModelConfigUpdate"/>).
 /// <para>
 /// The component is constructed directly (no bUnit, no browser rendering — these are mapping
-/// tests). The facade and service are the REAL <see cref="ConfigFacade"/> / <see cref="ConfigModelService"/>
-/// over a seeded <see cref="HiveConfigFile"/> and a <see cref="FakeConfigRepoManager"/> (recorded
-/// no-op commits — no real git or network). Persistence assertions parse the written YAML through
-/// the real <see cref="ConfigModelService"/> path, so parser normalization cannot mask
-/// empty-string materialization.
+/// tests). The evidence chain is: the REAL editor population/update helpers → the REAL
+/// <see cref="ConfigFacade"/> / <see cref="ConfigModelService"/> → the file they wrote → raw
+/// YamlDotNet value inspection of that file, plus independent assertions on the ORIGINAL live
+/// config object. Production <see cref="ConfigRepoManager"/>.ParseConfig and browser/rendered
+/// save-button wiring are NOT exercised by these tests: persistence assertions read
+/// hive-config.yaml directly from disk with the raw YamlDotNet deserializer (mirroring the
+/// production deserializer's conventions) instead of calling the production parser, so its
+/// primary-model normalization cannot hide accidentally persisted blank values — the bug
+/// this suite exists to catch.
 /// </para>
 /// </summary>
 [Collection("HiveIntegration")]
@@ -124,56 +128,38 @@ public sealed class ConfigurationModelEditorTests
 
     /// <summary>
     /// Saves the REAL payload produced by <see cref="ConfigurationPage.BuildModelConfigUpdate"/>
-    /// through the REAL facade + service, then parses the persisted YAML back through a real
-    /// deserializer (the same one <see cref="ConfigRepoManager"/> uses) so parser normalization
-    /// cannot mask empty-string materialization.
+    /// through the REAL facade + service, then reads hive-config.yaml directly from the config
+    /// repo directory the tests received from <see cref="Seed"/> / <see cref="ConfigFacadeTests.CreateRealService"/>
+    /// and inspects it with the raw YamlDotNet deserializer (the same conventions the production
+    /// <see cref="ConfigRepoManager"/> deserializer builder uses) so parser normalization cannot
+    /// mask empty-string materialization.
     /// </summary>
     private static async Task<HiveConfigFile> SaveAndParsePersistedYamlAsync(
-        ConfigFacade facade, ConfigurationPage page)
+        ConfigFacade facade, ConfigurationPage page, string configRepoDir)
     {
         var update = page.BuildModelConfigUpdate();
         var result = await facade.SaveModelsAsync(update, TestContext.Current.CancellationToken);
         Assert.True(result.Success, result.Error ?? "save failed");
-        return ParsePersistedYaml(facade);
+        return ParsePersistedYaml(configRepoDir);
     }
 
     /// <summary>
-    /// Parses the hive-config.yaml the real service wrote, using the same deserializer setup as
-    /// <see cref="ConfigRepoManager"/>, so the assertion sees exactly what was persisted.
+    /// Raw-value reader: reads the hive-config.yaml the real service wrote from the passed
+    /// config repo directory and deserializes it with YamlDotNet using the SAME production
+    /// conventions (UnderscoredNamingConvention + IgnoreUnmatchedProperties, mirroring
+    /// <see cref="ConfigRepoManager"/>'s deserializer builder). This is the intentional raw
+    /// reader — NOT a fallback and NOT <see cref="ConfigRepoManager"/>.ParseConfig, whose
+    /// primary-model normalization would hide accidentally persisted blank values (the bug
+    /// this suite exists to catch).
     /// </summary>
-    private static HiveConfigFile ParsePersistedYaml(ConfigFacade facade)
+    private static HiveConfigFile ParsePersistedYaml(string configRepoDir)
     {
-        var dir = ReadConfigRepoDir(facade);
-        var yaml = File.ReadAllText(Path.Combine(dir, "hive-config.yaml"));
+        var yaml = File.ReadAllText(Path.Combine(configRepoDir, "hive-config.yaml"));
         return DeserializeConfig(yaml);
-    }
-
-    private static string ReadConfigRepoDir(ConfigFacade facade)
-    {
-        // The real service's ConfigRepoManager is a FakeConfigRepoManager whose LocalPath is the
-        // harness directory; resolve it off the facade's private _configModel field.
-        var facadeModel = typeof(ConfigFacade)
-            .GetField("_configModel", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .GetValue(facade) as ConfigModelService;
-        Assert.NotNull(facadeModel);
-        var repo = typeof(ConfigModelService)
-            .GetField("_configRepo", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .GetValue(facadeModel)!;
-        return (string)typeof(ConfigRepoManager).GetProperty("LocalPath")!.GetValue(repo)!;
     }
 
     private static HiveConfigFile DeserializeConfig(string yaml)
     {
-        // Parse through HiveConfigFile's public YAML surface by round-tripping the raw file text
-        // with the same YamlDotNet builder the production deserializer uses.
-        var method = typeof(ConfigRepoManager).GetMethod(
-            "YamlDeserialize", BindingFlags.NonPublic | BindingFlags.Static);
-        if (method is not null)
-            return (HiveConfigFile)method.Invoke(null, [yaml])!;
-
-        // Fallback: use YamlDotNet directly with the SAME production conventions
-        // (UnderscoredNamingConvention + IgnoreUnmatchedProperties, mirroring
-        // <see cref="ConfigRepoManager"/>'s deserializer builder).
         var deserializer = new YamlDotNet.Serialization.DeserializerBuilder()
             .WithNamingConvention(YamlDotNet.Serialization.NamingConventions.UnderscoredNamingConvention.Instance)
             .IgnoreUnmatchedProperties()
@@ -277,7 +263,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.NotNull(update.PremiumWorkerModels);
             Assert.Empty(update.PremiumWorkerModels!);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Empty(persisted.Workers);
             Assert.Null(persisted.Composer);
             Assert.Null(persisted.Orchestrator.Model);
@@ -317,7 +303,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.NotNull(update.WorkerModels);
             Assert.Empty(update.WorkerModels!);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.Orchestrator.Model);
             Assert.Empty(persisted.Workers);
             Assert.Null(persisted.Composer);
@@ -360,7 +346,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal(role, entry.Key);
             Assert.Equal("model-b", entry.Value);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.GetModelForRole(role));
             // The other four roles were never materialized.
             foreach (var other in new[] { "coder", "tester", "reviewer", "docwriter", "improver" }.Where(r => r != role))
@@ -390,7 +376,7 @@ public sealed class ConfigurationModelEditorTests
             var update = page.BuildModelConfigUpdate();
             Assert.Equal("model-b", update.ComposerModel);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.Composer!.Model);
         }
         finally
@@ -428,7 +414,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("coder", entry.Key);
             Assert.Equal("model-a", entry.Value);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.Orchestrator.Model);
             Assert.Equal("model-a", persisted.GetModelForRole("coder"));
         }
@@ -463,7 +449,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("model-b", update.WorkerModels!["coder"]);
             Assert.Equal("model-a", update.WorkerModels!["tester"]);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.GetModelForRole("coder"));
             Assert.Equal("model-a", persisted.GetModelForRole("tester"));
         }
@@ -500,7 +486,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Empty(update.WorkerReasoningEffort!);
             Assert.Empty(update.WorkerPremiumReasoningEffort!);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Null(persisted.Orchestrator.ReasoningEffort);
             Assert.Null(persisted.Composer);
             Assert.Empty(persisted.Workers);
@@ -539,7 +525,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("coder", entry.Key);
             Assert.Equal(ReasoningEffort.None, entry.Value);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("none", persisted.Workers["coder"].ReasoningEffort);
         }
         finally
@@ -568,7 +554,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("reviewer", entry.Key);
             Assert.Equal(ReasoningEffort.High, entry.Value);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("high", persisted.Workers["reviewer"].ReasoningEffort);
             // Sibling assignments stay unmaterialized.
             Assert.Null(persisted.Orchestrator.ReasoningEffort);
@@ -603,7 +589,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Empty(update.PremiumWorkerModels!);
             Assert.Null(update.CompactionModel);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Empty(persisted.Workers);
             Assert.Null(persisted.Models?.CompactionModel);
 
@@ -648,7 +634,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("", premium.Value);
             Assert.Equal("", update.CompactionModel);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             // The service's blank normalization clears premium/compaction: the effective
             // GetPremiumModelForRole contract treats blank as unset (null). The persisted
             // premium string may retain the empty form (service normalization territory);
@@ -681,7 +667,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.DoesNotContain("tester", update.PremiumWorkerModels!.Keys);
             Assert.DoesNotContain("coder", update.PremiumWorkerModels!.Keys);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Empty(persisted.Workers);
 
             // POST-SAVE LIVE CONFIG: the missing sections were not created in the runtime
@@ -740,7 +726,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.DoesNotContain("coder", update.WorkerModels!.Keys);
             Assert.DoesNotContain("tester", update.WorkerModels!.Keys);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             // Nothing was cleared in the persisted YAML.
             Assert.Equal("model-a", persisted.Orchestrator.Model);
             Assert.Equal("model-b", persisted.Composer!.Model);
@@ -793,7 +779,7 @@ public sealed class ConfigurationModelEditorTests
             Assert.Equal("", premium.Value);
             Assert.Equal("", update.CompactionModel);
 
-            var persisted = await SaveAndParsePersistedYamlAsync(facade, page);
+            var persisted = await SaveAndParsePersistedYamlAsync(facade, page, dir);
             Assert.Equal("model-b", persisted.GetModelForRole("coder"));
             Assert.Null(persisted.GetPremiumModelForRole("coder"));
 
