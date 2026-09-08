@@ -430,6 +430,304 @@ public sealed class PipelineDriverWorkerOutputTests
                 p => p.Name == GoalPhase.Review && p.Iteration == 1 && p.Occurrence == 1).WorkerOutput);
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  CONTINUOUS EVIDENCE-PROPAGATION CHAIN REGRESSIONS
+    //
+    //  Each test drives a real completion through GoalDispatcher.HandleTaskCompletionAsync →
+    //  admission → DriveNextPhaseAsync → the Brain craft call → the dispatch, and verifies the
+    //  COMPLETE selected report survives into the value actually dispatched to the worker.
+    //
+    //  Two independent observations make the chain continuous, so neither a silently omitted
+    //  dispatch nor an unrelated prompt from the fake can pass:
+    //    (a) the prompt BUILT INSIDE CraftPromptAsync (real BuildCraftPromptText, captured at
+    //        invocation time — never rebuilt after the completion), asserted on its
+    //        Additional-context payload; and
+    //    (b) the WorkTask the dispatcher actually enqueued, whose Prompt must be that very
+    //        built prompt, for the expected goal/role/iteration.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    private const string AdditionalContextHeader = "=== Additional context ===";
+    private const string AdditionalContextFooter = "=== End additional context ===";
+
+    /// <summary>
+    /// Completed Review / REQUEST_CHANGES: the reviewer report — longer than the removed
+    /// 3,000-char cut — must reach the dispatched Coding retry prompt COMPLETE.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_ReviewRequestChanges_CompleteReportReachesDispatchedPrompt()
+    {
+        var report = BuildChainReport("REVIEW", 'r', "iteration 1 verdict request-changes.");
+        var harness = CreateDispatcherHarness(
+            GoalPhase.Review, recordCraftCalls: true, multiPhasePlan: true, seedPhaseEntry: true);
+
+        var enqueued = new List<WorkTask>();
+        harness.Queue.OnEnqueue = t => enqueued.Add(t);
+
+        await harness.Dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = harness.TaskId,
+            Status = TaskOutcome.Completed,
+            Output = "DIFFERENT-RAW-REVIEW-OUTPUT: not selected when the summary wins",
+            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES", Summary = report },
+        }, TestContext.Current.CancellationToken);
+
+        var craftCall = AssertRetryReplannedToCoding(harness);
+
+        // (a) The prompt BUILT INSIDE CraftPromptAsync carries the complete report in its
+        // Additional-context region — the driver-constructed region, not previous-feedback.
+        var payload = ExtractAdditionalContextPayload(craftCall.BuiltPrompt);
+        Assert.Contains("Reviewer feedback from iteration 1:", payload, StringComparison.Ordinal);
+        AssertContextCarriesCompleteReport(payload, report);
+        Assert.Contains("REVIEW-EVIDENCE-BEYOND-3000", payload, StringComparison.Ordinal);
+        Assert.Contains("REVIEW-TAIL-EVIDENCE-AT-END", payload, StringComparison.Ordinal);
+
+        // (b) The dispatcher actually enqueued that very prompt for the Coding retry.
+        AssertDispatchedCodingTask(enqueued, harness, craftCall.BuiltPrompt);
+    }
+
+    /// <summary>
+    /// Completed Testing / FAIL: the tester raw-output report — longer than the removed
+    /// 3,000-char cut — must reach the dispatched Coding retry prompt COMPLETE.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_TestingFail_CompleteReportReachesDispatchedPrompt()
+    {
+        var rawOutput = BuildChainReport("TESTER", 't', "iteration 1 tests failed.");
+        var harness = CreateDispatcherHarness(
+            GoalPhase.Testing, recordCraftCalls: true, multiPhasePlan: true, seedPhaseEntry: true);
+
+        var enqueued = new List<WorkTask>();
+        harness.Queue.OnEnqueue = t => enqueued.Add(t);
+
+        await harness.Dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = harness.TaskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "FAIL" }, // no Summary → raw fallback
+        }, TestContext.Current.CancellationToken);
+
+        var craftCall = AssertRetryReplannedToCoding(harness);
+
+        var payload = ExtractAdditionalContextPayload(craftCall.BuiltPrompt);
+        Assert.Contains("Test failures from iteration 1:", payload, StringComparison.Ordinal);
+        AssertContextCarriesCompleteReport(payload, rawOutput);
+        Assert.Contains("TESTER-EVIDENCE-BEYOND-3000", payload, StringComparison.Ordinal);
+        Assert.Contains("TESTER-TAIL-EVIDENCE-AT-END", payload, StringComparison.Ordinal);
+
+        AssertDispatchedCodingTask(enqueued, harness, craftCall.BuiltPrompt);
+    }
+
+    /// <summary>
+    /// Completed Coding / no-op with a NONBLANK summary: the summary — longer than the removed
+    /// 500-char cut — wins over a genuinely-present, distinguishable raw Output and reaches the
+    /// dispatched retry prompt COMPLETE. Because the competing raw Output really is supplied on
+    /// this vector, asserting its absence proves selection rather than being vacuous.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_CoderNoOp_SummarySelected_CompleteSummaryReachesDispatchedPrompt()
+    {
+        var summary = BuildNoOpReport("NOOP-SUMMARY", 's');
+        var competingRawOutput = BuildNoOpReport("NOOP-RAW", 'n');
+        var harness = CreateDispatcherHarness(
+            GoalPhase.Coding, recordCraftCalls: true, multiPhasePlan: true, seedPhaseEntry: true);
+
+        var enqueued = new List<WorkTask>();
+        harness.Queue.OnEnqueue = t => enqueued.Add(t);
+
+        await harness.Dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = harness.TaskId,
+            Status = TaskOutcome.Completed,
+            // The competing raw output IS supplied — the absence assertions below are therefore
+            // meaningful: only summary-wins selection can keep this text out of the prompt.
+            Output = competingRawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 }, // the no-op trigger
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        var craftCall = AssertNoOpRetryDispatched(harness);
+
+        // The nonblank summary is selected, COMPLETE, after the no-op preamble.
+        var context = craftCall.AdditionalContext!;
+        Assert.StartsWith("CRITICAL: Your previous attempt produced ZERO file changes.", context, StringComparison.Ordinal);
+        Assert.EndsWith(summary, context, StringComparison.Ordinal);
+
+        var payload = ExtractAdditionalContextPayload(craftCall.BuiltPrompt);
+        AssertContextCarriesCompleteReport(payload, summary);
+        Assert.Contains("NOOP-SUMMARY-EVIDENCE-BEYOND-500", payload, StringComparison.Ordinal);
+        Assert.Contains("NOOP-SUMMARY-TAIL-EVIDENCE-AT-END", payload, StringComparison.Ordinal);
+
+        // Selection proof: the competing raw output was present on the result but must NOT be
+        // in the retry context or anywhere in the dispatched prompt.
+        Assert.DoesNotContain("NOOP-RAW-TAIL-EVIDENCE-AT-END", context, StringComparison.Ordinal);
+        Assert.DoesNotContain("NOOP-RAW-TAIL-EVIDENCE-AT-END", craftCall.BuiltPrompt, StringComparison.Ordinal);
+
+        AssertDispatchedCodingTask(enqueued, harness, craftCall.BuiltPrompt);
+    }
+
+    /// <summary>
+    /// Completed Coding / no-op with a whitespace summary: the raw Output fallback — longer than
+    /// the removed 500-char cut — reaches the dispatched retry prompt COMPLETE. Retains the
+    /// raw-fallback half of the selection pair.
+    /// </summary>
+    [Fact]
+    public async Task HandleTaskCompletionAsync_CoderNoOp_RawFallback_CompleteOutputReachesDispatchedPrompt()
+    {
+        var rawOutput = BuildNoOpReport("NOOP-RAW", 'n');
+        var harness = CreateDispatcherHarness(
+            GoalPhase.Coding, recordCraftCalls: true, multiPhasePlan: true, seedPhaseEntry: true);
+
+        var enqueued = new List<WorkTask>();
+        harness.Queue.OnEnqueue = t => enqueued.Add(t);
+
+        await harness.Dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = harness.TaskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = new GitChangeSummary { FilesChanged = 0 }, // the no-op trigger
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "   " }, // whitespace → raw fallback
+        }, TestContext.Current.CancellationToken);
+
+        var craftCall = AssertNoOpRetryDispatched(harness);
+
+        var context = craftCall.AdditionalContext!;
+        Assert.StartsWith("CRITICAL: Your previous attempt produced ZERO file changes.", context, StringComparison.Ordinal);
+        Assert.EndsWith(rawOutput, context, StringComparison.Ordinal);
+
+        var payload = ExtractAdditionalContextPayload(craftCall.BuiltPrompt);
+        AssertContextCarriesCompleteReport(payload, rawOutput);
+        Assert.Contains("NOOP-RAW-EVIDENCE-BEYOND-500", payload, StringComparison.Ordinal);
+        Assert.Contains("NOOP-RAW-TAIL-EVIDENCE-AT-END", payload, StringComparison.Ordinal);
+
+        AssertDispatchedCodingTask(enqueued, harness, craftCall.BuiltPrompt);
+    }
+
+    // ── Chain-regression helpers ─────────────────────────────────────────
+
+    /// <summary>
+    /// Asserts the Review/Testing retry replanned into iteration 2 Coding without a swallowed
+    /// exception, and returns the single recorded craft call for the new iteration.
+    /// </summary>
+    private static LocalFakeBrain.CraftCall AssertRetryReplannedToCoding(DispatcherHarness harness)
+    {
+        // A caught drive exception would leave the goal Failed (or skip the replan entirely).
+        Assert.Null(harness.Logger.LastException);
+        Assert.False(harness.Pipeline.Phase == GoalPhase.Failed,
+            $"Goal failed: {harness.Pipeline.Goal.FailureReason}");
+        Assert.Equal(2, harness.Pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, harness.Pipeline.Phase);
+        Assert.Equal(WorkSlotState.Recorded,
+            Assert.Single(harness.Pipeline.GetSlotsForTest(), s => s.Slot.TaskId == harness.TaskId).State);
+
+        var craftCall = Assert.Single(harness.Brain.CraftCalls);
+        Assert.Equal(harness.Pipeline.GoalId, craftCall.GoalId);
+        Assert.Equal(2, craftCall.Iteration);
+        Assert.Equal(GoalPhase.Coding, craftCall.Phase);
+        Assert.NotNull(craftCall.AdditionalContext);
+        return craftCall;
+    }
+
+    /// <summary>
+    /// Asserts the coder no-op retry ran (iteration 2 Coding, no swallowed exception) and
+    /// returns the single recorded craft call.
+    /// </summary>
+    private static LocalFakeBrain.CraftCall AssertNoOpRetryDispatched(DispatcherHarness harness)
+    {
+        Assert.Null(harness.Logger.LastException);
+        Assert.False(harness.Pipeline.Phase == GoalPhase.Failed,
+            $"Goal failed: {harness.Pipeline.Goal.FailureReason}");
+        Assert.Equal(2, harness.Pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, harness.Pipeline.Phase);
+        Assert.Equal(WorkSlotState.Recorded,
+            Assert.Single(harness.Pipeline.GetSlotsForTest(), s => s.Slot.TaskId == harness.TaskId).State);
+
+        var craftCall = Assert.Single(harness.Brain.CraftCalls);
+        Assert.Equal(harness.Pipeline.GoalId, craftCall.GoalId);
+        Assert.Equal(2, craftCall.Iteration);
+        Assert.Equal(GoalPhase.Coding, craftCall.Phase);
+        Assert.NotNull(craftCall.AdditionalContext);
+        return craftCall;
+    }
+
+    /// <summary>
+    /// Asserts the dispatcher actually enqueued a Coding task for this goal carrying EXACTLY the
+    /// prompt built inside <c>CraftPromptAsync</c>. Omitting the dispatch, or dispatching some
+    /// other text, fails here.
+    /// </summary>
+    private static void AssertDispatchedCodingTask(
+        List<WorkTask> enqueued, DispatcherHarness harness, string expectedPrompt)
+    {
+        var task = Assert.Single(enqueued);
+        Assert.Equal(harness.Pipeline.GoalId, task.GoalId);
+        Assert.Equal(WorkerRole.Coder, task.Role);
+        // The captured task id encodes the position: {goalId}-{role}-{iteration:D3}-{occurrence:D2}-{attempt:D3}.
+        // Iteration 2 here proves the retry iteration's dispatch, not a re-run of iteration 1.
+        // (WorkTask.Iteration itself is left unset by TaskBuilder, so the id is the honest source.)
+        Assert.StartsWith($"{harness.Pipeline.GoalId}-coder-002-", task.TaskId, StringComparison.Ordinal);
+        // The dispatched prompt IS the built craft prompt — same string, byte for byte.
+        Assert.Equal(expectedPrompt, task.Prompt);
+        // …and the pipeline recorded it on the new iteration's Coding entry.
+        var retryEntry = Assert.Single(
+            harness.Pipeline.PhaseLog, e => e.Name == GoalPhase.Coding && e.Iteration == 2);
+        Assert.Equal(expectedPrompt, retryEntry.WorkerPrompt);
+    }
+
+    /// <summary>
+    /// Asserts the driver-constructed Additional-context region carries the report COMPLETE and
+    /// at its tail. The prompt template inserts a single line terminator before the closing
+    /// footer; exactly that framing terminator is stripped — no trimming of payload content.
+    /// </summary>
+    private static void AssertContextCarriesCompleteReport(string contextPayload, string expectedReport)
+    {
+        Assert.Contains(expectedReport, contextPayload, StringComparison.Ordinal);
+        Assert.EndsWith(expectedReport, contextPayload.TrimEnd('\n', '\r'), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Extracts the payload between the prompt's Additional-context header and footer. This is
+    /// the driver-constructed region; previous-feedback sections live OUTSIDE it, so finding the
+    /// report here (not merely somewhere in the prompt) is what the assertions require.
+    /// </summary>
+    private static string ExtractAdditionalContextPayload(string prompt)
+    {
+        var start = prompt.IndexOf(AdditionalContextHeader, StringComparison.Ordinal);
+        Assert.True(start >= 0, "Prompt should contain the additional-context header");
+        start += AdditionalContextHeader.Length;
+        var end = prompt.IndexOf(AdditionalContextFooter, start, StringComparison.Ordinal);
+        Assert.True(end >= 0, "Prompt should contain the additional-context footer");
+        return prompt[start..end];
+    }
+
+    /// <summary>
+    /// A report longer than the removed 3,000-char replan cut, with a marker past 3,000 and a
+    /// distinctive tail so a restored cut is detectable.
+    /// </summary>
+    private static string BuildChainReport(string label, char filler, string headline)
+    {
+        var head = $"{label}-REPORT-HEAD: {headline}\n";
+        var beyond3000 = $"{label}-EVIDENCE-BEYOND-3000: a legacy 3,000-char cut would lose this marker.\n";
+        var tail = $"{label}-TAIL-EVIDENCE-AT-END: complete evidence reached the retry prompt.";
+        return head
+            + new string(filler, 3_000 - head.Length) + beyond3000
+            + new string(filler, 1_500) + tail;
+    }
+
+    /// <summary>
+    /// A no-op report longer than the removed 500-char cut, with a marker past 500 and a
+    /// distinctive tail. The label makes summary and raw payloads distinguishable.
+    /// </summary>
+    private static string BuildNoOpReport(string label, char filler)
+    {
+        var head = $"{label}-HEAD: analysis only, no file edits.\n";
+        var beyond500 = $"{label}-EVIDENCE-BEYOND-500: a legacy 500-char preview would lose this marker.\n";
+        var tail = $"{label}-TAIL-EVIDENCE-AT-END: the change needs a config key the worker could not write.";
+        return head
+            + new string(filler, 500 - head.Length) + beyond500
+            + new string(filler, 900) + tail;
+    }
+
     private static string BuildExactLengthReport(int length, char fill)
     {
         const string head = "HEAD:\n";
@@ -569,6 +867,45 @@ public sealed class PipelineDriverWorkerOutputTests
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
         CreateDispatcher(GoalPhase phase)
     {
+        var harness = CreateDispatcherHarness(phase);
+        return (harness.Dispatcher, harness.Pipeline, harness.TaskId);
+    }
+
+    /// <summary>
+    /// The dispatcher harness behind <see cref="CreateDispatcher"/>, additionally exposing the
+    /// recording <see cref="LocalFakeBrain"/>, the live <see cref="TaskQueue"/> and the
+    /// capturing logger so chain tests can observe the crafted prompt, the actually dispatched
+    /// task, and any swallowed drive exception.
+    /// </summary>
+    /// <param name="Dispatcher">The real dispatcher under test.</param>
+    /// <param name="Pipeline">The seeded pipeline.</param>
+    /// <param name="TaskId">The admitted task id the completion must carry.</param>
+    /// <param name="Brain">The fake brain (recording when requested).</param>
+    /// <param name="Queue">The live task queue the dispatch enqueues into.</param>
+    /// <param name="Logger">Logger capturing any exception the dispatcher swallowed.</param>
+    private sealed record DispatcherHarness(
+        GoalDispatcher Dispatcher,
+        GoalPipeline Pipeline,
+        string TaskId,
+        LocalFakeBrain Brain,
+        TaskQueue Queue,
+        PipelineDriverCapturingLogger<GoalDispatcher> Logger);
+
+    /// <summary>
+    /// Creates the dispatcher harness. <paramref name="multiPhasePlan"/> selects the plan shape:
+    /// the default single-phase plan (existing WorkerOutput tests) or the full default plan the
+    /// chain regressions need so a retry iteration re-plans into Coding.
+    /// </summary>
+    /// <param name="phase">Phase the pipeline starts in.</param>
+    /// <param name="recordCraftCalls">Enable the fake brain's recording extension.</param>
+    /// <param name="multiPhasePlan">Use <see cref="IterationPlan.Default"/> instead of a one-phase plan.</param>
+    /// <param name="seedPhaseEntry">Seed the PhaseLog entry the completion lands on.</param>
+    private static DispatcherHarness CreateDispatcherHarness(
+        GoalPhase phase,
+        bool recordCraftCalls = false,
+        bool multiPhasePlan = false,
+        bool seedPhaseEntry = false)
+    {
         var goal = new Goal
         {
             Id = $"goal-{Guid.NewGuid():N}",
@@ -586,10 +923,17 @@ public sealed class PipelineDriverWorkerOutputTests
 
         // A one-phase plan reaches normal bookkeeping and then completes without invoking merge
         // infrastructure. Failed/request-changes verdicts still exercise the real retry path.
-        var plan = new IterationPlan { Phases = [phase] };
+        var plan = multiPhasePlan ? IterationPlan.Default() : new IterationPlan { Phases = [phase] };
         pipeline.SetPlan(plan);
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, phase);
         pipeline.AdvanceTo(phase);
+
+        if (seedPhaseEntry)
+        {
+            // The entry CurrentPhaseEntry resolves to — the drive writes the worker's selected
+            // report onto it before replanning.
+            pipeline.PhaseLog.Add(PhaseResult.Create(phase, pipeline.Iteration, 1));
+        }
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
@@ -600,18 +944,21 @@ public sealed class PipelineDriverWorkerOutputTests
             attempt: 1,
             WorkSlotState.Pending);
 
+        var queue = new TaskQueue();
+        var brain = new LocalFakeBrain { RecordCraftCalls = recordCraftCalls };
+        var logger = new PipelineDriverCapturingLogger<GoalDispatcher>();
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,
-            new TaskQueue(),
+            queue,
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
-            NullLogger<GoalDispatcher>.Instance,
+            logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain: new LocalFakeBrain(),
+            brain: brain,
             config: BuildDispatcherConfig());
 
-        return (dispatcher, pipeline, taskId);
+        return new DispatcherHarness(dispatcher, pipeline, taskId, brain, queue, logger);
     }
 
     /// <summary>
@@ -644,8 +991,38 @@ public sealed class PipelineDriverWorkerOutputTests
     }
 
     /// <summary>Minimal brain stub for pipeline driver tests.</summary>
+    /// <remarks>
+    /// RECORDING EXTENSION: when <see cref="RecordCraftCalls"/> is set, every
+    /// <see cref="CraftPromptAsync"/> invocation is captured together with the prompt built by
+    /// the REAL <see cref="BrainPromptBuilder.BuildCraftPromptText"/> at call time, and that
+    /// same built prompt is returned. This makes the value the dispatcher actually sends to the
+    /// worker observable without any production seam. The default (unset) behavior is unchanged:
+    /// the short canned prompt every pre-existing test relies on.
+    /// </remarks>
     private sealed class LocalFakeBrain : IDistributedBrain
     {
+        /// <summary>A single captured <c>CraftPromptAsync</c> invocation.</summary>
+        /// <param name="GoalId">Goal id sampled AT CALL TIME.</param>
+        /// <param name="Iteration">Pipeline iteration sampled AT CALL TIME.</param>
+        /// <param name="Phase">Phase the prompt was crafted for.</param>
+        /// <param name="AdditionalContext">The driver-constructed additional context, verbatim.</param>
+        /// <param name="BuiltPrompt">
+        /// The prompt built INSIDE this call with the real <c>BuildCraftPromptText</c> and
+        /// returned to the dispatcher — never reconstructed after the completion.
+        /// </param>
+        internal sealed record CraftCall(
+            string GoalId,
+            int Iteration,
+            GoalPhase Phase,
+            string? AdditionalContext,
+            string BuiltPrompt);
+
+        /// <summary>Opt-in: build/return real craft prompts and record every invocation.</summary>
+        internal bool RecordCraftCalls { get; init; }
+
+        /// <summary>Captured craft calls, in invocation order. Empty unless recording is enabled.</summary>
+        internal List<CraftCall> CraftCalls { get; } = [];
+
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public Task UpdateModelAsync(string model, int? maxContextTokens, Microsoft.Extensions.AI.ReasoningEffort? reasoningEffort, CancellationToken ct) =>
@@ -656,8 +1033,18 @@ public sealed class PipelineDriverWorkerOutputTests
             Task.FromResult(PlanResult.Success(IterationPlan.Default()));
 
         public Task<PromptResult> CraftPromptAsync(
-            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default) =>
-            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+            GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null, CancellationToken ct = default)
+        {
+            if (!RecordCraftCalls)
+                return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+
+            // Build with the REAL production builder, capture the immutable call-time values
+            // AND the built prompt, then return that very prompt — so the assertion target is
+            // the value the dispatcher goes on to dispatch, not a post-completion rebuild.
+            var builtPrompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, phase, additionalContext);
+            CraftCalls.Add(new CraftCall(pipeline.GoalId, pipeline.Iteration, phase, additionalContext, builtPrompt));
+            return Task.FromResult(PromptResult.Success(builtPrompt));
+        }
 
         public Task<string?> GenerateCommitMessageAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);

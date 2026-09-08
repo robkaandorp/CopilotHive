@@ -239,7 +239,7 @@ internal sealed class PipelineDriver
 
             var prevContext = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
                 ? result.Metrics.Summary
-                : (result.Output.Length > 500 ? result.Output[..500] + "..." : result.Output);
+                : result.Output;
             var noOpContext =
                 "CRITICAL: Your previous attempt produced ZERO file changes. " +
                 "You MUST edit files and commit them with `git add -A && git commit`. " +
@@ -553,11 +553,7 @@ internal sealed class PipelineDriver
 
         if (!string.IsNullOrWhiteSpace(output))
         {
-            const int maxOutputChars = 3000;
-            var truncated = output.Length > maxOutputChars
-                ? output[..maxOutputChars] + "..."
-                : output;
-            context += $"\n{truncated}";
+            context += $"\n{output}";
         }
         else
         {

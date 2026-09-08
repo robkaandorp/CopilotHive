@@ -269,18 +269,19 @@ public static class BrainPromptBuilder
         {
             hasAnyFeedback = true;
             sb.AppendLine($"=== Reviewer feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(reviewerEntry.WorkerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine(reviewerEntry.WorkerOutput);
             sb.AppendLine("=== End reviewer feedback ===");
         }
 
-        // Include tester feedback if tests failed
+        // Include tester feedback when the previous iteration has a Testing entry
+        // with nonblank content (selected by last-match, regardless of test outcome).
         var testerEntry = prevEntries
             .LastOrDefault(e => e.Name == GoalPhase.Testing);
         if (!string.IsNullOrWhiteSpace(testerEntry?.WorkerOutput))
         {
             hasAnyFeedback = true;
             sb.AppendLine($"=== Tester feedback (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(testerEntry.WorkerOutput, Constants.TruncationConversationSummary));
+            sb.AppendLine(testerEntry.WorkerOutput);
             sb.AppendLine("=== End tester feedback ===");
         }
 
@@ -292,7 +293,7 @@ public static class BrainPromptBuilder
         {
             hasAnyFeedback = true;
             sb.AppendLine($"=== Coder output round {i + 1} (iteration {prevIteration}) ===");
-            sb.AppendLine(Truncate(coderEntries[i].WorkerOutput!, Constants.TruncationMedium));
+            sb.AppendLine(coderEntries[i].WorkerOutput!);
             sb.AppendLine($"=== End coder output round {i + 1} ===");
         }
 

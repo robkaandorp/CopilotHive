@@ -445,24 +445,311 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void BuildPreviousIterationContext_LongOutput_TruncatesReviewer()
+    public void BuildPreviousIterationContext_LongReviewerOutput_Complete()
     {
-        var pipeline = CreatePipeline("g-ctx-8", "Long output goal");
-        var longOutput = new string('X', 5000);
-        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, longOutput);
+        var pipeline = CreatePipeline("g-ctx-8", "Long reviewer output goal");
+        var report = BuildLongReport("REVIEWER", "TAIL_EVIDENCE_PREV_REVIEWER_1a2b3c\n");
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, report);
         pipeline.IterationBudget.TryConsume();
 
         var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
 
-        // Reviewer uses TruncationConversationSummary (2000) so output should be truncated
-        Assert.True(result.Length < 5000 + 200); // Some overhead for labels
-        Assert.Contains("...", result);
+        AssertPreviousReviewerSectionEquals(result, 1, report);
+        Assert.Contains("TAIL_EVIDENCE_PREV_REVIEWER_1a2b3c", result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(1999, 'X')]
+    [InlineData(2000, 'Y')]
+    [InlineData(2001, 'Z')]
+    public void BuildPreviousIterationContext_ReviewerOutputAroundFormerBoundary_Complete(int length, char filler)
+    {
+        var pipeline = CreatePipeline($"g-ctx-rev-{length}", "Reviewer boundary goal");
+        var tail = $"TAIL_PREV_REVIEWER_{length}";
+        var report = new string(filler, length - tail.Length) + tail;
+        Assert.Equal(length, report.Length);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, report);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousReviewerSectionEquals(result, 1, report);
+        Assert.Contains(tail, result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_LongTesterOutput_Complete()
+    {
+        var pipeline = CreatePipeline("g-ctx-tester-8k", "Long tester output goal");
+        var report = BuildLongReport("TESTER", "TAIL_EVIDENCE_PREV_TESTER_4d5e6f\n");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, report);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousTesterSectionEquals(result, 1, report);
+        Assert.Contains("TAIL_EVIDENCE_PREV_TESTER_4d5e6f", result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(1999, 'P')]
+    [InlineData(2000, 'Q')]
+    [InlineData(2001, 'R')]
+    public void BuildPreviousIterationContext_TesterOutputAroundFormerBoundary_Complete(int length, char filler)
+    {
+        var pipeline = CreatePipeline($"g-ctx-tst-{length}", "Tester boundary goal");
+        var tail = $"TAIL_PREV_TESTER_{length}";
+        var report = new string(filler, length - tail.Length) + tail;
+        Assert.Equal(length, report.Length);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, report);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousTesterSectionEquals(result, 1, report);
+        Assert.Contains(tail, result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_LongCoderOutput_Complete()
+    {
+        var pipeline = CreatePipeline("g-ctx-coder-8k", "Long coder output goal");
+        var report = BuildLongReport("CODER", "TAIL_EVIDENCE_PREV_CODER_7f8a9b\n");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, report);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousCoderRoundSectionEquals(result, 1, 1, report);
+        Assert.Contains("TAIL_EVIDENCE_PREV_CODER_7f8a9b", result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(499, 'S')]
+    [InlineData(500, 'T')]
+    [InlineData(501, 'U')]
+    public void BuildPreviousIterationContext_CoderOutputAroundFormerBoundary_Complete(int length, char filler)
+    {
+        var pipeline = CreatePipeline($"g-ctx-cd-{length}", "Coder boundary goal");
+        var tail = $"TAIL_PREV_CODER_{length}";
+        var report = new string(filler, length - tail.Length) + tail;
+        Assert.Equal(length, report.Length);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, report);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousCoderRoundSectionEquals(result, 1, 1, report);
+        Assert.Contains(tail, result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_MultipleCoderRounds_AllIncludedInOrderComplete()
+    {
+        var pipeline = CreatePipeline("g-ctx-coder-multi", "Multi-round coder goal");
+        var round1 = BuildLongReport("CODER_R1", "TAIL_PREV_CODER_ROUND1_aaa\n");
+        var round2 = BuildLongReport("CODER_R2", "TAIL_PREV_CODER_ROUND2_bbb\n");
+        var round3 = BuildLongReport("CODER_R3", "TAIL_PREV_CODER_ROUND3_ccc\n");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, round1, occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, round2, occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, round3, occurrence: 3);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        AssertPreviousCoderRoundSectionEquals(result, 1, 1, round1);
+        AssertPreviousCoderRoundSectionEquals(result, 1, 2, round2);
+        AssertPreviousCoderRoundSectionEquals(result, 1, 3, round3);
+        // Order: round 1's tail must appear before round 2's, round 2's before round 3's.
+        var idx1 = result.IndexOf("TAIL_PREV_CODER_ROUND1_aaa", StringComparison.Ordinal);
+        var idx2 = result.IndexOf("TAIL_PREV_CODER_ROUND2_bbb", StringComparison.Ordinal);
+        var idx3 = result.IndexOf("TAIL_PREV_CODER_ROUND3_ccc", StringComparison.Ordinal);
+        Assert.True(idx1 >= 0 && idx2 > idx1 && idx3 > idx2,
+            $"Coder round tails should appear in order (round1 at {idx1}, round2 at {idx2}, round3 at {idx3})");
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_LatestMatchingEntriesSelected_OlderAndCurrentExcluded()
+    {
+        // Selection is scoped to the PRECEDING iteration only, and within it to the LATEST
+        // Review/Testing entry. Three distinguishable generations are seeded so both leakage
+        // directions are detectable:
+        //   • iteration 0  — an OLDER iteration (must not appear)
+        //   • iteration 1  — the previous iteration: an earlier occurrence (must not appear)
+        //                    and the latest occurrence (the only expected payload)
+        //   • iteration 2  — the CURRENT iteration (must not appear)
+        var pipeline = CreatePipeline("g-ctx-latest", "Latest selection goal");
+        var latestReviewer = "LATEST_REVIEWER_EXPECTED\n" + new string('V', 2500);
+        var latestTester = "LATEST_TESTER_EXPECTED\n" + new string('W', 2500);
+
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 0, "OLDER_ITERATION_REVIEWER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 0, "OLDER_ITERATION_TESTER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, "EARLIER_REVIEWER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, latestReviewer, occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "EARLIER_TESTER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, latestTester, occurrence: 2);
+        pipeline.IterationBudget.TryConsume(); // Now iteration 2 — the CURRENT iteration
+        // Current-iteration entries: later in PhaseLog than the selected ones, so an
+        // iteration-unfiltered LastOrDefault would pick THESE instead.
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 2, "CURRENT_ITERATION_REVIEWER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 2, "CURRENT_ITERATION_TESTER_SHOULD_NOT_APPEAR", occurrence: 1);
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        // Exactly the latest previous-iteration payloads, complete.
+        AssertPreviousReviewerSectionEquals(result, 1, latestReviewer);
+        AssertPreviousTesterSectionEquals(result, 1, latestTester);
+        // Neither older-iteration, earlier-occurrence, nor current-iteration text leaks.
+        Assert.DoesNotContain("OLDER_ITERATION_REVIEWER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("OLDER_ITERATION_TESTER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("EARLIER_REVIEWER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("EARLIER_TESTER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("CURRENT_ITERATION_REVIEWER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("CURRENT_ITERATION_TESTER_SHOULD_NOT_APPEAR", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_BlankLatestTesting_NoTesterSection_CodingSkipsBlankRounds()
+    {
+        // Selection semantics: Review/Testing use LastOrDefault THEN a nonblank check, so a
+        // blank latest entry means NO section for that phase (no fallback to earlier entries).
+        // Coding instead filters blank entries while collecting all nonblank rounds.
+        var pipeline = CreatePipeline("g-ctx-blank", "Blank latest goal");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_ROUND1_NONBLANK", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "   \n\t ", occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "CODER_ROUND3_NONBLANK", occurrence: 3);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "TESTER_EARLIER_NONBLANK", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "  \r\n ", occurrence: 2);
+        pipeline.IterationBudget.TryConsume();
+
+        var result = BrainPromptBuilder.BuildPreviousIterationContext(pipeline);
+
+        // Coding: blank middle round is skipped; nonblank rounds are included as rounds 1 and 2.
+        AssertPreviousCoderRoundSectionEquals(result, 1, 1, "CODER_ROUND1_NONBLANK");
+        AssertPreviousCoderRoundSectionEquals(result, 1, 2, "CODER_ROUND3_NONBLANK");
+        Assert.DoesNotContain("=== Coder output round 3", result, StringComparison.Ordinal);
+        // Reviewer/Testing: latest Testing entry is blank → no tester section at all
+        // (selection is LastOrDefault, then a nonblank check — there is NO earlier-entry fallback).
+        Assert.DoesNotContain("=== Tester feedback (iteration 1) ===", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("TESTER_EARLIER_NONBLANK", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_BuildPlanningPrompt_CarriesCompleteReports_LfNormalized()
+    {
+        // End-to-end: the planning prompt embeds the complete previous-iteration reports.
+        // BuildPlanningPrompt normalizes all line endings to LF; the expectation applies the
+        // same normalization (no new normalization is added anywhere).
+        var pipeline = CreatePipeline("g-plan-evidence", "Planning evidence goal");
+        var reviewerReport = BuildLongReport("REVIEWER", "TAIL_EVIDENCE_PLAN_REVIEWER_c1d2e3\n");
+        var testerReport = BuildLongReport("TESTER", "TAIL_EVIDENCE_PLAN_TESTER_f4a5b6\n");
+        var coderReport = BuildLongReport("CODER", "TAIL_EVIDENCE_PLAN_CODER_7c8d9e\n");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, coderReport, occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, testerReport, occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, reviewerReport, occurrence: 1);
+        pipeline.IterationBudget.TryConsume();
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+
+        // LF-normalized exact section comparison
+        AssertPreviousReviewerSectionEquals(prompt.ReplaceLineEndings("\n"), 1, reviewerReport.ReplaceLineEndings("\n"));
+        AssertPreviousTesterSectionEquals(prompt.ReplaceLineEndings("\n"), 1, testerReport.ReplaceLineEndings("\n"));
+        AssertPreviousCoderRoundSectionEquals(prompt.ReplaceLineEndings("\n"), 1, 1, coderReport.ReplaceLineEndings("\n"));
+        Assert.Contains("TAIL_EVIDENCE_PLAN_REVIEWER_c1d2e3", prompt, StringComparison.Ordinal);
+        Assert.Contains("TAIL_EVIDENCE_PLAN_TESTER_f4a5b6", prompt, StringComparison.Ordinal);
+        Assert.Contains("TAIL_EVIDENCE_PLAN_CODER_7c8d9e", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildPreviousIterationContext_BuildCraftPromptText_CodingAndTesting_CarriesCompleteReports()
+    {
+        // The coder retry prompt (Coding) and tester retry prompt (Testing) embed the complete
+        // previous-iteration reports in their previous-feedback sections, verbatim — reviewer,
+        // tester, and every coding round.
+        var pipeline = CreatePipeline("g-craft-evidence", "Craft evidence goal");
+        var reviewerReport = BuildLongReport("REVIEWER", "TAIL_EVIDENCE_CRAFT_REVIEWER_44aabb\n");
+        var testerReport = BuildLongReport("TESTER", "TAIL_EVIDENCE_CRAFT_TESTER_11aabb\n");
+        var coderRound1 = BuildLongReport("CODER_R1", "TAIL_EVIDENCE_CRAFT_CODER_R1_22ccdd\n");
+        var coderRound2 = BuildLongReport("CODER_R2", "TAIL_EVIDENCE_CRAFT_CODER_R2_33eeff\n");
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, coderRound1, occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, coderRound2, occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, testerReport, occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Reviewer, 1, reviewerReport, occurrence: 1);
+        pipeline.IterationBudget.TryConsume();
+
+        var codingPrompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Coding);
+        var testingPrompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Testing);
+
+        // Previous-iteration sections are embedded verbatim (no LF normalization on this path).
+        AssertPreviousReviewerSectionEquals(codingPrompt, 1, reviewerReport);
+        AssertPreviousTesterSectionEquals(codingPrompt, 1, testerReport);
+        AssertPreviousCoderRoundSectionEquals(codingPrompt, 1, 1, coderRound1);
+        AssertPreviousCoderRoundSectionEquals(codingPrompt, 1, 2, coderRound2);
+
+        AssertPreviousReviewerSectionEquals(testingPrompt, 1, reviewerReport);
+        AssertPreviousTesterSectionEquals(testingPrompt, 1, testerReport);
+        AssertPreviousCoderRoundSectionEquals(testingPrompt, 1, 1, coderRound1);
+        AssertPreviousCoderRoundSectionEquals(testingPrompt, 1, 2, coderRound2);
+
+        // Tail evidence beyond every removed cap survives on both prompts.
+        Assert.Contains("TAIL_EVIDENCE_CRAFT_REVIEWER_44aabb", codingPrompt, StringComparison.Ordinal);
+        Assert.Contains("TAIL_EVIDENCE_CRAFT_REVIEWER_44aabb", testingPrompt, StringComparison.Ordinal);
     }
 
     // -- Helpers --
 
     private static GoalPipeline CreatePipeline(string goalId, string description) =>
         new(new Goal { Id = goalId, Description = description });
+
+    // -- Previous-iteration section helpers (BuildPreviousIterationContext framing) --
+
+    /// <summary>
+    /// Asserts that the previous-iteration Reviewer feedback section carries exactly the
+    /// expected report between its header and footer (single line-terminator framing each side).
+    /// </summary>
+    private static void AssertPreviousReviewerSectionEquals(string text, int iteration, string expectedReport)
+    {
+        var header = $"=== Reviewer feedback (iteration {iteration}) ===";
+        AssertSectionBetweenEquals(text, header, $"=== End reviewer feedback ===", expectedReport);
+    }
+
+    private static void AssertPreviousTesterSectionEquals(string text, int iteration, string expectedReport)
+    {
+        var header = $"=== Tester feedback (iteration {iteration}) ===";
+        AssertSectionBetweenEquals(text, header, "=== End tester feedback ===", expectedReport);
+    }
+
+    private static void AssertPreviousCoderRoundSectionEquals(string text, int iteration, int round, string expectedReport)
+    {
+        var header = $"=== Coder output round {round} (iteration {iteration}) ===";
+        AssertSectionBetweenEquals(text, header, $"=== End coder output round {round} ===", expectedReport);
+    }
+
+    /// <summary>
+    /// Asserts the text between a header line and its footer equals the expected report,
+    /// after stripping the single line terminator the template inserts on each side.
+    /// Ordinal comparison — no whitespace or line-ending normalization.
+    /// </summary>
+    private static void AssertSectionBetweenEquals(string text, string header, string footer, string expectedReport)
+    {
+        var start = text.IndexOf(header, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Header '{header}' should be in prompt");
+        start += header.Length;
+        var end = text.IndexOf(footer, start, StringComparison.Ordinal);
+        Assert.True(end >= 0, $"Footer '{footer}' should follow header '{header}'");
+        var payload = text[start..end];
+
+        var leading = payload.StartsWith("\r\n", StringComparison.Ordinal) ? 2
+            : payload.StartsWith("\n", StringComparison.Ordinal) ? 1
+            : 0;
+        Assert.True(leading > 0, "Section payload should start with a line terminator");
+        var trailing = payload.EndsWith("\r\n", StringComparison.Ordinal) ? 2
+            : payload.EndsWith("\n", StringComparison.Ordinal) ? 1
+            : 0;
+        Assert.True(trailing > 0, "Section payload should end with a line terminator");
+
+        Assert.Equal(expectedReport, payload[leading..^trailing]);
+    }
 
     // -- Single Session Tests --
 
