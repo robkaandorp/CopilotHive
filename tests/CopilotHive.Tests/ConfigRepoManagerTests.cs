@@ -2628,6 +2628,687 @@ public class ConfigRepoManagerTests : IDisposable
         await Assert.ThrowsAsync<InvalidOperationException>(() => blockingTask);
     }
 
+    // ── Load/write serialization on the manager's _gitLock ────────────────────
+
+    /// <summary>
+    /// Generous protective bound for every gate/drain wait in the serialization tests. It is a
+    /// TIMEOUT-ONLY diagnostic bound (never a synchronization signal): the passing flow completes
+    /// promptly, and an expiry fails the test with a <see cref="TimeoutException"/> instead of
+    /// hanging the run. No assertion in these tests infers ordering from a timing observation —
+    /// every conclusion is drawn from the discriminating config values.
+    /// </summary>
+    private static readonly TimeSpan SerializationGateBound = TimeSpan.FromSeconds(30);
+
+    private const string GateConfigA = """
+        version: "1.0-A"
+        repositories:
+          - name: repo-a
+            url: https://github.com/org/a.git
+        """;
+
+    private const string GateConfigB = """
+        version: "2.0-B"
+        repositories:
+          - name: repo-b
+            url: https://github.com/org/b.git
+        """;
+
+    private const string GateConfigD = """
+        version: "4.0-D"
+        repositories:
+          - name: repo-d
+            url: https://github.com/org/d.git
+        """;
+
+    /// <summary>
+    /// Marker content written to disk AFTER an operation completed: a populated cache must keep
+    /// serving its own generation (a cache hit never reparses the YAML), so observing these values
+    /// proves the cache was EMPTY.
+    /// </summary>
+    private const string GateConfigMarker = """
+        version: "9.9-MARKER"
+        repositories:
+          - name: repo-marker
+            url: https://github.com/org/marker.git
+        """;
+
+    /// <summary>
+    /// Builds a manager whose REAL <see cref="ConfigRepoManager.SyncRepoAsync"/> pull path is gated
+    /// through the existing <c>GitRunner</c> seam (no real git, no network): the pull signals
+    /// <paramref name="pullEntered"/> — which establishes that the sync owns <c>_gitLock</c>,
+    /// because the pull runs inside the semaphore region — and then parks until
+    /// <paramref name="releasePull"/> is completed. On release it optionally rewrites
+    /// <c>hive-config.yaml</c> with <paramref name="yamlWrittenByPull"/>, exactly like a real pull
+    /// bringing down new content, before the sync invalidates the cache and releases the lock.
+    /// </summary>
+    private ConfigRepoManager CreateGatedSyncManager(
+        TaskCompletionSource pullEntered,
+        TaskCompletionSource releasePull,
+        string? yamlWrittenByPull)
+    {
+        // A .git directory routes SyncRepoAsync through the pull path.
+        Directory.CreateDirectory(Path.Combine(_tempDir, ".git"));
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+
+        return new ConfigRepoManager("https://example.com/config.git", _tempDir)
+        {
+            GitRunner = async (_, args, _) =>
+            {
+                if (args.Length > 0 && args[0] == "pull")
+                {
+                    pullEntered.TrySetResult();
+                    // Timeout-only wait: the caller's token must not turn a stuck gate into a
+                    // cancellation, and an expiry surfaces as a TimeoutException.
+                    await releasePull.Task.WaitAsync(SerializationGateBound);
+                    if (yamlWrittenByPull is not null)
+                        await File.WriteAllTextAsync(configPath, yamlWrittenByPull, CancellationToken.None);
+                }
+
+                return new ConfigRepoManager.GitRunResult(0, "", "");
+            }
+        };
+    }
+
+    /// <summary>
+    /// Drains a captured operation before fixture teardown under the protective bound. It is only
+    /// reached on a path where the test body did NOT already observe the task, i.e. where a body
+    /// fault is pending; that fault stays authoritative, so a drain fault is deliberately not
+    /// rethrown here — it would replace the real failure. Nothing is skipped: the caller nulls its
+    /// handle after a successful await, so a drained task is always one the body abandoned.
+    /// </summary>
+    private static async Task DrainPendingAsync(Task? task)
+    {
+        if (task is null)
+            return;
+
+        try
+        {
+            await task.WaitAsync(SerializationGateBound);
+        }
+        catch (Exception)
+        {
+            // Intentionally not rethrown — see the summary: the body's fault is authoritative.
+        }
+    }
+
+    /// <summary>
+    /// Awaits a gate signal under the timeout-only <see cref="SerializationGateBound"/>. The bound
+    /// is purely protective: an expiry throws a <see cref="TimeoutException"/> instead of hanging
+    /// the run, and no assertion draws a conclusion from the wait itself. Deliberately NOT
+    /// token-bound — a caller cancellation must not be able to turn a stuck gate into a silent
+    /// cancellation that skips the discriminating assertions. Kept as a helper (rather than an
+    /// inline await) so the wait stays a single, documented seam.
+    /// </summary>
+    private static Task AwaitGateAsync(Task gate) => gate.WaitAsync(SerializationGateBound);
+
+    /// <summary>
+    /// Reflection handle for <see cref="ConfigRepoManager"/>'s private config cache — the same
+    /// test-only access pattern as <see cref="GetGitLock"/> and <c>CatalogLockField</c>. Resolved
+    /// once; a stale field name fails here at setup rather than silently passing.
+    /// <para>
+    /// Reading the field directly is what makes the MID-WAIT cache assertions possible at all:
+    /// every public read path (<see cref="ConfigRepoManager.LoadConfigAsync"/>) now takes
+    /// <c>_gitLock</c>, so calling one while a gated sync holds the permit would deadlock. The
+    /// field read takes no lock.
+    /// </para>
+    /// </summary>
+    private static readonly FieldInfo CachedConfigField = typeof(ConfigRepoManager)
+        .GetField("_cachedConfig", BindingFlags.NonPublic | BindingFlags.Instance)
+        ?? throw new InvalidOperationException("ConfigRepoManager._cachedConfig field not found — test setup is stale.");
+
+    /// <summary>
+    /// The private cache's IDENTITY plus its observable membership/state, rendered as an exactly
+    /// comparable string. A cleared cache, a replaced generation, and a mutated generation are all
+    /// distinguishable: identity catches a replacement that happens to carry equal values, and the
+    /// rendered state catches a value change that reuses the instance.
+    /// </summary>
+    private static (HiveConfigFile? Instance, string State) CaptureCacheState(ConfigRepoManager manager)
+    {
+        var cached = (HiveConfigFile?)CachedConfigField.GetValue(manager);
+        var state = cached is null
+            ? "<no cached generation>"
+            : $"version={cached.Version}; configured={cached.IsConfigured}; repositories=[" +
+              string.Join(", ", cached.Repositories.Select(r => $"{r.Name}@{r.Url}")) + "]; " +
+              $"compaction={cached.Models?.CompactionModel ?? "<null>"}";
+        return (cached, state);
+    }
+
+    /// <summary>
+    /// Asserts the private cache is byte-for-byte the SAME generation as <paramref name="expected"/>:
+    /// same instance (never cleared, never replaced) and same rendered membership/state.
+    /// </summary>
+    private static void AssertCacheUnchanged(
+        (HiveConfigFile? Instance, string State) expected, ConfigRepoManager manager, string because)
+    {
+        var actual = CaptureCacheState(manager);
+        Assert.True(
+            ReferenceEquals(expected.Instance, actual.Instance),
+            $"{because} The cached generation INSTANCE changed: expected {Describe(expected.Instance)}, " +
+            $"observed {Describe(actual.Instance)} (state now: {actual.State}).");
+        Assert.Equal(expected.State, actual.State);
+
+        static string Describe(HiveConfigFile? instance) =>
+            instance is null ? "<no cached generation>" : $"instance #{instance.GetHashCode()}";
+    }
+
+    /// <summary>
+    /// Settles an operation and reports its fault WITHOUT throwing, so the caller can assert the
+    /// mid-wait file/cache invariants FIRST and only then classify the outcome. A <c>null</c> fault
+    /// means the operation COMPLETED — the discriminating observation when an unguarded operation
+    /// never queued behind the held sync at all. Bounded by the timeout-only
+    /// <see cref="SerializationGateBound"/>, so a genuinely stuck operation fails fast instead of
+    /// hanging; the bound is never used as evidence.
+    /// </summary>
+    private static async Task<Exception?> CaptureFaultAsync(Task operation)
+    {
+        try
+        {
+            await operation.WaitAsync(SerializationGateBound);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="CaptureFaultAsync"/> for a load: also surfaces the RESULT an unguarded load
+    /// would have answered with, so the failure message names the stale generation it served.
+    /// </summary>
+    private static async Task<(HiveConfigFile? Result, Exception? Fault)> CaptureLoadOutcomeAsync(
+        Task<HiveConfigFile> operation)
+    {
+        try
+        {
+            return (await operation.WaitAsync(SerializationGateBound), null);
+        }
+        catch (Exception ex)
+        {
+            return (null, ex);
+        }
+    }
+
+    /// <summary>
+    /// Ordering (a): a load issued while a sync HOLDS <c>_gitLock</c> must queue behind it and
+    /// observe the POST-sync state. The cache is primed with config A; the gated sync's pull writes
+    /// config B and then invalidates the cache. The queued load — and every later cached load —
+    /// must therefore return B. An unguarded cache-hit load would return the pre-sync A, so this
+    /// test fails if the serialization regresses.
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_QueuedBehindHeldSync_ReturnsPostSyncGeneration()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), GateConfigA, ct);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, GateConfigB);
+
+        // Prime the cache with A so an unguarded load would take the cache-hit path.
+        var primed = await manager.LoadConfigAsync(ct);
+        Assert.Equal("1.0-A", primed.Version);
+
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        Task<HiveConfigFile>? pendingLoad = null;
+        try
+        {
+            // The pull runs INSIDE the semaphore region: entering it establishes that the sync
+            // owns _gitLock.
+            await AwaitGateAsync(pullEntered.Task);
+
+            // Issued while the sync holds the lock. LoadConfigAsync runs synchronously up to its
+            // first await (the semaphore wait), so the request is registered before we release.
+            pendingLoad = manager.LoadConfigAsync(ct);
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+
+            var queued = await pendingLoad;
+            pendingLoad = null;
+
+            // The discriminating values: B (post-sync), never A (pre-sync).
+            Assert.Equal("2.0-B", queued.Version);
+            Assert.Equal("repo-b", queued.Repositories[0].Name);
+
+            var later = await manager.LoadConfigAsync(ct);
+            Assert.Equal("2.0-B", later.Version);
+            Assert.Equal("repo-b", later.Repositories[0].Name);
+            Assert.True(manager.IsRepositoryAllowed("https://github.com/org/b.git"));
+            Assert.False(manager.IsRepositoryAllowed("https://github.com/org/a.git"));
+
+            // The detached-copy contract survives the serialization: every load — miss or hit —
+            // returns its own instance and graph.
+            Assert.NotSame(queued, later);
+            Assert.NotSame(queued.Repositories, later.Repositories);
+            Assert.NotSame(queued.Repositories[0], later.Repositories[0]);
+            Assert.NotSame(primed, queued);
+
+            // No permit leaked or over-released across the whole sequence.
+            Assert.Equal(1, GetGitLock(manager).CurrentCount);
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+            await DrainPendingAsync(pendingLoad);
+        }
+    }
+
+    /// <summary>
+    /// Ordering (b): a write issued while a sync HOLDS <c>_gitLock</c> must capture its snapshot
+    /// only AFTER it actually acquires the lock. The owner's configuration is changed from B to C
+    /// through supported APIs while the write is queued and BEFORE the gate is released; the
+    /// released pull then writes D. Because the write runs last, disk and cache must hold C — a
+    /// pre-lock snapshot would have persisted B (and the sync's D would have survived on disk).
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_QueuedBehindHeldSync_SnapshotsAndPublishesAfterAcquisition()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, GateConfigA, ct);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, GateConfigD);
+
+        // The caller-owned config the write is invoked with: state B at invocation time.
+        var owner = new HiveConfigFile
+        {
+            Version = "2.0-B",
+            Repositories = [new RepositoryConfig { Name = "repo-b", Url = "https://github.com/org/b.git" }],
+            Orchestrator = new OrchestratorConfig { Model = "model-b" },
+            IsConfigured = true
+        };
+        owner.SetCompactionModel("compaction-b");
+
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        Task? pendingWrite = null;
+        try
+        {
+            await AwaitGateAsync(pullEntered.Task);
+
+            pendingWrite = manager.WriteConfigAsync(owner, ct);
+
+            // Mutate the owner to C through supported APIs while the write is still queued —
+            // strictly BEFORE the gate is released, so the input is stable from then on.
+            owner.Version = "3.0-C";
+            owner.Repositories = [new RepositoryConfig { Name = "repo-c", Url = "https://github.com/org/c.git" }];
+            owner.Orchestrator.Model = "model-c";
+            owner.SetCompactionModel("compaction-c");
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+            await pendingWrite;
+            pendingWrite = null;
+
+            // The input was NOT touched after the gate opened: whatever landed on disk was
+            // snapshotted from this exact state, after the write acquired the lock.
+            Assert.Equal("3.0-C", owner.Version);
+
+            // Disk: C — the write ran after the sync, so it overwrote the pull's D.
+            var disk = await File.ReadAllTextAsync(configPath, ct);
+            var parsed = ConfigRepoManager.ParseConfig(disk);
+            Assert.Equal("3.0-C", parsed.Version);
+            Assert.Equal("repo-c", parsed.Repositories[0].Name);
+            Assert.Equal("model-c", parsed.Orchestrator.Model);
+            Assert.Equal("compaction-c", parsed.Models!.CompactionModel);
+            Assert.DoesNotContain("2.0-B", disk);
+            Assert.DoesNotContain("4.0-D", disk);
+
+            // Cache: C too, and PUBLISHED after the sync's invalidation. An external disk edit is
+            // invisible to a populated cache, so a load that observed the marker would prove the
+            // publication had been discarded by the sync.
+            await File.WriteAllTextAsync(configPath, GateConfigMarker, ct);
+            var cached = await manager.LoadConfigAsync(ct);
+            Assert.Equal("3.0-C", cached.Version);
+            Assert.Equal("repo-c", cached.Repositories[0].Name);
+            Assert.Equal("compaction-c", cached.Models!.CompactionModel);
+            Assert.True(cached.IsConfigured);
+            Assert.NotSame(owner, cached);
+            Assert.NotSame(owner.Repositories, cached.Repositories);
+
+            Assert.Equal(1, GetGitLock(manager).CurrentCount);
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+            await DrainPendingAsync(pendingWrite);
+        }
+    }
+
+    /// <summary>
+    /// Cancellation while a load waits behind the held sync. The invariants are asserted MID-WAIT —
+    /// after the outcome is observed but strictly BEFORE the gate is released, while
+    /// <c>CurrentCount</c> is still zero — because releasing the pull rewrites the file and clears
+    /// the cache, which would erase any evidence of an effect by the cancelled waiter.
+    /// <para>
+    /// At that point a correctly serialized load has produced NO observable effect at all: the file
+    /// bytes are identical, the cached generation is the same instance carrying the same state, and
+    /// the operation itself did not answer a value. An unguarded load instead runs to completion
+    /// while the sync holds the lock — publishing the stale pre-sync generation to its caller and,
+    /// on a cache miss, populating the cache from the pre-pull file — which trips this block.
+    /// </para>
+    /// The post-sync recovery assertions are kept separately: the sync's own effects survive, the
+    /// permit is released, and a later load completes normally with the post-sync generation.
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_CancelledWhileWaitingForHeldSync_LeavesLockAndCacheIntact()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, GateConfigA, ct);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, GateConfigB);
+        var gitLock = GetGitLock(manager);
+
+        _ = await manager.LoadConfigAsync(ct);
+
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        try
+        {
+            await AwaitGateAsync(pullEntered.Task);
+
+            // Baselines captured BEFORE the cancelled operation starts, while the sync holds the
+            // permit: the exact file bytes and the exact cached generation (identity + state).
+            var expectedBytes = await File.ReadAllBytesAsync(configPath, ct);
+            var expectedCache = CaptureCacheState(manager);
+
+            using var cts = new CancellationTokenSource();
+            var cancelledLoad = manager.LoadConfigAsync(cts.Token);
+            await cts.CancelAsync();
+
+            // Settled WITHOUT throwing, so the invariants below are asserted first. A completed
+            // load is itself the discriminating observation: it answered while the sync held the
+            // lock instead of queueing behind it.
+            var (result, fault) = await CaptureLoadOutcomeAsync(cancelledLoad);
+
+            // ── MID-WAIT invariants (gate still closed, CurrentCount still 0) ────────
+            Assert.Equal(0, gitLock.CurrentCount);
+            Assert.Equal(expectedBytes, await File.ReadAllBytesAsync(configPath, ct));
+            AssertCacheUnchanged(expectedCache, manager, "A cancelled load must not touch the cache.");
+            Assert.True(
+                fault is not null,
+                "The cancelled load COMPLETED while the sync held _gitLock — it never queued behind " +
+                $"the sync and answered with version '{result?.Version}'.");
+            Assert.IsAssignableFrom<OperationCanceledException>(fault);
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+
+            // ── Recovery: the sync's own effects are intact and a later load works ───
+            Assert.Equal(1, gitLock.CurrentCount);
+            var later = await manager.LoadConfigAsync(ct);
+            Assert.Equal("2.0-B", later.Version);
+            Assert.Equal("repo-b", later.Repositories[0].Name);
+            Assert.Equal(1, gitLock.CurrentCount);
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+        }
+    }
+
+    /// <summary>
+    /// The cache-MISS companion to
+    /// <see cref="LoadConfigAsync_CancelledWhileWaitingForHeldSync_LeavesLockAndCacheIntact"/>: the
+    /// manager has never loaded, so the cache is empty when the cancelled load is issued behind the
+    /// held sync.
+    /// <para>
+    /// This is the shape in which an unguarded load leaves a durable CACHE effect rather than just
+    /// answering its caller: on a miss it reads the still-pre-pull file and PUBLISHES that stale
+    /// generation into <c>_cachedConfig</c>. Asserted mid-wait, before the gate is released and the
+    /// sync's invalidation erases the evidence, the cache must still be empty.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_CancelledWhileWaitingForHeldSync_PublishesNoCacheOnMiss()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, GateConfigA, ct);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, GateConfigB);
+        var gitLock = GetGitLock(manager);
+
+        // Deliberately NOT primed: the cache is empty, so an unguarded load takes the miss path
+        // and populates it from disk.
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        try
+        {
+            await AwaitGateAsync(pullEntered.Task);
+
+            var expectedBytes = await File.ReadAllBytesAsync(configPath, ct);
+            var expectedCache = CaptureCacheState(manager);
+            Assert.Null(expectedCache.Instance);
+
+            using var cts = new CancellationTokenSource();
+            var cancelledLoad = manager.LoadConfigAsync(cts.Token);
+            await cts.CancelAsync();
+
+            var (result, fault) = await CaptureLoadOutcomeAsync(cancelledLoad);
+
+            // ── MID-WAIT invariants (gate still closed, CurrentCount still 0) ────────
+            Assert.Equal(0, gitLock.CurrentCount);
+            Assert.Equal(expectedBytes, await File.ReadAllBytesAsync(configPath, ct));
+            AssertCacheUnchanged(
+                expectedCache, manager,
+                "A cancelled load must not parse the pre-sync file into the cache.");
+            Assert.True(
+                fault is not null,
+                "The cancelled load COMPLETED while the sync held _gitLock — it read the pre-pull " +
+                $"file and answered with version '{result?.Version}'.");
+            Assert.IsAssignableFrom<OperationCanceledException>(fault);
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+
+            // ── Recovery: the post-sync generation loads normally ────────────────────
+            Assert.Equal(1, gitLock.CurrentCount);
+            var later = await manager.LoadConfigAsync(ct);
+            Assert.Equal("2.0-B", later.Version);
+            Assert.Equal("repo-b", later.Repositories[0].Name);
+            Assert.Equal(1, gitLock.CurrentCount);
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+        }
+    }
+
+    /// <summary>
+    /// Cancellation while a write waits behind the held sync. As above, the invariants are asserted
+    /// MID-WAIT — before the gate is released, while <c>CurrentCount</c> is still zero — because the
+    /// released pull rewrites the file and the sync clears the cache, erasing the evidence of any
+    /// write or cache publication performed by the cancelled waiter.
+    /// <para>
+    /// A correctly serialized write never gets past its semaphore wait: the file bytes are
+    /// identical, the previously cached generation is the same instance with the same state, and no
+    /// value was produced. An unguarded write instead snapshots and serializes immediately and hits
+    /// the file while the sync holds the lock — persisting C (or truncating the file) and publishing
+    /// C into the cache — and every one of those effects trips this block.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_CancelledWhileWaitingForHeldSync_WritesNothingAndLeavesLockIntact()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, GateConfigA, ct);
+
+        var pullEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = CreateGatedSyncManager(pullEntered, releasePull, GateConfigD);
+        var gitLock = GetGitLock(manager);
+
+        _ = await manager.LoadConfigAsync(ct);
+
+        var cancelledInput = new HiveConfigFile
+        {
+            Version = "3.0-C",
+            Repositories = [new RepositoryConfig { Name = "repo-c", Url = "https://github.com/org/c.git" }],
+            Orchestrator = new OrchestratorConfig { Model = "model-c" }
+        };
+
+        Task? pendingSync = manager.SyncRepoAsync(ct);
+        try
+        {
+            await AwaitGateAsync(pullEntered.Task);
+
+            // Baselines captured BEFORE the cancelled write starts, while the sync holds the permit.
+            var expectedBytes = await File.ReadAllBytesAsync(configPath, ct);
+            var expectedCache = CaptureCacheState(manager);
+
+            using var cts = new CancellationTokenSource();
+            var cancelledWrite = manager.WriteConfigAsync(cancelledInput, cts.Token);
+            await cts.CancelAsync();
+
+            var fault = await CaptureFaultAsync(cancelledWrite);
+
+            // ── MID-WAIT invariants (gate still closed, CurrentCount still 0) ────────
+            Assert.Equal(0, gitLock.CurrentCount);
+            Assert.Equal(expectedBytes, await File.ReadAllBytesAsync(configPath, ct));
+            AssertCacheUnchanged(
+                expectedCache, manager, "A cancelled write must not replace the prior cached generation.");
+            Assert.True(
+                fault is not null,
+                "The cancelled write COMPLETED while the sync held _gitLock — it serialized and " +
+                "persisted its snapshot without ever queueing behind the sync.");
+            Assert.IsAssignableFrom<OperationCanceledException>(fault);
+
+            releasePull.TrySetResult();
+            await pendingSync;
+            pendingSync = null;
+            Assert.Equal(1, gitLock.CurrentCount);
+
+            // ── Recovery: disk carries the sync's D only; the manager stays usable ───
+            var disk = await File.ReadAllTextAsync(configPath, ct);
+            Assert.DoesNotContain("3.0-C", disk);
+            Assert.DoesNotContain("repo-c", disk);
+            Assert.Equal("4.0-D", ConfigRepoManager.ParseConfig(disk).Version);
+
+            // No cache was published by the cancelled write: the load reads the post-sync disk.
+            var later = await manager.LoadConfigAsync(ct);
+            Assert.Equal("4.0-D", later.Version);
+            Assert.Equal("repo-d", later.Repositories[0].Name);
+
+            // The manager is fully usable afterwards.
+            var followUp = new HiveConfigFile
+            {
+                Version = "5.0-E",
+                Repositories = [new RepositoryConfig { Name = "repo-e", Url = "https://github.com/org/e.git" }],
+                Orchestrator = new OrchestratorConfig { Model = "model-e" }
+            };
+            await manager.WriteConfigAsync(followUp, ct);
+            Assert.Equal("5.0-E", ConfigRepoManager.ParseConfig(await File.ReadAllTextAsync(configPath, ct)).Version);
+            Assert.Equal(1, gitLock.CurrentCount);
+        }
+        finally
+        {
+            releasePull.TrySetResult();
+            await DrainPendingAsync(pendingSync);
+        }
+    }
+
+    /// <summary>
+    /// A write whose token is ALREADY cancelled fails at the semaphore acquisition: no snapshot is
+    /// captured, no file is touched, the previously cached generation keeps serving loads and
+    /// membership, and no permit is released that was never acquired.
+    /// <para>
+    /// The same invariant shape as the mid-wait tests is applied here: the exact file bytes and the
+    /// exact cached generation (identity + state) are captured BEFORE the rejected call and
+    /// asserted IMMEDIATELY after its outcome is observed, before any recovery work can overwrite
+    /// the evidence.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WriteConfigAsync_PreCancelledToken_RetainsCacheAndLeavesDiskUnchanged()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var configPath = Path.Combine(_tempDir, "hive-config.yaml");
+        await File.WriteAllTextAsync(configPath, GateConfigA, ct);
+
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+        _ = await manager.LoadConfigAsync(ct);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/a.git"));
+
+        var rejected = new HiveConfigFile
+        {
+            Version = "3.0-C",
+            Repositories = [new RepositoryConfig { Name = "repo-c", Url = "https://github.com/org/c.git" }],
+            Orchestrator = new OrchestratorConfig { Model = "model-c" }
+        };
+
+        // Baselines captured BEFORE the rejected call.
+        var expectedBytes = await File.ReadAllBytesAsync(configPath, ct);
+        var expectedCache = CaptureCacheState(manager);
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        var fault = await CaptureFaultAsync(manager.WriteConfigAsync(rejected, cts.Token));
+
+        // ── Invariants asserted before any recovery work ─────────────────────────
+        Assert.Equal(expectedBytes, await File.ReadAllBytesAsync(configPath, ct));
+        AssertCacheUnchanged(
+            expectedCache, manager, "A pre-cancelled write must not replace the prior cached generation.");
+        Assert.True(fault is not null, "The pre-cancelled write COMPLETED instead of failing at acquisition.");
+        Assert.IsAssignableFrom<OperationCanceledException>(fault);
+
+        // Disk untouched.
+        Assert.Equal(GateConfigA, await File.ReadAllTextAsync(configPath, ct));
+
+        // Prior successful cache retained.
+        var loaded = await manager.LoadConfigAsync(ct);
+        Assert.Equal("1.0-A", loaded.Version);
+        Assert.Equal("repo-a", loaded.Repositories[0].Name);
+        Assert.True(manager.IsRepositoryAllowed("https://github.com/org/a.git"));
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/c.git"));
+
+        // A cancelled acquisition released nothing, so the manager still works.
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+        await manager.WriteConfigAsync(rejected, ct);
+        Assert.Equal("3.0-C", (await manager.LoadConfigAsync(ct)).Version);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
+    /// <summary>
+    /// A load whose token is ALREADY cancelled fails at the semaphore acquisition without touching
+    /// the cache or the file, and releases no permit.
+    /// </summary>
+    [Fact]
+    public async Task LoadConfigAsync_PreCancelledToken_ThrowsAndLeavesLockIntact()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "hive-config.yaml"), GateConfigA, ct);
+
+        var manager = new ConfigRepoManager("https://example.com/config.git", _tempDir);
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => manager.LoadConfigAsync(cts.Token));
+
+        // Nothing was cached by the cancelled load...
+        Assert.False(manager.IsRepositoryAllowed("https://github.com/org/a.git"));
+        // ...and the next load succeeds on the same (balanced) semaphore.
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+        var loaded = await manager.LoadConfigAsync(ct);
+        Assert.Equal("1.0-A", loaded.Version);
+        Assert.Equal(1, GetGitLock(manager).CurrentCount);
+    }
+
     // ── Merge conflict abort ──────────────────────────────────────────────────
 
     [Fact]

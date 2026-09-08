@@ -267,23 +267,40 @@ public class ConfigRepoManager
     /// a cache hit never reparses the YAML. Runtime nulls (null/missing sections) survive the
     /// copy, and <see cref="HiveConfigFile.IsConfigured"/> is carried over explicitly.
     /// </para>
+    /// <para>
+    /// <b>Serialization.</b> The WHOLE operation — the cache check included — runs under the
+    /// manager's <c>_gitLock</c>, the same semaphore <see cref="SyncRepoAsync"/> holds. A load
+    /// queued behind a running sync therefore observes the POST-sync cache state (i.e. the
+    /// invalidation), never a pre-sync cached generation, and can never read
+    /// <c>hive-config.yaml</c> while another operation rewrites it. The lock is acquired BEFORE
+    /// any cache read, file access or YAML parse; a cancelled/failed acquisition releases
+    /// nothing. No other lock-taking manager entry point is called from inside the region.
+    /// </para>
     /// </summary>
     public async Task<HiveConfigFile> LoadConfigAsync(CancellationToken ct = default)
     {
-        // One local capture: field reads can straddle invalidation by SyncRepoAsync.
-        var cached = _cachedConfig;
-        if (cached is null)
+        await _gitLock.WaitAsync(ct);
+        try
         {
-            var configPath = Path.Combine(_localPath, "hive-config.yaml");
-            if (!File.Exists(configPath))
-                throw new FileNotFoundException("Config file not found in config repo.", configPath);
+            // One local capture: field reads can straddle invalidation by SyncRepoAsync.
+            var cached = _cachedConfig;
+            if (cached is null)
+            {
+                var configPath = Path.Combine(_localPath, "hive-config.yaml");
+                if (!File.Exists(configPath))
+                    throw new FileNotFoundException("Config file not found in config repo.", configPath);
 
-            var yaml = await File.ReadAllTextAsync(configPath, ct);
-            cached = ParseConfig(yaml);
-            _cachedConfig = cached;
+                var yaml = await File.ReadAllTextAsync(configPath, ct);
+                cached = ParseConfig(yaml);
+                _cachedConfig = cached;
+            }
+
+            return MaterializeDetached(cached.CaptureConfigSnapshot(), cached.IsConfigured);
         }
-
-        return MaterializeDetached(cached.CaptureConfigSnapshot(), cached.IsConfigured);
+        finally
+        {
+            _gitLock.Release();
+        }
     }
 
     /// <summary>
@@ -396,24 +413,44 @@ public class ConfigRepoManager
     /// succeeds — a failed or cancelled write never replaces an existing cache, and the
     /// live config is never re-read after the await.
     /// </para>
+    /// <para>
+    /// <b>Serialization.</b> The WHOLE operation runs under the manager's <c>_gitLock</c>, the
+    /// same semaphore <see cref="SyncRepoAsync"/> holds. The snapshot is captured only AFTER the
+    /// permit is acquired, so a write queued behind a sync serializes the caller's state as of
+    /// the moment it actually owns the lock — never a pre-lock generation — and its file write
+    /// and cache publication are ordered after the sync's invalidation. A cancelled or failed
+    /// acquisition performs no snapshot, no file access and releases nothing. Lock order is
+    /// <see cref="ConfigModelService"/> save semaphore → <c>_gitLock</c> → the short-lived
+    /// <see cref="HiveConfigFile"/> catalog monitor, which the synchronous
+    /// <see cref="HiveConfigFile.CaptureConfigSnapshot"/> takes and drops without any await; no
+    /// other lock-taking manager entry point is called from inside the region.
+    /// </para>
     /// </summary>
     /// <param name="config">The updated configuration to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task WriteConfigAsync(HiveConfigFile config, CancellationToken ct = default)
     {
-        // ONE snapshot: serialized to YAML AND used as the post-write cache — the written
-        // bytes and the cached values are the same detached generation by construction.
-        // IsConfigured is not part of the snapshot; it is carried explicitly from the caller.
-        var snapshot = config.CaptureConfigSnapshot();
-        var cached = MaterializeDetached(snapshot, config.IsConfigured);
+        await _gitLock.WaitAsync(ct);
+        try
+        {
+            // ONE snapshot: serialized to YAML AND used as the post-write cache — the written
+            // bytes and the cached values are the same detached generation by construction.
+            // IsConfigured is not part of the snapshot; it is carried explicitly from the caller.
+            var snapshot = config.CaptureConfigSnapshot();
+            var cached = MaterializeDetached(snapshot, config.IsConfigured);
 
-        var yaml = YamlSerializer.Serialize(snapshot);
-        var configPath = Path.Combine(_localPath, "hive-config.yaml");
-        await File.WriteAllTextAsync(configPath, yaml, ct);
+            var yaml = YamlSerializer.Serialize(snapshot);
+            var configPath = Path.Combine(_localPath, "hive-config.yaml");
+            await File.WriteAllTextAsync(configPath, yaml, ct);
 
-        // Publish only after the write succeeded: a failed or cancelled write must never
-        // replace an existing cache.
-        _cachedConfig = cached;
+            // Publish only after the write succeeded: a failed or cancelled write must never
+            // replace an existing cache.
+            _cachedConfig = cached;
+        }
+        finally
+        {
+            _gitLock.Release();
+        }
     }
 
     /// <summary>
