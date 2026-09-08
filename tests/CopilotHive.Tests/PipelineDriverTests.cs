@@ -1246,10 +1246,13 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Equal(PhaseOutcome.Pass, unrelatedTrailing.Result);
         Assert.Equal("UNRELATED-TRAILING-EVIDENCE: tester output", unrelatedTrailing.WorkerOutput);
 
-        // Assert: the persisted pre-consume summary (iteration 1) contains ALL FOUR entries —
-        // the three untouched ones with their original outputs and the targeted one with the
-        // reason-plus-report — proving the snapshot reflects the whole historical log, not just
-        // the mutated entry.
+        // Assert: the persisted pre-consume summary (iteration 1) contains the three
+        // current-iteration entries — the earlier Coding occurrence, the targeted Coding
+        // occurrence (with the reason-plus-report), and the unrelated Testing entry —
+        // since BuildIterationSummary filters to the current iteration. The older
+        // iteration's entry is protected by the separate direct assertions above, not
+        // included in this summary. (Summary content is checked below; the untouched
+        // state of each entry is asserted directly on the PhaseLog objects.)
         var inProgressUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.InProgress);
         var summaryUpdate = inProgressUpdate.Metadata?.IterationSummary;
         Assert.NotNull(summaryUpdate);
@@ -1358,8 +1361,13 @@ public sealed class PipelineDriverNoOpRetryTests
         Assert.Equal("UNRELATED-TRAILING-EVIDENCE-TERMINAL: tester output", unrelatedTrailing.WorkerOutput);
 
         // Assert: goal failed via the terminal path; the terminal summary (the only one, from
-        // FinalizeGoalAsync) carries all four entries — the three untouched ones verbatim and
-        // the targeted one with the exact reason-plus-report string.
+        // FinalizeGoalAsync) contains the three current-iteration entries — the earlier Coding
+        // occurrence, the targeted Coding occurrence (with the exact reason-plus-report string),
+        // and the unrelated Testing entry — since BuildIterationSummary filters to the current
+        // iteration. The older iteration's entry is protected by the separate direct assertions
+        // above, not included in this summary. (Only the summary-selected content is asserted
+        // on the summary; each entry's untouched state is asserted directly on the PhaseLog
+        // objects.)
         Assert.Equal(GoalPhase.Failed, pipeline.Phase);
         var failedUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Metadata?.IterationSummary is not null);
         Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
