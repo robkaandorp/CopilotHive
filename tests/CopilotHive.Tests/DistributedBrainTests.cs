@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text;
 
 using CopilotHive.Configuration;
 using CopilotHive.Goals;
@@ -1319,30 +1320,135 @@ public sealed class DistributedBrainTests
         Assert.Contains("Target repositories: repo-1, repo-2", prompt);
     }
 
-    // -- Tester Output Truncation Tests (Change E) --
+    // -- Full (uncapped) Tester/Coder Report Embedding Tests --
+
+    private const string TesterSectionHeaderPrefix = "=== Tester output (iteration ";
+    private const string TesterSectionFooter = "=== End tester output ===";
+    private const string CoderSectionHeaderPrefix = "=== Coder output (iteration ";
+    private const string CoderSectionFooter = "=== End coder output ===";
+
+    /// <summary>
+    /// Extracts the exact payload embedded between a section header line and its footer,
+    /// using ordinal (non-normalizing) comparisons so payload whitespace and line endings
+    /// are preserved for assertion.
+    /// </summary>
+    private static string ExtractSectionPayload(string prompt, string header, string footer)
+    {
+        var start = prompt.IndexOf(header, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Header '{header}' should be in prompt");
+        start += header.Length;
+        var end = prompt.IndexOf(footer, start, StringComparison.Ordinal);
+        Assert.True(end >= 0, $"Footer '{footer}' should follow header '{header}'");
+        return prompt[start..end];
+    }
+
+    /// <summary>
+    /// Asserts that the section contains exactly the expected report, surrounded by the single
+    /// line terminator the prompt template inserts. Uses ordinal string equality — no
+    /// whitespace or line-ending normalization.
+    /// </summary>
+    private static void AssertSectionEqualsExactly(string prompt, string headerPrefix, string footer, int iteration, string expectedReport)
+    {
+        var header = $"{headerPrefix}{iteration}) ===";
+        var payload = ExtractSectionPayload(prompt, header, footer);
+
+        // The template frames the payload with one line terminator on each side; strip exactly
+        // those framing terminators, then compare the remainder byte-for-byte.
+        var leading = payload.StartsWith("\r\n", StringComparison.Ordinal) ? 2
+            : payload.StartsWith("\n", StringComparison.Ordinal) ? 1
+            : 0;
+        Assert.True(leading > 0, "Section payload should start with a line terminator");
+        var trailing = payload.EndsWith("\r\n", StringComparison.Ordinal) ? 2
+            : payload.EndsWith("\n", StringComparison.Ordinal) ? 1
+            : 0;
+        Assert.True(trailing > 0, "Section payload should end with a line terminator");
+
+        Assert.Equal(expectedReport, payload[leading..^trailing]);
+    }
+
+    /// <summary>
+    /// Builds a realistic multiline worker report of at least <paramref name="minLength"/> characters,
+    /// mixing CRLF/LF line endings and literal ellipses, ending in a unique tail-only marker.
+    /// </summary>
+    private static string BuildLongReport(string label, string tailEvidence, int minLength = 8192)
+    {
+        var sb = new StringBuilder();
+        sb.Append($"{label} report — build and test summary...\r\n");
+        var i = 0;
+        while (sb.Length < minLength)
+        {
+            sb.Append($"[{label}] step {i:D4}: processed tests/CopilotHive.Tests/File{i}.cs — ok ...\r\n");
+            sb.Append($"    detail {i:D4}: assertions=12 duration=0.0{i % 10}s\n");
+            i++;
+        }
+        sb.Append(tailEvidence);
+        return sb.ToString();
+    }
 
     [Fact]
-    public void BuildCraftPromptText_ReviewPhase_TruncatesTesterOutputTo2000Chars()
+    public void BuildCraftPromptText_ReviewPhase_TesterOutputJustBelow2000Chars_EmbeddedInFull()
     {
-        // Arrange: create a pipeline with a very long tester output
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("goal-truncate", "Test tester output truncation");
-        const int largeTesterOutputLength = 5000;
-        var largeTesterOutput = new string('X', largeTesterOutputLength);
-        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, largeTesterOutput);
+        // Arrange: 1,999 chars — below the removed cap boundary
+        var pipeline = CreatePipeline("g-tester-1999", "Tester below boundary");
+        var report = new string('A', 1989) + "TAIL_T1999";
+        Assert.Equal(1999, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, report);
 
-        // Act: craft a Review-phase prompt
+        // Act
         var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
-        // Assert: the full tester output does NOT appear in the prompt
-        Assert.DoesNotContain(largeTesterOutput, prompt);
+        // Assert: complete report embedded, exact section payload
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, report);
+    }
 
-        // Assert: the prompt contains an ellipsis truncation marker (truncated portion)
-        Assert.Contains("...", prompt);
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_TesterOutputExactly2000Chars_EmbeddedInFull()
+    {
+        // Arrange: exactly 2,000 chars — at the removed cap boundary
+        var pipeline = CreatePipeline("g-tester-2000", "Tester at boundary");
+        var report = new string('B', 1990) + "TAIL_T2000";
+        Assert.Equal(2000, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, report);
 
-        // Assert: the truncated tester output (first 2000 chars) appears in the prompt
-        var first2000Chars = largeTesterOutput[..2000];
-        Assert.Contains(first2000Chars, prompt);
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, report);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_TesterOutputJustAbove2000Chars_EmbeddedInFull()
+    {
+        // Arrange: 2,001 chars — above the removed cap boundary; the tail must survive
+        var pipeline = CreatePipeline("g-tester-2001", "Tester above boundary");
+        var report = new string('C', 1991) + "TAIL_T2001";
+        Assert.Equal(2001, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: complete section, including tail evidence beyond the old 2,000-char boundary
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_T2001", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_LargeMultilineTesterReport_EmbeddedInFull()
+    {
+        // Arrange: realistic 8KB+ multiline tester report with distinct tail evidence
+        var pipeline = CreatePipeline("g-tester-8k", "Tester large report");
+        var report = BuildLongReport("TESTER", "TAIL_EVIDENCE_TESTER_7c41e9\n");
+        Assert.True(report.Length > 8192, $"Report should exceed 8KB, was {report.Length}");
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: exact fenced payload — whitespace and line endings preserved
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_EVIDENCE_TESTER_7c41e9", prompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1358,7 +1464,7 @@ public sealed class DistributedBrainTests
         var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: full short output appears verbatim in the prompt (no truncation)
-        Assert.Contains(shortOutput, prompt);
+        Assert.Contains(shortOutput, prompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1374,7 +1480,7 @@ public sealed class DistributedBrainTests
         var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
         // Assert: exactly 2000 chars should appear as-is (no truncation)
-        Assert.Contains(exactly2000, prompt);
+        Assert.Contains(exactly2000, prompt, StringComparison.Ordinal);
     }
 
     // -- Coder Output Tests --
@@ -1427,27 +1533,109 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void BuildCraftPromptText_ReviewPhase_CoderOutputTruncatedAt2000Chars()
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputJustBelow2000Chars_EmbeddedInFull()
     {
-        // Arrange: create a pipeline with a very long coder output
-        var brain = new DistributedBrain("copilot/test-model", NullLogger<DistributedBrain>.Instance);
-        var pipeline = CreatePipeline("g-coder-truncate", "Test coder output truncation");
-        const int largeCoderOutputLength = 5000;
-        var largeCoderOutput = new string('Z', largeCoderOutputLength);
-        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
+        // Arrange: 1,999 chars — below the removed cap boundary
+        var pipeline = CreatePipeline("g-coder-1999", "Coder below boundary");
+        var report = new string('D', 1989) + "TAIL_C1999";
+        Assert.Equal(1999, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
 
         // Act
         var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
 
-        // Assert: the full coder output does NOT appear in the prompt
-        Assert.DoesNotContain(largeCoderOutput, prompt);
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+    }
 
-        // Assert: the prompt contains an ellipsis truncation marker
-        Assert.Contains("...", prompt);
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputExactly2000Chars_EmbeddedInFull()
+    {
+        // Arrange: exactly 2,000 chars — at the removed cap boundary
+        var pipeline = CreatePipeline("g-coder-2000", "Coder at boundary");
+        var report = new string('E', 1990) + "TAIL_C2000";
+        Assert.Equal(2000, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
 
-        // Assert: the truncated coder output (first 2000 chars) appears in the prompt
-        var first2000Chars = largeCoderOutput[..2000];
-        Assert.Contains(first2000Chars, prompt);
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_CoderOutputJustAbove2000Chars_EmbeddedInFull()
+    {
+        // Arrange: 2,001 chars — above the removed cap boundary; the tail must survive
+        var pipeline = CreatePipeline("g-coder-2001", "Coder above boundary");
+        var report = new string('F', 1991) + "TAIL_C2001";
+        Assert.Equal(2001, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_C2001", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_LargeMultilineCoderReport_EmbeddedInFull()
+    {
+        // Arrange: realistic 8KB+ multiline coder report with distinct tail evidence
+        var pipeline = CreatePipeline("g-coder-8k", "Coder large report");
+        var report = BuildLongReport("CODER", "TAIL_EVIDENCE_CODER_b93a17\n");
+        Assert.True(report.Length > 8192, $"Report should exceed 8KB, was {report.Length}");
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: exact fenced payload — whitespace and line endings preserved
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_EVIDENCE_CODER_b93a17", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_BothLongTesterAndCoderReports_BothEmbeddedInFull()
+    {
+        // Arrange: a single constructed Review request carrying BOTH long reports
+        var pipeline = CreatePipeline("g-both-8k", "Both long reports");
+        var testerReport = BuildLongReport("TESTER", "TAIL_EVIDENCE_BOTH_TESTER_51ff0d\n");
+        var coderReport = BuildLongReport("CODER", "TAIL_EVIDENCE_BOTH_CODER_2ab8c6\n");
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, testerReport);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, coderReport);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: both complete sections present, tail evidence for both survives
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, testerReport);
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, coderReport);
+        Assert.Contains("TAIL_EVIDENCE_BOTH_TESTER_51ff0d", prompt, StringComparison.Ordinal);
+        Assert.Contains("TAIL_EVIDENCE_BOTH_CODER_2ab8c6", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildCraftPromptText_ReviewPhase_BlankLatestTesterAndCoder_DoesNotFallBackToEarlierEntry()
+    {
+        // Arrange: an earlier nonblank entry followed by a LATEST BLANK entry in the same iteration
+        var pipeline = CreatePipeline("g-blank-latest", "Blank latest entries");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "EARLIER_TESTER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "   \n\t ", occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "EARLIER_CODER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "  \r\n ", occurrence: 2);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(pipeline, GoalPhase.Review);
+
+        // Assert: sections omitted; no fallback to the earlier nonblank rounds
+        Assert.DoesNotContain("=== Tester output (iteration", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("=== Coder output (iteration", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("EARLIER_TESTER_SHOULD_NOT_APPEAR", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("EARLIER_CODER_SHOULD_NOT_APPEAR", prompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1571,24 +1759,124 @@ public sealed class DistributedBrainTests
     }
 
     [Fact]
-    public void BuildReviewFallbackPrompt_CoderOutputTruncatedAt2000Chars()
+    public void BuildReviewFallbackPrompt_CoderOutputJustBelow2000Chars_EmbeddedInFull()
     {
-        // Arrange
-        var pipeline = CreatePipeline("g-fb-coder-trunc", "Fallback coder truncation test");
-        const int largeCoderOutputLength = 5000;
-        var largeCoderOutput = new string('W', largeCoderOutputLength);
-        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, largeCoderOutput);
+        // Arrange: 1,999 chars — below the removed cap boundary (direct-to-Reviewer route)
+        var pipeline = CreatePipeline("g-fb-coder-1999", "Fallback coder below boundary");
+        var report = new string('G', 1989) + "TAIL_F1999";
+        Assert.Equal(1999, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
 
         // Act
         var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
 
-        // Assert: the full coder output does NOT appear
-        Assert.DoesNotContain(largeCoderOutput, prompt);
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+    }
 
-        // Assert: truncated coder output appears with ellipsis
-        var first2000Chars = largeCoderOutput[..2000];
-        Assert.Contains(first2000Chars, prompt);
-        Assert.Contains("...", prompt);
+    [Fact]
+    public void BuildReviewFallbackPrompt_CoderOutputExactly2000Chars_EmbeddedInFull()
+    {
+        // Arrange: exactly 2,000 chars — at the removed cap boundary
+        var pipeline = CreatePipeline("g-fb-coder-2000", "Fallback coder at boundary");
+        var report = new string('H', 1990) + "TAIL_F2000";
+        Assert.Equal(2000, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_CoderOutputJustAbove2000Chars_EmbeddedInFull()
+    {
+        // Arrange: 2,001 chars — above the removed cap boundary; the tail must survive
+        var pipeline = CreatePipeline("g-fb-coder-2001", "Fallback coder above boundary");
+        var report = new string('I', 1991) + "TAIL_F2001";
+        Assert.Equal(2001, report.Length);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_F2001", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_LargeMultilineCoderReport_EmbeddedInFull()
+    {
+        // Arrange: realistic 8KB+ multiline coder report with distinct tail evidence
+        var pipeline = CreatePipeline("g-fb-coder-8k", "Fallback coder large report");
+        var report = BuildLongReport("CODER", "TAIL_EVIDENCE_FALLBACK_CODER_9d20fe\n");
+        Assert.True(report.Length > 8192, $"Report should exceed 8KB, was {report.Length}");
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert: exact fenced payload — whitespace and line endings preserved
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_EVIDENCE_FALLBACK_CODER_9d20fe", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_LargeMultilineTesterReport_RemainsUncapped()
+    {
+        // Guard: the fallback tester output was already uncapped and must stay so
+        var pipeline = CreatePipeline("g-fb-tester-8k", "Fallback tester large report");
+        var report = BuildLongReport("TESTER", "TAIL_EVIDENCE_FALLBACK_TESTER_4e77bb\n");
+        Assert.True(report.Length > 8192, $"Report should exceed 8KB, was {report.Length}");
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, report);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, report);
+        Assert.Contains("TAIL_EVIDENCE_FALLBACK_TESTER_4e77bb", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_BothLongTesterAndCoderReports_BothEmbeddedInFull()
+    {
+        // Arrange: a single fallback Review prompt carrying BOTH long reports
+        var pipeline = CreatePipeline("g-fb-both-8k", "Fallback both long reports");
+        var testerReport = BuildLongReport("TESTER", "TAIL_EVIDENCE_FB_BOTH_TESTER_08cc31\n");
+        var coderReport = BuildLongReport("CODER", "TAIL_EVIDENCE_FB_BOTH_CODER_66a4de\n");
+        pipeline.SetTestPhaseOutput(WorkerRole.Tester, pipeline.Iteration, testerReport);
+        pipeline.SetTestPhaseOutput(WorkerRole.Coder, pipeline.Iteration, coderReport);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        AssertSectionEqualsExactly(prompt, TesterSectionHeaderPrefix, TesterSectionFooter, pipeline.Iteration, testerReport);
+        AssertSectionEqualsExactly(prompt, CoderSectionHeaderPrefix, CoderSectionFooter, pipeline.Iteration, coderReport);
+    }
+
+    [Fact]
+    public void BuildReviewFallbackPrompt_BlankLatestTesterAndCoder_DoesNotFallBackToEarlierEntry()
+    {
+        // Arrange: earlier nonblank entries followed by LATEST BLANK entries in the same iteration
+        var pipeline = CreatePipeline("g-fb-blank-latest", "Fallback blank latest entries");
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "FB_EARLIER_TESTER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Tester, 1, "  \n ", occurrence: 2);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, "FB_EARLIER_CODER_SHOULD_NOT_APPEAR", occurrence: 1);
+        pipeline.RecordTestOutput(WorkerRole.Coder, 1, " \t\r\n", occurrence: 2);
+
+        // Act
+        var prompt = BrainPromptBuilder.BuildReviewFallbackPrompt(pipeline);
+
+        // Assert
+        Assert.DoesNotContain("=== Tester output (iteration", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("=== Coder output (iteration", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("FB_EARLIER_TESTER_SHOULD_NOT_APPEAR", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("FB_EARLIER_CODER_SHOULD_NOT_APPEAR", prompt, StringComparison.Ordinal);
     }
 
     // -- ForkSessionForGoalAsync Tests --

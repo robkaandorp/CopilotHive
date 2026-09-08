@@ -150,10 +150,7 @@ public static class BrainPromptBuilder
             && testerEntry?.WorkerOutput is { } testerOut
             && !string.IsNullOrWhiteSpace(testerOut))
         {
-            const int maxTesterOutputChars = 2000;
-            currentTestResults = testerOut.Length > maxTesterOutputChars
-                ? testerOut[..maxTesterOutputChars] + "..."
-                : testerOut;
+            currentTestResults = testerOut;
         }
         else
         {
@@ -161,7 +158,7 @@ public static class BrainPromptBuilder
         }
 
         // For review phase, also include coder output so the reviewer understands the rationale
-        // behind code decisions. Cap at 2000 chars with ellipsis if truncated.
+        // behind code decisions. The selected report is embedded in full.
         string currentCoderOutput;
         var coderEntry = pipeline.PhaseLog
             .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
@@ -169,10 +166,7 @@ public static class BrainPromptBuilder
             && coderEntry?.WorkerOutput is { } coderOut
             && !string.IsNullOrWhiteSpace(coderOut))
         {
-            const int maxCoderOutputChars = 2000;
-            currentCoderOutput = coderOut.Length > maxCoderOutputChars
-                ? coderOut[..maxCoderOutputChars] + "..."
-                : coderOut;
+            currentCoderOutput = coderOut;
         }
         else
         {
@@ -222,17 +216,13 @@ public static class BrainPromptBuilder
             : "";
 
         // Include coder output so the reviewer understands the rationale behind code decisions.
-        // Cap at 2000 chars with ellipsis if truncated.
+        // This prompt goes directly to the Reviewer worker; the selected report is embedded in full.
         string currentCoderOutput = "";
         var coderLogEntry = pipeline.PhaseLog
             .LastOrDefault(e => e.Iteration == pipeline.Iteration && e.Name == GoalPhase.Coding);
         if (!string.IsNullOrWhiteSpace(coderLogEntry?.WorkerOutput))
         {
-            var coderOut = coderLogEntry.WorkerOutput;
-            const int maxCoderOutputChars = 2000;
-            currentCoderOutput = coderOut.Length > maxCoderOutputChars
-                ? coderOut[..maxCoderOutputChars] + "..."
-                : coderOut;
+            currentCoderOutput = coderLogEntry.WorkerOutput;
         }
 
         return $$"""
