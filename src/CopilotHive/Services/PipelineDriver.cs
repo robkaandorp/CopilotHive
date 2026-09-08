@@ -134,6 +134,58 @@ internal sealed class PipelineDriver
         await AppendToProgressDocumentAsync(pipeline.GoalId, narrativeText.TrimEnd(), ct);
     }
 
+    /// <summary>
+    /// Derives the narrative attribution label for a phase WITHOUT ever throwing.
+    /// <para>
+    /// Deliberately uses <see cref="GoalPhaseExtensions.ToRoleName(GoalPhase)"/> rather than
+    /// <c>ToWorkerRole().ToRoleName()</c>: the latter throws for Planning/Merging/Done/Failed,
+    /// and argument evaluation happens BEFORE <see cref="AppendPhaseNarrativesAsync"/> is entered
+    /// — so on an early-exit path it could propagate out of <see cref="DriveNextPhaseAsync"/>
+    /// before terminal finalization, even when no knowledge graph or document exists. The
+    /// failure and no-op exits must never gain a throwing conversion they did not previously
+    /// require.
+    /// </para>
+    /// For every worker phase both expressions produce the SAME string (Coding → "coder",
+    /// Testing → "tester", Review → "reviewer", DocWriting → "docwriter", Improve → "improver"),
+    /// so existing attribution is unchanged. Non-worker phases yield an empty role name, which
+    /// is replaced with a generic label so the header can never degenerate to "###  (narrative)".
+    /// </summary>
+    private static string DeriveNarrativeRole(GoalPhase phase)
+    {
+        var roleName = phase.ToRoleName();
+        return string.IsNullOrEmpty(roleName) ? "worker" : roleName;
+    }
+
+    /// <summary>
+    /// Snapshots the narratives already received for the completing task, in chronological order
+    /// by <see cref="NarrativeEntry.Timestamp"/>, and attaches them to the LAST PhaseLog entry
+    /// matching the pre-transition <see cref="GoalPipeline.Phase"/> and
+    /// <see cref="GoalPipeline.Iteration"/> — the same idiom the failure and no-op branches use
+    /// for their finalization bookkeeping.
+    /// The captured collection is a detached <c>List</c> (never the live bag or a view over it):
+    /// NarrativeEntry records are immutable, so copying references into a fresh list in
+    /// chronological order is sufficient — later <see cref="GoalPipeline.AddNarrativeEntry"/>
+    /// calls into the live ConcurrentBag cannot mutate the already-captured set.
+    /// No-op when no entry matches: no synthetic entry is created and no unrelated entry gains
+    /// evidence. When an entry IS selected but the task had no narratives, an EMPTY list is
+    /// assigned (never left null) — see <see cref="PhaseResult.Narratives"/>: empty positively
+    /// records "captured, zero narratives", distinct from null's "never captured".
+    /// Capture is independent of the knowledge graph, the progress document, and
+    /// config-repo commit success, and performs no status writes or iteration summaries.
+    /// </summary>
+    private static void CapturePhaseNarratives(GoalPipeline pipeline, TaskResult result)
+    {
+        var entry = pipeline.PhaseLog
+            .LastOrDefault(e => e.Name == pipeline.Phase && e.Iteration == pipeline.Iteration);
+        if (entry is null)
+            return;
+
+        entry.Narratives = pipeline.Narratives
+            .Where(n => n.TaskId == result.TaskId)
+            .OrderBy(n => n.Timestamp)
+            .ToList();
+    }
+
     public async Task DriveNextPhaseAsync(GoalPipeline pipeline, TaskResult result, CancellationToken ct)
     {
         // Early-exit guard: a crashed/failed worker should not continue through the pipeline.
@@ -150,6 +202,11 @@ internal sealed class PipelineDriver
             var truncatedOutput = result.Output.Length > 300 ? result.Output[..300] + "..." : result.Output;
             _logger.LogError("Worker for goal {GoalId} failed with output: {Output}", pipeline.GoalId, result.Output);
 
+            // Snapshot the narratives already received for this task and attach them to the
+            // matching phase entry — before finalization bookkeeping and before the terminal
+            // MarkGoalFailedAsync call. The pipeline phase is still the executing phase here.
+            CapturePhaseNarratives(pipeline, result);
+
             // Select the LAST entry matching the pre-terminal phase and current iteration —
             // same idiom as the no-op retry path. The pipeline phase is still the phase that
             // was executing (no Failed advance has happened yet). The null guard preserves the
@@ -164,6 +221,13 @@ internal sealed class PipelineDriver
                 failedEntry.Result = PhaseOutcome.Fail;
                 failedEntry.CompletedAt = DateTime.UtcNow;
             }
+
+            // Attempt the progress-document narrative append on this early exit too — the
+            // single attempt for this invocation (no branch-local duplicate). Narratives were
+            // already captured above and live on the phase entry independently of the document.
+            // The role is derived NON-THROWINGLY: a worker failure recorded while the pipeline
+            // sits on a non-worker phase must not throw before MarkGoalFailedAsync runs.
+            await AppendPhaseNarrativesAsync(pipeline, result, DeriveNarrativeRole(pipeline.Phase), ct);
 
             await _lifecycleService.MarkGoalFailedAsync(pipeline, $"Worker failed: {truncatedOutput}", ct);
             return;
@@ -211,6 +275,21 @@ internal sealed class PipelineDriver
                     ? "Coder produced no file changes (no-op)"
                     : "Coder produced no file changes (no-op)\n\n" + noOpReport;
             }
+
+            // Snapshot the narratives already received for this task and attach them to the
+            // matching Coding entry — BEFORE the iteration snapshot (BuildIterationSummary) and
+            // before IterationBudget.TryConsume, so the archived entry carries the narratives
+            // for BOTH the retry exit and the terminal no-op exit (the terminal branch reuses
+            // the already-populated entry).
+            CapturePhaseNarratives(pipeline, result);
+
+            // Attempt the progress-document narrative append on this early exit too — the
+            // single attempt for this invocation (no branch-local duplicate). Narratives were
+            // already captured above and live on the phase entry independently of the document.
+            // Attribution stays the completed Coding work: the pipeline phase is still Coding.
+            // Positioned BEFORE the budget-exhausted return below so it covers BOTH no-op exits
+            // (retry AND terminal exhaustion). Role derivation is non-throwing.
+            await AppendPhaseNarrativesAsync(pipeline, result, DeriveNarrativeRole(pipeline.Phase), ct);
 
             // If the iteration budget is exhausted there is no retry possible: fail the goal
             // directly. The Coding phase was already marked failed above, so FinalizeGoalAsync's
@@ -337,6 +416,11 @@ internal sealed class PipelineDriver
         var workerRole = pipeline.Phase.ToWorkerRole().ToRoleName();
         var outputSummary = PipelineHelpers.BuildWorkerOutputSummary(pipeline.Phase, verdict, result);
         pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary, pipeline.Iteration, "worker-output"));
+
+        // Snapshot the narratives already received for this task and attach them to the last
+        // matching phase entry — before the advancement/bookkeeping continues. This is the
+        // single append-attempt site for the normal completion path.
+        CapturePhaseNarratives(pipeline, result);
 
         // Append worker narratives for the completed phase to the living progress document.
         await AppendPhaseNarrativesAsync(pipeline, result, workerRole, ct);

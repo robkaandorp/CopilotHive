@@ -158,6 +158,59 @@ public sealed class PipelineStoreTests : IAsyncDisposable
         Assert.Equal("test output", snap.PhaseLog[1].WorkerOutput);
     }
 
+    /// <summary>
+    /// A PhaseLog entry carrying a populated Narratives collection round-trips through the live
+    /// PipelineStore save/load (the PhaseLog JSON column): every NarrativeEntry field, the
+    /// chronological order and the whitespace/ellipsis content survive exactly, and a separate
+    /// entry without Narratives stays null — proving per-entry independence.
+    /// </summary>
+    [Fact]
+    public void SavePipeline_ThenLoad_RestoresPhaseLogNarrativesExactly()
+    {
+        var pipeline = CreatePipeline();
+        var t1 = new DateTime(2025, 3, 4, 5, 6, 7, 89, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 3, 4, 5, 6, 9, 12, DateTimeKind.Utc);
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Fail,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "test output with narratives",
+            Narratives =
+            [
+                new NarrativeEntry { Timestamp = t1, WorkerId = "worker-early", TaskId = "task-n", Content = "First narrative ..." },
+                new NarrativeEntry { Timestamp = t2, WorkerId = "worker-late", TaskId = "task-n", Content = "Second\nmulti-line\tentry  " },
+            ],
+        });
+        pipeline.PhaseLog.Add(new PhaseResult
+        {
+            Name = GoalPhase.Review, Result = PhaseOutcome.Pass,
+            Iteration = 1, Occurrence = 1,
+            WorkerOutput = "review output without narratives",
+        });
+
+        _store.SavePipeline(pipeline);
+        var snap = Assert.Single(_store.LoadActivePipelines());
+
+        Assert.Equal(2, snap.PhaseLog.Count);
+
+        var narrativeEntry = snap.PhaseLog[0];
+        Assert.NotNull(narrativeEntry.Narratives);
+        Assert.Equal(2, narrativeEntry.Narratives!.Count);
+
+        Assert.Equal(t1, narrativeEntry.Narratives[0].Timestamp);
+        Assert.Equal("worker-early", narrativeEntry.Narratives[0].WorkerId);
+        Assert.Equal("task-n", narrativeEntry.Narratives[0].TaskId);
+        Assert.Equal("First narrative ...", narrativeEntry.Narratives[0].Content);
+
+        Assert.Equal(t2, narrativeEntry.Narratives[1].Timestamp);
+        Assert.Equal("worker-late", narrativeEntry.Narratives[1].WorkerId);
+        Assert.Equal("task-n", narrativeEntry.Narratives[1].TaskId);
+        Assert.Equal("Second\nmulti-line\tentry  ", narrativeEntry.Narratives[1].Content);
+
+        // The unrelated entry without narratives must stay null — Narratives is per-entry.
+        Assert.Null(snap.PhaseLog[1].Narratives);
+    }
+
     [Fact]
     public void SavePipeline_ThenLoad_RestoresMetrics()
     {

@@ -476,6 +476,170 @@ public sealed class PhaseResultSerializationTests : IDisposable
         }
     }
 
+    // ─── Test 6: Narratives — legacy compatibility and exact round-trip ───────
+
+    /// <summary>
+    /// Legacy JSON stored BEFORE the Narratives property existed must still load: the
+    /// optional property stays <c>null</c> and every legacy field is preserved. Without
+    /// backward compatibility this would fail the dashboard's stored-iteration reads.
+    /// </summary>
+    [Fact]
+    public void OldJsonFormat_WithoutNarrativesProperty_DeserializesWithNullNarratives()
+    {
+        // The pre-slice format: no "narratives" key at all.
+        var oldJson = """{"name":"Coding","result":"pass","durationSeconds":45.2,"workerOutput":"legacy output"}""";
+
+        var phaseResult = JsonSerializer.Deserialize<PhaseResult>(oldJson, SqliteJsonOptions);
+
+        Assert.NotNull(phaseResult);
+        Assert.Null(phaseResult!.Narratives);
+        Assert.Equal(GoalPhase.Coding, phaseResult.Name);
+        Assert.Equal(PhaseOutcome.Pass, phaseResult.Result);
+        Assert.Equal(45.2, phaseResult.DurationSeconds);
+        Assert.Equal("legacy output", phaseResult.WorkerOutput);
+    }
+
+    /// <summary>
+    /// A populated Narratives list round-trips through the exact JSON options GoalStore uses
+    /// (camelCase): every NarrativeEntry field and the chronological ordering survive verbatim.
+    /// </summary>
+    [Fact]
+    public void RoundTrip_PopulatedNarratives_PreservesExactFieldValuesAndOrdering()
+    {
+        // Timestamps with sub-second precision so a lossy round-trip is detectable.
+        var t1 = new DateTime(2025, 1, 1, 10, 0, 0, 123, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 1, 1, 10, 0, 5, 456, DateTimeKind.Utc);
+
+        var phaseResult = new PhaseResult
+        {
+            Name = GoalPhase.Testing,
+            Result = PhaseOutcome.Fail,
+            DurationSeconds = 30.0,
+            Narratives =
+            [
+                new NarrativeEntry
+                {
+                    Timestamp = t1,
+                    WorkerId = "worker-early",
+                    TaskId = "task-42",
+                    Content = "First narrative\nwith a new line\tand a tab ...",
+                },
+                new NarrativeEntry
+                {
+                    Timestamp = t2,
+                    WorkerId = "worker-late",
+                    TaskId = "task-42",
+                    // Long multi-line content with trailing whitespace that must survive verbatim.
+                    Content = new string('x', 6_000) + "\nTRAILING-SPACE-END " ,
+                },
+            ],
+        };
+
+        var json = JsonSerializer.Serialize(phaseResult, SqliteJsonOptions);
+        var roundTripped = JsonSerializer.Deserialize<PhaseResult>(json, SqliteJsonOptions);
+
+        Assert.NotNull(roundTripped);
+        Assert.NotNull(roundTripped!.Narratives);
+        Assert.Equal(2, roundTripped.Narratives!.Count);
+
+        Assert.Equal(t1, roundTripped.Narratives[0].Timestamp);
+        Assert.Equal("worker-early", roundTripped.Narratives[0].WorkerId);
+        Assert.Equal("task-42", roundTripped.Narratives[0].TaskId);
+        Assert.Equal("First narrative\nwith a new line\tand a tab ...", roundTripped.Narratives[0].Content);
+
+        Assert.Equal(t2, roundTripped.Narratives[1].Timestamp);
+        Assert.Equal("worker-late", roundTripped.Narratives[1].WorkerId);
+        Assert.Equal("task-42", roundTripped.Narratives[1].TaskId);
+        Assert.Equal(new string('x', 6_000) + "\nTRAILING-SPACE-END ", roundTripped.Narratives[1].Content);
+
+        // Ordering is part of the contract: the serialized array must carry entry 1 before entry 2.
+        Assert.True(json.IndexOf("worker-early", StringComparison.Ordinal) < json.IndexOf("worker-late", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Pins the three-way representation contract that <see cref="PhaseResult.Narratives"/>
+    /// documents, plus the separation-from-WorkerOutput invariant:
+    /// <list type="bullet">
+    ///   <item>null Narratives round-trips as null ("never captured");</item>
+    ///   <item>an EMPTY list round-trips as an empty list, NOT null ("captured, zero
+    ///     narratives") — the two states must stay distinguishable through persistence;</item>
+    ///   <item>narrative content is never merged into, nor read from, WorkerOutput.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public void RoundTrip_NullVersusEmptyNarratives_StaysDistinguishableAndSeparateFromWorkerOutput()
+    {
+        // ── null: "never captured" ───────────────────────────────────────────
+        var neverCaptured = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            DurationSeconds = 1.0,
+            WorkerOutput = "the authoritative worker report",
+            Narratives = null,
+        };
+
+        var nullJson = JsonSerializer.Serialize(neverCaptured, SqliteJsonOptions);
+        var nullRoundTripped = JsonSerializer.Deserialize<PhaseResult>(nullJson, SqliteJsonOptions);
+
+        Assert.NotNull(nullRoundTripped);
+        Assert.Null(nullRoundTripped!.Narratives);
+        // WorkerOutput is untouched by the narrative property being absent.
+        Assert.Equal("the authoritative worker report", nullRoundTripped.WorkerOutput);
+
+        // ── empty: "captured, zero narratives" ───────────────────────────────
+        var capturedEmpty = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Pass,
+            DurationSeconds = 1.0,
+            WorkerOutput = "the authoritative worker report",
+            Narratives = [],
+        };
+
+        var emptyJson = JsonSerializer.Serialize(capturedEmpty, SqliteJsonOptions);
+        var emptyRoundTripped = JsonSerializer.Deserialize<PhaseResult>(emptyJson, SqliteJsonOptions);
+
+        Assert.NotNull(emptyRoundTripped);
+        // The critical distinction: empty must NOT collapse into null through persistence.
+        Assert.NotNull(emptyRoundTripped!.Narratives);
+        Assert.Empty(emptyRoundTripped.Narratives!);
+        Assert.Equal("the authoritative worker report", emptyRoundTripped.WorkerOutput);
+
+        // ── separation: narrative content never leaks into WorkerOutput ──────
+        const string narrativeContent = "NARRATIVE-ONLY-MARKER: the blocker was a missing key.";
+        const string workerOutputText = "WORKER-OUTPUT-ONLY-MARKER: structured report.";
+        var populated = new PhaseResult
+        {
+            Name = GoalPhase.Coding,
+            Result = PhaseOutcome.Fail,
+            DurationSeconds = 2.0,
+            WorkerOutput = workerOutputText,
+            Narratives =
+            [
+                new NarrativeEntry
+                {
+                    Timestamp = new DateTime(2025, 3, 4, 5, 6, 7, DateTimeKind.Utc),
+                    WorkerId = "worker-a",
+                    TaskId = "task-sep",
+                    Content = narrativeContent,
+                },
+            ],
+        };
+
+        var populatedRoundTripped = JsonSerializer.Deserialize<PhaseResult>(
+            JsonSerializer.Serialize(populated, SqliteJsonOptions), SqliteJsonOptions);
+
+        Assert.NotNull(populatedRoundTripped);
+        // WorkerOutput carries ONLY the worker report — no narrative concatenation.
+        Assert.Equal(workerOutputText, populatedRoundTripped!.WorkerOutput);
+        Assert.DoesNotContain(narrativeContent, populatedRoundTripped.WorkerOutput!);
+        // The narrative carries ONLY its own content — it did not absorb the worker output.
+        var singleNarrative = Assert.Single(populatedRoundTripped.Narratives!);
+        Assert.Equal(narrativeContent, singleNarrative.Content);
+        Assert.DoesNotContain(workerOutputText, singleNarrative.Content);
+    }
+
     /// <summary>
     /// Stand-in for the internal PhaseResultEntry DTO previously used by the removed YAML source.
     /// </summary>

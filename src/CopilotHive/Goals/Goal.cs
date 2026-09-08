@@ -223,6 +223,21 @@ public sealed class PhaseResult
     public DateTime? CompletedAt { get; set; }
     /// <summary>The raw verdict string from the worker (e.g. "PASS", "FAIL", "APPROVE", "REQUEST_CHANGES").</summary>
     public string? Verdict { get; set; }
+    /// <summary>
+    /// Worker narratives already received for this phase's task, snapshotted in chronological
+    /// order (by <see cref="NarrativeEntry.Timestamp"/>) when the phase completed.
+    /// <para>
+    /// <c>null</c> means no snapshot was ever taken for this entry — legacy persisted data that
+    /// predates the property, or a phase entry the capture never selected. When a capture DOES
+    /// select this entry but the completing task had no narratives, the value is an EMPTY list,
+    /// not null: an empty list positively records "the phase completed with zero narratives",
+    /// which is distinct from "never captured".
+    /// </para>
+    /// The property is optional and backward compatible. It is kept strictly separate from
+    /// <see cref="WorkerOutput"/>: narratives are never concatenated into, never read from, and
+    /// never replace the worker output.
+    /// </summary>
+    public List<NarrativeEntry>? Narratives { get; set; }
 
     /// <summary>
     /// Creates a new <see cref="PhaseResult"/> entry for a phase that is about to start.

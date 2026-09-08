@@ -46,8 +46,8 @@ public sealed class PipelineDriverWorkerOutputTests
     public async Task DriveNextPhaseAsync_WhenMetricsSummaryPresent_UsesMetricsSummaryAsWorkerOutput()
     {
         // Arrange
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
 
         const string summaryText = "Detailed review findings: 3 issues found.";
         const string rawOutput = "changes"; // single word the LLM emits
@@ -79,8 +79,8 @@ public sealed class PipelineDriverWorkerOutputTests
     public async Task DriveNextPhaseAsync_WhenMetricsSummaryAbsentOrWhitespace_UsesRawOutput(string? summary)
     {
         // Arrange
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
 
         const string rawOutput = "All looks good.";
 
@@ -107,8 +107,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [InlineData(4_001)]
     public async Task DriveNextPhaseAsync_WhenReviewSummaryCrossesLegacyBoundary_PreservesExactly(int length)
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
         var summary = BuildExactLengthReport(length, 'S');
 
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
@@ -128,8 +128,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [InlineData(4_001)]
     public async Task DriveNextPhaseAsync_WhenReviewRawOutputCrossesLegacyBoundary_PreservesExactly(int length)
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
         var rawOutput = BuildExactLengthReport(length, 'O');
 
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
@@ -218,8 +218,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [InlineData(8_500)] // realistic tester report size
     public async Task DriveNextPhaseAsync_WhenTestingSummary_PreservesFullSummaryExactly(int length)
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         // Distinctive evidence in every region: head, past char 4000, and the very end.
         var summary = "HEAD:" + new string('S', length - 10) + "TAIL:";
@@ -248,8 +248,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [InlineData(8_500)]
     public async Task DriveNextPhaseAsync_WhenTestingRawOutputFallback_PreservesFullRawOutputExactly(int length)
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         var rawOutput = "HEAD:" + new string('O', length - 10) + "TAIL:";
 
@@ -273,8 +273,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [Fact]
     public async Task DriveNextPhaseAsync_WhenTestingRealisticReport_PreservesEvidencePast4000AndTrailing()
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         var report = BuildRealisticTesterReport();
 
@@ -306,8 +306,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [InlineData("   ")]
     public async Task DriveNextPhaseAsync_WhenTestingSummaryAbsentOrWhitespace_PreservesFullRawOutput(string? summary)
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         var rawOutput = new string('O', 6000) + "\nTAIL-EVIDENCE";
 
@@ -331,8 +331,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [Fact]
     public async Task DriveNextPhaseAsync_WhenTestingFails_PreservesFullReport()
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         var report = BuildRealisticTesterReport();
 
@@ -360,8 +360,8 @@ public sealed class PipelineDriverWorkerOutputTests
     [Fact]
     public async Task DriveNextPhaseAsync_WhenTestingNonBlankSummaryStillWinsOverRawOutput()
     {
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Testing);
-        AddPhaseEntry(pipeline, GoalPhase.Testing);
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
 
         var summary = "Summary with distinctive content: " + new string('S', 5000);
         var rawOutput = "DIFFERENT raw text entirely";
@@ -735,7 +735,7 @@ public sealed class PipelineDriverWorkerOutputTests
         return head + new string(fill, length - head.Length - tail.Length) + tail;
     }
 
-    private static string BuildRealisticPhaseReport(GoalPhase phase, string representation)
+    internal static string BuildRealisticPhaseReport(GoalPhase phase, string representation)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"## {phase} report ({representation})");
@@ -775,7 +775,7 @@ public sealed class PipelineDriverWorkerOutputTests
         pipeline.SetPlan(plan);
         pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
         pipeline.AdvanceTo(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
 
         var taskId = $"task-review-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
@@ -839,7 +839,7 @@ public sealed class PipelineDriverWorkerOutputTests
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    private static HiveConfigFile BuildDispatcherConfig() => new()
+    internal static HiveConfigFile BuildDispatcherConfig() => new()
     {
         Repositories =
         [
@@ -864,7 +864,7 @@ public sealed class PipelineDriverWorkerOutputTests
     /// Builds a minimal self-contained <see cref="GoalDispatcher"/> for testing
     /// <c>DriveNextPhaseAsync</c> WorkerOutput assignment.
     /// </summary>
-    private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
+    internal static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
         CreateDispatcher(GoalPhase phase)
     {
         var harness = CreateDispatcherHarness(phase);
@@ -883,7 +883,7 @@ public sealed class PipelineDriverWorkerOutputTests
     /// <param name="Brain">The fake brain (recording when requested).</param>
     /// <param name="Queue">The live task queue the dispatch enqueues into.</param>
     /// <param name="Logger">Logger capturing any exception the dispatcher swallowed.</param>
-    private sealed record DispatcherHarness(
+    internal sealed record DispatcherHarness(
         GoalDispatcher Dispatcher,
         GoalPipeline Pipeline,
         string TaskId,
@@ -900,7 +900,7 @@ public sealed class PipelineDriverWorkerOutputTests
     /// <param name="recordCraftCalls">Enable the fake brain's recording extension.</param>
     /// <param name="multiPhasePlan">Use <see cref="IterationPlan.Default"/> instead of a one-phase plan.</param>
     /// <param name="seedPhaseEntry">Seed the PhaseLog entry the completion lands on.</param>
-    private static DispatcherHarness CreateDispatcherHarness(
+    internal static DispatcherHarness CreateDispatcherHarness(
         GoalPhase phase,
         bool recordCraftCalls = false,
         bool multiPhasePlan = false,
@@ -965,7 +965,7 @@ public sealed class PipelineDriverWorkerOutputTests
     /// Adds a <see cref="PhaseResult"/> for <paramref name="phase"/> to the pipeline's
     /// PhaseLog so that <c>CurrentPhaseEntry</c> is non-null when DriveNextPhaseAsync runs.
     /// </summary>
-    private static void AddPhaseEntry(GoalPipeline pipeline, GoalPhase phase)
+    internal static void AddPhaseEntry(GoalPipeline pipeline, GoalPhase phase)
     {
         pipeline.PhaseLog.Add(new PhaseResult
         {
@@ -999,7 +999,7 @@ public sealed class PipelineDriverWorkerOutputTests
     /// worker observable without any production seam. The default (unset) behavior is unchanged:
     /// the short canned prompt every pre-existing test relies on.
     /// </remarks>
-    private sealed class LocalFakeBrain : IDistributedBrain
+    internal sealed class LocalFakeBrain : IDistributedBrain
     {
         /// <summary>A single captured <c>CraftPromptAsync</c> invocation.</summary>
         /// <param name="GoalId">Goal id sampled AT CALL TIME.</param>
@@ -2157,7 +2157,7 @@ public sealed class PipelineDriverNoOpRetryTests
     /// When <paramref name="exhaustBudget"/> is set, the iteration budget is consumed so the
     /// no-op path takes the terminal branch.
     /// </summary>
-    private static async Task<(PipelineDriver Driver, GoalPipeline Pipeline, GoalStore Store)>
+    internal static async Task<(PipelineDriver Driver, GoalPipeline Pipeline, GoalStore Store)>
         CreateSqliteNoOpDriver(CopilotHiveDbContext dbContext, bool exhaustBudget)
     {
         var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
@@ -2224,7 +2224,7 @@ public sealed class PipelineDriverNoOpRetryTests
     /// TaskCompletionService → PipelineDriver → GoalLifecycleService.MarkGoalFailedAsync,
     /// and the terminal summary is persisted by the real store.
     /// </summary>
-    private static async Task<(GoalDispatcher Dispatcher, GoalPipeline Pipeline, GoalStore Store, GoalPipelineManager PipelineManager, PipelineDriverCapturingLogger<GoalDispatcher> Logger)>
+    internal static async Task<(GoalDispatcher Dispatcher, GoalPipeline Pipeline, GoalStore Store, GoalPipelineManager PipelineManager, PipelineDriverCapturingLogger<GoalDispatcher> Logger)>
         CreateSqliteNoOpDispatcher(CopilotHiveDbContext dbContext, bool exhaustBudget)
     {
         var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
@@ -2307,7 +2307,7 @@ public sealed class PipelineDriverNoOpRetryTests
         },
     };
 
-    private static (PipelineDriver Driver, GoalPipeline Pipeline, IterationCapturingGoalStore Store) CreateNoOpDriver(
+    internal static (PipelineDriver Driver, GoalPipeline Pipeline, IterationCapturingGoalStore Store) CreateNoOpDriver(
         Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task>? dispatchToRole = null)
     {
         var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "No-op retry persistence test" };
@@ -2348,7 +2348,7 @@ public sealed class PipelineDriverNoOpRetryTests
     /// was consumed: if the persist call were moved after <c>TryConsume()</c>, the captured
     /// iteration would be the new (post-consume) number and the assertion would fail.
     /// </summary>
-    private sealed class IterationCapturingGoalStore(Goal goal) : IGoalStore
+    internal sealed class IterationCapturingGoalStore(Goal goal) : IGoalStore
     {
         /// <summary>Pipeline whose <see cref="GoalPipeline.Iteration"/> is sampled on each update.</summary>
         internal GoalPipeline? Pipeline { get; set; }
@@ -3124,7 +3124,7 @@ public sealed class PipelineDriverFailedWorkerTests
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    private static HiveConfigFile BuildFailedWorkerDispatcherConfig() => new()
+    internal static HiveConfigFile BuildFailedWorkerDispatcherConfig() => new()
     {
         Repositories =
         [
@@ -3145,7 +3145,7 @@ public sealed class PipelineDriverFailedWorkerTests
         },
     };
 
-    private static (PipelineDriver Driver, GoalPipeline Pipeline, CountingGoalStore Store, Goal Goal)
+    internal static (PipelineDriver Driver, GoalPipeline Pipeline, CountingGoalStore Store, Goal Goal)
         CreateFailedWorkerDriver(
             GoalPhase phase,
             Func<GoalPipeline, WorkerRole, string?, CancellationToken, Task>? dispatchToRole = null)
@@ -3190,7 +3190,7 @@ public sealed class PipelineDriverFailedWorkerTests
     /// EXACTLY ONE terminal update happened (a single row alone is insufficient because an
     /// upsert would hide duplicate calls).
     /// </summary>
-    private sealed class CountingGoalStore(Goal goal) : IGoalStore
+    internal sealed class CountingGoalStore(Goal goal) : IGoalStore
     {
         internal List<(GoalStatus Status, GoalUpdateMetadata? Metadata)> StatusUpdates { get; } = [];
 
@@ -3335,7 +3335,7 @@ public sealed class PipelineDriverFailedWorkerTests
     }
 
     /// <summary>Minimal brain stub for the failed-worker end-to-end dispatcher test.</summary>
-    private sealed class FailedWorkerDispatcherFakeBrain : IDistributedBrain
+    internal sealed class FailedWorkerDispatcherFakeBrain : IDistributedBrain
     {
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -3381,5 +3381,1005 @@ public sealed class PipelineDriverFailedWorkerTests
             Task.FromResult($"Goal '{pipeline.GoalId}' completed.");
 
         public BrainStats? GetStats() => null;
+    }
+}
+
+/// <summary>
+/// Tests for narrative retention at phase completion: <see cref="PipelineDriver.DriveNextPhaseAsync"/>
+/// snapshots the narratives already received for the completing task (chronological, exact content)
+/// onto the LAST PhaseLog entry matching the pre-transition phase and current iteration — on the
+/// normal advancement path, the worker-failure early exit, and the coder no-op (retry and terminal)
+/// exits. The captured collection is detached from the live narrative bag, and the whole capture is
+/// independent of the knowledge graph / progress document.
+/// </summary>
+public sealed class PipelineDriverNarrativeRetentionTests
+{
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Shared test data
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Fixed base timestamp so ordering between entries is deterministic: the seeded entries
+    /// advance one second apart. The production capture (ordered by
+    /// <see cref="NarrativeEntry.Timestamp"/>, so the assertions below rely on this order.
+    /// </summary>
+    private static readonly DateTime Base = new(2025, 6, 1, 12, 0, 0, DateTimeKind.Utc);
+
+    private static NarrativeEntry Narrative(int seconds, string workerId, string taskId, string content) => new()
+    {
+        Timestamp = Base.AddSeconds(seconds),
+        WorkerId = workerId,
+        TaskId = taskId,
+        Content = content,
+    };
+
+    /// <summary>Long multi-line content with internal whitespace, ellipses and a distinctive tail.</summary>
+    private static string LongNarrative(string label) =>
+        $"{label}-HEAD: started the work.\n"
+        + $"{label}-MIDDLE: ... (literal ellipses) ...\n\n"
+        + new string('m', 4_100) + $"\n{label}-BEYOND-4000\n"
+        + $"{label}-TRAILING-EVIDENCE: final line with trailing spaces   ";
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  A. Normal completion (existing dispatcher fixture — normal advancement)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Normal completion: every narrative for the completing task is captured on the matching
+    /// phase entry with Timestamp/WorkerId/TaskId/Content EXACTLY preserved, in chronological
+    /// order — long multi-line text, whitespace-only content, literal ellipses and repeated
+    /// duplicates included.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_CapturesEveryNarrativeForTaskWithExactFieldsInOrder()
+    {
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", taskId, LongNarrative("N1")));
+        pipeline.Narratives.Add(Narrative(2, "worker-b", "task-OTHER-1", "unrelated narrative content"));
+        pipeline.Narratives.Add(Narrative(3, "worker-c", taskId, "   "));                        // whitespace-only
+        pipeline.Narratives.Add(Narrative(4, "worker-d", taskId, "... literal ellipses only ..."));
+        pipeline.Narratives.Add(Narrative(5, "worker-e", taskId, LongNarrative("N2")));          // repeated-style duplicate
+        pipeline.Narratives.Add(Narrative(5, "worker-e", taskId, LongNarrative("N2")));          // exact duplicate
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = "structured review summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // The completion landed on the seeded Review entry.
+        var reviewEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Review);
+        Assert.NotNull(reviewEntry.Narratives);
+
+        var captured = reviewEntry.Narratives!;
+        Assert.Equal(5, captured.Count);
+
+        // Exact per-entry preservation, in chronological (seeded) order.
+        Assert.Equal(Base.AddSeconds(1), captured[0].Timestamp);
+        Assert.Equal("worker-a", captured[0].WorkerId);
+        Assert.Equal(taskId, captured[0].TaskId);
+        Assert.Equal(LongNarrative("N1"), captured[0].Content);
+
+        Assert.Equal(Base.AddSeconds(3), captured[1].Timestamp);
+        Assert.Equal("worker-c", captured[1].WorkerId);
+        Assert.Equal("   ", captured[1].Content);
+
+        Assert.Equal(Base.AddSeconds(4), captured[2].Timestamp);
+        Assert.Equal("worker-d", captured[2].WorkerId);
+        Assert.Equal("... literal ellipses only ...", captured[2].Content);
+
+        Assert.Equal(Base.AddSeconds(5), captured[3].Timestamp);
+        Assert.Equal("worker-e", captured[3].WorkerId);
+        Assert.Equal(LongNarrative("N2"), captured[3].Content);
+
+        Assert.Equal(Base.AddSeconds(5), captured[4].Timestamp);
+        Assert.Equal("worker-e", captured[4].WorkerId);
+        Assert.Equal(LongNarrative("N2"), captured[4].Content);
+
+        // Both identical duplicates are retained — no dedup: the count (5) and the exact
+        // repeated content pin the duplicate preservation.
+    }
+
+    /// <summary>
+    /// Normal completion: narratives for other task IDs never appear on the captured phase entry.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_ExcludesNarrativesOfOtherTasks()
+    {
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Testing);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Testing);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-x", "task-OTHER-A", "OTHER-A narrative"));
+        pipeline.Narratives.Add(Narrative(2, "worker-y", "task-OTHER-B", "OTHER-B narrative"));
+        pipeline.Narratives.Add(Narrative(2, "worker-z", taskId, "the only matching narrative"));
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw tester output",
+            Metrics = new TaskMetrics { Verdict = "PASS" },
+        }, TestContext.Current.CancellationToken);
+
+        var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
+        var captured = Assert.Single(testingEntry.Narratives!);
+        Assert.Equal(taskId, captured.TaskId);
+        Assert.Equal("the only matching narrative", captured.Content);
+    }
+
+    /// <summary>
+    /// Historical/earlier-occurrence isolation: a narrative belonging to a PREVIOUS iteration's
+    /// task (different task id) must not attach to the current entry, and an earlier occurrence
+    /// entry's already-captured data stays exactly untouched by the new capture.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_SameTaskNarrativeFromEarlierPhaseOccurrence_DoesNotAttachToCurrentEntry()
+    {
+        var (dispatcher, pipeline, taskId, _, _, _) = PipelineDriverWorkerOutputTests.CreateDispatcherHarness(
+            GoalPhase.Review, recordCraftCalls: false, multiPhasePlan: true, seedPhaseEntry: false);
+
+        // Simulate the PREVIOUS iteration: an earlier Review entry (iteration 0) that already
+        // captured its own narrative, then a narrative from that earlier occurrence's task.
+        var earlierEntry = new PhaseResult
+        {
+            Name = GoalPhase.Review,
+            Result = PhaseOutcome.Pass,
+            Iteration = 0,
+            Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            CompletedAt = DateTime.UtcNow.AddMinutes(-9),
+            WorkerOutput = "earlier iteration review output",
+        };
+        pipeline.PhaseLog.Add(earlierEntry);
+        const string earlierTaskId = "task-EARLIER-OCCURRENCE";
+        pipeline.Narratives.Add(Narrative(1, "worker-old", earlierTaskId, "EARLIER-OCCURRENCE narrative"));
+
+        // The earlier occurrence's capture is already recorded on it.
+        earlierEntry.Narratives = pipeline.Narratives
+            .Where(n => n.TaskId == earlierTaskId)
+            .OrderBy(n => n.Timestamp)
+            .ToList();
+
+        // Now seed the CURRENT iteration's Review entry and drive the real completion with a
+        // DIFFERENT (current) narrative on the current task id.
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
+        pipeline.Narratives.Add(Narrative(2, "worker-new", taskId, "CURRENT narrative"));
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = "structured review summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // The current entry must carry ONLY the current task's narrative, never the earlier
+        // occurrence's (different task id).
+        var currentEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Review && e.Iteration == pipeline.Iteration);
+        var captured = Assert.Single(currentEntry.Narratives!);
+        Assert.Equal(taskId, captured.TaskId);
+        Assert.Equal("CURRENT narrative", captured.Content);
+        Assert.Equal(Base.AddSeconds(2), captured.Timestamp);
+
+        // The earlier entry's captured data is untouched: still exactly its own narrative.
+        var earlierCaptured = Assert.Single(earlierEntry.Narratives!);
+        Assert.Equal("EARLIER-OCCURRENCE narrative", earlierCaptured.Content);
+        Assert.Equal(Base.AddSeconds(1), earlierCaptured.Timestamp);
+        Assert.Single(earlierEntry.Narratives!);
+    }
+
+    /// <summary>
+    /// Empty-narratives case: no narratives for the task → the capture assigns an EMPTY list
+    /// (never null) on the selected phase entry, and lifecycle behavior is otherwise unchanged.
+    /// This pins the documented contract exactly: empty means "captured, zero narratives",
+    /// which is distinct from null's "never captured".
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_NoNarrativesForTask_CapturesEmptyListNotNull()
+    {
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
+
+        // An unrelated task's narrative exists — still nothing for THIS task.
+        pipeline.Narratives.Add(Narrative(1, "worker-x", "task-OTHER", "other task narrative"));
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = "structured review summary" },
+        }, TestContext.Current.CancellationToken);
+
+        var reviewEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Review);
+        // EXACT contract: the capture ran and assigned an empty list — NOT null. A null here
+        // would mean the entry was never selected, which is a different (wrong) outcome.
+        Assert.NotNull(reviewEntry.Narratives);
+        Assert.Empty(reviewEntry.Narratives!);
+
+        // Lifecycle otherwise unchanged: the review completed normally.
+        Assert.Equal(PhaseOutcome.Pass, reviewEntry.Result);
+        Assert.Equal("structured review summary", reviewEntry.WorkerOutput);
+    }
+
+    /// <summary>
+    /// Missing phase entry: with NO PhaseLog entry matching the pipeline's phase/iteration, the
+    /// drive keeps existing lifecycle behavior — no synthetic entry, nothing attached elsewhere.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_NoMatchingPhaseEntry_NothingAttachedAndNoSyntheticEntry()
+    {
+        var harness = PipelineDriverWorkerOutputTests.CreateDispatcherHarness(
+            GoalPhase.Review, recordCraftCalls: false, multiPhasePlan: true, seedPhaseEntry: false);
+        var dispatcher = harness.Dispatcher;
+        var pipeline = harness.Pipeline;
+        var taskId = harness.TaskId;
+        // No seeded entry: PhaseLog is empty.
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", taskId, "narrative with nowhere to land"));
+
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = "structured review summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // The capture is a no-op: the pipeline advanced (normal completion) and only the NEXT
+        // phase's entry exists — no entry was given the narrative.
+        var entriesWithNarratives = pipeline.PhaseLog.Where(e => e.Narratives is { Count: > 0 }).ToList();
+        Assert.Empty(entriesWithNarratives);
+        // No synthetic entry was created beyond the driver's own dispatch bookkeeping.
+        Assert.Equal(phaseLogCountBefore + 1, pipeline.PhaseLog.Count);
+        var newEntry = pipeline.PhaseLog[phaseLogCountBefore];
+        Assert.NotEqual(GoalPhase.Review, newEntry.Name);
+        Assert.Null(newEntry.Narratives);
+    }
+
+    /// <summary>
+    /// Non-worker phase on the worker-FAILURE early exit must not throw. The narrative
+    /// attribution is derived from the pipeline phase; deriving it via
+    /// <c>ToWorkerRole().ToRoleName()</c> throws for Planning/Merging/Done/Failed, and because
+    /// arguments are evaluated BEFORE the best-effort append is entered, that throw would
+    /// escape <c>DriveNextPhaseAsync</c> BEFORE <c>MarkGoalFailedAsync</c> — turning a clean
+    /// terminal failure into an unhandled exception, even with no knowledge graph configured.
+    /// <para>
+    /// This test pins the non-throwing derivation: a failure recorded while the pipeline sits
+    /// on Merging must still reach terminal finalization.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_OnNonWorkerPhase_DoesNotThrowAndStillFinalizes()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+        // Merging is a NON-worker phase: ToWorkerRole() throws for it.
+        pipeline.AdvanceTo(GoalPhase.Merging);
+        var mergingEntry = PhaseResult.Create(GoalPhase.Merging, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(mergingEntry);
+
+        // Narratives exist for the failing task, so the append path is genuinely reached.
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-nonworker", "narrative on a non-worker phase"));
+
+        // Act: must NOT throw.
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-nonworker",
+            Status = TaskOutcome.Failed,
+            Output = "fatal worker crash",
+        }, TestContext.Current.CancellationToken);
+
+        // Terminal finalization still happened — the failure was recorded, not short-circuited.
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        // The capture still ran on the selected entry.
+        Assert.NotNull(mergingEntry.Narratives);
+        var captured = Assert.Single(mergingEntry.Narratives!);
+        Assert.Equal("narrative on a non-worker phase", captured.Content);
+        // Failure bookkeeping is unchanged: verbatim diagnostic, Fail outcome.
+        Assert.Equal("fatal worker crash", mergingEntry.WorkerOutput);
+        Assert.Equal(PhaseOutcome.Fail, mergingEntry.Result);
+    }
+
+    /// <summary>
+    /// Snapshot independence: after capture, adding a further narrative to the live bag for the
+    /// same task does NOT change the captured collection — count and exact contents verified
+    /// AFTER the bag addition.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_LaterBagAddition_DoesNotMutateCapturedCollection()
+    {
+        var (dispatcher, pipeline, taskId) = PipelineDriverWorkerOutputTests.CreateDispatcher(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", taskId, "narrative one"));
+        pipeline.Narratives.Add(Narrative(2, "worker-b", taskId, "narrative two"));
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = "structured review summary" },
+        }, TestContext.Current.CancellationToken);
+
+        var reviewEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Review);
+        var captured = reviewEntry.Narratives!;
+        Assert.Equal(2, captured.Count);
+
+        // LATER addition to the live bag — same task id, later timestamp.
+        pipeline.Narratives.Add(Narrative(3, "worker-c", taskId, "narrative added after capture"));
+
+        // The captured collection is UNCHANGED — count and exact contents.
+        Assert.Equal(2, reviewEntry.Narratives!.Count);
+        Assert.Equal("narrative one", reviewEntry.Narratives[0].Content);
+        Assert.Equal("narrative two", reviewEntry.Narratives[1].Content);
+        Assert.Equal(Base.AddSeconds(1), reviewEntry.Narratives[0].Timestamp);
+        Assert.Equal(Base.AddSeconds(2), reviewEntry.Narratives[1].Timestamp);
+        Assert.DoesNotContain(reviewEntry.Narratives, n => n.Content == "narrative added after capture");
+    }
+
+    /// <summary>
+    /// REAL READBACK (normal completion): the driver → GoalStore.GetIterationsAsync SQLite chain
+    /// persists the captured Narratives on the phase record. The copies are asserted SEPARATELY —
+    /// the serialized Narratives collection from the readback, the WorkerOutput string, and the
+    /// PhaseOutputs mapping — so a loss of the Narratives field cannot be masked by another
+    /// retained copy.
+    /// </summary>
+    [Fact]
+    public async Task NormalCompletion_SqliteReadback_PersistsCapturedNarrativesSeparatelyFromOtherCopies()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var (pipeline, report, taskId) = await CompleteReviewWithNarrativesAsync(dbContext);
+
+        // ── Copy 1: the WorkerOutput string, alone. ──────────────────────────
+        Assert.Equal(report, pipeline.PhaseLog[0].WorkerOutput);
+
+        // ── Copy 2: the serialized Narratives from the real SQLite readback, alone. ──
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        var persistedPhase = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Review);
+        Assert.Equal(report, persistedPhase.WorkerOutput);
+        Assert.NotNull(persistedPhase.Narratives);
+        var persistedNarrative = Assert.Single(persistedPhase.Narratives!);
+        Assert.Equal("worker-narr", persistedNarrative.WorkerId);
+        Assert.Equal(taskId, persistedNarrative.TaskId);
+        Assert.Equal(NarrativeReadbackContent, persistedNarrative.Content);
+
+        // ── Copy 3: the PhaseOutputs mapping, separately from both copies above. ──
+        Assert.Equal(report, persisted.PhaseOutputs["reviewer-1"]);
+        Assert.Equal(report, persisted.PhaseOutputs["reviewer-1-1"]);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  B. Worker failure (existing failed-worker driver fixture)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Worker-failure early exit: narratives for the failed task are captured BEFORE
+    /// finalization — exact fields, chronological order, duplicates preserved.
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_CapturesEveryNarrativeForTaskWithExactFieldsInOrder()
+    {
+        var (driver, pipeline, taskId) = CreateFailedWorkerDriverWithNarratives(GoalPhase.Testing);
+        var testingEntry = Assert.Single(pipeline.PhaseLog);
+
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", taskId, LongNarrative("F1")));
+        pipeline.Narratives.Add(Narrative(2, "worker-b", "task-OTHER-2", "unrelated narrative content"));
+        pipeline.Narratives.Add(Narrative(3, "worker-d", taskId, LongNarrative("F1"))); // duplicate content
+        pipeline.Narratives.Add(Narrative(4, "worker-c", taskId, "... ellipses ..."));
+
+        const string diagnostic = "crash: worker died mid-phase";
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+        }, TestContext.Current.CancellationToken);
+
+        // The failure landed on the seeded Testing entry (existing bookkeeping).
+        Assert.Equal(PhaseOutcome.Fail, testingEntry.Result);
+        Assert.Equal(diagnostic, testingEntry.WorkerOutput);
+
+        var captured = testingEntry.Narratives!;
+        Assert.Equal(3, captured.Count);
+        Assert.Equal(Base.AddSeconds(1), captured[0].Timestamp);
+        Assert.Equal("worker-a", captured[0].WorkerId);
+        Assert.Equal(taskId, captured[0].TaskId);
+        Assert.Equal(LongNarrative("F1"), captured[0].Content);
+
+        Assert.Equal(Base.AddSeconds(3), captured[1].Timestamp);
+        Assert.Equal("worker-d", captured[1].WorkerId);
+        Assert.Equal(LongNarrative("F1"), captured[1].Content);
+
+        Assert.Equal(Base.AddSeconds(4), captured[2].Timestamp);
+        Assert.Equal("worker-c", captured[2].WorkerId);
+        Assert.Equal("... ellipses ...", captured[2].Content);
+    }
+
+    /// <summary>
+    /// Worker-failure: unrelated-task narratives never attach, earlier-iteration/occurrence
+    /// entries stay untouched, and the terminal failure behavior is unchanged.
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_ExcludesOtherTasksAndLeavesHistoricalEntriesUntouched()
+    {
+        var (driver, pipeline, taskId, goal, _) = CreateFailedWorkerDriverWithNarrativesFull(GoalPhase.Coding);
+
+        // Historical entries that must stay untouched.
+        var olderIterationEntry = new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 0, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            WorkerOutput = "older iteration output",
+        };
+        pipeline.PhaseLog.Add(olderIterationEntry);
+        var earlierOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            WorkerOutput = "first occurrence output",
+        };
+        pipeline.PhaseLog.Add(earlierOccurrence);
+        // LAST occurrence of the current iteration — the entry the failure bookkeeping targets.
+        var lastOccurrence = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 2);
+        pipeline.PhaseLog.Add(lastOccurrence);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-x", "task-OTHER-3", "OTHER narrative"));
+        pipeline.Narratives.Add(Narrative(2, "worker-y", taskId, "matching failure narrative"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Failed,
+            Output = "crash in the coding attempt",
+        }, TestContext.Current.CancellationToken);
+
+        var captured = Assert.Single(lastOccurrence.Narratives!);
+        Assert.Equal(taskId, captured.TaskId);
+        Assert.Equal("matching failure narrative", captured.Content);
+
+        // Historical entries untouched.
+        Assert.Null(olderIterationEntry.Narratives);
+        Assert.Null(earlierOccurrence.Narratives);
+        Assert.Equal(PhaseOutcome.Pass, olderIterationEntry.Result);
+        Assert.Equal(PhaseOutcome.Pass, earlierOccurrence.Result);
+    }
+
+    /// <summary>
+    /// Worker-failure: NO matching PhaseLog entry → existing terminal behavior, no synthetic
+    /// entry, nothing attached to the unrelated trailing entry.
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_NoMatchingEntry_NothingAttachedAndBehaviorUnchanged()
+    {
+        var (driver, pipeline, _, goal, _) = CreateFailedWorkerDriverWithNarrativesFull(GoalPhase.Coding);
+
+        // Only an unrelated-phase entry exists — no Coding entry for the current iteration.
+        var unrelated = new PhaseResult
+        {
+            Name = GoalPhase.Testing, Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration, Occurrence = 1,
+            StartedAt = DateTime.UtcNow,
+        };
+        pipeline.PhaseLog.Add(unrelated);
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-failed-nomatch-n", "narrative for a task with no entry"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-failed-nomatch-n",
+            Status = TaskOutcome.Failed,
+            Output = "crash with no matching entry",
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(phaseLogCountBefore, pipeline.PhaseLog.Count);
+        Assert.Null(unrelated.Narratives);
+        Assert.Equal(GoalStatus.Failed, goal.Status);
+        Assert.Equal("Worker failed: crash with no matching entry", goal.FailureReason);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+    }
+
+    /// <summary>
+    /// Worker-failure: snapshot independence — a narrative added to the bag AFTER the failed
+    /// drive cannot leak into the captured collection (asserted after the bag addition).
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_LaterBagAddition_DoesNotMutateCapturedCollection()
+    {
+        var (driver, pipeline, taskId) = CreateFailedWorkerDriverWithNarratives(GoalPhase.Testing);
+        var testingEntry = pipeline.PhaseLog[0];
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", taskId, "failure narrative one"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Failed,
+            Output = "crash after narrative",
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Single(testingEntry.Narratives!);
+
+        pipeline.Narratives.Add(Narrative(2, "worker-b", taskId, "added after failure capture"));
+
+        // Count and exact contents unchanged AFTER the bag addition.
+        Assert.Single(testingEntry.Narratives!);
+        Assert.Equal("failure narrative one", testingEntry.Narratives![0].Content);
+        Assert.Equal(Base.AddSeconds(1), testingEntry.Narratives[0].Timestamp);
+    }
+
+    /// <summary>
+    /// REAL READBACK (worker failure): the SQLite readback carries the captured narratives on
+    /// the failed phase — asserted separately from the WorkerOutput diagnostic and from the
+    /// PhaseOutputs mapping.
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_SqliteReadback_PersistsCapturedNarrativesOnFailedPhase()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-failed-worker-narr-{Guid.NewGuid():N}",
+            Description = "Retain failed-worker narrative evidence",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken))?.Id);
+        await goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, TestContext.Current.CancellationToken);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Testing);
+        pipeline.AdvanceTo(GoalPhase.Testing);
+
+        var testingEntry = PhaseResult.Create(GoalPhase.Testing, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(testingEntry);
+
+        var taskId = $"task-failed-narr-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        Assert.True(pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, GoalPhase.Testing, 1),
+            attempt: 1,
+            WorkSlotState.Pending));
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            new PipelineDriverCapturingLogger<GoalDispatcher>(),
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: new PipelineDriverFailedWorkerTests.FailedWorkerDispatcherFakeBrain(),
+            config: PipelineDriverFailedWorkerTests.BuildFailedWorkerDispatcherConfig());
+
+        pipeline.Narratives.Add(Narrative(1, "worker-narr", taskId, NarrativeReadbackContent));
+        pipeline.Narratives.Add(Narrative(2, "worker-other", "task-OTHER-4", "unrelated"));
+
+        const string diagnostic = "fatal narrative-retention crash";
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+        }, TestContext.Current.CancellationToken);
+
+        // Copy 1: the WorkerOutput diagnostic on the in-memory entry (existing behavior).
+        Assert.Equal(diagnostic, testingEntry.WorkerOutput);
+
+        // Copy 2: the serialized Narratives from the SQLite readback — the FAILED phase record
+        // carries the captured narrative, independently of the diagnostic string.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(goal.Id, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        var persistedPhase = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Testing);
+        Assert.Equal(PhaseOutcome.Fail, persistedPhase.Result);
+        Assert.Equal(diagnostic, persistedPhase.WorkerOutput);
+        Assert.NotNull(persistedPhase.Narratives);
+        var persistedNarrative = Assert.Single(persistedPhase.Narratives!);
+        Assert.Equal("worker-narr", persistedNarrative.WorkerId);
+        Assert.Equal(taskId, persistedNarrative.TaskId);
+        Assert.Equal(NarrativeReadbackContent, persistedNarrative.Content);
+
+        // Copy 3: the PhaseOutputs mapping — still the diagnostic, unchanged by the capture.
+        Assert.Equal(diagnostic, persisted.PhaseOutputs["tester-1"]);
+        Assert.Equal(diagnostic, persisted.PhaseOutputs["tester-1-1"]);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  C. Coder no-op — retry and terminal exits (existing no-op driver fixture)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// No-op RETRY path: narratives are captured on the failed Coding entry with exact fields
+    /// and order, BEFORE the iteration snapshot/budget advance.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_CapturesEveryNarrativeForTaskWithExactFieldsInOrder()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+        pipeline.Conversation.Add(new ConversationEntry("user", "retry craft", 2, "craft-prompt"));
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-noop-narr-1", LongNarrative("R1")));
+        pipeline.Narratives.Add(Narrative(2, "worker-b", "task-OTHER-5", "unrelated narrative"));
+        pipeline.Narratives.Add(Narrative(3, "worker-c", "task-noop-narr-1", "... ellipses ..."));
+        pipeline.Narratives.Add(Narrative(4, "worker-d", "task-noop-narr-1", "  "));  // whitespace
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-narr-1",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        var captured = codingEntry.Narratives!;
+        Assert.Equal(3, captured.Count);
+        Assert.Equal(Base.AddSeconds(1), captured[0].Timestamp);
+        Assert.Equal("worker-a", captured[0].WorkerId);
+        Assert.Equal("task-noop-narr-1", captured[0].TaskId);
+        Assert.Equal(LongNarrative("R1"), captured[0].Content);
+        Assert.Equal("... ellipses ...", captured[1].Content);
+        Assert.Equal("  ", captured[2].Content);
+
+        // Existing no-op bookkeeping unchanged.
+        Assert.Equal(PhaseOutcome.Fail, codingEntry.Result);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", codingEntry.WorkerOutput);
+        Assert.Equal(2, pipeline.Iteration);
+    }
+
+    /// <summary>
+    /// No-op RETRY: the narrative is captured before the summary snapshot, so the PERSISTED
+    /// summary (the InProgress write before budget consume) already carries it.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_CapturedNarratives_AreInPersistedIterationSummary()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+        pipeline.Conversation.Add(new ConversationEntry("user", "retry craft", 2, "craft-prompt"));
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-noop-narr-2", "persisted retry narrative"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-narr-2",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        var inProgressUpdate = Assert.Single(goalStore.StatusUpdates, u => u.Status == GoalStatus.InProgress);
+        var summaryUpdate = inProgressUpdate.Metadata?.IterationSummary;
+        Assert.NotNull(summaryUpdate);
+        var codingInSummary = Assert.Single(summaryUpdate!.Phases, p => p.Name == GoalPhase.Coding);
+        var captured = Assert.Single(codingInSummary.Narratives!);
+        Assert.Equal("persisted retry narrative", captured.Content);
+        Assert.Equal("task-noop-narr-2", captured.TaskId);
+    }
+
+    /// <summary>
+    /// No-op TERMINAL (budget exhausted): the already-captured narratives survive on the failed
+    /// entry that FinalizeGoalAsync's terminal summary includes.
+    /// </summary>
+    [Fact]
+    public async Task NoOpTerminal_CapturesEveryNarrativeForTaskWithExactFieldsInOrder()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+        for (var i = 0; i < 4; i++)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-noop-narr-3", LongNarrative("T1")));
+        pipeline.Narratives.Add(Narrative(2, "worker-b", "task-OTHER-5", "unrelated narrative"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-narr-3",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        var captured = codingEntry.Narratives!;
+        Assert.Single(captured);
+        Assert.Equal(Base.AddSeconds(1), captured[0].Timestamp);
+        Assert.Equal("worker-a", captured[0].WorkerId);
+        Assert.Equal("task-noop-narr-3", captured[0].TaskId);
+        Assert.Equal(LongNarrative("T1"), captured[0].Content);
+
+        // Terminal behavior unchanged.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        var summary = Assert.Single(pipeline.CompletedIterationSummaries);
+        var codingInSummary = Assert.Single(summary.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", codingInSummary.WorkerOutput);
+    }
+
+    /// <summary>
+    /// No-op: historical/earlier-occurrence isolation — the capture targets ONLY the last
+    /// current-iteration occurrence; earlier occurrences and older iterations stay untouched.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_HistoricalEntries_StayUntouchedByCapture()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+
+        var olderIterationEntry = new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = 0, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            WorkerOutput = "OLDER-ITERATION narrative-retention evidence",
+        };
+        pipeline.PhaseLog.Add(olderIterationEntry);
+
+        var earlierOccurrence = new PhaseResult
+        {
+            Name = GoalPhase.Coding, Result = PhaseOutcome.Pass,
+            Iteration = pipeline.Iteration, Occurrence = 1,
+            StartedAt = DateTime.UtcNow.AddMinutes(-2),
+            WorkerOutput = "FIRST-OCCURRENCE narrative-retention evidence",
+        };
+        pipeline.PhaseLog.Add(earlierOccurrence);
+
+        var lastOccurrence = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 2);
+        pipeline.PhaseLog.Add(lastOccurrence);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-noop-narr-4", "capture target narrative"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-narr-4",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        // Only the last current-iteration occurrence got the capture.
+        var captured = Assert.Single(lastOccurrence.Narratives!);
+        Assert.Equal("capture target narrative", captured.Content);
+        Assert.Null(olderIterationEntry.Narratives);
+        Assert.Null(earlierOccurrence.Narratives);
+    }
+
+    /// <summary>
+    /// No-op: snapshot independence — a narrative added to the bag after capture does not leak
+    /// into the captured collection (asserted after the bag addition).
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_LaterBagAddition_DoesNotMutateCapturedCollection()
+    {
+        var (driver, pipeline, goalStore) = PipelineDriverNoOpRetryTests.CreateNoOpDriver();
+        var codingEntry = PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(codingEntry);
+        pipeline.Conversation.Add(new ConversationEntry("user", "retry craft", 2, "craft-prompt"));
+
+        pipeline.Narratives.Add(Narrative(1, "worker-a", "task-noop-narr-5", "retry narrative one"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-narr-5",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Single(codingEntry.Narratives!);
+
+        pipeline.Narratives.Add(Narrative(2, "worker-b", "task-noop-narr-5", "added after no-op capture"));
+
+        Assert.Single(codingEntry.Narratives!);
+        Assert.Equal("retry narrative one", codingEntry.Narratives![0].Content);
+        Assert.Equal(Base.AddSeconds(1), codingEntry.Narratives[0].Timestamp);
+    }
+
+    /// <summary>
+    /// REAL READBACK (no-op retry): the driver → GetIterationsAsync SQLite chain persists the
+    /// captured narrative on the failed Coding phase record; asserted separately from
+    /// WorkerOutput and the PhaseOutputs mapping.
+    /// </summary>
+    [Fact]
+    public async Task NoOpRetry_SqliteReadback_PersistsCapturedNarrativesOnFailedCoding()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore) = await PipelineDriverNoOpRetryTests.CreateSqliteNoOpDriver(dbContext, exhaustBudget: false);
+
+        pipeline.Narratives.Add(Narrative(1, "worker-narr", "task-noop-sqlite-narr", NarrativeReadbackContent));
+        pipeline.Narratives.Add(Narrative(2, "worker-other", "task-OTHER-6", "unrelated"));
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-noop-sqlite-narr",
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, pipeline.Iteration);
+
+        // Copy 2: the serialized Narratives from the real SQLite readback.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.NotNull(persistedCoding.Narratives);
+        var persistedNarrative = Assert.Single(persistedCoding.Narratives!);
+        Assert.Equal("worker-narr", persistedNarrative.WorkerId);
+        Assert.Equal("task-noop-sqlite-narr", persistedNarrative.TaskId);
+        Assert.Equal(NarrativeReadbackContent, persistedNarrative.Content);
+
+        // Copy 1 (WorkerOutput) and Copy 3 (PhaseOutputs mapping) are asserted separately:
+        // each copy alone detects a loss of the serialized Narratives field.
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persisted.PhaseOutputs["coder-1"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persisted.PhaseOutputs["coder-1-1"]);
+    }
+
+    /// <summary>
+    /// REAL READBACK (terminal no-op): the SQLite chain's terminal summary carries the captured
+    /// narrative — asserted separately from the WorkerOutput string and the PhaseOutputs mapping.
+    /// </summary>
+    [Fact]
+    public async Task NoOpTerminal_SqliteReadback_PersistsCapturedNarrativesOnTerminalFailure()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (dispatcher, pipeline, goalStore, _, capturingLogger) = await PipelineDriverNoOpRetryTests.CreateSqliteNoOpDispatcher(dbContext, exhaustBudget: true);
+
+        var taskId = pipeline.ActiveTaskId
+            ?? throw new InvalidOperationException("the seeded task must be the pipeline's active task");
+
+        pipeline.Narratives.Add(Narrative(1, "worker-narr", taskId, NarrativeReadbackContent));
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Null(capturingLogger.LastException);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        var persistedCoding = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Coding);
+        Assert.Equal(PhaseOutcome.Fail, persistedCoding.Result);
+        Assert.NotNull(persistedCoding.Narratives);
+        var persistedNarrative = Assert.Single(persistedCoding.Narratives!);
+        Assert.Equal("worker-narr", persistedNarrative.WorkerId);
+        Assert.Equal(taskId, persistedNarrative.TaskId);
+        Assert.Equal(NarrativeReadbackContent, persistedNarrative.Content);
+
+        // Copy 1 and Copy 3, separately from the Narratives field.
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persistedCoding.WorkerOutput);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persisted.PhaseOutputs["coder-5"]);
+        Assert.Equal("Coder produced no file changes (no-op)\n\nno changes made", persisted.PhaseOutputs["coder-5-1"]);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Helpers
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>The exact narrative content used by the SQLite readback tests.</summary>
+    private const string NarrativeReadbackContent = "SQLITE-READBACK-NARRATIVE: ... narrative retention evidence ...";
+
+    /// <summary>
+    /// Failed-worker driver (reusing the existing <see cref="PipelineDriverFailedWorkerTests.CreateFailedWorkerDriver"/> shape)
+    /// with a deterministic task id; the caller seeds the target phase entry.
+    /// </summary>
+    private static (PipelineDriver Driver, GoalPipeline Pipeline, string TaskId)
+        CreateFailedWorkerDriverWithNarratives(GoalPhase phase)
+    {
+        var (driver, pipeline, _, _) = PipelineDriverFailedWorkerTests.CreateFailedWorkerDriver(phase);
+        pipeline.SetPlan(IterationPlan.Default());
+        pipeline.AdvanceTo(phase);
+        // Seed the target phase entry explicitly: the failure tests index PhaseLog[0], and the
+        // existing in-memory failed-worker fixture seeds its entries per-test, so this helper
+        // provides the one entry the failure bookkeeping targets.
+        pipeline.PhaseLog.Add(PhaseResult.Create(phase, pipeline.Iteration, 1));
+        return (driver, pipeline, "task-narr-failed");
+    }
+
+    internal static (PipelineDriver Driver, GoalPipeline Pipeline, string TaskId, Goal Goal, PipelineDriverFailedWorkerTests.CountingGoalStore Store)
+        CreateFailedWorkerDriverWithNarrativesFull(GoalPhase phase)
+    {
+        var (driver, pipeline, goalStore, goal) = PipelineDriverFailedWorkerTests.CreateFailedWorkerDriver(phase);
+        return (driver, pipeline, "task-failed-nomatch-n", goal, goalStore);
+    }
+
+    /// <summary>
+    /// Real completion through the existing SQLite chain (Review REQUEST_CHANGES path) with a
+    /// narrative seeded on the completing task — proves the persisted summary carries the
+    /// captured narratives through GoalStore.GetIterationsAsync.
+    /// </summary>
+    private static async Task<(GoalPipeline Pipeline, string Report, string TaskId)>
+        CompleteReviewWithNarrativesAsync(CopilotHiveDbContext dbContext)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-sqlite-narr-{Guid.NewGuid():N}",
+            Description = "Persist the review narrative",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, ct);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(ct))?.Id);
+
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
+        pipeline.AdvanceTo(GoalPhase.Review);
+        PipelineDriverWorkerOutputTests.AddPhaseEntry(pipeline, GoalPhase.Review);
+
+        var taskId = $"task-review-narr-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        Assert.True(pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, GoalPhase.Review, 1),
+            attempt: 1,
+            WorkSlotState.Pending));
+
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            new PipelineDriverCapturingLogger<GoalDispatcher>(),
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: new PipelineDriverWorkerOutputTests.LocalFakeBrain(),
+            config: PipelineDriverWorkerOutputTests.BuildDispatcherConfig());
+
+        pipeline.Narratives.Add(Narrative(1, "worker-narr", taskId, NarrativeReadbackContent));
+
+        var report = PipelineDriverWorkerOutputTests.BuildRealisticPhaseReport(GoalPhase.Review, "narrative-readback");
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "different raw output",
+            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES", Summary = report },
+        }, ct);
+
+        Assert.False(pipeline.Phase == GoalPhase.Failed, pipeline.Goal.FailureReason);
+        return (pipeline, report, taskId);
     }
 }

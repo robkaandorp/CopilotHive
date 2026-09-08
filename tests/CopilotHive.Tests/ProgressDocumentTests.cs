@@ -652,6 +652,156 @@ public sealed class ProgressDocumentTests
         Assert.Contains("Testing all", section);
     }
 
+    // ── Narrative projection on EARLY-EXIT paths (worker failure, coder no-op) ──
+
+    /// <summary>
+    /// Worker failure: the progress document ALSO includes the matching narrative exactly once
+    /// on the failed-worker early exit (the new append-attempt site), and an unrelated task's
+    /// narrative is absent from the document.
+    /// </summary>
+    [Fact]
+    public async Task WorkerFailure_ProgressDocumentIncludesMatchingNarrativeExactlyOnce()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+        var taskId = pipeline!.ActiveTaskId;
+        Assert.NotNull(taskId);
+
+        pipeline.AddNarrativeEntry("worker-a", taskId!, "FAILED-PATH narrative: hit an unrecoverable error.");
+        pipeline.AddNarrativeEntry("worker-other", "task-UNRELATED", "UNRELATED narrative content.");
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId!,
+            Status = TaskOutcome.Failed,
+            Output = "fatal worker crash",
+        }, ct);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // Exactly ONE narrative section for the matching narrative. The pattern MUST be escaped:
+        // the section header contains literal parentheses, which an unescaped regex would parse
+        // as a capture group (matching "### coder narrative", which never occurs).
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(
+            doc!.Content, System.Text.RegularExpressions.Regex.Escape("### coder (narrative)")));
+        Assert.Contains("FAILED-PATH narrative: hit an unrecoverable error.", doc.Content);
+        // Unrelated narrative is absent.
+        Assert.DoesNotContain("UNRELATED narrative content.", doc.Content);
+    }
+
+    /// <summary>
+    /// Coder no-op retry: the document includes the matching narrative exactly once on the
+    /// no-op (retry) path — the second new append-attempt site — with unrelated narratives
+    /// absent.
+    /// </summary>
+    [Fact]
+    public async Task CoderNoOpRetry_ProgressDocumentIncludesMatchingNarrativeExactlyOnce()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, maxRetries: 3);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+        var taskId = pipeline!.ActiveTaskId;
+        Assert.NotNull(taskId);
+
+        pipeline.AddNarrativeEntry("worker-a", taskId!, "NOOP-PATH narrative: the blocker was the missing config key.");
+        pipeline.AddNarrativeEntry("worker-other", "task-UNRELATED", "UNRELATED noop narrative.");
+
+        // 0 files changed → the no-op retry path.
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId!,
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, ct);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // Exactly ONE narrative section — the retry context and the summary write must not
+        // duplicate the narrative projection. The pattern MUST be escaped: the section header
+        // contains literal parentheses, which an unescaped regex would parse as a capture group.
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(
+            doc!.Content, System.Text.RegularExpressions.Regex.Escape("### coder (narrative)")));
+        Assert.Contains("NOOP-PATH narrative: the blocker was the missing config key.", doc.Content);
+        Assert.DoesNotContain("UNRELATED noop narrative.", doc.Content);
+    }
+
+    /// <summary>
+    /// Coder no-op TERMINAL exhaustion: when the iteration budget is exhausted the no-op path
+    /// takes the Fail → AdvanceTo(Failed) → MarkGoalFailedAsync terminal exit instead of the
+    /// retry exit. The narrative projection must still reach the progress document exactly once
+    /// per matching narrative.
+    /// <para>
+    /// This is the mutation guard the retry-exit test cannot provide: moving the production
+    /// append BELOW the <c>IterationBudget.IsExhausted</c> return keeps the retry test green
+    /// (the retry exit still appends) while silently dropping the projection on this terminal
+    /// exit. Only this test fails for that mutant.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CoderNoOpBudgetExhausted_ProgressDocumentIncludesMatchingNarrativeExactlyOnce()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var graph = new KnowledgeGraph();
+        var goal = new Goal { Id = $"goal-progress-{Guid.NewGuid():N}", Description = "Implement feature X", RepositoryNames = ["test-repo"] };
+        var dispatcher = CreateDispatcher(goal, graph, out var pipelineManager, out _, maxRetries: 3);
+
+        await InvokeDispatchNextGoalAsync(dispatcher, ct);
+
+        var pipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(pipeline);
+        var taskId = pipeline!.ActiveTaskId;
+        Assert.NotNull(taskId);
+
+        // Drive the no-op path into its TERMINAL branch: exhaust the iteration budget so
+        // IsExhausted is true when the no-op is detected.
+        while (!pipeline.IterationBudget.IsExhausted)
+            pipeline.IterationBudget.TryConsume();
+        Assert.True(pipeline.IterationBudget.IsExhausted);
+
+        // A Coding entry for the CURRENT (post-exhaustion) iteration so the capture selects a
+        // real entry, mirroring the driver-level terminal no-op fixture.
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Coding, pipeline.Iteration, 1));
+
+        pipeline.AddNarrativeEntry("worker-a", taskId!, "TERMINAL-NOOP narrative: exhausted every avenue.");
+        pipeline.AddNarrativeEntry("worker-other", "task-UNRELATED", "UNRELATED terminal narrative.");
+
+        // 0 files changed with the budget exhausted → the terminal no-op exit.
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId!,
+            Status = TaskOutcome.Completed,
+            Output = "no changes made",
+            GitStatus = new GitChangeSummary { FilesChanged = 0 },
+        }, ct);
+
+        // The terminal branch really was taken.
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+
+        var doc = graph.GetDocument($"progress-{goal.Id}");
+        Assert.NotNull(doc);
+        // Exactly ONE narrative section — the terminal finalization must not duplicate or drop
+        // the projection. Pattern MUST be escaped: the header's literal parentheses would
+        // otherwise be parsed as a capture group and match nothing.
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(
+            doc!.Content, System.Text.RegularExpressions.Regex.Escape("### coder (narrative)")));
+        Assert.Contains("TERMINAL-NOOP narrative: exhausted every avenue.", doc.Content);
+        Assert.DoesNotContain("UNRELATED terminal narrative.", doc.Content);
+    }
+
     // ── Custom Brain summary from SummarizeAndMergeAsync ──────────────────────
 
     [Fact]
