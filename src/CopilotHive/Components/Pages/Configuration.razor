@@ -58,12 +58,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Orchestrator / Brain</label>
                     <select @bind="_orchestratorModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_orchestratorReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -72,12 +75,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Composer</label>
                     <select @bind="_composerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_composerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -86,12 +92,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Coder</label>
                     <select @bind="_coderModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_coderReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -107,6 +116,7 @@ else
                         }
                     </select>
                     <select @bind="_coderPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -115,12 +125,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Tester</label>
                     <select @bind="_testerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_testerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -136,6 +149,7 @@ else
                         }
                     </select>
                     <select @bind="_testerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -144,12 +158,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Reviewer</label>
                     <select @bind="_reviewerModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_reviewerReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -165,6 +182,7 @@ else
                         }
                     </select>
                     <select @bind="_reviewerPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -173,12 +191,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Doc Writer</label>
                     <select @bind="_docwriterModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_docwriterReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -194,6 +215,7 @@ else
                         }
                     </select>
                     <select @bind="_docwriterPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -202,12 +224,15 @@ else
 
                     <label style="color:var(--text-muted);font-size:0.9rem">Improver</label>
                     <select @bind="_improverModel" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <!-- Unset assignment sentinel: never visually selects the first catalog model. -->
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var m in models)
                         {
                             <option value="@m.Name">@m.Name</option>
                         }
                     </select>
                     <select @bind="_improverReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -223,6 +248,7 @@ else
                         }
                     </select>
                     <select @bind="_improverPremiumReasoningEffort" style="padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;cursor:pointer;width:100%">
+                        <option value="" disabled>(not configured)</option>
                         @foreach (var opt in ReasoningEffortOptions.Options)
                         {
                             <option value="@ReasoningEffortOptions.WireValue(opt.Value)">@opt.Label</option>
@@ -1098,12 +1124,11 @@ else
         string.IsNullOrEmpty(value) ? null : ReasoningEffortConverter.Parse(value);
 
     /// <summary>
-    /// Converts a loaded <see cref="ReasoningEffort"/> into the wire value the
-    /// <c>&lt;select&gt;</c> elements bind to. An unset (null) effort falls back to <c>"none"</c>
-    /// so the dropdown always has a matching option selected.
+    /// Sentinel wire value bound by the Models-tab selects when an assignment is unset.
+    /// An empty value must NEVER map to a catalog model or to <see cref="ReasoningEffort.None"/> —
+    /// <see cref="ParseReasoning"/> maps it to <c>null</c> (leave-unchanged) on save.
     /// </summary>
-    private static string WireOrNone(ReasoningEffort? effort) =>
-        ReasoningEffortOptions.WireValue(effort ?? ReasoningEffort.None);
+    internal const string UnsetSentinel = "";
 
     // The page consumes the shared facade DTOs from CopilotHive.Services (FacadeDtos.cs)
     // directly — ModelsConfigDto, AvailableModelDto, ConfigSubAgentModelDto, DiscoveredModelDto,
@@ -1123,34 +1148,36 @@ else
     private bool _saveSuccess;
     private string? _saveError;
 
-    // Per-field binding
-    private string _orchestratorModel = "";
-    private string _composerModel = "";
-    private string _compactionModel = "";
-    private string _coderModel = "";
-    private string _testerModel = "";
-    private string _reviewerModel = "";
-    private string _docwriterModel = "";
-    private string _improverModel = "";
-    private string _coderPremiumModel = "";
-    private string _testerPremiumModel = "";
-    private string _reviewerPremiumModel = "";
-    private string _docwriterPremiumModel = "";
-    private string _improverPremiumModel = "";
+    // Per-field binding. Primary selects bind the empty sentinel when the stored assignment is
+    // unset; premium/compaction selects bind "" for their existing '(none)' / '(use main model)'.
+    private string _orchestratorModel = UnsetSentinel;
+    private string _composerModel = UnsetSentinel;
+    private string _compactionModel = UnsetSentinel;
+    private string _coderModel = UnsetSentinel;
+    private string _testerModel = UnsetSentinel;
+    private string _reviewerModel = UnsetSentinel;
+    private string _docwriterModel = UnsetSentinel;
+    private string _improverModel = UnsetSentinel;
+    private string _coderPremiumModel = UnsetSentinel;
+    private string _testerPremiumModel = UnsetSentinel;
+    private string _reviewerPremiumModel = UnsetSentinel;
+    private string _docwriterPremiumModel = UnsetSentinel;
+    private string _improverPremiumModel = UnsetSentinel;
 
-    // Per-assignment reasoning effort
-    private string _orchestratorReasoningEffort = "none";
-    private string _composerReasoningEffort = "none";
-    private string _coderReasoningEffort = "none";
-    private string _testerReasoningEffort = "none";
-    private string _reviewerReasoningEffort = "none";
-    private string _docwriterReasoningEffort = "none";
-    private string _improverReasoningEffort = "none";
-    private string _coderPremiumReasoningEffort = "none";
-    private string _testerPremiumReasoningEffort = "none";
-    private string _reviewerPremiumReasoningEffort = "none";
-    private string _docwriterPremiumReasoningEffort = "none";
-    private string _improverPremiumReasoningEffort = "none";
+    // Per-assignment reasoning effort. The empty sentinel means "not configured" (a no-op on
+    // save); "none" is a real persisted level and must round-trip as such.
+    private string _orchestratorReasoningEffort = UnsetSentinel;
+    private string _composerReasoningEffort = UnsetSentinel;
+    private string _coderReasoningEffort = UnsetSentinel;
+    private string _testerReasoningEffort = UnsetSentinel;
+    private string _reviewerReasoningEffort = UnsetSentinel;
+    private string _docwriterReasoningEffort = UnsetSentinel;
+    private string _improverReasoningEffort = UnsetSentinel;
+    private string _coderPremiumReasoningEffort = UnsetSentinel;
+    private string _testerPremiumReasoningEffort = UnsetSentinel;
+    private string _reviewerPremiumReasoningEffort = UnsetSentinel;
+    private string _docwriterPremiumReasoningEffort = UnsetSentinel;
+    private string _improverPremiumReasoningEffort = UnsetSentinel;
 
     private IReadOnlyList<BackupInfoDto> _backups = [];
     private bool _backupsLoading;
@@ -1329,37 +1356,7 @@ else
             _modelsData = result.Value;
             if (_modelsData is not null)
             {
-                _orchestratorModel = _modelsData.Orchestrator ?? "";
-                _composerModel     = _modelsData.Composer ?? _modelsData.Orchestrator ?? "";
-                _compactionModel   = _modelsData.Compaction ?? "";
-                _coderModel        = _modelsData.Workers.GetValueOrDefault("coder")?.Model
-                                     ?? _modelsData.Orchestrator ?? "";
-                _testerModel       = _modelsData.Workers.GetValueOrDefault("tester")?.Model
-                                     ?? _modelsData.Orchestrator ?? "";
-                _reviewerModel     = _modelsData.Workers.GetValueOrDefault("reviewer")?.Model
-                                     ?? _modelsData.Orchestrator ?? "";
-                _docwriterModel    = _modelsData.Workers.GetValueOrDefault("docwriter")?.Model
-                                     ?? _modelsData.Orchestrator ?? "";
-                _improverModel     = _modelsData.Workers.GetValueOrDefault("improver")?.Model
-                                     ?? _modelsData.Orchestrator ?? "";
-                _coderPremiumModel        = _modelsData.Workers.GetValueOrDefault("coder")?.PremiumModel ?? "";
-                _testerPremiumModel       = _modelsData.Workers.GetValueOrDefault("tester")?.PremiumModel ?? "";
-                _reviewerPremiumModel     = _modelsData.Workers.GetValueOrDefault("reviewer")?.PremiumModel ?? "";
-                _docwriterPremiumModel    = _modelsData.Workers.GetValueOrDefault("docwriter")?.PremiumModel ?? "";
-                _improverPremiumModel     = _modelsData.Workers.GetValueOrDefault("improver")?.PremiumModel ?? "";
-
-                _orchestratorReasoningEffort = WireOrNone(_modelsData.OrchestratorReasoningEffort);
-                _composerReasoningEffort     = WireOrNone(_modelsData.ComposerReasoningEffort);
-                _coderReasoningEffort        = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("coder"));
-                _testerReasoningEffort       = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("tester"));
-                _reviewerReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("reviewer"));
-                _docwriterReasoningEffort    = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("docwriter"));
-                _improverReasoningEffort     = WireOrNone(_modelsData.WorkerReasoningEffort.GetValueOrDefault("improver"));
-                _coderPremiumReasoningEffort     = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("coder"));
-                _testerPremiumReasoningEffort    = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("tester"));
-                _reviewerPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("reviewer"));
-                _docwriterPremiumReasoningEffort = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("docwriter"));
-                _improverPremiumReasoningEffort  = WireOrNone(_modelsData.WorkerPremiumReasoningEffort.GetValueOrDefault("improver"));
+                PopulateModelEditorFields(_modelsData);
             }
         }
         catch (Exception ex)
@@ -1374,6 +1371,199 @@ else
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Populates the Models-tab binding fields from the loaded <see cref="ModelsConfigDto"/>.
+    /// NULL-PRESERVING: each of the seven primary selects displays ONLY its own assignment —
+    /// an unset (null) assignment binds the empty sentinel so the disabled '(not configured)'
+    /// placeholder is shown. No orchestrator fallback is applied to Composer or the five primary
+    /// worker roles (the old fallbacks materialized the orchestrator's model on open+save).
+    /// </summary>
+    internal void PopulateModelEditorFields(ModelsConfigDto data)
+    {
+        _orchestratorModel = data.Orchestrator ?? UnsetSentinel;
+        _composerModel = data.Composer ?? UnsetSentinel;
+        _compactionModel = data.Compaction ?? UnsetSentinel;
+        _coderModel = data.Workers.GetValueOrDefault("coder")?.Model ?? UnsetSentinel;
+        _testerModel = data.Workers.GetValueOrDefault("tester")?.Model ?? UnsetSentinel;
+        _reviewerModel = data.Workers.GetValueOrDefault("reviewer")?.Model ?? UnsetSentinel;
+        _docwriterModel = data.Workers.GetValueOrDefault("docwriter")?.Model ?? UnsetSentinel;
+        _improverModel = data.Workers.GetValueOrDefault("improver")?.Model ?? UnsetSentinel;
+        _coderPremiumModel = data.Workers.GetValueOrDefault("coder")?.PremiumModel ?? UnsetSentinel;
+        _testerPremiumModel = data.Workers.GetValueOrDefault("tester")?.PremiumModel ?? UnsetSentinel;
+        _reviewerPremiumModel = data.Workers.GetValueOrDefault("reviewer")?.PremiumModel ?? UnsetSentinel;
+        _docwriterPremiumModel = data.Workers.GetValueOrDefault("docwriter")?.PremiumModel ?? UnsetSentinel;
+        _improverPremiumModel = data.Workers.GetValueOrDefault("improver")?.PremiumModel ?? UnsetSentinel;
+
+        // Null reasoning binds the empty sentinel — NOT 'none' — so an untouched save never
+        // materializes the adjacent nullable fields. Explicit ReasoningEffort.None is a real
+        // configured value and keeps the 'none' wire value.
+        _orchestratorReasoningEffort = WireOrUnset(data.OrchestratorReasoningEffort);
+        _composerReasoningEffort = WireOrUnset(data.ComposerReasoningEffort);
+        _coderReasoningEffort = WireOrUnset(data.WorkerReasoningEffort.GetValueOrDefault("coder"));
+        _testerReasoningEffort = WireOrUnset(data.WorkerReasoningEffort.GetValueOrDefault("tester"));
+        _reviewerReasoningEffort = WireOrUnset(data.WorkerReasoningEffort.GetValueOrDefault("reviewer"));
+        _docwriterReasoningEffort = WireOrUnset(data.WorkerReasoningEffort.GetValueOrDefault("docwriter"));
+        _improverReasoningEffort = WireOrUnset(data.WorkerReasoningEffort.GetValueOrDefault("improver"));
+        _coderPremiumReasoningEffort = WireOrUnset(data.WorkerPremiumReasoningEffort.GetValueOrDefault("coder"));
+        _testerPremiumReasoningEffort = WireOrUnset(data.WorkerPremiumReasoningEffort.GetValueOrDefault("tester"));
+        _reviewerPremiumReasoningEffort = WireOrUnset(data.WorkerPremiumReasoningEffort.GetValueOrDefault("reviewer"));
+        _docwriterPremiumReasoningEffort = WireOrUnset(data.WorkerPremiumReasoningEffort.GetValueOrDefault("docwriter"));
+        _improverPremiumReasoningEffort = WireOrUnset(data.WorkerPremiumReasoningEffort.GetValueOrDefault("improver"));
+    }
+
+    /// <summary>
+    /// Converts a loaded <see cref="ReasoningEffort"/> into the wire value the Models-tab
+    /// reasoning <c>&lt;select&gt;</c> elements bind to. An unset (null) effort binds the empty
+    /// sentinel so the disabled '(not configured)' placeholder is shown — it must never claim
+    /// the explicit 'none' level. <see cref="ReasoningEffort.None"/> itself remains the real
+    /// 'none' wire value and round-trips as such.
+    /// </summary>
+    private static string WireOrUnset(ReasoningEffort? effort) =>
+        effort is null ? UnsetSentinel : ReasoningEffortOptions.WireValue(effort.Value);
+
+    /// <summary>
+    /// Builds the <see cref="ModelConfigUpdate"/> from the current binding fields. NULL-PRESERVING,
+    /// with the PRIMARY contract deliberately separate from the premium/compaction one:
+    /// <list type="bullet">
+    /// <item>An empty primary scalar (orchestrator / Composer) is sent as <c>null</c>
+    /// (leave-unchanged) over ANY baseline — including a previously concrete one. Clearing an
+    /// existing primary model is NOT a feature, so the empty-string clear must never travel here.</item>
+    /// <item>An empty primary worker selection is ALWAYS OMITTED from
+    /// <see cref="ModelConfigUpdate.WorkerModels"/> — never sent as an empty string and never
+    /// substituted with another role's model. A concrete selection keeps its exact name, even
+    /// when it equals the orchestrator's model (equality is never inferred as inheritance).</item>
+    /// <item>Premium/compaction keep the BASELINE-AWARE behavior: a displayed empty over an
+    /// originally null baseline (the loaded <see cref="_modelsData"/>) omits the premium key /
+    /// sends a <c>null</c> compaction, while an explicitly cleared previously-concrete value
+    /// still travels as the existing empty-string update, per the service's blank-normalization
+    /// contract.</item>
+    /// <item>An unset reasoning binds the empty sentinel and maps through
+    /// <see cref="ParseReasoning"/> to <c>null</c> (no-op); explicit 'none' round-trips as
+    /// <see cref="ReasoningEffort.None"/>.</item>
+    /// </list>
+    /// </summary>
+    internal ModelConfigUpdate BuildModelConfigUpdate()
+    {
+        var data = _modelsData;
+
+        return new ModelConfigUpdate(
+            // Primaries: unconditional no-op on empty — NOT NullIfUnset (which clears over a
+            // concrete baseline; that behavior belongs to premium/compaction only).
+            OrchestratorModel: NullIfEmpty(_orchestratorModel),
+            ComposerModel: NullIfEmpty(_composerModel),
+            WorkerModels: BuildPrimaryWorkerModels(),
+            PremiumWorkerModels: BuildPremiumWorkerModels(data),
+            CompactionModel: NullIfUnset(_compactionModel, data?.Compaction),
+            OrchestratorReasoningEffort: ParseReasoning(_orchestratorReasoningEffort),
+            ComposerReasoningEffort: ParseReasoning(_composerReasoningEffort),
+            WorkerReasoningEffort: BuildWorkerReasoningDictionary(primary: true),
+            WorkerPremiumReasoningEffort: BuildWorkerReasoningDictionary(primary: false));
+    }
+
+    /// <summary>
+    /// PRIMARY mapping: an empty display is ALWAYS <c>null</c> (leave-unchanged), regardless of
+    /// the loaded baseline — this editor never clears an existing primary model. A non-empty
+    /// value travels verbatim, including a selection equal to the orchestrator's model.
+    /// </summary>
+    private static string? NullIfEmpty(string displayed) =>
+        displayed.Length == 0 ? null : displayed;
+
+    /// <summary>
+    /// PREMIUM/COMPACTION mapping ONLY: returns <c>null</c> (leave-unchanged) when the displayed
+    /// value is the empty sentinel AND the stored baseline was also null — an untouched unset
+    /// field is a no-op. A non-empty value travels verbatim, and an empty value over a CONCRETE
+    /// baseline travels as the empty string, preserving the existing user clearing behavior of
+    /// the '(none)' / '(use main model)' selects. Deliberately NOT used for the primary
+    /// orchestrator/Composer/worker fields.
+    /// </summary>
+    private static string? NullIfUnset(string displayed, string? baseline) =>
+        displayed.Length == 0
+            ? (baseline is null ? null : "")
+            : displayed;
+
+    /// <summary>
+    /// Builds the PRIMARY worker-model dictionary. An empty (sentinel) selection is ALWAYS
+    /// omitted — no baseline lookup is consulted, so a previously concrete role is left
+    /// untouched rather than cleared. Concrete selections keep their exact names.
+    /// </summary>
+    private Dictionary<string, string> BuildPrimaryWorkerModels()
+    {
+        var displayed = new Dictionary<string, string>
+        {
+            ["coder"] = _coderModel,
+            ["tester"] = _testerModel,
+            ["reviewer"] = _reviewerModel,
+            ["docwriter"] = _docwriterModel,
+            ["improver"] = _improverModel,
+        };
+
+        Dictionary<string, string> result = [];
+        foreach (var (role, value) in displayed)
+        {
+            var effective = NullIfEmpty(value);
+            if (effective is not null)
+                result.Add(role, effective);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds the PREMIUM worker-model dictionary. An empty display over an originally null
+    /// baseline is omitted (an untouched blank never creates a worker section); an empty display
+    /// over a CONCRETE baseline travels as the empty string so the existing '(none)' clearing
+    /// behavior keeps working.
+    /// </summary>
+    private Dictionary<string, string> BuildPremiumWorkerModels(ModelsConfigDto? data)
+    {
+        var displayed = new Dictionary<string, string>
+        {
+            ["coder"] = _coderPremiumModel,
+            ["tester"] = _testerPremiumModel,
+            ["reviewer"] = _reviewerPremiumModel,
+            ["docwriter"] = _docwriterPremiumModel,
+            ["improver"] = _improverPremiumModel,
+        };
+
+        Dictionary<string, string> result = [];
+        foreach (var (role, value) in displayed)
+        {
+            var baselineValue = data?.Workers.GetValueOrDefault(role)?.PremiumModel;
+            var effective = NullIfUnset(value, baselineValue);
+            if (effective is not null)
+                result.Add(role, effective);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Builds the per-role reasoning-effort dictionary. A sentinel (unset) reasoning assignment
+    /// maps through <see cref="ParseReasoning"/> to <c>null</c>, which the service treats as a
+    /// no-op for that role, so an untouched save never materializes the adjacent nullable
+    /// fields; a concrete selection (including explicit 'none') is included so it persists.
+    /// </summary>
+    private Dictionary<string, ReasoningEffort?> BuildWorkerReasoningDictionary(bool primary)
+    {
+        var displayed = new Dictionary<string, string>
+        {
+            ["coder"] = primary ? _coderReasoningEffort : _coderPremiumReasoningEffort,
+            ["tester"] = primary ? _testerReasoningEffort : _testerPremiumReasoningEffort,
+            ["reviewer"] = primary ? _reviewerReasoningEffort : _reviewerPremiumReasoningEffort,
+            ["docwriter"] = primary ? _docwriterReasoningEffort : _docwriterPremiumReasoningEffort,
+            ["improver"] = primary ? _improverReasoningEffort : _improverPremiumReasoningEffort,
+        };
+
+        var result = new Dictionary<string, ReasoningEffort?>();
+        foreach (var (role, value) in displayed)
+        {
+            var parsed = ParseReasoning(value);
+            if (parsed is not null)
+                result.Add(role, parsed);
+        }
+        return result;
+    }
+
     private async Task SaveModelsAsync()
     {
         _modelsSaving = true;
@@ -1381,44 +1571,7 @@ else
         _saveError    = null;
         try
         {
-            var update = new ModelConfigUpdate(
-                OrchestratorModel: _orchestratorModel,
-                ComposerModel: _composerModel,
-                WorkerModels: new Dictionary<string, string>
-                {
-                    ["coder"]      = _coderModel,
-                    ["tester"]     = _testerModel,
-                    ["reviewer"]   = _reviewerModel,
-                    ["docwriter"]  = _docwriterModel,
-                    ["improver"]   = _improverModel,
-                },
-                PremiumWorkerModels: new Dictionary<string, string>
-                {
-                    ["coder"]      = _coderPremiumModel,
-                    ["tester"]     = _testerPremiumModel,
-                    ["reviewer"]   = _reviewerPremiumModel,
-                    ["docwriter"]  = _docwriterPremiumModel,
-                    ["improver"]   = _improverPremiumModel,
-                },
-                CompactionModel: _compactionModel,
-                OrchestratorReasoningEffort: ParseReasoning(_orchestratorReasoningEffort),
-                ComposerReasoningEffort: ParseReasoning(_composerReasoningEffort),
-                WorkerReasoningEffort: new Dictionary<string, ReasoningEffort?>
-                {
-                    ["coder"]     = ParseReasoning(_coderReasoningEffort),
-                    ["tester"]    = ParseReasoning(_testerReasoningEffort),
-                    ["reviewer"]  = ParseReasoning(_reviewerReasoningEffort),
-                    ["docwriter"] = ParseReasoning(_docwriterReasoningEffort),
-                    ["improver"]  = ParseReasoning(_improverReasoningEffort),
-                },
-                WorkerPremiumReasoningEffort: new Dictionary<string, ReasoningEffort?>
-                {
-                    ["coder"]     = ParseReasoning(_coderPremiumReasoningEffort),
-                    ["tester"]    = ParseReasoning(_testerPremiumReasoningEffort),
-                    ["reviewer"]  = ParseReasoning(_reviewerPremiumReasoningEffort),
-                    ["docwriter"] = ParseReasoning(_docwriterPremiumReasoningEffort),
-                    ["improver"]  = ParseReasoning(_improverPremiumReasoningEffort),
-                });
+            var update = BuildModelConfigUpdate();
 
             var result = await ConfigFacade.SaveModelsAsync(update, CancellationToken.None);
             if (result.Success)
