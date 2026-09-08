@@ -7198,6 +7198,151 @@ public sealed class ComposerToolTests : IDisposable
         }
     }
 
+    // ── review_goal — parse-failure / long-output preservation regressions ──
+    // Continuous regressions invoking the ACTUAL registered review_goal tool from
+    // BuildComposerTools, wired to a REAL GoalReviewService with a deterministic fake review
+    // chat client. They guard the complete-preservation fix for malformed parse-failure output
+    // and the already-uncapped normal NeedsChanges path. Each setup starts from a fresh empty
+    // knowledge graph and invokes review once, so these tests exercise the document-CREATION
+    // path only; the UPDATED-document path is covered at the service level by
+    // GoalReviewServiceTests.ReviewGoalAsync_MalformedOutput_ExistingReviewDocument_UpdatedWithCompleteSummary.
+    // Assertions are against in-memory knowledge-graph document content — this is NOT a
+    // disk/Git durability verification.
+
+    /// <summary>
+    /// Builds a Composer with a REAL <see cref="GoalReviewService"/> (backed by the test goal
+    /// store, an in-memory knowledge graph, and a fake review chat client) plus the matching
+    /// knowledge graph, so the registered review_goal tool can be exercised end-to-end.
+    /// </summary>
+    private (Composer Composer, KnowledgeGraph KnowledgeGraph) CreateComposerWithRealReviewService(
+        string reviewChatReply)
+    {
+        var kg = new KnowledgeGraph();
+        var reviewService = new GoalReviewService(
+            knowledgeGraph: kg,
+            configRepo: null,
+            config: new HiveConfigFile
+            {
+                Workers =
+                {
+                    ["reviewer"] = new WorkerConfig { Model = "reviewer-model" },
+                },
+            },
+            goalStore: _store,
+            brainRepoManager: null,
+            stateDir: Path.GetTempPath(),
+            logger: NullLogger<GoalReviewService>.Instance,
+            chatClientFactory: _ => new StubChatClient(reviewChatReply));
+
+        var composer = new Composer(
+            "test-model",
+            NullLogger<Composer>.Instance,
+            _store,
+            stateDir: Path.GetTempPath(),
+            knowledgeGraph: kg,
+            goalReviewService: reviewService);
+
+        return (composer, kg);
+    }
+
+    /// <summary>Invokes the registered review_goal tool with the given goal id.</summary>
+    private static async Task<string> InvokeReviewGoalToolAsync(Composer composer, string goalId)
+    {
+        var tools = composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().First(t => t.Name == "review_goal");
+        return (await tool.InvokeAsync(
+            new AIFunctionArguments { ["goal_id"] = goalId },
+            TestContext.Current.CancellationToken))?.ToString() ?? "";
+    }
+
+    /// <summary>The exact parse-error summary for a given raw reviewer response.</summary>
+    private static string ExpectedParseFailureSummary(string raw) =>
+        $"The review agent returned a response that could not be parsed as JSON. Raw output: {raw}";
+
+    [Fact]
+    public async Task ReviewGoalTool_MalformedResponse_PreservesCompleteRawTextInToolOutputAndDocument()
+    {
+        // Long malformed response (no JSON envelope), with distinctive evidence beyond the old
+        // 500-character cutoff and at the very end.
+        var raw = new string('e', 600) + "\nBOUNDARY EVIDENCE TOOL-MALFORMED-PAST-500\n" +
+                  "FINAL LINE: trailing evidence TOOL-MALFORMED-TAIL must survive at the very end.";
+        var (composer, kg) = CreateComposerWithRealReviewService(raw);
+        await composer.CreateGoalAsync("review-tool-malformed", "Test goal");
+
+        var toolResult = await InvokeReviewGoalToolAsync(composer, "review-tool-malformed");
+
+        var expected = ExpectedParseFailureSummary(raw);
+
+        // The tool output must embed the COMPLETE parse-error summary — including the trailing
+        // raw evidence — verbatim, not a prefix or a length.
+        Assert.Contains(expected, toolResult);
+        Assert.Contains("BOUNDARY EVIDENCE TOOL-MALFORMED-PAST-500", toolResult);
+        Assert.Contains("TOOL-MALFORMED-TAIL must survive at the very end.", toolResult);
+        Assert.Equal(ReviewStatus.NeedsChanges,
+            (await _store.GetGoalAsync("review-tool-malformed", TestContext.Current.CancellationToken))!.ReviewStatus);
+
+        // The review document created by this same execution must contain the complete summary
+        // too (fresh graph + single invocation ⇒ this exercises the document-CREATION path only;
+        // the updated-document path is covered by
+        // GoalReviewServiceTests.ReviewGoalAsync_MalformedOutput_ExistingReviewDocument_UpdatedWithCompleteSummary).
+        // Assertions are against in-memory knowledge-graph content — NOT a disk/Git durability
+        // verification.
+        var doc = kg.GetDocument("review-review-tool-malformed");
+        Assert.NotNull(doc);
+        Assert.Contains(expected, doc!.Content);
+        Assert.EndsWith("TOOL-MALFORMED-TAIL must survive at the very end.\n", doc.Content);
+    }
+
+    [Fact]
+    public async Task ReviewGoalTool_LongValidNeedsChanges_PreservesCompleteIssuesAndRecommendation()
+    {
+        // Long VALID NeedsChanges response: issue descriptions and the recommendation each exceed
+        // 500 characters, are multiline, and carry distinctive tails. This guards the
+        // already-uncapped normal path — it is not a reproduced normal-path defect.
+        var issue1 = new string('f', 300) + "\n" + new string('g', 300) + "\nISSUE-ONE-TAIL-marker-α";
+        var issue2 = new string('h', 550) + "\nISSUE-TWO-TAIL-marker-β";
+        var recommendation = new string('i', 320) + "\n" + new string('j', 300) +
+                             "\nRECOMMENDATION-TAIL-marker-γ";
+
+        var raw = JsonSerializer.Serialize(new
+        {
+            verdict = "NeedsChanges",
+            issues = new[]
+            {
+                new { severity = "CRITICAL", description = issue1 },
+                new { severity = "MAJOR", description = issue2 },
+            },
+            verified = Array.Empty<object>(),
+            recommendation,
+        });
+
+        var (composer, kg) = CreateComposerWithRealReviewService(raw);
+        await composer.CreateGoalAsync("review-tool-longvalid", "Test goal");
+
+        var toolResult = await InvokeReviewGoalToolAsync(composer, "review-tool-longvalid");
+
+        // The tool output renders issues as "[SEVERITY] description" joined by newlines, and the
+        // recommendation as the summary — each embedded verbatim and complete.
+        var expectedIssues = $"[CRITICAL] {issue1}\n[MAJOR] {issue2}";
+        Assert.Contains(expectedIssues, toolResult);
+        Assert.Contains(recommendation, toolResult);
+        Assert.Contains("ISSUE-ONE-TAIL-marker-α", toolResult);
+        Assert.Contains("ISSUE-TWO-TAIL-marker-β", toolResult);
+        Assert.Contains("RECOMMENDATION-TAIL-marker-γ", toolResult);
+
+        // The review document created by this same execution must contain the complete issue
+        // headings and recommendation. This setup starts from a fresh empty graph and invokes
+        // review once, so it exercises the document-CREATION path only — not an updated
+        // document. Assertions are against in-memory knowledge-graph content — NOT a disk/Git
+        // durability verification.
+        var doc = kg.GetDocument("review-review-tool-longvalid");
+        Assert.NotNull(doc);
+        Assert.Contains($"### [CRITICAL] {issue1}", doc!.Content);
+        Assert.Contains($"### [MAJOR] {issue2}", doc.Content);
+        Assert.Contains($"## Recommendation\n{recommendation}\n", doc.Content);
+        Assert.EndsWith("RECOMMENDATION-TAIL-marker-γ\n", doc.Content);
+    }
+
     [Fact]
     public async Task UpdateGoal_Description_ResetsReviewStatus()
     {

@@ -162,6 +162,206 @@ public sealed class GoalReviewServiceTests
         Assert.Contains("could not be parsed", result.Summary);
     }
 
+    // ── Malformed-output parse-failure regressions: complete raw text preserved ──
+    // Regression tests for the confirmed destructive 500-character truncation of malformed
+    // pre-execution reviewer output in ParseFailure. The parse-error summary must embed the
+    // COMPLETE received raw text verbatim — no character cap, no truncation marker, no
+    // shortening requirement, and no follow-up retrieval workaround. These are in-memory
+    // document assertions only; they do not verify disk/Git durability.
+
+    /// <summary>
+    /// Builds a realistic multiline malformed reviewer response well above the old 500-character
+    /// cap, with distinctive evidence both beyond the 500-character boundary and at the very end.
+    /// </summary>
+    private static string BuildLongMalformedOutput(string marker)
+    {
+        // 60 lines of ~60 characters each ≈ 3,600 characters total — far past the old cap.
+        var lines = new List<string>
+        {
+            "Line 001: The review agent streamed this narrative before the envelope was lost.",
+        };
+        for (var i = 2; i <= 59; i++)
+            lines.Add($"Line {i:D3}: padding evidence {marker} — distinct content per line to avoid accidental matches.");
+        lines.Add($"FINAL LINE: trailing evidence {marker}-TAIL must survive intact at the very end.");
+
+        var body = string.Join("\n", lines);
+        // Boundary evidence: a unique marker placed just AFTER the old 500-character cutoff.
+        return body.Insert(Constants.TruncationMedium, $"\nBOUNDARY EVIDENCE {marker}-PAST-500\n");
+    }
+
+    /// <summary>The exact parse-error summary the service must produce for the given raw text.</summary>
+    private static string ExpectedParseFailureSummary(string raw) =>
+        $"The review agent returned a response that could not be parsed as JSON. Raw output: {raw}";
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedOutputWithoutJsonEnvelope_PreservesCompleteRawTextInSummary()
+    {
+        var raw = BuildLongMalformedOutput("NOENVELOPE");
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var service = CreateService(raw, knowledgeGraph: kg);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var expected = ExpectedParseFailureSummary(raw);
+
+        // Exact full expected summary — the complete raw portion embedded verbatim.
+        Assert.Equal(expected, result.Summary);
+
+        // Distinctive evidence beyond the old 500-character boundary and at the very end.
+        Assert.Contains("BOUNDARY EVIDENCE NOENVELOPE-PAST-500", result.Summary);
+        Assert.EndsWith("NOENVELOPE-TAIL must survive intact at the very end.", result.Summary);
+
+        // Verdict, issue structure, and review-status transitions preserved unchanged.
+        Assert.Equal("NeedsChanges", result.Verdict);
+        Assert.Equal(ReviewStatus.NeedsChanges, goal.ReviewStatus);
+        Assert.Equal("[ERROR] Failed to parse review response", result.Issues);
+
+        // Complete summary appears in the review-document content (in-memory knowledge graph;
+        // this is NOT a disk/Git durability verification).
+        var doc = kg.GetDocument($"review-{goal.Id}");
+        Assert.NotNull(doc);
+        Assert.Contains(expected, doc!.Content);
+        Assert.Contains("BOUNDARY EVIDENCE NOENVELOPE-PAST-500", doc.Content);
+        Assert.EndsWith("NOENVELOPE-TAIL must survive intact at the very end.\n", doc.Content);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedJsonDeserializationFailure_PreservesCompleteRawTextInSummary()
+    {
+        // Contains '{' and '}' so envelope extraction succeeds, but the JSON is invalid —
+        // exercising the deserialization-failure branch of ParseReviewResult.
+        var raw = "{ not valid json } :: broken" + new string('x', 400) + " ||| " +
+                  "BOUNDARY EVIDENCE BADJSON-PAST-500 |||\n" +
+                  "FINAL LINE: trailing evidence BADJSON-TAIL must survive intact at the very end.";
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var service = CreateService(raw, knowledgeGraph: kg);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var expected = ExpectedParseFailureSummary(raw);
+
+        Assert.Equal(expected, result.Summary);
+        Assert.Contains("BOUNDARY EVIDENCE BADJSON-PAST-500", result.Summary);
+        Assert.EndsWith("BADJSON-TAIL must survive intact at the very end.", result.Summary);
+
+        Assert.Equal("NeedsChanges", result.Verdict);
+        Assert.Equal(ReviewStatus.NeedsChanges, goal.ReviewStatus);
+        Assert.Equal("[ERROR] Failed to parse review response", result.Issues);
+
+        var doc = kg.GetDocument($"review-{goal.Id}");
+        Assert.NotNull(doc);
+        Assert.Contains(expected, doc!.Content);
+        Assert.EndsWith("BADJSON-TAIL must survive intact at the very end.\n", doc.Content);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedOutput_At500CharBoundary_PreservesExactContent()
+    {
+        // Content whose total length is exactly the old 500-character cutoff plus evidence that
+        // spans the boundary: with the old slicing the marker would be cut mid-token or dropped.
+        var raw = new string('a', 495) + "BOUNDARY-MARKER-XX" + new string('b', 20);
+        Assert.True(raw.Length > Constants.TruncationMedium);
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var service = CreateService(raw, knowledgeGraph: kg);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var expected = ExpectedParseFailureSummary(raw);
+        Assert.Equal(expected, result.Summary);
+        // The old slicing kept only the first 500 chars, which would cut the marker in half
+        // ("BOUNDARY-MARKER-XX" starts at index 495 and is cut at index 500).
+        Assert.Contains("BOUNDARY-MARKER-XX", result.Summary);
+
+        var doc = kg.GetDocument($"review-{goal.Id}");
+        Assert.NotNull(doc);
+        Assert.Contains(expected, doc!.Content);
+        Assert.Contains("BOUNDARY-MARKER-XX", doc.Content);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedOutput_JustUnder500Chars_AlreadyComplete()
+    {
+        // Just below the old cap: content was already preserved verbatim before the fix.
+        // Guards against accidental shortening even for short outputs.
+        var raw = new string('c', 499);
+        var goal = NewGoal();
+        var service = CreateService(raw);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        Assert.Equal(ExpectedParseFailureSummary(raw), result.Summary);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedOutput_JustOver500Chars_PreservesEverythingPastBoundary()
+    {
+        // Just above the old cap: with the old slicing the final 20 characters were destroyed.
+        var raw = new string('d', 501) + "PAST-CAP-TAIL";
+        var goal = NewGoal();
+        var service = CreateService(raw);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        Assert.Equal(ExpectedParseFailureSummary(raw), result.Summary);
+        Assert.Contains("PAST-CAP-TAIL", result.Summary);
+    }
+
+    [Fact]
+    public async Task ReviewGoalAsync_MalformedOutput_ExistingReviewDocument_UpdatedWithCompleteSummary()
+    {
+        // UPDATED-document path: all other long-output regressions start from an empty knowledge
+        // graph and invoke review once, so only document CREATION is exercised. This regression
+        // pre-creates review-{goal.Id} with stale content (simulating a previous review), then
+        // runs the real service with long malformed reviewer output and asserts the exact full
+        // parse-error summary and its verbatim presence in the UPDATED document, with the stale
+        // content replaced. In-memory assertions only — NOT a disk/Git durability verification.
+        var raw = BuildLongMalformedOutput("STALEDOC");
+        var goal = NewGoal();
+        var kg = new KnowledgeGraph();
+        var docId = $"review-{goal.Id}";
+
+        await kg.CreateDocumentAsync(
+            id: docId,
+            title: $"Review: {goal.Id}",
+            type: DocumentType.Scratch,
+            content: "STALE CONTENT — old verdict/issues text that must be replaced.",
+            topic: "review",
+            author: "reviewer",
+            ct: TestContext.Current.CancellationToken);
+
+        var service = CreateService(raw, knowledgeGraph: kg);
+
+        var result = await service.ReviewGoalAsync(goal, TestContext.Current.CancellationToken);
+
+        var expected = ExpectedParseFailureSummary(raw);
+
+        // (a) The exact full expected summary — complete raw portion embedded verbatim.
+        Assert.Equal(expected, result.Summary);
+        // Distinctive evidence beyond the old 500-character boundary and at the very end.
+        Assert.Contains("BOUNDARY EVIDENCE STALEDOC-PAST-500", result.Summary);
+        Assert.EndsWith("STALEDOC-TAIL must survive intact at the very end.", result.Summary);
+
+        // Verdict, issue structure, and review-status transitions preserved unchanged.
+        Assert.Equal("NeedsChanges", result.Verdict);
+        Assert.Equal(ReviewStatus.NeedsChanges, goal.ReviewStatus);
+        Assert.Equal("[ERROR] Failed to parse review response", result.Issues);
+
+        // (b) + (c) The entire summary is present verbatim in the updated document and the
+        // stale content is gone. Same document id — updated in place, not duplicated.
+        var doc = kg.GetDocument(docId);
+        Assert.NotNull(doc);
+        Assert.Equal(docId, doc!.Id);
+        Assert.DoesNotContain("STALE CONTENT", doc.Content);
+        Assert.Contains(expected, doc.Content);
+        Assert.Contains("BOUNDARY EVIDENCE STALEDOC-PAST-500", doc.Content);
+        Assert.EndsWith("STALEDOC-TAIL must survive intact at the very end.\n", doc.Content);
+        // Only one document with this id exists (no duplication).
+        Assert.Single(kg.Search("*"), d => d.Id == docId);
+    }
+
     [Fact]
     public async Task ReviewGoalAsync_NullKnowledgeGraph_Completes()
     {

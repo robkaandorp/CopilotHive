@@ -400,15 +400,11 @@ public class GoalReviewService
 
     private static (string Verdict, List<ReviewIssue> Issues, List<ReviewVerified> Verified, string Summary) ParseFailure(string raw)
     {
-        var truncated = raw.Length > Constants.TruncationMedium
-            ? raw.Substring(0, Constants.TruncationMedium)
-            : raw;
-
         return (
             "NeedsChanges",
             [new ReviewIssue("ERROR", "Failed to parse review response")],
             [],
-            $"The review agent returned a response that could not be parsed as JSON. Raw output: {truncated}");
+            $"The review agent returned a response that could not be parsed as JSON. Raw output: {raw}");
     }
 
     /// <summary>Renders the parsed issues as a single newline-joined string for the <see cref="ReviewResult"/>.</summary>
