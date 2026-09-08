@@ -1,7 +1,9 @@
+using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -9,10 +11,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CopilotHive.Tests;
 
 /// <summary>
-/// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/> sets
-/// <see cref="PhaseResult.WorkerOutput"/> to <see cref="TaskMetrics.Summary"/>
-/// when present, falling back to <see cref="TaskResult.Output"/> otherwise,
-/// with 4000-char truncation applied in both cases.
+/// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/> preserves the complete
+/// authoritative phase report for every worker phase: a nonblank
+/// <see cref="TaskMetrics.Summary"/> when present, otherwise <see cref="TaskResult.Output"/>.
 /// </summary>
 public sealed class PipelineDriverWorkerOutputTests
 {
@@ -75,64 +76,114 @@ public sealed class PipelineDriverWorkerOutputTests
         Assert.Equal(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
     }
 
-    // ── Test 3: Truncation at 4000 chars for Summary path ────────────────
+    // ── Legacy 4,000-character boundary regressions ──────────────────────
 
-    [Fact]
-    public async Task DriveNextPhaseAsync_WhenSummaryExceeds4000Chars_TruncatesWithSuffix()
+    [Theory]
+    [InlineData(3_999)]
+    [InlineData(4_000)]
+    [InlineData(4_001)]
+    public async Task DriveNextPhaseAsync_WhenReviewSummaryCrossesLegacyBoundary_PreservesExactly(int length)
     {
-        // Arrange
         var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
         AddPhaseEntry(pipeline, GoalPhase.Review);
+        var summary = BuildExactLengthReport(length, 'S');
 
-        var longSummary = new string('S', 5000); // 5000-char summary
-
-        // Act
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
-            Output = "short",
+            Output = "different raw review output",
+            Metrics = new TaskMetrics { Verdict = "APPROVE", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(summary, pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    [Theory]
+    [InlineData(3_999)]
+    [InlineData(4_000)]
+    [InlineData(4_001)]
+    public async Task DriveNextPhaseAsync_WhenReviewRawOutputCrossesLegacyBoundary_PreservesExactly(int length)
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
+        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var rawOutput = BuildExactLengthReport(length, 'O');
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "APPROVE" },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
+    }
+
+    // ── All five normal worker phases preserve both selection paths ──────
+
+    [Theory]
+    [InlineData(GoalPhase.Coding)]
+    [InlineData(GoalPhase.Testing)]
+    [InlineData(GoalPhase.Review)]
+    [InlineData(GoalPhase.DocWriting)]
+    [InlineData(GoalPhase.Improve)]
+    public async Task DriveNextPhaseAsync_AllWorkerPhases_PreserveRealisticStructuredSummaryExactly(GoalPhase phase)
+    {
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(phase);
+        AddPhaseEntry(pipeline, phase);
+        var summary = BuildRealisticPhaseReport(phase, "structured-summary");
+        Assert.True(summary.Length > 8 * 1024);
+        var rawOutput = $"DIFFERENT-RAW-OUTPUT:{phase}";
+
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            GitStatus = phase == GoalPhase.Coding
+                ? new GitChangeSummary { FilesChanged = 2, Pushed = true, ChangedFiles = ["src/Feature.cs", "tests/FeatureTests.cs"] }
+                : null,
             Metrics = new TaskMetrics
             {
-                Verdict = "REQUEST_CHANGES",
-                Summary = longSummary,
+                Verdict = phase == GoalPhase.Review ? "APPROVE" : "PASS",
+                Summary = summary,
             },
         }, TestContext.Current.CancellationToken);
 
-        // Assert: truncated to 4000 chars with trailing length annotation
-        var workerOutput = pipeline.PhaseLog[0].WorkerOutput;
-        Assert.NotNull(workerOutput);
-        Assert.StartsWith(new string('S', 4000), workerOutput);
-        Assert.Contains("5000 chars total", workerOutput);
-        Assert.True(workerOutput!.Length < 5000);
+        var completedEntry = pipeline.PhaseLog[0];
+        Assert.Equal(summary, completedEntry.WorkerOutput);
+        Assert.Equal(PhaseOutcome.Pass, completedEntry.Result);
+        Assert.NotNull(completedEntry.CompletedAt);
+        if (phase == GoalPhase.Coding)
+            Assert.NotEqual("Coder produced no file changes (no-op)", completedEntry.WorkerOutput);
     }
 
-    // ── Test 4: Truncation at 4000 chars for Output fallback path ─────────
-
-    [Fact]
-    public async Task DriveNextPhaseAsync_WhenOutputExceeds4000Chars_TruncatesWithSuffix()
+    [Theory]
+    [InlineData(GoalPhase.Coding)]
+    [InlineData(GoalPhase.Testing)]
+    [InlineData(GoalPhase.Review)]
+    [InlineData(GoalPhase.DocWriting)]
+    [InlineData(GoalPhase.Improve)]
+    public async Task DriveNextPhaseAsync_AllWorkerPhases_PreserveRealisticRawOutputFallbackExactly(GoalPhase phase)
     {
-        // Arrange
-        var (dispatcher, pipeline, taskId) = CreateDispatcher(GoalPhase.Review);
-        AddPhaseEntry(pipeline, GoalPhase.Review);
+        var (dispatcher, pipeline, taskId) = CreateDispatcher(phase);
+        AddPhaseEntry(pipeline, phase);
+        var rawOutput = BuildRealisticPhaseReport(phase, "raw-output-fallback");
+        Assert.True(rawOutput.Length > 8 * 1024);
 
-        var longOutput = new string('O', 5000); // 5000-char raw output
-
-        // Act
         await dispatcher.HandleTaskCompletionAsync(new TaskResult
         {
             TaskId = taskId,
             Status = TaskOutcome.Completed,
-            Output = longOutput,
-            Metrics = new TaskMetrics { Verdict = "REQUEST_CHANGES" }, // no Summary
+            Output = rawOutput,
+            GitStatus = phase == GoalPhase.Coding
+                ? new GitChangeSummary { FilesChanged = 1, Pushed = true, ChangedFiles = ["src/Feature.cs"] }
+                : null,
+            Metrics = new TaskMetrics { Verdict = phase == GoalPhase.Review ? "APPROVE" : "PASS" },
         }, TestContext.Current.CancellationToken);
 
-        // Assert: truncated to 4000 chars with trailing length annotation
-        var workerOutput = pipeline.PhaseLog[0].WorkerOutput;
-        Assert.NotNull(workerOutput);
-        Assert.StartsWith(new string('O', 4000), workerOutput);
-        Assert.Contains("5000 chars total", workerOutput);
-        Assert.True(workerOutput!.Length < 5000);
+        Assert.Equal(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
     }
 
     // ── Testing phase: FULL report preservation (no truncation, no suffix) ──
@@ -275,6 +326,8 @@ public sealed class PipelineDriverWorkerOutputTests
         }, TestContext.Current.CancellationToken);
 
         Assert.Equal(report, pipeline.PhaseLog[0].WorkerOutput);
+        Assert.Equal("FAIL", pipeline.PhaseLog[0].Verdict);
+        Assert.Equal(PhaseOutcome.Fail, pipeline.PhaseLog[0].Result);
     }
 
     /// <summary>
@@ -302,6 +355,149 @@ public sealed class PipelineDriverWorkerOutputTests
         Assert.NotEqual(rawOutput, pipeline.PhaseLog[0].WorkerOutput);
     }
 
+    // ── Continuous completion-to-SQLite and explicit live-snapshot storage ──
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HandleTaskCompletionAsync_ReviewRequestChanges_PersistsCompleteSelectedReportToGoalStore(
+        bool useStructuredSummary)
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var (pipeline, report) = await CompleteReviewRequestChangesAsync(goalStore, useStructuredSummary);
+
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(
+            pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        Assert.Equal(1, persisted.Iteration);
+        Assert.Equal(report,
+            Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Review).WorkerOutput);
+        Assert.Equal(report, persisted.PhaseOutputs["reviewer-1"]);
+        Assert.Equal(report, persisted.PhaseOutputs["reviewer-1-1"]);
+
+        // REQUEST_CHANGES with retry budget must end iteration 1 and start Coding in iteration 2.
+        // These assertions ensure a caught drive/persistence error cannot masquerade as success.
+        Assert.Equal(2, pipeline.Iteration);
+        Assert.Equal(GoalPhase.Coding, pipeline.Phase);
+        Assert.Equal(GoalPhase.Coding, pipeline.StateMachine.Phase);
+    }
+
+    [Fact]
+    public async Task CompletionProducedPipeline_ExplicitPipelineStoreRoundTrip_PreservesCompleteReviewReport()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var (pipeline, report) = await CompleteReviewRequestChangesAsync(goalStore, useStructuredSummary: true);
+        await using var pipelineStore = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
+
+        // This explicitly exercises the live SavePipeline/LoadPipeline store path after the real
+        // completion. The fixture does not claim automatic production persistence, process restart,
+        // or deployment recovery verification.
+        pipelineStore.SavePipeline(pipeline);
+        dbContext.ChangeTracker.Clear();
+        var snapshot = pipelineStore.LoadPipeline(pipeline.GoalId);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(2, snapshot!.Iteration);
+        Assert.Equal(GoalPhase.Coding, snapshot.Phase);
+        Assert.Equal(report,
+            Assert.Single(snapshot.PhaseLog,
+                p => p.Name == GoalPhase.Review && p.Iteration == 1 && p.Occurrence == 1).WorkerOutput);
+    }
+
+    private static string BuildExactLengthReport(int length, char fill)
+    {
+        const string head = "HEAD:\n";
+        const string tail = "\nTAIL";
+        return head + new string(fill, length - head.Length - tail.Length) + tail;
+    }
+
+    private static string BuildRealisticPhaseReport(GoalPhase phase, string representation)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"## {phase} report ({representation})");
+        sb.AppendLine("Build and verification evidence follows exactly as emitted by the worker.");
+        while (sb.Length < 4_100)
+            sb.AppendLine("Evidence row: deterministic finding, path, assertion, and observed result.");
+        sb.AppendLine($"UNIQUE-EVIDENCE-BEYOND-OLD-BOUNDARY:{phase}:{representation}");
+        while (sb.Length < 8_600)
+            sb.AppendLine("Additional multiline detail: regression reasoning and reproducible observation.");
+        sb.Append($"UNIQUE-TAIL-EVIDENCE:{phase}:{representation}");
+        return sb.ToString();
+    }
+
+    private static async Task<(GoalPipeline Pipeline, string Report)> CompleteReviewRequestChangesAsync(
+        GoalStore goalStore,
+        bool useStructuredSummary)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = $"goal-sqlite-report-{Guid.NewGuid():N}",
+            Description = "Persist the complete review report",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, ct);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(ct))?.Id);
+
+        // Deliberately omit PipelineStore from the manager. Iteration persistence below therefore
+        // proves the GoalDispatcher → GoalStore chain; the separate test explicitly saves the live
+        // completion-produced pipeline through PipelineStore.
+        var pipelineManager = new GoalPipelineManager();
+        var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        var plan = IterationPlan.Default();
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Review);
+        pipeline.AdvanceTo(GoalPhase.Review);
+        AddPhaseEntry(pipeline, GoalPhase.Review);
+
+        var taskId = $"task-review-{Guid.NewGuid():N}";
+        pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        Assert.True(pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, GoalPhase.Review, 1),
+            attempt: 1,
+            WorkSlotState.Pending));
+
+        var logger = new CapturingLogger<GoalDispatcher>();
+        var dispatcher = new GoalDispatcher(
+            goalManager,
+            pipelineManager,
+            new TaskQueue(),
+            new GrpcWorkerGateway(new WorkerPool()),
+            new TaskCompletionNotifier(),
+            logger,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            brain: new LocalFakeBrain(),
+            config: BuildDispatcherConfig());
+
+        var report = BuildRealisticPhaseReport(
+            GoalPhase.Review,
+            useStructuredSummary ? "sqlite-structured-summary" : "sqlite-raw-fallback");
+        await dispatcher.HandleTaskCompletionAsync(new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = useStructuredSummary ? "different raw output" : report,
+            Metrics = new TaskMetrics
+            {
+                Verdict = "REQUEST_CHANGES",
+                Summary = useStructuredSummary ? report : "   ",
+            },
+        }, ct);
+
+        Assert.False(pipeline.Phase == GoalPhase.Failed, logger.LastException?.ToString() ?? pipeline.Goal.FailureReason);
+        Assert.Equal(WorkSlotState.Recorded,
+            Assert.Single(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == taskId).State);
+        return (pipeline, report);
+    }
+
     /// <summary>
     /// Builds a realistic ~8KB tester report with structured sections, newlines, and mutation
     /// evidence both just past char 4,000 and at the very end.
@@ -322,6 +518,27 @@ public sealed class PipelineDriverWorkerOutputTests
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    private static HiveConfigFile BuildDispatcherConfig() => new()
+    {
+        Repositories =
+        [
+            new RepositoryConfig
+            {
+                Name = "CopilotHive",
+                Url = "https://example.invalid/CopilotHive.git",
+                DefaultBranch = "main",
+            },
+        ],
+        Workers =
+        {
+            ["coder"] = new WorkerConfig { Model = "test-coder-model" },
+            ["tester"] = new WorkerConfig { Model = "test-tester-model" },
+            ["reviewer"] = new WorkerConfig { Model = "test-reviewer-model" },
+            ["docwriter"] = new WorkerConfig { Model = "test-docwriter-model" },
+            ["improver"] = new WorkerConfig { Model = "test-improver-model" },
+        },
+    };
+
     /// <summary>
     /// Builds a minimal self-contained <see cref="GoalDispatcher"/> for testing
     /// <c>DriveNextPhaseAsync</c> WorkerOutput assignment.
@@ -329,7 +546,12 @@ public sealed class PipelineDriverWorkerOutputTests
     private static (GoalDispatcher dispatcher, GoalPipeline pipeline, string taskId)
         CreateDispatcher(GoalPhase phase)
     {
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Test goal",
+            RepositoryNames = ["CopilotHive"],
+        };
 
         var goalSource = new LocalFakeGoalSource(goal);
         var goalManager = new GoalManager();
@@ -339,15 +561,21 @@ public sealed class PipelineDriverWorkerOutputTests
         var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
 
-        // Set up the state machine so transitions work (Review → Merging)
-        pipeline.StateMachine.RestoreFromPlan(
-            [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging],
-            phase);
-
+        // A one-phase plan reaches normal bookkeeping and then completes without invoking merge
+        // infrastructure. Failed/request-changes verdicts still exercise the real retry path.
+        var plan = new IterationPlan { Phases = [phase] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, phase);
         pipeline.AdvanceTo(phase);
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
+        pipeline.SetActiveTask(taskId);
+        pipeline.SeedSlotForTest(
+            taskId,
+            new WorkSlotPosition(pipeline.Iteration, phase, 1),
+            attempt: 1,
+            WorkSlotState.Pending);
 
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -357,7 +585,8 @@ public sealed class PipelineDriverWorkerOutputTests
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            brain: new LocalFakeBrain());
+            brain: new LocalFakeBrain(),
+            config: BuildDispatcherConfig());
 
         return (dispatcher, pipeline, taskId);
     }
@@ -389,6 +618,25 @@ public sealed class PipelineDriverWorkerOutputTests
         public Task UpdateGoalStatusAsync(
             string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
             Task.CompletedTask;
+    }
+
+    private sealed class CapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        internal Exception? LastException { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (exception is not null)
+                LastException = exception;
+        }
     }
 
     /// <summary>Minimal brain stub for pipeline driver tests.</summary>

@@ -344,11 +344,8 @@ internal sealed class PipelineDriver
             var workerOutput = !string.IsNullOrWhiteSpace(result.Metrics?.Summary)
                 ? result.Metrics.Summary
                 : result.Output;
-            logEntry.WorkerOutput = pipeline.Phase == GoalPhase.Testing
-                ? workerOutput // preserve the entire tester report for reviewer handoff
-                : workerOutput.Length > 4000
-                    ? workerOutput[..4000] + $"... ({workerOutput.Length} chars total)"
-                    : workerOutput;
+            // Preserve the entire worker report for all phases — the authoritative phase output.
+            logEntry.WorkerOutput = workerOutput;
             logEntry.Result = phaseInput == PhaseInput.Succeeded ? PhaseOutcome.Pass : PhaseOutcome.Fail;
         }
 
