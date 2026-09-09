@@ -822,9 +822,26 @@ public sealed class TaskExecutor(
                 The following agents.md file(s) exceed the {WorkerConstants.AgentsMdMaxCharacters}-character limit:
                 {violationDetails}
 
-                Please condense each file to fit within {WorkerConstants.AgentsMdMaxCharacters} characters.
-                Prioritize the most impactful rules and remove less important content.
-                Do NOT add new content — only condense what is there.
+                Please bring each file back within {WorkerConstants.AgentsMdMaxCharacters} characters
+                using the append-new/compress-old policy:
+                - Work from the TOP of the existing material downward: first consolidate and compress
+                  the older rules, then, only if that is still not enough, remove the oldest material
+                  that is redundant or obsolete.
+                - Never meet the limit by truncating a whole file: do not cut the file short, do not
+                  drop its remaining content wholesale, and do not replace it with a stub. Reduce
+                  from the TOP of the older material downward instead.
+                - Leave the lessons you appended in this session untouched — do not edit, reword,
+                  reorder or delete them.
+                - Do NOT add new content or new lessons on this pass — only the older, already
+                  existing material may change.
+                - Do not weaken or drop protected safety constraints (git workflow, test
+                  requirements, output-format compliance) and do not degrade guidance into cryptic
+                  abbreviations or symbol-heavy shorthand — keep readable ordinary-language bullets.
+                - The compressed file must stay readable to a new reader: keep useful headings and
+                  concise ordinary-language bullets so someone opening the file for the first time
+                  can follow it.
+                - If the protected content genuinely cannot fit within the limit, stop and report
+                  that blocker in your response instead of sacrificing protected content.
                 """;
 
             var condenseOutput = await agentRunner.SendPromptAsync(condensePrompt, _configAgentsDir, ct);

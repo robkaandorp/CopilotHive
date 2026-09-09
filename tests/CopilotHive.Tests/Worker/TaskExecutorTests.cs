@@ -154,6 +154,15 @@ public sealed class TaskExecutorTests
         /// <summary>The prompt content passed to the most recent <see cref="SendPromptAsync"/> call.</summary>
         public string? LastPrompt { get; private set; }
 
+        /// <summary>Every prompt and working directory delivered to this runner, in order.</summary>
+        public List<(string Prompt, string WorkDir)> PromptCalls { get; } = [];
+
+        /// <summary>
+        /// Optional response hook used by tests that need the fake agent to perform a prompted
+        /// file repair before <see cref="TaskExecutor"/> re-checks the agents.md size.
+        /// </summary>
+        public Func<string, string, CancellationToken, Task<string>>? PromptResponder { get; set; }
+
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) => CapturedSubAgentModels = models;
         public void SetSession(object? session) => _session = session;
         public object? GetSession() => _session;
@@ -162,7 +171,7 @@ public sealed class TaskExecutorTests
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
-        public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+        public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
             // After TaskExecutor clears reports (ClearWorkerReport/ClearTestReport), inject the
             // mock reports here so they are visible to the code that reads LastWorkerReport/LastTestReport.
@@ -170,7 +179,10 @@ public sealed class TaskExecutorTests
             LastTestReport = TestReportToReturn;
             LastWorkDir = workDir;
             LastPrompt = prompt;
-            return Task.FromResult("Mock agent response");
+            PromptCalls.Add((prompt, workDir));
+            return PromptResponder is null
+                ? "Mock agent response"
+                : await PromptResponder(prompt, workDir, ct);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -810,6 +822,175 @@ public sealed class TaskExecutorTests
         Role = WorkerRole.Improver,
         Repositories = [Repo("test-repo")],
     };
+
+    /// <summary>
+    /// The actual overflow retry delivered through <see cref="IAgentRunner"/> must carry the
+    /// append-new/compress-old policy, the concrete violation, and the configured limit. The
+    /// retry must also explicitly forbid meeting the limit by truncating a whole file and must
+    /// require the compressed result to stay readable to a new reader (useful headings, concise
+    /// ordinary-language bullets). The fake repairs the real oversized file on that retry by
+    /// compressing the OLD material from the top while keeping the heading and the newly
+    /// appended lesson intact — the behaviour the prompt asks for — so this exercises successful
+    /// enforcement rather than the exhausted-retry rollback path.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverOverflow_DeliversTopFirstRepairPromptAndAcceptsRepair()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fileName = "capacity-policy.agents.md";
+        var filePath = Path.Combine(configRepoDir, "agents", fileName);
+
+        // A realistically structured file: a heading, a body of older bullets, and a newly
+        // appended lesson at the very end. Repairing it by cutting the file short or replacing
+        // it with a stub is precisely what the delivered retry prompt must forbid.
+        const string heading = "# Older guidance\n";
+        const string appendedSection =
+            "\n## Newly appended lessons\n- Check guidance file sizes before and after editing.\n";
+        const string oldBullet = "- Older rule: release every resource on every code path.\n";
+        var olderBody = string.Concat(Enumerable.Repeat(oldBullet, 100));
+        var oversized = heading + olderBody
+            + new string('x', WorkerConstants.AgentsMdMaxCharacters + 1
+                - heading.Length - olderBody.Length - appendedSection.Length)
+            + appendedSection;
+        await File.WriteAllTextAsync(filePath, oversized, TestContext.Current.CancellationToken);
+
+        var observedLength = File.ReadAllText(filePath).Length;
+        Assert.Equal(8_001, observedLength);
+        Assert.Equal(WorkerConstants.AgentsMdMaxCharacters + 1, observedLength);
+
+        // The compliant repair: older material consolidated from the top, heading kept, and the
+        // appended lesson preserved byte-for-byte. Nothing is truncated away wholesale.
+        var repaired = heading
+            + "- Older rules consolidated: release every resource on every code path.\n"
+            + appendedSection;
+
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = async (prompt, _, ct) =>
+            {
+                if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                    await File.WriteAllTextAsync(filePath, repaired, ct);
+                return "Mock agent response";
+            },
+        };
+        var git = new MockGitOperations();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
+
+        await executor.ExecuteAsync(
+            BuildImproverTask("improver-overflow-policy"), TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, agentRunner.PromptCalls.Count);
+        var retry = agentRunner.PromptCalls[1];
+        var normalizedRetryPrompt = string.Join(' ',
+            retry.Prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        Assert.Equal(Path.Combine(configRepoDir, "agents"), retry.WorkDir);
+        Assert.Contains($"{fileName}: {observedLength} characters", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains($"limit: {WorkerConstants.AgentsMdMaxCharacters}", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains($"within {WorkerConstants.AgentsMdMaxCharacters} characters", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("Work from the TOP of the existing material downward", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("first consolidate and compress", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("remove the oldest material", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("lessons you appended in this session untouched", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("do not edit, reword, reorder or delete them", normalizedRetryPrompt, StringComparison.Ordinal);
+        Assert.Contains("Do NOT add new content or new lessons", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("protected safety constraints", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("readable ordinary-language bullets", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("stop and report", retry.Prompt, StringComparison.Ordinal);
+        Assert.Contains("blocker", retry.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("Prioritize the most impactful rules", retry.Prompt, StringComparison.Ordinal);
+
+        // Defect 1: the retry must explicitly forbid meeting the cap by truncating a whole file.
+        Assert.Contains("Never meet the limit by truncating a whole file", normalizedRetryPrompt, StringComparison.Ordinal);
+        Assert.Contains("do not cut the file short", normalizedRetryPrompt, StringComparison.Ordinal);
+        Assert.Contains("do not replace it with a stub", normalizedRetryPrompt, StringComparison.Ordinal);
+
+        // Defect 2: the retry must require the compressed result to remain readable to a new
+        // reader, with useful headings — not just bullets.
+        Assert.Contains("readable to a new reader", normalizedRetryPrompt, StringComparison.Ordinal);
+        Assert.Contains("keep useful headings and concise ordinary-language bullets", normalizedRetryPrompt, StringComparison.Ordinal);
+        Assert.Contains("opening the file for the first time", normalizedRetryPrompt, StringComparison.Ordinal);
+
+        // The accepted repair compresses from the top instead of truncating: the heading survives,
+        // the appended lesson is byte-for-byte intact, and the file is not a stub.
+        var finalContent = await File.ReadAllTextAsync(filePath, TestContext.Current.CancellationToken);
+        Assert.Equal(repaired, finalContent);
+        Assert.StartsWith(heading, finalContent, StringComparison.Ordinal);
+        Assert.EndsWith(appendedSection, finalContent, StringComparison.Ordinal);
+        Assert.True(finalContent.Length <= WorkerConstants.AgentsMdMaxCharacters);
+        Assert.DoesNotContain("checkout -- agents/", git.GitCommands);
+    }
+
+    /// <summary>
+    /// Enforcement uses the fixed 8,000-character product boundary: 7,999 and 8,000 UTF-16
+    /// code units pass untouched, while 8,001 causes one successful compression prompt. The
+    /// explicit 8,000 vector is removal-proof against restoring the former 4,000-character cap.
+    /// </summary>
+    [Theory]
+    [InlineData(7_999, false)]
+    [InlineData(8_000, false)]
+    [InlineData(8_001, true)]
+    public async Task ExecuteAsync_ImproverAgentsMdBoundary_EnforcesOnlyAboveEightThousand(
+        int characterCount, bool expectsCompression)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "boundary.agents.md");
+        await File.WriteAllTextAsync(
+            filePath, new string('a', characterCount), TestContext.Current.CancellationToken);
+
+        Assert.Equal(characterCount, File.ReadAllText(filePath).Length);
+
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = async (prompt, _, ct) =>
+            {
+                if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                    await File.WriteAllTextAsync(filePath, "repaired", ct);
+                return "Mock agent response";
+            },
+        };
+        var git = new MockGitOperations();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
+
+        await executor.ExecuteAsync(
+            BuildImproverTask($"improver-boundary-{characterCount}"),
+            TestContext.Current.CancellationToken);
+
+        var compressionPrompts = agentRunner.PromptCalls.Count(call =>
+            call.Prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal));
+        Assert.Equal(expectsCompression ? 1 : 0, compressionPrompts);
+        Assert.DoesNotContain("checkout -- agents/", git.GitCommands);
+    }
+
+    /// <summary>
+    /// A file containing surrogate pairs can exceed 8,000 UTF-8 bytes while remaining exactly
+    /// 8,000 UTF-16 code units. It must pass without compression, proving the cap is not byte-based.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverNonAsciiBoundary_CountsUtf16CodeUnitsNotUtf8Bytes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "unicode-boundary.agents.md");
+        var content = string.Concat(Enumerable.Repeat("😀", 4_000));
+        await File.WriteAllTextAsync(filePath, content, TestContext.Current.CancellationToken);
+
+        var readBack = File.ReadAllText(filePath);
+        Assert.Equal(8_000, readBack.Length);
+        Assert.Equal(WorkerConstants.AgentsMdMaxCharacters, readBack.Length);
+        Assert.Equal(16_000, System.Text.Encoding.UTF8.GetByteCount(readBack));
+        Assert.Equal(16_000, new FileInfo(filePath).Length);
+
+        var agentRunner = new MockAgentRunner();
+        var git = new MockGitOperations();
+        var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
+
+        await executor.ExecuteAsync(
+            BuildImproverTask("improver-unicode-boundary"), TestContext.Current.CancellationToken);
+
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.DoesNotContain(agentRunner.PromptCalls, call =>
+            call.Prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal));
+        Assert.DoesNotContain("checkout -- agents/", git.GitCommands);
+    }
 
     /// <summary>
     /// Builds a responder that reports the given staged config-repo paths via the

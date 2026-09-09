@@ -329,7 +329,38 @@ public sealed class SharpCoderRunner : IAgentRunner
                 edits on your behalf — use your own file tools or delegate to a sub-agent with
                 `enable_file_writes=true`.
 
-                The updated agents.md file MUST NOT exceed 4000 characters. Count characters before finalising.
+                ## Guidance update policy: append new, compress old
+
+                Each `*.agents.md` file MUST NOT exceed {WorkerConstants.AgentsMdMaxCharacters} characters.
+                Size is measured in characters (UTF-16 code units) of the file's full text.
+
+                Follow this policy exactly:
+
+                1. **Look before you edit.** Read the existing files and check their current sizes
+                   first — call the `get_file_sizes` tool before making any edit, and call it again
+                   after you re-read a file you changed.
+                2. **Only genuinely new lessons.** Formulate only lessons that are genuinely new,
+                   broadly applicable, and not already covered by an existing rule. Write them in
+                   concise, readable Markdown.
+                3. **Append at the end.** Add new lessons at the END of the file. Never interleave
+                   them among the older rules and never prepend them.
+                4. **New lessons are frozen.** Keep each newly appended lesson unchanged
+                   byte-for-byte for the rest of this task, including during any later attempt to
+                   reduce the file back under the limit.
+                5. **Make room from the top.** When a file is over the limit, work from the TOP of
+                   the existing/older material downward: first consolidate and compress the older
+                   rules, then, only if that is not enough, remove the oldest material that is
+                   redundant or obsolete.
+                6. **Never take these shortcuts.** Do not meet the cap by truncating a whole file,
+                   by modifying, removing or reordering the new lessons, by weakening protected
+                   safety constraints, or by turning guidance into cryptic abbreviations or
+                   symbol-heavy shorthand. Keep concise ordinary-language bullets and useful
+                   headings that a new reader can understand.
+                7. **Touch as little as possible.** Do not rewrite files that your lessons do not
+                   affect, do not pad a file to fill unused capacity, and do not churn old material
+                   when there is no need to.
+                8. **Verify by re-reading.** After editing, re-read each changed file and confirm
+                   that the new lessons are intact and that the older guidance is still readable.
 
                 Do NOT add "Iteration History" or changelog-style entries to agents.md files. agents.md files contain
                 guidance rules and quality standards, not logs of past iterations. Extract actionable lessons from the
@@ -1084,5 +1115,5 @@ public sealed class SharpCoderRunner : IAgentRunner
             }
         },
         "get_file_sizes",
-        "Get character and byte counts for files in the agents directory. Use before editing to check against the 4000-character limit.");
+        $"Get character and byte counts for files in the agents directory. Use before editing to check against the {WorkerConstants.AgentsMdMaxCharacters}-character limit.");
 }

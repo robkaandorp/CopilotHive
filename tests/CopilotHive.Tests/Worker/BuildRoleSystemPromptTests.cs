@@ -1,3 +1,4 @@
+using System.Globalization;
 using CopilotHive.Worker;
 using CopilotHive.Workers;
 
@@ -138,7 +139,7 @@ public sealed class BuildRoleSystemPromptTests
     }
 
     /// <summary>
-    /// The Improver prompt must contain the role identity, the 4000-character limit,
+    /// The Improver prompt must contain the role identity, the character limit,
     /// and the constraint against removing safety rules.
     /// </summary>
     [Fact]
@@ -147,7 +148,7 @@ public sealed class BuildRoleSystemPromptTests
         var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Improver, null);
 
         Assert.Contains("# Improver", prompt);
-        Assert.Contains("4000", prompt);
+        Assert.Contains(WorkerConstants.AgentsMdMaxCharacters.ToString(CultureInfo.InvariantCulture), prompt);
         Assert.Contains("safety constraints", prompt);
         Assert.Contains("test requirements or output format compliance.", prompt);
         Assert.DoesNotContain("tool call contracts", prompt);
@@ -155,6 +156,76 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("sub-agents", prompt);
         Assert.Contains("Do not ask the orchestrator to apply file", prompt);
         Assert.Contains("file reading and editing only", prompt);
+    }
+
+    /// <summary>
+    /// The complete Improver prompt must deliver the append-new/compress-old contract together
+    /// with the existing scope, delegation, anti-duplication, and safety constraints. Supplying
+    /// learned guidance also proves the role policy remains composed before that appendix.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Improver_DeliversAppendNewTopFirstPolicyAndPreservedConstraints()
+    {
+        const string LearnedRule = "Always preserve this learned rule.";
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Improver, LearnedRule);
+        var normalizedPrompt = string.Join(' ',
+            prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        var configuredLimit = WorkerConstants.AgentsMdMaxCharacters.ToString(CultureInfo.InvariantCulture);
+
+        Assert.Contains($"MUST NOT exceed {configuredLimit} characters", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("UTF-16 code units", prompt, StringComparison.Ordinal);
+
+        Assert.Contains("Read the existing files and check their current sizes", prompt, StringComparison.Ordinal);
+        Assert.Contains("call the `get_file_sizes` tool before making any edit", prompt, StringComparison.Ordinal);
+        Assert.Contains("call it again", prompt, StringComparison.Ordinal);
+        Assert.Contains("after you re-read a file you changed", prompt, StringComparison.Ordinal);
+        Assert.Contains("genuinely new", prompt, StringComparison.Ordinal);
+        Assert.Contains("broadly applicable", prompt, StringComparison.Ordinal);
+        Assert.Contains("not already covered by an existing rule", prompt, StringComparison.Ordinal);
+        Assert.Contains("concise, readable Markdown", prompt, StringComparison.Ordinal);
+
+        Assert.Contains("Add new lessons at the END of the file", prompt, StringComparison.Ordinal);
+        Assert.Contains("Never interleave", prompt, StringComparison.Ordinal);
+        Assert.Contains("never prepend them", prompt, StringComparison.Ordinal);
+        Assert.Contains("unchanged", prompt, StringComparison.Ordinal);
+        Assert.Contains("byte-for-byte", prompt, StringComparison.Ordinal);
+        Assert.Contains("including during any later attempt", prompt, StringComparison.Ordinal);
+
+        Assert.Contains("work from the TOP", prompt, StringComparison.Ordinal);
+        Assert.Contains("existing/older material downward", prompt, StringComparison.Ordinal);
+        Assert.Contains("first consolidate and compress the older", prompt, StringComparison.Ordinal);
+        Assert.Contains("remove the oldest material", prompt, StringComparison.Ordinal);
+        Assert.Contains("redundant or obsolete", prompt, StringComparison.Ordinal);
+        Assert.Contains("Do not meet the cap by truncating a whole file", prompt, StringComparison.Ordinal);
+        Assert.Contains("modifying, removing or reordering the new lessons", prompt, StringComparison.Ordinal);
+        Assert.Contains("weakening protected", prompt, StringComparison.Ordinal);
+        Assert.Contains("cryptic abbreviations", prompt, StringComparison.Ordinal);
+        Assert.Contains("symbol-heavy shorthand", prompt, StringComparison.Ordinal);
+        Assert.Contains("ordinary-language bullets", prompt, StringComparison.Ordinal);
+        Assert.Contains("useful headings", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("After editing, re-read each changed file", prompt, StringComparison.Ordinal);
+        Assert.Contains("new lessons are intact", prompt, StringComparison.Ordinal);
+        Assert.Contains("older guidance is still readable", prompt, StringComparison.Ordinal);
+
+        Assert.Contains("cannot run shell commands", prompt.Replace("**", ""), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Only edit `*.agents.md` files", prompt, StringComparison.Ordinal);
+        Assert.Contains("do not create new files, rename files, or touch anything", prompt, StringComparison.Ordinal);
+        Assert.Contains("enable_file_writes=true", prompt, StringComparison.Ordinal);
+        Assert.Contains("do not duplicate it", prompt, StringComparison.Ordinal);
+        Assert.Contains("must NOT be added", prompt, StringComparison.Ordinal);
+        Assert.Contains("specific file, class, method, past", prompt, StringComparison.Ordinal);
+        Assert.Contains("incident advice", prompt, StringComparison.Ordinal);
+        Assert.Contains("Never remove or weaken safety constraints", prompt, StringComparison.Ordinal);
+        Assert.Contains("git workflow", prompt, StringComparison.Ordinal);
+        Assert.Contains("test requirements or output format compliance", prompt, StringComparison.Ordinal);
+
+        var policyIndex = prompt.IndexOf("## Guidance update policy", StringComparison.Ordinal);
+        var heuristicsIndex = prompt.IndexOf("# Learned Heuristics", StringComparison.Ordinal);
+        var learnedRuleIndex = prompt.IndexOf(LearnedRule, StringComparison.Ordinal);
+        Assert.True(policyIndex >= 0, "The Improver policy heading must be present.");
+        Assert.True(heuristicsIndex > policyIndex, "Learned Heuristics must follow the hardcoded Improver policy.");
+        Assert.True(learnedRuleIndex > heuristicsIndex, "Supplied learned guidance must follow its heading.");
+        Assert.EndsWith(LearnedRule, prompt, StringComparison.Ordinal);
     }
 
     /// <summary>

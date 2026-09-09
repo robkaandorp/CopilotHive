@@ -2,6 +2,7 @@ using CopilotHive.Worker;
 using CopilotHive.Workers;
 using Microsoft.Extensions.AI;
 using System.ComponentModel;
+using System.Globalization;
 using System.Reflection;
 
 namespace CopilotHive.Tests.Worker;
@@ -157,6 +158,22 @@ public sealed class SharpCoderRunnerToolsTests
         Assert.Equal("Parser crash", call.Title);
         Assert.Equal("Crashes on empty input", call.Description);
         Assert.Equal("low", call.Severity);
+    }
+
+    /// <summary>
+    /// The file-size tool shown to the Improver must advertise the same centrally configured
+    /// character limit that executor enforcement uses.
+    /// </summary>
+    [Fact]
+    public void GetFileSizesTool_DescriptionAdvertisesConfiguredAgentsMdLimit()
+    {
+        var runner = new SharpCoderRunner();
+        var buildMethod = typeof(SharpCoderRunner).GetMethod(
+            "BuildFileSizesTool", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var tool = Assert.IsAssignableFrom<AIFunction>(buildMethod.Invoke(runner, []));
+        var configuredLimit = WorkerConstants.AgentsMdMaxCharacters.ToString(CultureInfo.InvariantCulture);
+
+        Assert.Contains($"{configuredLimit}-character limit", tool.Description, StringComparison.Ordinal);
     }
 
     /// <summary>
