@@ -444,6 +444,76 @@ public sealed class TaskExecutorSessionTests
     }
 
     /// <summary>
+    /// Regression: an ORDINARY non-cancellation Improver Git failure (a failed publication
+    /// push) still saves the session via the existing best-effort helper — the failure path
+    /// must not bypass <see cref="TaskExecutor"/>'s session epilogue with an early return.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverGitFailure_StillSavesSession()
+    {
+        // Arrange — an improver task whose config-repo push fails (non-zero exit).
+        var configRepo = Path.Combine(Path.GetTempPath(), $"CfgRepoSession_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepo, ".git"));
+        Directory.CreateDirectory(Path.Combine(configRepo, "agents"));
+        try
+        {
+            var git = new FailingPushConfigGit();
+            var sessionClient = new FakeSessionClient();
+            var agentRunner = new SessionTrackingAgentRunner();
+            var executor = new TaskExecutor(
+                agentRunner, gitOperations: git, sessionClient: sessionClient,
+                configRepoDir: configRepo);
+            var task = BuildTask("goal-improver-git-fail") with
+            {
+                Role = WorkerRole.Improver,
+                Repositories = [],
+            };
+
+            // Act
+            var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+            // Assert — truthful failure, and the session WAS saved on that failure path.
+            Assert.Equal(TaskOutcome.Failed, result.Status);
+            Assert.Equal("FAIL", result.Metrics!.Verdict);
+            Assert.Equal(1, sessionClient.SaveCallCount);
+        }
+        finally
+        {
+            // The directory contains a .git folder (locked pack-files on Windows) — use the
+            // project's retrying cleanup helper, not a bare Directory.Delete.
+            if (Directory.Exists(configRepo))
+                TestHelpers.ForceDeleteDirectory(configRepo);
+        }
+    }
+
+    /// <summary>
+    /// A config-repo <see cref="IGitOperations"/> whose publication push fails with a non-zero
+    /// exit code, simulating an ordinary Improver Git failure. Everything else delegates to
+    /// <see cref="NoOpGitOperations"/> behavior.
+    /// </summary>
+    private sealed class FailingPushConfigGit : IGitOperations
+    {
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct) => Task.CompletedTask;
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+            => Task.FromResult(new GitChangeSummary { FilesChanged = 1 });
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => Task.FromResult<string?>(null);
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
+
+        public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+            string workDir, string args, CancellationToken ct) => args switch
+        {
+            "diff --cached --name-only -z" => Task.FromResult((0, "agents/coder.agents.md\0", "")),
+            "push" => Task.FromResult((1, "", "fatal: remote rejected")),
+            _ => Task.FromResult((0, "", "")),
+        };
+    }
+
+    /// <summary>
     /// Regression test: When <see cref="Console.Error"/> is disposed (e.g., by xUnit test framework
     /// redirecting output), <see cref="TaskExecutor.ExecuteAsync"/> must not throw
     /// <see cref="ObjectDisposedException"/> when the catch blocks try to log errors.

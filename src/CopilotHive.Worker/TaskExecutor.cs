@@ -236,7 +236,12 @@ public sealed class TaskExecutor(
             }
             else
             {
-                // Improver: pull latest config repo to get freshest agents.md files
+                // Improver: pull latest config repo to get freshest agents.md files.
+                // A missing repository or a failed pull is a TRUTHFUL failure: the agent is
+                // never prompted to edit a non-repository directory, and an unsuccessful
+                // preparation never masquerades as a normal no-change completion. The thrown
+                // ConfigRepoPreparationException carries the sanitized stage reason and is
+                // mapped by the catch blocks below into TaskOutcome.Failed + FAIL.
                 await PullConfigRepoAsync(ct);
             }
 
@@ -388,8 +393,25 @@ public sealed class TaskExecutor(
                 // Re-prompts Copilot in the same session to condense if over limit.
                 copilotOutput = await EnsureAgentsMdWithinLimitsAsync(copilotOutput, ct);
 
-                // Improver: commit and push changes to the config repo agents folder
-                aggregatedStatus = await CommitAndPushConfigRepoAsync(ct);
+                // Improver: commit and push changes to the config repo agents folder.
+                // The result distinguishes a successful EMPTY staged diff (a genuine no-change
+                // completion) from every FAILED preparation command. A failed add/diff/commit/
+                // pull/push is a publication FAILURE: the accumulated agent/retry output is
+                // preserved verbatim and a sanitized stage-specific reason is appended, and the
+                // throw is mapped to TaskOutcome.Failed + an authoritative FAIL verdict below —
+                // regardless of any test/worker report or the default Improver PASS.
+                var publication = await CommitAndPushConfigRepoAsync(ct);
+                if (publication.FailureReason is { } failureReason)
+                {
+                    // A failed add/diff/commit/pull/push is a PUBLICATION FAILURE, never a
+                    // successful no-change completion. The accumulated agent/retry output is
+                    // carried on the exception so the catch below can preserve it VERBATIM and
+                    // append only the sanitized stage reason — never replace the evidence.
+                    throw new ConfigRepoPublicationException(
+                        copilotOutput, failureReason, publication.Summary);
+                }
+
+                aggregatedStatus = publication.Summary;
             }
             else
             {
@@ -626,8 +648,12 @@ public sealed class TaskExecutor(
         }
         catch (OperationCanceledException ex)
         {
-            // Not a real cancellation — likely an API timeout or HTTP failure.
-            // Treat as a failure so the orchestrator can retry or fail the phase.
+            // Not a real cancellation — likely an API timeout or HTTP failure, or an
+            // OperationCanceledException surfaced by a config-repo Git command WITHOUT the
+            // execution token being cancelled. Treat as a failure so the orchestrator can retry
+            // or fail the phase — a config Git cancellation must never masquerade as a normal
+            // no-change completion. Requested cancellations keep flowing through the
+            // ct.IsCancellationRequested guard above into Cancelled/CANCELLED.
             //
             // SANITIZED: this is the FIRST consuming boundary for a provisioning/client/LLM
             // exception thrown out of IAgentRunner.SendPromptAsync. The raw message can echo a
@@ -645,6 +671,38 @@ public sealed class TaskExecutor(
                 {
                     Verdict = "FAIL",
                     Issues = [$"API timeout/error [{safe}]"],
+                },
+            };
+        }
+        catch (ConfigRepoPublicationException ex)
+        {
+            // ORDINARY Improver Git failure (failed preparation/pull/add/diff/commit/pull/push
+            // or a push that threw). Authoritative semantics: TaskOutcome.Failed with a FAIL
+            // verdict regardless of any test/worker report or the default Improver PASS, and
+            // NEVER a SKIP — a genuine Git/infrastructure failure is not guidance exhaustion.
+            //
+            // SANITIZED: the reason was built from RenderForLog/SafeExceptionLog.Describe at the
+            // stage boundary, so no raw exception text, credential, or control character reaches
+            // the log or the persisted result.
+            TryWriteError($"[Task] Failed (config repo Git) [{ex.Reason}]");
+
+            // Best-effort session save for the accumulated context after the agent has run.
+            if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
+                await SaveSessionAsync(task.SessionId, ct);
+
+            return new TaskResult
+            {
+                TaskId = task.TaskId,
+                Status = TaskOutcome.Failed,
+                // The accumulated agent/retry output is preserved VERBATIM (Git-log sanitization
+                // is never applied to the agent's own output) with the sanitized stage-specific
+                // reason appended — the evidence is never replaced by the error alone.
+                Output = $"{ex.PreservedOutput}\n\n[Config Repo Git Failure]\n{ex.Reason}",
+                GitStatus = ex.Summary ?? new GitChangeSummary(),
+                Metrics = new TaskMetrics
+                {
+                    Verdict = "FAIL",
+                    Issues = [ex.Reason],
                 },
             };
         }
@@ -921,56 +979,182 @@ public sealed class TaskExecutor(
         LogSanitizer.SanitizeText(GitUrlRedactor.Redact(value.Trim()));
 
     /// <summary>
+    /// The outcome of the Improver's config-repo publication attempt. A non-null
+    /// <see cref="FailureReason"/> is a FAILURE; <c>null</c> means the attempt concluded
+    /// truthfully — either a confirmed push (<see cref="GitChangeSummary.Pushed"/>) or a
+    /// successful empty staged diff (a genuine no-change completion).
+    /// </summary>
+    private sealed record ConfigRepoPublication(GitChangeSummary Summary, string? FailureReason);
+
+    /// <summary>
+    /// An ordinary Improver config-repo Git failure. Carries the accumulated agent/retry output
+    /// VERBATIM (Git-log sanitization is never applied to it), the sanitized stage-specific
+    /// failure reason, and the diagnostic <see cref="GitChangeSummary"/> (when the staged-file
+    /// list was already computed) so the catch boundary can preserve the evidence instead of
+    /// replacing it.
+    /// </summary>
+    private sealed class ConfigRepoPublicationException(
+        string preservedOutput, string reason, GitChangeSummary? summary = null)
+        : InvalidOperationException(reason)
+    {
+        public string PreservedOutput { get; } = preservedOutput;
+        public string Reason { get; } = reason;
+        public GitChangeSummary? Summary { get; } = summary;
+    }
+
+    /// <summary>
     /// Pulls the latest changes from the config repo so the improver works on fresh agents.md files.
     /// The config repository is prepared per task assignment — WorkerService performs the
     /// per-assignment preparation (the probe plus the clone-if-absent) BEFORE this assignment's
     /// TaskExecutor runs, and <see cref="PullConfigRepoAsync"/> operates on that prepared repository.
+    /// <para>
+    /// TRUTHFUL PREPARATION: three outcomes are distinguished. An ABSENT repository throws a
+    /// <see cref="ConfigRepoPublicationException"/> BEFORE the agent is prompted — a worker must
+    /// never be given permission to edit a non-repository directory. A FAILED pull (non-zero
+    /// exit, seam rejection, or thrown error) also throws — the Improver path stops with a
+    /// truthful failure instead of logging and continuing. Only a SUCCESSFUL pull proceeds.
+    /// </para>
     /// </summary>
     private async Task PullConfigRepoAsync(CancellationToken ct)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
         {
-            _log.Info("Config repo not found — improver will work without it");
-            return;
+            _log.Error("Config repo not found — refusing to prompt the improver to edit a non-repository directory");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo not found — the improver cannot prepare its workspace without the config repository.");
         }
 
         _log.Info("Pulling latest config repo for improver...");
-        var result = await RunConfigRepoCommandAsync(["pull", "--ff-only"], "pull --ff-only", ct);
+        ConfigRepoOpResult result;
+        try
+        {
+            result = await RunConfigRepoCommandAsync(["pull", "--ff-only"], "pull --ff-only", ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            // An OCE that is NOT a requested execution cancellation is an ordinary preparation
+            // failure (a transport timeout, for example) — never a normal completion. Rendered
+            // through SafeExceptionLog.Describe so no raw exception text escapes. A REQUESTED
+            // cancellation does not enter this filter and propagates to the outer
+            // ct.IsCancellationRequested guard unchanged.
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo pull failed (cancelled) [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation pull was interrupted without a requested cancellation [{safe}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo pull failed (error) [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation pull failed with an error [{safe}].");
+        }
 
         // git echoes the credential-bearing config-repo remote in both streams, so the LOG
         // rendering is redacted AND control-character sanitized. The raw values are untouched.
         if (result.Success)
+        {
             _log.Info($"Config repo up to date: {RenderForLog(result.Stdout)}");
-        else
-            _log.Error($"Config repo pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+            return;
+        }
+
+        _log.Error($"Config repo pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+        throw new ConfigRepoPublicationException(
+            preservedOutput: "",
+            reason: $"Config repo preparation pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
     }
 
     /// <summary>
     /// Commits and pushes any changes the improver made to *.agents.md files in the config repo.
     /// Only stages files in the agents/ subfolder to prevent accidental changes elsewhere.
+    /// <para>
+    /// TRUTHFUL PUBLICATION: every stage distinguishes SUCCESS from FAILURE. A failed add, diff,
+    /// or commit stops all subsequent publication commands and is reported as a FAILURE with a
+    /// sanitized stage-specific reason — never as a no-change completion. After a failed
+    /// post-commit pull the existing merge-abort attempt still runs (best effort), but push NEVER
+    /// proceeds — whether the abort succeeds, fails, or throws; there is no force push, retry,
+    /// or remote rollback. A failed or throwing push is a publication FAILURE, never a no-change
+    /// result, and push acceptance is never inferred from a transport error — a non-null failure
+    /// reason is returned in every such case, and Pushed is set only after a confirmed
+    /// successful push. The summary preserves the diagnostic
+    /// changed-file paths on failure so the orchestrator can log a useful warning.
+    /// </para>
     /// </summary>
-    private async Task<GitChangeSummary> CommitAndPushConfigRepoAsync(CancellationToken ct)
+    private async Task<ConfigRepoPublication> CommitAndPushConfigRepoAsync(CancellationToken ct)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
-            return new GitChangeSummary();
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                "Config repo not found — the improver cannot publish without the config repository.");
 
         // Only stage agents/*.agents.md — defense-in-depth to prevent touching other files
-        var addResult = await RunConfigRepoCommandAsync(
-            ["add", "agents/*.agents.md"], "add agents/*.agents.md", ct);
+        ConfigRepoOpResult addResult;
+        try
+        {
+            addResult = await RunConfigRepoCommandAsync(
+                ["add", "agents/*.agents.md"], "add agents/*.agents.md", ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _log.Error($"git add threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git add failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"git add threw [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git add failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
         if (!addResult.Success)
         {
             _log.Error($"git add failed: {RenderForLog(addResult.SanitizedError)}");
-            return new GitChangeSummary();
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git add failed (exit {addResult.ExitCode}): {RenderForLog(addResult.SanitizedError)}");
         }
 
         // Check if there are staged changes.
         // `-z` gives NUL-delimited, UNQUOTED paths so filenames with unusual characters survive.
-        var diffResult = await RunConfigRepoCommandAsync(
-            ["diff", "--cached", "--name-only", "-z"], "diff --cached --name-only -z", ct);
-        if (!diffResult.Success || string.IsNullOrWhiteSpace(diffResult.Stdout))
+        ConfigRepoOpResult diffResult;
+        try
         {
+            diffResult = await RunConfigRepoCommandAsync(
+                ["diff", "--cached", "--name-only", "-z"], "diff --cached --name-only -z", ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _log.Error($"git diff threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git diff failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"git diff threw [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git diff failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+        if (!diffResult.Success)
+        {
+            _log.Error($"git diff failed: {RenderForLog(diffResult.SanitizedError)}");
+            return new ConfigRepoPublication(
+                new GitChangeSummary(),
+                $"git diff failed (exit {diffResult.ExitCode}): {RenderForLog(diffResult.SanitizedError)}");
+        }
+
+        if (string.IsNullOrWhiteSpace(diffResult.Stdout))
+        {
+            // A SUCCESSFUL empty staged diff is a genuine no-change completion — kept strictly
+            // separate from every failure above.
             _log.Info("No agents.md changes to commit");
-            return new GitChangeSummary();
+            return new ConfigRepoPublication(new GitChangeSummary(), null);
         }
 
         var changedFiles = diffResult.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries);
@@ -993,53 +1177,128 @@ public sealed class TaskExecutor(
         _log.Info($"Improver changed {filesChanged} file(s): " +
                   $"{LogSanitizer.FormatPathList(displayPaths, filesChanged)}");
 
+        var stagedSummary = new GitChangeSummary
+        {
+            FilesChanged = filesChanged,
+            ChangedFiles = cappedPaths,
+        };
+
         // Commit
-        var commitResult = await RunConfigRepoCommandAsync(
-            ["commit", "-m", ImproverCommitMessage],
-            $"commit -m \"{ImproverCommitMessage}\"",
-            ct);
+        ConfigRepoOpResult commitResult;
+        try
+        {
+            commitResult = await RunConfigRepoCommandAsync(
+                ["commit", "-m", ImproverCommitMessage],
+                $"commit -m \"{ImproverCommitMessage}\"",
+                ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _log.Error($"git commit threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git commit failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"git commit threw [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git commit failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
         if (!commitResult.Success)
         {
             _log.Error($"git commit failed: {RenderForLog(commitResult.SanitizedError)}");
-            return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git commit failed (exit {commitResult.ExitCode}): {RenderForLog(commitResult.SanitizedError)}");
         }
 
         _log.Info($"Committed: {RenderForLog(commitResult.Stdout)}");
 
-        // Pull (merge orchestrator's goals/metrics commits) then push
-        var pushed = false;
+        // Pull (merge orchestrator's goals/metrics commits) then push.
+        // After a FAILED post-commit pull, the merge-abort attempt below still runs (best
+        // effort), but push NEVER proceeds — there is no force push, retry, or remote rollback.
+        ConfigRepoOpResult pullResult;
         try
         {
-            var pullResult = await RunConfigRepoCommandAsync(
+            pullResult = await RunConfigRepoCommandAsync(
                 ["pull", "--no-rebase"], "pull --no-rebase", ct);
-            if (!pullResult.Success)
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _log.Error($"git pull threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"git pull threw [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git pull failed with an error [{SafeExceptionLog.Describe(ex)}].");
+        }
+
+        if (!pullResult.Success)
+        {
+            _log.Error($"git pull failed: {RenderForLog(pullResult.SanitizedError)}");
+            // Abort any in-progress merge (best effort). Whatever happens to the abort —
+            // success, failure, or a thrown error — push is NEVER attempted afterwards.
+            try
             {
-                _log.Error($"git pull failed: {RenderForLog(pullResult.SanitizedError)}");
-                // Abort any in-progress merge and try force-pushing our commit
-                await RunConfigRepoCommandAsync(["merge", "--abort"], "merge --abort", ct);
+                var abortResult = await RunConfigRepoCommandAsync(
+                    ["merge", "--abort"], "merge --abort", ct);
+                if (!abortResult.Success)
+                    _log.Error($"git merge --abort failed (exit {abortResult.ExitCode}): {RenderForLog(abortResult.SanitizedError)}");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // requested execution cancellation keeps its established semantics
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"git merge --abort threw [{SafeExceptionLog.Describe(ex)}]");
             }
 
-            var pushResult = await RunConfigRepoCommandAsync(
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git pull failed (exit {pullResult.ExitCode}): {RenderForLog(pullResult.SanitizedError)} — push not attempted after the failed pull");
+        }
+
+        // Push — the FINAL confirmation of publication. A failed or throwing push is a
+        // publication FAILURE, never a no-change result, and push acceptance is never inferred
+        // from a transport error: Published requires a confirmed exit-0 push.
+        ConfigRepoOpResult pushResult;
+        try
+        {
+            pushResult = await RunConfigRepoCommandAsync(
                 ["push", "origin", "HEAD"], "push", ct);
-            if (!pushResult.Success)
-            {
-                _log.Error($"git push failed: {RenderForLog(pushResult.SanitizedError)}");
-                return new GitChangeSummary { FilesChanged = filesChanged, ChangedFiles = cappedPaths };
-            }
-
-            pushed = true;
-            _log.Info("Pushed config repo changes");
         }
-        catch (Exception ex)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
-            _log.Error($"Push failed: {GitUrlRedactor.Redact(ex.Message)}");
+            _log.Error($"git push threw (no requested cancellation) [{SafeExceptionLog.Describe(ex)}]");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.Error($"Push failed: {SafeExceptionLog.Describe(ex)}");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git push failed with an error [{SafeExceptionLog.Describe(ex)}] — the remote state is unknown");
         }
 
-        return new GitChangeSummary
+        if (!pushResult.Success)
         {
-            FilesChanged = filesChanged,
-            Pushed = pushed,
-            ChangedFiles = cappedPaths,
-        };
+            _log.Error($"git push failed: {RenderForLog(pushResult.SanitizedError)}");
+            return new ConfigRepoPublication(
+                stagedSummary,
+                $"git push failed (exit {pushResult.ExitCode}): {RenderForLog(pushResult.SanitizedError)}");
+        }
+
+        _log.Info("Pushed config repo changes");
+        return new ConfigRepoPublication(stagedSummary with { Pushed = true }, null);
     }
 }

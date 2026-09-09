@@ -462,8 +462,10 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     }
 
     /// <summary>
-    /// A push that throws (rather than returning a non-zero exit code) hits the catch-all
-    /// config-repo push log, which is redacted too.
+    /// A push that throws (rather than returning a non-zero exit code) is a publication FAILURE.
+    /// Its diagnostics are rendered through <see cref="SafeExceptionLog.Describe"/> — type names
+    /// only, never the message — so no credential even reaches the log, and the task result
+    /// carries a truthful Failed/FAIL outcome.
     /// </summary>
     [Fact]
     public async Task ExecuteAsync_Improver_ConfigRepoPushThrowLog_IsCredentialFree()
@@ -484,12 +486,22 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         var executor = new TaskExecutor(
             new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
 
-        await executor.ExecuteAsync(
+        var result = await executor.ExecuteAsync(
             BuildImproverTask(), TestContext.Current.CancellationToken);
 
+        // TRUTHFUL PUBLICATION: a throwing push is a publication failure.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git push failed"));
+
+        // SANITIZED: the exception diagnostics are classified (type names only) — the raw
+        // message text (which embeds the credential URL) never reaches log or result.
         Assert.Contains("Push failed:", AllOutput);
         Assert.DoesNotContain(Token, AllOutput);
-        Assert.Contains($"push to {RedactedUrl} exploded", AllOutput);
+        Assert.DoesNotContain("push to", AllOutput);
+        Assert.DoesNotContain("exploded", AllOutput);
+        Assert.DoesNotContain(Token, result.Output);
+        Assert.Contains("InvalidOperationException", result.Output);
     }
 
     /// <summary>

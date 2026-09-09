@@ -1046,6 +1046,8 @@ public sealed class TaskExecutorTests
     /// END-TO-END regression for the reviewer's CRITICAL finding: when the improver's config-repo
     /// push FAILS, the result must reach the orchestrator with a positive count AND the real
     /// changed-file paths — previously the filenames were discarded, leaving an empty list.
+    /// TRUTHFUL PUBLICATION: the failed push is additionally a truthful Failed/FAIL outcome, with
+    /// the accumulated agent output preserved verbatim and the sanitized reason appended.
     /// </summary>
     [Fact]
     public async Task ExecuteAsync_ImproverPushFails_StillReportsConfigRepoChangedPaths()
@@ -1071,6 +1073,16 @@ public sealed class TaskExecutorTests
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
         Assert.NotEmpty(result.GitStatus.ChangedFiles);
 
+        // TRUTHFUL PUBLICATION: a failed push is a publication failure, not a no-change pass.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git push failed"));
+
+        // The accumulated agent output is preserved VERBATIM with the sanitized reason appended.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+        Assert.Contains("git push failed (exit 1): remote rejected: permission denied", result.Output);
+
         // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
         var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
         Assert.Contains(configRepoDir, git.WorkDirs);
@@ -1079,7 +1091,8 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// When the improver's COMMIT fails, the paths must still be reported.
+    /// When the improver's COMMIT fails, the paths must still be reported, and the commit
+    /// failure is a truthful Failed/FAIL publication outcome — never a silent pass.
     /// </summary>
     [Fact]
     public async Task ExecuteAsync_ImproverCommitFails_StillReportsConfigRepoChangedPaths()
@@ -1109,6 +1122,24 @@ public sealed class TaskExecutorTests
         Assert.False(result.GitStatus!.Pushed);
         Assert.Equal(1, result.GitStatus.FilesChanged);
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // TRUTHFUL PUBLICATION: failed commit stops ALL subsequent publication commands —
+        // no post-commit pull, no merge --abort, and no push (full subsequence absence via
+        // the shared helper, so a stray merge-abort would fail this test).
+        AssertLegacyStoppedAfterCommit(git.GitCommands);
+        // And the exact captured sequence proves nothing beyond the failed commit launched.
+        Assert.Equal(
+            [
+                "pull --ff-only",
+                "add agents/*.agents.md",
+                "diff --cached --name-only -z",
+                $"commit -m \"{ImproverCommitMessage}\"",
+            ],
+            git.GitCommands);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git commit failed (exit 1)") && i.Contains("hook rejected"));
 
         // Path-resolution assertions: git work dir, agent work dir, and prompt context all resolve to the injected agents path.
         var expectedAgentsDir = Path.Combine(configRepoDir, "agents");
@@ -1446,8 +1477,14 @@ public sealed class TaskExecutorTests
         var git = new MockGitOperations { FilesChanged = 0 };
         var agentRunner = new MockAgentRunner();
         // Use a non-existent config repo dir so EnsureAgentsMdWithinLimitsAsync returns
-        // early (Directory.Exists check) — no real agents.md files are read.
+        // early (Directory.Exists check) — no real agents.md files are read. A .git MARKER
+        // is still created so preparation succeeds and the prompt is delivered: with the
+        // truthful-preparation change a non-repository directory FAILS the task before
+        // the agent is ever prompted.
         var tempConfigRepo = Path.Combine(Path.GetTempPath(), $"test-config-repo-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(tempConfigRepo, ".git"));
+        Directory.CreateDirectory(Path.Combine(tempConfigRepo, "agents"));
+        using var remover = new DirectoryRemover(tempConfigRepo);
         var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: tempConfigRepo);
 
         var task = new WorkTask
@@ -1462,6 +1499,7 @@ public sealed class TaskExecutorTests
 
         var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
 
+        // The .git marker exists, so preparation succeeds and the (PASS) default verdict holds.
         Assert.Equal("PASS", result.Metrics!.Verdict);
         var expectedAgentsDir = Path.Combine(tempConfigRepo, "agents");
         Assert.Equal(expectedAgentsDir, agentRunner.LastWorkDir);
@@ -2359,7 +2397,8 @@ public sealed class TaskExecutorTests
         ConfigRepoGitOperations seam,
         SeamProcessRunnerFake fake,
         MockGitOperations git,
-        CancellationToken? ct = null)
+        CancellationToken? ct = null,
+        MockAgentRunner? agentRunner = null)
     {
         var originalRunner = GitOperations.ProcessRunner;
         var originalOut = Console.Out;
@@ -2373,7 +2412,7 @@ public sealed class TaskExecutorTests
             Console.SetError(errWriter);
 
             var executor = new TaskExecutor(
-                new MockAgentRunner(), null, git, null, configRepoDir, seam);
+                agentRunner ?? new MockAgentRunner(), null, git, null, configRepoDir, seam);
             var result = await executor.ExecuteAsync(
                 BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
 
@@ -2393,7 +2432,8 @@ public sealed class TaskExecutorTests
     /// the mock intercepts at <see cref="IGitOperations.RunGitCommandAsync"/>.
     /// </summary>
     private static async Task<(TaskResult Result, string Stdout, string Stderr)> RunImproverLegacyAsync(
-        string taskId, string configRepoDir, MockGitOperations git, CancellationToken? ct = null)
+        string taskId, string configRepoDir, MockGitOperations git, CancellationToken? ct = null,
+        MockAgentRunner? agentRunner = null)
     {
         var originalOut = Console.Out;
         var originalErr = Console.Error;
@@ -2405,7 +2445,7 @@ public sealed class TaskExecutorTests
             Console.SetError(errWriter);
 
             var executor = new TaskExecutor(
-                new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
+                agentRunner ?? new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
             var result = await executor.ExecuteAsync(
                 BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
 
@@ -2435,6 +2475,57 @@ public sealed class TaskExecutorTests
         Assert.Equal(expected.Length, fake.Requests.Count);
         for (var i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], fake.Launched[i]);
+    }
+
+    // ── Stage-stop coverage helpers ───────────────────────────────────────────
+    //
+    // A stage failure must stop EVERY subsequent publication command, not merely the
+    // immediately following one. Each helper asserts the full forbidden subsequence is
+    // absent on its command-routing path, so removing the protection named by a test
+    // makes the test fail.
+
+    /// <summary>After a failed ADD: no diff, no commit, no post-commit pull, no merge --abort, no push.</summary>
+    private static void AssertLegacyStoppedAfterAdd(List<string> commands)
+    {
+        Assert.DoesNotContain(commands, c => c.StartsWith("diff --cached", StringComparison.Ordinal));
+        AssertLegacyStoppedAfterDiff(commands);
+    }
+
+    /// <summary>After a failed DIFF: no commit, no post-commit pull, no merge --abort, no push.</summary>
+    private static void AssertLegacyStoppedAfterDiff(List<string> commands)
+    {
+        Assert.DoesNotContain(commands, c => c.StartsWith("commit -m", StringComparison.Ordinal));
+        AssertLegacyStoppedAfterCommit(commands);
+    }
+
+    /// <summary>After a failed COMMIT: no post-commit pull, no merge --abort, no push.</summary>
+    private static void AssertLegacyStoppedAfterCommit(List<string> commands)
+    {
+        Assert.DoesNotContain(commands, c => c == "pull --no-rebase");
+        Assert.DoesNotContain(commands, c => c == "merge --abort");
+        Assert.DoesNotContain(commands, c => c == "push");
+    }
+
+    /// <summary>SEAM form of <see cref="AssertLegacyStoppedAfterAdd"/>: additionally no second add.</summary>
+    private static void AssertSeamStoppedAfterAdd(List<string[]> launched)
+    {
+        Assert.DoesNotContain(launched, t => t is ["diff", ..]);
+        AssertSeamStoppedAfterDiff(launched);
+    }
+
+    /// <summary>SEAM form of <see cref="AssertLegacyStoppedAfterDiff"/>.</summary>
+    private static void AssertSeamStoppedAfterDiff(List<string[]> launched)
+    {
+        Assert.DoesNotContain(launched, t => t is ["commit", ..]);
+        AssertSeamStoppedAfterCommit(launched);
+    }
+
+    /// <summary>SEAM form of <see cref="AssertLegacyStoppedAfterCommit"/>.</summary>
+    private static void AssertSeamStoppedAfterCommit(List<string[]> launched)
+    {
+        Assert.DoesNotContain(launched, t => t is ["pull", "--no-rebase", ..]);
+        Assert.DoesNotContain(launched, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(launched, t => t is ["push", ..]);
     }
 
     /// <summary>
@@ -2632,11 +2723,12 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// A FAILING <c>pull --no-rebase</c> still aborts the merge and force-pushes — through the
-    /// seam, with the tokenized <c>merge --abort</c> between them.
+    /// A FAILING <c>pull --no-rebase</c> aborts the merge — through the seam, with the tokenized
+    /// <c>merge --abort</c> between them — and push is NEVER attempted, whether the abort
+    /// succeeds, fails, or throws. The task ends in a truthful Failed/FAIL outcome.
     /// </summary>
     [Fact]
-    public async Task Improver_SeamPath_FailedPull_AbortsMergeAndStillPushes()
+    public async Task Improver_SeamPath_FailedPull_AbortsMergeAndNeverPushes()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
@@ -2646,7 +2738,7 @@ public sealed class TaskExecutorTests
             {
                 ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
                 ["pull", "--no-rebase", ..] => new GitProcessResult(1, "", "merge conflict"),
-                _ => null,
+                _ => null, // merge --abort succeeds (exit 0)
             },
         };
         using var seam = CreateConfigRepoSeam(configRepoDir);
@@ -2655,6 +2747,7 @@ public sealed class TaskExecutorTests
         var (result, _, stderr) = await RunImproverWithSeamAsync(
             "improver-seam-merge-abort", configRepoDir, seam, fake, git);
 
+        // The push (and its check-ref-format / origin inspection preamble) is ABSENT.
         AssertLaunchedSequence(fake,
             ["remote", "get-url", "origin"],
             ["pull", "--ff-only", "origin"],
@@ -2663,13 +2756,80 @@ public sealed class TaskExecutorTests
             ["commit", "-m", ImproverCommitMessage],
             ["remote", "get-url", "origin"],
             ["pull", "--no-rebase", "origin"],
-            ["merge", "--abort"],
-            ["check-ref-format", "--allow-onelevel", "HEAD"],
-            ["remote", "get-url", "origin"],
-            ["push", "origin", "HEAD"]);
+            ["merge", "--abort"]);
 
         Assert.Contains("git pull failed: merge conflict", FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
-        Assert.True(result.GitStatus!.Pushed);
+
+        // TRUTHFUL PUBLICATION: failed pull → Failed outcome, FAIL verdict, no Pushed claim.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git pull failed (exit 1)") && i.Contains("push not attempted"));
+    }
+
+    /// <summary>
+    /// A FAILING <c>pull --no-rebase</c> followed by a THROWING <c>merge --abort</c>: the abort's
+    /// exception must not lose the pull failure, and push is still NEVER attempted.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_ThrowingMergeAbort_StillNeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(1, "", "merge conflict"),
+                ["merge", "--abort"] => throw new InvalidOperationException("abort exploded"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-abort-throw", configRepoDir, seam, fake, git);
+
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git pull failed (exit 1)"));
+    }
+
+    /// <summary>
+    /// A FAILING <c>pull --no-rebase</c> followed by a FAILING <c>merge --abort</c>: push is
+    /// still NEVER attempted and the outcome is a truthful failure.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_FailingMergeAbort_StillNeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(1, "", "merge conflict"),
+                ["merge", "--abort"] => new GitProcessResult(3, "", "abort refused"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-abort-fail", configRepoDir, seam, fake, git);
+
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
     }
 
     // ── (b) The LEGACY path (public constructor) ─────────────────────────────
@@ -2706,7 +2866,8 @@ public sealed class TaskExecutorTests
 
     /// <summary>
     /// The legacy DISCARD and <c>merge --abort</c> opaque strings, which the happy path never
-    /// reaches.
+    /// reaches. After the failed pull and its abort, push is NEVER attempted — the bare
+    /// <c>push</c> string is deliberately absent from the recorded commands.
     /// </summary>
     [Fact]
     public async Task Improver_LegacyPath_DiscardAndMergeAbort_UseTheExactOpaqueStrings()
@@ -2727,7 +2888,7 @@ public sealed class TaskExecutorTests
             },
         };
 
-        await RunImproverLegacyAsync("improver-legacy-abort", configRepoDir, git);
+        var (result, _, _) = await RunImproverLegacyAsync("improver-legacy-abort", configRepoDir, git);
 
         Assert.Equal(
             [
@@ -2738,9 +2899,13 @@ public sealed class TaskExecutorTests
                 $"commit -m \"{ImproverCommitMessage}\"",
                 "pull --no-rebase",
                 "merge --abort",
-                "push",
             ],
             git.GitCommands);
+
+        // TRUTHFUL PUBLICATION: the failed pull fails the task; no push ever ran.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
     }
 
     /// <summary>
@@ -2869,8 +3034,11 @@ public sealed class TaskExecutorTests
     // ── (d) Preserved behaviors on the SEAM path ─────────────────────────────
 
     /// <summary>
-    /// The <c>Directory.Exists(.git)</c> early-outs are preserved: with no <c>.git</c> marker
-    /// NEITHER the pull NOR the commit/push sequence launches anything.
+    /// TRUTHFUL PREPARATION: the <c>Directory.Exists(.git)</c> absence check FAILS the task
+    /// BEFORE the agent is prompted — a worker must never be given permission to edit a
+    /// non-repository directory. NEITHER the pull NOR the commit/push sequence launches
+    /// anything, and the result is a truthful Failed outcome with a FAIL verdict (never a
+    /// normal no-change completion).
     /// </summary>
     [Fact]
     public async Task Improver_SeamPath_MissingGitMarker_LaunchesNothing()
@@ -2883,14 +3051,18 @@ public sealed class TaskExecutorTests
         var fake = new SeamProcessRunnerFake();
         using var seam = CreateConfigRepoSeam(configRepoDir);
         var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
 
-        var (result, stdout, _) = await RunImproverWithSeamAsync(
-            "improver-seam-nogit", configRepoDir, seam, fake, git);
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-nogit", configRepoDir, seam, fake, git, agentRunner: agentRunner);
 
         Assert.Empty(fake.Requests);
         Assert.Empty(git.GitCommands);
-        Assert.Contains("Config repo not found", stdout, StringComparison.Ordinal);
-        Assert.Equal(0, result.GitStatus!.FilesChanged);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("Config repo not found"));
+        // The agent was never prompted — no permission to edit a non-repository directory.
+        Assert.Empty(agentRunner.PromptCalls);
     }
 
     /// <summary>
@@ -2924,9 +3096,10 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// A seam REJECTION (Stage 6a: the resolved URL is absent) never launches a process and
-    /// flows into the SAME error log lines as a legacy non-zero exit, carrying the seam's
-    /// fixed <c>SanitizedError</c> and its <c>-1</c> exit code.
+    /// A seam REJECTION (Stage 6a: the resolved URL is absent) during PREPARATION stops the
+    /// Improver path truthfully: the rejection flows into the SAME error log lines as a legacy
+    /// non-zero exit, carrying the seam's fixed <c>SanitizedError</c> and its <c>-1</c> exit
+    /// code — and the task FAILS before the agent is ever prompted.
     /// </summary>
     [Fact]
     public async Task Improver_SeamPath_Rejection_FlowsIntoTheSameErrorLogLines()
@@ -2939,37 +3112,29 @@ public sealed class TaskExecutorTests
                 ? new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), "")
                 : null,
         };
-        // No resolved URL: every TRANSPORT command is rejected at Stage 6a; the local
-        // commands are unaffected and still launch.
+        // No resolved URL: every TRANSPORT command is rejected at Stage 6a — including the
+        // PREPARATION pull, which now truthfully fails the task.
         using var seam = CreateConfigRepoSeam(configRepoDir, resolvedUrlResolver: static () => null);
         var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
 
         var (result, _, stderr) = await RunImproverWithSeamAsync(
-            "improver-seam-reject", configRepoDir, seam, fake, git);
+            "improver-seam-reject", configRepoDir, seam, fake, git, agentRunner: agentRunner);
 
         Assert.Contains(
             "Config repo pull failed (exit -1): Config repo URL is not available.",
             FindLine(stderr, "Config repo pull failed"),
             StringComparison.Ordinal);
-        Assert.Contains(
-            "git pull failed: Config repo URL is not available.",
-            FindLine(stderr, "git pull failed"),
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "git push failed: Config repo URL is not available.",
-            FindLine(stderr, "git push failed"),
-            StringComparison.Ordinal);
 
-        // Only the LOCAL commands reached a launch — no transport, no origin inspection.
-        AssertLaunchedSequence(fake,
-            ["add", "agents/*.agents.md"],
-            ["diff", "--cached", "--name-only", "-z"],
-            ["commit", "-m", ImproverCommitMessage],
-            ["merge", "--abort"]);
+        // The preparation pull was the ONLY transport attempt — nothing after it launched.
+        Assert.Empty(fake.Launched);
 
-        // The push-failure path preserves the diagnostic paths and reports Pushed = false.
-        Assert.False(result.GitStatus!.Pushed);
-        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        // TRUTHFUL PREPARATION: the task fails BEFORE the agent is prompted.
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("Config repo preparation pull failed (exit -1)"));
     }
 
     // ── (e) The reachable control-character boundary vector ──────────────────
@@ -3036,5 +3201,761 @@ public sealed class TaskExecutorTests
             StringComparison.Ordinal);
         Assert.DoesNotContain(
             SplitLines(stderr), l => l.Trim() == "[Task] ERROR: forged line");
+    }
+
+    // ── (f) Truthful preparation/publication failure semantics ───────────────
+
+    /// <summary>
+    /// TRUTHFUL PREPARATION (legacy path): a non-zero preparation pull FAILS the task BEFORE
+    /// the agent is prompted — never a normal no-change completion.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_FailedPreparationPull_FailsBeforePrompting()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "pull --ff-only"
+                ? (128, "", "fatal: authentication failed")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-prep-fail", configRepoDir, git, agentRunner: agentRunner);
+
+        // The pull was the ONLY command — the publication flow never launched.
+        Assert.Equal(["pull --ff-only"], git.GitCommands);
+
+        // The agent was never prompted.
+        Assert.Empty(agentRunner.PromptCalls);
+
+        // Truthful failure: Failed outcome, authoritative FAIL verdict, sanitized reason.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("Config repo preparation pull failed (exit 128)") && i.Contains("authentication failed"));
+        Assert.Contains("Config repo pull failed (exit 128)", FindLine(stderr, "Config repo pull failed"), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// TRUTHFUL PREPARATION: a preparation pull that the SEAM cannot even launch is a truthful
+    /// failure — the seam maps an unlaunchable transport command to its exit -1 rejection with
+    /// a fixed <c>SanitizedError</c>, the task FAILS before the agent is prompted, and no raw
+    /// exception text escapes.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_ThrownPreparationPull_IsSanitizedFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["pull", "--ff-only", ..]
+                ? throw new InvalidOperationException("git binary exploded")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-prep-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        // The seam's rejection is the authoritative sanitized classification — no message text.
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("Config repo preparation pull failed (exit -1)") && !i.Contains("exploded"));
+        // The preparation pull was the only attempt; nothing launched after the failure.
+        Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
+    }
+
+    /// <summary>
+    /// A SUCCESSFUL empty staged diff is a genuine NO-CHANGE completion — Completed, PASS,
+    /// Pushed=false, and clearly distinct from every failure.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_EmptyStagedDiff_IsNoChangeSuccess()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, "", "") // successful EMPTY diff — not a failure
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-empty-diff", configRepoDir, git, agentRunner: agentRunner);
+
+        // The commit was never reached, and no failure was manufactured.
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("commit -m"));
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.Empty(result.Metrics.Issues);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// A FAILED diff (non-zero exit) is distinct from a successful empty diff: publication
+    /// stops — no commit ever launches — and the task fails truthfully.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_FailedDiff_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (1, "", "fatal: diff failed")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-diff-fail", configRepoDir, git, agentRunner: agentRunner);
+
+        // EVERY subsequent forbidden command is absent — publication stopped at the failed diff.
+        AssertLegacyStoppedAfterDiff(git.GitCommands);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git diff failed (exit 1)") && i.Contains("fatal: diff failed"));
+        // The agent's output evidence is preserved verbatim with the reason appended.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// A THROWN post-commit-pull (ordinary exception) is a publication failure with the
+    /// sanitized classification, and push NEVER launches.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ThrownPostCommitPull_NeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+            GitCommandThrower = args => args == "pull --no-rebase"
+                ? new InvalidOperationException("pull exploded")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-pull-throw", configRepoDir, git, agentRunner: agentRunner);
+
+        // push (and merge --abort, which belongs to the non-zero-pull path) never launched.
+        Assert.DoesNotContain(git.GitCommands, c => c == "push");
+        Assert.DoesNotContain(git.GitCommands, c => c == "merge --abort");
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git pull failed with an error [InvalidOperationException]") && !i.Contains("exploded"));
+        // Evidence preserved verbatim + sanitized reason appended.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+    }
+
+    /// <summary>
+    /// OCE without a requested cancellation from a config Git command is a FAILED outcome
+    /// (FAIL verdict) — never a normal completion and never Cancelled.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_NonCancellationOCE_YieldsFailed()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var unrelatedCts = new CancellationTokenSource();
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["pull", "--ff-only", ..]
+                ? throw new OperationCanceledException("simulated timeout", unrelatedCts.Token)
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        // The execution token is NOT cancelled — the OCE is an ordinary failure.
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-oce-fail", configRepoDir, seam, fake, git,
+            TestContext.Current.CancellationToken, agentRunner);
+
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("Config repo preparation pull was interrupted without a requested cancellation [OperationCanceledException]"));
+    }
+
+    /// <summary>
+    /// A REQUESTED execution cancellation during a config Git command keeps its established
+    /// semantics: Cancelled outcome with a CANCELLED verdict (via the ct guard), not a
+    /// publication failure.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_RequestedCancellationDuringConfigGit_YieldsCancelled()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens =>
+            {
+                if (tokens is ["pull", "--ff-only", ..])
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+                return null;
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-oce-cancelled", configRepoDir, seam, fake, git, cts.Token);
+
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        // The OCE was NOT reclassified as a publication failure.
+        Assert.DoesNotContain(result.Metrics.Issues, i => i.Contains("Config repo preparation"));
+    }
+
+    /// <summary>
+    /// REPORT PRECEDENCE (worker report): an ordinary Improver Git failure yields FAIL even
+    /// when the agent filed a passing WORKER report whose verdict would otherwise dominate.
+    /// The selected <see cref="TaskMetrics.Summary"/> must expose the Git failure — never
+    /// only the passing report's summary — and the accumulated agent output evidence must
+    /// be retained verbatim with the sanitized reason appended.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_PushFailure_FailsDespitePassingReports()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: true),
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            WorkerReportToReturn = new WorkerReport
+            {
+                TaskVerdict = TaskVerdict.Pass,
+                Summary = "Improver summary",
+                Issues = [],
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-precedence", configRepoDir, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git push failed"));
+        // The Git failure is exposed through the selected metrics — a passing report's summary
+        // must NEVER be selected on a Git failure (on the failure path the catch constructs
+        // fresh FAIL metrics, so the report summary cannot hide the failure here).
+        Assert.DoesNotContain("Improver summary", result.Metrics.Summary, StringComparison.Ordinal);
+
+        // The worker report's summary survives in the returned output evidence (evidence is
+        // not replaced), but the verdict and the Git failure issue are authoritative.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// REPORT PRECEDENCE (test report): an ordinary Improver Git failure yields FAIL even
+    /// when the agent filed a PASSING TESTER report — the test report source would otherwise
+    /// dominate the metrics construction. The Git failure must appear in the issues AND be
+    /// exposed by the selected <see cref="TaskMetrics.Summary"/>.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_PushFailure_FailsDespitePassingTestReport()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: true),
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            // A PASSING tester report — the highest-precedence metrics source.
+            TestReportToReturn = new TestResultReport
+            {
+                Verdict = TaskVerdict.Pass,
+                TotalTests = 5,
+                PassedTests = 5,
+                FailedTests = 0,
+                Summary = "All 5 tests passed, build succeeded",
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-precedence-testreport", configRepoDir, git, agentRunner: agentRunner);
+
+        // The Git failure dominates BOTH report sources: verdict FAIL and a Git failure issue.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues, i => i.Contains("git push failed"));
+        // The passing test report's own summary is never selected on a Git failure — the
+        // failure path constructs fresh FAIL metrics, so the passing summary cannot hide it.
+        Assert.DoesNotContain("All 5 tests passed", result.Metrics.Summary, StringComparison.Ordinal);
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Confirmed successful publication: Completed outcome, PASS verdict, Pushed=true. The
+    /// no-change and failure outcomes are all distinct.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ConfirmedPush_IsSuccessfulCompletion()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] staged = ["agents/coder.agents.md"];
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(staged, pushFails: false),
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-push-ok", configRepoDir, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Equal(staged, result.GitStatus.ChangedFiles);
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, failed preparation pull THROWN as an ordinary exception at the legacy
+    /// layer: truthful failure with a sanitized classification, before prompting.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ThrownPreparationPull_IsSanitizedFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandThrower = args => args == "pull --ff-only"
+                ? new InvalidOperationException("git binary missing")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-prep-throw", configRepoDir, git, agentRunner: agentRunner);
+
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(["pull --ff-only"], git.GitCommands);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("Config repo preparation pull failed with an error [InvalidOperationException]")
+                && !i.Contains("git binary missing"));
+    }
+
+    /// <summary>
+    /// SEAM path, non-zero git ADD: publication stops before the diff, the task fails
+    /// truthfully, and no diagnostic paths are manufactured.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedAdd_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["add", ..]
+                ? new GitProcessResult(1, "", "fatal: bad path")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-add-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // EVERY subsequent forbidden command is absent — publication stopped at the failed add.
+        AssertSeamStoppedAfterAdd(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git add failed (exit 1)") && i.Contains("fatal: bad path"));
+        // Evidence preserved verbatim + sanitized reason appended.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, THROWN commit (ordinary exception): publication stops — no pull, no push —
+    /// and the staged diagnostics still reach the result.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_ThrownCommit_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["commit", ..] => throw new InvalidOperationException("commit exploded"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-commit-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // EVERY subsequent forbidden command is absent — publication stopped at the commit.
+        AssertSeamStoppedAfterCommit(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        // The seam maps an unlaunchable command to its exit -1 rejection with a FIXED
+        // SanitizedError — no raw exception text escapes.
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git commit failed (exit -1)") && !i.Contains("exploded"));
+    }
+
+    /// <summary>
+    /// SEAM path, non-zero PUSH: the publication failure is truthful — Failed outcome, FAIL
+    /// verdict, Pushed never claimed, and no retry or second push attempt.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPush_IsPublicationFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var pushCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["push", "origin", "HEAD"] => new GitProcessResult(1, "", "remote rejected: permission denied"),
+                _ => null,
+            },
+        };
+        pushCalls = fake.Launched.Count(t => t is ["push", ..]);
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-push-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git push failed (exit 1)") && i.Contains("remote rejected: permission denied"));
+        // Exactly ONE push attempt — no force push, retry, or remote rollback.
+        Assert.Single(fake.Launched, t => t is ["push", ..]);
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    // ── (g) Stage/path/failure-form matrix: the missing converse cells ────────
+    //
+    // Every named publication stage must be protected on BOTH command-routing paths
+    // (injected seam and legacy) and BOTH failure forms (nonzero exit and ordinary
+    // exception). Each test below proves the converse cell of an existing case, and each
+    // asserts the FULL forbidden subsequence absence so removing the protection the test
+    // names makes it fail.
+
+    /// <summary>
+    /// LEGACY path, non-zero git ADD (converse of the seam nonzero case): publication stops
+    /// before the diff and EVERY subsequent forbidden command is absent.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_FailedAdd_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "add agents/*.agents.md"
+                ? (1, "", "fatal: bad path")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-add-fail", configRepoDir, git, agentRunner: agentRunner);
+
+        // No diff, no commit, no post-commit pull, no merge --abort, no push.
+        AssertLegacyStoppedAfterAdd(git.GitCommands);
+        Assert.Equal(["pull --ff-only", "add agents/*.agents.md"], git.GitCommands);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git add failed (exit 1)") && i.Contains("fatal: bad path"));
+        // Evidence preserved verbatim + sanitized reason appended.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, non-zero git DIFF (converse of the legacy nonzero case): publication stops
+    /// before the commit and EVERY subsequent forbidden command is absent.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedDiff_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["diff", ..]
+                ? new GitProcessResult(1, "", "fatal: diff failed")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-diff-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // No commit, no post-commit pull, no merge --abort, no push.
+        AssertSeamStoppedAfterDiff(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git diff failed (exit 1)") && i.Contains("fatal: diff failed"));
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, non-zero git COMMIT (converse of the legacy nonzero case): publication
+    /// stops — no post-commit pull, no merge --abort, no push — and the staged diagnostics
+    /// still reach the result.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedCommit_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["commit", ..] => new GitProcessResult(1, "", "nothing to commit / hook rejected"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-commit-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // No post-commit pull, no merge --abort, no push.
+        AssertSeamStoppedAfterCommit(fake.Launched);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git commit failed (exit 1)") && i.Contains("hook rejected"));
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// LEGACY path, THROWN git COMMIT — ordinary exception, not a non-zero exit (converse of
+    /// the seam thrown case): publication stops and EVERY subsequent forbidden command is
+    /// absent. The sanitized classification replaces the raw message; the staged diagnostics
+    /// still reach the result.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_ThrownCommit_StopsPublicationAndFails()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, StagedOutput("agents/coder.agents.md"), "")
+                : null,
+            GitCommandThrower = args => args.StartsWith("commit -m")
+                ? new InvalidOperationException("commit exploded")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-commit-throw", configRepoDir, git, agentRunner: agentRunner);
+
+        // No post-commit pull, no merge --abort, no push.
+        AssertLegacyStoppedAfterCommit(git.GitCommands);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        // SANITIZED: type-name classification only — no raw message text escapes.
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git commit failed with an error [InvalidOperationException]")
+                && !i.Contains("commit exploded"));
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, THROWN post-commit pull — ordinary exception, not a non-zero exit (converse
+    /// of the legacy thrown case): no merge --abort, no push, staged diagnostics preserved.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_ThrownPostCommitPull_NeverPushes()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => throw new InvalidOperationException("pull exploded"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-pull-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // The seam maps an unlaunchable command to its exit -1 rejection — so the merge-abort
+        // attempt from the non-zero-pull path does not fire here either; push NEVER launches.
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        // SANITIZED: the seam's fixed rejection classification — no raw message text escapes.
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git pull failed (exit -1)") && !i.Contains("pull exploded"));
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// SEAM path, THROWN push — ordinary exception, not a non-zero exit (converse of the seam
+    /// nonzero push case): a publication failure whose sanitized classification never carries
+    /// the raw message, with exactly ONE push attempt and no retry.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_ThrownPush_IsPublicationFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["push", "origin", "HEAD"] => throw new InvalidOperationException("push exploded"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-push-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        // SANITIZED: the seam's fixed rejection classification — no raw message text escapes.
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains("git push failed (exit -1)") && !i.Contains("push exploded"));
+        // Exactly ONE push attempt — no force push, retry, or remote rollback.
+        Assert.Single(fake.Launched, t => t is ["push", ..]);
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// FULL EVIDENCE: the complete accumulated MULTI-PART agent/retry output (initial response
+    /// plus the size-enforcement retry segment) is retained VERBATIM on an ordinary publication
+    /// failure, with the sanitized stage reason APPENDED — never replacing or truncating any
+    /// part of the evidence. The size-enforcement retry genuinely repairs the oversized file,
+    /// so the flow reaches the push and fails there.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_PushFailure_PreservesCompleteMultiPartEvidence()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        await File.WriteAllTextAsync(
+            filePath,
+            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
+            TestContext.Current.CancellationToken);
+
+        const string initialSegment = "Initial improver analysis: reviewed every guidance file.";
+        const string retrySegment = "Condensation retry: compressed the older material from the top.";
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (prompt, _, ct) =>
+            {
+                if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                {
+                    // The genuine repair the enforcement retry asks for — one retry succeeds.
+                    return File.WriteAllTextAsync(
+                        filePath, "repaired", ct).ContinueWith(_ => retrySegment, ct);
+                }
+                return Task.FromResult(initialSegment);
+            },
+        };
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = ConfigRepoResponder(["agents/coder.agents.md"], pushFails: true),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-evidence", configRepoDir, git, agentRunner: agentRunner);
+
+        // Two prompts were delivered (the initial one plus the size-enforcement retry), and
+        // BOTH segments are retained verbatim in the returned evidence.
+        Assert.Equal(2, agentRunner.PromptCalls.Count);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.StartsWith(initialSegment, result.Output, StringComparison.Ordinal);
+        Assert.Contains(retrySegment, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Agents.md size enforcement]", result.Output, StringComparison.Ordinal);
+        // The sanitized reason is APPENDED after the evidence — never replacing it.
+        var reasonIndex = result.Output.IndexOf("[Config Repo Git Failure]", StringComparison.Ordinal);
+        Assert.True(reasonIndex > result.Output.IndexOf(retrySegment, StringComparison.Ordinal));
+        Assert.Contains("git push failed (exit 1): remote rejected: permission denied", result.Output, StringComparison.Ordinal);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
     }
 }
