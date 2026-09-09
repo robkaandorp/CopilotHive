@@ -29,6 +29,10 @@ public class ActorTests
 
         public void CompleteMailboxForTest() => CompleteMailbox();
 
+        /// <summary>Test-only exposure of the protected loop token, so a test can register a
+        /// cancellation callback that observes the exact disposal ordering.</summary>
+        public CancellationToken LoopTokenForTest => LoopToken;
+
         protected override async Task HandleAsync(TestMessage message, CancellationToken ct)
         {
             Interlocked.Increment(ref HandleCallCount);
@@ -244,5 +248,118 @@ public class ActorTests
         Assert.Contains(buffered, actor.Canceled);
         Assert.Equal(0, actor.DisposeTimeoutCount);
         Assert.Equal(0, actor.UnhandledCount);
+    }
+
+    /// <summary>
+    /// Disposal ORDERING regression guard (unstarted actor): <c>DisposeAsync</c> must close
+    /// mailbox admission BEFORE cancelling the loop token, so any <c>Tell</c> issued from a
+    /// loop-token cancellation callback is deterministically REJECTED. If cancellation ran
+    /// first, such a message would be accepted into a mailbox nobody will handle, and the
+    /// sender would wrongly believe it was delivered.
+    /// <para>Fully synchronous: the callback runs on this thread inside <c>_cts.Cancel()</c>,
+    /// so there are no timing assumptions.</para>
+    /// </summary>
+    [Fact]
+    public async Task DisposeWithoutStart_TellFromLoopTokenCallback_IsRejected()
+    {
+        var actor = new TestActor();
+        var rejected = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        var callbackRan = false;
+        bool? tellResult = null;
+
+        // Not disposed: the registration outlives the actor's CTS, and letting it go is
+        // harmless — the callback has already run by the time disposal returns.
+        _ = actor.LoopTokenForTest.Register(() =>
+        {
+            callbackRan = true;
+            tellResult = actor.Tell(rejected);
+        });
+
+        await actor.DisposeAsync();
+
+        Assert.True(callbackRan, "The loop-token cancellation callback never ran.");
+        Assert.False(tellResult, "Tell from a cancellation callback must be rejected: the mailbox must be closed before cancellation.");
+
+        // Never admitted, therefore never drained/cancelled by the unstarted dispose path.
+        Assert.DoesNotContain(rejected, actor.Canceled);
+        Assert.False(rejected.Handled);
+        Assert.Equal(1, actor.UnstartedDisposeCount);
+        Assert.True(actor.IsCompleted);
+    }
+
+    /// <summary>
+    /// Disposal ORDERING regression guard (started actor): same invariant as the unstarted
+    /// case, but with the message loop provably running and parked inside a handler, so the
+    /// read/drain path is established before disposal begins. The cancellation callback runs
+    /// synchronously inside <c>DisposeAsync</c>'s <c>_cts.Cancel()</c> on this thread, so the
+    /// assertion has no timing assumptions.
+    /// </summary>
+    [Fact]
+    public async Task DisposeAfterStart_TellFromLoopTokenCallback_IsRejected()
+    {
+        // Cancelable gate: the handler parks here so the loop is inside the read/handle path,
+        // and the loop token release lets disposal complete without the timeout hook.
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var actor = new TestActor(async (_, ct) => await gate.Task.WaitAsync(ct));
+
+        // Hoisted so the finally can await the ORIGINAL disposal task even when an assertion
+        // above throws: a second DisposeAsync sees _disposed and returns early, so only the
+        // first call's task guarantees cancellation/cleanup actually completed before the
+        // test exits.
+        Task? disposeTask = null;
+
+        // Set only after every try-block assertion has passed. If the try block failed, a
+        // fault on the disposal join below is secondary and must not mask the assertion
+        // that failed first.
+        var tryBlockPassed = false;
+        try
+        {
+            actor.Start();
+            var blocking = new TestMessage(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+            Assert.True(actor.Tell(blocking));
+            await AwaitAsync(actor.EnteredHandler.Task);
+
+            var callbackRan = false;
+            bool? tellResult = null;
+            _ = actor.LoopTokenForTest.Register(() =>
+            {
+                callbackRan = true;
+                tellResult = actor.Tell(new TestMessage());
+            });
+
+            // Disposal is started here and the ORIGINAL task is retained (hoisted above);
+            // a second DisposeAsync would return early because _disposed is already set.
+            disposeTask = actor.DisposeAsync().AsTask();
+
+            Assert.True(callbackRan, "The loop-token cancellation callback never ran.");
+            Assert.False(tellResult, "Tell from a cancellation callback must be rejected: the mailbox must be closed before cancellation.");
+
+            await AwaitAsync(disposeTask);
+            await disposeTask;
+
+            Assert.Equal(0, actor.DisposeTimeoutCount);
+            Assert.True(actor.IsCompleted);
+
+            tryBlockPassed = true;
+        }
+        finally
+        {
+            gate.TrySetResult();
+            // Await the original disposal task if it was started, so cleanup/cancellation
+            // completes even when an intermediate assertion failed (e.g. under the required
+            // old-order mutation check). The second DisposeAsync call returns early without
+            // joining the loop, so the first task is the only authoritative join.
+            if (disposeTask is not null)
+            {
+                try { await disposeTask; }
+                catch (Exception) when (!tryBlockPassed)
+                {
+                    // The try block already failed; THAT exception is the one under test and
+                    // must win. A disposal fault here is secondary cleanup noise — swallowed
+                    // only on this failure path so it cannot replace the assertion failure.
+                    // On a passing path a fault propagates normally.
+                }
+            }
+        }
     }
 }

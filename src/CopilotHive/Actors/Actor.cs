@@ -131,8 +131,20 @@ public abstract class Actor<TMessage> : IAsyncDisposable
 
         try
         {
-            _cts.Cancel();
+            // ORDER IS LOAD-BEARING: admission is closed BEFORE the loop token is cancelled.
+            // Cancellation synchronously runs every registered callback and unblocks
+            // cancellation-aware work (including derived shutdown paths), any of which may
+            // attempt a self-Tell. If the token were cancelled first, such a Tell could be
+            // ACCEPTED into a mailbox whose reader is already leaving its drain path, so the
+            // message would be silently discarded while the sender believes it was delivered.
+            // Closing the writer first makes every cancellation-triggered Tell deterministically
+            // return false, so senders can take their rejected-message fallback.
+            //
+            // BOUNDARY: this only closes admission before cancellation-triggered work. Messages
+            // ACCEPTED before disposal began may still be drained (cancelled) rather than
+            // handled — that is a separate, documented limitation.
             _mailbox.Writer.TryComplete();
+            _cts.Cancel();
 
             if (!IsStarted)
             {
