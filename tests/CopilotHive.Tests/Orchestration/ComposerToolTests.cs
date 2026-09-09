@@ -13,6 +13,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using System.ComponentModel;
+using System.Globalization;
 using System.Net;
 using System.Text.Json;
 
@@ -3494,8 +3495,999 @@ public sealed class ComposerToolTests : IDisposable
 
         var result = await _composer.GetPhaseOutputAsync("invalid-content", 1, "Coding", content: invalidContent);
 
-        Assert.Contains($"Invalid content '{invalidContent}'. Valid values: output, brain_prompt, worker_prompt.", result);
+        Assert.Contains($"Invalid content '{invalidContent}'. Valid values: output, brain_prompt, worker_prompt, narratives.", result);
         Assert.DoesNotContain("should not see this", result);
+    }
+
+    [Theory]
+    [InlineData("narrativess")]
+    [InlineData("Narratives")]
+    [InlineData("NARRATIVES")]
+    public async Task GetPhaseOutput_InvalidNarrativesContent_CaseSensitiveWhitelist(string invalidContent)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await _composer.CreateGoalAsync("narr-case", "Goal for narratives case test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, WorkerOutput = "out" }],
+        };
+        await _store.AddIterationAsync("narr-case", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-case", 1, "Coding", content: invalidContent);
+
+        Assert.Contains($"Invalid content '{invalidContent}'. Valid values: output, brain_prompt, worker_prompt, narratives.", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_Populated_ReturnsAllRecordsVerbatim()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var t1 = new DateTime(2025, 1, 1, 10, 0, 0, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 1, 1, 10, 0, 5, DateTimeKind.Utc);
+
+        await _composer.CreateGoalAsync("narr-pop", "Populated narratives");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                WorkerOutput = "coder output",
+                Occurrence = 1,
+                Narratives =
+                [
+                    new NarrativeEntry { Timestamp = t1, WorkerId = "worker-a", TaskId = "task-1", Content = "First narrative.\nSecond line." },
+                    new NarrativeEntry { Timestamp = t2, WorkerId = "worker-b", TaskId = "task-1", Content = "   " },
+                    new NarrativeEntry { Timestamp = t2, WorkerId = "worker-b", TaskId = "task-1", Content = "... literal ellipses ..." },
+                ],
+            }],
+        };
+        await _store.AddIterationAsync("narr-pop", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-pop", 1, "Coding", content: "narratives");
+
+        Assert.Contains(t1.ToString("o", CultureInfo.InvariantCulture), result);
+        Assert.Contains("worker-a (task-1):", result);
+        Assert.Contains("First narrative.\nSecond line.", result);
+        Assert.Contains("   ", result);
+        Assert.Contains("... literal ellipses ...", result);
+        Assert.Contains("occurrence 1", result);
+        Assert.Contains("match 1 of 1", result);
+        // Complete, not truncated
+        Assert.DoesNotContain("truncated", result);
+        Assert.DoesNotContain("coder output", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_NullVsEmpty_Distinguished()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-mixed", "Mixed narrative states");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = null },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2, Narratives = [] },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2, Narratives = [new NarrativeEntry { Timestamp = new DateTime(2025, 1, 1, 10, 0, 0, DateTimeKind.Utc), WorkerId = "w", TaskId = "t", Content = "retry narrative" }] },
+            ],
+        };
+        await _store.AddIterationAsync("narr-mixed", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-mixed", 1, "Coding", content: "narratives");
+
+        Assert.Contains("narrative archive unavailable / never captured", result);
+        Assert.Contains("narratives captured, none recorded", result);
+        Assert.Contains("retry narrative", result);
+        // All three matches rendered regardless of duplicate occurrence metadata
+        Assert.Contains("match 1 of 3", result);
+        Assert.Contains("match 2 of 3", result);
+        Assert.Contains("match 3 of 3", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_LegacyOccurrenceNull_ShowsUnknown()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-legacy", "Legacy narrative data");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Testing,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Narratives = [new NarrativeEntry { Timestamp = new DateTime(2025, 1, 1, 10, 0, 0, DateTimeKind.Utc), WorkerId = "worker-x", TaskId = "task-9", Content = "legacy content" }],
+            }],
+        };
+        await _store.AddIterationAsync("narr-legacy", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-legacy", 1, "Testing", content: "narratives");
+
+        Assert.Contains("occurrence unknown", result);
+        Assert.Contains("legacy content", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_GoalNotFound_IterationNotFound_PhaseNotFound()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        Assert.Equal("Goal not found", await _composer.GetPhaseOutputAsync("narr-missing", 1, "Coding", content: "narratives"));
+
+        await _composer.CreateGoalAsync("narr-no-iter", "No iterations");
+        Assert.Equal("Iteration 1 not found", await _composer.GetPhaseOutputAsync("narr-no-iter", 1, "Coding", content: "narratives"));
+
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0 }],
+        };
+        await _store.AddIterationAsync("narr-no-iter", summary, ct);
+        Assert.Equal("Phase 'Review' not found in iteration 1", await _composer.GetPhaseOutputAsync("narr-no-iter", 1, "Review", content: "narratives"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_OtherPhaseAndIterationNotLeaked()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-isolation", "Isolation test");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [new NarrativeEntry { Timestamp = new DateTime(2025, 1, 1, 10, 0, 0, DateTimeKind.Utc), WorkerId = "w", TaskId = "t", Content = "coding narrative" }] },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [new NarrativeEntry { Timestamp = new DateTime(2025, 1, 1, 10, 0, 1, DateTimeKind.Utc), WorkerId = "w", TaskId = "t", Content = "testing narrative" }] },
+            ],
+        };
+        var summary2 = new IterationSummary
+        {
+            Iteration = 2,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [new NarrativeEntry { Timestamp = new DateTime(2025, 1, 1, 11, 0, 0, DateTimeKind.Utc), WorkerId = "w", TaskId = "t", Content = "iteration two narrative" }] }],
+        };
+        await _store.AddIterationAsync("narr-isolation", summary, ct);
+        await _store.AddIterationAsync("narr-isolation", summary2, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-isolation", 1, "Coding", content: "narratives");
+
+        Assert.Contains("coding narrative", result);
+        Assert.DoesNotContain("testing narrative", result);
+        Assert.DoesNotContain("iteration two narrative", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutput_Narratives_MissingOccurrenceOnNewEntry_RendersEveryMatch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Mixed occurrence metadata: one with Occurrence set, one legacy with null —
+        // both rendered regardless of the occurrence metadata.
+        await _composer.CreateGoalAsync("narr-dup-occ", "Duplicate occurrence metadata");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = null, Narratives = [] },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [] },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [] },
+            ],
+        };
+        await _store.AddIterationAsync("narr-dup-occ", summary, ct);
+
+        var result = await _composer.GetPhaseOutputAsync("narr-dup-occ", 1, "Coding", content: "narratives");
+
+        Assert.Contains("occurrence unknown", result);
+        Assert.Equal(2, result.Split("occurrence 1").Length - 1);
+        Assert.Contains("match 1 of 3", result);
+        Assert.Contains("match 2 of 3", result);
+        Assert.Contains("match 3 of 3", result);
+        Assert.Contains("narratives captured, none recorded", result);
+    }
+
+    // ── get_phase_output content="narratives" — registered-tool (AIFunction) tests ──
+
+    /// <summary>
+    /// Invokes the REGISTERED get_phase_output function through the tool registry
+    /// (AIFunctionFactory path), not the internal method directly.
+    /// </summary>
+    private static async Task<string> InvokeGetPhaseOutputToolAsync(
+        Composer composer,
+        string id,
+        int iteration,
+        string phase,
+        string? content = null,
+        int? maxLines = null)
+    {
+        var tools = composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().Single(t => t.Name == "get_phase_output");
+
+        var args = new AIFunctionArguments
+        {
+            ["id"] = id,
+            ["iteration"] = iteration,
+            ["phase"] = phase,
+        };
+        if (content is not null)
+            args["content"] = content;
+        if (maxLines is not null)
+            args["max_lines"] = maxLines;
+
+        return (await tool.InvokeAsync(args, TestContext.Current.CancellationToken))?.ToString() ?? "";
+    }
+
+    private static NarrativeEntry MakeNarrative(DateTime timestamp, string workerId, string taskId, string content) => new()
+    {
+        Timestamp = timestamp,
+        WorkerId = workerId,
+        TaskId = taskId,
+        Content = content,
+    };
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_SqlitePersistenceRoundTrip_ReturnsPopulatedRecords()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var t1 = new DateTime(2025, 3, 4, 8, 1, 2, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 3, 4, 8, 5, 9, DateTimeKind.Utc);
+
+        await _composer.CreateGoalAsync("narr-tool-sqlite", "Real SQLite persistence round-trip");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            PhaseOutputs = { ["coder-1"] = "CoderOutput marker that must never be used as narrative content" },
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding,
+                    Result = PhaseOutcome.Pass,
+                    DurationSeconds = 1.5,
+                    WorkerOutput = "WorkerOutput marker that must never be used as narrative content",
+                    Occurrence = 1,
+                    Narratives =
+                    [
+                        MakeNarrative(t1, "worker-alpha", "task-A", "narr-one: persisted via SQLite JSON"),
+                        MakeNarrative(t2, "worker-beta", "task-B", "narr-two: second persisted record"),
+                    ],
+                },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tool-sqlite", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-sqlite", 1, "Coding", content: "narratives");
+
+        // Exact framing header with round-trip metadata
+        Assert.Contains(
+            $"--- Iteration 1 / phase Coding / occurrence 1 / match 1 of 1 ---",
+            result);
+
+        // Exact record framing: timestamp round-trip ("o" format), WorkerId, TaskId
+        Assert.Contains(
+            $"[{t1.ToString("o", CultureInfo.InvariantCulture)}] worker-alpha (task-A):\n" +
+            "narr-one: persisted via SQLite JSON\n",
+            result, StringComparison.Ordinal);
+        Assert.Contains(
+            $"[{t2.ToString("o", CultureInfo.InvariantCulture)}] worker-beta (task-B):\n" +
+            "narr-two: second persisted record",
+            result, StringComparison.Ordinal);
+
+        // Order preserved
+        Assert.True(
+            result.IndexOf("narr-one", StringComparison.Ordinal) < result.IndexOf("narr-two", StringComparison.Ordinal),
+            "Narrative records must be returned in persisted (stored) order.");
+
+        // No substitution from other sources
+        Assert.DoesNotContain("CoderOutput marker", result);
+        Assert.DoesNotContain("WorkerOutput marker", result);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_LongContent_ReturnsCompleteWithDefaultAndTinyMaxLines()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // 250 lines (beyond the default max_lines=200) plus a single line over 4000 chars.
+        var longPayload = string.Join("\n", Enumerable.Range(1, 250).Select(i => $"narr-line-{i:000}")) +
+            "\n" + new string('L', 4001) + "-LONG-LINE-END";
+        var longTail = "TAIL: last narrative line must survive NARR-TAIL-EVIDENCE";
+
+        await _composer.CreateGoalAsync("narr-tool-long", "Long narrative content");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 1,
+                Narratives = [MakeNarrative(new DateTime(2025, 5, 5, 9, 0, 0, DateTimeKind.Utc), "w-long", "task-long", longPayload + "\n" + longTail)],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tool-long", summary, ct);
+
+        // Default max_lines (omitted)
+        var defaultResult = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-long", 1, "Coding", content: "narratives");
+        // Explicitly tiny max_lines
+        var tinyResult = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-long", 1, "Coding", content: "narratives", maxLines: 1);
+
+        // First line of the payload
+        Assert.StartsWith("narr-line-001", defaultResult.Substring(defaultResult.IndexOf("narr-line-001", StringComparison.Ordinal)));
+        Assert.StartsWith("narr-line-001", tinyResult.Substring(tinyResult.IndexOf("narr-line-001", StringComparison.Ordinal)));
+
+        // Complete: first, last of 250 lines, the >4000-char single line, and the tail all present.
+        foreach (var result in new[] { defaultResult, tinyResult })
+        {
+            Assert.Contains("narr-line-001", result, StringComparison.Ordinal);
+            Assert.Contains("narr-line-250", result, StringComparison.Ordinal);
+            Assert.Contains(new string('L', 4001), result, StringComparison.Ordinal);
+            Assert.Contains("NARR-TAIL-EVIDENCE", result, StringComparison.Ordinal);
+            Assert.DoesNotContain("truncated", result, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Default and tiny max_lines must return identical output (no truncation either way).
+        Assert.Equal(defaultResult, tinyResult, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_ExactMetadataAndPayloadFields()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ts = new DateTime(2025, 7, 7, 12, 34, 56, DateTimeKind.Utc);
+        var content = "exact-metadata narrative\nwith a second line";
+
+        await _composer.CreateGoalAsync("narr-tool-meta", "Exact metadata checks");
+        var summary = new IterationSummary
+        {
+            Iteration = 3,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.DocWriting,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 2,
+                Narratives = [MakeNarrative(ts, "doc-worker-7", "doc-task-42", content)],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tool-meta", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-meta", 3, "DocWriting", content: "narratives");
+
+        // FULL expected response — exact framing, exact metadata, exact payload.
+        // No response-wide trimming: the record-end marker delimits the payload instead.
+        var expected =
+            "--- Iteration 3 / phase DocWriting / occurrence 2 / match 1 of 1 ---\n" +
+            $"[{ts.ToString("o", CultureInfo.InvariantCulture)}] doc-worker-7 (doc-task-42):\n" +
+            content + "\n" +
+            "--- end of record ---\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+    }
+
+    /// <summary>
+    /// Removal-proof whole-response assertions for payloads whose FINAL characters are
+    /// empty, whitespace-only, or trailing whitespace/newlines. A response-wide TrimEnd
+    /// (or any other normalization of the tail) makes these fail.
+    /// </summary>
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_FinalRecordEmptyContent_ExactWholeResponse()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var t1 = new DateTime(2025, 8, 8, 8, 8, 8, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 8, 8, 8, 9, 9, DateTimeKind.Utc);
+
+        await _composer.CreateGoalAsync("narr-tail-empty", "Final record with empty content");
+        var summary = new IterationSummary
+        {
+            Iteration = 2,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 4,
+                Narratives =
+                [
+                    MakeNarrative(t1, "w-first", "task-first", "leading record"),
+                    MakeNarrative(t2, "w-empty", "task-empty", ""),
+                ],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tail-empty", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tail-empty", 2, "Coding", content: "narratives");
+
+        var expected =
+            "--- Iteration 2 / phase Coding / occurrence 4 / match 1 of 1 ---\n" +
+            $"[{t1.ToString("o", CultureInfo.InvariantCulture)}] w-first (task-first):\n" +
+            "leading record\n" +
+            "--- end of record ---\n" +
+            $"[{t2.ToString("o", CultureInfo.InvariantCulture)}] w-empty (task-empty):\n" +
+            "" + "\n" +
+            "--- end of record ---\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_FinalRecordWhitespaceOnlyContent_ExactWholeResponse()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ts = new DateTime(2025, 9, 9, 9, 9, 9, DateTimeKind.Utc);
+        var whitespaceOnly = "  \t \n \t ";
+
+        await _composer.CreateGoalAsync("narr-tail-ws", "Final record whitespace-only content");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Review,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = null,
+                Narratives = [MakeNarrative(ts, "w-ws", "task-ws", whitespaceOnly)],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tail-ws", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tail-ws", 1, "Review", content: "narratives");
+
+        var expected =
+            "--- Iteration 1 / phase Review / occurrence unknown / match 1 of 1 ---\n" +
+            $"[{ts.ToString("o", CultureInfo.InvariantCulture)}] w-ws (task-ws):\n" +
+            whitespaceOnly + "\n" +
+            "--- end of record ---\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_FinalRecordTrailingWhitespaceAndNewlines_ExactWholeResponse()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var t1 = new DateTime(2025, 10, 10, 10, 10, 10, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 10, 10, 10, 11, 11, DateTimeKind.Utc);
+        // Trailing evidence at the very end of the response: spaces, tabs, and newlines.
+        var trailing = "TAIL-EVIDENCE body line\nsecond line   \t\n\n  \t";
+
+        await _composer.CreateGoalAsync("narr-tail-trailing", "Final record ending in whitespace");
+        var summary = new IterationSummary
+        {
+            Iteration = 5,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1,
+                    Narratives = [MakeNarrative(t1, "w-a", "task-a", "first occurrence record")],
+                },
+                new PhaseResult
+                {
+                    Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2,
+                    Narratives = [MakeNarrative(t2, "w-b", "task-b", trailing)],
+                },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tail-trailing", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tail-trailing", 5, "Testing", content: "narratives");
+
+        var expected =
+            "--- Iteration 5 / phase Testing / occurrence 1 / match 1 of 2 ---\n" +
+            $"[{t1.ToString("o", CultureInfo.InvariantCulture)}] w-a (task-a):\n" +
+            "first occurrence record\n" +
+            "--- end of record ---\n" +
+            "--- Iteration 5 / phase Testing / occurrence 2 / match 2 of 2 ---\n" +
+            $"[{t2.ToString("o", CultureInfo.InvariantCulture)}] w-b (task-b):\n" +
+            trailing + "\n" +
+            "--- end of record ---\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+
+        // Exact terminal substring that includes the trailing whitespace of the payload —
+        // a response-wide TrimEnd would delete these characters.
+        Assert.EndsWith(
+            "second line   \t\n\n  \t\n--- end of record ---\n",
+            result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("text   ")]
+    [InlineData("\t\t")]
+    [InlineData("line ending in LF\n")]
+    [InlineData("line ending in CRLF\r\n")]
+    [InlineData("   ")]
+    public async Task GetPhaseOutputTool_Narratives_FinalRecordTrailingCharacters_ExactWholeResponse(string payload)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ts = new DateTime(2025, 11, 11, 11, 11, 11, DateTimeKind.Utc);
+
+        await _composer.CreateGoalAsync("narr-tail-vector", "Final-record trailing-character vector");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 1,
+                Narratives = [MakeNarrative(ts, "tail-worker", "tail-task", payload)],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tail-vector", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(
+            _composer, "narr-tail-vector", 1, "Coding", content: "narratives");
+
+        var expected =
+            "--- Iteration 1 / phase Coding / occurrence 1 / match 1 of 1 ---\n" +
+            $"[{ts.ToString("o", CultureInfo.InvariantCulture)}] tail-worker (tail-task):\n" +
+            payload + "\n" +
+            "--- end of record ---\n";
+
+        // Whole-response ordinal equality is intentional: changing even one trailing space,
+        // tab, CR, or LF in the final record must fail this assertion.
+        Assert.Equal(
+            expected,
+            result,
+            ignoreLineEndingDifferences: false,
+            ignoreWhiteSpaceDifferences: false,
+            ignoreAllWhiteSpace: false);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_NullAndEmptyStates_ExactWholeResponse()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-tail-states", "Exact response for null/empty states");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = null, Narratives = null },
+                new PhaseResult { Name = GoalPhase.Improve, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [] },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tail-states", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tail-states", 1, "Improve", content: "narratives");
+
+        var expected =
+            "--- Iteration 1 / phase Improve / occurrence unknown / match 1 of 2 ---\n" +
+            "narrative archive unavailable / never captured\n" +
+            "--- Iteration 1 / phase Improve / occurrence 1 / match 2 of 2 ---\n" +
+            "narratives captured, none recorded\n";
+        Assert.Equal(expected, result, ignoreLineEndingDifferences: false, ignoreWhiteSpaceDifferences: false, ignoreAllWhiteSpace: false);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_AllOccurrencesInPersistedOrder_NoLeakage()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var t1 = new DateTime(2025, 2, 2, 1, 0, 0, DateTimeKind.Utc);
+        var t2 = new DateTime(2025, 2, 2, 1, 1, 0, DateTimeKind.Utc);
+        var t3 = new DateTime(2025, 2, 2, 1, 2, 0, DateTimeKind.Utc);
+
+        await _composer.CreateGoalAsync("narr-tool-occ", "Repeated occurrences");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [MakeNarrative(t1, "t-w1", "t-task1", "testing-occ-1 narrative")] },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2, Narratives = [MakeNarrative(t2, "t-w2", "t-task2", "testing-occ-2 narrative")] },
+                new PhaseResult { Name = GoalPhase.Testing, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 3, Narratives = [MakeNarrative(t3, "t-w3", "t-task3", "testing-occ-3 narrative")] },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tool-occ", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-occ", 1, "Testing", content: "narratives");
+
+        // All three matches, labeled with stored Occurrence and 1-based sequence.
+        Assert.Contains("--- Iteration 1 / phase Testing / occurrence 1 / match 1 of 3 ---", result, StringComparison.Ordinal);
+        Assert.Contains("--- Iteration 1 / phase Testing / occurrence 2 / match 2 of 3 ---", result, StringComparison.Ordinal);
+        Assert.Contains("--- Iteration 1 / phase Testing / occurrence 3 / match 3 of 3 ---", result, StringComparison.Ordinal);
+
+        // Persisted order preserved.
+        Assert.True(
+            result.IndexOf("testing-occ-1", StringComparison.Ordinal) <
+            result.IndexOf("testing-occ-2", StringComparison.Ordinal) &&
+            result.IndexOf("testing-occ-2", StringComparison.Ordinal) <
+            result.IndexOf("testing-occ-3", StringComparison.Ordinal),
+            "Matching occurrences must be returned in persisted list order.");
+
+        // No leakage: another phase in the same iteration is not present.
+        var codingOnly = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-occ", 1, "Coding", content: "narratives");
+        Assert.Equal("Phase 'Coding' not found in iteration 1", codingOnly);
+
+        // No leakage: another iteration that does not exist is not present.
+        Assert.Equal("Iteration 2 not found",
+            await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-occ", 2, "Testing", content: "narratives"));
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_RelatedPhaseInOtherIterationExcluded()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-tool-multi-iter", "Multiple iterations same phase");
+        var summary1 = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [MakeNarrative(new DateTime(2025, 2, 3, 2, 0, 0, DateTimeKind.Utc), "w1", "t1", "iter-1 coding narrative")] }],
+        };
+        var summary2 = new IterationSummary
+        {
+            Iteration = 2,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [MakeNarrative(new DateTime(2025, 2, 3, 3, 0, 0, DateTimeKind.Utc), "w2", "t2", "iter-2 coding narrative")] }],
+        };
+        await _store.AddIterationAsync("narr-tool-multi-iter", summary1, ct);
+        await _store.AddIterationAsync("narr-tool-multi-iter", summary2, ct);
+
+        // Iteration 1 must include iteration-1 content only.
+        var iter1 = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-multi-iter", 1, "Coding", content: "narratives");
+        Assert.Contains("iter-1 coding narrative", iter1, StringComparison.Ordinal);
+        Assert.DoesNotContain("iter-2 coding narrative", iter1, StringComparison.Ordinal);
+        Assert.Contains("match 1 of 1", iter1, StringComparison.Ordinal);
+
+        // Iteration 2 must include iteration-2 content only.
+        var iter2 = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-multi-iter", 2, "Coding", content: "narratives");
+        Assert.Contains("iter-2 coding narrative", iter2, StringComparison.Ordinal);
+        Assert.DoesNotContain("iter-1 coding narrative", iter2, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_PopulatedNullEmptyDistinguished_NoFallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // One iteration, three matching Coding entries: null, empty, populated.
+        // WorkerOutput and PhaseOutputs carry data markers that must never leak as substitute
+        // narrative content for the unavailable/empty entries.
+        await _composer.CreateGoalAsync("narr-tool-states", "Null vs empty vs populated");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            PhaseOutputs = { ["coder-1"] = "PHASEOUTPUTS-FALLBACK-MARKER coder-1" },
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1,
+                    WorkerOutput = "WORKEROUTPUT-FALLBACK-MARKER entry-1",
+                    Narratives = null,
+                },
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2,
+                    WorkerOutput = "WORKEROUTPUT-FALLBACK-MARKER entry-2",
+                    Narratives = [],
+                },
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2,
+                    WorkerOutput = "WORKEROUTPUT-FALLBACK-MARKER entry-3",
+                    Narratives = [MakeNarrative(new DateTime(2025, 4, 4, 4, 4, 4, DateTimeKind.Utc), "w-pop", "t-pop", "populated narrative record POPULATED-EVIDENCE")],
+                },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tool-states", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-states", 1, "Coding", content: "narratives");
+
+        // Null state — distinct marker, no fallback to WorkerOutput/PhaseOutputs.
+        Assert.Contains("narrative archive unavailable / never captured", result, StringComparison.Ordinal);
+        // Empty state — distinct marker, no fallback.
+        Assert.Contains("narratives captured, none recorded", result, StringComparison.Ordinal);
+        // Populated state — actual record.
+        Assert.Contains("populated narrative record POPULATED-EVIDENCE", result, StringComparison.Ordinal);
+
+        // Each state appears exactly once.
+        Assert.Equal(1, result.Split("narrative archive unavailable / never captured").Length - 1);
+        Assert.Equal(1, result.Split("narratives captured, none recorded").Length - 1);
+
+        // No fallback from any state to other sources: output/prompt data markers absent.
+        Assert.DoesNotContain("PHASEOUTPUTS-FALLBACK-MARKER", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("WORKEROUTPUT-FALLBACK-MARKER", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("coder-1", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_PromptDataMarkersNeverSubstituted()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // BrainPrompt/WorkerPrompt data on the matching entries must never appear as substitute
+        // narrative content when Narratives is null or empty.
+        await _composer.CreateGoalAsync("narr-tool-prompt-markers", "Prompt data markers");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases =
+            [
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1,
+                    BrainPrompt = "BRAINPROMPT-SUBSTITUTE-MARKER brain prompt text",
+                    WorkerPrompt = "WORKERPROMPT-SUBSTITUTE-MARKER worker prompt text",
+                    WorkerOutput = "WORKEROUTPUT-SUBSTITUTE-MARKER output text",
+                    Narratives = null,
+                },
+                new PhaseResult
+                {
+                    Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2,
+                    BrainPrompt = "BRAINPROMPT-SUBSTITUTE-MARKER-2 brain prompt text",
+                    WorkerPrompt = "WORKERPROMPT-SUBSTITUTE-MARKER-2 worker prompt text",
+                    WorkerOutput = "WORKEROUTPUT-SUBSTITUTE-MARKER-2 output text",
+                    Narratives = [],
+                },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tool-prompt-markers", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-prompt-markers", 1, "Coding", content: "narratives");
+
+        Assert.DoesNotContain("BRAINPROMPT-SUBSTITUTE-MARKER", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("WORKERPROMPT-SUBSTITUTE-MARKER", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("WORKEROUTPUT-SUBSTITUTE-MARKER", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("output text", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("prompt text", result, StringComparison.Ordinal);
+
+        // Both entries are still rendered (null and empty distinguished).
+        Assert.Contains("narrative archive unavailable / never captured", result, StringComparison.Ordinal);
+        Assert.Contains("narratives captured, none recorded", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_DuplicatesMultilineAndEllipsesPreserved()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ts = new DateTime(2025, 6, 6, 6, 6, 6, DateTimeKind.Utc);
+        var multiline = "line one\nline two\n\nline four with trailing spaces   \n... evidence truncated at ...\nEND marker";
+        var duplicateContent = "exact duplicate record";
+
+        await _composer.CreateGoalAsync("narr-tool-dupes", "Duplicates and literal payload");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Review,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 1,
+                Narratives =
+                [
+                    MakeNarrative(ts, "dup-worker", "dup-task", duplicateContent),
+                    MakeNarrative(ts, "dup-worker", "dup-task", duplicateContent),
+                    MakeNarrative(ts, "dup-worker", "dup-task", multiline),
+                ],
+            }],
+        };
+        await _store.AddIterationAsync("narr-tool-dupes", summary, ct);
+
+        var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-dupes", 1, "Review", content: "narratives");
+
+        // Repeated/duplicate narrative records preserved in stored order — both instances present.
+        Assert.Equal(2, result.Split(duplicateContent).Length - 1);
+        Assert.True(
+            result.IndexOf(duplicateContent, StringComparison.Ordinal) <
+            result.IndexOf("line one", StringComparison.Ordinal),
+            "Duplicate records must precede the later record in stored order.");
+
+        // Multiline content, literal ellipses, and trailing evidence preserved exactly
+        // (no trimming/normalization — trailing spaces survive on their line).
+        Assert.Contains("line one\nline two\n\nline four with trailing spaces   \n... evidence truncated at ...\nEND marker", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_AbsentGoalIterationPhase_Messages()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Absent goal
+        Assert.Equal("Goal not found",
+            await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-absent", 1, "Coding", content: "narratives"));
+
+        // Absent iteration
+        await _composer.CreateGoalAsync("narr-tool-absent-iter", "No iterations yet");
+        Assert.Equal("Iteration 1 not found",
+            await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-absent-iter", 1, "Coding", content: "narratives"));
+
+        // Absent phase
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [] }],
+        };
+        await _store.AddIterationAsync("narr-tool-absent-iter", summary, ct);
+        Assert.Equal("Phase 'Review' not found in iteration 1",
+            await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-absent-iter", 1, "Review", content: "narratives"));
+    }
+
+    [Fact]
+    public void GetPhaseOutputTool_Narratives_RegisteredSchemaAdvertisesMode()
+    {
+        var tools = _composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().Single(t => t.Name == "get_phase_output");
+
+        // Registered function description documents the new mode and its all-occurrences,
+        // complete/untruncated semantics.
+        Assert.NotNull(tool.Description);
+        Assert.Contains("narratives", tool.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("all archived occurrences", tool.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("complete and untruncated", tool.Description, StringComparison.OrdinalIgnoreCase);
+
+        // Parameter [Description] attributes document the new mode and max_lines scope.
+        var parameters = tool.UnderlyingMethod!.GetParameters();
+        var contentParam = parameters.Single(p => p.Name == "content");
+        var maxLinesParam = parameters.Single(p => p.Name == "max_lines");
+
+        var contentDescription = (string)contentParam.GetCustomAttributesData()
+            .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute")
+            .ConstructorArguments[0].Value!;
+        Assert.Contains("narratives", contentDescription, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("untruncated", contentDescription, StringComparison.OrdinalIgnoreCase);
+
+        var maxLinesDescription = (string)maxLinesParam.GetCustomAttributesData()
+            .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute")
+            .ConstructorArguments[0].Value!;
+        Assert.Contains("applies only to output, brain_prompt, and worker_prompt", maxLinesDescription, StringComparison.Ordinal);
+        Assert.Contains("narratives is never truncated", maxLinesDescription, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GetPhaseOutputTool_MethodAndRegisteredDescriptions_StateCompleteAllOccurrencesAndTextModeLimitScope()
+    {
+        var tools = _composer.BuildComposerTools();
+        var tool = tools.OfType<AIFunction>().Single(t => t.Name == "get_phase_output");
+        var methodDescription = (string)tool.UnderlyingMethod!.GetCustomAttributesData()
+            .First(a => a.AttributeType.FullName == "System.ComponentModel.DescriptionAttribute")
+            .ConstructorArguments[0].Value!;
+        var registeredDescription = Assert.IsType<string>(tool.Description);
+
+        static void AssertRequiredSemantics(string description)
+        {
+            Assert.Contains("narratives", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("all", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("occurrences", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("records", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("complete", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("untruncated", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("max_lines applies only", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("output", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("brain_prompt", description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("worker_prompt", description, StringComparison.OrdinalIgnoreCase);
+        }
+
+        AssertRequiredSemantics(methodDescription);
+        AssertRequiredSemantics(registeredDescription);
+    }
+
+    [Fact]
+    public void GetPhaseOutputTool_ComposerCapabilitySentenceMentionsArchivedNarratives()
+    {
+        var prompt = _composer.GetSystemPrompt();
+
+        Assert.Contains("archived worker narratives", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("brain prompts, or worker prompts for", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_ExistingModes_RegisteredInvocationUnchangedSemantics()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // First Coding occurrence (output mode) + last Coding occurrence (prompt mode) in one iteration.
+        await _composer.CreateGoalAsync("narr-tool-regression", "Regression guard for other modes");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            PhaseOutputs = { ["coder-1"] = "first coder output" },
+            Phases =
+            [
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, WorkerOutput = "first-coder-output", BrainPrompt = "first brain prompt", WorkerPrompt = "first worker prompt" },
+                new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 2, WorkerOutput = "second-coder-output", BrainPrompt = "second brain prompt", WorkerPrompt = "second worker prompt" },
+            ],
+        };
+        await _store.AddIterationAsync("narr-tool-regression", summary, ct);
+
+        // output: FIRST matching phase.
+        var output = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-regression", 1, "Coding", content: "output");
+        Assert.Contains("first-coder-output", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("second-coder-output", output, StringComparison.Ordinal);
+
+        // brain_prompt: LAST matching phase.
+        var brainPrompt = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-regression", 1, "Coding", content: "brain_prompt");
+        Assert.Contains("second brain prompt", brainPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("first brain prompt", brainPrompt, StringComparison.Ordinal);
+
+        // worker_prompt: LAST matching phase.
+        var workerPrompt = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-regression", 1, "Coding", content: "worker_prompt");
+        Assert.Contains("second worker prompt", workerPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("first worker prompt", workerPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_OutputMode_RegisteredInvocationUsesPhaseOutputsFallback()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-tool-output-fallback", "Registered output fallback guard");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult
+            {
+                Name = GoalPhase.Coding,
+                Result = PhaseOutcome.Pass,
+                DurationSeconds = 1.0,
+                Occurrence = 1,
+                WorkerOutput = null,
+            }],
+            PhaseOutputs = { ["coder-1"] = "registered PhaseOutputs fallback evidence" },
+        };
+        await _store.AddIterationAsync("narr-tool-output-fallback", summary, ct);
+
+        var output = await InvokeGetPhaseOutputToolAsync(
+            _composer, "narr-tool-output-fallback", 1, "Coding", content: "output");
+
+        Assert.Contains("registered PhaseOutputs fallback evidence", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_TextModes_MaxLinesTruncationGuard()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var longOutput = string.Join("\n", Enumerable.Range(1, 300).Select(i => $"Guard line {i}"));
+
+        await _composer.CreateGoalAsync("narr-tool-maxlines", "max_lines truncation guard");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, WorkerOutput = longOutput }],
+        };
+        await _store.AddIterationAsync("narr-tool-maxlines", summary, ct);
+
+        // output mode with tiny max_lines truncates (guard: max_lines still applies to text modes).
+        var output = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-maxlines", 1, "Coding", content: "output", maxLines: 10);
+        Assert.Contains("truncated", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Guard line 1", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("Guard line 300", output, StringComparison.Ordinal);
+
+        // narratives mode with the same tiny max_lines is complete (contrast).
+        var narratives = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-maxlines", 1, "Coding", content: "narratives", maxLines: 10);
+        Assert.DoesNotContain("truncated", narratives, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetPhaseOutputTool_Narratives_InvalidContentCaseSensitivity_ThroughRegistry()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        await _composer.CreateGoalAsync("narr-tool-case", "Case sensitivity through the registry");
+        var summary = new IterationSummary
+        {
+            Iteration = 1,
+            Phases = [new PhaseResult { Name = GoalPhase.Coding, Result = PhaseOutcome.Pass, DurationSeconds = 1.0, Occurrence = 1, Narratives = [] }],
+        };
+        await _store.AddIterationAsync("narr-tool-case", summary, ct);
+
+        foreach (var invalid in new[] { "Narratives", "NARRATIVES", "narrativess", "" })
+        {
+            var result = await InvokeGetPhaseOutputToolAsync(_composer, "narr-tool-case", 1, "Coding", content: invalid);
+            Assert.Contains($"Invalid content '{invalid}'. Valid values: output, brain_prompt, worker_prompt, narratives.", result, StringComparison.Ordinal);
+        }
     }
 
     [Fact]

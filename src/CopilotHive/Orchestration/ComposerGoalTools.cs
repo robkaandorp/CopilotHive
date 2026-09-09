@@ -611,13 +611,13 @@ public sealed partial class Composer
         return sb.ToString().Replace("\r\n", "\n");
     }
 
-    [Description("Get the raw worker output, brain prompt, or worker prompt for a specific phase within an iteration.")]
+    [Description("Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns ALL archived occurrences and ALL narrative records for the selected phase and iteration, complete and untruncated; max_lines applies ONLY to the output, brain_prompt, and worker_prompt modes.")]
     internal async Task<string> GetPhaseOutputAsync(
         [Description("Goal ID")] string id,
         [Description("Iteration number (1-based)")] int iteration,
         [Description("Phase name: Coding, Testing, Review, DocWriting, or Improve")] string phase,
-        [Description("Maximum lines to return. Default: 200")] int max_lines = 200,
-        [Description("What to return: output (default), brain_prompt, or worker_prompt")] string content = "output")
+        [Description("Maximum lines to return (applies only to output, brain_prompt, and worker_prompt modes; narratives is never truncated). Default: 200")] int max_lines = 200,
+        [Description("What to return: output (default), brain_prompt, worker_prompt, or narratives (archived worker narrative records; returns all matching occurrences and records, complete and untruncated)")] string content = "output")
     {
         // 1. Explicit required-param validation with EXACT messages FIRST
         if (string.IsNullOrWhiteSpace(id))
@@ -639,10 +639,74 @@ public sealed partial class Composer
             return $"Phase '{phase}' does not have a worker output key.";
 
         // 3. Validate content parameter
-        if (content is not "output" and not "brain_prompt" and not "worker_prompt")
-            return $"Invalid content '{content}'. Valid values: output, brain_prompt, worker_prompt.";
+        if (content is not "output" and not "brain_prompt" and not "worker_prompt" and not "narratives")
+            return $"Invalid content '{content}'. Valid values: output, brain_prompt, worker_prompt, narratives.";
 
-        // 4. Handle brain_prompt / worker_prompt via PhaseResult entries
+        // 4. Handle narratives mode — archived per-phase worker narratives
+        if (content == "narratives")
+        {
+            var narrativeGoal = await _goalStore.GetGoalAsync(id);
+            if (narrativeGoal is null)
+                return "Goal not found";
+
+            var iterationsForNarratives = await _goalStore.GetIterationsAsync(id);
+            var iterSummaryForNarratives = iterationsForNarratives.FirstOrDefault(i => i.Iteration == iteration);
+            if (iterSummaryForNarratives is null)
+                return $"Iteration {iteration} not found";
+
+            // Select ALL matching PhaseResult entries in persisted list order — earlier
+            // coding/testing rounds must stay accessible even when a later round exists.
+            var phaseEntries = iterSummaryForNarratives.Phases
+                .Where(p => p.Name.ToString().Equals(phase, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (phaseEntries.Count == 0)
+                return $"Phase '{phase}' not found in iteration {iteration}";
+
+            var sb = new System.Text.StringBuilder();
+            for (var sequence = 0; sequence < phaseEntries.Count; sequence++)
+            {
+                var entry = phaseEntries[sequence];
+                var occurrenceText = entry.Occurrence?.ToString(CultureInfo.InvariantCulture) ?? "unknown";
+                sb.Append($"--- Iteration {iteration} / phase {phase} / occurrence {occurrenceText} / match {sequence + 1} of {phaseEntries.Count} ---")
+                  .Append('\n');
+
+                if (entry.Narratives is null)
+                {
+                    // null means no snapshot was ever taken for this entry — legacy data
+                    // that predates the property, or an entry the capture never selected.
+                    sb.Append("narrative archive unavailable / never captured").Append('\n');
+                }
+                else if (entry.Narratives.Count == 0)
+                {
+                    // An empty list positively records "the phase completed with zero narratives".
+                    sb.Append("narratives captured, none recorded").Append('\n');
+                }
+                else
+                {
+                    // Every record in STORED order, complete content verbatim — no trimming,
+                    // normalization, sorting, deduplication, or truncation. The payload is
+                    // written between the record header line and the record-end marker; the
+                    // ONLY framing character added around the payload is the single '\n' that
+                    // precedes the end marker, so every stored payload character (including
+                    // trailing spaces, tabs, and newlines) round-trips byte-for-byte.
+                    foreach (var narrative in entry.Narratives)
+                    {
+                        sb.Append($"[{narrative.Timestamp.ToString("o", CultureInfo.InvariantCulture)}] {narrative.WorkerId} ({narrative.TaskId}):")
+                          .Append('\n')
+                          .Append(narrative.Content)
+                          .Append('\n')
+                          .Append("--- end of record ---")
+                          .Append('\n');
+                    }
+                }
+            }
+
+            // No response-wide trimming: trailing payload characters of the final record must
+            // survive verbatim. The response is delimited by the record-end markers instead.
+            return sb.ToString();
+        }
+
+        // 5. Handle brain_prompt / worker_prompt via PhaseResult entries
         if (content is "brain_prompt" or "worker_prompt")
         {
             // Verify the goal still exists before retrieving prompt data

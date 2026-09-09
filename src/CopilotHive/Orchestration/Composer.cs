@@ -214,7 +214,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
         - Read the codebase to understand current state (read_file, glob, grep)
         - Search existing goals to avoid duplication (search_goals, with optional release filter)
         - Browse goal history and status (list_goals, get_goal)
-        - Drill into worker phase output, brain prompts, or worker prompts for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
+        - Drill into worker phase output, brain prompts, worker prompts, or archived worker narratives for Coding, Testing, Review, DocWriting, or Improve (get_phase_output)
         - Create goals as drafts for user review (create_goal)
         - Approve drafts to queue them for execution (approve_goal)
         - Update existing goals (update_goal) — description, priority, scope, repositories, target_repositories, depends_on, and documents can only be changed on Draft goals; status and release can be changed on any goal
@@ -1013,7 +1013,7 @@ public sealed partial class Composer : IClarificationRouter, IAsyncDisposable
             AIFunctionFactory.Create(GetGoalAsync, "get_goal",
                 "Get full details for a goal including iteration history."),
             AIFunctionFactory.Create(GetPhaseOutputAsync, "get_phase_output",
-                "Get the raw worker output, brain prompt, or worker prompt for a specific phase within an iteration."),
+                "Get the raw worker output, brain prompt, worker prompt, or archived worker narratives for a specific phase within an iteration. The narratives mode returns all archived occurrences and records for the selected phase and iteration, complete and untruncated; max_lines applies only to the output, brain_prompt, and worker_prompt modes."),
             AIFunctionFactory.Create(ListGoalsAsync, "list_goals",
                 "List goals, optionally filtered by status and release. Default release filter is 'unreleased'. Use 'all' for all goals or a release ID for a specific release (selects all releases sharing its tag and status). Output always names the active filter."),
             AIFunctionFactory.Create(SearchGoalsAsync, "search_goals",
