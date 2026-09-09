@@ -1068,6 +1068,10 @@ public sealed class ConfigRepoGitOperationsTests
             "Invalid git command: the arguments do not match the allowed form for 'status'.");
         AssertRejected(await RunAsync(seam, new[] { "commit", "-m" }),
             "Invalid git command: the arguments do not match the allowed form for 'commit'.");
+        AssertRejected(await RunAsync(seam, new[] { "rev-parse", "--verify", "main" }),
+            "Invalid git command: the arguments do not match the allowed form for 'rev-parse'.");
+        AssertRejected(await RunAsync(seam, new[] { "clean", "-fd" }),
+            "Invalid git command: the arguments do not match the allowed form for 'clean'.");
     }
 
     public static TheoryData<string[]> RefPrecheckFailureCases => new()
@@ -1264,7 +1268,29 @@ public sealed class ConfigRepoGitOperationsTests
         { new[] { "commit", "-m", "update agents" }, LaunchFailed },
         { new[] { "merge", "--abort" }, LaunchFailed },
         { new[] { "status" }, LaunchFailed },
+        // The cleanup-prerequisite local forms — every hash length and both letter cases.
+        { new[] { "status", "--porcelain=v1", "--untracked-files=all", "--ignored" }, LaunchFailed },
+        { new[] { "rev-parse", "--verify", "HEAD" }, LaunchFailed },
+        { new[] { "reset", "--hard", FullSha40Lower }, LaunchFailed },
+        { new[] { "reset", "--hard", FullSha40Upper }, LaunchFailed },
+        { new[] { "reset", "--hard", FullSha64Lower }, LaunchFailed },
+        { new[] { "reset", "--hard", FullSha64Upper }, LaunchFailed },
+        { new[] { "clean", "-fdx" }, LaunchFailed },
     };
+
+    /// <summary>A 40-character lower-case hexadecimal full commit SHA.</summary>
+    private const string FullSha40Lower = "0123456789abcdef0123456789abcdef01234567";
+
+    /// <summary>A 40-character UPPER-case hexadecimal full commit SHA.</summary>
+    private const string FullSha40Upper = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+    /// <summary>A 64-character lower-case hexadecimal full commit SHA (SHA-256 length).</summary>
+    private const string FullSha64Lower =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// <summary>A 64-character UPPER-case hexadecimal full commit SHA (SHA-256 length).</summary>
+    private const string FullSha64Upper =
+        "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
 
     /// <summary>
     /// Every accepted form reaches the real execution — the ProcessRunner seam throws, and the
@@ -1314,6 +1340,477 @@ public sealed class ConfigRepoGitOperationsTests
             GitOperations.ProcessRunner = originalRunner;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Cleanup-prerequisite local forms (rev-parse / reset / clean / verbose status)
+    // ------------------------------------------------------------------
+
+    /// <summary>The fixed form-mismatch message for a subcommand.</summary>
+    private static string FormMismatch(string subcommand) =>
+        $"Invalid git command: the arguments do not match the allowed form for '{subcommand}'.";
+
+    /// <summary>
+    /// The cleanup-prerequisite forms launch EXACTLY ONE process — the final command with the
+    /// SNAPSHOT verbatim — through the canonical working directory and the scrubbed env (no
+    /// credential injection). Exercises both hash lengths and both letter cases.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(LocalCommandCases))]
+    public async Task CleanupForms_LaunchExactlyOneVerbatimProcess(string[] args)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var previousEnv = SeedChildEnvVariables();
+        var requests = new List<GitProcessRequest>();
+
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // The call-time working-directory spelling differs from the constructor input but
+            // canonicalizes identically — the launch must use the CONSTRUCTOR-canonicalized dir.
+            using var seam = CreateSeam(pathCanonicalizer: _ => CanonicalizedRepoDir);
+            var result = await RunInAsync(seam, args, RepoDirWithSeparator);
+
+            Assert.True(result.Success);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal("", result.SanitizedError);
+            Assert.Single(requests);
+
+            var request = requests[0];
+            Assert.Equal("git", request.Executable);
+            Assert.Empty(request.Args);
+            Assert.Equal(args, request.TokenizedArgs!.ToArray()); // verbatim snapshot
+            Assert.Equal(CanonicalizedRepoDir, request.WorkingDirectory);
+            AssertChildEnv(request);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+    }
+
+    /// <summary>
+    /// The URL and credential resolvers are NEVER read by the cleanup-prerequisite forms, and
+    /// the transport-origin gate is never acquired: these are LOCAL operations only.
+    /// </summary>
+    [Fact]
+    public async Task CleanupForms_NeverReadTheResolvers()
+    {
+        var urlCalls = 0;
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        using var seam = new ConfigRepoGitOperations(
+            RepoDir,
+            () => { urlCalls++; return EligibleUrl; },
+            () => { credentialCalls++; return null; },
+            Log(),
+            () => { helperCalls++; return "/helper"; },
+            static () => { });
+
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+
+            foreach (var args in LocalCommandForms)
+            {
+                var result = await RunAsync(seam, args);
+                Assert.True(result.Success);
+            }
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+
+        Assert.Equal(0, urlCalls);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>
+    /// Every INVALID cleanup-form variant is rejected by the Stage 5 grammar with the fixed
+    /// form-mismatch message, launches ZERO processes, and (being local) never reads the URL
+    /// resolver.
+    /// </summary>
+    [Fact]
+    public async Task CleanupForms_MalformedVariants_AreRejectedWithZeroLaunches()
+    {
+        var urlCalls = 0;
+        using var seam = new ConfigRepoGitOperations(
+            RepoDir,
+            () => { urlCalls++; return EligibleUrl; },
+            static () => null,
+            Log(),
+            static () => "/helper",
+            static () => { });
+
+        var originalRunner = GitOperations.ProcessRunner;
+        var launches = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                launches++;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // rev-parse — wrong arity, order, and options.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "HEAD", "--verify"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD", "extra"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "--HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse"]), FormMismatch("rev-parse"));
+
+            // reset — arity and option placement.
+            AssertRejected(await RunAsync(seam, ["reset"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", FullSha40Lower, "extra"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--keep", FullSha40Lower]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "--", FullSha40Lower]), FormMismatch("reset"));
+
+            // reset — revision expressions, names, abbreviated hashes, and option-like args.
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "HEAD"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "HEAD~1"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "HEAD^"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "@"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "main"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "master"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", ":path"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "abc123"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "abc123d"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "-hard"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", "--"]), FormMismatch("reset"));
+            // Wrong lengths: 39, 41, 63, 65 characters.
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha40Lower[..39]]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha40Lower + "0"]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha64Lower[..63]]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha64Lower + "0"]), FormMismatch("reset"));
+            // Non-hex characters, whitespace, and control characters at BOTH lengths.
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", new string('g', 40)]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", new string('G', 64)]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", " " + FullSha40Lower[1..]]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha40Lower[..39] + " "]), FormMismatch("reset"));
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha64Lower[..63] + "\u0001"]), FormMismatch("reset"));
+            // A pathspec after the SHA.
+            AssertRejected(await RunAsync(seam, ["reset", "--hard", FullSha40Lower, "--", "agents/"]), FormMismatch("reset"));
+
+            // clean — wrong options and arity, including twice-force and extra paths.
+            AssertRejected(await RunAsync(seam, ["clean"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-fd"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-ffdx"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-xdf"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-fdx", "extra"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-fdx", "--", "agents/"]), FormMismatch("clean"));
+            AssertRejected(await RunAsync(seam, ["clean", "-dxf"]), FormMismatch("clean"));
+
+            // verbose status — wrong order, subset, superset, and the bare extra.
+            AssertRejected(await RunAsync(seam, ["status", "--porcelain=v1"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--untracked-files=all"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--ignored"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--porcelain=v1", "--ignored", "--untracked-files=all"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--porcelain=v1", "--untracked-files=all"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored", "extra"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--porcelain=v2", "--untracked-files=all", "--ignored"]), FormMismatch("status"));
+            AssertRejected(await RunAsync(seam, ["status", "--untracked-files=normal", "--porcelain=v1", "--ignored"]), FormMismatch("status"));
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+
+        Assert.Equal(0, launches);
+        Assert.Equal(0, urlCalls);
+    }
+
+    /// <summary>
+    /// SHA syntax validation only: the seam does NOT verify the object exists — a well-formed
+    /// SHA whose <c>git reset</c> FAILS at execution time surfaces the real Git failure through
+    /// the standard result mapping (exit code preserved, redacted stderr).
+    /// </summary>
+    [Fact]
+    public async Task CleanupForms_ResetSha_SyntaxOnly_ExecutionFailureSurfacesGitResult()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+                Task.FromResult(new GitProcessResult(128, "", "fatal: bad object"));
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "reset", "--hard", FullSha40Lower });
+
+            Assert.False(result.Success);
+            Assert.Equal(128, result.ExitCode);
+            Assert.Equal("fatal: bad object", result.SanitizedError);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Focused REAL-LOCAL-GIT coverage — isolated temporary repositories.
+    // Never the checkout under test and never a real config repository.
+    // Through the ACTUAL seam (GitOperations.ProcessRunner restored in a
+    // finally), real git runs in the temp repo, so Grammar + Stage 5 +
+    // the canonical working-directory containment all execute for real.
+    // ------------------------------------------------------------------
+
+    /// <summary>The verbose status form — the ONLY verified-clean oracle.</summary>
+    private static readonly string[] VerboseStatus =
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"];
+
+    /// <summary>Runs a real git subprocess in <paramref name="workingDirectory"/>.</summary>
+    private static (int ExitCode, string Stdout, string Stderr) RunGit(
+        string workingDirectory, params string[] args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return (process.ExitCode, stdout, stderr);
+    }
+
+    /// <summary>
+    /// Creates an isolated temporary git repository (init + initial commit) and returns its
+    /// path. The caller disposes via <see cref="TempRepo.Dispose"/> in a finally block.
+    /// </summary>
+    private static TempRepo CreateTempRepo()
+    {
+        var path = Directory.CreateTempSubdirectory("cghive-cfgrepo-").FullName;
+        RunGit(path, "init", "-b", "main");
+        RunGit(path, "config", "user.email", "test@example.com");
+        RunGit(path, "config", "user.name", "CopilotHive Tests");
+        Directory.CreateDirectory(Path.Combine(path, "agents"));
+        File.WriteAllText(
+            Path.Combine(path, "agents", "orchestrator.agents.md"), "baseline\n");
+        RunGit(path, "add", ".");
+        RunGit(path, "commit", "-m", "baseline");
+        return new TempRepo(path);
+    }
+
+    /// <summary>A disposable isolated temporary git repository.</summary>
+    private sealed class TempRepo(string path) : IDisposable
+    {
+        public string Path { get; } = path;
+
+        public void Dispose()
+        {
+            try
+            {
+                TestHelpers.ForceDeleteDirectory(Path);
+            }
+            catch (Exception)
+            {
+                // Best-effort on Windows file locking; never mask a test failure with a
+                // cleanup exception. Leftovers live under the OS temp directory.
+            }
+        }
+    }
+
+    /// <summary>
+    /// End-to-end: capture a committed baseline via rev-parse, make tracked/index/untracked/
+    /// ignored fixture changes, reset --hard to the captured SHA, run clean -fdx, and verify
+    /// the tracked content is RESTORED and the verbose status is EMPTY. Clean's exit code is
+    /// NOT the oracle — the status output is checked explicitly.
+    /// </summary>
+    [Fact]
+    public async Task RealGit_ResetHardAndClean_RestoresTrackedAndVerifiesCleanStatus()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        using var repo = CreateTempRepo();
+        try
+        {
+            using var seam = new ConfigRepoGitOperations(
+                repo.Path, static () => EligibleUrl, static () => null, Log(),
+                static () => "/helper", static () => { });
+
+            // Baseline capture through the seam.
+            var baseline = await RunInAsync(seam, ["rev-parse", "--verify", "HEAD"], repo.Path);
+            Assert.True(baseline.Success, baseline.SanitizedError);
+            var sha = baseline.Stdout.Trim();
+            Assert.True(IsValidShaSyntax(sha), $"unexpected SHA form: '{sha}'");
+
+            // Fixture changes: tracked modification, staged file, untracked file, ignored file.
+            File.WriteAllText(
+                Path.Combine(repo.Path, "agents", "orchestrator.agents.md"), "modified\n");
+            File.WriteAllText(Path.Combine(repo.Path, "staged.txt"), "staged\n");
+            RunGit(repo.Path, "add", "staged.txt");
+            File.WriteAllText(Path.Combine(repo.Path, "untracked.txt"), "untracked\n");
+            File.WriteAllText(Path.Combine(repo.Path, ".gitignore"), "ignored.txt\n");
+            File.WriteAllText(Path.Combine(repo.Path, "ignored.txt"), "ignored\n");
+
+            // Reset --hard to the captured SHA through the seam — tracked content restored.
+            var reset = await RunInAsync(seam, ["reset", "--hard", sha], repo.Path);
+            Assert.True(reset.Success, reset.SanitizedError);
+            Assert.Equal(
+                "baseline\n",
+                File.ReadAllText(Path.Combine(repo.Path, "agents", "orchestrator.agents.md")));
+
+            // Clean -fdx through the seam.
+            var clean = await RunInAsync(seam, ["clean", "-fdx"], repo.Path);
+            Assert.True(clean.Success, clean.SanitizedError);
+
+            // The verified-clean ORACLE is the verbose status output — NOT clean's exit code.
+            var status = await RunInAsync(seam, VerboseStatus, repo.Path);
+            Assert.True(status.Success, status.SanitizedError);
+            Assert.True(
+                status.Stdout.Length == 0,
+                $"expected a clean worktree, but status reported:{Environment.NewLine}{status.Stdout}");
+
+            // The staged file is gone; nothing survived.
+            Assert.False(File.Exists(Path.Combine(repo.Path, "staged.txt")));
+            Assert.False(File.Exists(Path.Combine(repo.Path, "untracked.txt")));
+            Assert.False(File.Exists(Path.Combine(repo.Path, "ignored.txt")));
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Negative case: a nested repository with committed content. Single-force clean (-fdx)
+    /// must NOT escalate (no -ffd) and must NOT delete the nested repository; the later
+    /// verbose status EXPOSES the remaining worktree dirt (the nested repo directory survives).
+    /// </summary>
+    [Fact]
+    public async Task RealGit_SingleForceClean_ProtectsNestedRepository()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        using var repo = CreateTempRepo();
+        try
+        {
+            using var seam = new ConfigRepoGitOperations(
+                repo.Path, static () => EligibleUrl, static () => null, Log(),
+                static () => "/helper", static () => { });
+
+            // A nested repository with committed content, planted as an untracked fixture.
+            var nestedPath = Path.Combine(repo.Path, "nested-repo");
+            RunGit(repo.Path, "clean", "-fdx"); // start from a known-clean baseline
+            Directory.CreateDirectory(nestedPath);
+            RunGit(nestedPath, "init", "-b", "main");
+            RunGit(nestedPath, "config", "user.email", "test@example.com");
+            RunGit(nestedPath, "config", "user.name", "CopilotHive Tests");
+            File.WriteAllText(Path.Combine(nestedPath, "content.txt"), "nested\n");
+            RunGit(nestedPath, "add", ".");
+            RunGit(nestedPath, "commit", "-m", "nested baseline");
+            var nestedHeadBefore = RunGit(nestedPath, "rev-parse", "HEAD").Stdout.Trim();
+
+            // Also plant ordinary dirt to prove the clean did run.
+            File.WriteAllText(Path.Combine(repo.Path, "untracked.txt"), "dirt\n");
+
+            // Single-force clean through the seam — success but NO escalation.
+            var clean = await RunInAsync(seam, ["clean", "-fdx"], repo.Path);
+            Assert.True(clean.Success, clean.SanitizedError);
+
+            // The nested repository was NOT deleted and its HEAD is intact.
+            Assert.True(Directory.Exists(nestedPath), "nested repository directory was deleted");
+            Assert.True(
+                Directory.Exists(Path.Combine(nestedPath, ".git")),
+                "nested .git directory was removed");
+            Assert.True(
+                File.Exists(Path.Combine(nestedPath, "content.txt")),
+                "nested repository content was deleted");
+            var nestedHeadAfter = RunGit(nestedPath, "rev-parse", "HEAD").Stdout.Trim();
+            Assert.Equal(nestedHeadBefore, nestedHeadAfter);
+
+            // The later verbose status EXPOSES the remaining worktree dirt (the nested repo).
+            var status = await RunInAsync(seam, VerboseStatus, repo.Path);
+            Assert.True(status.Success, status.SanitizedError);
+            Assert.Contains("nested-repo/", status.Stdout);
+
+            // The ordinary untracked dirt WAS removed — the clean really ran.
+            Assert.False(File.Exists(Path.Combine(repo.Path, "untracked.txt")));
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// Sentinel check: after reset --hard + clean -fdx, a NEIGHBORING tracked file in the
+    /// same directory and a file OUTSIDE the repository are both untouched.
+    /// </summary>
+    [Fact]
+    public async Task RealGit_ResetAndClean_LeaveSentinelsUntouched()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        using var repo = CreateTempRepo();
+        var outsideDir = Directory.CreateTempSubdirectory("cghive-outside-");
+        try
+        {
+            using var seam = new ConfigRepoGitOperations(
+                repo.Path, static () => EligibleUrl, static () => null, Log(),
+                static () => "/helper", static () => { });
+
+            // A NEIGHBORING tracked file (committed at baseline) next to the fixture, and a
+            // sentinel file completely OUTSIDE the repository.
+            File.WriteAllText(
+                Path.Combine(repo.Path, "agents", "neighbor.agents.md"), "neighbor\n");
+            RunGit(repo.Path, "add", ".");
+            RunGit(repo.Path, "commit", "-m", "with neighbor");
+            var baseline = await RunInAsync(seam, ["rev-parse", "--verify", "HEAD"], repo.Path);
+            Assert.True(baseline.Success, baseline.SanitizedError);
+            var sha = baseline.Stdout.Trim();
+
+            var outsidePath = Path.Combine(outsideDir.FullName, "outside-sentinel.txt");
+            File.WriteAllText(outsidePath, "outside\n");
+
+            // Make dirt, then reset + clean through the seam.
+            File.WriteAllText(
+                Path.Combine(repo.Path, "agents", "orchestrator.agents.md"), "modified\n");
+            File.WriteAllText(Path.Combine(repo.Path, "untracked.txt"), "dirt\n");
+            var reset = await RunInAsync(seam, ["reset", "--hard", sha], repo.Path);
+            Assert.True(reset.Success, reset.SanitizedError);
+            var clean = await RunInAsync(seam, ["clean", "-fdx"], repo.Path);
+            Assert.True(clean.Success, clean.SanitizedError);
+
+            // BOTH sentinels are untouched — and the outside sentinel is byte-identical.
+            Assert.Equal(
+                "neighbor\n",
+                File.ReadAllText(Path.Combine(repo.Path, "agents", "neighbor.agents.md")));
+            Assert.True(File.Exists(outsidePath), "outside sentinel file was deleted");
+            Assert.Equal("outside\n", File.ReadAllText(outsidePath));
+        }
+        finally
+        {
+            try
+            {
+                TestHelpers.ForceDeleteDirectory(outsideDir.FullName);
+            }
+            catch (Exception)
+            {
+                // Best-effort cleanup; never mask a test failure.
+            }
+
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>40/64 ASCII-hex syntactic check for the captured baseline SHA.</summary>
+    private static bool IsValidShaSyntax(string value) =>
+        (value.Length == 40 || value.Length == 64) &&
+        value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F');
 
     // ------------------------------------------------------------------
     // Cancellation PROPAGATES at the first launch reached (2c-b1b-ii)
@@ -2776,15 +3273,32 @@ public sealed class ConfigRepoGitOperationsTests
     /// LOCAL commands skip Stage 6a ENTIRELY: a THROWING URL resolver still lets every local
     /// form succeed, and the resolver is never read.
     /// </summary>
-    public static TheoryData<string[]> LocalCommandCases => new()
+    /// <summary>The local command forms, shared by the theory table and the resolver tests.</summary>
+    private static readonly string[][] LocalCommandForms =
+    [
+        ["checkout", "--", "agents/"],
+        ["add", "agents/*.agents.md"],
+        ["diff", "--cached", "--name-only", "-z"],
+        ["commit", "-m", "update agents"],
+        ["merge", "--abort"],
+        ["status"],
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+        ["rev-parse", "--verify", "HEAD"],
+        ["reset", "--hard", FullSha40Lower],
+        ["reset", "--hard", FullSha64Upper],
+        ["clean", "-fdx"],
+    ];
+
+    public static TheoryData<string[]> LocalCommandCases
     {
-        new[] { "checkout", "--", "agents/" },
-        new[] { "add", "agents/*.agents.md" },
-        new[] { "diff", "--cached", "--name-only", "-z" },
-        new[] { "commit", "-m", "update agents" },
-        new[] { "merge", "--abort" },
-        new[] { "status" },
-    };
+        get
+        {
+            var data = new TheoryData<string[]>();
+            foreach (var form in LocalCommandForms)
+                data.Add(form);
+            return data;
+        }
+    }
 
     [Theory]
     [MemberData(nameof(LocalCommandCases))]

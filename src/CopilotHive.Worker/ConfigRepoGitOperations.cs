@@ -1564,7 +1564,8 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     }
 
     private static bool IsKnownSubcommand(string subcommand) =>
-        subcommand is "pull" or "push" or "fetch" or "checkout" or "add" or "diff" or "commit" or "merge" or "status";
+        subcommand is "pull" or "push" or "fetch" or "checkout" or "add" or "diff" or "commit"
+            or "merge" or "status" or "rev-parse" or "reset" or "clean";
 
     /// <summary>
     /// The TRANSPORT (network) subcommands — the only ones that reach Stage 6a. Every other
@@ -1692,14 +1693,19 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         string subcommand, string[] snapshot) =>
         subcommand switch
         {
-            "checkout" or "add" or "diff" or "commit" or "merge" or "status" =>
+            "checkout" or "add" or "diff" or "commit" or "merge" or "status"
+                or "rev-parse" or "reset" or "clean" =>
                 (ValidateLocalForm(subcommand, snapshot), null, false),
             "pull" or "push" or "fetch" => ScanCredentialScoped(subcommand, snapshot),
             _ => throw new InvalidOperationException($"Unhandled subcommand '{subcommand}'."),
         };
 
     /// <summary>
-    /// Credential-free local commands accept EXACT token forms only.
+    /// Credential-free local commands accept EXACT token forms only. The cleanup prerequisite
+    /// forms (<c>rev-parse --verify HEAD</c>, <c>reset --hard &lt;full-SHA&gt;</c>,
+    /// <c>clean -fdx</c>, and the verbose <c>status --porcelain=v1 --untracked-files=all
+    /// --ignored</c> alongside the bare <c>status</c>) are LOCAL: they never reach Stage 6a,
+    /// never touch the URL/credential resolvers, and launch the snapshot verbatim.
     /// </summary>
     private static string? ValidateLocalForm(string subcommand, string[] snapshot)
     {
@@ -1718,10 +1724,46 @@ internal sealed class ConfigRepoGitOperations : IDisposable
             case "merge":
                 return snapshot.Length == 2 && snapshot[1] == "--abort" ? null : malformed;
             case "status":
-                return snapshot.Length == 1 ? null : malformed;
+                return snapshot.Length == 1
+                    || (snapshot.Length == 4 && snapshot[1] == "--porcelain=v1"
+                        && snapshot[2] == "--untracked-files=all" && snapshot[3] == "--ignored")
+                    ? null
+                    : malformed;
+            case "rev-parse":
+                return snapshot.Length == 3 && snapshot[1] == "--verify" && snapshot[2] == "HEAD"
+                    ? null
+                    : malformed;
+            case "reset":
+                return snapshot.Length == 3 && snapshot[1] == "--hard" && IsValidCommitSha(snapshot[2])
+                    ? null
+                    : malformed;
+            case "clean":
+                return snapshot.Length == 2 && snapshot[1] == "-fdx" ? null : malformed;
             default:
                 throw new InvalidOperationException($"Unhandled local subcommand '{subcommand}'.");
         }
+    }
+
+    /// <summary>
+    /// The <c>reset</c> SHA domain: EXACTLY 40 or 64 ASCII hexadecimal characters (upper and
+    /// lower case allowed), compared without trimming or normalization. This is SYNTAX
+    /// validation only — it does NOT prove the object exists or is a commit; the real
+    /// <c>git reset</c> at execution time remains the authority. Abbreviated hashes, HEAD or
+    /// branch names, revision expressions (<c>HEAD~1</c>, <c>@</c>, <c>:path</c>), and
+    /// option-like tokens all fall outside this domain.
+    /// </summary>
+    private static bool IsValidCommitSha(string value)
+    {
+        if (value.Length is not (40 or 64))
+            return false;
+
+        foreach (var c in value)
+        {
+            if (!TryParseHexDigit(c, out _))
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
