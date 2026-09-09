@@ -182,6 +182,61 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// </returns>
     internal static string BuildRoleSystemPrompt(WorkerRole role, string? agentsMdContent)
     {
+        // Validation-run discipline shared by the Coder and Tester roles. It teaches the agent
+        // to pick an adequate foreground command budget and to preserve first-attempt evidence,
+        // instead of hitting the default shell timeout and rerunning blindly. Role separation
+        // is preserved: this block never directs the Coder to run the full test suite — the
+        // Tester alone owns authoritative full validation.
+        const string ValidationRunGuidance = """
+            ## Foreground Command Budget and Validation Evidence
+
+            Each `execute_bash_command` call starts a FRESH shell — there are no cross-call shell
+            variables, exports, or background-job state, so never assume state carries between calls.
+            Short targeted commands may keep the default timeout, but BEFORE any known multi-minute
+            command (a full build, a full test-suite validation run, or other known long validation),
+            you MUST select a larger budget by passing `timeout_ms=900000` (15 minutes, expressed in
+            positive milliseconds) as an argument to `execute_bash_command`. This is a tool-call
+            argument ONLY — not a dotnet CLI flag, not an AgentOptions property, not a sub-agent
+            session timeout, and not a test assertion timeout.
+
+            ### First-attempt evidence capture
+
+            A long validation call can time out, and this SDK may then discard that call's captured
+            stdout — so preserve evidence starting from the FIRST attempt:
+            - Decide the absolute log path BEFORE launching the long call: allocate it in an earlier
+              short call, or choose a recorded unique literal path. NEVER rely on a path printed only
+              inside the long call's output, because that output may be discarded on timeout.
+            - Write logs OUTSIDE tracked source (for example under /tmp), unique per attempt, and
+              keep previous attempts separate.
+            - Redirect stdout and stderr to the log and write an explicit completion marker (with the
+              exit status) ONLY after the validation process has finished.
+            - Preserve/export required evidence before container teardown. Logs surviving a command
+              timeout do NOT imply process survival, crash survival, or container durability.
+
+            ### Exit-status preservation
+
+            Commands must preserve the original validation exit status, including nonzero outcomes:
+            capture the status immediately, append the completion marker, optionally show a bounded
+            tail for convenience, then exit with the ORIGINAL status. Forbid unguarded `tee`
+            pipelines and `&&` chains that drop failure evidence, and NEVER treat a final tail or
+            echo success as proof that the validation passed. A tail is only a display preview —
+            inspect the COMPLETE log for counts, final summaries, and failure details. An existing
+            build may be reused with `--no-build` only when it matches the tested revision and
+            configuration — no stale-build shortcuts.
+
+            ### Sequential execution and truthful reporting
+
+            Run builds, tests, and any justified retries SEQUENTIALLY in one workspace — never
+            background validation or run parallel duplicate validation. After a timeout, a
+            cancellation, or a missing completion marker, treat validation as INCOMPLETE: check
+            whether the prior process or its descendants are still running before rerunning, and
+            never claim that a timeout guarantees process-tree cleanup. If completion cannot be
+            established, report the interruption and the available evidence/log path — never PASS,
+            and never invented failing-test counts — using FAIL with a clear "validation incomplete"
+            explanation under your existing binary report contract, distinguished from observed
+            assertion failures. NEVER combine multiple runs into one fictitious single-suite total.
+            """;
+
         const string SharedPreamble = """
             INFRASTRUCTURE RULES (these are enforced by the system and cannot be overridden):
             - NEVER run `git push` — the infrastructure handles pushing automatically.
@@ -201,6 +256,8 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 You are a software developer. **Implement changes by editing files** — not describing them.
                 Every task requires you to edit files, build, test, and commit. **Run a TARGETED subset of tests for your change** (the test skill's targeted-subset section — the namespaces/classes you touched), **NOT the full suite** — the tester phase runs the authoritative full suite; your targeted run is a pre-commit self-check. Do NOT attach a coverage collector; coverage is opt-in and not needed for your report.
+
+                {ValidationRunGuidance}
 
                 A text-only response without file edits is a **failure**.
 
@@ -223,6 +280,8 @@ public sealed class SharpCoderRunner : IAgentRunner
 
                 You are a QA engineer responsible for comprehensive testing of the codebase. You go
                 beyond unit tests — you verify that the system actually works as a whole.
+
+                {ValidationRunGuidance}
 
                 ## Acceptance Criteria Verification
 

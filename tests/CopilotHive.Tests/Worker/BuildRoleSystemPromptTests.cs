@@ -404,4 +404,268 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Throws<InvalidOperationException>(
             () => SharpCoderRunner.BuildRoleSystemPrompt(unknownRole, null));
     }
+
+    // ── Validation-run guidance (Coder and Tester) ─────────────────────────────
+
+    /// <summary>
+    /// Both Coder and Tester prompts must instruct the agent to select a 15-minute
+    /// foreground command budget (<c>timeout_ms=900000</c> passed to
+    /// <c>execute_bash_command</c>) before known multi-minute commands, and must make
+    /// clear it is an optional positive-millisecond tool argument rather than a dotnet
+    /// flag, AgentOptions property, sub-agent timeout, or test assertion timeout.
+    /// Removal-proof: fails if the budget-selection guidance is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_ContainTimeoutBudgetSelection(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("timeout_ms=900000", prompt, StringComparison.Ordinal);
+        Assert.Contains("15 minutes", prompt, StringComparison.Ordinal);
+        Assert.Contains("execute_bash_command", prompt, StringComparison.Ordinal);
+        // It is a tool-call argument, not a dotnet flag, AgentOptions property,
+        // sub-agent session timeout, or test assertion timeout.
+        Assert.Contains("not a dotnet CLI flag", prompt, StringComparison.Ordinal);
+        Assert.Contains("not an AgentOptions property", prompt, StringComparison.Ordinal);
+        Assert.Contains("not a sub-agent", prompt, StringComparison.Ordinal);
+        Assert.Contains("not a test assertion timeout", prompt, StringComparison.Ordinal);
+        Assert.Contains("positive milliseconds", prompt, StringComparison.Ordinal);
+        // The budget applies before known long commands: full builds and full validation runs.
+        Assert.Contains("full build", prompt, StringComparison.Ordinal);
+        Assert.Contains("full test-suite validation run", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must explain that each shell call starts fresh,
+    /// so there must be no cross-call shell-variable or job-state assumptions.
+    /// Removal-proof: fails if the fresh-shell explanation is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_ContainFreshShellWarning(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("starts a FRESH shell", prompt, StringComparison.Ordinal);
+        Assert.Contains("no cross-call shell", prompt, StringComparison.Ordinal);
+        Assert.Contains("background-job state", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require the absolute log path to be known
+    /// BEFORE the long call — allocated in an earlier short call or chosen as a recorded
+    /// unique literal path — because the SDK can discard the long call's stdout on timeout.
+    /// Removal-proof: fails if the known-log-path requirement is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireKnownLogPathBeforeLongCall(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("BEFORE launching the long call", prompt, StringComparison.Ordinal);
+        Assert.Contains("recorded unique literal path", prompt, StringComparison.Ordinal);
+        Assert.Contains("earlier", prompt, StringComparison.Ordinal);
+        Assert.Contains("discard", prompt, StringComparison.Ordinal);
+        Assert.Contains("timeout", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require first-attempt, per-attempt unique log
+    /// capture, an explicit completion marker written only after the validation process
+    /// finishes, storage outside tracked source, and evidence preservation before teardown.
+    /// Removal-proof: fails if the evidence-capture guidance is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireFirstAttemptEvidenceCapture(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("FIRST attempt", prompt, StringComparison.Ordinal);
+        Assert.Contains("unique per attempt", prompt, StringComparison.Ordinal);
+        Assert.Contains("keep previous attempts separate", prompt, StringComparison.Ordinal);
+        Assert.Contains("completion marker", prompt, StringComparison.Ordinal);
+        Assert.Contains("ONLY after the validation process has finished", prompt, StringComparison.Ordinal);
+        Assert.Contains("/tmp", prompt, StringComparison.Ordinal);
+        Assert.Contains("before container teardown", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must state that logs surviving a command timeout do
+    /// not imply crash or container durability.
+    /// Removal-proof: fails if that caveat is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_StateLogsSurvivingTimeoutAreNotDurabilityProof(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("Logs surviving a command", prompt, StringComparison.Ordinal);
+        Assert.Contains("timeout do NOT imply process survival, crash survival, or container durability", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require preserving the original validation exit
+    /// status (including nonzero outcomes): capture it immediately, append the marker, show
+    /// a bounded tail, and exit with the original status.
+    /// Removal-proof: fails if the exit-status preservation guidance is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireExitStatusPreservation(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("preserve the original validation exit status", prompt, StringComparison.Ordinal);
+        Assert.Contains("nonzero", prompt, StringComparison.Ordinal);
+        Assert.Contains("exit with the ORIGINAL status", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must forbid unguarded tee pipelines, <c>&amp;&amp;</c> chains that
+    /// drop failure evidence, and treating a tail/echo success as proof the validation
+    /// passed. A tail must be described as only a display preview.
+    /// Removal-proof: fails if the pipeline/tail guardrails are removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_ForbidEvidenceDroppingPipelines(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("tee", prompt, StringComparison.Ordinal);
+        Assert.Contains("&&", prompt, StringComparison.Ordinal);
+        Assert.Contains("drop failure evidence", prompt, StringComparison.Ordinal);
+        Assert.Contains("echo success", prompt, StringComparison.Ordinal);
+        Assert.Contains("only a display preview", prompt, StringComparison.Ordinal);
+        Assert.Contains("COMPLETE log", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must allow --no-build reuse only when the existing
+    /// build matches the tested revision and configuration — no stale-build shortcuts.
+    /// Removal-proof: fails if the no-stale-build rule is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RestrictNoBuildReuse(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("--no-build", prompt, StringComparison.Ordinal);
+        Assert.Contains("revision", prompt, StringComparison.Ordinal);
+        Assert.Contains("configuration", prompt, StringComparison.Ordinal);
+        Assert.Contains("no stale-build shortcuts", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require sequential execution in one workspace
+    /// with no backgrounded or parallel duplicate validation.
+    /// Removal-proof: fails if the sequential-execution rule is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireSequentialValidation(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("SEQUENTIALLY", prompt, StringComparison.Ordinal);
+        Assert.Contains("one workspace", prompt, StringComparison.Ordinal);
+        Assert.Contains("background validation", prompt, StringComparison.Ordinal);
+        Assert.Contains("parallel duplicate validation", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require treating timeouts, cancellations, or a
+    /// missing completion marker as incomplete validation, checking for surviving processes
+    /// before rerunning, and never claiming a timeout guarantees process-tree cleanup.
+    /// Removal-proof: fails if the incomplete-validation rule is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireIncompleteValidationHandling(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("INCOMPLETE", prompt, StringComparison.Ordinal);
+        Assert.Contains("missing completion marker", prompt, StringComparison.Ordinal);
+        Assert.Contains("process or its descendants", prompt, StringComparison.Ordinal);
+        Assert.Contains("never claim that a timeout guarantees process-tree cleanup", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must require truthful reporting when completion cannot
+    /// be established: report the interruption and evidence/log path, never PASS or invented
+    /// failing-test counts, using FAIL with a "validation incomplete" explanation under the
+    /// existing binary report contract, distinguished from observed assertion failures.
+    /// Removal-proof: fails if the truthful-reporting rule is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_RequireTruthfulIncompleteReporting(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("report the interruption and the available evidence/log path", prompt, StringComparison.Ordinal);
+        Assert.Contains("never PASS", prompt, StringComparison.Ordinal);
+        Assert.Contains("invented failing-test counts", prompt, StringComparison.Ordinal);
+        Assert.Contains("\"validation incomplete\"", prompt, StringComparison.Ordinal);
+        Assert.Contains("distinguished from observed", prompt, StringComparison.Ordinal);
+        Assert.Contains("assertion failures", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both Coder and Tester prompts must forbid combining multiple runs into a fictitious
+    /// single-suite total.
+    /// Removal-proof: fails if the no-combined-runs rule is removed.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    public void BuildRoleSystemPrompt_CoderAndTester_ForbidCombiningRunsIntoSingleSuiteTotal(WorkerRole role)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(role, null);
+
+        Assert.Contains("fictitious single-suite total", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The Tester prompt must receive full-suite validation-run guidance affirmatively,
+    /// while the Coder prompt must NOT receive any direction to run the full suite —
+    /// the Coder's targeted pre-commit self-check role must be preserved. The Coder's
+    /// budget guidance legitimately names long commands generically, so the absence
+    /// assertion targets affirmatively coder-directed full-suite phrasings only.
+    /// Removal-proof: fails if the Tester full-suite guidance or the Coder role
+    /// separation is removed.
+    /// </summary>
+    [Fact]
+    public void BuildRoleSystemPrompt_Tester_ReceivesFullSuiteGuidance_CoderDoesNot()
+    {
+        var testerPrompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Tester, null);
+        var coderPrompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, null);
+
+        // Tester: full-suite validation runs are part of its authoritative role.
+        Assert.Contains("full test-suite validation run", testerPrompt, StringComparison.Ordinal);
+
+        // Coder: still targeted-subset only; the guidance must not direct full-suite testing.
+        Assert.DoesNotContain("Run the full suite", coderPrompt);
+        Assert.DoesNotContain("run the full suite", coderPrompt);
+        Assert.DoesNotContain("run all tests", coderPrompt);
+        Assert.DoesNotContain("Run a TARGETED subset", testerPrompt, StringComparison.Ordinal);
+        Assert.Contains("Run a TARGETED subset of tests for your change", coderPrompt, StringComparison.Ordinal);
+    }
 }
