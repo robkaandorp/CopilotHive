@@ -865,7 +865,6 @@ internal sealed class ComposerAgentService(
             MaxConcurrentSubAgents = 4,
             DefaultTimeout = TimeSpan.FromMinutes(5),
             MaxTimeout = TimeSpan.FromMinutes(15),
-            MaxSummaryChars = 8_000,
             ClientFactory = modelId => CreateClient(modelId),
             DefaultClient = null,
             // Sub-agents are read-only: no bash, no writes, no skills.

@@ -53,7 +53,6 @@ public sealed class SharpCoderRunnerSubAgentTests
             Assert.Equal(2, result.MaxConcurrentSubAgents);
             Assert.Equal(TimeSpan.FromMinutes(5), result.DefaultTimeout);
             Assert.Equal(TimeSpan.FromMinutes(15), result.MaxTimeout);
-            Assert.Equal(8_000, result.MaxSummaryChars);
             Assert.Equal(2, result.AvailableModels.Count);
 
             Assert.Equal("model-a", result.AvailableModels[0].Id);

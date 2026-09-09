@@ -1557,7 +1557,6 @@ public sealed class ComposerAgentServiceTests
             Assert.Equal(4, subAgents.MaxConcurrentSubAgents);
             Assert.Equal(TimeSpan.FromMinutes(5), subAgents.DefaultTimeout);
             Assert.Equal(TimeSpan.FromMinutes(15), subAgents.MaxTimeout);
-            Assert.Equal(8_000, subAgents.MaxSummaryChars);
 
             // ClientFactory is set
             Assert.NotNull(subAgents.ClientFactory);

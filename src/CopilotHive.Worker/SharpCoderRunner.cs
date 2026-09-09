@@ -152,7 +152,6 @@ public sealed class SharpCoderRunner : IAgentRunner
             MaxConcurrentSubAgents = 2,
             DefaultTimeout = TimeSpan.FromMinutes(5),
             MaxTimeout = TimeSpan.FromMinutes(15),
-            MaxSummaryChars = 8_000,
         };
 
         foreach (var m in _subAgentModels)

@@ -160,7 +160,6 @@ public class BrainActorSubAgentTests
             Assert.Equal(2, options.MaxConcurrentSubAgents);
             Assert.Equal(TimeSpan.FromMinutes(5), options.DefaultTimeout);
             Assert.Equal(TimeSpan.FromMinutes(15), options.MaxTimeout);
-            Assert.Equal(8_000, options.MaxSummaryChars);
             Assert.NotNull(options.ClientFactory);
             Assert.Null(options.DefaultClient);
             Assert.False(options.DefaultEnableBash);

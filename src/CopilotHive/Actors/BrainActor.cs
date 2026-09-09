@@ -400,7 +400,6 @@ internal sealed class BrainActor : Actor<IBrainMessage>
             MaxConcurrentSubAgents = 2,
             DefaultTimeout = TimeSpan.FromMinutes(5),
             MaxTimeout = TimeSpan.FromMinutes(15),
-            MaxSummaryChars = 8_000,
             ClientFactory = modelId => _chatClientFactory(modelId),
             DefaultClient = null,
             DefaultEnableBash = false,
