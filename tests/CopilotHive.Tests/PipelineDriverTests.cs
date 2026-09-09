@@ -1081,6 +1081,597 @@ public sealed class PipelineDriverWorkerOutputTests
 }
 
 /// <summary>
+/// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/> recognizes an EXPLICIT Improver
+/// skip — the exact triple of Completed outcome, Improve phase, and case-insensitive SKIP
+/// verdict — records <see cref="PhaseOutcome.Skip"/> on the existing phase entry with the
+/// complete selected report, omits the post-Improve config-repo sync for that result only,
+/// and still advances through the existing nonblocking Improve transition.
+/// </summary>
+public sealed class PipelineDriverImproveSkipTests
+{
+    // ── Test 1: explicit SKIP verdict on Improve → PhaseOutcome.Skip, no sync, full report ──
+
+    [Theory]
+    [InlineData("SKIP")]
+    [InlineData("skip")]
+    [InlineData("Skip")]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_RecordsSkipOnExistingEntryAndSkipsSync(string verdictText)
+    {
+        // Arrange: pipeline in Improve with a seeded phase entry; sync counter proves the
+        // post-Improve config-repo sync is omitted for this result.
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
+        const string summary = "SKIP REASON: agents.md guidance update was unsuccessful — the edit "
+            + "conflicted with the immutable constitution rules, so the update was aborted. "
+            + "TAIL-EVIDENCE: the full reason must be retained verbatim with no truncation.";
+        var rawOutput = "DIFFERENT-RAW-OUTPUT:should-not-be-selected";
+
+        // Act
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = verdictText, Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // Assert: the EXISTING entry records the skip — PhaseOutcome.Skip, completion timestamp,
+        // the structured verdict, and the complete selected report (summary wins over raw output).
+        Assert.Equal(PhaseOutcome.Skip, entry.Result);
+        Assert.NotNull(entry.CompletedAt);
+        Assert.Equal(verdictText, entry.Verdict);
+        Assert.Equal(summary, entry.WorkerOutput);
+        Assert.NotEqual(rawOutput, entry.WorkerOutput);
+
+        // Assert: the goal did NOT fail on the Improve phase — the nonblocking transition
+        // advanced past Improve (into Merging; CoderBranch is unset so Merging then fails
+        // the goal, which is the pre-existing merge contract, not the skip recording).
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+
+        // Assert: NO sync call for a skipped result, and no success announcement side effect
+        // (a sync would be the visible "guidance updated" behavior).
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 2: raw-output fallback on the skip path preserves the raw output verbatim ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkipWithoutSummary_PreservesRawOutputVerbatim()
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+        var rawOutput = "SKIP-RAW-REPORT: the agents.md update could not be completed because the "
+            + "analysis produced no actionable guidance changes. " + new string('r', 5_000)
+            + " TAIL-EVIDENCE-AT-END: full raw output must survive.";
+        Assert.True(rawOutput.Length > 4_000);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-raw",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "skip" },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PhaseOutcome.Skip, entry.Result);
+        Assert.Equal(rawOutput, entry.WorkerOutput);
+        Assert.Equal(0, syncCount[0]);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+    }
+
+    // ── Test 3: ordinary successful Improve still syncs ──────────────────
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproveSucceeds_StillSyncsAgents()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-success",
+            Status = TaskOutcome.Completed,
+            Output = "guidance updated successfully",
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "agents.md updated." },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PhaseOutcome.Pass, entry.Result);
+        Assert.Equal("agents.md updated.", entry.WorkerOutput);
+        Assert.Equal(1, syncCount[0]);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+    }
+
+    // ── Test 4: SKIP verdict outside Improve (Testing) is NOT a skip ─────
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenNonImprovePhaseReportsSkip_TreatedAsNormalSuccess()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver(
+            phase: GoalPhase.Testing);
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-testing-skip-verdict",
+            Status = TaskOutcome.Completed,
+            Output = "tests ran",
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = "testing summary" },
+        }, TestContext.Current.CancellationToken);
+
+        // The exact triple is not met (phase is Testing): normal successful recording applies.
+        Assert.Equal(PhaseOutcome.Pass, entry.Result);
+        Assert.Equal("testing summary", entry.WorkerOutput);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+    }
+
+    // ── Test 5: skipped Improver prose with PASS verdict is NOT a skip ───
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproveProseMentionsSkip_PassVerdictIsNotASkip()
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-prose",
+            Status = TaskOutcome.Completed,
+            Output = "I decided to skip the agents.md update this iteration.",
+            Metrics = new TaskMetrics { Verdict = "PASS", Summary = "I decided to skip the agents.md update this iteration." },
+        }, TestContext.Current.CancellationToken);
+
+        // Output prose is never interpreted as a skip signal — normal successful recording.
+        Assert.Equal(PhaseOutcome.Pass, entry.Result);
+        Assert.Equal(1, syncCount[0]);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+    }
+
+    // ── Test 6: skip keeps the existing entry identity (iteration/occurrence/prompts) ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_EntryIdentityIsPreserved()
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+        entry.WorkerPrompt = "improve worker prompt";
+        entry.BrainPrompt = "brain craft prompt";
+        var iterationBefore = pipeline.Iteration;
+        var summariesBefore = pipeline.CompletedIterationSummaries.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-identity",
+            Status = TaskOutcome.Completed,
+            Output = "skipped: no actionable guidance",
+            Metrics = new TaskMetrics { Verdict = "SKIP" },
+        }, TestContext.Current.CancellationToken);
+
+        // Same entry object, same phase/iteration/occurrence, prompts untouched.
+        Assert.Equal(PhaseOutcome.Skip, entry.Result);
+        Assert.Equal(GoalPhase.Improve, entry.Name);
+        Assert.Equal(iterationBefore, entry.Iteration);
+        Assert.Equal(1, entry.Occurrence);
+        Assert.Equal("improve worker prompt", entry.WorkerPrompt);
+        Assert.Equal("brain craft prompt", entry.BrainPrompt);
+
+        // No retry consumed. The ONLY summary added is the terminal one from
+        // FinalizeGoalAsync (Merging failed on the unset CoderBranch) — the skip path
+        // itself must NOT add a pre-terminal snapshot, which would make the count two.
+        Assert.Equal(iterationBefore, pipeline.Iteration);
+        Assert.Equal(summariesBefore + 1, pipeline.CompletedIterationSummaries.Count);
+        Assert.Equal(0, syncCount[0]);
+        // No SYNTHESIZED skip entry: the PhaseLog holds only the seeded Improve entry plus
+        // the Merging entry the existing dispatch contract created (no Improve duplicate).
+        Assert.Equal(2, pipeline.PhaseLog.Count);
+        Assert.Equal(GoalPhase.Improve, pipeline.PhaseLog[0].Name);
+        Assert.Equal(GoalPhase.Merging, pipeline.PhaseLog[1].Name);
+    }
+
+    // ── Test 7: a LONG structured summary (4000+ chars) is retained verbatim ──
+
+    [Theory]
+    [InlineData(4_000)]
+    [InlineData(4_001)]
+    [InlineData(6_000)]
+    public async Task DriveNextPhaseAsync_WhenImproverSkipSummaryExceedsLegacyCap_PreservesSummaryVerbatim(int length)
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+
+        // Distinctive evidence in every region: head, past char 4000, and the very end.
+        var summary = "SKIP-HEAD: guidance update aborted because " + new string('s', length - 53) + "SKIP-TAIL:";
+        Assert.True(summary.Length >= 4_000);
+        var rawOutput = "DIFFERENT-RAW-OUTPUT:should-not-be-selected";
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-long",
+            Status = TaskOutcome.Completed,
+            Output = rawOutput,
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // EXACT equality — not a prefix, not a length, not the legacy 4000-char cap.
+        Assert.Equal(summary, entry.WorkerOutput);
+        Assert.Equal(length, entry.WorkerOutput!.Length);
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 8: skip preserves task narratives and the conversation entry ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_CapturesNarrativesAndConversationEntry()
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+        var taskId = "task-improve-skip-narr";
+        var baseTime = new DateTime(2025, 6, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        pipeline.Narratives.Add(new NarrativeEntry
+        {
+            Timestamp = baseTime.AddSeconds(1), WorkerId = "worker-a", TaskId = taskId,
+            Content = "SKIP NARRATIVE ONE: long evidence " + new string('n', 4_100) + " TAIL-ONE",
+        });
+        pipeline.Narratives.Add(new NarrativeEntry
+        {
+            Timestamp = baseTime.AddSeconds(2), WorkerId = "worker-b", TaskId = "task-OTHER-9",
+            Content = "unrelated task narrative",
+        });
+        pipeline.Narratives.Add(new NarrativeEntry
+        {
+            Timestamp = baseTime.AddSeconds(2), WorkerId = "worker-c", TaskId = taskId,
+            Content = "SKIP NARRATIVE TWO: ... literal ellipses ... tail evidence",
+        });
+        var conversationCountBefore = pipeline.Conversation.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = taskId,
+            Status = TaskOutcome.Completed,
+            Output = "skipped: no actionable guidance changes",
+            Metrics = new TaskMetrics { Verdict = "skip" },
+        }, TestContext.Current.CancellationToken);
+
+        // Narrative snapshot: exactly the two matching entries, chronological, verbatim.
+        Assert.NotNull(entry.Narratives);
+        var captured = entry.Narratives!;
+        Assert.Equal(2, captured.Count);
+        Assert.Equal(baseTime.AddSeconds(1), captured[0].Timestamp);
+        Assert.Equal("worker-a", captured[0].WorkerId);
+        Assert.Equal(taskId, captured[0].TaskId);
+        Assert.Contains("SKIP NARRATIVE ONE", captured[0].Content);
+        Assert.Contains("TAIL-ONE", captured[0].Content); // no truncation of the narrative
+        Assert.Equal(baseTime.AddSeconds(2), captured[1].Timestamp);
+        Assert.Equal("worker-c", captured[1].WorkerId);
+        Assert.Equal("SKIP NARRATIVE TWO: ... literal ellipses ... tail evidence", captured[1].Content);
+
+        // The worker-output conversation entry is still appended for the skip result.
+        Assert.Equal(conversationCountBefore + 1, pipeline.Conversation.Count);
+        var conversationEntry = Assert.Single(pipeline.Conversation, c => c.Purpose == "worker-output");
+        Assert.Equal("improver", conversationEntry.Role);
+        Assert.Equal(pipeline.Iteration, conversationEntry.Iteration);
+        Assert.Contains("skip", conversationEntry.Content);
+
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 9: skip consumes no retry and adds no duplicate summary/status write ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_ConsumesNoRetryAndWritesNoDuplicate()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
+        var iterationBefore = pipeline.Iteration;
+        var summariesBefore = pipeline.CompletedIterationSummaries.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-budget",
+            Status = TaskOutcome.Completed,
+            Output = "skipped: analysis produced no changes",
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = "skipped the guidance update" },
+        }, TestContext.Current.CancellationToken);
+
+        // No retry consumed — review AND iteration budgets both untouched.
+        Assert.Equal(0, pipeline.ReviewRetryBudget.Used);
+        Assert.Equal(0, pipeline.IterationBudget.Used);
+        Assert.Equal(iterationBefore, pipeline.Iteration);
+
+        // Exactly ONE summary added — the terminal one from FinalizeGoalAsync (Merging failed
+        // on the unset CoderBranch). The skip path itself added NO pre-terminal snapshot.
+        Assert.Equal(summariesBefore + 1, pipeline.CompletedIterationSummaries.Count);
+
+        // Exactly ONE status write — the terminal Failed one. The skip path itself performed
+        // no InProgress status write, no iteration-summary write, and no notes write.
+        var failedUpdate = Assert.Single(goalStore.StatusUpdates);
+        Assert.Equal(GoalStatus.Failed, failedUpdate.Status);
+        Assert.Equal("No coder branch set", failedUpdate.Metadata?.FailureReason ?? pipeline.Goal.FailureReason);
+
+        // The failure came from the pre-existing Merging contract, NOT the skip: the Improve
+        // entry is the ONLY phase bookkeeping the skip changed.
+        Assert.Equal(PhaseOutcome.Skip, entry.Result);
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 10: next planned phase is dispatched exactly once ───────────
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_DispatchesNextPlannedPhaseExactlyOnce()
+    {
+        var (driver, pipeline, entry, syncCount, _) = CreateImproveDriver();
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-dispatch",
+            Status = TaskOutcome.Completed,
+            Output = "skipped",
+            Metrics = new TaskMetrics { Verdict = "Skip" },
+        }, TestContext.Current.CancellationToken);
+
+        // The nonblocking Improve transition advanced into the NEXT planned phase (Merging) and
+        // DispatchPhaseAsync appended EXACTLY ONE new entry for it — no duplicate dispatch.
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Equal(phaseLogCountBefore + 1, pipeline.PhaseLog.Count);
+        var mergingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Merging);
+        Assert.Equal(pipeline.Iteration, mergingEntry.Iteration);
+        Assert.Equal(1, mergingEntry.Occurrence);
+        // The Improve entry was not duplicated by the advancement.
+        Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Improve);
+        Assert.Equal(PhaseOutcome.Skip, entry.Result);
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 11: a FAILED Improve result keeps its terminal failure behavior ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproveResultIsFailed_KeepsTerminalFailureBehavior()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
+        const string diagnostic = "improver crashed before writing any guidance";
+
+        // A FAILED result with a SKIP verdict in its metrics must NEVER gain the skip treatment:
+        // the failed-worker early exit runs before verdict extraction.
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-failed",
+            Status = TaskOutcome.Failed,
+            Output = diagnostic,
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = "should not be consulted" },
+        }, TestContext.Current.CancellationToken);
+
+        // Existing terminal behavior: raw diagnostic on the entry, Fail outcome, goal failed.
+        Assert.Equal(PhaseOutcome.Fail, entry.Result);
+        Assert.Equal(diagnostic, entry.WorkerOutput);
+        Assert.NotEqual("should not be consulted", entry.WorkerOutput);
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+        Assert.Equal(GoalPhase.Failed, pipeline.Phase);
+        Assert.Equal(0, syncCount[0]);
+    }
+
+    // ── Test 12: a CANCELLED Improve result with a SKIP verdict is NOT a skip ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproveResultIsCancelledWithSkipVerdict_KeepsExistingBehavior()
+    {
+        var (driver, pipeline, entry, syncCount, goalStore) = CreateImproveDriver();
+
+        // The recognition triple requires TaskOutcome.Completed; a Cancelled outcome keeps the
+        // existing mapping (verdict SKIP is not a FAIL/CANCELLED/REQUEST_CHANGES verdict, so the
+        // pre-existing code path records a Pass and still syncs — unchanged by this slice).
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-cancelled",
+            Status = TaskOutcome.Cancelled,
+            Output = "task was cancelled",
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = "cancelled before completion" },
+        }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(PhaseOutcome.Pass, entry.Result);
+        Assert.NotEqual(PhaseOutcome.Skip, entry.Result);
+        Assert.Equal(1, syncCount[0]);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+    }
+
+    // ── Test 13: a Completed Improve result with NO matching entry must not throw ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverSkipsWithNoMatchingEntry_NoExceptionNoSynthesizedEntry()
+    {
+        var (driver, pipeline, _, syncCount, goalStore) = CreateImproveDriver();
+
+        // Remove the seeded Improve entry so CurrentPhaseEntry resolves to nothing.
+        pipeline.PhaseLog.Clear();
+        var phaseLogCountBefore = pipeline.PhaseLog.Count;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-noentry",
+            Status = TaskOutcome.Completed,
+            Output = "skipped: no actionable guidance",
+            Metrics = new TaskMetrics { Verdict = "SKIP" },
+        }, TestContext.Current.CancellationToken);
+
+        // No synthetic Improve entry was created and nothing threw — the existing
+        // `CurrentPhaseEntry is { }` guard absorbed the missing entry; the only PhaseLog
+        // addition is the Merging entry from the normal next-phase dispatch.
+        Assert.Equal(phaseLogCountBefore + 1, pipeline.PhaseLog.Count);
+        Assert.DoesNotContain(pipeline.PhaseLog, e => e.Name == GoalPhase.Improve);
+        Assert.Equal(GoalPhase.Merging, pipeline.StateMachine.Phase);
+        Assert.Equal(0, syncCount[0]);
+        // The goal still reached its terminal state through the pre-existing Merging contract.
+        Assert.Contains(goalStore.StatusUpdates, u => u.Status == GoalStatus.Failed);
+    }
+
+    // ── Test 14: REAL persistence — driver → lifecycle → SQLite iteration readback ──
+
+    [Fact]
+    public async Task DriveNextPhaseAsync_WhenImproverReportsSkip_PersistsSkipOutcomeThroughSqliteReadback()
+    {
+        using var dbContext = CopilotHiveDbContext.CreateInMemory();
+        var (driver, pipeline, goalStore, syncCount) = await CreateSqliteImproveDriver(dbContext);
+        var improveEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Improve);
+
+        const string summaryHead = "SKIP REASON: the agents.md guidance update was unsuccessful because the ";
+        const string summaryTail = "MUTATION-EVIDENCE-BEYOND-4000-AND-AT-END: full reason stored verbatim.";
+        var summary = summaryHead + new string('g', 4_500) + summaryTail;
+
+        await driver.DriveNextPhaseAsync(pipeline, new TaskResult
+        {
+            TaskId = "task-improve-skip-sqlite",
+            Status = TaskOutcome.Completed,
+            Output = "DIFFERENT-RAW-OUTPUT:should-not-be-persisted",
+            Metrics = new TaskMetrics { Verdict = "SKIP", Summary = summary },
+        }, TestContext.Current.CancellationToken);
+
+        // In-memory entry first: the skip recording landed on the seeded entry.
+        Assert.Equal(PhaseOutcome.Skip, improveEntry.Result);
+        Assert.Equal(summary, improveEntry.WorkerOutput);
+        Assert.Equal(0, syncCount[0]);
+
+        // REAL READBACK: the terminal Failed write from FinalizeGoalAsync (the pre-existing
+        // Merging null-CoderBranch contract) carried the iteration summary through the REAL
+        // GoalStore persistence chain. The persisted phase record proves the skip outcome
+        // reached SQLite — not a manufactured summary.
+        dbContext.ChangeTracker.Clear();
+        var summaries = await goalStore.GetIterationsAsync(pipeline.GoalId, TestContext.Current.CancellationToken);
+        var persisted = Assert.Single(summaries);
+        var persistedImprove = Assert.Single(persisted.Phases, p => p.Name == GoalPhase.Improve);
+        Assert.Equal(PhaseOutcome.Skip, persistedImprove.Result);
+        Assert.Equal("SKIP", persistedImprove.Verdict);
+        Assert.Equal(summary, persistedImprove.WorkerOutput);
+        Assert.NotNull(persistedImprove.CompletedAt);
+
+        // The generic skipped note plus the full stored reason: the iteration summary note
+        // names the skip, and the phase record carries the complete reason.
+        Assert.Contains(persisted.Notes, n => n.StartsWith("improver skipped:", StringComparison.Ordinal));
+        Assert.Equal(summary, persisted.PhaseOutputs["improver-1"]);
+        Assert.Equal(summary, persisted.PhaseOutputs["improver-1-1"]);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a <see cref="PipelineDriver"/> with the pipeline positioned in
+    /// <paramref name="phase"/> (Improve by default). For the Improve phase the plan is
+    /// <c>[Improve, Merging]</c> because the state machine requires plans to end with Merging;
+    /// the follow-up Merging phase then fails the goal via the pre-existing null-CoderBranch
+    /// contract — the tests assert on the Improve entry and the transition position, not on
+    /// goal completion. Carries a counting <c>syncAgents</c> seam.
+    /// </summary>
+    internal static (PipelineDriver Driver, GoalPipeline Pipeline, PhaseResult Entry, int[] SyncCount, PipelineDriverNoOpRetryTests.IterationCapturingGoalStore Store)
+        CreateImproveDriver(GoalPhase phase = GoalPhase.Improve)
+    {
+        var goal = new Goal { Id = $"goal-improve-skip-{Guid.NewGuid():N}", Description = "Improve skip recording test" };
+        var goalStore = new PipelineDriverNoOpRetryTests.IterationCapturingGoalStore(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        // The state machine requires plans to end with Merging; the follow-up Merging phase
+        // fails the goal via the pre-existing null-CoderBranch contract. The tests assert on
+        // the <paramref name="phase"/> entry and the transition position, not goal completion.
+        var plan = new IterationPlan { Phases = [phase, GoalPhase.Merging] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, phase);
+        pipeline.AdvanceTo(phase);
+        goalStore.Pipeline = pipeline;
+
+        // The seeded entry the completion lands on — CurrentPhaseEntry resolves to this.
+        var entry = PhaseResult.Create(phase, pipeline.Iteration, 1);
+        pipeline.PhaseLog.Add(entry);
+
+        // Boxed counter so the lambda's increments are visible to the caller after return.
+        var syncCount = new int[1];
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var driver = new PipelineDriver(
+            brain: new PipelineDriverNoOpRetryTests.NoOpRetryFakeBrain(),
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("improve prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ =>
+            {
+                Interlocked.Increment(ref syncCount[0]);
+                return Task.CompletedTask;
+            },
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return (driver, pipeline, entry, syncCount, goalStore);
+    }
+
+    /// <summary>
+    /// REAL-persistence variant of <see cref="CreateImproveDriver"/>: wires the SAME
+    /// Improve-positioned pipeline (plan <c>[Improve, Merging]</c>, seeded entry, counting
+    /// sync seam) to a REAL SQLite <see cref="GoalStore"/> — the goal is created in the store
+    /// and registered as a source, mirroring GoalDispatchService's GetNextGoalAsync +
+    /// InProgress write, so the driver's lifecycle finalization persists through the actual
+    /// storage chain instead of a recording stub.
+    /// </summary>
+    internal static async Task<(PipelineDriver Driver, GoalPipeline Pipeline, GoalStore Store, int[] SyncCount)>
+        CreateSqliteImproveDriver(CopilotHiveDbContext dbContext)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var goalStore = new GoalStore(dbContext, NullLogger<GoalStore>.Instance);
+        var goal = new Goal
+        {
+            Id = $"goal-improve-skip-sqlite-{Guid.NewGuid():N}",
+            Description = "Improve skip recording SQLite readback test",
+            RepositoryNames = ["CopilotHive"],
+        };
+        await goalStore.CreateGoalAsync(goal, ct);
+
+        var goalManager = new GoalManager();
+        goalManager.AddSource(goalStore);
+        // Mirror the production admission: register the goal as a source (Pending), then write
+        // InProgress so the later terminal status update applies to the stored row.
+        Assert.Equal(goal.Id, (await goalManager.GetNextGoalAsync(ct))?.Id);
+        await goalManager.UpdateGoalStatusAsync(goal.Id, GoalStatus.InProgress,
+            new GoalUpdateMetadata { StartedAt = DateTime.UtcNow }, ct);
+
+        var pipeline = new GoalPipelineManager().CreatePipeline(goal, maxRetries: 3, maxIterations: 5);
+        // The state machine requires plans to end with Merging; the follow-up Merging phase
+        // fails the goal via the pre-existing null-CoderBranch contract, whose FinalizeGoalAsync
+        // write is the real persistence event the readback asserts against.
+        var plan = new IterationPlan { Phases = [GoalPhase.Improve, GoalPhase.Merging] };
+        pipeline.SetPlan(plan);
+        pipeline.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Improve);
+        pipeline.AdvanceTo(GoalPhase.Improve);
+
+        // The seeded entry the completion must land on.
+        pipeline.PhaseLog.Add(PhaseResult.Create(GoalPhase.Improve, pipeline.Iteration, 1));
+
+        var syncCount = new int[1];
+        var lifecycleService = new GoalLifecycleService(goalManager, NullLogger<GoalLifecycleService>.Instance);
+
+        var driver = new PipelineDriver(
+            brain: new PipelineDriverNoOpRetryTests.NoOpRetryFakeBrain(),
+            lifecycleService: lifecycleService,
+            goalManager: goalManager,
+            repoManager: new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+            improvementAnalyzer: null,
+            agentsManager: null,
+            metricsTracker: null,
+            dispatchToRole: (_, _, _, _) => Task.CompletedTask,
+            resolvePrompt: (_, _, _, _) => Task.FromResult("improve prompt"),
+            resolvePlan: (_, _, _) => Task.FromResult(PlanResult.Success(IterationPlan.Default())),
+            resolveRepositories: _ => [],
+            syncAgents: _ =>
+            {
+                Interlocked.Increment(ref syncCount[0]);
+                return Task.CompletedTask;
+            },
+            generateMergeCommitMessage: (_, _) => Task.FromResult("message"),
+            logger: NullLogger<PipelineDriver>.Instance);
+
+        return (driver, pipeline, goalStore, syncCount);
+    }
+}
+
+/// <summary>
 /// Tests that <see cref="PipelineDriver.DriveNextPhaseAsync"/>'s no-op coder retry path
 /// persists the no-op iteration summary (with Coding marked failed) BEFORE consuming the
 /// iteration budget, so the iteration stays visible in the dashboard tab bar — the same
@@ -2431,7 +3022,7 @@ public sealed class PipelineDriverNoOpRetryTests
     }
 
     /// <summary>Minimal brain stub that returns the default plan.</summary>
-    private sealed class NoOpRetryFakeBrain : IDistributedBrain
+    internal sealed class NoOpRetryFakeBrain : IDistributedBrain
     {
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 

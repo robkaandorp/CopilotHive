@@ -22,6 +22,9 @@ public static class Verdict
     /// <summary>Reviewer requested changes before the work can be accepted.</summary>
     public const string RequestChanges = "REQUEST_CHANGES";
 
+    /// <summary>Improver explicitly skipped its agents.md guidance update.</summary>
+    public const string Skip = "SKIP";
+
     /// <summary>
     /// Returns <c>true</c> if the verdict matches the expected value,
     /// using case-insensitive comparison to handle worker variability.

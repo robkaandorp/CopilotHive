@@ -417,6 +417,15 @@ internal sealed class PipelineDriver
         var outputSummary = PipelineHelpers.BuildWorkerOutputSummary(pipeline.Phase, verdict, result);
         pipeline.Conversation.Add(new ConversationEntry(workerRole, outputSummary, pipeline.Iteration, "worker-output"));
 
+        // An explicit Improver skip is recognized ONLY when the task completed, the pipeline is
+        // on the Improve phase, and the worker reported the structured SKIP verdict. Output
+        // prose is never interpreted as a skip signal; other roles and other verdicts are
+        // untouched. The full reason stays in the stored phase report — nothing is truncated.
+        var isSkippedImprovement =
+            result.Status == TaskOutcome.Completed &&
+            pipeline.Phase == GoalPhase.Improve &&
+            Verdict.Matches(verdict, Verdict.Skip);
+
         // Snapshot the narratives already received for this task and attach them to the last
         // matching phase entry — before the advancement/bookkeeping continues. This is the
         // single append-attempt site for the normal completion path.
@@ -425,12 +434,21 @@ internal sealed class PipelineDriver
         // Append worker narratives for the completed phase to the living progress document.
         await AppendPhaseNarrativesAsync(pipeline, result, workerRole, ct);
 
-        // After Improver: sync config repo to pick up the changes it pushed directly
-        if (pipeline.Phase == GoalPhase.Improve)
+        // After Improver: sync config repo to pick up the changes it pushed directly.
+        // Omitted when the Improver explicitly skipped — there are no pushed changes to sync,
+        // and announcing a sync would wrongly imply the guidance was updated.
+        if (pipeline.Phase == GoalPhase.Improve && !isSkippedImprovement)
         {
             _logger.LogInformation("Improver completed for goal {GoalId} — syncing config repo for updated agents.md files",
                 pipeline.GoalId);
             await _syncAgents(ct);
+        }
+
+        if (isSkippedImprovement)
+        {
+            _logger.LogWarning(
+                "Improver for goal {GoalId} explicitly skipped its agents.md guidance update — continuing without publishing",
+                pipeline.GoalId);
         }
 
         // Map verdict to PhaseInput directly — no Brain interpretation needed
@@ -464,7 +482,16 @@ internal sealed class PipelineDriver
                 : result.Output;
             // Preserve the entire worker report for all phases — the authoritative phase output.
             logEntry.WorkerOutput = workerOutput;
-            logEntry.Result = phaseInput == PhaseInput.Succeeded ? PhaseOutcome.Pass : PhaseOutcome.Fail;
+            if (isSkippedImprovement)
+            {
+                // Explicit Improver skip recorded on the existing entry — the complete selected
+                // report is retained above; no truncation and no synthesized entry.
+                logEntry.Result = PhaseOutcome.Skip;
+            }
+            else
+            {
+                logEntry.Result = phaseInput == PhaseInput.Succeeded ? PhaseOutcome.Pass : PhaseOutcome.Fail;
+            }
         }
 
         // State machine transition
