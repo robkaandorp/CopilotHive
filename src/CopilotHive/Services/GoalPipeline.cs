@@ -666,7 +666,21 @@ public sealed class GoalPipeline
         {
             // The prospective attempt is READ but not yet committed, so every refusal below
             // still leaves the counter exactly where it was.
-            var attempt = _dispatchAttempts.TryGetValue(position, out var previous) ? previous + 1 : 1;
+            var previous = _dispatchAttempts.TryGetValue(position, out var stored) ? stored : 0;
+            int attempt;
+            try
+            {
+                // CHECKED: an int.MaxValue high-water entry is legal to restore but exhausted —
+                // the wrap must throw, not roll over to a negative attempt.
+                attempt = checked(previous + 1);
+            }
+            catch (OverflowException)
+            {
+                // Exhausted counter: refuse WITHOUT mutating either dictionary.
+                throw new InvalidOperationException(
+                    $"Dispatch attempt counter for position {position} has reached int.MaxValue and cannot advance.");
+            }
+
             var taskId = $"{goalId}-{roleName}-{position.Iteration:D3}-{position.Occurrence:D2}-{attempt:D3}";
 
             if (_slots.ContainsKey(taskId))
@@ -730,7 +744,22 @@ public sealed class GoalPipeline
                 throw new WorkSlotException(WorkSlotEvent.DoubleAssignment, position, entry.Slot.TaskId);
             }
 
-            var attempt = _dispatchAttempts.TryGetValue(position, out var previous) ? previous + 1 : 1;
+            var previous = _dispatchAttempts.TryGetValue(position, out var stored) ? stored : 0;
+            int attempt;
+            try
+            {
+                // CHECKED: an int.MaxValue high-water entry is legal to restore but exhausted —
+                // the wrap must throw, not roll over to a negative attempt.
+                attempt = checked(previous + 1);
+            }
+            catch (OverflowException)
+            {
+                // Exhausted counter: refuse WITHOUT mutating either dictionary. The live-position
+                // scans above have already passed, but no state was changed by them.
+                throw new InvalidOperationException(
+                    $"Dispatch attempt counter for position {position} has reached int.MaxValue and cannot advance.");
+            }
+
             _dispatchAttempts[position] = attempt;
             _slots[taskId] = (new WorkSlot(taskId, position, attempt), WorkSlotState.Pending);
 
@@ -1117,6 +1146,220 @@ public sealed class GoalPipeline
         }
     }
 
+    /// <summary>
+    /// Captures the ENTIRE work-slot registry — both <see cref="_slots"/> and
+    /// <see cref="_dispatchAttempts"/> — as a detached, immutable
+    /// <see cref="WorkSlotRegistrySnapshot"/> in ONE <c>_lock</c> acquisition.
+    /// <para>
+    /// The snapshot REUSES the existing immutable domain values: each slot becomes an
+    /// <see cref="WorkSlotView"/> (the same shape <see cref="GetSlotsForTest"/> emits) and each
+    /// per-position attempt high-water entry is carried as a
+    /// <see cref="WorkSlotRegistryAttemptEntry"/>. No mutable registry storage is exposed, no
+    /// task IDs are parsed, and no identity is reconstructed — the entries are exactly the
+    /// values the registry holds at the capture instant. Entry order is not contractual.
+    /// </para>
+    /// </summary>
+    /// <returns>A detached snapshot of both dictionaries.</returns>
+    internal WorkSlotRegistrySnapshot CaptureRegistry()
+    {
+        lock (_lock)
+        {
+            var slots = new List<WorkSlotView>(_slots.Count);
+            foreach (var (_, entry) in _slots)
+                slots.Add(new WorkSlotView(entry.Slot, entry.State));
+
+            var attempts = new List<WorkSlotRegistryAttemptEntry>(_dispatchAttempts.Count);
+            foreach (var (position, highWater) in _dispatchAttempts)
+                attempts.Add(new WorkSlotRegistryAttemptEntry(position, highWater));
+
+            return new WorkSlotRegistrySnapshot(slots, attempts);
+        }
+    }
+
+    /// <summary>
+    /// Restores the ENTIRE work-slot registry from a detached
+    /// <see cref="WorkSlotRegistrySnapshot"/> — both dictionaries, atomically, in ONE
+    /// <c>_lock</c> span.
+    /// <para>
+    /// THE TWO-PHASE CONTRACT: ALL input is copied and validated BEFORE anything is installed.
+    /// Every malformed entry throws <see cref="ArgumentNullException"/> or
+    /// <see cref="ArgumentException"/> with the target registry completely unchanged — including
+    /// when the invalid entry is encountered LATE in the input. No partial installs.
+    /// </para>
+    /// <para>
+    /// THE EMPTY-TARGET CONTRACT: both the slot registry and the attempt counters of the target
+    /// must be empty. A nonempty target — including a counter-only one where
+    /// <see cref="_dispatchAttempts"/> has entries but <see cref="_slots"/> is empty — is rejected
+    /// with <see cref="InvalidOperationException"/> WITHOUT clearing or merging its state.
+    /// </para>
+    /// <para>
+    /// THE VALUES ARE PRESERVED, NOT RECOMPUTED: slots are installed with their captured
+    /// <see cref="WorkSlotState"/> exactly (Claimed stays Claimed, Recorded stays Recorded,
+    /// Abandoned stays Abandoned) and high-water entries are installed EXACTLY as given —
+    /// including counter-only entries (no slot at that position) and entries HIGHER than any
+    /// slot's attempt. Nothing is renumbered, incremented, or inferred; contiguous attempt
+    /// history is not required. No allocation method and no test-only reset/seeding helper is
+    /// used. EVERY position — a slot's or a counter-only entry's — must have a positive
+    /// iteration, a positive occurrence and a defined <see cref="GoalPhase"/>. Cross-checks
+    /// performed: duplicate task IDs (ordinal), duplicate high-water positions, duplicate
+    /// (position, attempt) slot allocations, multiple live (Pending or Claimed) slots at one
+    /// position, and every slot having a high-water entry at its position that is
+    /// <c>&gt;=</c> its own attempt. Historical positions are NEVER compared against the current
+    /// plan or machine phase — that is the future storage caller's responsibility.
+    /// </para>
+    /// </summary>
+    /// <param name="snapshot">The detached snapshot to restore from.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="snapshot"/>, one of its
+    /// collections, or a required member is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">Any entry is malformed, duplicated, or violates a
+    /// cross-entry invariant.</exception>
+    /// <exception cref="InvalidOperationException">The target registry is not empty.</exception>
+    internal void RestoreRegistry(WorkSlotRegistrySnapshot? snapshot)
+    {
+        // ── PHASE 1: COPY + VALIDATE EVERYTHING, TOUCHING NO REGISTRY STATE. ──
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        var slotViews = snapshot.Slots;
+        var attemptEntries = snapshot.DispatchAttempts;
+        ArgumentNullException.ThrowIfNull(slotViews);
+        ArgumentNullException.ThrowIfNull(attemptEntries);
+
+        var slotsToInstall = new List<(WorkSlot Slot, WorkSlotState State)>(slotViews.Count);
+        var seenTaskIds = new HashSet<string>(StringComparer.Ordinal);
+        var seenLivePositions = new HashSet<WorkSlotPosition>();
+        var seenAllocations = new HashSet<(WorkSlotPosition Position, int Attempt)>();
+
+        foreach (var view in slotViews)
+        {
+            if (view is null)
+                throw new ArgumentException("Snapshot contains a null slot entry.", nameof(snapshot));
+            if (view.Slot is null)
+                throw new ArgumentException("Snapshot contains a slot entry with a null slot.", nameof(snapshot));
+
+            var slot = view.Slot;
+            if (string.IsNullOrWhiteSpace(slot.TaskId))
+                throw new ArgumentException(
+                    $"Snapshot slot entry has a null or blank task ID ('{slot.TaskId}').", nameof(snapshot));
+            if (slot.Position is null)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has a null position.", nameof(snapshot));
+
+            var position = slot.Position;
+            if (position.Iteration <= 0)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has a non-positive iteration {position.Iteration}.",
+                    nameof(snapshot));
+            if (position.Occurrence <= 0)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has a non-positive occurrence {position.Occurrence}.",
+                    nameof(snapshot));
+            if (!Enum.IsDefined(position.Phase))
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has an undefined phase {position.Phase}.",
+                    nameof(snapshot));
+            if (slot.Attempt <= 0)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has a non-positive attempt {slot.Attempt}.",
+                    nameof(snapshot));
+            if (!Enum.IsDefined(view.State))
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has an undefined state {view.State}.", nameof(snapshot));
+
+            if (!seenTaskIds.Add(slot.TaskId))
+                throw new ArgumentException(
+                    $"Snapshot contains duplicate task ID '{slot.TaskId}'.", nameof(snapshot));
+
+            // DUPLICATE ALLOCATION: two distinct task IDs can never own the SAME attempt at the
+            // SAME position — each allocation stamps a unique (position, attempt) pair, so a
+            // repeat means the input's allocation history is corrupt. Dead slots included.
+            if (!seenAllocations.Add((position, slot.Attempt)))
+                throw new ArgumentException(
+                    $"Snapshot contains duplicate (position, attempt) allocation " +
+                    $"({position}, {slot.Attempt}) for task '{slot.TaskId}'.", nameof(snapshot));
+
+            if (view.State is WorkSlotState.Pending or WorkSlotState.Claimed
+                && !seenLivePositions.Add(position))
+            {
+                throw new ArgumentException(
+                    $"Snapshot contains multiple live slots at position {position}.", nameof(snapshot));
+            }
+
+            slotsToInstall.Add((slot, view.State));
+        }
+
+        var attemptsToInstall = new List<(WorkSlotPosition Position, int HighWater)>(attemptEntries.Count);
+        var seenPositions = new HashSet<WorkSlotPosition>();
+
+        foreach (var entry in attemptEntries)
+        {
+            if (entry is null)
+                throw new ArgumentException("Snapshot contains a null attempt entry.", nameof(snapshot));
+            if (entry.Position is null)
+                throw new ArgumentException("Snapshot attempt entry has a null position.", nameof(snapshot));
+
+            // THE SAME POSITION MATRIX AS THE SLOTS: a counter-only entry carries a position
+            // too, and an entry with a nonpositive iteration/occurrence or an undefined phase is
+            // just as malformed there as it is on a slot.
+            var entryPosition = entry.Position;
+            if (entryPosition.Iteration <= 0)
+                throw new ArgumentException(
+                    $"Snapshot attempt entry has a non-positive iteration {entryPosition.Iteration}.",
+                    nameof(snapshot));
+            if (entryPosition.Occurrence <= 0)
+                throw new ArgumentException(
+                    $"Snapshot attempt entry has a non-positive occurrence {entryPosition.Occurrence}.",
+                    nameof(snapshot));
+            if (!Enum.IsDefined(entryPosition.Phase))
+                throw new ArgumentException(
+                    $"Snapshot attempt entry has an undefined phase {entryPosition.Phase}.",
+                    nameof(snapshot));
+
+            if (entry.HighWaterAttempt <= 0)
+                throw new ArgumentException(
+                    $"Snapshot attempt entry for position {entryPosition} has a non-positive " +
+                    $"high-water {entry.HighWaterAttempt}.", nameof(snapshot));
+
+            if (!seenPositions.Add(entryPosition))
+                throw new ArgumentException(
+                    $"Snapshot contains duplicate attempt entries for position {entryPosition}.",
+                    nameof(snapshot));
+
+            attemptsToInstall.Add((entryPosition, entry.HighWaterAttempt));
+        }
+
+        // CROSS-ENTRY INVARIANT: every slot must have a high-water entry at its position that
+        // is >= its own attempt. Counter-only entries (no slot) are fine; a slot without its
+        // counter is not. (A List-based lookup keeps the ONLY dictionary touches in this method
+        // inside the locked install span.)
+        foreach (var (slot, _) in slotsToInstall)
+        {
+            var highWaterEntry = attemptsToInstall.Find(a => a.Position == slot.Position);
+            if (highWaterEntry.Position is null)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has no attempt entry for its position {slot.Position}.",
+                    nameof(snapshot));
+            if (highWaterEntry.HighWater < slot.Attempt)
+                throw new ArgumentException(
+                    $"Snapshot slot '{slot.TaskId}' has attempt {slot.Attempt} exceeding its " +
+                    $"position's high-water {highWaterEntry.HighWater} at {slot.Position}.", nameof(snapshot));
+        }
+
+        // ── PHASE 2: INSTALL, in ONE _lock span, with no other lock taken. ──
+        lock (_lock)
+        {
+            if (_slots.Count > 0 || _dispatchAttempts.Count > 0)
+                throw new InvalidOperationException(
+                    "Cannot restore a work-slot registry snapshot into a nonempty registry: the " +
+                    "slot registry and attempt counters must both be empty.");
+
+            foreach (var (slot, state) in slotsToInstall)
+                _slots[slot.TaskId] = (slot, state);
+
+            foreach (var (position, highWater) in attemptsToInstall)
+                _dispatchAttempts[position] = highWater;
+        }
+    }
+
     #endregion
 
     /// <summary>Returns a human-friendly display name for the given <see cref="GoalPhase"/>.</summary>
@@ -1266,6 +1509,31 @@ internal enum SlotRetirementOutcome
 /// <param name="Slot">The slot that was observed.</param>
 /// <param name="State">The state the slot was in when observed.</param>
 internal sealed record WorkSlotView(WorkSlot Slot, WorkSlotState State);
+
+/// <summary>
+/// A detached per-position dispatch-attempt high-water entry: the position and the highest
+/// attempt number ever allocated for it. Immutable — reused verbatim from the registry during
+/// capture and installed verbatim during restore.
+/// </summary>
+/// <param name="Position">The iteration/phase/occurrence position the counter belongs to.</param>
+/// <param name="HighWaterAttempt">The highest attempt number allocated for the position.</param>
+internal sealed record WorkSlotRegistryAttemptEntry(WorkSlotPosition Position, int HighWaterAttempt);
+
+/// <summary>
+/// A detached, point-in-time snapshot of an entire work-slot registry: the slot entries and the
+/// per-position attempt high-water entries, captured together under the registry's single lock.
+/// <para>
+/// Purely a carrier of existing immutable domain values (<see cref="WorkSlot"/>,
+/// <see cref="WorkSlotPosition"/>, <see cref="WorkSlotState"/>); no task IDs are parsed, no
+/// identities are reconstructed, and no serialization format is implied. Entry order is not
+/// contractual.
+/// </para>
+/// </summary>
+/// <param name="Slots">One view per registered slot, state included.</param>
+/// <param name="DispatchAttempts">One high-water entry per position that ever allocated an attempt.</param>
+internal sealed record WorkSlotRegistrySnapshot(
+    IReadOnlyList<WorkSlotView> Slots,
+    IReadOnlyList<WorkSlotRegistryAttemptEntry> DispatchAttempts);
 
 /// <summary>
 /// Result of allocating an attempt and registering a work slot.

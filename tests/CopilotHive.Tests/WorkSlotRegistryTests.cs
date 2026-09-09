@@ -1492,6 +1492,10 @@ public sealed class WorkSlotRegistryTests
         "ForceSlotStateForTest",
         "ClearRegistryForTest",
         "SeedSlotForTest",
+        // Added with the detached capture/restore building block: CaptureRegistry and
+        // RestoreRegistry both touch _slots/_dispatchAttempts and must run wholly under _lock.
+        "CaptureRegistry",
+        "RestoreRegistry",
     ];
 
     /// <summary>Theory feed of <see cref="LockedRegistryMethodNames"/> (strings only — the
@@ -4377,6 +4381,729 @@ public sealed class WorkSlotRegistryTests
                 $"retire-returned:{SlotRetirementOutcome.Retired}",
             ],
             log.Snapshot());
+    }
+
+    #endregion
+
+    #region (v) Capture/Restore — the detached snapshot building block
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  WHAT THIS REGION PROVES — and what it deliberately does NOT.
+    //
+    //  CaptureRegistry/RestoreRegistry are a DOMAIN-ONLY building block: a detached,
+    //  validated copy of the in-memory work-slot registry and its dispatch-attempt
+    //  high-water marks. The tests below prove value preservation, detachment of BOTH
+    //  the captured and the restored-collection storage, validation and rejection
+    //  contracts, late-invalid atomicity, nonempty-target refusals, and counter
+    //  continuity/overflow. They do NOT claim restart continuity or crash-safe
+    //  completion processing — wiring the snapshot into persistence and activating
+    //  restoration at startup is a separate future slice.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    private static WorkSlotView View(string id, WorkSlotPosition pos, int attempt, WorkSlotState state) =>
+        new(new WorkSlot(id, pos, attempt), state);
+
+    /// <summary>An empty pipeline to restore into — the "both dictionaries empty" target.</summary>
+    private static GoalPipeline FreshTarget() => NewPipeline();
+
+    private static WorkSlotRegistryAttemptEntry Entry(WorkSlotPosition pos, int highWater) =>
+        new(pos, highWater);
+
+    private static HashSet<WorkSlotView> ViewsOf(WorkSlotRegistrySnapshot snapshot) => [.. snapshot.Slots];
+
+    /// <summary>The captured high-water entries as a comparable value set.</summary>
+    private static HashSet<WorkSlotRegistryAttemptEntry> AttemptsOf(WorkSlotRegistrySnapshot snapshot) =>
+        [.. snapshot.DispatchAttempts];
+
+    private static void AssertTargetStillEmpty(GoalPipeline target)
+    {
+        var snapshot = target.CaptureRegistry();
+        Assert.Empty(snapshot.Slots);
+        Assert.Empty(snapshot.DispatchAttempts);
+    }
+
+    /// <summary>
+    /// Builds a registry through REAL allocation/transition paths ONLY — never the
+    /// <c>SeedSlotForTest</c> seam, which deliberately permits attempt zero and does not
+    /// advance counters, and therefore cannot prove restore semantics. Every lifecycle
+    /// state is reached through production transitions: Pending (fresh allocation), Claimed
+    /// (<c>ResolveAndCheckSlot</c>), Recorded (<c>RecordSlot</c>), Abandoned
+    /// (<c>AbandonSlot</c>), plus a second, higher attempt at a retried position.
+    /// </summary>
+    private static GoalPipeline RealPathSource()
+    {
+        var pipeline = NewPipeline();
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var posC = Position(occurrence: 3);
+        var posD = Position(occurrence: 4);
+
+        // Pending → Claimed (a real in-flight dispatch).
+        pipeline.AllocateAttemptAndRegisterSlot("claimed-task", posA);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("claimed-task"));
+
+        // Pending → Recorded, then a retry at the SAME position (attempt 2, Pending).
+        // RecordSlot only transitions Claimed → Recorded, so the claim comes first —
+        // ResolveAndCheckSlot then RecordSlot is the production completion path.
+        pipeline.AllocateAttemptAndRegisterSlot("recorded-task", posB);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("recorded-task"));
+        Assert.Equal(SlotRecordOutcome.Recorded, pipeline.RecordSlot("recorded-task"));
+        pipeline.AllocateAttemptAndRegisterSlot("retried-task", posB);
+
+        // Pending → Abandoned.
+        pipeline.AllocateAttemptAndRegisterSlot("abandoned-task", posC);
+        Assert.True(pipeline.AbandonSlot("abandoned-task"));
+
+        // Plain Pending.
+        pipeline.AllocateAttemptAndRegisterSlot("pending-task", posD);
+
+        return pipeline;
+    }
+
+    // ── 1. All-state round trips ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void Restore_AllStateRoundTrip_PreservesSlotsStatesAttemptsAndCounters()
+    {
+        var source = RealPathSource();
+        var snapshot = source.CaptureRegistry();
+
+        var target = FreshTarget();
+        target.RestoreRegistry(snapshot);
+
+        // Every slot, position, attempt and state survived intact.
+        Assert.Equal(ViewsOf(source.CaptureRegistry()), ViewsOf(target.CaptureRegistry()));
+        Assert.Equal(5, target.GetSlotsForTest().Count);
+
+        // Lifecycle states preserved EXACTLY: a restored Claimed slot still answers Proceed
+        // and STAYS Claimed…
+        Assert.Equal(SlotGuardResult.Proceed, target.ResolveAndCheckSlot("claimed-task"));
+        Assert.Contains(
+            View("claimed-task", Position(occurrence: 1), 1, WorkSlotState.Claimed),
+            ViewsOf(target.CaptureRegistry()));
+
+        // …is NOT replayable through admission (it was never turned back into Pending)…
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, target.AdmitCompletion("claimed-task"));
+
+        // …while a restored Pending slot admits normally, and unknown IDs are still NoSlot.
+        Assert.Equal(AdmissionOutcome.Admitted, target.AdmitCompletion("pending-task"));
+        Assert.Equal(AdmissionOutcome.NoSlot, target.AdmitCompletion("never-registered"));
+
+        // Counter continuity: posC holds only the Abandoned attempt-1 slot, and its restored
+        // counter makes the next allocation there attempt 2 — not a restart at 1.
+        Assert.Equal(2, target.AllocateAttemptAndRegisterSlot("after-restore", Position(occurrence: 3)).Attempt);
+    }
+
+    [Fact]
+    public void Capture_EmptyRegistry_YieldsAnEmptySnapshotThatRestoresIntoAFreshTarget()
+    {
+        var source = FreshTarget();
+
+        var snapshot = source.CaptureRegistry();
+        Assert.Empty(snapshot.Slots);
+        Assert.Empty(snapshot.DispatchAttempts);
+
+        var target = FreshTarget();
+        target.RestoreRegistry(snapshot);
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_EmptySnapshot_IsLegalIntoAnEmptyTarget()
+    {
+        var target = FreshTarget();
+
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot([], []));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    // ── 2. Detachment of the captured and the restored-collection storage ─────────────
+
+    [Fact]
+    public void Capture_RegistryMutationsAfterCapture_DoNotReachTheSnapshot()
+    {
+        var source = RealPathSource();
+        var snapshot = source.CaptureRegistry();
+        var frozen = ViewsOf(snapshot);
+
+        // Mutate the registry AFTER the capture: a state transition plus a brand-new slot.
+        // RecordSlot only moves Claimed → Recorded; "pending-task" must be claimed first.
+        Assert.Equal(SlotGuardResult.Proceed, source.ResolveAndCheckSlot("pending-task"));
+        Assert.Equal(SlotRecordOutcome.Recorded, source.RecordSlot("pending-task"));
+        source.AllocateAttemptAndRegisterSlot("latecomer", Position(occurrence: 5));
+
+        // The snapshot is frozen at capture time.
+        Assert.Equal(frozen, ViewsOf(snapshot));
+        Assert.DoesNotContain(snapshot.Slots, v => v.Slot.TaskId == "latecomer");
+        Assert.Contains(View("pending-task", Position(occurrence: 4), 1, WorkSlotState.Pending), frozen);
+    }
+
+    [Fact]
+    public void Capture_MutatingTheReturnedCollections_CannotTouchTheRegistry()
+    {
+        var source = RealPathSource();
+        var before = ViewsOf(source.CaptureRegistry());
+
+        var snapshot = source.CaptureRegistry();
+        var slots = (List<WorkSlotView>)snapshot.Slots;
+        var attempts = (List<WorkSlotRegistryAttemptEntry>)snapshot.DispatchAttempts;
+
+        // Hostile mutation of the returned collections themselves.
+        slots.Clear();
+        slots.Add(View("injected", Position(occurrence: 99), 1, WorkSlotState.Claimed));
+        attempts.Clear();
+        attempts.Add(Entry(Position(occurrence: 99), 42));
+
+        // The registry is untouched.
+        Assert.Equal(before, ViewsOf(source.CaptureRegistry()));
+
+        // And the counters still work: posC holds only the Abandoned attempt-1 slot with
+        // counter 1, so the next allocation is attempt 2.
+        Assert.Equal(2, source.AllocateAttemptAndRegisterSlot("probe", Position(occurrence: 3)).Attempt);
+    }
+
+    [Fact]
+    public void Restore_MutatingTheInputCollectionsAfterwards_CannotTouchTheInstalledRegistry()
+    {
+        var target = FreshTarget();
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+
+        var slots = new List<WorkSlotView> { View("t1", posA, 2, WorkSlotState.Recorded) };
+        var attempts = new List<WorkSlotRegistryAttemptEntry> { Entry(posA, 4), Entry(posB, 7) };
+
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(slots, attempts));
+        var installed = ViewsOf(target.CaptureRegistry());
+
+        // Mutate the INPUT lists after the restore completed.
+        slots.Clear();
+        attempts.Clear();
+        attempts.Add(Entry(posA, 100));
+
+        // The installed registry is independent of the caller's collections.
+        Assert.Equal(installed, ViewsOf(target.CaptureRegistry()));
+        Assert.Equal(5, target.AllocateAttemptAndRegisterSlot("n1", posA).Attempt); // 4 + 1, never 101
+        Assert.Equal(8, target.AllocateAttemptAndRegisterSlot("n2", posB).Attempt); // 7 + 1
+    }
+
+    // ── 3. Independent / counter-only / higher counters ───────────────────────────────
+
+    [Fact]
+    public void Restore_IndependentCounterOnlyAndHigherHighWaters_ArePreservedExactly()
+    {
+        // Hand-built fixture: real paths cannot produce counter-only or higher-than-slot
+        // counters (retirement never removes slots), so the fixture carries them directly.
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("t1", posA, 3, WorkSlotState.Recorded)],
+            [Entry(posA, 9), Entry(posB, 5)]);   // 9 > 3: higher; 5: counter-only
+
+        var first = FreshTarget();
+        first.RestoreRegistry(snapshot);
+
+        // THE ROUND TRIP: capture the restored registry, restore THAT into a fresh target.
+        var second = FreshTarget();
+        second.RestoreRegistry(first.CaptureRegistry());
+
+        Assert.Equal(ViewsOf(first.CaptureRegistry()), ViewsOf(second.CaptureRegistry()));
+
+        // The higher counter survived EXACTLY: the next allocation continues from 9, never
+        // renumbered down to the slot's own attempt 3.
+        Assert.Equal(10, second.AllocateAttemptAndRegisterSlot("n1", posA).Attempt);
+
+        // The counter-only entry survived EXACTLY: 6, not inferred from anything else.
+        Assert.Equal(6, second.AllocateAttemptAndRegisterSlot("n2", posB).Attempt);
+    }
+
+    // ── 4. Next-attempt continuity after restore ──────────────────────────────────────
+
+    [Fact]
+    public void Restore_NextAttemptContinuesFromTheHighWater_NotFromSlotHistoryOrAStartup()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View("t1", pos, 3, WorkSlotState.Recorded)],
+            [Entry(pos, 7)]));
+
+        // 8 — NOT 4 (inferred from the slot's history) and NOT 1 (a restart).
+        Assert.Equal(8, target.AllocateAttemptAndRegisterSlot("next", pos).Attempt);
+    }
+
+    [Fact]
+    public void Restore_NextAttemptContinuity_HoldsForTheWithIdAllocatorAndBuiltTaskId()
+    {
+        var pos = Position(occurrence: 2);
+        var target = FreshTarget();
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [Entry(pos, 5)]));
+
+        var built = target.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos);
+
+        Assert.Equal(6, built.Attempt);
+        Assert.Equal("goal-1-coder-001-02-006", built.TaskId);
+    }
+
+    // ── 5. Duplicate / invalid import rejections ──────────────────────────────────────
+
+    /// <summary>
+    /// Builds a single-slot snapshot that is malformed in exactly one way, named by
+    /// <paramref name="kind"/>. The counter entry carries the SLOT'S OWN position (malformed
+    /// or not) rather than a separate valid one, so the missing-matching-high-water cross-check
+    /// can never be the guard that rejects a slot-position defect: removing the slot-position
+    /// validation must change WHICH guard fires, which
+    /// <see cref="Restore_MalformedSlotPosition_IsRejectedByTheSlotGuardItself"/> pins down.
+    /// </summary>
+    private static WorkSlotRegistrySnapshot MalformedSnapshot(string kind)
+    {
+        var pos = Position(occurrence: 1);
+
+        WorkSlotRegistrySnapshot WithSlot(string? id, WorkSlotPosition? slotPos, int attempt, WorkSlotState state) =>
+            new(
+                [new WorkSlotView(new WorkSlot(id!, slotPos!, attempt), state)],
+                [Entry(slotPos ?? pos, Math.Max(attempt, 1))]);
+
+        return kind switch
+        {
+            "null-slot-entry" => new WorkSlotRegistrySnapshot([null!], [Entry(pos, 1)]),
+            "null-slot" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(null!, WorkSlotState.Pending)], [Entry(pos, 1)]),
+            "blank-task-id-null" => WithSlot(null, pos, 1, WorkSlotState.Pending),
+            "blank-task-id-empty" => WithSlot("", pos, 1, WorkSlotState.Pending),
+            "blank-task-id-whitespace" => WithSlot("   ", pos, 1, WorkSlotState.Pending),
+            "null-slot-position" => WithSlot("t1", null!, 1, WorkSlotState.Pending),
+            "zero-iteration" => WithSlot("t1", Position(iteration: 0), 1, WorkSlotState.Pending),
+            "negative-iteration" => WithSlot("t1", Position(iteration: -3), 1, WorkSlotState.Pending),
+            "zero-occurrence" => WithSlot("t1", Position(occurrence: 0), 1, WorkSlotState.Pending),
+            "negative-occurrence" => WithSlot("t1", Position(occurrence: -2), 1, WorkSlotState.Pending),
+            "zero-attempt" => WithSlot("t1", pos, 0, WorkSlotState.Pending),
+            "negative-attempt" => WithSlot("t1", pos, -4, WorkSlotState.Pending),
+            "undefined-phase" => WithSlot("t1", new WorkSlotPosition(1, (GoalPhase)999, 1), 1, WorkSlotState.Pending),
+            "undefined-state" => WithSlot("t1", pos, 1, (WorkSlotState)99),
+            "null-attempt-entry" => new WorkSlotRegistrySnapshot([], [null!]),
+            "null-attempt-position" => new WorkSlotRegistrySnapshot([], [Entry(null!, 1)]),
+            "zero-high-water" => new WorkSlotRegistrySnapshot([], [Entry(pos, 0)]),
+            "negative-high-water" => new WorkSlotRegistrySnapshot([], [Entry(pos, -1)]),
+            // ISOLATED counter-only positions: no slot references them at all, so only the
+            // attempt-entry position guard can possibly reject these.
+            "counter-only-zero-iteration" =>
+                new WorkSlotRegistrySnapshot([], [Entry(Position(iteration: 0), 1)]),
+            "counter-only-negative-iteration" =>
+                new WorkSlotRegistrySnapshot([], [Entry(Position(iteration: -3), 1)]),
+            "counter-only-zero-occurrence" =>
+                new WorkSlotRegistrySnapshot([], [Entry(Position(occurrence: 0), 1)]),
+            "counter-only-negative-occurrence" =>
+                new WorkSlotRegistrySnapshot([], [Entry(Position(occurrence: -2), 1)]),
+            "counter-only-undefined-phase" =>
+                new WorkSlotRegistrySnapshot([], [Entry(new WorkSlotPosition(1, (GoalPhase)999, 1), 1)]),
+            _ => throw new InvalidOperationException($"Unhandled malformed-snapshot kind '{kind}'."),
+        };
+    }
+
+    /// <summary>
+    /// Theory feed of <see cref="MalformedSnapshot"/> kinds whose rejection is provable by the
+    /// throw ALONE. The slot-POSITION defects are deliberately absent: their fixtures' counter
+    /// entry carries the same malformed position, so the attempt-entry guard would also reject
+    /// them and a bare <c>Throws</c> could not tell the two guards apart. They live in
+    /// <see cref="MalformedSlotPositionKinds"/>, whose test pins the message to the slot guard.
+    /// </summary>
+    public static TheoryData<string> MalformedSnapshotKinds => new()
+    {
+        "null-slot-entry",
+        "null-slot",
+        "blank-task-id-null",
+        "blank-task-id-empty",
+        "blank-task-id-whitespace",
+        "null-slot-position",
+        "zero-attempt",
+        "negative-attempt",
+        "undefined-state",
+        "null-attempt-entry",
+        "null-attempt-position",
+        "zero-high-water",
+        "negative-high-water",
+        "counter-only-zero-iteration",
+        "counter-only-negative-iteration",
+        "counter-only-zero-occurrence",
+        "counter-only-negative-occurrence",
+        "counter-only-undefined-phase",
+    };
+
+    [Theory]
+    [MemberData(nameof(MalformedSnapshotKinds))]
+    public void Restore_MalformedEntry_ThrowsArgumentException_TargetUnchanged(string kind)
+    {
+        var target = FreshTarget();
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(MalformedSnapshot(kind)));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    /// <summary>The slot-position defects, named separately so the guard that rejects them can be
+    /// pinned down.</summary>
+    public static TheoryData<string> MalformedSlotPositionKinds => new()
+    {
+        "zero-iteration",
+        "negative-iteration",
+        "zero-occurrence",
+        "negative-occurrence",
+        "undefined-phase",
+    };
+
+    /// <summary>
+    /// REMOVAL PROOF for the slot-position validation. Each fixture's high-water entry carries
+    /// the slot's OWN (malformed) position, so no missing-matching-high-water cross-check can
+    /// stand in for the slot guard; and the assertion pins the message to the SLOT guard, which
+    /// alone names the offending task. Delete the slot-position checks and the rejection either
+    /// disappears or comes from the attempt-entry guard, whose message names no task — either
+    /// way this test fails.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MalformedSlotPositionKinds))]
+    public void Restore_MalformedSlotPosition_IsRejectedByTheSlotGuardItself(string kind)
+    {
+        var target = FreshTarget();
+
+        var ex = Assert.Throws<ArgumentException>(() => target.RestoreRegistry(MalformedSnapshot(kind)));
+
+        Assert.Contains("Snapshot slot 't1'", ex.Message, StringComparison.Ordinal);
+
+        AssertTargetStillEmpty(target);
+    }
+
+    /// <summary>
+    /// The mirror proof for the ATTEMPT-ENTRY position guard: a counter-only entry no slot
+    /// references can only be rejected by that guard, and its message names an attempt entry.
+    /// </summary>
+    [Theory]
+    [InlineData("counter-only-zero-iteration")]
+    [InlineData("counter-only-negative-iteration")]
+    [InlineData("counter-only-zero-occurrence")]
+    [InlineData("counter-only-negative-occurrence")]
+    [InlineData("counter-only-undefined-phase")]
+    public void Restore_MalformedCounterOnlyPosition_IsRejectedByTheAttemptEntryGuard(string kind)
+    {
+        var target = FreshTarget();
+
+        var ex = Assert.Throws<ArgumentException>(() => target.RestoreRegistry(MalformedSnapshot(kind)));
+
+        Assert.Contains("Snapshot attempt entry", ex.Message, StringComparison.Ordinal);
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_DuplicateSlotPositionAttemptPair_Throws_TargetUnchanged()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        // Two otherwise-legal DEAD slots (so the live-position guard cannot fire) with DISTINCT
+        // task IDs (so the duplicate-ID guard cannot fire) claiming the SAME allocation: one
+        // attempt at one position was stamped twice, which no allocator can ever produce.
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("dead-1", pos, 2, WorkSlotState.Recorded), View("dead-2", pos, 2, WorkSlotState.Abandoned)],
+            [Entry(pos, 2)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_SamePositionDistinctAttempts_IsLegal()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        // The complement of the duplicate-allocation guard: distinct attempts at one position
+        // are ordinary retry history and must still be accepted.
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View("dead-1", pos, 1, WorkSlotState.Recorded), View("dead-2", pos, 2, WorkSlotState.Abandoned)],
+            [Entry(pos, 2)]));
+
+        Assert.Equal(2, target.GetSlotsForTest().Count);
+    }
+
+    [Fact]
+    public void Restore_NullSnapshot_ThrowsArgumentNull_TargetUnchanged()
+    {
+        var target = FreshTarget();
+
+        Assert.Throws<ArgumentNullException>(() => target.RestoreRegistry(null));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_NullSlotsCollection_ThrowsArgumentNull_TargetUnchanged()
+    {
+        var target = FreshTarget();
+
+        Assert.Throws<ArgumentNullException>(
+            () => target.RestoreRegistry(new WorkSlotRegistrySnapshot(null!, [])));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_NullAttemptsCollection_ThrowsArgumentNull_TargetUnchanged()
+    {
+        var target = FreshTarget();
+
+        Assert.Throws<ArgumentNullException>(
+            () => target.RestoreRegistry(new WorkSlotRegistrySnapshot([], null!)));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_DuplicateOrdinalTaskId_Throws_TargetUnchanged()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("t1", posA, 1, WorkSlotState.Recorded), View("t1", posB, 1, WorkSlotState.Recorded)],
+            [Entry(posA, 1), Entry(posB, 1)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_TaskIdComparisonIsOrdinal_DistinctCaseIsLegal()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var target = FreshTarget();
+
+        // Ordinal comparison: "t1" and "T1" are DISTINCT ids, so this import is legal. A
+        // case-insensitive duplicate check would reject it — the removal proof for ordinality.
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View("t1", posA, 1, WorkSlotState.Recorded), View("T1", posB, 1, WorkSlotState.Recorded)],
+            [Entry(posA, 1), Entry(posB, 1)]));
+
+        Assert.Equal(2, target.GetSlotsForTest().Count);
+    }
+
+    [Fact]
+    public void Restore_DuplicateHighWaterPosition_Throws_TargetUnchanged()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot([], [Entry(pos, 1), Entry(pos, 2)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Theory]
+    [InlineData(StPending, StPending)]
+    [InlineData(StPending, StClaimed)]
+    [InlineData(StClaimed, StClaimed)]
+    public void Restore_MultipleLiveSlotsAtOnePosition_Throws_TargetUnchanged(
+        int firstStateCode, int secondStateCode)
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("a", pos, 1, St(firstStateCode)), View("b", pos, 2, St(secondStateCode))],
+            [Entry(pos, 2)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_TwoDeadSlotsAtOnePosition_IsLegal()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        // Only Pending|Claimed occupy a position; two retired slots at one position are the
+        // ordinary retry history and must be accepted.
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View("dead-1", pos, 1, WorkSlotState.Recorded), View("dead-2", pos, 2, WorkSlotState.Abandoned)],
+            [Entry(pos, 2)]));
+
+        Assert.Equal(2, target.GetSlotsForTest().Count);
+    }
+
+    [Fact]
+    public void Restore_SlotWithoutHighWaterEntryForItsPosition_Throws_TargetUnchanged()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("t1", posA, 1, WorkSlotState.Recorded)],
+            [Entry(posB, 1)]);   // posA's counter is missing entirely.
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_SlotAttemptExceedingItsPositionHighWater_Throws_TargetUnchanged()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("t1", pos, 5, WorkSlotState.Recorded)],
+            [Entry(pos, 4)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_SlotAttemptEqualToItsPositionHighWater_IsLegal()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View("t1", pos, 5, WorkSlotState.Recorded)],
+            [Entry(pos, 5)]));
+
+        Assert.Equal(6, target.AllocateAttemptAndRegisterSlot("next", pos).Attempt);
+    }
+
+    // ── 6. Late-invalid atomicity ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void Restore_LateInvalidSlotEntry_LeavesTheTargetCompletelyUnchanged()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var posC = Position(occurrence: 3);
+        var target = FreshTarget();
+
+        // Two fully valid entries are followed by an invalid one — the duplicate task ID is
+        // encountered LAST, after everything else has already validated.
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [
+                View("t1", posA, 2, WorkSlotState.Claimed),
+                View("t2", posB, 1, WorkSlotState.Recorded),
+                View("t1", posC, 1, WorkSlotState.Abandoned),   // duplicate, late
+            ],
+            [Entry(posA, 5), Entry(posB, 1), Entry(posC, 1)]);
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    [Fact]
+    public void Restore_LateInvalidAttemptEntry_LeavesTheTargetCompletelyUnchanged()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var target = FreshTarget();
+
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("t1", posA, 2, WorkSlotState.Claimed)],
+            [Entry(posA, 5), Entry(posB, 1), Entry(posB, 7)]);   // duplicate position, late
+
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(snapshot));
+
+        AssertTargetStillEmpty(target);
+    }
+
+    // ── 7. Nonempty-target rejections ─────────────────────────────────────────────────
+
+    [Fact]
+    public void Restore_IntoRegistryWithExistingSlots_ThrowsInvalidOperation_PreservesTarget()
+    {
+        var target = RealPathSource();
+        var beforeSlots = ViewsOf(target.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(target.CaptureRegistry());
+
+        var incoming = new WorkSlotRegistrySnapshot(
+            [View("other", Position(occurrence: 8), 1, WorkSlotState.Recorded)],
+            [Entry(Position(occurrence: 8), 1)]);
+
+        Assert.Throws<InvalidOperationException>(() => target.RestoreRegistry(incoming));
+
+        // No clearing, no merging — the COMPLETE snapshot, counters included, is identical.
+        var after = target.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+
+        // And the incoming counter was never inserted: its position still starts at attempt 1.
+        Assert.Equal(1, target.AllocateAttemptAndRegisterSlot("probe", Position(occurrence: 8)).Attempt);
+    }
+
+    [Fact]
+    public void Restore_IntoCounterOnlyRegistry_ThrowsInvalidOperation_PreservesCounters()
+    {
+        var pos = Position(occurrence: 1);
+        var incomingPos = Position(occurrence: 9);
+        var target = FreshTarget();
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [Entry(pos, 5)]));
+
+        var beforeSlots = ViewsOf(target.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(target.CaptureRegistry());
+
+        // A counter-only target (attempts but no slots) is nonempty too.
+        Assert.Throws<InvalidOperationException>(
+            () => target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [Entry(incomingPos, 4)])));
+
+        // The complete snapshot is unchanged: nothing cleared, nothing merged.
+        var after = target.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+
+        // THE INSERT PROBE: had the incoming counter been written before the refusal threw,
+        // this position would continue from 4 (i.e. 5) instead of starting fresh at 1.
+        Assert.Equal(1, target.AllocateAttemptAndRegisterSlot("incoming-probe", incomingPos).Attempt);
+
+        // The existing counter was neither cleared nor merged: allocation continues from 5.
+        Assert.Equal(6, target.AllocateAttemptAndRegisterSlot("n", pos).Attempt);
+    }
+
+    // ── 8. Overflow in BOTH allocators ────────────────────────────────────────────────
+
+    [Fact]
+    public void Restore_IntMaxHighWater_AllocateViaBothAllocators_RefusesOverflowWithoutMutation()
+    {
+        var pos = Position(occurrence: 1);
+        var target = FreshTarget();
+
+        // An int.MaxValue high-water is LEGAL to restore…
+        target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [Entry(pos, int.MaxValue)]));
+
+        // …but exhausted: allocator 1 refuses with InvalidOperationException, never a wrap.
+        Assert.Throws<InvalidOperationException>(
+            () => target.AllocateAttemptAndRegisterSlot("overflow-1", pos));
+
+        // …and so does allocator 2.
+        Assert.Throws<InvalidOperationException>(
+            () => target.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos));
+
+        // No negative attempt ever appeared: neither refusal registered a slot.
+        Assert.Empty(target.GetSlotsForTest());
+
+        // Neither dictionary mutated on overflow: the target is STILL a nonempty
+        // (counter-only) registry, so a restore into it is refused again.
+        Assert.Throws<InvalidOperationException>(
+            () => target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [])));
+
+        // The rest of the registry is unimpaired: a different position allocates normally.
+        Assert.Equal(1, target.AllocateAttemptAndRegisterSlot("fresh", Position(occurrence: 2)).Attempt);
     }
 
     #endregion
