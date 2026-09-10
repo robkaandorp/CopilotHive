@@ -1164,59 +1164,169 @@ public sealed class GoalPipeline
     {
         lock (_lock)
         {
-            var slots = new List<WorkSlotView>(_slots.Count);
-            foreach (var (_, entry) in _slots)
-                slots.Add(new WorkSlotView(entry.Slot, entry.State));
-
-            var attempts = new List<WorkSlotRegistryAttemptEntry>(_dispatchAttempts.Count);
-            foreach (var (position, highWater) in _dispatchAttempts)
-                attempts.Add(new WorkSlotRegistryAttemptEntry(position, highWater));
-
-            return new WorkSlotRegistrySnapshot(slots, attempts);
+            return CopyRegistrySnapshotUnderLock();
         }
     }
 
     /// <summary>
-    /// Restores the ENTIRE work-slot registry from a detached
-    /// <see cref="WorkSlotRegistrySnapshot"/> — both dictionaries, atomically, in ONE
-    /// <c>_lock</c> span.
+    /// THE LOCK-HELD COPY STEP shared by <see cref="CaptureRegistry"/> and
+    /// <see cref="CaptureAdmissionOwnership"/>: builds the detached
+    /// <see cref="WorkSlotRegistrySnapshot"/> from the two registry dictionaries.
     /// <para>
-    /// THE TWO-PHASE CONTRACT: ALL input is copied and validated BEFORE anything is installed.
-    /// Every malformed entry throws <see cref="ArgumentNullException"/> or
-    /// <see cref="ArgumentException"/> with the target registry completely unchanged — including
-    /// when the invalid entry is encountered LATE in the input. No partial installs.
-    /// </para>
-    /// <para>
-    /// THE EMPTY-TARGET CONTRACT: both the slot registry and the attempt counters of the target
-    /// must be empty. A nonempty target — including a counter-only one where
-    /// <see cref="_dispatchAttempts"/> has entries but <see cref="_slots"/> is empty — is rejected
-    /// with <see cref="InvalidOperationException"/> WITHOUT clearing or merging its state.
-    /// </para>
-    /// <para>
-    /// THE VALUES ARE PRESERVED, NOT RECOMPUTED: slots are installed with their captured
-    /// <see cref="WorkSlotState"/> exactly (Claimed stays Claimed, Recorded stays Recorded,
-    /// Abandoned stays Abandoned) and high-water entries are installed EXACTLY as given —
-    /// including counter-only entries (no slot at that position) and entries HIGHER than any
-    /// slot's attempt. Nothing is renumbered, incremented, or inferred; contiguous attempt
-    /// history is not required. No allocation method and no test-only reset/seeding helper is
-    /// used. EVERY position — a slot's or a counter-only entry's — must have a positive
-    /// iteration, a positive occurrence and a defined <see cref="GoalPhase"/>. Cross-checks
-    /// performed: duplicate task IDs (ordinal), duplicate high-water positions, duplicate
-    /// (position, attempt) slot allocations, multiple live (Pending or Claimed) slots at one
-    /// position, and every slot having a high-water entry at its position that is
-    /// <c>&gt;=</c> its own attempt. Historical positions are NEVER compared against the current
-    /// plan or machine phase — that is the future storage caller's responsibility.
+    /// THE CALLER MUST ALREADY HOLD <c>_lock</c>. This helper takes NO lock of its own, so a
+    /// caller composing it with other registry reads gets ONE acquisition covering the whole
+    /// composition rather than two independent ones. It performs no validation, parses no task
+    /// IDs and reconstructs no identity — the entries are exactly the values the registry holds
+    /// at the copy instant, and entry order is not contractual.
     /// </para>
     /// </summary>
-    /// <param name="snapshot">The detached snapshot to restore from.</param>
+    /// <returns>A detached snapshot of both dictionaries.</returns>
+    private WorkSlotRegistrySnapshot CopyRegistrySnapshotUnderLock()
+    {
+        var slots = new List<WorkSlotView>(_slots.Count);
+        foreach (var (_, entry) in _slots)
+            slots.Add(new WorkSlotView(entry.Slot, entry.State));
+
+        var attempts = new List<WorkSlotRegistryAttemptEntry>(_dispatchAttempts.Count);
+        foreach (var (position, highWater) in _dispatchAttempts)
+            attempts.Add(new WorkSlotRegistryAttemptEntry(position, highWater));
+
+        return new WorkSlotRegistrySnapshot(slots, attempts);
+    }
+
+    /// <summary>
+    /// Captures the pipeline's ADMISSION OWNERSHIP STATE — the goal identity, the active-task
+    /// pointer, and the COMPLETE work-slot registry (slots and per-position counters) — as a
+    /// detached <see cref="AdmissionOwnershipSnapshot"/> taken in ONE <c>_lock</c> acquisition.
+    /// <para>
+    /// WHAT THIS IS AND IS NOT. It captures POINTER/REGISTRY OWNERSHIP state only — NOT the
+    /// phase, the plan, or the machine position, and therefore NOT a coherent whole-pipeline
+    /// snapshot. Capturing an observed intermediate state does not make that state a VALID
+    /// admission: validity is decided separately by
+    /// <see cref="PreflightAdmissionOwnership"/>.
+    /// </para>
+    /// <para>
+    /// NOTHING IS MUTATED OR ALLOCATED: no task or attempt is allocated, the pointer, the slot
+    /// registry and the counters are left exactly as they are, no task ID is parsed, and no
+    /// machine, manager or database lock is taken (the single pipeline monitor is the only lock
+    /// involved). The result is fully detached: it exposes no live registry collection and is
+    /// unaffected by every later pipeline mutation.
+    /// </para>
+    /// </summary>
+    /// <returns>The detached goal identity, active-task pointer and registry snapshot.</returns>
+    internal AdmissionOwnershipSnapshot CaptureAdmissionOwnership()
+    {
+        lock (_lock)
+        {
+            return new AdmissionOwnershipSnapshot(GoalId, ActiveTaskId, CopyRegistrySnapshotUnderLock());
+        }
+    }
+
+    /// <summary>
+    /// THE ADMISSION PREFLIGHT: a PURE validation of a detached
+    /// <see cref="AdmissionOwnershipSnapshot"/>, returning an equally detached, VALIDATED
+    /// carrier. It installs nothing, takes no lock, touches no pipeline, and performs no I/O,
+    /// serialization or store interaction of any kind.
+    /// <para>
+    /// THE REFUSALS, exhaustively — every one of them throws BEFORE any future store would ever
+    /// be consulted, so none of them is a SQL-guard refusal:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description><paramref name="candidate"/> (or its registry) is <c>null</c> →
+    ///     <see cref="ArgumentNullException"/>;</description></item>
+    ///   <item><description>a blank goal identity → <see cref="ArgumentException"/>;</description></item>
+    ///   <item><description>a blank or <c>null</c> active task → <see cref="ArgumentException"/>;</description></item>
+    ///   <item><description>a malformed registry → the SAME rules and error categories as
+    ///     <see cref="ValidateDetachedRegistrySnapshot"/>, which is reused verbatim for the
+    ///     ENTIRE registry;</description></item>
+    ///   <item><description>no slot matching the active task (ordinal), or a matching slot that
+    ///     is not <see cref="WorkSlotState.Pending"/> → <see cref="ArgumentException"/>.</description></item>
+    /// </list>
+    /// <para>
+    /// THE COMPLETE HISTORY SURVIVES: every historical slot (in any state) and every
+    /// counter-only high-water entry is preserved exactly as supplied, in the supplied order.
+    /// Only the ACTIVE task needs a matching Pending slot — historical slots are not required to
+    /// have any current mapping — and historical positions are never compared with the current
+    /// plan or machine phase. The returned carrier's collections are FRESH copies, so mutating
+    /// the caller's own detached input collections afterwards cannot alter the validated result.
+    /// </para>
+    /// </summary>
+    /// <param name="candidate">The detached carrier to validate.</param>
+    /// <returns>A validated, detached carrier holding the same values.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="candidate"/>, its registry, one of
+    /// the registry's collections, or a required member is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The goal identity or active task is blank, the registry
+    /// is malformed, or the active task has no matching Pending slot.</exception>
+    internal static AdmissionOwnershipSnapshot PreflightAdmissionOwnership(AdmissionOwnershipSnapshot? candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+
+        if (string.IsNullOrWhiteSpace(candidate.GoalId))
+            throw new ArgumentException(
+                $"Admission goal ID must be a non-blank string ('{candidate.GoalId}').", nameof(candidate));
+        if (string.IsNullOrWhiteSpace(candidate.ActiveTaskId))
+            throw new ArgumentException(
+                $"Admission active task ID must be a non-blank string ('{candidate.ActiveTaskId}').",
+                nameof(candidate));
+
+        // THE WHOLE registry goes through the SAME validator the restore path uses — the rules
+        // and error categories are reused, never duplicated.
+        var registry = ValidateDetachedRegistrySnapshot(candidate.Registry);
+
+        WorkSlotView? match = null;
+        foreach (var view in registry.Slots)
+        {
+            if (!string.Equals(view.Slot.TaskId, candidate.ActiveTaskId, StringComparison.Ordinal))
+                continue;
+            match = view;
+            break;
+        }
+
+        if (match is null)
+            throw new ArgumentException(
+                $"Admission active task '{candidate.ActiveTaskId}' has no matching slot in the registry.",
+                nameof(candidate));
+
+        if (match.State != WorkSlotState.Pending)
+            throw new ArgumentException(
+                $"Admission active task '{candidate.ActiveTaskId}' has a slot in state {match.State}, " +
+                $"not {WorkSlotState.Pending}.", nameof(candidate));
+
+        return new AdmissionOwnershipSnapshot(candidate.GoalId, candidate.ActiveTaskId, registry);
+    }
+
+    /// <summary>
+    /// THE PURE COPY-AND-VALIDATE STEP of the restore path, extracted so it can be reused
+    /// wherever a detached registry snapshot must be proven well-formed. It COPIES the supplied
+    /// entries into fresh collections and returns a validated, DETACHED
+    /// <see cref="WorkSlotRegistrySnapshot"/>.
+    /// <para>
+    /// It installs into no pipeline, acquires no lock, creates no pipeline, serializes nothing
+    /// and performs no I/O. The supplied values and their COLLECTION ORDER are preserved exactly:
+    /// nothing is sorted, normalized, renumbered or inferred, no counter is reconstructed, and no
+    /// task ID is parsed.
+    /// </para>
+    /// <para>
+    /// THE RULES (the restore path's own, stated once and shared): EVERY position — a slot's or a
+    /// counter-only entry's — must have a positive iteration, a positive occurrence and a defined
+    /// <see cref="GoalPhase"/>; every slot needs a non-blank task ID, a positive attempt and a
+    /// defined <see cref="WorkSlotState"/>; every high-water entry needs a positive value.
+    /// Cross-checks performed: duplicate task IDs (ordinal), duplicate high-water positions,
+    /// duplicate (position, attempt) slot allocations, multiple live (Pending or Claimed) slots at
+    /// one position, and every slot having a high-water entry at its position that is <c>&gt;=</c>
+    /// its own attempt. Counter-only entries (no slot) and high-water entries HIGHER than any
+    /// slot's attempt are legal and preserved. Historical positions are NEVER compared against the
+    /// current plan or machine phase.
+    /// </para>
+    /// </summary>
+    /// <param name="snapshot">The detached snapshot to copy and validate.</param>
+    /// <returns>A validated, detached snapshot holding the supplied values in the supplied order.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="snapshot"/>, one of its
     /// collections, or a required member is <c>null</c>.</exception>
     /// <exception cref="ArgumentException">Any entry is malformed, duplicated, or violates a
     /// cross-entry invariant.</exception>
-    /// <exception cref="InvalidOperationException">The target registry is not empty.</exception>
-    internal void RestoreRegistry(WorkSlotRegistrySnapshot? snapshot)
+    internal static WorkSlotRegistrySnapshot ValidateDetachedRegistrySnapshot(WorkSlotRegistrySnapshot? snapshot)
     {
-        // ── PHASE 1: COPY + VALIDATE EVERYTHING, TOUCHING NO REGISTRY STATE. ──
         ArgumentNullException.ThrowIfNull(snapshot);
 
         var slotViews = snapshot.Slots;
@@ -1224,7 +1334,7 @@ public sealed class GoalPipeline
         ArgumentNullException.ThrowIfNull(slotViews);
         ArgumentNullException.ThrowIfNull(attemptEntries);
 
-        var slotsToInstall = new List<(WorkSlot Slot, WorkSlotState State)>(slotViews.Count);
+        var validatedSlots = new List<WorkSlotView>(slotViews.Count);
         var seenTaskIds = new HashSet<string>(StringComparer.Ordinal);
         var seenLivePositions = new HashSet<WorkSlotPosition>();
         var seenAllocations = new HashSet<(WorkSlotPosition Position, int Attempt)>();
@@ -1284,10 +1394,10 @@ public sealed class GoalPipeline
                     $"Snapshot contains multiple live slots at position {position}.", nameof(snapshot));
             }
 
-            slotsToInstall.Add((slot, view.State));
+            validatedSlots.Add(view);
         }
 
-        var attemptsToInstall = new List<(WorkSlotPosition Position, int HighWater)>(attemptEntries.Count);
+        var validatedAttempts = new List<WorkSlotRegistryAttemptEntry>(attemptEntries.Count);
         var seenPositions = new HashSet<WorkSlotPosition>();
 
         foreach (var entry in attemptEntries)
@@ -1324,25 +1434,73 @@ public sealed class GoalPipeline
                     $"Snapshot contains duplicate attempt entries for position {entryPosition}.",
                     nameof(snapshot));
 
-            attemptsToInstall.Add((entryPosition, entry.HighWaterAttempt));
+            validatedAttempts.Add(entry);
         }
 
         // CROSS-ENTRY INVARIANT: every slot must have a high-water entry at its position that
         // is >= its own attempt. Counter-only entries (no slot) are fine; a slot without its
-        // counter is not. (A List-based lookup keeps the ONLY dictionary touches in this method
-        // inside the locked install span.)
-        foreach (var (slot, _) in slotsToInstall)
+        // counter is not.
+        foreach (var view in validatedSlots)
         {
-            var highWaterEntry = attemptsToInstall.Find(a => a.Position == slot.Position);
-            if (highWaterEntry.Position is null)
+            var slot = view.Slot;
+            var highWaterEntry = validatedAttempts.Find(a => a.Position == slot.Position);
+            if (highWaterEntry is null)
                 throw new ArgumentException(
                     $"Snapshot slot '{slot.TaskId}' has no attempt entry for its position {slot.Position}.",
                     nameof(snapshot));
-            if (highWaterEntry.HighWater < slot.Attempt)
+            if (highWaterEntry.HighWaterAttempt < slot.Attempt)
                 throw new ArgumentException(
                     $"Snapshot slot '{slot.TaskId}' has attempt {slot.Attempt} exceeding its " +
-                    $"position's high-water {highWaterEntry.HighWater} at {slot.Position}.", nameof(snapshot));
+                    $"position's high-water {highWaterEntry.HighWaterAttempt} at {slot.Position}.", nameof(snapshot));
         }
+
+        return new WorkSlotRegistrySnapshot(validatedSlots, validatedAttempts);
+    }
+
+    /// <summary>
+    /// Restores the ENTIRE work-slot registry from a detached
+    /// <see cref="WorkSlotRegistrySnapshot"/> — both dictionaries, atomically, in ONE
+    /// <c>_lock</c> span.
+    /// <para>
+    /// THE TWO-PHASE CONTRACT: ALL input is copied and validated BEFORE anything is installed.
+    /// Every malformed entry throws <see cref="ArgumentNullException"/> or
+    /// <see cref="ArgumentException"/> with the target registry completely unchanged — including
+    /// when the invalid entry is encountered LATE in the input. No partial installs.
+    /// </para>
+    /// <para>
+    /// THE EMPTY-TARGET CONTRACT: both the slot registry and the attempt counters of the target
+    /// must be empty. A nonempty target — including a counter-only one where
+    /// <see cref="_dispatchAttempts"/> has entries but <see cref="_slots"/> is empty — is rejected
+    /// with <see cref="InvalidOperationException"/> WITHOUT clearing or merging its state.
+    /// </para>
+    /// <para>
+    /// THE VALUES ARE PRESERVED, NOT RECOMPUTED: slots are installed with their captured
+    /// <see cref="WorkSlotState"/> exactly (Claimed stays Claimed, Recorded stays Recorded,
+    /// Abandoned stays Abandoned) and high-water entries are installed EXACTLY as given —
+    /// including counter-only entries (no slot at that position) and entries HIGHER than any
+    /// slot's attempt. Nothing is renumbered, incremented, or inferred; contiguous attempt
+    /// history is not required. No allocation method and no test-only reset/seeding helper is
+    /// used. EVERY position — a slot's or a counter-only entry's — must have a positive
+    /// iteration, a positive occurrence and a defined <see cref="GoalPhase"/>. Cross-checks
+    /// performed: duplicate task IDs (ordinal), duplicate high-water positions, duplicate
+    /// (position, attempt) slot allocations, multiple live (Pending or Claimed) slots at one
+    /// position, and every slot having a high-water entry at its position that is
+    /// <c>&gt;=</c> its own attempt. Historical positions are NEVER compared against the current
+    /// plan or machine phase — that is the future storage caller's responsibility.
+    /// </para>
+    /// </summary>
+    /// <param name="snapshot">The detached snapshot to restore from.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="snapshot"/>, one of its
+    /// collections, or a required member is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">Any entry is malformed, duplicated, or violates a
+    /// cross-entry invariant.</exception>
+    /// <exception cref="InvalidOperationException">The target registry is not empty.</exception>
+    internal void RestoreRegistry(WorkSlotRegistrySnapshot? snapshot)
+    {
+        // ── PHASE 1: COPY + VALIDATE EVERYTHING, TOUCHING NO REGISTRY STATE. ──
+        // The shared pure helper owns every rule and every error category; this method adds
+        // only the empty-target check and the installation below.
+        var validated = ValidateDetachedRegistrySnapshot(snapshot);
 
         // ── PHASE 2: INSTALL, in ONE _lock span, with no other lock taken. ──
         lock (_lock)
@@ -1352,11 +1510,11 @@ public sealed class GoalPipeline
                     "Cannot restore a work-slot registry snapshot into a nonempty registry: the " +
                     "slot registry and attempt counters must both be empty.");
 
-            foreach (var (slot, state) in slotsToInstall)
-                _slots[slot.TaskId] = (slot, state);
+            foreach (var view in validated.Slots)
+                _slots[view.Slot.TaskId] = (view.Slot, view.State);
 
-            foreach (var (position, highWater) in attemptsToInstall)
-                _dispatchAttempts[position] = highWater;
+            foreach (var entry in validated.DispatchAttempts)
+                _dispatchAttempts[entry.Position] = entry.HighWaterAttempt;
         }
     }
 
@@ -1534,6 +1692,28 @@ internal sealed record WorkSlotRegistryAttemptEntry(WorkSlotPosition Position, i
 internal sealed record WorkSlotRegistrySnapshot(
     IReadOnlyList<WorkSlotView> Slots,
     IReadOnlyList<WorkSlotRegistryAttemptEntry> DispatchAttempts);
+
+/// <summary>
+/// A detached carrier of a pipeline's ADMISSION OWNERSHIP state: the goal identity, the
+/// active-task pointer, and the complete work-slot registry snapshot that goes with them.
+/// <para>
+/// SCOPE, stated honestly: this is pointer/registry OWNERSHIP state only. It carries no phase,
+/// no plan and no machine position, so it is NOT a coherent whole-pipeline snapshot, and merely
+/// having been captured does not make it a VALID admission —
+/// <see cref="GoalPipeline.PreflightAdmissionOwnership"/> decides that separately.
+/// </para>
+/// <para>
+/// Purely a carrier of existing immutable domain values; no task IDs are parsed, no identities
+/// are reconstructed, and no serialization format is implied.
+/// </para>
+/// </summary>
+/// <param name="GoalId">The goal the pipeline is tracking.</param>
+/// <param name="ActiveTaskId">The active-task pointer at the capture instant, or <c>null</c> when idle.</param>
+/// <param name="Registry">The complete detached registry (slots and per-position counters).</param>
+internal sealed record AdmissionOwnershipSnapshot(
+    string GoalId,
+    string? ActiveTaskId,
+    WorkSlotRegistrySnapshot Registry);
 
 /// <summary>
 /// Result of allocating an attempt and registering a work slot.

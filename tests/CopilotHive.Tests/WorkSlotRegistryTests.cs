@@ -1496,6 +1496,23 @@ public sealed class WorkSlotRegistryTests
         // RestoreRegistry both touch _slots/_dispatchAttempts and must run wholly under _lock.
         "CaptureRegistry",
         "RestoreRegistry",
+        // Added with the detached admission carrier: the ownership capture reads the pointer AND
+        // the whole registry, and must do so in ONE _lock span.
+        "CaptureAdmissionOwnership",
+    ];
+
+    /// <summary>
+    /// The LOCK-HELD HELPERS: private methods that touch the backing dictionaries but take NO
+    /// lock themselves, because their contract requires the CALLER to already hold <c>_lock</c>.
+    /// They are deliberately excluded from <see cref="LockedRegistryMethodNames"/> (they emit no
+    /// Monitor pair of their own) and are instead pinned by
+    /// <see cref="LockHeldHelper_TakesNoLockAndIsCalledOnlyFromLockedEntryPoints"/>, while a CALL
+    /// to one of them counts as a guarded access in every analysis below — so an entry point that
+    /// delegates its storage reads to a helper is held to exactly the same lock structure.
+    /// </summary>
+    private static readonly string[] LockHeldRegistryHelperNames =
+    [
+        "CopyRegistrySnapshotUnderLock",
     ];
 
     /// <summary>Theory feed of <see cref="LockedRegistryMethodNames"/> (strings only — the
@@ -1553,7 +1570,7 @@ public sealed class WorkSlotRegistryTests
     private static MethodInfo RegistryMethod(string name) =>
         typeof(GoalPipeline).GetMethod(
             name,
-            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
         ?? throw new Xunit.Sdk.XunitException($"No method '{name}' on GoalPipeline.");
 
     /// <summary>
@@ -1632,16 +1649,115 @@ public sealed class WorkSlotRegistryTests
     private static bool IsMonitor(MethodBase m, string name) =>
         m.DeclaringType == typeof(Monitor) && m.Name == name;
 
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  THE ACTIVE-TASK POINTER AS A GUARDED DATUM.
+    //
+    //  The dictionary-only notion of "guarded access" below is NOT sufficient for the
+    //  methods that capture or mutate the ACTIVE-TASK POINTER alongside the registry.
+    //  A method may take the lock, copy the registry entirely inside it, and still have
+    //  read `ActiveTaskId` BEFORE `Monitor.Enter`:
+    //
+    //      var pointer = ActiveTaskId;                       // ← unsynchronized read
+    //      lock (_lock) { return new …(GoalId, pointer, CopyRegistrySnapshotUnderLock()); }
+    //
+    //  That mutant satisfies every dictionary-based assertion and every behavioural
+    //  blocked-while-held observation (the pointer can be committed before the worker is
+    //  even started), yet it destroys the one-lock pointer+registry coherence the capture
+    //  exists to provide. The pointer must therefore be treated as guarded state in its
+    //  own right, with the SAME deterministic IL technique: provenance, dominance, and
+    //  try-span containment, all resolved from the emitted bytes.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The property accessors through which <see cref="GoalPipeline.ActiveTaskId"/> is reached.
+    /// The property is auto-implemented, so C# lowers every in-class read/write to one of these
+    /// calls; the direct backing-field forms are covered separately by
+    /// <see cref="IsPointerAccessInstruction"/> so a hand-written field-backed property cannot
+    /// slip past.
+    /// </summary>
+    private static readonly string[] PointerAccessorNames =
+    [
+        "get_ActiveTaskId",
+        "set_ActiveTaskId",
+    ];
+
+    /// <summary>
+    /// True when <paramref name="instruction"/> READS OR WRITES the active-task pointer — either
+    /// through its property accessors or through a direct <c>ldfld</c>/<c>ldflda</c>/<c>stfld</c>
+    /// of its backing field. Both forms are recognised, so neither an auto-property nor a
+    /// hand-rolled field-backed property can hide an unsynchronized pointer access.
+    /// </summary>
+    private static bool IsPointerAccessInstruction(DecodedBody body, Instruction instruction)
+    {
+        var module = body.Method.Module;
+        var op = instruction.OpCode;
+
+        if (op == OpCodes.Call || op == OpCodes.Callvirt)
+        {
+            MethodBase? target;
+            try
+            {
+                target = module.ResolveMethod(BitConverter.ToInt32(body.Il, instruction.OperandOffset));
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+
+            return target is not null
+                && target.DeclaringType == typeof(GoalPipeline)
+                && PointerAccessorNames.Contains(target.Name, StringComparer.Ordinal);
+        }
+
+        if (op == OpCodes.Ldfld || op == OpCodes.Ldflda || op == OpCodes.Stfld)
+        {
+            FieldInfo? field;
+            try
+            {
+                field = module.ResolveField(BitConverter.ToInt32(body.Il, instruction.OperandOffset));
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+
+            return field is not null
+                && field.DeclaringType == typeof(GoalPipeline)
+                && field.Name.Contains("ActiveTaskId", StringComparison.Ordinal);
+        }
+
+        return false;
+    }
+
+    /// <summary>Offsets of every active-task-pointer access in the decoded body.</summary>
+    private static List<int> PointerAccessOffsets(DecodedBody body) =>
+        [.. body.Instructions.Where(i => IsPointerAccessInstruction(body, i)).Select(i => i.Offset)];
+
     /// <summary>
     /// A guarded access: any call on the registry's backing <see cref="Dictionary{TKey,TValue}"/>
     /// storage (or its nested enumerator / key-collection), i.e. a read or write of
-    /// <c>_slots</c> or <c>_dispatchAttempts</c> that MUST sit inside the lock.
+    /// <c>_slots</c> or <c>_dispatchAttempts</c> that MUST sit inside the lock — PLUS a call to
+    /// one of the <see cref="LockHeldRegistryHelperNames"/>, whose whole body is such storage
+    /// work performed on the caller's behalf. Counting the delegation itself keeps a delegating
+    /// entry point under exactly the same lock-structure proof as an inlined one.
+    /// <para>
+    /// The active-task POINTER is deliberately not folded in here: it is not reached through a
+    /// call site at all in every form, so it gets its own instruction-level treatment via
+    /// <see cref="PointerAccessOffsets"/> and
+    /// <see cref="PointerAndRegistryMethod_ReadsThePointerInsideTheSameLockSpanAsTheRegistry"/>.
+    /// </para>
     /// </summary>
     private static bool IsGuardedAccess(MethodBase m)
     {
         var declaring = m.DeclaringType;
         if (declaring is null)
             return false;
+
+        if (declaring == typeof(GoalPipeline)
+            && LockHeldRegistryHelperNames.Contains(m.Name, StringComparer.Ordinal))
+        {
+            return true;
+        }
 
         // Walk out of nested types (Dictionary<,>.Enumerator, .KeyCollection) to the owner.
         for (var t = declaring; t is not null; t = t.DeclaringType)
@@ -2076,9 +2192,240 @@ public sealed class WorkSlotRegistryTests
     }
 
     /// <summary>
+    /// The locked entry points that touch the ACTIVE-TASK POINTER as well as the registry, and
+    /// therefore owe the one-lock-span pointer proof below. The drift guard
+    /// <see cref="PointerProof_CoversEveryLockedMethodThatTouchesThePointer"/> keeps this list
+    /// honest.
+    /// </summary>
+    private static readonly string[] PointerAndRegistryMethodNames =
+    [
+        // Captures the pointer AND the whole registry — the one-lock coherence contract.
+        "CaptureAdmissionOwnership",
+        // Retires the slot AND if-current-clears the pointer in a single acquisition.
+        "RetireSlotAndClearIfCurrent",
+    ];
+
+    /// <summary>Theory feed of <see cref="PointerAndRegistryMethodNames"/> (strings only — the
+    /// registry types are internal and cannot appear in a public test signature).</summary>
+    public static TheoryData<string> PointerAndRegistryMethods
+    {
+        get
+        {
+            var data = new TheoryData<string>();
+            foreach (var name in PointerAndRegistryMethodNames)
+                data.Add(name);
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// THE POINTER-INSIDE-THE-SAME-LOCK-SPAN PROOF — the gap the dictionary-only structural test
+    /// and the behavioural blocked-while-held test both leave open.
+    /// <para>
+    /// For every method that touches the ACTIVE-TASK POINTER alongside the registry, this pins,
+    /// against the emitted bytes and with zero timing dependence:
+    /// </para>
+    /// <list type="number">
+    ///   <item>at least one pointer access exists at all (so the probe is never vacuous) and at
+    ///     least one guarded registry access exists — the method really does combine the two;</item>
+    ///   <item>EVERY pointer access lies at an IL offset AFTER the <c>Monitor.Enter</c> and
+    ///     BEFORE the <c>Monitor.Exit</c>, both re-resolved here to
+    ///     <c>GoalPipeline._lock</c> through the operand-provenance analysis;</item>
+    ///   <item>DOMINANCE — no pointer access is reachable from the method entry WITHOUT executing
+    ///     that <c>Monitor.Enter</c>, following fall-through and every branch form, so the access
+    ///     cannot be hoisted above the lock or reached by a conditional bypass;</item>
+    ///   <item>EVERY pointer access lies inside the SAME <c>finally</c>-protected try region that
+    ///     covers the guarded registry work — i.e. the pointer and the registry are touched in
+    ///     ONE protected span, not two.</item>
+    /// </list>
+    /// <para>
+    /// THE NAMED MUTANT THIS KILLS: caching the pointer before the lock —
+    /// <c>var pointer = ActiveTaskId; lock (_lock) { … CopyRegistrySnapshotUnderLock() … }</c> —
+    /// moves the <c>get_ActiveTaskId</c> call to an offset below <c>Monitor.Enter</c>, makes it
+    /// reachable from the entry without executing the Enter, and puts it outside the try region.
+    /// Three independent assertions fail, on 100% of runs. That mutant satisfies every
+    /// dictionary-based assertion and the behavioural <c>WhileLockHeld</c> observation, which is
+    /// precisely why this test exists; the behavioural companion stays supplemental only.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PointerAndRegistryMethods))]
+    public void PointerAndRegistryMethod_ReadsThePointerInsideTheSameLockSpanAsTheRegistry(string methodName)
+    {
+        var method = RegistryMethod(methodName);
+        var body = DecodeBody(method);
+        var calls = DecodeCallSites(method);
+
+        // ── (1) NON-VACUITY: the method really does combine pointer and registry work ──
+        var pointerOffsets = PointerAccessOffsets(body);
+        Assert.True(
+            pointerOffsets.Count > 0,
+            $"'{methodName}' contains no active-task-pointer access — the pointer probe would be " +
+            "vacuous, so this method no longer belongs in PointerAndRegistryMethodNames.");
+
+        var guarded = calls.Where(c => IsGuardedAccess(c.Target)).ToList();
+        Assert.True(
+            guarded.Count > 0,
+            $"'{methodName}' has no recognised guarded storage access — the one-span claim would be vacuous.");
+
+        // ── The monitor pair: exactly one of each, resolved to GoalPipeline._lock here so
+        //    this test stands on its own operand analysis rather than on another test's.
+        var lockField = typeof(GoalPipeline).GetField("_lock", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new Xunit.Sdk.XunitException("GoalPipeline no longer has a private '_lock' field.");
+
+        var monitorCalls = new List<(int Index, bool IsEnter)>();
+        for (var i = 0; i < body.Instructions.Count; i++)
+        {
+            var instruction = body.Instructions[i];
+            if (instruction.OpCode != OpCodes.Call && instruction.OpCode != OpCodes.Callvirt)
+                continue;
+
+            MethodBase? target;
+            try
+            {
+                target = method.Module.ResolveMethod(BitConverter.ToInt32(body.Il, instruction.OperandOffset));
+            }
+            catch (ArgumentException)
+            {
+                continue;
+            }
+
+            if (target is null || target.DeclaringType != typeof(Monitor))
+                continue;
+            if (target.Name is nameof(Monitor.Enter) or nameof(Monitor.Exit))
+                monitorCalls.Add((i, target.Name == nameof(Monitor.Enter)));
+        }
+
+        var enterCalls = monitorCalls.Where(c => c.IsEnter).ToList();
+        var exitCalls = monitorCalls.Where(c => !c.IsEnter).ToList();
+        Assert.True(enterCalls.Count == 1, $"'{methodName}' emits {enterCalls.Count} Monitor.Enter calls — expected exactly one.");
+        Assert.True(exitCalls.Count == 1, $"'{methodName}' emits {exitCalls.Count} Monitor.Exit calls — expected exactly one.");
+
+        Assert.True(
+            ResolveMonitorArgumentFieldToken(body, enterCalls[0].Index, isEnter: true) == lockField.MetadataToken,
+            $"'{methodName}': the pointer's protecting Monitor.Enter does not acquire GoalPipeline._lock.");
+
+        var enterOffset = body.Instructions[enterCalls[0].Index].Offset;
+        var exitOffset = body.Instructions[exitCalls[0].Index].Offset;
+
+        // ── (2) ORDERING: every pointer access sits strictly between Enter and Exit ────
+        var beforeEnter = pointerOffsets.Where(o => o < enterOffset).OrderBy(o => o).ToList();
+        Assert.True(
+            beforeEnter.Count == 0,
+            $"'{methodName}': active-task-pointer access(es) at IL offset(s) [{string.Join(", ", beforeEnter)}] " +
+            $"precede the Monitor.Enter at {enterOffset} — the pointer is read or written OUTSIDE the lock " +
+            "(e.g. cached before the acquisition), so the pointer and the registry are not captured as one " +
+            "coherent state.");
+
+        var afterExit = pointerOffsets.Where(o => o > exitOffset).OrderBy(o => o).ToList();
+        Assert.True(
+            afterExit.Count == 0,
+            $"'{methodName}': active-task-pointer access(es) at IL offset(s) [{string.Join(", ", afterExit)}] " +
+            $"follow the Monitor.Exit at {exitOffset} — the pointer is touched after the lock was released.");
+
+        // ── (3) DOMINANCE: no pointer access is reachable without executing the Enter ──
+        var withoutEnter = ReachableWithoutExecuting(body, enterOffset);
+        var unguardedReachable = pointerOffsets.Where(withoutEnter.Contains).OrderBy(o => o).ToList();
+        Assert.True(
+            unguardedReachable.Count == 0,
+            $"'{methodName}': active-task-pointer access(es) at IL offset(s) " +
+            $"[{string.Join(", ", unguardedReachable)}] are reachable from the method entry WITHOUT executing " +
+            $"the Monitor.Enter at {enterOffset} — the pointer can be touched unlocked on some execution path.");
+
+        // ── (4) ONE PROTECTED SPAN: the pointer and the registry share the SAME try ───
+        var firstGuarded = guarded[0].Offset;
+        var lastGuarded = guarded[^1].Offset;
+
+        var covering = method.GetMethodBody()!.ExceptionHandlingClauses
+            .Where(c => c.Flags == ExceptionHandlingClauseOptions.Finally)
+            .FirstOrDefault(c =>
+                exitOffset >= c.HandlerOffset
+                && exitOffset < c.HandlerOffset + c.HandlerLength
+                && c.TryOffset <= firstGuarded
+                && c.TryOffset + c.TryLength >= lastGuarded);
+
+        Assert.True(
+            covering is not null,
+            $"'{methodName}': no finally handler holds the Monitor.Exit while covering the guarded registry " +
+            $"span [{firstGuarded}, {lastGuarded}].");
+
+        var pointerOutsideTry = pointerOffsets
+            .Where(o => o < covering!.TryOffset || o >= covering.TryOffset + covering.TryLength)
+            .OrderBy(o => o)
+            .ToList();
+
+        Assert.True(
+            pointerOutsideTry.Count == 0,
+            $"'{methodName}': active-task-pointer access(es) at IL offset(s) " +
+            $"[{string.Join(", ", pointerOutsideTry)}] lie outside the try range " +
+            $"[{covering!.TryOffset}, {covering.TryOffset + covering.TryLength}) that protects the guarded " +
+            "registry work — the pointer and the registry are not touched in ONE lock span.");
+    }
+
+    /// <summary>
+    /// NON-VACUITY BACKSTOP for the pointer probe itself: <see cref="IsPointerAccessInstruction"/>
+    /// must genuinely recognise the pointer in the shapes production uses.
+    /// <para>
+    /// Without this, a probe that silently stopped matching anything (a renamed accessor, a
+    /// changed lowering) would make
+    /// <see cref="PointerAndRegistryMethod_ReadsThePointerInsideTheSameLockSpanAsTheRegistry"/>
+    /// pass vacuously on an empty offset set — except that its own non-vacuity assertion fires
+    /// first. This test pins the recognition POSITIVELY and independently: the pointer-only
+    /// methods must be detected, and a method that provably never touches the pointer must NOT
+    /// be, so the predicate is neither blind nor indiscriminate.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PointerAccessProbe_RecognisesRealPointerAccessesAndNothingElse()
+    {
+        // POSITIVE: the pointer's own entry points are detected in both directions.
+        foreach (var name in new[] { "TrySetActiveTask", "ClearActiveTaskIfCurrent", "SetActiveTask", "ClearActiveTask" })
+        {
+            Assert.True(
+                PointerAccessOffsets(DecodeBody(RegistryMethod(name))).Count > 0,
+                $"The pointer probe does not recognise the active-task access inside '{name}' — it has gone " +
+                "blind, so every pointer assertion built on it would be vacuous.");
+        }
+
+        // NEGATIVE: a registry method that provably never touches the pointer is not matched.
+        foreach (var name in new[] { "CaptureRegistry", "RecordSlot", "AbandonPendingSlots" })
+        {
+            Assert.True(
+                PointerAccessOffsets(DecodeBody(RegistryMethod(name))).Count == 0,
+                $"The pointer probe reports an active-task access inside '{name}', which touches no pointer — " +
+                "the predicate is matching indiscriminately.");
+        }
+    }
+
+    /// <summary>
+    /// DRIFT GUARD for the pointer proof, mirroring
+    /// <see cref="LockStructureBackstop_CoversEveryRegistryEntryPoint"/>: every locked registry
+    /// entry point that ALSO touches the active-task pointer must be listed in
+    /// <see cref="PointerAndRegistryMethodNames"/>, so a future combined pointer+registry method
+    /// cannot be added without inheriting the one-span proof above.
+    /// </summary>
+    [Fact]
+    public void PointerProof_CoversEveryLockedMethodThatTouchesThePointer()
+    {
+        var expected = PointerAndRegistryMethodNames.ToHashSet(StringComparer.Ordinal);
+
+        var actual = LockedRegistryMethodNames
+            .Where(name => PointerAccessOffsets(DecodeBody(RegistryMethod(name))).Count > 0)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
     /// Guards the backstop itself against silent drift: if <see cref="GoalPipeline"/> ever gains a
     /// registry entry point that is not listed in <see cref="LockedRegistryMethods"/>, this fails,
     /// so a new unlocked method cannot slip past the structural proof unnoticed.
+    /// <para>
+    /// The <see cref="LockHeldRegistryHelperNames"/> are excluded here BY NAME and pinned instead
+    /// by <see cref="LockHeldHelper_TakesNoLockAndIsCalledOnlyFromLockedEntryPoints"/> — they take
+    /// no lock of their own by design, so listing them among the locked entry points would assert
+    /// a Monitor pair they must not have. A brand-new method still fails this test.
+    /// </para>
     /// </summary>
     [Fact]
     public void LockStructureBackstop_CoversEveryRegistryEntryPoint()
@@ -2088,11 +2435,71 @@ public sealed class WorkSlotRegistryTests
         var actual = typeof(GoalPipeline)
             .GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly)
             .Where(m => !m.IsSpecialName)
+            .Where(m => !LockHeldRegistryHelperNames.Contains(m.Name, StringComparer.Ordinal))
             .Where(m => DecodeCallSites(m).Any(c => IsGuardedAccess(c.Target)))
             .Select(m => m.Name)
             .ToHashSet(StringComparer.Ordinal);
 
         Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// THE LOCK-HELD HELPER CONTRACT, asserted against the compiled artifact (deterministic — no
+    /// timing anywhere). For every <see cref="LockHeldRegistryHelperNames"/> entry:
+    /// <list type="number">
+    ///   <item>it is PRIVATE and touches the backing dictionaries, so it is genuinely registry
+    ///     storage work;</item>
+    ///   <item>it emits NO <c>Monitor.Enter</c>/<c>Exit</c> of its own — it neither re-enters nor
+    ///     independently acquires the monitor, which is what lets a caller cover it plus other
+    ///     reads with a SINGLE acquisition;</item>
+    ///   <item>EVERY call site of it inside <see cref="GoalPipeline"/> is a method listed in
+    ///     <see cref="LockedRegistryMethodNames"/> — so the helper is never reached from an
+    ///     unlocked path.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public void LockHeldHelper_TakesNoLockAndIsCalledOnlyFromLockedEntryPoints()
+    {
+        var lockedNames = LockedRegistryMethodNames.ToHashSet(StringComparer.Ordinal);
+
+        foreach (var helperName in LockHeldRegistryHelperNames)
+        {
+            var helper = RegistryMethod(helperName);
+            Assert.True(helper.IsPrivate, $"'{helperName}' must be private — it is a lock-held internal step.");
+
+            var helperCalls = DecodeCallSites(helper);
+
+            // (1) It really is storage work: it touches the backing dictionaries directly.
+            Assert.True(
+                helperCalls.Any(c => IsGuardedAccess(c.Target)),
+                $"'{helperName}' performs no registry storage access — the helper contract would be vacuous.");
+
+            // (2) No monitor traffic of its own: neither Enter nor Exit.
+            Assert.True(
+                !helperCalls.Any(c => IsMonitor(c.Target, nameof(Monitor.Enter))
+                    || IsMonitor(c.Target, nameof(Monitor.Exit))),
+                $"'{helperName}' emits Monitor traffic — a lock-held helper must rely on the caller's " +
+                "single acquisition instead of taking or re-entering the monitor itself.");
+
+            // (3) Every caller inside GoalPipeline is a locked entry point.
+            var callers = typeof(GoalPipeline)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic
+                    | BindingFlags.Public | BindingFlags.DeclaredOnly)
+                .Where(m => m.Name != helperName && m.GetMethodBody() is not null)
+                .Where(m => DecodeCallSites(m).Any(c =>
+                    c.Target.DeclaringType == typeof(GoalPipeline)
+                    && string.Equals(c.Target.Name, helperName, StringComparison.Ordinal)))
+                .Select(m => m.Name)
+                .ToList();
+
+            Assert.NotEmpty(callers);
+
+            var unlockedCallers = callers.Where(n => !lockedNames.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToList();
+            Assert.True(
+                unlockedCallers.Count == 0,
+                $"'{helperName}' is called from non-locked method(s) [{string.Join(", ", unlockedCallers)}] — " +
+                "the lock-held helper would then run without the pipeline monitor.");
+        }
     }
 
     #endregion
@@ -5104,6 +5511,947 @@ public sealed class WorkSlotRegistryTests
 
         // The rest of the registry is unimpaired: a different position allocates normally.
         Assert.Equal(1, target.AllocateAttemptAndRegisterSlot("fresh", Position(occurrence: 2)).Attempt);
+    }
+
+    #endregion
+
+    #region (w) The pure validator, the ownership capture and the admission preflight
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  WHAT THIS REGION PROVES — and what it deliberately does NOT.
+    //
+    //  Three DOMAIN-ONLY additions, all built on the existing fixtures above:
+    //    • ValidateDetachedRegistrySnapshot — the restore path's copy-and-validate step,
+    //      extracted as a pure function: it installs nothing, locks nothing, and returns a
+    //      detached snapshot preserving the supplied values AND their order;
+    //    • CaptureAdmissionOwnership — goal identity + active-task pointer + the COMPLETE
+    //      registry, taken in ONE _lock span;
+    //    • PreflightAdmissionOwnership — a pure validation of such a carrier.
+    //
+    //  What is NOT claimed: nothing here persists anything, nothing changes the production
+    //  restore or dispatch paths, and the ownership capture is NOT a coherent whole-pipeline
+    //  snapshot — it carries no phase, plan or machine position, and capturing an observed
+    //  intermediate state does not make that state a valid admission.
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>A detached carrier built from explicit values (no pipeline involved).</summary>
+    private static AdmissionOwnershipSnapshot Ownership(
+        string goalId,
+        string? activeTaskId,
+        IReadOnlyList<WorkSlotView> slots,
+        IReadOnlyList<WorkSlotRegistryAttemptEntry> attempts) =>
+        new(goalId, activeTaskId, new WorkSlotRegistrySnapshot(slots, attempts));
+
+    // ── 1. The pure validator: no mutation, independent copies, order preserved ────────
+
+    /// <summary>
+    /// The validator is PURE: validating a live pipeline's captured registry changes neither the
+    /// registry nor the counters, and the returned collections are FRESH — mutating them cannot
+    /// reach the pipeline, and mutating the INPUT lists afterwards cannot reach the result.
+    /// </summary>
+    [Fact]
+    public void Validate_IsNonMutating_AndReturnsIndependentCollectionCopies()
+    {
+        var source = RealPathSource();
+        var beforeSlots = ViewsOf(source.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(source.CaptureRegistry());
+
+        // The INPUT lists are the caller's own, so they can be mutated after the call.
+        var inputSlots = new List<WorkSlotView>(source.CaptureRegistry().Slots);
+        var inputAttempts = new List<WorkSlotRegistryAttemptEntry>(source.CaptureRegistry().DispatchAttempts);
+
+        var validated = GoalPipeline.ValidateDetachedRegistrySnapshot(
+            new WorkSlotRegistrySnapshot(inputSlots, inputAttempts));
+
+        // (a) The source pipeline is untouched — validation installs nothing.
+        var after = source.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+
+        // (b) The result holds exactly the supplied values, in the SUPPLIED ORDER.
+        Assert.Equal(inputSlots, validated.Slots);
+        Assert.Equal(inputAttempts, validated.DispatchAttempts);
+
+        var frozenSlots = validated.Slots.ToList();
+        var frozenAttempts = validated.DispatchAttempts.ToList();
+
+        // (c) Mutating the INPUT lists afterwards cannot alter the validated result.
+        inputSlots.Clear();
+        inputAttempts.Clear();
+        inputAttempts.Add(Entry(Position(occurrence: 99), 42));
+
+        Assert.Equal(frozenSlots, validated.Slots);
+        Assert.Equal(frozenAttempts, validated.DispatchAttempts);
+
+        // (d) Mutating the RESULT's collections cannot reach the pipeline registry.
+        ((List<WorkSlotView>)validated.Slots).Clear();
+        ((List<WorkSlotRegistryAttemptEntry>)validated.DispatchAttempts).Clear();
+
+        var stillThere = source.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(stillThere));
+        Assert.Equal(beforeAttempts, AttemptsOf(stillThere));
+    }
+
+    /// <summary>
+    /// The validator preserves EVERY lifecycle state, every high-water entry (including ones
+    /// HIGHER than any slot's attempt) and every counter-only entry — exactly as supplied, with
+    /// nothing renumbered, normalized or reconstructed, and with no identity rebuilt from an ID.
+    /// </summary>
+    [Fact]
+    public void Validate_PreservesEveryLifecycleStateHighWaterAndCounterOnlyEntry()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var posC = Position(occurrence: 3);
+        var counterOnly = Position(occurrence: 4);
+
+        List<WorkSlotView> slots =
+        [
+            View("pending-1", posA, 2, WorkSlotState.Pending),
+            View("claimed-1", posB, 3, WorkSlotState.Claimed),
+            View("recorded-1", posC, 1, WorkSlotState.Recorded),
+            View("abandoned-1", posC, 2, WorkSlotState.Abandoned),
+        ];
+        List<WorkSlotRegistryAttemptEntry> attempts =
+        [
+            Entry(posA, 9),               // HIGHER than the slot's own attempt
+            Entry(posB, 3),
+            Entry(posC, 2),
+            Entry(counterOnly, 7),        // counter-only: no slot references it
+        ];
+
+        var validated = GoalPipeline.ValidateDetachedRegistrySnapshot(
+            new WorkSlotRegistrySnapshot(slots, attempts));
+
+        // Sequence equality: same values, same order, same references — no reconstruction.
+        Assert.Equal(slots, validated.Slots);
+        Assert.Equal(attempts, validated.DispatchAttempts);
+
+        // And the validated snapshot is still installable, preserving those exact values.
+        var target = FreshTarget();
+        target.RestoreRegistry(validated);
+        Assert.Equal([.. slots], ViewsOf(target.CaptureRegistry()));
+        Assert.Equal([.. attempts], AttemptsOf(target.CaptureRegistry()));
+    }
+
+    /// <summary>
+    /// A LATE invalid entry still fails the whole validation: nothing partially valid is returned.
+    /// Both a late slot defect and a late attempt-entry defect are covered.
+    /// </summary>
+    [Fact]
+    public void Validate_LateInvalidEntry_FailsTheWholeValidation()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var posC = Position(occurrence: 3);
+
+        // Late duplicate task ID, after two fully valid entries.
+        Assert.Throws<ArgumentException>(() => GoalPipeline.ValidateDetachedRegistrySnapshot(
+            new WorkSlotRegistrySnapshot(
+                [
+                    View("t1", posA, 2, WorkSlotState.Claimed),
+                    View("t2", posB, 1, WorkSlotState.Recorded),
+                    View("t1", posC, 1, WorkSlotState.Abandoned),
+                ],
+                [Entry(posA, 5), Entry(posB, 1), Entry(posC, 1)])));
+
+        // Late duplicate high-water position.
+        Assert.Throws<ArgumentException>(() => GoalPipeline.ValidateDetachedRegistrySnapshot(
+            new WorkSlotRegistrySnapshot(
+                [View("t1", posA, 2, WorkSlotState.Claimed)],
+                [Entry(posA, 5), Entry(posB, 1), Entry(posB, 7)])));
+    }
+
+    /// <summary>
+    /// The validator carries the restore path's ENTIRE rejection matrix — the same fixtures the
+    /// restore tests feed, asserted directly against the extracted helper.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MalformedSnapshotKinds))]
+    public void Validate_MalformedEntry_ThrowsArgumentException(string kind)
+    {
+        Assert.Throws<ArgumentException>(
+            () => GoalPipeline.ValidateDetachedRegistrySnapshot(MalformedSnapshot(kind)));
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedSlotPositionKinds))]
+    public void Validate_MalformedSlotPosition_IsRejectedByTheSlotGuardItself(string kind)
+    {
+        var ex = Assert.Throws<ArgumentException>(
+            () => GoalPipeline.ValidateDetachedRegistrySnapshot(MalformedSnapshot(kind)));
+
+        Assert.Contains("Snapshot slot 't1'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_NullSnapshotOrCollections_ThrowArgumentNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => GoalPipeline.ValidateDetachedRegistrySnapshot(null));
+        Assert.Throws<ArgumentNullException>(
+            () => GoalPipeline.ValidateDetachedRegistrySnapshot(new WorkSlotRegistrySnapshot(null!, [])));
+        Assert.Throws<ArgumentNullException>(
+            () => GoalPipeline.ValidateDetachedRegistrySnapshot(new WorkSlotRegistrySnapshot([], null!)));
+    }
+
+    /// <summary>
+    /// The validator never compares historical positions against the CURRENT plan or machine
+    /// phase: a registry full of positions from other iterations/phases than the pipeline's own
+    /// validates and installs unchanged.
+    /// </summary>
+    [Fact]
+    public void Validate_HistoricalPositions_AreNotComparedWithTheCurrentPlanOrMachine()
+    {
+        var stale = new WorkSlotPosition(7, GoalPhase.Improve, 3);
+        var snapshot = new WorkSlotRegistrySnapshot(
+            [View("old-1", stale, 4, WorkSlotState.Recorded)],
+            [Entry(stale, 4)]);
+
+        var validated = GoalPipeline.ValidateDetachedRegistrySnapshot(snapshot);
+
+        // The pipeline sits at iteration 1 / Coding; the historical position is untouched.
+        var target = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+        target.RestoreRegistry(validated);
+
+        Assert.Equal(
+            View("old-1", stale, 4, WorkSlotState.Recorded),
+            Assert.Single(target.GetSlotsForTest()));
+    }
+
+    /// <summary>
+    /// RestoreRegistry DELEGATES to the extracted validator instead of carrying a second copy of
+    /// the rules — asserted against the compiled artifact, so a re-inlined duplicate validator
+    /// fails deterministically.
+    /// </summary>
+    [Fact]
+    public void Restore_DelegatesItsValidationToTheExtractedHelper()
+    {
+        var called = DecodeCallSites(RegistryMethod("RestoreRegistry"))
+            .Any(c => c.Target.DeclaringType == typeof(GoalPipeline)
+                && c.Target.Name == "ValidateDetachedRegistrySnapshot");
+
+        Assert.True(
+            called,
+            "RestoreRegistry does not call ValidateDetachedRegistrySnapshot — the copy-and-validate " +
+            "step must be the shared helper, not a second validator.");
+    }
+
+    // ── 2. The ownership capture ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The capture, taken over a registry built by REAL allocation/transition paths and a REAL
+    /// active-pointer operation: it reports the COMPLETE values (goal identity, pointer, every
+    /// slot and every counter), and later pipeline mutations cannot reach the captured carrier.
+    /// </summary>
+    [Fact]
+    public void CaptureAdmissionOwnership_RealPaths_ReportsCompleteValuesAndIsFrozenAtCapture()
+    {
+        var source = RealPathSource();
+        source.SetActiveTask("pending-task");
+
+        var captured = source.CaptureAdmissionOwnership();
+
+        // COMPLETE values, compared against the registry itself — nothing reconstructed.
+        Assert.Equal("goal-1", captured.GoalId);
+        Assert.Equal("pending-task", captured.ActiveTaskId);
+        Assert.Equal(ViewsOf(source.CaptureRegistry()), ViewsOf(captured.Registry));
+        Assert.Equal(AttemptsOf(source.CaptureRegistry()), AttemptsOf(captured.Registry));
+        Assert.Contains(View("pending-task", Position(occurrence: 4), 1, WorkSlotState.Pending), ViewsOf(captured.Registry));
+        Assert.Contains(View("claimed-task", Position(occurrence: 1), 1, WorkSlotState.Claimed), ViewsOf(captured.Registry));
+
+        var frozenSlots = ViewsOf(captured.Registry);
+        var frozenAttempts = AttemptsOf(captured.Registry);
+
+        // ── MUTATE THE SOURCE AFTERWARDS, through real production paths ───────────────
+        Assert.Equal(SlotGuardResult.Proceed, source.ResolveAndCheckSlot("pending-task"));
+        Assert.Equal(SlotRecordOutcome.Recorded, source.RecordSlot("pending-task"));
+        source.AllocateAttemptAndRegisterSlot("latecomer", Position(occurrence: 5));
+        Assert.True(source.ClearActiveTaskIfCurrent("pending-task"));
+
+        // The carrier is frozen at the capture instant.
+        Assert.Equal("pending-task", captured.ActiveTaskId);
+        Assert.Equal(frozenSlots, ViewsOf(captured.Registry));
+        Assert.Equal(frozenAttempts, AttemptsOf(captured.Registry));
+        Assert.DoesNotContain(captured.Registry.Slots, v => v.Slot.TaskId == "latecomer");
+    }
+
+    /// <summary>
+    /// The capture MUTATES NOTHING: no slot state changes, no attempt is allocated, no counter
+    /// advances and the pointer is left exactly as it was (idle stays idle).
+    /// </summary>
+    [Fact]
+    public void CaptureAdmissionOwnership_ChangesNoPointerRegistryOrCounter()
+    {
+        var source = RealPathSource();
+        var beforeSlots = ViewsOf(source.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(source.CaptureRegistry());
+
+        var idle = source.CaptureAdmissionOwnership();
+        Assert.Null(idle.ActiveTaskId);   // an idle pipeline captures a null pointer honestly
+
+        source.SetActiveTask("pending-task");
+        var captured = source.CaptureAdmissionOwnership();
+        Assert.Equal("pending-task", captured.ActiveTaskId);
+
+        // Nothing moved: the same slots, the same states, the same counters, the same pointer.
+        var after = source.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+        Assert.Equal("pending-task", source.ActiveTaskId);
+
+        // The counters were not advanced by the capture: posC still continues from 1 → 2.
+        Assert.Equal(2, source.AllocateAttemptAndRegisterSlot("after-capture", Position(occurrence: 3)).Attempt);
+    }
+
+    /// <summary>
+    /// The carrier exposes NO live collection: mutating the returned lists cannot touch the
+    /// registry it was taken from.
+    /// </summary>
+    [Fact]
+    public void CaptureAdmissionOwnership_MutatingTheReturnedCollections_CannotTouchTheRegistry()
+    {
+        var source = RealPathSource();
+        var before = ViewsOf(source.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(source.CaptureRegistry());
+
+        var captured = source.CaptureAdmissionOwnership();
+        ((List<WorkSlotView>)captured.Registry.Slots).Clear();
+        ((List<WorkSlotRegistryAttemptEntry>)captured.Registry.DispatchAttempts).Clear();
+
+        var after = source.CaptureRegistry();
+        Assert.Equal(before, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+    }
+
+    /// <summary>
+    /// CaptureRegistry's own behaviour is UNCHANGED by the shared lock-held copy helper: it still
+    /// returns the complete detached registry, and the two APIs agree value-for-value.
+    /// </summary>
+    [Fact]
+    public void CaptureRegistry_BehaviourIsUnchangedAndAgreesWithTheOwnershipCapture()
+    {
+        var source = RealPathSource();
+        source.SetActiveTask("pending-task");
+
+        var registry = source.CaptureRegistry();
+        var ownership = source.CaptureAdmissionOwnership();
+
+        Assert.Equal(ViewsOf(registry), ViewsOf(ownership.Registry));
+        Assert.Equal(AttemptsOf(registry), AttemptsOf(ownership.Registry));
+
+        // Still a detached copy in its own right: hostile mutation cannot reach the registry.
+        ((List<WorkSlotView>)registry.Slots).Clear();
+        Assert.Equal(ViewsOf(ownership.Registry), ViewsOf(source.CaptureRegistry()));
+    }
+
+    /// <summary>
+    /// THE SINGLE-ACQUISITION CONTRACT, asserted against the COMPILED ARTIFACT (deterministic —
+    /// no timing anywhere): <c>CaptureAdmissionOwnership</c> must read the pointer AND the whole
+    /// registry inside ONE <c>_lock</c> span, so it must not call any other locked registry entry
+    /// point — above all <c>CaptureRegistry</c>, which would be a second, separate acquisition
+    /// through which the pointer and the registry could drift apart.
+    /// <para>
+    /// The whole-operation lock structure itself (exactly one Enter/Exit on
+    /// <c>GoalPipeline._lock</c>, covering every guarded access on every path) is pinned for this
+    /// method by <see cref="RegistryEntryPoint_RunsWhollyUnderTheLock"/>, which now includes it.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void CaptureAdmissionOwnership_DoesNotNestAnyOtherLockedRegistryEntryPoint()
+    {
+        var lockedNames = LockedRegistryMethodNames.ToHashSet(StringComparer.Ordinal);
+
+        var nested = DecodeCallSites(RegistryMethod("CaptureAdmissionOwnership"))
+            .Where(c => c.Target.DeclaringType == typeof(GoalPipeline) && lockedNames.Contains(c.Target.Name))
+            .Select(c => c.Target.Name)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.True(
+            nested.Count == 0,
+            $"'CaptureAdmissionOwnership' calls locked registry entry point(s) [{string.Join(", ", nested)}] — " +
+            "the pointer and the registry must be read under ONE acquisition, not two.");
+    }
+
+    /// <summary>
+    /// The BEHAVIOURAL companion, using the suite's existing deterministic seam (the reflected
+    /// <c>_lock</c> monitor) and its established <c>WhileLockHeld</c> pattern — no new harness,
+    /// no stress, no sleep-based proof. Two facts only: the capture cannot complete while the
+    /// pipeline lock is held, and once released it reports the COMPLETE coherent after-state.
+    /// </summary>
+    [Fact]
+    public void CaptureAdmissionOwnership_WhileLockHeld_IsBlocked_ThenReportsCommittedState()
+    {
+        var pipeline = NewPipeline();
+        var pos = Position();
+        Assert.True(pipeline.SeedSlotForTest("t1", pos, 5, WorkSlotState.Pending));
+
+        var monitor = GetPipelineLock(pipeline);
+
+        using var callAttempted = new ManualResetEventSlim(false);
+        using var callCompleted = new ManualResetEventSlim(false);
+        AdmissionOwnershipSnapshot? workerResult = null;
+        bool attemptObserved;
+        bool completedWhileHeld;
+
+        var worker = new Thread(() =>
+        {
+            callAttempted.Set();                                     // signalled IMMEDIATELY BEFORE the call…
+            var captured = pipeline.CaptureAdmissionOwnership();     // …which parks on the pipeline lock
+            Volatile.Write(ref workerResult, captured);
+            callCompleted.Set();
+        })
+        {
+            IsBackground = true,
+            Name = "work-slot-blocked-ownership-capture",
+        };
+
+        Monitor.Enter(monitor);
+        try
+        {
+            // The pointer is set from INSIDE the held region, so it is committed before the
+            // parked capture can possibly observe anything.
+            pipeline.SetActiveTask("t1");
+            worker.Start();
+#pragma warning disable xUnit1051 // Timeout-only waits are intentional: the fixed bound IS the proof
+            attemptObserved = callAttempted.Wait(WaitTimeout);
+            completedWhileHeld = callCompleted.Wait(BlockedGrace);
+#pragma warning restore xUnit1051
+        }
+        finally
+        {
+            Monitor.Exit(monitor);
+        }
+
+        Assert.True(worker.Join(WaitTimeout), "The blocked capture never completed after the lock was released.");
+
+        Assert.True(attemptObserved, "The worker thread never signalled its call attempt.");
+        Assert.False(
+            completedWhileHeld,
+            "CaptureAdmissionOwnership completed while the pipeline lock was held — it is not running under the lock.");
+
+        var result = Volatile.Read(ref workerResult);
+        Assert.NotNull(result);
+        Assert.Equal("goal-1", result!.GoalId);
+        Assert.Equal("t1", result.ActiveTaskId);
+        Assert.Equal(
+            new WorkSlotView(new WorkSlot("t1", pos, 5), WorkSlotState.Pending),
+            Assert.Single(result.Registry.Slots));
+    }
+
+    // ── 3. The admission preflight ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// THE VALID VECTOR, built from real allocation and a real active-pointer operation: the
+    /// active task owns a Pending slot, so the preflight succeeds and returns a carrier holding
+    /// the COMPLETE values — identity, pointer, and every slot/counter of the registry.
+    /// </summary>
+    [Fact]
+    public void Preflight_ValidPendingIdentity_ReturnsTheCompleteValidatedCarrier()
+    {
+        var source = RealPathSource();
+        source.SetActiveTask("pending-task");
+        var captured = source.CaptureAdmissionOwnership();
+
+        var validated = GoalPipeline.PreflightAdmissionOwnership(captured);
+
+        Assert.Equal("goal-1", validated.GoalId);
+        Assert.Equal("pending-task", validated.ActiveTaskId);
+        Assert.Equal(ViewsOf(captured.Registry), ViewsOf(validated.Registry));
+        Assert.Equal(AttemptsOf(captured.Registry), AttemptsOf(validated.Registry));
+
+        // The EXACT slot identity survives — never rebuilt from the task ID.
+        Assert.Contains(View("pending-task", Position(occurrence: 4), 1, WorkSlotState.Pending), ViewsOf(validated.Registry));
+    }
+
+    /// <summary>
+    /// The preflight preserves the COMPLETE history: historical slots in every state and
+    /// counter-only high-water entries all survive, and NO requirement is imposed that every
+    /// historical slot have a current mapping — only the ACTIVE task needs a Pending slot.
+    /// </summary>
+    [Fact]
+    public void Preflight_PreservesHistoricalAndCounterOnlyEntries_WithoutRequiringAMappingForEach()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+        var posC = Position(occurrence: 3);
+        var counterOnly = Position(occurrence: 4);
+
+        List<WorkSlotView> slots =
+        [
+            View("recorded-1", posA, 1, WorkSlotState.Recorded),
+            View("abandoned-1", posA, 2, WorkSlotState.Abandoned),
+            View("claimed-1", posB, 1, WorkSlotState.Claimed),
+            View("active-1", posC, 6, WorkSlotState.Pending),
+        ];
+        List<WorkSlotRegistryAttemptEntry> attempts =
+        [
+            Entry(posA, 2), Entry(posB, 1), Entry(posC, 9), Entry(counterOnly, 4),
+        ];
+
+        var validated = GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "active-1", slots, attempts));
+
+        // Every entry survives, in the supplied order — including the counter-only one and the
+        // high-water (9) that exceeds the active slot's own attempt (6).
+        Assert.Equal(slots, validated.Registry.Slots);
+        Assert.Equal(attempts, validated.Registry.DispatchAttempts);
+    }
+
+    // ── THE GUARD MESSAGES, quoted from production so each rejection test can pin the EXACT
+    //    guard that must have fired rather than accepting any ArgumentException. Without these
+    //    a rejection test passes through an unrelated fallback: e.g. deleting the blank-active
+    //    guard still throws — from the later missing-slot check — so a bare Throws<> proves
+    //    nothing about the guard it claims to cover.
+    private const string BlankGoalGuard = "Admission goal ID must be a non-blank string";
+    private const string BlankActiveTaskGuard = "Admission active task ID must be a non-blank string";
+    private const string MissingSlotGuard = "has no matching slot in the registry";
+    private const string NonPendingGuardFragment = "has a slot in state";
+
+    /// <summary>
+    /// Asserts that <paramref name="ex"/> came from <paramref name="expectedGuard"/> and from
+    /// NONE of the other preflight guards — the isolation the reviewer's fallback finding
+    /// requires. Each rejection test names one guard, so removing that guard changes the message
+    /// (or removes the throw entirely) and the test fails.
+    /// </summary>
+    private static void AssertGuard(ArgumentException ex, string expectedGuard)
+    {
+        Assert.Contains(expectedGuard, ex.Message, StringComparison.Ordinal);
+
+        foreach (var other in new[] { BlankGoalGuard, BlankActiveTaskGuard, MissingSlotGuard, NonPendingGuardFragment })
+        {
+            if (string.Equals(other, expectedGuard, StringComparison.Ordinal))
+                continue;
+
+            Assert.DoesNotContain(other, ex.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Preflight_MissingSlotForTheActiveTask_ThrowsArgumentException()
+    {
+        var pos = Position(occurrence: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "never-registered", [View("t1", pos, 1, WorkSlotState.Pending)], [Entry(pos, 1)])));
+
+        Assert.Contains("never-registered", ex.Message, StringComparison.Ordinal);
+        AssertGuard(ex, MissingSlotGuard);
+    }
+
+    /// <summary>
+    /// An EMPTY registry is the degenerate missing-slot case: an active task can never match.
+    /// </summary>
+    [Fact]
+    public void Preflight_EmptyRegistry_ThrowsArgumentException()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "t1", [], [])));
+
+        AssertGuard(ex, MissingSlotGuard);
+    }
+
+    /// <summary>
+    /// THE PENDING RULE, per state: a matching slot that is Claimed, Recorded or Abandoned is
+    /// refused — only Pending is admissible. Each state is its own vector, and the message is
+    /// pinned to the non-Pending guard so no other refusal can stand in for it.
+    /// </summary>
+    [Theory]
+    [InlineData(StClaimed)]
+    [InlineData(StRecorded)]
+    [InlineData(StAbandoned)]
+    public void Preflight_MatchingSlotNotPending_ThrowsArgumentException(int stateCode)
+    {
+        var pos = Position(occurrence: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "t1", [View("t1", pos, 1, St(stateCode))], [Entry(pos, 1)])));
+
+        Assert.Contains(St(stateCode).ToString(), ex.Message, StringComparison.Ordinal);
+        AssertGuard(ex, NonPendingGuardFragment);
+    }
+
+    /// <summary>
+    /// The match is ORDINAL, exactly as the registry's own keying is: a case-different id is a
+    /// DIFFERENT task and therefore has no matching slot — proved by the missing-slot guard
+    /// firing, not merely by "something threw".
+    /// </summary>
+    [Fact]
+    public void Preflight_TaskMatchIsOrdinal_CaseDifferenceIsNotAMatch()
+    {
+        var pos = Position(occurrence: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "T1", [View("t1", pos, 1, WorkSlotState.Pending)], [Entry(pos, 1)])));
+
+        AssertGuard(ex, MissingSlotGuard);
+    }
+
+    /// <summary>
+    /// THE BLANK-GOAL GUARD, isolated. The registry carries a fully valid active Pending mapping,
+    /// so nothing else in the preflight can refuse this input: delete the blank-goal check and the
+    /// call SUCCEEDS, failing the <c>Throws</c>. The message is pinned as well, so no other guard
+    /// can be mistaken for this one.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Preflight_BlankGoalIdentity_ThrowsArgumentException(string? goalId)
+    {
+        var pos = Position(occurrence: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership(goalId!, "t1", [View("t1", pos, 1, WorkSlotState.Pending)], [Entry(pos, 1)])));
+
+        AssertGuard(ex, BlankGoalGuard);
+    }
+
+    /// <summary>
+    /// THE BLANK-ACTIVE-TASK GUARD, isolated — the reviewer's named fallback.
+    /// <para>
+    /// A blank active task can NEVER match a slot, so removing the blank/null guard still yields
+    /// an <see cref="ArgumentException"/>: the later missing-slot check fires instead. A bare
+    /// <c>Throws&lt;ArgumentException&gt;</c> is therefore worthless here. This test pins the
+    /// EXACT guard message and asserts the missing-slot wording is ABSENT, so deleting the
+    /// blank/null active-task guard fails all three vectors deterministically.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Preflight_BlankOrNullActiveTask_ThrowsArgumentException(string? activeTaskId)
+    {
+        var pos = Position(occurrence: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", activeTaskId, [View("t1", pos, 1, WorkSlotState.Pending)], [Entry(pos, 1)])));
+
+        AssertGuard(ex, BlankActiveTaskGuard);
+    }
+
+    /// <summary>
+    /// An IDLE pipeline captures a null pointer, and that carrier is refused by the BLANK-ACTIVE
+    /// guard specifically — the same isolation as above, reached through a real capture rather
+    /// than a hand-built carrier.
+    /// </summary>
+    [Fact]
+    public void Preflight_IdlePipelineCapture_IsRefused()
+    {
+        var source = RealPathSource();
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => GoalPipeline.PreflightAdmissionOwnership(source.CaptureAdmissionOwnership()));
+
+        AssertGuard(ex, BlankActiveTaskGuard);
+    }
+
+    [Fact]
+    public void Preflight_NullCarrierOrRegistryOrCollections_ThrowArgumentNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => GoalPipeline.PreflightAdmissionOwnership(null));
+        Assert.Throws<ArgumentNullException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            new AdmissionOwnershipSnapshot("goal-1", "t1", null!)));
+        Assert.Throws<ArgumentNullException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "t1", null!, [])));
+        Assert.Throws<ArgumentNullException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "t1", [], null!)));
+    }
+
+    /// <summary>
+    /// The position of the VALID active Pending slot injected into every malformed-registry
+    /// preflight vector. It is distinct from every position <see cref="MalformedSnapshot"/> uses
+    /// (which all sit at occurrence 1, or carry a malformed iteration/occurrence/phase), so it
+    /// can never collide with the defect under test.
+    /// </summary>
+    private static WorkSlotPosition ActiveAdmissionPosition => Position(occurrence: 7);
+
+    /// <summary>The task id of that valid active Pending slot.</summary>
+    private const string ActiveAdmissionTaskId = "active-admission-task";
+
+    /// <summary>
+    /// THE ISOLATION FIXTURE for the malformed-registry preflight vectors.
+    /// <para>
+    /// It takes a <see cref="MalformedSnapshot"/> defect and prepends an otherwise-perfect ACTIVE
+    /// PENDING slot with its own valid high-water entry. The resulting carrier is therefore valid
+    /// in EVERY respect the admission-identity rules care about — the active task exists, it is
+    /// Pending, and its counter is present — so the ONLY thing that can refuse it is the shared
+    /// validator's inspection of the HISTORICAL / counter-only entries.
+    /// </para>
+    /// <para>
+    /// WHY THIS MATTERS (the reviewer's named fallback): with the older fixtures the active task
+    /// named the malformed slot itself, so bypassing entry validation still threw — from the
+    /// missing-slot check, or (for the undefined-state kind) from the ordinary non-Pending check.
+    /// A bare <c>Throws</c> therefore proved nothing about whether the entries were validated.
+    /// With a valid active mapping present, skipping the entry validation makes the preflight
+    /// SUCCEED, so every vector below genuinely proves the ENTIRE registry goes through the
+    /// shared validator.
+    /// </para>
+    /// </summary>
+    private static AdmissionOwnershipSnapshot MalformedRegistryWithValidActiveMapping(string kind)
+    {
+        var malformed = MalformedSnapshot(kind);
+
+        List<WorkSlotView> slots =
+        [
+            View(ActiveAdmissionTaskId, ActiveAdmissionPosition, 1, WorkSlotState.Pending),
+            .. malformed.Slots,
+        ];
+        List<WorkSlotRegistryAttemptEntry> attempts =
+        [
+            Entry(ActiveAdmissionPosition, 1),
+            .. malformed.DispatchAttempts,
+        ];
+
+        return Ownership("goal-1", ActiveAdmissionTaskId, slots, attempts);
+    }
+
+    /// <summary>
+    /// THE POSITIVE CONTROL that makes every malformed-registry vector below non-vacuous: the
+    /// injected active mapping ON ITS OWN is fully valid and preflights SUCCESSFULLY. So when a
+    /// vector below throws, the refusal is attributable to the HISTORICAL / counter-only entries
+    /// alone — never to the active identity.
+    /// </summary>
+    [Fact]
+    public void Preflight_TheInjectedActiveMappingAlone_IsValidAndSucceeds()
+    {
+        var validated = GoalPipeline.PreflightAdmissionOwnership(Ownership(
+            "goal-1",
+            ActiveAdmissionTaskId,
+            [View(ActiveAdmissionTaskId, ActiveAdmissionPosition, 1, WorkSlotState.Pending)],
+            [Entry(ActiveAdmissionPosition, 1)]));
+
+        Assert.Equal(ActiveAdmissionTaskId, validated.ActiveTaskId);
+        Assert.Equal(
+            View(ActiveAdmissionTaskId, ActiveAdmissionPosition, 1, WorkSlotState.Pending),
+            Assert.Single(validated.Registry.Slots));
+    }
+
+    /// <summary>
+    /// A MALFORMED registry is refused by the preflight through the SHARED validator, even though
+    /// the ADMISSION IDENTITY ITSELF IS PERFECTLY VALID (see
+    /// <see cref="MalformedRegistryWithValidActiveMapping"/> and the positive control above).
+    /// <para>
+    /// The assertion also proves WHICH guard fired: the message must NOT be any of the
+    /// admission-identity refusals, so a mutant that skipped entry validation could not pass by
+    /// falling through to the missing-slot or non-Pending check — it would not throw at all.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MalformedSnapshotKinds))]
+    public void Preflight_MalformedRegistry_ThrowsArgumentException(string kind)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            MalformedRegistryWithValidActiveMapping(kind)));
+
+        // The refusal came from the registry validator, NOT from an admission-identity fallback.
+        Assert.DoesNotContain(MissingSlotGuard, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(NonPendingGuardFragment, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(BlankGoalGuard, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(BlankActiveTaskGuard, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Snapshot", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The MIRROR of the restore path's slot-guard proof, applied to the preflight and with a
+    /// valid active mapping present: the slot-POSITION defects must be rejected by the shared
+    /// SLOT guard, whose message alone names the offending task.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MalformedSlotPositionKinds))]
+    public void Preflight_MalformedRegistry_IsRejectedByTheSharedSlotGuard(string kind)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            MalformedRegistryWithValidActiveMapping(kind)));
+
+        Assert.Contains("Snapshot slot 't1'", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(MissingSlotGuard, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(NonPendingGuardFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The COUNTER-ONLY mirror, with a valid active mapping present: an isolated malformed
+    /// high-water entry that NO slot references — the active one included — can only be rejected
+    /// by the shared attempt-entry guard, whose message names an attempt entry.
+    /// <para>
+    /// This is the sharpest form of the reviewer's requirement: nothing about the admission
+    /// identity is wrong here, and the defect lives purely in counter history, so the vector
+    /// passes only if counter-only entries genuinely go through the shared validator.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("counter-only-zero-iteration")]
+    [InlineData("counter-only-negative-iteration")]
+    [InlineData("counter-only-zero-occurrence")]
+    [InlineData("counter-only-negative-occurrence")]
+    [InlineData("counter-only-undefined-phase")]
+    public void Preflight_MalformedCounterOnlyEntry_IsRejectedByTheSharedAttemptEntryGuard(string kind)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            MalformedRegistryWithValidActiveMapping(kind)));
+
+        Assert.Contains("Snapshot attempt entry", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(MissingSlotGuard, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(NonPendingGuardFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The HISTORICAL cross-entry invariants are enforced for the preflight too, again with a
+    /// perfectly valid active mapping present. Each vector's defect is confined to historical
+    /// slots/counters, so only the shared validator can produce the refusal.
+    /// </summary>
+    [Theory]
+    [InlineData("historical-duplicate-task-id", "duplicate task ID")]
+    [InlineData("historical-duplicate-allocation", "duplicate (position, attempt) allocation")]
+    [InlineData("historical-duplicate-high-water", "duplicate attempt entries for position")]
+    [InlineData("historical-multiple-live-slots", "multiple live slots at position")]
+    [InlineData("historical-missing-counter", "has no attempt entry for its position")]
+    [InlineData("historical-attempt-exceeds-high-water", "exceeding its")]
+    public void Preflight_MalformedHistoricalCrossEntry_IsRejectedByTheSharedValidator(
+        string kind, string expectedFragment)
+    {
+        var histA = Position(occurrence: 1);
+        var histB = Position(occurrence: 2);
+
+        // Every vector starts from the SAME valid active mapping; only the historical entries
+        // differ, so nothing about the admission identity can be responsible for the refusal.
+        List<WorkSlotView> slots = [View(ActiveAdmissionTaskId, ActiveAdmissionPosition, 1, WorkSlotState.Pending)];
+        List<WorkSlotRegistryAttemptEntry> attempts = [Entry(ActiveAdmissionPosition, 1)];
+
+        switch (kind)
+        {
+            case "historical-duplicate-task-id":
+                slots.Add(View("hist", histA, 1, WorkSlotState.Recorded));
+                slots.Add(View("hist", histB, 1, WorkSlotState.Recorded));
+                attempts.Add(Entry(histA, 1));
+                attempts.Add(Entry(histB, 1));
+                break;
+            case "historical-duplicate-allocation":
+                slots.Add(View("hist-1", histA, 2, WorkSlotState.Recorded));
+                slots.Add(View("hist-2", histA, 2, WorkSlotState.Abandoned));
+                attempts.Add(Entry(histA, 2));
+                break;
+            case "historical-duplicate-high-water":
+                attempts.Add(Entry(histA, 1));
+                attempts.Add(Entry(histA, 2));
+                break;
+            case "historical-multiple-live-slots":
+                slots.Add(View("hist-1", histA, 1, WorkSlotState.Claimed));
+                slots.Add(View("hist-2", histA, 2, WorkSlotState.Claimed));
+                attempts.Add(Entry(histA, 2));
+                break;
+            case "historical-missing-counter":
+                slots.Add(View("hist-1", histA, 1, WorkSlotState.Recorded));
+                break;   // histA's counter is deliberately absent
+            case "historical-attempt-exceeds-high-water":
+                slots.Add(View("hist-1", histA, 5, WorkSlotState.Recorded));
+                attempts.Add(Entry(histA, 4));
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled historical vector '{kind}'.");
+        }
+
+        var ex = Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", ActiveAdmissionTaskId, slots, attempts)));
+
+        Assert.Contains(expectedFragment, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(MissingSlotGuard, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(NonPendingGuardFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE DETACHMENT PROOF for the preflight result: after a SUCCESSFUL preflight, mutating the
+    /// caller's own input lists cannot alter the validated carrier — the result holds copies, not
+    /// the caller's collections.
+    /// </summary>
+    [Fact]
+    public void Preflight_MutatingTheInputListsAfterwards_CannotAlterTheValidatedResult()
+    {
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+
+        var slots = new List<WorkSlotView>
+        {
+            View("history-1", posA, 1, WorkSlotState.Recorded),
+            View("active-1", posB, 2, WorkSlotState.Pending),
+        };
+        var attempts = new List<WorkSlotRegistryAttemptEntry> { Entry(posA, 1), Entry(posB, 2) };
+
+        var validated = GoalPipeline.PreflightAdmissionOwnership(
+            Ownership("goal-1", "active-1", slots, attempts));
+
+        var frozenSlots = validated.Registry.Slots.ToList();
+        var frozenAttempts = validated.Registry.DispatchAttempts.ToList();
+
+        // Hostile mutation of the caller's lists AFTER the successful preflight.
+        slots.Clear();
+        slots.Add(View("injected", Position(occurrence: 99), 1, WorkSlotState.Claimed));
+        attempts.Clear();
+        attempts.Add(Entry(Position(occurrence: 99), 42));
+
+        Assert.Equal(frozenSlots, validated.Registry.Slots);
+        Assert.Equal(frozenAttempts, validated.Registry.DispatchAttempts);
+        Assert.DoesNotContain(validated.Registry.Slots, v => v.Slot.TaskId == "injected");
+        Assert.Equal("active-1", validated.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The preflight is PURE with respect to the pipeline it was captured from: running it (in
+    /// either the success or the refusal direction) leaves the source registry, counters and
+    /// pointer exactly as they were.
+    /// </summary>
+    [Fact]
+    public void Preflight_LeavesTheCapturedPipelineCompletelyUntouched()
+    {
+        var source = RealPathSource();
+        source.SetActiveTask("pending-task");
+
+        var beforeSlots = ViewsOf(source.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(source.CaptureRegistry());
+
+        GoalPipeline.PreflightAdmissionOwnership(source.CaptureAdmissionOwnership());
+        Assert.Throws<ArgumentException>(() => GoalPipeline.PreflightAdmissionOwnership(
+            new AdmissionOwnershipSnapshot("goal-1", "claimed-task", source.CaptureAdmissionOwnership().Registry)));
+
+        var after = source.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(after));
+        Assert.Equal(beforeAttempts, AttemptsOf(after));
+        Assert.Equal("pending-task", source.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// The preflight REUSES the extracted validator rather than carrying its own copy — asserted
+    /// against the compiled artifact, so a duplicated validation path fails deterministically.
+    /// </summary>
+    [Fact]
+    public void Preflight_DelegatesRegistryValidationToTheSharedHelper()
+    {
+        var called = DecodeCallSites(RegistryMethod("PreflightAdmissionOwnership"))
+            .Any(c => c.Target.DeclaringType == typeof(GoalPipeline)
+                && c.Target.Name == "ValidateDetachedRegistrySnapshot");
+
+        Assert.True(
+            called,
+            "PreflightAdmissionOwnership does not call ValidateDetachedRegistrySnapshot — the registry " +
+            "rules must be reused, not duplicated.");
+    }
+
+    /// <summary>
+    /// The preflight is a PURE domain operation: it takes NO lock at all (it is static and never
+    /// touches a pipeline's storage), so it can never contend with, or nest inside, the registry
+    /// monitor. Asserted against the compiled artifact.
+    /// </summary>
+    [Fact]
+    public void Preflight_TakesNoLockAndTouchesNoPipelineStorage()
+    {
+        var method = RegistryMethod("PreflightAdmissionOwnership");
+        Assert.True(method.IsStatic, "PreflightAdmissionOwnership must be static — it validates a detached carrier.");
+
+        var calls = DecodeCallSites(method);
+        Assert.DoesNotContain(calls, c => IsMonitor(c.Target, nameof(Monitor.Enter)));
+        Assert.DoesNotContain(calls, c => IsMonitor(c.Target, nameof(Monitor.Exit)));
     }
 
     #endregion
