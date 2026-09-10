@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
 
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
@@ -1474,5 +1475,1055 @@ internal sealed class ThrowingLogger<T> : ILogger<T>
 
         Interlocked.Increment(ref _throwCount);
         throw LoggerSentinel;
+    }
+}
+
+/// <summary>
+/// The work-slot registry DURABLE STORAGE layer, end to end, against a REAL FILE-BACKED SQLite
+/// database (never an in-memory-only handle): the <c>work_slot_registry_json</c> column, the
+/// <see cref="PipelineStore.SaveWorkSlotRegistry"/> explicit store API, the
+/// <see cref="WorkSlotRegistryCodec"/> version-1 envelope, and — critically — the INERTNESS of
+/// all of it.
+/// </summary>
+/// <remarks>
+/// <para>
+/// EVERY snapshot under test is captured from a REAL <see cref="GoalPipeline"/> through its own
+/// <c>CaptureRegistry</c> API after driving slots through the PRODUCTION allocation/claim/record/
+/// abandon paths, and every restoration targets a FRESH TEST pipeline — no production wiring is
+/// invoked, because there is none to invoke: the storage layer has ZERO production callers by
+/// design, and the no-activation vectors below are what pin that.
+/// </para>
+/// <para>
+/// THE DELIBERATE DIVISION OF LABOUR the tests encode: the CODEC decides whether the BYTES are
+/// well-formed; <c>GoalPipeline.RestoreRegistry</c> decides whether the VALUES are admissible. A
+/// successful decode is never authorization to restore, and a stored payload is never authorization
+/// to recover.
+/// </para>
+/// </remarks>
+public sealed class WorkSlotRegistryStorageTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"copilothive-wsr-store-{Guid.NewGuid():N}.db");
+
+    public WorkSlotRegistryStorageTests()
+    {
+        // A REAL database FILE with the full current schema.
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection);
+        context.Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var candidate in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+            catch
+            {
+                // Best-effort cleanup — a leftover temp file must never fail a test.
+            }
+        }
+    }
+
+    // ───────────────────────────── fixture plumbing ─────────────────────────────
+
+    /// <summary>Opens a NEW connection to the database FILE (pooling off so the file stays deletable).</summary>
+    private SqliteConnection OpenConnection()
+    {
+        var connection = new SqliteConnection($"Data Source={_dbPath};Pooling=False");
+        connection.Open();
+        return connection;
+    }
+
+    private static CopilotHiveDbContext ContextOn(SqliteConnection connection, IInterceptor? interceptor = null)
+    {
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+        return new CopilotHiveDbContext(builder.Options);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> against a FRESHLY OPENED connection/context/store and closes
+    /// all three before returning — so consecutive calls model a genuine close-and-reopen of the
+    /// database file, not a shared handle.
+    /// </summary>
+    private T WithStore<T>(Func<PipelineStore, CopilotHiveDbContext, T> body, IInterceptor? interceptor = null,
+        ILogger<PipelineStore>? logger = null)
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection, interceptor);
+        var store = new PipelineStore(context, logger ?? NullLogger<PipelineStore>.Instance);
+        return body(store, context);
+    }
+
+    private void WithStore(Action<PipelineStore, CopilotHiveDbContext> body, IInterceptor? interceptor = null,
+        ILogger<PipelineStore>? logger = null) =>
+        WithStore<object?>((store, context) => { body(store, context); return null; }, interceptor, logger);
+
+    /// <summary>Reads the RAW column value on its own connection — no EF, no change tracker.</summary>
+    private object? RawScalar(string sql)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        var value = command.ExecuteScalar();
+        return value is DBNull ? null : value;
+    }
+
+    /// <summary>The raw persisted blob for a goal, or <c>null</c> when the column is SQL NULL.</summary>
+    private string? RawBlob(string goalId) =>
+        (string?)RawScalar($"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'");
+
+    private void ExecuteRaw(string sql)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>Every column of a pipeline row, keyed by column name — the byte-identity baseline.</summary>
+    private Dictionary<string, object?> ReadWholeRow(string goalId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT * FROM pipelines WHERE goal_id = '{goalId}'";
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read(), $"no pipelines row for goal '{goalId}'");
+
+        var row = new Dictionary<string, object?>(StringComparer.Ordinal);
+        for (var i = 0; i < reader.FieldCount; i++)
+            row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+        return row;
+    }
+
+    private static Goal NewGoal(string id) =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    /// <summary>A FRESH TEST pipeline — never production wiring.</summary>
+    private static GoalPipeline NewPipeline(string goalId) => new(NewGoal(goalId));
+
+    private static WorkSlotPosition Pos(int iteration, GoalPhase phase, int occurrence) =>
+        new(iteration, phase, occurrence);
+
+    private static HashSet<WorkSlotView> SlotsOf(WorkSlotRegistrySnapshot snapshot) => [.. snapshot.Slots];
+
+    private static HashSet<WorkSlotRegistryAttemptEntry> AttemptsOf(WorkSlotRegistrySnapshot snapshot) =>
+        [.. snapshot.DispatchAttempts];
+
+    // The positions the rich source registry occupies.
+    private static readonly WorkSlotPosition PosClaimed = Pos(1, GoalPhase.Coding, 1);
+    private static readonly WorkSlotPosition PosRetried = Pos(1, GoalPhase.Coding, 2);   // repeated Coding occurrence
+    private static readonly WorkSlotPosition PosAbandoned = Pos(1, GoalPhase.Testing, 1);
+    private static readonly WorkSlotPosition PosCurrent = Pos(2, GoalPhase.Review, 1);    // a LATER iteration
+    private static readonly WorkSlotPosition PosHigherCounter = Pos(1, GoalPhase.Improve, 2);
+    private static readonly WorkSlotPosition PosCounterOnly = Pos(1, GoalPhase.Merging, 4);
+
+    /// <summary>
+    /// Builds the RICH source registry inside a REAL pipeline, exercising the production paths:
+    /// a seeded historical portion (a dead slot whose position's counter is HIGHER than its own
+    /// attempt, plus a COUNTER-ONLY position with no slot at all — exactly the shape a recovered
+    /// registry carries) followed by REAL allocations driven to all four lifecycle states,
+    /// including a retry at an already-used position and a slot in a later iteration.
+    /// </summary>
+    private static GoalPipeline BuildRichSourcePipeline(string goalId = "wsr-source")
+    {
+        var pipeline = NewPipeline(goalId);
+
+        // The historical portion: a dead slot at attempt 2 whose counter already stands at 9,
+        // and a counter-only position at 7. Installed through the registry's own restore API.
+        pipeline.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("seeded-recorded", PosHigherCounter, 2), WorkSlotState.Recorded)],
+            [new WorkSlotRegistryAttemptEntry(PosHigherCounter, 9),
+             new WorkSlotRegistryAttemptEntry(PosCounterOnly, 7)]));
+
+        // Pending → Claimed (a real in-flight dispatch).
+        pipeline.AllocateAttemptAndRegisterSlot("claimed-task", PosClaimed);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("claimed-task"));
+
+        // Pending → Claimed → Recorded, then a RETRY at the SAME position (attempt 2, Pending).
+        pipeline.AllocateAttemptAndRegisterSlot("recorded-task", PosRetried);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("recorded-task"));
+        Assert.Equal(SlotRecordOutcome.Recorded, pipeline.RecordSlot("recorded-task"));
+        pipeline.AllocateAttemptAndRegisterSlot("retried-task", PosRetried);
+
+        // Pending → Abandoned.
+        pipeline.AllocateAttemptAndRegisterSlot("abandoned-task", PosAbandoned);
+        Assert.True(pipeline.AbandonSlot("abandoned-task"));
+
+        // Plain Pending, in the CURRENT (later) iteration.
+        pipeline.AllocateAttemptAndRegisterSlot("pending-task", PosCurrent);
+
+        return pipeline;
+    }
+
+    /// <summary>
+    /// THE ANTI-VACUOUS PRECONDITION for every round-trip vector: the snapshot really does carry
+    /// all four lifecycle states, a repeated phase occurrence, two iterations, a counter-only
+    /// position and a counter standing HIGHER than its position's slot attempt. Without this, a
+    /// "round-trip preserved everything" assertion could pass over a trivial registry.
+    /// </summary>
+    private static void AssertSnapshotIsRich(WorkSlotRegistrySnapshot snapshot)
+    {
+        var states = snapshot.Slots.Select(s => s.State).ToHashSet();
+        Assert.Equal(Enum.GetValues<WorkSlotState>().ToHashSet(), states);
+
+        // A repeated occurrence at ONE position (the retry) — two slots, two attempts.
+        Assert.Equal(2, snapshot.Slots.Count(s => s.Slot.Position == PosRetried));
+        // Two distinct iterations: historical positions AND the current one.
+        Assert.True(snapshot.Slots.Select(s => s.Slot.Position.Iteration).Distinct().Count() >= 2);
+
+        // A COUNTER-ONLY position: a high-water entry with no slot at that position.
+        Assert.Contains(snapshot.DispatchAttempts, a => a.Position == PosCounterOnly);
+        Assert.DoesNotContain(snapshot.Slots, s => s.Slot.Position == PosCounterOnly);
+
+        // A counter standing HIGHER than the attempt of the slot living at that position.
+        var higher = Assert.Single(snapshot.DispatchAttempts, a => a.Position == PosHigherCounter);
+        var slotThere = Assert.Single(snapshot.Slots, s => s.Slot.Position == PosHigherCounter);
+        Assert.True(higher.HighWaterAttempt > slotThere.Slot.Attempt,
+            "the fixture must carry a counter higher than its position's slot attempt");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (1) Round-trip continuity across a real close/reopen of the database file
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE FULL ROUND TRIP: capture from a real pipeline → encode+store through the explicit API →
+    /// CLOSE the database → REOPEN it → load → decode → restore into a FRESH TEST pipeline. Every
+    /// slot, state, attempt, position and counter survives byte-for-byte, and the restored registry
+    /// CONTINUES attempt numbering rather than restarting it — including at the counter-only
+    /// position and at the position whose counter stands higher than its slot's attempt.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: drop the encode of any field and the corresponding equality fails; reset or
+    /// recompute counters on decode/restore and the three next-attempt assertions fail (they would
+    /// yield 1, 1 and 3 instead of 2, 8 and 10); lose the state and the Claimed/Abandoned entries
+    /// collapse into Pending, failing both the set equality and the admission probes.
+    /// </remarks>
+    [Fact]
+    public void CaptureEncodeStore_ReopenFile_LoadDecodeRestore_PreservesEverythingAndContinuesAttempts()
+    {
+        var source = BuildRichSourcePipeline();
+        var captured = source.CaptureRegistry();
+        AssertSnapshotIsRich(captured);   // the anti-vacuous precondition
+
+        // The row must exist first — the explicit API never creates one.
+        WithStore((store, _) => store.SavePipeline(source));
+
+        // PRECONDITION: an ordinary save leaves the column SQL NULL (no capture happens there).
+        Assert.Null(RawBlob("wsr-source"));
+
+        // ENCODE + STORE through the explicit API, then close everything.
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-source", captured)));
+
+        // The blob is durable ON DISK, visible to a brand-new raw connection.
+        var persisted = RawBlob("wsr-source");
+        Assert.NotNull(persisted);
+
+        // REOPEN: load through a fresh store/context/connection and decode explicitly.
+        var carrier = WithStore((store, _) => store.LoadPipeline("wsr-source")!.WorkSlotRegistryJson);
+        Assert.Equal(persisted, carrier);   // the carrier is the raw column, byte-exact
+
+        var decoded = WorkSlotRegistryCodec.Decode(carrier!);
+
+        // RESTORE into a FRESH TEST pipeline (never production wiring).
+        var target = NewPipeline("wsr-target");
+        Assert.Empty(target.GetSlotsForTest());   // precondition: the target starts empty
+        target.RestoreRegistry(decoded);
+
+        // EVERY value survived: slots (task id, position, attempt, state) and counters.
+        var restored = target.CaptureRegistry();
+        Assert.Equal(SlotsOf(captured), SlotsOf(restored));
+        Assert.Equal(AttemptsOf(captured), AttemptsOf(restored));
+        AssertSnapshotIsRich(restored);
+
+        // THE STATES ARE FUNCTIONALLY PRESERVED, not just structurally equal:
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, target.AdmitCompletion("claimed-task"));
+        Assert.Equal(AdmissionOutcome.SlotAlreadyAdmitted, target.AdmitCompletion("recorded-task"));
+        Assert.Equal(AdmissionOutcome.SlotAbandoned, target.AdmitCompletion("abandoned-task"));
+        Assert.Equal(AdmissionOutcome.Admitted, target.AdmitCompletion("pending-task"));
+        Assert.Equal(AdmissionOutcome.NoSlot, target.AdmitCompletion("never-registered"));
+
+        // NEXT-ATTEMPT CONTINUITY at three different counter shapes. Each probe position holds
+        // only a DEAD slot (or none), so a DoubleAssignment cannot mask a counter regression:
+        //   an ordinary position whose only slot is Abandoned (counter 1 → 2), the COUNTER-ONLY
+        //   position (7 → 8), and the position whose counter (9) stands above its slot's attempt
+        //   (2) — that one must continue from 9, not from the slot's own attempt.
+        Assert.Equal(2, target.AllocateAttemptAndRegisterSlot("next-abandoned", PosAbandoned).Attempt);
+        Assert.Equal(8, target.AllocateAttemptAndRegisterSlot("next-counter-only", PosCounterOnly).Attempt);
+        Assert.Equal(10, target.AllocateAttemptAndRegisterSlot("next-higher", PosHigherCounter).Attempt);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2) The JSON contract, pinned
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE WIRE CONTRACT, PINNED so accidental drift is caught: the version-1 envelope
+    /// (<c>version</c>/<c>slots</c>/<c>dispatchAttempts</c>), NAMED STRING values for phase and
+    /// state (never ordinals — the shared <c>JsonStringEnumConverter&lt;GoalPhase&gt;</c> contract),
+    /// the exact per-entry field names, and the COLUMN NAME <c>work_slot_registry_json</c> the
+    /// payload lands in.
+    /// </summary>
+    [Fact]
+    public void EncodeAndStore_PinsVersion1Envelope_NamedPhaseAndState_AndColumnName()
+    {
+        var source = NewPipeline("wsr-contract");
+        var position = Pos(3, GoalPhase.DocWriting, 2);
+        source.AllocateAttemptAndRegisterSlot("contract-task", position);
+        Assert.Equal(SlotGuardResult.Proceed, source.ResolveAndCheckSlot("contract-task")); // → Claimed
+
+        var snapshot = source.CaptureRegistry();
+        var json = WorkSlotRegistryCodec.Encode(snapshot);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        Assert.Equal(JsonValueKind.Object, root.ValueKind);
+
+        // THE VERSION MARKER: the NUMBER 1, under the property name "version".
+        var version = root.GetProperty("version");
+        Assert.Equal(JsonValueKind.Number, version.ValueKind);
+        Assert.Equal(1, version.GetInt32());
+        Assert.Equal(1, WorkSlotRegistryCodec.Version);
+
+        // THE SLOT ENTRY shape.
+        var slots = root.GetProperty("slots");
+        Assert.Equal(JsonValueKind.Array, slots.ValueKind);
+        var slot = Assert.Single(slots.EnumerateArray().ToList());
+        Assert.Equal("contract-task", slot.GetProperty("taskId").GetString());
+        Assert.Equal(1, slot.GetProperty("attempt").GetInt32());
+
+        // STATE IS A NAMED STRING — an ordinal here would be silent contract drift.
+        var state = slot.GetProperty("state");
+        Assert.Equal(JsonValueKind.String, state.ValueKind);
+        Assert.Equal("Claimed", state.GetString());
+
+        var slotPosition = slot.GetProperty("position");
+        Assert.Equal(JsonValueKind.Object, slotPosition.ValueKind);
+        Assert.Equal(3, slotPosition.GetProperty("iteration").GetInt32());
+        Assert.Equal(2, slotPosition.GetProperty("occurrence").GetInt32());
+
+        // PHASE IS A NAMED STRING, exactly the canonical GoalPhase name.
+        var phase = slotPosition.GetProperty("phase");
+        Assert.Equal(JsonValueKind.String, phase.ValueKind);
+        Assert.Equal("DocWriting", phase.GetString());
+        Assert.Equal(GoalPhase.DocWriting.ToString(), phase.GetString());
+
+        // THE ATTEMPT ENTRY shape.
+        var attempts = root.GetProperty("dispatchAttempts");
+        Assert.Equal(JsonValueKind.Array, attempts.ValueKind);
+        var attempt = Assert.Single(attempts.EnumerateArray().ToList());
+        Assert.Equal(1, attempt.GetProperty("highWaterAttempt").GetInt32());
+        Assert.Equal("DocWriting", attempt.GetProperty("position").GetProperty("phase").GetString());
+
+        // THE COLUMN NAME: the payload lands in work_slot_registry_json, byte-exact.
+        WithStore((store, _) => store.SavePipeline(source));
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-contract", snapshot)));
+        Assert.Equal(json, RawScalar(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'wsr-contract'"));
+
+        // …and the column genuinely exists under that name on the real table.
+        Assert.Equal(1L, RawScalar(
+            "SELECT COUNT(*) FROM pragma_table_info('pipelines') WHERE name = 'work_slot_registry_json'"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (3) Absence vs. an empty payload — two DISTINCT truths
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// SQL NULL ("no snapshot was ever supplied" — the legacy-absence marker) and a stored
+    /// version-1 payload carrying TWO EMPTY COLLECTIONS ("an empty registry was captured") are
+    /// DISTINCT and must never collapse into one another. Absence has nothing to decode; the empty
+    /// payload decodes to an empty — but genuine — snapshot.
+    /// </summary>
+    [Fact]
+    public void SqlNullAbsence_IsDistinctFrom_Version1EmptyPayload()
+    {
+        var pipeline = NewPipeline("wsr-absence");
+        WithStore((store, _) => store.SavePipeline(pipeline));
+
+        // ABSENCE: the raw column is SQL NULL and the carrier is null — no payload, nothing to decode.
+        Assert.Null(RawBlob("wsr-absence"));
+        Assert.Null(WithStore((store, _) => store.LoadPipeline("wsr-absence")!.WorkSlotRegistryJson));
+
+        // THE EMPTY CAPTURE: a real (empty) registry captured and stored.
+        var empty = pipeline.CaptureRegistry();
+        Assert.Empty(empty.Slots);
+        Assert.Empty(empty.DispatchAttempts);
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-absence", empty)));
+
+        // The column is now a NON-NULL version-1 payload — provably different from absence.
+        var stored = RawBlob("wsr-absence");
+        Assert.NotNull(stored);
+        Assert.Contains("\"version\":1", stored, StringComparison.Ordinal);
+
+        var carrier = WithStore((store, _) => store.LoadPipeline("wsr-absence")!.WorkSlotRegistryJson);
+        Assert.Equal(stored, carrier);
+
+        // It decodes to an EMPTY snapshot — the empty registry is REPRESENTED, not invented.
+        var decoded = WorkSlotRegistryCodec.Decode(carrier!);
+        Assert.Empty(decoded.Slots);
+        Assert.Empty(decoded.DispatchAttempts);
+
+        // And an empty snapshot restores legally into a fresh target.
+        var target = NewPipeline("wsr-absence-target");
+        target.RestoreRegistry(decoded);
+        Assert.Empty(target.GetSlotsForTest());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (4) Corrupt payloads: they LOAD, but explicit decoding REFUSES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A CORRUPT blob sitting in the column must NEVER break loading — the carrier is copied
+    /// verbatim — and must NEVER be repaired: explicit decoding FAILS with a clear error instead of
+    /// falling back to an empty registry, guessing a version, or salvaging partial entries.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: add ANY corruption-to-empty fallback, heuristic version repair or
+    /// "best effort" salvage and <c>Assert.Throws</c> fails; make the load path decode the blob and
+    /// the <c>LoadPipeline</c>/<c>LoadActivePipelines</c> assertions throw instead of returning the
+    /// row.
+    /// </remarks>
+    [Theory]
+    [InlineData("malformed-json", "{\"version\":1,\"slots\":[")]
+    [InlineData("not-json-at-all", "definitely not json")]
+    [InlineData("json-null-root", "null")]
+    [InlineData("array-root", "[]")]
+    [InlineData("empty-string", "")]
+    [InlineData("missing-version", "{\"slots\":[],\"dispatchAttempts\":[]}")]
+    [InlineData("unsupported-version-2", "{\"version\":2,\"slots\":[],\"dispatchAttempts\":[]}")]
+    [InlineData("unsupported-version-0", "{\"version\":0,\"slots\":[],\"dispatchAttempts\":[]}")]
+    [InlineData("version-as-string", "{\"version\":\"1\",\"slots\":[],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-slots", "{\"version\":1,\"dispatchAttempts\":[]}")]
+    [InlineData("null-slots", "{\"version\":1,\"slots\":null,\"dispatchAttempts\":[]}")]
+    [InlineData("missing-attempts", "{\"version\":1,\"slots\":[]}")]
+    [InlineData("null-slot-entry", "{\"version\":1,\"slots\":[null],\"dispatchAttempts\":[]}")]
+    [InlineData("null-attempt-entry", "{\"version\":1,\"slots\":[],\"dispatchAttempts\":[null]}")]
+    [InlineData("missing-state",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1}],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-attempt",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":\"Coding\",\"occurrence\":1},\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-position",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("null-position",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":null,\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-occurrence",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":\"Coding\"},\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-iteration",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("null-task-id",
+        "{\"version\":1,\"slots\":[{\"taskId\":null,\"position\":{\"iteration\":1,\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("numeric-phase",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":1,\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("unknown-phase-name",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":\"Nonsense\",\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("unknown-state-name",
+        "{\"version\":1,\"slots\":[{\"taskId\":\"t\",\"position\":{\"iteration\":1,\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1,\"state\":\"Nonsense\"}],\"dispatchAttempts\":[]}")]
+    [InlineData("missing-high-water",
+        "{\"version\":1,\"slots\":[],\"dispatchAttempts\":[{\"position\":{\"iteration\":1,\"phase\":\"Coding\",\"occurrence\":1}}]}")]
+    public void CorruptStoredBlob_LoadsVerbatim_ButExplicitDecodeRefuses(string label, string rawPayload)
+    {
+        var goalId = "wsr-corrupt-" + label;
+        WithStore((store, _) => store.SavePipeline(NewPipeline(goalId)));
+
+        // PRECONDITION: absent before the corruption is planted.
+        Assert.Null(RawBlob(goalId));
+        ExecuteRaw(
+            $"UPDATE pipelines SET work_slot_registry_json = '{rawPayload.Replace("'", "''", StringComparison.Ordinal)}' " +
+            $"WHERE goal_id = '{goalId}'");
+        Assert.Equal(rawPayload, RawBlob(goalId));
+
+        // THE LOAD IS UNAFFECTED: both load paths return the row and carry the blob VERBATIM.
+        var snapshot = WithStore((store, _) => store.LoadPipeline(goalId));
+        Assert.NotNull(snapshot);
+        Assert.Equal(rawPayload, snapshot!.WorkSlotRegistryJson);
+        Assert.Equal(goalId, snapshot.GoalId);
+
+        var active = WithStore((store, _) =>
+            store.LoadActivePipelines().Single(p => p.GoalId == goalId));
+        Assert.Equal(rawPayload, active.WorkSlotRegistryJson);
+
+        // EXPLICIT DECODING REFUSES — no fallback, no invented empty registry.
+        var error = Assert.Throws<WorkSlotRegistryCodecException>(
+            () => WorkSlotRegistryCodec.Decode(snapshot.WorkSlotRegistryJson!));
+        Assert.False(string.IsNullOrWhiteSpace(error.Message));
+
+        // And a pipeline restored from this very snapshot is completely unaffected: it starts
+        // empty, so an empty restore into it still succeeds (both dictionaries genuinely empty).
+        var restored = new GoalPipeline(snapshot);
+        Assert.Empty(restored.GetSlotsForTest());
+        restored.RestoreRegistry(new WorkSlotRegistrySnapshot([], []));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) Structurally valid, semantically invalid: the restore is the authority
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A snapshot that is STRUCTURALLY well-formed but violates the registry's DOMAIN or
+    /// CROSS-ENTRY rules stores successfully and decodes successfully — the codec deliberately
+    /// owns neither rule — and is then REFUSED by <c>GoalPipeline.RestoreRegistry</c>, leaving the
+    /// target pipeline COMPLETELY unmutated. A successful decode is NOT authorization to restore.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF both ways: copy the domain validation into the codec and the "stores and
+    /// decodes" half fails; drop it from <c>RestoreRegistry</c> and the <c>Assert.Throws</c> plus
+    /// the untouched-target probes fail.
+    /// </remarks>
+    [Theory]
+    [InlineData("slot-without-its-counter")]
+    [InlineData("attempt-above-high-water")]
+    [InlineData("duplicate-task-id")]
+    [InlineData("duplicate-position-attempt")]
+    [InlineData("two-live-slots-at-one-position")]
+    [InlineData("zero-attempt")]
+    [InlineData("zero-iteration")]
+    [InlineData("zero-occurrence")]
+    [InlineData("zero-high-water")]
+    [InlineData("duplicate-attempt-position")]
+    public void SemanticallyInvalidSnapshot_StoresAndDecodes_ButRestoreRefuses_TargetUnmutated(string kind)
+    {
+        var position = Pos(1, GoalPhase.Coding, 1);
+        var other = Pos(1, GoalPhase.Testing, 1);
+
+        WorkSlotRegistrySnapshot invalid = kind switch
+        {
+            "slot-without-its-counter" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("a", position, 1), WorkSlotState.Pending)],
+                []),
+            "attempt-above-high-water" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("a", position, 5), WorkSlotState.Pending)],
+                [new WorkSlotRegistryAttemptEntry(position, 2)]),
+            "duplicate-task-id" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("dup", position, 1), WorkSlotState.Recorded),
+                 new WorkSlotView(new WorkSlot("dup", other, 1), WorkSlotState.Recorded)],
+                [new WorkSlotRegistryAttemptEntry(position, 1),
+                 new WorkSlotRegistryAttemptEntry(other, 1)]),
+            "duplicate-position-attempt" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("a", position, 1), WorkSlotState.Recorded),
+                 new WorkSlotView(new WorkSlot("b", position, 1), WorkSlotState.Recorded)],
+                [new WorkSlotRegistryAttemptEntry(position, 1)]),
+            "two-live-slots-at-one-position" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("a", position, 1), WorkSlotState.Pending),
+                 new WorkSlotView(new WorkSlot("b", position, 2), WorkSlotState.Claimed)],
+                [new WorkSlotRegistryAttemptEntry(position, 2)]),
+            "zero-attempt" => new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("a", position, 0), WorkSlotState.Pending)],
+                [new WorkSlotRegistryAttemptEntry(position, 1)]),
+            "zero-iteration" => new WorkSlotRegistrySnapshot(
+                [],
+                [new WorkSlotRegistryAttemptEntry(Pos(0, GoalPhase.Coding, 1), 1)]),
+            "zero-occurrence" => new WorkSlotRegistrySnapshot(
+                [],
+                [new WorkSlotRegistryAttemptEntry(Pos(1, GoalPhase.Coding, 0), 1)]),
+            "zero-high-water" => new WorkSlotRegistrySnapshot(
+                [],
+                [new WorkSlotRegistryAttemptEntry(position, 0)]),
+            "duplicate-attempt-position" => new WorkSlotRegistrySnapshot(
+                [],
+                [new WorkSlotRegistryAttemptEntry(position, 1),
+                 new WorkSlotRegistryAttemptEntry(position, 2)]),
+            _ => throw new InvalidOperationException($"Unhandled invalid-snapshot kind: {kind}"),
+        };
+
+        var goalId = "wsr-semantic-" + kind;
+        WithStore((store, _) => store.SavePipeline(NewPipeline(goalId)));
+
+        // THE STORE ACCEPTS IT: encoding is a serialization step, not an admissibility ruling.
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry(goalId, invalid)));
+        var carrier = WithStore((store, _) => store.LoadPipeline(goalId)!.WorkSlotRegistryJson);
+        Assert.NotNull(carrier);
+
+        // THE CODEC ACCEPTS IT TOO — the bytes are well-formed; the VALUES are someone else's call.
+        var decoded = WorkSlotRegistryCodec.Decode(carrier!);
+        Assert.Equal(invalid.Slots.Count, decoded.Slots.Count);
+        Assert.Equal(invalid.DispatchAttempts.Count, decoded.DispatchAttempts.Count);
+
+        // THE RESTORE REFUSES — and the target is left COMPLETELY unmutated.
+        var target = NewPipeline("wsr-semantic-target");
+        Assert.Empty(target.GetSlotsForTest());   // precondition
+        Assert.Throws<ArgumentException>(() => target.RestoreRegistry(decoded));
+
+        var after = target.CaptureRegistry();
+        Assert.Empty(after.Slots);
+        Assert.Empty(after.DispatchAttempts);
+        // THE COUNTER PROBE: had any counter been installed before the refusal threw, this
+        // allocation would continue from it instead of starting fresh at 1.
+        Assert.Equal(1, target.AllocateAttemptAndRegisterSlot("probe", position).Attempt);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (6) Store API semantics
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A MISSING pipeline row is reported as <c>false</c> and NO row is created as a side effect —
+    /// the explicit API never manufactures an incomplete pipeline just to hold a blob.
+    /// </summary>
+    [Fact]
+    public void SaveWorkSlotRegistry_MissingRow_ReturnsFalse_AndCreatesNoRow()
+    {
+        var source = BuildRichSourcePipeline("wsr-missing-source");
+        var snapshot = source.CaptureRegistry();
+
+        // PRECONDITION: the goal has no pipeline row at all.
+        Assert.Equal(0L, RawScalar("SELECT COUNT(*) FROM pipelines WHERE goal_id = 'wsr-nonexistent'"));
+
+        Assert.False(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-nonexistent", snapshot)));
+
+        // NOTHING was created — not a partial row, not a placeholder.
+        Assert.Equal(0L, RawScalar("SELECT COUNT(*) FROM pipelines WHERE goal_id = 'wsr-nonexistent'"));
+        Assert.Equal(0L, RawScalar("SELECT COUNT(*) FROM pipelines"));
+        Assert.Equal(0L, RawScalar("SELECT COUNT(*) FROM conversation_entries WHERE goal_id = 'wsr-nonexistent'"));
+        Assert.Equal(0L, RawScalar("SELECT COUNT(*) FROM task_mappings WHERE goal_id = 'wsr-nonexistent'"));
+
+        // …and a later load still finds nothing.
+        Assert.Null(WithStore((store, _) => store.LoadPipeline("wsr-nonexistent")));
+    }
+
+    /// <summary>
+    /// A FAILED WRITE (a genuine <see cref="SqliteException"/> raised by an interceptor at the
+    /// registry UPDATE) PROPAGATES and leaves the PREVIOUSLY persisted blob byte-exactly intact —
+    /// a failed store never half-writes and never clears what was already durable.
+    /// </summary>
+    [Fact]
+    public void SaveWorkSlotRegistry_WriteFails_PropagatesAndLeavesPriorBlobIntact()
+    {
+        var pipeline = NewPipeline("wsr-writefail");
+        WithStore((store, _) => store.SavePipeline(pipeline));
+
+        // A FIRST, SUCCESSFUL write establishes the prior durable value.
+        var first = BuildRichSourcePipeline("wsr-writefail-src").CaptureRegistry();
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-writefail", first)));
+        var priorBlob = RawBlob("wsr-writefail");
+        Assert.NotNull(priorBlob);
+
+        // The SECOND write carries a DIFFERENT payload, so a partial success would be visible.
+        var second = pipeline.CaptureRegistry();   // an EMPTY registry — provably different
+        Assert.NotEqual(priorBlob, WorkSlotRegistryCodec.Encode(second));
+
+        var interceptor = new RegistryUpdateThrowInterceptor();
+        var thrown = Assert.ThrowsAny<Exception>(() =>
+            WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-writefail", second), interceptor));
+
+        // THE INJECTION REALLY FIRED and the ORIGINAL failure propagated (by identity).
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Contains(EnumerateChain(thrown), e => ReferenceEquals(e, interceptor.Sentinel));
+
+        // THE PRIOR DATA IS INTACT, byte-exactly — not cleared, not overwritten, not truncated.
+        Assert.Equal(priorBlob, RawBlob("wsr-writefail"));
+        Assert.Equal(priorBlob, WithStore((store, _) => store.LoadPipeline("wsr-writefail")!.WorkSlotRegistryJson));
+    }
+
+    /// <summary>
+    /// An ENCODE failure performs NO write at all: the previously persisted blob is untouched and
+    /// nothing partial reaches the column.
+    /// </summary>
+    [Fact]
+    public void SaveWorkSlotRegistry_EncodeFails_PerformsNoWrite()
+    {
+        WithStore((store, _) => store.SavePipeline(NewPipeline("wsr-encodefail")));
+        var good = BuildRichSourcePipeline("wsr-encodefail-src").CaptureRegistry();
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-encodefail", good)));
+        var priorBlob = RawBlob("wsr-encodefail");
+        Assert.NotNull(priorBlob);
+
+        // A snapshot the format cannot represent (a null slot entry).
+        var unencodable = new WorkSlotRegistrySnapshot([null!], []);
+        Assert.Throws<WorkSlotRegistryCodecException>(() =>
+            WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-encodefail", unencodable)));
+
+        Assert.Equal(priorBlob, RawBlob("wsr-encodefail"));
+    }
+
+    /// <summary>
+    /// THE DETACHMENT CONTRACT at the codec boundary: every decode allocates FRESH storage, so no
+    /// caller ever shares a collection with another decode, with the source snapshot, or with a
+    /// live registry. Mutating any one of them reaches none of the others, in either direction.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: return a cached/shared list from <c>Decode</c> (or hand back the source
+    /// snapshot's own lists) and the reference-inequality plus the independent-mutation assertions
+    /// fail; install the snapshot's collections into the registry by reference and the
+    /// live-registry probes fail.
+    /// </remarks>
+    [Fact]
+    public void DecodedSnapshot_IsFullyDetached_FromTheLiveRegistry()
+    {
+        var source = BuildRichSourcePipeline("wsr-detach-src");
+        var sourceSnapshot = source.CaptureRegistry();
+        WithStore((store, _) => store.SavePipeline(source));
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-detach-src", sourceSnapshot)));
+
+        var carrier = WithStore((store, _) => store.LoadPipeline("wsr-detach-src")!.WorkSlotRegistryJson);
+        var decoded = WorkSlotRegistryCodec.Decode(carrier!);
+        var second = WorkSlotRegistryCodec.Decode(carrier!);
+
+        // ── DECODE ALLOCATES FRESH STORAGE EVERY TIME ─────────────────────────────────
+        // Neither decode shares storage with the other, nor with the captured source snapshot.
+        Assert.NotSame(decoded.Slots, second.Slots);
+        Assert.NotSame(decoded.DispatchAttempts, second.DispatchAttempts);
+        Assert.NotSame(decoded.Slots, sourceSnapshot.Slots);
+        Assert.NotSame(decoded.DispatchAttempts, sourceSnapshot.DispatchAttempts);
+        // …and the two decodes are VALUE-equal, so the reference check above is not vacuous.
+        Assert.Equal(SlotsOf(decoded), SlotsOf(second));
+        Assert.Equal(AttemptsOf(decoded), AttemptsOf(second));
+
+        var target = NewPipeline("wsr-detach-target");
+        target.RestoreRegistry(decoded);
+
+        var afterRestore = target.CaptureRegistry();
+        var decodedSlotCount = decoded.Slots.Count;
+        var decodedAttemptCount = decoded.DispatchAttempts.Count;
+        Assert.True(decodedSlotCount > 0 && decodedAttemptCount > 0);   // anti-vacuous precondition
+
+        // ── DIRECTION 1: mutate the DECODED snapshot's storage ────────────────────────
+        var decodedSlots = Assert.IsType<List<WorkSlotView>>(decoded.Slots);
+        var decodedAttempts = Assert.IsType<List<WorkSlotRegistryAttemptEntry>>(decoded.DispatchAttempts);
+        decodedSlots.Clear();
+        decodedAttempts.Clear();
+
+        // The LIVE REGISTRY it was restored into is untouched…
+        var afterSnapshotMutation = target.CaptureRegistry();
+        Assert.Equal(SlotsOf(afterRestore), SlotsOf(afterSnapshotMutation));
+        Assert.Equal(AttemptsOf(afterRestore), AttemptsOf(afterSnapshotMutation));
+        Assert.NotEmpty(afterSnapshotMutation.Slots);
+
+        // …the SOURCE snapshot is untouched…
+        Assert.Equal(decodedSlotCount, sourceSnapshot.Slots.Count);
+        Assert.Equal(decodedAttemptCount, sourceSnapshot.DispatchAttempts.Count);
+
+        // …and the OTHER decode of the very same payload is untouched (no shared codec storage).
+        Assert.Equal(decodedSlotCount, second.Slots.Count);
+        Assert.Equal(decodedAttemptCount, second.DispatchAttempts.Count);
+
+        // A LATER decode is likewise complete — a shared buffer would have been emptied above.
+        var third = WorkSlotRegistryCodec.Decode(carrier!);
+        Assert.Equal(decodedSlotCount, third.Slots.Count);
+        Assert.Equal(decodedAttemptCount, third.DispatchAttempts.Count);
+
+        // ── DIRECTION 2: mutate the LIVE REGISTRY ────────────────────────────────────
+        decodedSlots.AddRange(SlotsOf(afterRestore));
+        decodedAttempts.AddRange(AttemptsOf(afterRestore));
+        Assert.Equal(decodedSlotCount, decoded.Slots.Count);        // precondition restored
+
+        target.AllocateAttemptAndRegisterSlot("after-restore-task", Pos(9, GoalPhase.Merging, 9));
+        Assert.Equal(decodedSlotCount, decoded.Slots.Count);
+        Assert.Equal(decodedAttemptCount, decoded.DispatchAttempts.Count);
+        Assert.DoesNotContain(decoded.Slots, s => s.Slot.TaskId == "after-restore-task");
+        Assert.DoesNotContain(second.Slots, s => s.Slot.TaskId == "after-restore-task");
+        Assert.DoesNotContain(sourceSnapshot.Slots, s => s.Slot.TaskId == "after-restore-task");
+
+        // The SOURCE registry is likewise untouched by anything the target did.
+        Assert.DoesNotContain(source.GetSlotsForTest(), s => s.Slot.TaskId == "after-restore-task");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7) Blob-preservation inertness
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE BLOB-ONLY UPDATE: the explicit API writes NOTHING but <c>work_slot_registry_json</c> —
+    /// every other column of the row, the conversation, the task mappings and the active pointer
+    /// stay byte-identical.
+    /// </summary>
+    [Fact]
+    public void SaveWorkSlotRegistry_UpdatesOnlyTheBlobColumn_EverythingElseByteIdentical()
+    {
+        var pipeline = NewPipeline("wsr-onlyblob");
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing] });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("task-onlyblob", "coder/wsr-onlyblob");
+        pipeline.Conversation.Add(new ConversationEntry("user", "hello"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "hi"));
+
+        WithStore((store, _) =>
+        {
+            store.SavePipeline(pipeline);
+            store.SaveTaskMapping("task-onlyblob", "wsr-onlyblob");
+        });
+
+        var before = ReadWholeRow("wsr-onlyblob");
+        // PRECONDITIONS: real scalar content is present, and the blob is absent.
+        Assert.Equal("task-onlyblob", before["active_task_id"]);
+        Assert.Equal("Coding", before["phase"]);
+        Assert.Null(before["work_slot_registry_json"]);
+
+        var snapshot = BuildRichSourcePipeline("wsr-onlyblob-src").CaptureRegistry();
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-onlyblob", snapshot)));
+
+        var after = ReadWholeRow("wsr-onlyblob");
+        Assert.Equal(before.Count, after.Count);
+        foreach (var (column, value) in before)
+        {
+            if (string.Equals(column, "work_slot_registry_json", StringComparison.Ordinal))
+                continue;
+            Assert.Equal(value, after[column]);
+        }
+
+        // The BLOB is the ONLY thing that changed.
+        Assert.NotNull(after["work_slot_registry_json"]);
+        Assert.Equal(WorkSlotRegistryCodec.Encode(snapshot), after["work_slot_registry_json"]);
+
+        // Conversation, mappings and the pointer are untouched.
+        Assert.Equal(2L, RawScalar("SELECT COUNT(*) FROM conversation_entries WHERE goal_id = 'wsr-onlyblob'"));
+        Assert.Equal("wsr-onlyblob", RawScalar("SELECT goal_id FROM task_mappings WHERE task_id = 'task-onlyblob'"));
+        Assert.Equal("task-onlyblob", RawScalar("SELECT active_task_id FROM pipelines WHERE goal_id = 'wsr-onlyblob'"));
+
+        var loaded = WithStore((store, _) => store.LoadPipeline("wsr-onlyblob"))!;
+        Assert.Equal(2, loaded.Conversation.Count);
+        Assert.Equal("task-onlyblob", loaded.ActiveTaskId);
+        Assert.Equal(GoalPhase.Coding, loaded.Phase);
+    }
+
+    /// <summary>
+    /// THE INERTNESS OF THE ORDINARY WRITE PATHS: <c>SavePipeline</c>, <c>SavePipelineState</c>,
+    /// <c>SaveAdmissionWithPointer</c> and the ownership-checked pointer clear each preserve an
+    /// EXISTING blob BYTE-EXACTLY — none of them captures a registry, overwrites the column, clears
+    /// it, or decodes it. Each step also asserts that it genuinely DID its own work, so the
+    /// preservation cannot be satisfied by a no-op.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: make <c>ApplyToEntity</c> capture/write the registry column (or NULL it out)
+    /// and the byte-exact comparison after the very first ordinary save fails.
+    /// </remarks>
+    [Fact]
+    public void OrdinaryWritePaths_PreserveAnExistingBlobByteExactly()
+    {
+        var pipeline = NewPipeline("wsr-inert");
+        WithStore((store, _) => store.SavePipeline(pipeline));
+
+        var snapshot = BuildRichSourcePipeline("wsr-inert-src").CaptureRegistry();
+        Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry("wsr-inert", snapshot)));
+        var blob = RawBlob("wsr-inert");
+        Assert.NotNull(blob);
+        // PRECONDITION: the blob is a substantial payload, not an empty envelope.
+        Assert.Contains("\"claimed-task\"", blob, StringComparison.Ordinal);
+
+        // (a) SavePipeline — a FULL save, conversation included.
+        pipeline.Conversation.Add(new ConversationEntry("user", "after-blob"));
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        WithStore((store, _) => store.SavePipeline(pipeline));
+        Assert.Equal("Coding", RawScalar("SELECT phase FROM pipelines WHERE goal_id = 'wsr-inert'")); // it really saved
+        Assert.Equal(1L, RawScalar("SELECT COUNT(*) FROM conversation_entries WHERE goal_id = 'wsr-inert'"));
+        Assert.Equal(blob, RawBlob("wsr-inert"));
+
+        // (b) SavePipelineState — the scalar-only save.
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        WithStore((store, _) => store.SavePipelineState(pipeline));
+        Assert.Equal("Testing", RawScalar("SELECT phase FROM pipelines WHERE goal_id = 'wsr-inert'"));
+        Assert.Equal(blob, RawBlob("wsr-inert"));
+
+        // (c) SaveAdmissionWithPointer — the atomic mapping+pointer transaction.
+        pipeline.SetActiveTask("task-inert");
+        Assert.Equal(AdmissionStoreResult.Committed,
+            WithStore((store, _) => store.SaveAdmissionWithPointer(pipeline, "task-inert")));
+        Assert.Equal("wsr-inert", RawScalar("SELECT goal_id FROM task_mappings WHERE task_id = 'task-inert'"));
+        Assert.Equal("task-inert", RawScalar("SELECT active_task_id FROM pipelines WHERE goal_id = 'wsr-inert'"));
+        Assert.Equal(blob, RawBlob("wsr-inert"));
+
+        // (d) The ownership-checked POINTER CLEAR.
+        Assert.Equal(PointerRollbackResult.Cleared,
+            WithStore((store, _) => store.ClearActiveTaskIdIfMatches("wsr-inert", "task-inert")));
+        Assert.Null(RawScalar("SELECT active_task_id FROM pipelines WHERE goal_id = 'wsr-inert'"));
+        Assert.Equal(blob, RawBlob("wsr-inert"));
+
+        // (e) A non-matching pointer clear (the no-op refusal) is equally inert.
+        Assert.Equal(PointerRollbackResult.NotMatched,
+            WithStore((store, _) => store.ClearActiveTaskIdIfMatches("wsr-inert", "some-other-task")));
+        Assert.Equal(blob, RawBlob("wsr-inert"));
+
+        // THE BLOB IS STILL DECODABLE AND COMPLETE after every ordinary write path ran.
+        var decoded = WorkSlotRegistryCodec.Decode(RawBlob("wsr-inert")!);
+        Assert.Equal(SlotsOf(snapshot), SlotsOf(decoded));
+        Assert.Equal(AttemptsOf(snapshot), AttemptsOf(decoded));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (8) NO ACTIVATION — the inertness the whole slice exists to guarantee
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE NO-ACTIVATION PROOF: neither the ordinary <see cref="GoalPipeline"/> restore constructor
+    /// nor <see cref="GoalPipelineManager"/>'s restoration paths look at the blob — with a
+    /// POPULATED payload or a MALFORMED one, the restored pipeline's registry comes up COMPLETELY
+    /// EMPTY, no exception is raised, and every other piece of restored state is exactly what it
+    /// would be with no blob at all. Recovery wiring is a LATER goal; this test fails the moment
+    /// anything starts activating it.
+    /// </summary>
+    [Theory]
+    [InlineData("populated")]
+    [InlineData("malformed")]
+    [InlineData("empty-payload")]
+    public void RestorePaths_IgnoreTheBlobEntirely_NoRegistryRecoveryActivates(string blobKind)
+    {
+        var goalId = "wsr-noactivate-" + blobKind;
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing] });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("task-" + blobKind, "coder/" + goalId);
+        WithStore((store, _) => store.SavePipeline(pipeline));
+
+        var rich = BuildRichSourcePipeline(goalId + "-src").CaptureRegistry();
+        switch (blobKind)
+        {
+            case "populated":
+                Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry(goalId, rich)));
+                break;
+            case "empty-payload":
+                Assert.True(WithStore((store, _) =>
+                    store.SaveWorkSlotRegistry(goalId, new WorkSlotRegistrySnapshot([], []))));
+                break;
+            case "malformed":
+                ExecuteRaw($"UPDATE pipelines SET work_slot_registry_json = '{{not json' WHERE goal_id = '{goalId}'");
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled blob kind: {blobKind}");
+        }
+
+        // PRECONDITION: the column really is populated — otherwise "ignored" would be vacuous.
+        var blob = RawBlob(goalId);
+        Assert.NotNull(blob);
+
+        // (a) THE RESTORE CONSTRUCTOR ignores it.
+        var snapshot = WithStore((store, _) => store.LoadPipeline(goalId))!;
+        Assert.Equal(blob, snapshot.WorkSlotRegistryJson);   // the carrier IS populated…
+        var restoredDirectly = new GoalPipeline(snapshot);
+        AssertRegistryCompletelyEmpty(restoredDirectly);     // …and the registry is STILL empty.
+
+        // (b) GoalPipelineManager.RestoreFromStore (the startup path) ignores it.
+        WithStore((store, _) =>
+        {
+            var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+            var restored = manager.RestoreFromStore();
+            var fromStartup = Assert.Single(restored, p => p.GoalId == goalId);
+            AssertRegistryCompletelyEmpty(fromStartup);
+
+            // Non-registry state restored exactly as it always did — unchanged startup behavior.
+            Assert.Equal(GoalPhase.Coding, fromStartup.Phase);
+            Assert.Equal("task-" + blobKind, fromStartup.ActiveTaskId);
+            Assert.Equal("coder/" + goalId, fromStartup.CoderBranch);
+        });
+
+        // (c) GoalPipelineManager.RestorePipeline (the on-demand path) ignores it too.
+        WithStore((store, _) =>
+        {
+            var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+            var onDemand = manager.RestorePipeline(goalId);
+            Assert.NotNull(onDemand);
+            AssertRegistryCompletelyEmpty(onDemand!);
+        });
+
+        // (d) THE LEGACY NoSlot BEHAVIOR IS UNCHANGED: with nothing recovered, a completion for a
+        //     task that had a slot in the STORED snapshot still passes through as NoSlot.
+        Assert.Equal(AdmissionOutcome.NoSlot, restoredDirectly.AdmitCompletion("claimed-task"));
+        Assert.Equal(AdmissionOutcome.NoSlot, restoredDirectly.AdmitCompletion("pending-task"));
+        Assert.Equal(SlotGuardResult.Unknown, restoredDirectly.ResolveAndCheckSlot("claimed-task"));
+
+        // …and for the populated case, those task ids really WERE in the stored payload.
+        if (blobKind == "populated")
+        {
+            var storedSnapshot = WorkSlotRegistryCodec.Decode(blob!);
+            Assert.Contains(storedSnapshot.Slots, s => s.Slot.TaskId == "claimed-task");
+            Assert.Contains(storedSnapshot.Slots, s => s.Slot.TaskId == "pending-task");
+        }
+    }
+
+    /// <summary>
+    /// BOTH registry dictionaries are empty. The empty-restore probe is the strong form: a restore
+    /// into a nonempty registry — INCLUDING a counter-only one, which no capture would reveal
+    /// through the slot list alone — throws <see cref="InvalidOperationException"/>.
+    /// </summary>
+    private static void AssertRegistryCompletelyEmpty(GoalPipeline pipeline)
+    {
+        Assert.Empty(pipeline.GetSlotsForTest());
+
+        var snapshot = pipeline.CaptureRegistry();
+        Assert.Empty(snapshot.Slots);
+        Assert.Empty(snapshot.DispatchAttempts);
+
+        // Would THROW if either dictionary carried anything at all.
+        pipeline.RestoreRegistry(new WorkSlotRegistrySnapshot([], []));
+    }
+
+    /// <summary>Every exception in the propagated chain, outermost first.</summary>
+    private static IEnumerable<Exception> EnumerateChain(Exception exception)
+    {
+        for (var current = (Exception?)exception; current is not null; current = current.InnerException)
+            yield return current;
+    }
+}
+
+/// <summary>
+/// Throws a genuine <see cref="SqliteException"/> at the registry column's UPDATE statement — the
+/// real failure vector for "a failed write leaves prior persisted data intact". The thrown
+/// instance is a pre-created <see cref="Sentinel"/> so propagation can be asserted by IDENTITY,
+/// and <see cref="ThrowCount"/> proves the injection actually fired.
+/// </summary>
+internal sealed class RegistryUpdateThrowInterceptor : DbCommandInterceptor
+{
+    private int _throwCount;
+
+    /// <summary>The pre-created exception instance the injection throws.</summary>
+    public SqliteException Sentinel { get; } =
+        new("registry update interceptor SENTINEL", 5, 5);   // SQLITE_BUSY
+
+    /// <summary>How many times the sentinel was thrown.</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    private void ThrowIfTargeted(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (!text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase))
+            return;
+        if (!text.Contains("work_slot_registry_json", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        Interlocked.Increment(ref _throwCount);
+        throw Sentinel;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        ThrowIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfTargeted(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        ThrowIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfTargeted(command);
+        return ValueTask.FromResult(result);
     }
 }

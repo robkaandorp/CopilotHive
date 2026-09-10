@@ -84,4 +84,16 @@ public sealed class PipelineEntity
 
     /// <summary>JSON-serialised phase log, or null.</summary>
     public string? PhaseLogJson { get; set; }
+
+    /// <summary>
+    /// Opaque encoded work-slot registry snapshot, or <c>null</c> when no snapshot has ever been
+    /// stored for this row (the legacy-absence marker).
+    /// <para>
+    /// SQL NULL is MEANINGFUL and is NOT the same as a stored version-1 payload carrying two empty
+    /// collections: null means "no snapshot supplied", the empty payload means "an empty registry
+    /// was captured". Ordinary pipeline saves never write, clear, or read this column — it is
+    /// carried verbatim end to end and decoded only by an explicit caller.
+    /// </para>
+    /// </summary>
+    public string? WorkSlotRegistryJson { get; set; }
 }

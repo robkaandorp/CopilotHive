@@ -261,6 +261,11 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.PhaseOccurrence).HasColumnName("phase_occurrence").IsRequired().HasDefaultValue(1);
         entity.Property(e => e.MachinePhase).HasColumnName("machine_phase");
         entity.Property(e => e.PhaseLogJson).HasColumnName("phase_log_json");
+
+        // Nullable by design: SQL NULL is the legacy-absence marker and must stay distinct from a
+        // stored version-1 payload with empty collections. No default value is configured, so
+        // ordinary newly-inserted rows leave the column SQL NULL.
+        entity.Property(e => e.WorkSlotRegistryJson).HasColumnName("work_slot_registry_json");
     }
 
     private static void ConfigureConversationEntry(EntityTypeBuilder<ConversationEntryEntity> entity)

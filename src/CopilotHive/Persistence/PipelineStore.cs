@@ -697,6 +697,109 @@ public sealed class PipelineStore : IAsyncDisposable
     }
 
     /// <summary>
+    /// Persists an encoded work-slot registry snapshot onto an EXISTING pipeline row, writing ONLY
+    /// the <c>work_slot_registry_json</c> column.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ENCODE-BEFORE-TOUCH: the snapshot is encoded BEFORE any database interaction, so an encode
+    /// failure propagates having performed NO write at all (and having created no context).
+    /// </para>
+    /// <para>
+    /// EXISTING ROWS ONLY: a single column-scoped <c>ExecuteUpdate</c> matches the row by goal id.
+    /// A missing row affects zero rows and is reported as <c>false</c> — an incomplete pipeline row
+    /// is NEVER created as a side effect. Nothing else is written: no scalars, no task mappings, no
+    /// conversation, no timestamps, and not the active pointer.
+    /// </para>
+    /// <para>
+    /// TRACKER COHERENCE: <c>ExecuteUpdate</c> bypasses the change tracker, so on the direct
+    /// (test-owned) context path a previously tracked <see cref="PipelineEntity"/> would keep the
+    /// stale pre-write value and hand it back to the next <c>Find</c>. The tracked copy is
+    /// therefore refreshed in place and the refreshed property is marked unmodified so it is not
+    /// re-flushed by an unrelated later <c>SaveChanges</c>.
+    /// </para>
+    /// <para>
+    /// FAILURES PROPAGATE: a store failure is logged and rethrown; the previously persisted blob is
+    /// left exactly as it was.
+    /// </para>
+    /// <para>
+    /// INERT BY DESIGN: nothing in production calls this yet. Storing a snapshot is NOT a decision
+    /// to restore one — the restore validation stays with <c>GoalPipeline.RestoreRegistry</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="goalId">The goal id whose pipeline row receives the snapshot.</param>
+    /// <param name="snapshot">The registry snapshot to encode and store.</param>
+    /// <returns><c>true</c> when the row existed and was updated; <c>false</c> when no row matched.</returns>
+    /// <exception cref="ArgumentException"><paramref name="goalId"/> is null, empty, or blank.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="snapshot"/> is <c>null</c>.</exception>
+    internal bool SaveWorkSlotRegistry(string goalId, WorkSlotRegistrySnapshot snapshot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(goalId);
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        // PHASE 1 — the encode, BEFORE any database interaction. A codec failure escapes here with
+        // no context created and no statement issued.
+        var encoded = WorkSlotRegistryCodec.Encode(snapshot);
+
+        // PHASE 2 — the column-scoped write.
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            var affected = db.Pipelines
+                .Where(p => p.GoalId == goalId)
+                .ExecuteUpdate(setters => setters.SetProperty(p => p.WorkSlotRegistryJson, encoded));
+
+            if (affected <= 0)
+                return false;
+
+            RefreshTrackedRegistryBlob(db, goalId, encoded);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save work-slot registry snapshot for goal {GoalId}", goalId);
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Re-synchronises a tracked <see cref="PipelineEntity"/> with the value just written by
+    /// <c>ExecuteUpdate</c>, so the tracker cannot hand back the stale blob to a later
+    /// <c>Find</c>/load on the direct-context path.
+    /// <para>
+    /// BOTH VALUES ARE MOVED. The row genuinely holds the encoded blob now, so it is the tracked
+    /// entity's ORIGINAL value as well as its current one. Assigning only the current value would
+    /// leave the property looking modified, and clearing <c>IsModified</c> afterwards would then
+    /// roll the current value back to the stale original — the refresh would silently undo itself.
+    /// With both values moved, the column matches the row and no unrelated later
+    /// <c>SaveChanges</c> re-flushes it.
+    /// </para>
+    /// </summary>
+    private static void RefreshTrackedRegistryBlob(CopilotHiveDbContext db, string goalId, string encoded)
+    {
+        var tracked = db.ChangeTracker.Entries<PipelineEntity>()
+            .FirstOrDefault(e => string.Equals(e.Entity.GoalId, goalId, StringComparison.Ordinal));
+        if (tracked is null)
+            return;
+
+        // Added/Deleted entities have no meaningful persisted original value to move; only the
+        // current value is synchronised for them.
+        var hasPersistedOriginal = tracked.State is EntityState.Unchanged or EntityState.Modified;
+
+        var property = tracked.Property(p => p.WorkSlotRegistryJson);
+        if (hasPersistedOriginal)
+            property.OriginalValue = encoded;
+        property.CurrentValue = encoded;
+        if (hasPersistedOriginal)
+            property.IsModified = false;
+    }
+
+    /// <summary>
     /// TRUE iff the exception chain carries a <see cref="SqliteException"/> with
     /// <c>SqliteErrorCode == 19</c> AND <c>SqliteExtendedErrorCode == 1555</c> (SQLITE_CONSTRAINT_PRIMARYKEY).
     /// Every other code — NOTNULL (1299), UNIQUE (2067), CHECK (275), FK (787), BUSY (5),
@@ -825,6 +928,10 @@ public sealed class PipelineStore : IAsyncDisposable
                 : JsonSerializer.Deserialize<List<PhaseResult>>(entity.PhaseLogJson, JsonOptions) ?? [],
             PhaseOccurrence = entity.PhaseOccurrence,
             MachinePhase = ParseMachinePhase(entity.MachinePhase),
+            // THE RAW CARRIER: copied VERBATIM, never parsed or decoded here. A SQL NULL stays
+            // null (the legacy-absence marker) and any stored text — including malformed text —
+            // is handed over unchanged for an explicit caller to decode later.
+            WorkSlotRegistryJson = entity.WorkSlotRegistryJson,
         };
     }
 
@@ -986,6 +1093,21 @@ public sealed class PipelineSnapshot
     /// phase equals the snapshot's pipeline phase; null or mismatched → the legacy path.
     /// </summary>
     public GoalPhase? MachinePhase { get; init; }
+
+    /// <summary>
+    /// The RAW, still-encoded work-slot registry blob exactly as it sits in the
+    /// <c>work_slot_registry_json</c> column, or <c>null</c> when the column is SQL NULL.
+    /// <para>
+    /// A CARRIER ONLY — the load path copies it verbatim and NEVER decodes it, so a malformed value
+    /// cannot break a load. SQL NULL ("no snapshot supplied / legacy absence") stays distinct from a
+    /// stored version-1 payload holding two empty collections ("an empty registry was captured").
+    /// </para>
+    /// <para>
+    /// INTERNAL on purpose: no public surface exposes the registry domain, and no production code
+    /// reads this yet — pipeline construction and restoration ignore it entirely.
+    /// </para>
+    /// </summary>
+    internal string? WorkSlotRegistryJson { get; init; }
 }
 
 /// <summary>

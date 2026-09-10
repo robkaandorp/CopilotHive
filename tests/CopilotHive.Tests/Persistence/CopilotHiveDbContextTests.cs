@@ -1350,4 +1350,294 @@ public sealed class CopilotHiveDbContextTests
             Assert.Null(other!.MachinePhase);
         }
     }
+
+    // ── 12. work_slot_registry_json reconciliation (REAL file-backed SQLite) ───
+
+    /// <summary>
+    /// The pipelines DDL as it stood BEFORE <c>work_slot_registry_json</c> existed — the exact
+    /// legacy column set an on-disk database written by an older build carries.
+    /// </summary>
+    private const string LegacyPipelinesDdlWithoutRegistryColumn =
+        """
+        CREATE TABLE pipelines (
+            goal_id TEXT NOT NULL PRIMARY KEY,
+            description TEXT NOT NULL,
+            goal_json TEXT NOT NULL,
+            phase TEXT NOT NULL DEFAULT 'Planning',
+            iteration INTEGER NOT NULL DEFAULT 1,
+            review_retries INTEGER NOT NULL DEFAULT 0,
+            test_retries INTEGER NOT NULL DEFAULT 0,
+            improver_retries INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            max_iterations INTEGER NOT NULL DEFAULT 10,
+            active_task_id TEXT,
+            coder_branch TEXT,
+            plan_json TEXT,
+            phase_outputs TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            goal_started_at TEXT,
+            merge_commit_hash TEXT,
+            role_sessions_json TEXT NOT NULL DEFAULT '{}',
+            iteration_start_sha TEXT,
+            phase_occurrence INTEGER NOT NULL DEFAULT 1,
+            machine_phase TEXT,
+            phase_log_json TEXT
+        )
+        """;
+
+    /// <summary>Allocates a unique temp database path (the file itself is created by SQLite).</summary>
+    private static string NewTempDbPath(string tag) =>
+        Path.Combine(Path.GetTempPath(), $"copilothive-{tag}-{Guid.NewGuid():N}.db");
+
+    /// <summary>Deletes a SQLite database file and its WAL/SHM siblings, best-effort.</summary>
+    private static void DeleteDbFiles(string path)
+    {
+        foreach (var candidate in new[] { path, path + "-wal", path + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+            catch
+            {
+                // Best-effort cleanup — a leftover temp file must never fail a test.
+            }
+        }
+    }
+
+    /// <summary>Opens a NEW connection to the given file-backed database (pooling off so the file can be deleted).</summary>
+    private static SqliteConnection OpenFileConnection(string path)
+    {
+        var connection = new SqliteConnection($"Data Source={path};Pooling=False");
+        connection.Open();
+        return connection;
+    }
+
+    private static CopilotHiveDbContext ContextOn(SqliteConnection connection) =>
+        new(new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+
+    private static object? ScalarOn(SqliteConnection connection, string sql)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = sql;
+        var value = cmd.ExecuteScalar();
+        return value is DBNull ? null : value;
+    }
+
+    /// <summary>Counts how many times a column name appears on a table (duplicate detection).</summary>
+    private static int CountColumnOccurrences(SqliteConnection connection, string tableName, string columnName)
+    {
+        var count = 0;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{tableName}\")";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// THE ADDITIVE-RECONCILIATION PROOF for <c>work_slot_registry_json</c> on a REAL, on-disk
+    /// SQLite database (not an in-memory-only handle): a POPULATED legacy schema that predates the
+    /// column gains it through the existing <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>
+    /// additive path, EVERY pre-existing row survives with EVERY scalar byte-identical, the new
+    /// column reads back SQL NULL (the legacy-absence marker — never an invented empty payload),
+    /// and a SECOND reconciliation is idempotent: no duplicate column, no data loss, and — the
+    /// strong form — a value written between the two runs is NOT wiped by the second run.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the <c>WorkSlotRegistryJson</c> property or its
+    /// <c>HasColumnName("work_slot_registry_json")</c> mapping and the generated CREATE script no
+    /// longer carries the column, so the post-reconcile <c>Assert.Contains</c> fails. Make the
+    /// column non-nullable or give it a DEFAULT and the "SQL NULL for legacy rows" assertions fail.
+    /// </remarks>
+    [Fact]
+    public void EnsureSchema_FileBackedLegacyPipelines_AddsWorkSlotRegistryColumnAsNull_AndIsIdempotent()
+    {
+        var dbPath = NewTempDbPath("wsr-reconcile");
+        try
+        {
+            // ── Arrange: a REAL database FILE carrying the pre-column schema and TWO rows. ──
+            using (var seedConnection = OpenFileConnection(dbPath))
+            {
+                ExecuteDirect(seedConnection, LegacyPipelinesDdlWithoutRegistryColumn);
+                ExecuteDirect(seedConnection,
+                    """
+                    INSERT INTO pipelines
+                        (goal_id, description, goal_json, phase, iteration, active_task_id,
+                         coder_branch, created_at, phase_occurrence, machine_phase)
+                    VALUES
+                        ('wsr-legacy-1', 'First legacy pipeline', '{"id":"wsr-legacy-1"}', 'Coding', 3,
+                         'task-legacy-1', 'coder/wsr-legacy-1', '2025-06-01T10:00:00.0000000Z', 2, 'Coding'),
+                        ('wsr-legacy-2', 'Second legacy pipeline', '{"id":"wsr-legacy-2"}', 'Testing', 1,
+                         NULL, NULL, '2025-06-02T10:00:00.0000000Z', 1, NULL)
+                    """);
+
+                // PRECONDITION (anti-vacuous): the column genuinely does not exist yet, so the
+                // post-reconcile assertions cannot pass by accident.
+                Assert.DoesNotContain("work_slot_registry_json", GetTableColumns(seedConnection, "pipelines"));
+                Assert.Equal(2L, ScalarOn(seedConnection, "SELECT COUNT(*) FROM pipelines"));
+            }
+
+            // ── Act: the FIRST reconciliation, on a fresh connection to the same file. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            // ── Assert: the column exists, is nullable, and every row survived untouched. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                var columns = GetTableColumns(connection, "pipelines");
+                Assert.Contains("work_slot_registry_json", columns);
+
+                var columnInfo = GetTableColumnInfo(connection, "pipelines");
+                Assert.False(columnInfo["work_slot_registry_json"].NotNull);
+                // No DEFAULT: an added column must not manufacture a payload for legacy rows.
+                Assert.Null(columnInfo["work_slot_registry_json"].DefaultValue);
+
+                // BOTH rows survive, and NEITHER has a registry value (COUNT(col) skips NULLs).
+                Assert.Equal(2L, ScalarOn(connection, "SELECT COUNT(*) FROM pipelines"));
+                Assert.Equal(0L, ScalarOn(connection, "SELECT COUNT(work_slot_registry_json) FROM pipelines"));
+
+                // EVERY scalar of the first row is byte-identical to what was seeded.
+                Assert.Equal("First legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("Coding",
+                    ScalarOn(connection, "SELECT phase FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal(3L,
+                    ScalarOn(connection, "SELECT iteration FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("task-legacy-1",
+                    ScalarOn(connection, "SELECT active_task_id FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("coder/wsr-legacy-1",
+                    ScalarOn(connection, "SELECT coder_branch FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("2025-06-01T10:00:00.0000000Z",
+                    ScalarOn(connection, "SELECT created_at FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal(2L,
+                    ScalarOn(connection, "SELECT phase_occurrence FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("Coding",
+                    ScalarOn(connection, "SELECT machine_phase FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+                Assert.Equal("Second legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'wsr-legacy-2'"));
+                Assert.Null(ScalarOn(connection, "SELECT active_task_id FROM pipelines WHERE goal_id = 'wsr-legacy-2'"));
+
+                // A value written NOW must survive the second reconciliation below.
+                ExecuteDirect(connection,
+                    """
+                    UPDATE pipelines
+                    SET work_slot_registry_json = '{"version":1,"slots":[],"dispatchAttempts":[]}'
+                    WHERE goal_id = 'wsr-legacy-1'
+                    """);
+            }
+
+            // ── Act: the SECOND reconciliation — must be a no-op for this column. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                // IDEMPOTENT: exactly ONE column of that name, never a duplicate.
+                Assert.Equal(1, CountColumnOccurrences(connection, "pipelines", "work_slot_registry_json"));
+
+                // The rows and their data survived the second run…
+                Assert.Equal(2L, ScalarOn(connection, "SELECT COUNT(*) FROM pipelines"));
+                Assert.Equal("First legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+
+                // …INCLUDING the blob written between the two runs (a drop/recreate would lose it).
+                Assert.Equal("""{"version":1,"slots":[],"dispatchAttempts":[]}""",
+                    ScalarOn(connection, "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'wsr-legacy-1'"));
+
+                // …and the untouched row is STILL SQL NULL — the absence marker is not contagious.
+                Assert.Null(ScalarOn(connection, "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'wsr-legacy-2'"));
+            }
+        }
+        finally
+        {
+            DeleteDbFiles(dbPath);
+        }
+    }
+
+    /// <summary>
+    /// THE NEW-SCHEMA (fresh database) SIDE, also on a REAL file: reconciling an EMPTY database
+    /// file creates <c>pipelines</c> WITH <c>work_slot_registry_json</c>; an ORDINARY inserted row
+    /// leaves the column SQL NULL (no default is manufactured); and an explicit write round-trips
+    /// through the EF model across a CLOSE/REOPEN of the file.
+    /// </summary>
+    [Fact]
+    public void EnsureSchema_FreshFileBackedDb_CreatesNullableWorkSlotRegistryColumn_AndWritesRoundTrip()
+    {
+        var dbPath = NewTempDbPath("wsr-fresh");
+        try
+        {
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                // PRECONDITION (anti-vacuous): the database file is genuinely empty.
+                Assert.Empty(GetAllTableNames(connection));
+
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+                Assert.Contains("pipelines", GetAllTableNames(connection));
+                Assert.Contains("work_slot_registry_json", GetTableColumns(connection, "pipelines"));
+                var columnInfo = GetTableColumnInfo(connection, "pipelines");
+                Assert.False(columnInfo["work_slot_registry_json"].NotNull);
+
+                // An ORDINARY new row through the EF model: the column stays SQL NULL.
+                ctx.Pipelines.Add(new PipelineEntity
+                {
+                    GoalId = "wsr-fresh-1",
+                    Description = "Fresh pipeline",
+                    GoalJson = """{"id":"wsr-fresh-1"}""",
+                    Phase = "Planning",
+                    MetricsJson = "{}",
+                    RoleSessionsJson = "{}",
+                    PhaseOutputs = "{}",
+                    CreatedAt = "2025-06-15T10:00:00.0000000Z",
+                    PhaseOccurrence = 1,
+                });
+                ctx.SaveChanges();
+
+                Assert.Null(ScalarOn(connection,
+                    "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'wsr-fresh-1'"));
+            }
+
+            // A DIFFERENT connection/context writes the column through the EF model…
+            const string payload = """{"version":1,"slots":[],"dispatchAttempts":[]}""";
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                var row = ctx.Pipelines.Find("wsr-fresh-1");
+                Assert.NotNull(row);
+                Assert.Null(row!.WorkSlotRegistryJson);   // still absent before the write
+
+                row.WorkSlotRegistryJson = payload;
+                ctx.SaveChanges();
+            }
+
+            // …and after a full CLOSE/REOPEN of the FILE the value is durable and byte-exact.
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                Assert.Equal(payload, ScalarOn(connection,
+                    "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'wsr-fresh-1'"));
+
+                using var ctx = ContextOn(connection);
+                Assert.Equal(payload, ctx.Pipelines.Find("wsr-fresh-1")!.WorkSlotRegistryJson);
+            }
+        }
+        finally
+        {
+            DeleteDbFiles(dbPath);
+        }
+    }
 }
