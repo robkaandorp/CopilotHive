@@ -298,7 +298,14 @@ public sealed class GoalDispatcherCancelTests
         Assert.False(result);
     }
 
-    private static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
+    /// <summary>
+    /// Invokes the private production <see cref="GoalDispatcher"/> dispatch entry point
+    /// (<c>GoalDispatchService.DispatchNextGoalAsync</c>) and returns its actual Task so
+    /// callers can AWAIT a real dispatch instead of relying on background-service timing.
+    /// Internal so <see cref="GoalDispatcherClearRetryStateTests"/> can reuse the same
+    /// harness; this widens nothing in production.
+    /// </summary>
+    internal static Task InvokeDispatchNextGoalAsync(GoalDispatcher dispatcher, CancellationToken ct)
     {
         var method = typeof(GoalDispatcher).GetMethod(
             "DispatchNextGoalAsync",
@@ -569,21 +576,38 @@ public sealed class GoalDispatcherClearRetryStateTests
     [Fact]
     public async Task ClearGoalRetryState_AfterActualDispatch_AllowsGoalToBeRedispatched()
     {
-        // This test proves that ClearGoalRetryState removes the stale pipeline so the
-        // goal can be dispatched again. The pipeline manager is the source of truth for
-        // whether a goal is already dispatched, so we must run the background service loop
-        // to create a pipeline, then verify that after ClearGoalRetryState the same
-        // dispatcher can dispatch the goal again.
+        // This test proves that a goal whose pipeline was removed by ClearGoalRetryState
+        // becomes eligible for REDISPATCH: two sequential AWAITED calls to the real
+        // DispatchNextGoalAsync against the SAME dispatcher instance produce two distinct
+        // pipelines, with the real ClearGoalRetryState + ResetForRequeue in between. There
+        // is NO background service, NO StartAsync, NO cancellation choreography and NO
+        // timing dependence — each dispatch is awaited to completion before the next
+        // assertion, so background-service lifecycle races cannot interfere.
         //
-        // Without clearing the stale pipeline, the second dispatch loop would silently return
-        // early at the GetByGoalId guard in DispatchNextGoalAsync, and no second pipeline would form.
+        // Without clearing the stale pipeline, the second dispatch would return early at the
+        // GetByGoalId guard in DispatchNextGoalAsync and no second pipeline would form.
+        var ct = TestContext.Current.CancellationToken;
+
         var logger = new RetryStateCollectingLogger<GoalDispatcher>();
-        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Retry goal", Status = GoalStatus.Pending };
+        var goal = new Goal
+        {
+            Id = $"goal-{Guid.NewGuid():N}",
+            Description = "Retry goal",
+            Status = GoalStatus.Pending,
+            RepositoryNames = ["test-repo"]
+        };
         var goalSource = new CancelFakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
 
         var pipelineManager = new GoalPipelineManager();
+
+        var config = TestHelpers.FullReadyConfig();
+        config.Orchestrator.MaxParallelGoals = 5; // readiness/capacity must never mask the duplicate-pipeline guard
+        config.Repositories =
+        [
+            new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" }
+        ];
 
         var dispatcher = new GoalDispatcher(
             goalManager,
@@ -595,47 +619,37 @@ public sealed class GoalDispatcherClearRetryStateTests
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             // A Brain is required to plan the goal — without one, dispatch fails the goal.
             brain: new RetryStateFakeBrain(),
-            config: TestHelpers.FullReadyConfig(),
+            config: config,
             startupDelay: TimeSpan.Zero);
 
-        // Act 1: Run the background service so DispatchNextGoalAsync executes and
-        // creates a pipeline for the goal in the pipeline manager. The goal becomes InProgress after dispatch.
-        using var cts1 = new CancellationTokenSource();
-        using var linked1 = CancellationTokenSource.CreateLinkedTokenSource(
-            cts1.Token, TestContext.Current.CancellationToken);
-        var task1 = dispatcher.StartAsync(linked1.Token);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
-        cts1.Cancel();
-        await Task.WhenAny(task1, Task.Delay(1000, TestContext.Current.CancellationToken));
+        // Act 1: ONE awaited real dispatch call — no background service, no sleeps.
+        await GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(dispatcher, ct);
 
-        // Assert: pipeline was created — this proves the pipeline manager tracks dispatched goals
-        // and DispatchNextGoalAsync's GetByGoalId guard allowed the dispatch.
-        var pipelineAfterFirstDispatch = pipelineManager.GetByGoalId(goal.Id);
-        Assert.NotNull(pipelineAfterFirstDispatch);
-        var firstDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
-        Assert.Equal(1, firstDispatchLogs);
+        // Assert (pipeline/admission first — log counts are supplementary proof only).
+        var firstPipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(firstPipeline);
+        Assert.Equal(GoalStatus.InProgress, goal.Status);
+        Assert.False(string.IsNullOrWhiteSpace(firstPipeline.ActiveTaskId), "dispatch must have claimed an active task");
+        Assert.Equal(1, logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'")));
 
-        // Act 2: Clear retry state — removes the stale pipeline.
+        // Act 2: the REAL reset operations — remove the stale pipeline and re-queue the goal.
         dispatcher.ClearGoalRetryState(goal.Id);
-        goalSource.ResetForRequeue(); // Goal becomes Pending again for re-dispatch.
+        goalSource.ResetForRequeue();
 
         // Assert: pipeline was removed by ClearGoalRetryState.
         Assert.Null(pipelineManager.GetByGoalId(goal.Id));
 
-        // Act 3: Run the SAME dispatcher instance again. Because the stale pipeline was cleared,
-        // GetByGoalId in DispatchNextGoalAsync returns null and the goal is dispatched a second time.
-        // Without ClearGoalRetryState, GetByGoalId would find the existing pipeline and skip dispatch.
-        using var cts2 = new CancellationTokenSource();
-        using var linked2 = CancellationTokenSource.CreateLinkedTokenSource(
-            cts2.Token, TestContext.Current.CancellationToken);
-        var task2 = dispatcher.StartAsync(linked2.Token);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
-        cts2.Cancel();
-        await Task.WhenAny(task2, Task.Delay(1000, TestContext.Current.CancellationToken));
+        // Act 3: ONE awaited real dispatch call on the SAME dispatcher instance.
+        await GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(dispatcher, ct);
 
-        // Assert: goal was dispatched a second time — proving the stale pipeline was cleared.
-        var totalDispatchLogs = logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'"));
-        Assert.Equal(2, totalDispatchLogs);
+        // Assert: a NEW pipeline instance was created — proving the stale pipeline was cleared
+        // and the goal was genuinely dispatched a second time.
+        var secondPipeline = pipelineManager.GetByGoalId(goal.Id);
+        Assert.NotNull(secondPipeline);
+        Assert.NotSame(firstPipeline, secondPipeline);
+        Assert.Equal(GoalStatus.InProgress, goal.Status);
+        Assert.False(string.IsNullOrWhiteSpace(secondPipeline.ActiveTaskId), "redispatch must have claimed an active task");
+        Assert.Equal(2, logger.Logs.Count(l => l.Message.Contains($"Dispatching goal '{goal.Id}'")));
     }
 }
 
