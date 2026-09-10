@@ -136,15 +136,133 @@ public sealed class TaskExecutor(
     }
 
     /// <summary>
+    /// Writes to <see cref="Console.Out"/> safely, mirroring <see cref="TryWriteError"/>'s
+    /// contract: an informational line NEVER propagates an exception. Shares the same lock so
+    /// concurrent tasks cannot interleave partial lines across the two streams.
+    /// </summary>
+    private static void TryWriteInfo(string message)
+    {
+        try
+        {
+            lock (_errorLock)
+            {
+                Console.WriteLine(message);
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (IOException) { }
+    }
+
+    /// <summary>
+    /// THE NONTHROWING FINALIZATION LOGGING BOUNDARY (informational).
+    /// <para>
+    /// <see cref="WorkerLogger.Info"/> writes STRAIGHT to <see cref="Console.Out"/>, so a
+    /// disposed or failing writer throws out of the call. Inside finalization that would turn a
+    /// verified-clean cleanup into an error path — or escape a catch body and hide the primary
+    /// Completed/Failed/Cancelled result. Every finalization diagnostic therefore goes through
+    /// this boundary, which preserves the SAME rendered content on the normal path
+    /// (<c>[Task] &lt;message&gt;</c>, matching <see cref="WorkerLogger"/>'s category prefix) and
+    /// swallows only the writer's own failure.
+    /// </para>
+    /// <para>
+    /// The catch is deliberately BROAD (unlike <see cref="TryWriteError"/>'s two-exception
+    /// form): this is a diagnostic sink of last resort whose ONLY contract is that reporting the
+    /// outcome can never replace it. A custom <see cref="TextWriter"/> installed by a host — or
+    /// by a test — may fail with any exception type, and none of them may reach the caller.
+    /// </para>
+    /// </summary>
+    private static void LogFinalizationInfo(string message)
+    {
+        try
+        {
+            TryWriteInfo($"[Task] {message}");
+        }
+        catch (Exception)
+        {
+            // Swallowed by design — see the remarks above. A diagnostic must never become the
+            // result.
+        }
+    }
+
+    /// <summary>
+    /// THE NONTHROWING FINALIZATION LOGGING BOUNDARY (error). The error counterpart of
+    /// <see cref="LogFinalizationInfo"/>: identical rendered content to
+    /// <see cref="WorkerLogger.Error"/> (<c>[Task] ERROR: &lt;message&gt;</c>) with the writer's
+    /// own failure swallowed, so a cleanup diagnostic can never escape a catch body and replace
+    /// the outcome it was meant to describe.
+    /// </summary>
+    private static void LogFinalizationError(string message)
+    {
+        try
+        {
+            TryWriteError($"[Task] ERROR: {message}");
+        }
+        catch (Exception)
+        {
+            // Swallowed by design — see LogFinalizationInfo's remarks.
+        }
+    }
+
+    /// <summary>
+    /// PHASE-ROUTED error logging for the helpers shared by preparation, publication and the
+    /// step-end cleanup. The CLEANUP phase goes through the nonthrowing
+    /// <see cref="LogFinalizationError"/> boundary (a diagnostic there must never become the
+    /// outcome); every other phase keeps the EXISTING <see cref="WorkerLogger"/> behavior
+    /// unchanged, so preparation and publication semantics are untouched.
+    /// </summary>
+    private void LogPhaseError(string phase, string message)
+    {
+        if (string.Equals(phase, CleanupPhase, StringComparison.Ordinal))
+            LogFinalizationError(message);
+        else
+            _log.Error(message);
+    }
+
+    /// <summary>
     /// Executes the full lifecycle of a task: cloning repos, branching,
     /// running Copilot, collecting results, and pushing changes.
+    /// <para>
+    /// For the IMPROVER role the outcome is composed through ONE shared finalization path
+    /// (<see cref="FinalizeImproverOutcomeAsync"/>) before this method returns: the awaited,
+    /// verified clean-at-step-end cleanup runs on normal/no-change completions, agent/retry
+    /// exceptions, publication failures AND requested cancellations alike — every prepared
+    /// Improver outcome flows through it. The cleanup carries its own independent finite
+    /// budget and never changes a non-Improver task.
+    /// </para>
     /// </summary>
     /// <param name="task">The domain task containing prompt, repos, and branch info.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A <see cref="TaskResult"/> with status, output, and git metrics.</returns>
     public async Task<TaskResult> ExecuteAsync(WorkTask task, CancellationToken ct)
     {
+        // Invocation-local state: the trusted restore evidence plus the confirmed publication
+        // SHA. Never persisted, never a dirty flag — created fresh per call and discarded.
+        var finalization = new ConfigRepoFinalization();
+
+        var outcome = await ExecuteCoreAsync(task, ct, finalization);
+
+        // ONE shared finalization path for every prepared Improver outcome, awaited BEFORE
+        // this method returns. Composes cleanup diagnostics WITH the original outcome.
+        return await FinalizeImproverOutcomeAsync(task, outcome, finalization);
+    }
+
+    /// <summary>
+    /// The original execution body, returning the outcome that the shared finalization path
+    /// then composes with the step-end cleanup diagnostics.
+    /// </summary>
+    private async Task<TaskResult> ExecuteCoreAsync(
+        WorkTask task, CancellationToken ct, ConfigRepoFinalization finalization)
+    {
         var stopwatch = Stopwatch.StartNew();
+
+        // The accumulated agent/retry output, recorded AS EACH SEGMENT ARRIVES so a
+        // cancellation or a later retry exception cannot discard evidence the agent already
+        // produced. The catch boundaries below compose their diagnostics ONTO this evidence.
+        //
+        // SCOPED TO THE IMPROVER: every other role keeps its BASE terminal output byte for
+        // byte (the bare cancellation notice / the sanitized error alone). The accumulator is
+        // constructed DISABLED for them, so it records nothing and composes nothing.
+        var agentEvidence = new AgentOutputEvidence(enabled: task.Role == WorkerRole.Improver);
 
         // Wire tool bridge and task context into CopilotRunner
         agentRunner.SetToolBridge(toolBridge);
@@ -245,7 +363,7 @@ public sealed class TaskExecutor(
                 // preparation never masquerades as a normal no-change completion. The thrown
                 // ConfigRepoPublicationException carries the sanitized stage reason and is
                 // mapped by the catch blocks below into TaskOutcome.Failed + FAIL.
-                await PrepareConfigRepoBaselineAsync(ct);
+                await PrepareConfigRepoBaselineAsync(ct, finalization);
             }
 
             // Compute merge-base for feature branches so reviewers/testers diff only branch changes
@@ -369,8 +487,14 @@ public sealed class TaskExecutor(
             _log.Info($"Sending prompt to Copilot ({enrichedPrompt.Length} chars)");
             var copilotOutput = await agentRunner.SendPromptAsync(enrichedPrompt, primaryWorkDir, ct);
 
+            // RECORD ON ARRIVAL (Improver only — the accumulator is disabled for every other
+            // role): the initial agent output is evidence the catch boundaries below must not
+            // discard if a later Improver stage is cancelled or throws.
+            agentEvidence.Append(copilotOutput);
+
             // For roles that push code, ensure Copilot committed its changes.
             // If the working directory is dirty, re-prompt Copilot to commit.
+            // NON-IMPROVER path: the base string-accumulating form, unchanged.
             if (!isImprover && task.Role != WorkerRole.Reviewer)
             {
                 foreach (var (_, dir) in repoDirectories)
@@ -381,6 +505,7 @@ public sealed class TaskExecutor(
 
             // For testers: ensure structured test metrics were reported via tool call.
             // If the tester didn't call report_test_results, prompt it to do so.
+            // NON-IMPROVER path: the base string-accumulating form, unchanged.
             if (task.Role == WorkerRole.Tester && agentRunner.LastTestReport is null)
             {
                 copilotOutput = await EnsureTestMetricsReportedAsync(copilotOutput, primaryWorkDir, ct);
@@ -394,7 +519,7 @@ public sealed class TaskExecutor(
             {
                 // Enforce character limit on *.agents.md files before committing.
                 // Re-prompts Copilot in the same session to condense if over limit.
-                copilotOutput = await EnsureAgentsMdWithinLimitsAsync(copilotOutput, ct);
+                copilotOutput = await EnsureAgentsMdWithinLimitsAsync(agentEvidence, ct);
 
                 // Improver: commit and push changes to the config repo agents folder.
                 // The result distinguishes a successful EMPTY staged diff (a genuine no-change
@@ -403,15 +528,16 @@ public sealed class TaskExecutor(
                 // preserved verbatim and a sanitized stage-specific reason is appended, and the
                 // throw is mapped to TaskOutcome.Failed + an authoritative FAIL verdict below —
                 // regardless of any test/worker report or the default Improver PASS.
-                var publication = await CommitAndPushConfigRepoAsync(ct);
+                var publication = await CommitAndPushConfigRepoAsync(ct, finalization);
                 if (publication.FailureReason is { } failureReason)
                 {
-                    // A failed add/diff/commit/pull/push is a PUBLICATION FAILURE, never a
-                    // successful no-change completion. The accumulated agent/retry output is
-                    // carried on the exception so the catch below can preserve it VERBATIM and
-                    // append only the sanitized stage reason — never replace the evidence.
+                    // A failed add/diff/commit/pull/push — AND a failed publication-HEAD
+                    // resolution — is a PUBLICATION FAILURE, never a successful no-change
+                    // completion. The accumulated agent/retry output and the staged summary are
+                    // carried on the exception so the catch below preserves them VERBATIM and
+                    // appends only the sanitized stage reason — never replacing the evidence.
                     throw new ConfigRepoPublicationException(
-                        copilotOutput, failureReason, publication.Summary);
+                        agentEvidence.Snapshot, failureReason, publication.Summary);
                 }
 
                 aggregatedStatus = publication.Summary;
@@ -632,20 +758,30 @@ public sealed class TaskExecutor(
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Completed,
                 Output = copilotOutput,
-                GitStatus = aggregatedStatus ?? new GitChangeSummary(),
+                // A CONFIRMED publication is reported from the RETAINED evidence, so the
+                // Pushed=true fact cannot be lost by anything that ran after the confirmation.
+                GitStatus = finalization.PublishedSummary ?? aggregatedStatus ?? new GitChangeSummary(),
                 Metrics = metrics,
                 IterationStartSha = iterationStartSha,
             };
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Real cancellation (e.g., shutdown signal) — propagate as Cancelled
+            // Real cancellation (e.g., shutdown signal) — propagate as Cancelled.
+            // EVIDENCE PRESERVED (IMPROVER ONLY): once the initial prompt has returned, the
+            // accumulated initial/retry output is real agent work. A cancellation during size
+            // enforcement or publication must not replace it with the bare notice —
+            // finalization would then compose its cleanup diagnostics onto an impoverished
+            // result. For every OTHER role the accumulator is disabled, so Compose returns the
+            // bare "Task was cancelled." notice EXACTLY as the base behavior does. The
+            // Cancelled/CANCELLED semantics are unchanged for all roles.
             TryWriteError($"[Task] Cancelled by token: {task.TaskId}");
             return new TaskResult
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Cancelled,
-                Output = "Task was cancelled.",
+                Output = agentEvidence.Compose("Task was cancelled."),
+                GitStatus = finalization.PublishedSummary,
                 Metrics = new TaskMetrics { Verdict = "CANCELLED" },
             };
         }
@@ -662,14 +798,18 @@ public sealed class TaskExecutor(
             // exception thrown out of IAgentRunner.SendPromptAsync. The raw message can echo a
             // provisioned GH_TOKEN or OLLAMA_API_KEY, and the TaskResult below travels to the
             // orchestrator where it is logged and persisted — so neither the log line nor the
-            // result may carry raw exception text.
+            // result may carry raw exception text. The agent's OWN accumulated output is
+            // evidence, not exception text, and is preserved VERBATIM ahead of the diagnostic —
+            // FOR THE IMPROVER ONLY. For every other role the accumulator is disabled, so this
+            // returns the sanitized diagnostic ALONE, exactly as the base behavior does.
             var safe = SafeExceptionLog.Describe(ex);
             TryWriteError($"[Task] Failed (API timeout/error) [{safe}]");
             return new TaskResult
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Failed,
-                Output = $"Error: API call failed or timed out [{safe}]",
+                Output = agentEvidence.Compose($"Error: API call failed or timed out [{safe}]"),
+                GitStatus = finalization.PublishedSummary,
                 Metrics = new TaskMetrics
                 {
                     Verdict = "FAIL",
@@ -693,6 +833,13 @@ public sealed class TaskExecutor(
             if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
                 await SaveSessionAsync(task.SessionId, ct);
 
+            // The wrapper at the publication call site carries the accumulated output; a
+            // preparation failure (thrown before the agent ran) carries none, so the
+            // accumulated evidence is the fallback. Either way the evidence is never replaced.
+            var preserved = ex.PreservedOutput.Length > 0
+                ? ex.PreservedOutput
+                : agentEvidence.Snapshot;
+
             return new TaskResult
             {
                 TaskId = task.TaskId,
@@ -700,8 +847,10 @@ public sealed class TaskExecutor(
                 // The accumulated agent/retry output is preserved VERBATIM (Git-log sanitization
                 // is never applied to the agent's own output) with the sanitized stage-specific
                 // reason appended — the evidence is never replaced by the error alone.
-                Output = $"{ex.PreservedOutput}\n\n[Config Repo Git Failure]\n{ex.Reason}",
-                GitStatus = ex.Summary ?? new GitChangeSummary(),
+                Output = $"{preserved}\n\n[Config Repo Git Failure]\n{ex.Reason}",
+                // A CONFIRMED publication survives a later failure: the retained Pushed=true
+                // evidence wins over a summary that predates the confirmation.
+                GitStatus = finalization.PublishedSummary ?? ex.Summary ?? new GitChangeSummary(),
                 Metrics = new TaskMetrics
                 {
                     Verdict = "FAIL",
@@ -714,7 +863,11 @@ public sealed class TaskExecutor(
             // SANITIZED for the same reason as the OperationCanceledException catch above:
             // this is the first boundary that consumes an exception originating at the
             // provisioning / LLM-client / LLM-HTTP layer, and the TaskResult is transmitted to
-            // the orchestrator for logging and persistence.
+            // the orchestrator for logging and persistence. The agent's OWN accumulated output
+            // is evidence, not exception text, and is preserved VERBATIM ahead of the
+            // diagnostic — a later retry exception must not discard it. IMPROVER ONLY: for
+            // every other role the accumulator is disabled, so this returns the sanitized
+            // diagnostic ALONE, exactly as the base behavior does.
             var safe = SafeExceptionLog.Describe(ex);
             TryWriteError($"[Task] Failed [{safe}]");
 
@@ -722,7 +875,10 @@ public sealed class TaskExecutor(
             {
                 TaskId = task.TaskId,
                 Status = TaskOutcome.Failed,
-                Output = $"Error [{safe}]",
+                Output = agentEvidence.Compose($"Error [{safe}]"),
+                // A CONFIRMED publication survives even when a later step (a failing log
+                // write, a failing session save) throws into this handler.
+                GitStatus = finalization.PublishedSummary,
                 Metrics = new TaskMetrics
                 {
                     Verdict = "FAIL",
@@ -790,6 +946,11 @@ public sealed class TaskExecutor(
     /// Checks if the working directory has uncommitted changes and, if so, re-prompts Copilot
     /// to stage and commit them. Retries up to <paramref name="maxRetries"/> times.
     /// Returns the accumulated Copilot output including any cleanup conversation.
+    /// <para>
+    /// NON-IMPROVER ONLY (coder/tester paths), so this keeps its BASE string-accumulating
+    /// form verbatim — including the empty-initial-output formatting. The Improver's
+    /// evidence accumulator deliberately does not participate here.
+    /// </para>
     /// </summary>
     private async Task<string> EnsureCleanWorktreeAsync(
         string previousOutput, string workDir, CancellationToken ct, int maxRetries = 2)
@@ -823,6 +984,10 @@ public sealed class TaskExecutor(
     /// <summary>
     /// If the tester didn't call <c>report_test_results</c>, re-prompts Copilot in the same
     /// session to report structured metrics via the tool call. No retry — single prompt.
+    /// <para>
+    /// NON-IMPROVER ONLY (the tester path), so this keeps its BASE string-accumulating form
+    /// verbatim — including the empty-initial-output formatting.
+    /// </para>
     /// </summary>
     private async Task<string> EnsureTestMetricsReportedAsync(
         string previousOutput, string workDir, CancellationToken ct)
@@ -861,17 +1026,23 @@ public sealed class TaskExecutor(
     /// Checks all *.agents.md files in the config repo agents folder against the character limit.
     /// If any file exceeds the limit, re-prompts Copilot in the same session to condense it.
     /// After max retries, discards all changes to keep the config repo clean.
+    /// <para>
+    /// Each condensation segment is recorded into <paramref name="evidence"/> AS IT ARRIVES, so
+    /// a cancellation or throw during a later retry (or during the discard) cannot discard the
+    /// segments the agent already produced.
+    /// </para>
     /// </summary>
-    private async Task<string> EnsureAgentsMdWithinLimitsAsync(string previousOutput, CancellationToken ct)
+    private async Task<string> EnsureAgentsMdWithinLimitsAsync(
+        AgentOutputEvidence evidence, CancellationToken ct)
     {
         if (!Directory.Exists(_configAgentsDir))
-            return previousOutput;
+            return evidence.Snapshot;
 
         for (var attempt = 0; attempt < WorkerConstants.AgentsMdMaxRetries; attempt++)
         {
             var violations = GetAgentsMdViolations();
             if (violations.Count == 0)
-                return previousOutput;
+                return evidence.Snapshot;
 
             _log.Info($"Agents.md size check (attempt {attempt + 1}/{WorkerConstants.AgentsMdMaxRetries}): " +
                       $"{violations.Count} file(s) over {WorkerConstants.AgentsMdMaxCharacters} chars");
@@ -906,7 +1077,7 @@ public sealed class TaskExecutor(
                 """;
 
             var condenseOutput = await agentRunner.SendPromptAsync(condensePrompt, _configAgentsDir, ct);
-            previousOutput += "\n\n[Agents.md size enforcement]\n" + condenseOutput;
+            evidence.Append("[Agents.md size enforcement]\n" + condenseOutput);
         }
 
         // Final check after all retries
@@ -918,10 +1089,11 @@ public sealed class TaskExecutor(
 
             // Discard all agents.md changes to keep config repo clean
             await RunConfigRepoCommandAsync(["checkout", "--", "agents/"], "checkout -- agents/", ct);
-            previousOutput += $"\n\n[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]";
+            evidence.Append(
+                $"[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]");
         }
 
-        return previousOutput;
+        return evidence.Snapshot;
     }
 
     /// <summary>
@@ -989,6 +1161,151 @@ public sealed class TaskExecutor(
     /// </summary>
     private sealed record ConfigRepoPublication(GitChangeSummary Summary, string? FailureReason);
 
+    /// <summary>The preparation phase label — the pre-run baseline restore.</summary>
+    private const string PreparationPhase = "preparation";
+
+    /// <summary>The step-end cleanup (finalization) phase label used in every diagnostic.</summary>
+    private const string CleanupPhase = "cleanup";
+
+    /// <summary>The publication phase label for the publication-HEAD resolution diagnostics.</summary>
+    private const string PublicationPhase = "publication";
+
+    /// <summary>
+    /// The INDEPENDENT finite cancellation budget for the whole step-end cleanup sequence.
+    /// This is deliberately NOT the (possibly already-cancelled) execution token and NOT an
+    /// unbounded wait: one 30-second cooperative budget covers the cleanup's trust
+    /// revalidation, the destructive restore and the verification. It is a managed,
+    /// cooperative budget — never a process-crash or absolute OS-call termination guarantee,
+    /// and never a Git-subprocess supervision mechanism.
+    /// </summary>
+    private static readonly TimeSpan ConfigRepoCleanupBudget = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The INVOCATION-LOCAL state one Improver execution carries from preparation through
+    /// finalization. It is created fresh per <see cref="ExecuteAsync"/> call, never persisted,
+    /// and holds no dirty/manual-clear flag — only the trusted restore evidence.
+    /// <para>
+    /// <see cref="BaselineSha"/> and <see cref="Branch"/> are captured from the freshly
+    /// fetched, validated target BEFORE the first destructive preparation reset, so a
+    /// preparation that fails or is cancelled after that point still leaves finalization a
+    /// safe target. Before any validation establishes a target, both stay null and cleanup is
+    /// NEVER performed (fail-before-mutation is preserved — no target is ever guessed).
+    /// </para>
+    /// <para>
+    /// <see cref="PublishedSha"/> and <see cref="PublishedSummary"/> are set ONLY by a confirmed
+    /// exit-zero push, TOGETHER and immediately after that confirmation (see
+    /// <see cref="RetainConfirmedPublication"/>), before any fallible logging/session/result
+    /// work. <see cref="PublishedSha"/> selects the restore target for finalization;
+    /// <see cref="PublishedSummary"/> is the retained <c>Pushed=true</c> evidence every later
+    /// outcome is constructed from, so a throwing post-push log can never yield a result that
+    /// omits the confirmed publication. A failed or interrupted push leaves BOTH null: the
+    /// remote state stays uncertain and the LOCAL reset to the baseline neither rolls back nor
+    /// establishes the remote result.
+    /// </para>
+    /// </summary>
+    private sealed class ConfigRepoFinalization
+    {
+        /// <summary>The fetched, validated baseline SHA captured before the first reset.</summary>
+        public string? BaselineSha { get; set; }
+
+        /// <summary>The validated attached branch captured before the first reset.</summary>
+        public string? Branch { get; set; }
+
+        /// <summary>The confirmed publication HEAD, set immediately after an exit-zero push.</summary>
+        public string? PublishedSha { get; private set; }
+
+        /// <summary>
+        /// The retained <c>Pushed=true</c> summary, materialized in the SAME step as
+        /// <see cref="PublishedSha"/>. Non-null exactly when a push was confirmed.
+        /// </summary>
+        public GitChangeSummary? PublishedSummary { get; private set; }
+
+        /// <summary>
+        /// Retains BOTH publication facts ATOMICALLY with respect to the caller's subsequent
+        /// fallible work: after this returns, the confirmed publication is recorded and any
+        /// later throw (a failing log write, a failing session save) can no longer produce an
+        /// outcome that omits it. Callers construct their result from
+        /// <see cref="PublishedSummary"/> rather than recomputing it.
+        /// </summary>
+        public void RetainConfirmedPublication(string publishedSha, GitChangeSummary publishedSummary)
+        {
+            PublishedSha = publishedSha;
+            PublishedSummary = publishedSummary;
+        }
+
+        /// <summary>Whether a push was CONFIRMED for this invocation.</summary>
+        public bool HasConfirmedPublication => PublishedSha is not null && PublishedSummary is not null;
+
+        /// <summary>
+        /// One-shot guard: the shared finalization path runs at most ONCE per invocation. A
+        /// cleanup failure is terminal — there is no retry loop and no second attempt.
+        /// </summary>
+        public bool Finalized { get; set; }
+
+        /// <summary>Whether a safe restore target exists — the precondition for any cleanup.</summary>
+        public bool HasTarget => BaselineSha is not null && Branch is not null;
+    }
+
+    /// <summary>
+    /// The INVOCATION-LOCAL accumulator for the agent's returned output, recorded segment by
+    /// segment AS EACH ARRIVES rather than only when a helper returns.
+    /// <para>
+    /// SCOPE — IMPROVER ONLY. The Improver's post-prompt stages (size enforcement, publication)
+    /// can be cancelled or throw AFTER the initial prompt has already returned real agent output
+    /// and after one or more retry segments have been produced. Without this accumulator that
+    /// evidence lives only in a local string inside the try block, so the catch boundaries
+    /// replace it with <c>"Task was cancelled."</c> or a bare error line — and finalization then
+    /// composes its cleanup diagnostics onto an impoverished result. Recording each segment on
+    /// arrival keeps the accumulated initial/retry output available to EVERY catch boundary.
+    /// </para>
+    /// <para>
+    /// Every OTHER role (Coder, Tester, Reviewer, …) keeps its BASE behavior byte for byte: a
+    /// requested cancellation returns the bare <c>"Task was cancelled."</c> notice and a failure
+    /// returns the sanitized diagnostic ALONE. The scope is enforced STRUCTURALLY by
+    /// <see cref="_enabled"/> rather than at each call site: a disabled accumulator ignores
+    /// every <see cref="Append"/> and returns the caller's diagnostic UNCHANGED from
+    /// <see cref="Compose"/>, so no future call site can reintroduce the leak by forgetting a
+    /// guard.
+    /// </para>
+    /// </summary>
+    private sealed class AgentOutputEvidence(bool enabled)
+    {
+        private readonly System.Text.StringBuilder _builder = new();
+        private readonly bool _enabled = enabled;
+
+        /// <summary>
+        /// Appends one arrived segment verbatim (no sanitization — this is the agent's own
+        /// output). A DISABLED (non-Improver) accumulator records nothing at all.
+        /// </summary>
+        public void Append(string segment)
+        {
+            if (!_enabled || string.IsNullOrEmpty(segment))
+                return;
+
+            if (_builder.Length > 0)
+                _builder.Append("\n\n");
+
+            _builder.Append(segment);
+        }
+
+        /// <summary>Whether any agent output has been recorded yet.</summary>
+        public bool HasOutput => _builder.Length > 0;
+
+        /// <summary>The accumulated output so far, VERBATIM.</summary>
+        public string Snapshot => _builder.ToString();
+
+        /// <summary>
+        /// Composes the accumulated evidence with a terminal diagnostic: the evidence FIRST,
+        /// the diagnostic appended — never the diagnostic alone when evidence exists.
+        /// <para>
+        /// A DISABLED (non-Improver) accumulator has no evidence and therefore returns
+        /// <paramref name="diagnostic"/> EXACTLY as given, which is the base behavior.
+        /// </para>
+        /// </summary>
+        public string Compose(string diagnostic) =>
+            HasOutput ? $"{Snapshot}\n\n{diagnostic}" : diagnostic;
+    }
+
     /// <summary>
     /// An ordinary Improver config-repo Git failure. Carries the accumulated agent/retry output
     /// VERBATIM (Git-log sanitization is never applied to it), the sanitized stage-specific
@@ -1003,6 +1320,197 @@ public sealed class TaskExecutor(
         public string PreservedOutput { get; } = preservedOutput;
         public string Reason { get; } = reason;
         public GitChangeSummary? Summary { get; } = summary;
+    }
+
+    /// <summary>
+    /// THE SHARED FINALIZATION PATH for every prepared Improver outcome. Awaits the verified
+    /// clean-at-step-end cleanup (when a safe restore target exists), then COMPOSES the
+    /// cleanup diagnostics WITH — never replacing — the original outcome/evidence:
+    /// <list type="bullet">
+    ///   <item><description>A normal completion whose cleanup FAILS is returned as
+    ///   <see cref="TaskOutcome.Failed"/>/FAIL — cleanliness is never claimed when it cannot
+    ///   be verified.</description></item>
+    ///   <item><description>Existing failures remain Failed/FAIL with their original
+    ///   returned agent/retry output and sanitized reason, with cleanup diagnostics
+    ///   APPENDED; <c>Pushed=true</c> survives a confirmed publication even when
+    ///   finalization itself fails.</description></item>
+    ///   <item><description>A requested execution cancellation remains Cancelled/CANCELLED
+    ///   and reports any cleanup failure explicitly.</description></item>
+    ///   <item><description>No cleanup exception may escape and hide the primary
+    ///   result.</description></item>
+    /// </list>
+    /// Non-Improver tasks pass through untouched (no target is ever captured for them).
+    /// </summary>
+    private async Task<TaskResult> FinalizeImproverOutcomeAsync(
+        WorkTask task, TaskResult outcome, ConfigRepoFinalization finalization)
+    {
+        if (task.Role != WorkerRole.Improver || finalization.Finalized || !finalization.HasTarget)
+        {
+            // No prepared Improver outcome, or nothing was ever prepared: no cleanup target
+            // exists, so nothing may be cleaned and nothing is claimed clean. Fail-before-
+            // mutation is preserved — an unverified tree is never silently "finalized".
+            return outcome;
+        }
+
+        finalization.Finalized = true;
+
+        // The independent, finite cooperative budget — deliberately NOT linked to the
+        // (possibly already-cancelled) execution token, and not an unbounded wait.
+        using var budget = new CancellationTokenSource(ConfigRepoCleanupBudget);
+
+        string? cleanupFailure;
+        try
+        {
+            // The restore target is selected by ACTUAL publication evidence: the confirmed
+            // published SHA when publication was confirmed, the captured fetched baseline
+            // otherwise. Never current HEAD, never a stale FETCH_HEAD or tracking ref.
+            var selectedSha = finalization.PublishedSha ?? finalization.BaselineSha!;
+            var branch = finalization.Branch!;
+            await FinalizeConfigRepoCleanAsync(budget.Token, selectedSha, branch);
+            cleanupFailure = null;
+            // NONTHROWING: the success line is a diagnostic, never a gate. A failing writer
+            // must not turn a VERIFIED-clean cleanup into a cleanup failure.
+            LogFinalizationInfo(
+                $"Config repo cleanup verified at {RenderForLog(selectedSha[..Math.Min(selectedSha.Length, 12)])}");
+        }
+        catch (ConfigRepoPublicationException ex)
+        {
+            // SANITIZED at the stage boundary (the phase label in the reason is accurate to
+            // the cleanup); carried as diagnostics, never thrown onward. The write itself is
+            // NONTHROWING so the diagnostic can never escape this catch and hide the primary
+            // Completed/Failed/Cancelled result.
+            cleanupFailure = ex.Reason;
+            LogFinalizationError($"Config repo cleanup failed [{ex.Reason}]");
+        }
+        catch (Exception ex)
+        {
+            // SANITIZED: an unexpected cleanup exception (including a cooperative budget
+            // expiry surfaced as an OperationCanceledException) is classified — never
+            // propagated out of the finalization to hide the primary result. The failure
+            // reason is materialized BEFORE the (nonthrowing) write, so the diagnostic and the
+            // composed outcome cannot diverge.
+            var safe = SafeExceptionLog.Describe(ex);
+            cleanupFailure = $"Config repo cleanup failed with an error [{safe}].";
+            LogFinalizationError($"Config repo cleanup failed with an error [{safe}]");
+        }
+
+        if (cleanupFailure is null)
+            return outcome;
+
+        var diagnostic = $"[Config Repo Cleanup Failure]\n{cleanupFailure}";
+
+        // Cancellation keeps its established semantics; the cleanup failure is reported
+        // explicitly but never reclassified as an ordinary failure.
+        if (outcome.Status == TaskOutcome.Cancelled)
+        {
+            return outcome with
+            {
+                Output = outcome.Output.Length == 0 ? diagnostic : outcome.Output + "\n\n" + diagnostic,
+                Metrics = outcome.Metrics is null
+                    ? null
+                    : outcome.Metrics with { Issues = [.. outcome.Metrics.Issues, cleanupFailure] },
+            };
+        }
+
+        if (outcome.Status == TaskOutcome.Completed)
+        {
+            // A normal completion whose cleanup failed is a FAILED outcome: the verified-clean
+            // claim would otherwise be false. Pushed survives a confirmed publication.
+            return outcome with
+            {
+                Status = TaskOutcome.Failed,
+                Output = outcome.Output + "\n\n" + diagnostic,
+                Metrics = outcome.Metrics is null
+                    ? null
+                    : outcome.Metrics with { Verdict = "FAIL", Issues = [.. outcome.Metrics.Issues, cleanupFailure] },
+            };
+        }
+
+        // An existing failure (Failed): the original output, sanitized reason, GitStatus
+        // (including Pushed=true after a confirmed publication) and issues all survive, with
+        // the cleanup diagnostics APPENDED — never replacing the evidence.
+        return outcome with
+        {
+            Output = outcome.Output + "\n\n" + diagnostic,
+            Metrics = outcome.Metrics is null
+                ? null
+                : outcome.Metrics with { Issues = [.. outcome.Metrics.Issues, cleanupFailure] },
+        };
+    }
+
+    /// <summary>
+    /// Runs ONE verified clean-at-step-end restore through the shared command dispatch:
+    /// revalidate the configured worktree root and the captured branch/upstream identity, then
+    /// a checked <c>reset --hard</c> to the SELECTED full SHA (the confirmed publication SHA
+    /// when publication was confirmed; the captured fetched baseline otherwise — never current
+    /// HEAD, never a stale FETCH_HEAD or tracking ref), EXACTLY one <c>clean -fdx</c>, then a
+    /// peeled-HEAD equality check and a strictly-empty verbose status. Every step's failure —
+    /// a command error, a timeout, a malformed SHA, a mismatched HEAD or a nonempty status —
+    /// fails the cleanup TRUTHFULLY: cleanliness is never claimed without verification.
+    /// <para>
+    /// Through <see cref="RunPreparationCommandAsync"/> with the CLEANUP phase label (both seam
+    /// and legacy routes), the same helpers as preparation. There is no additional push, force
+    /// push, or network reconciliation; reflogs, unreachable objects and external
+    /// session/credential files are not worktree leftovers. A failed trust validation stops
+    /// every further destructive command. A cooperative budget expiry surfaces as an
+    /// <see cref="OperationCanceledException"/> and is classified by the finalization
+    /// boundary as an ordinary cleanup failure — never a supervision mechanism.
+    /// </para>
+    /// </summary>
+    private async Task FinalizeConfigRepoCleanAsync(CancellationToken ct, string selectedSha, string branch)
+    {
+        // ── Trust revalidation BEFORE any destructive command ─────────────────
+        var toplevel = await RunPreparationCommandAsync(
+            ["rev-parse", "--show-toplevel"], "rev-parse --show-toplevel", "worktree root check", ct,
+            phase: CleanupPhase);
+        VerifyWorktreeRoot(toplevel.Stdout, CleanupPhase);
+
+        var currentBranch = await ResolveAttachedBranchAsync(ct, CleanupPhase);
+        if (!string.Equals(currentBranch, branch, StringComparison.Ordinal))
+        {
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo cleanup rejected: the worktree is no longer on the captured branch.");
+        }
+
+        await VerifyUpstreamAsync(currentBranch, ct, CleanupPhase);
+
+        // ── Destructive restore to the SELECTED SHA ───────────────────────────
+        await RunPreparationCommandAsync(
+            ["reset", "--hard", selectedSha], $"reset --hard {selectedSha}", "reset", ct,
+            phase: CleanupPhase);
+        await RunPreparationCommandAsync(
+            ["clean", "-fdx"], "clean -fdx", "clean", ct, phase: CleanupPhase);
+
+        // ── Verification: HEAD equality, then the strictly empty status ───────
+        var restoredSha = await ResolveSingleShaAsync(
+            ConfigRepoGitOperations.RevHeadCommit, "post-restore HEAD check", "HEAD", ct,
+            phase: CleanupPhase);
+        if (!string.Equals(restoredSha, selectedSha, StringComparison.Ordinal))
+        {
+            LogFinalizationError("Config repo cleanup rejected: HEAD does not match the selected restore SHA after the restore");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo cleanup rejected: HEAD does not match the selected restore SHA after the restore.");
+        }
+
+        var status = await RunPreparationCommandAsync(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+            "status --porcelain=v1 --untracked-files=all --ignored",
+            "post-restore status check",
+            ct,
+            phase: CleanupPhase);
+        if (status.Stdout.Length != 0)
+        {
+            // STRICT EMPTY: the verified-clean oracle is a completely EMPTY status output.
+            // Whitespace-only output is NOT clean — it is unrecognized residual output, and
+            // a protected nested repository is never forcibly deleted (its residual status is
+            // cleanup FAILURE). No second forced clean, no recursive deletion.
+            LogFinalizationError($"Config repo cleanup rejected: the working tree is not clean after the restore: {RenderForLog(status.Stdout)}");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo cleanup rejected: the working tree is not clean after the restore: {RenderForLog(status.Stdout)}");
+        }
     }
 
     /// <summary>
@@ -1047,7 +1555,7 @@ public sealed class TaskExecutor(
     /// recursive deletion, no quarantine flag and no remote rollback or force push.
     /// </para>
     /// </summary>
-    private async Task PrepareConfigRepoBaselineAsync(CancellationToken ct)
+    private async Task PrepareConfigRepoBaselineAsync(CancellationToken ct, ConfigRepoFinalization finalization)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
         {
@@ -1087,6 +1595,16 @@ public sealed class TaskExecutor(
 
         var baselineSha = await ResolveSingleShaAsync(
             ConfigRepoGitOperations.RevFetchHeadCommit, "fetched baseline check", "FETCH_HEAD", ct);
+
+        // ── TRUSTED RESTORE EVIDENCE, retained for finalization ───────────────────
+        // The freshly fetched, validated target becomes available to the step-end cleanup
+        // BEFORE the first destructive reset: an interrupted or failed partial preparation
+        // after this point still leaves finalization a safe, validated target. Before this
+        // point nothing is stored, so cleanup never guesses a target.
+        finalization.BaselineSha = baselineSha;
+        finalization.Branch = branch;
+        _log.Info($"Config repo captured restore evidence: branch {RenderForLog(branch)} " +
+                  $"baseline {RenderForLog(baselineSha[..Math.Min(baselineSha.Length, 12)])}");
 
         // ── Destructive restore to the fetched baseline ───────────────────────────
         await RunPreparationCommandAsync(
@@ -1143,7 +1661,8 @@ public sealed class TaskExecutor(
     /// stays Cancelled/CANCELLED.
     /// </summary>
     private async Task<ConfigRepoOpResult> RunPreparationCommandAsync(
-        IReadOnlyList<string> tokenizedForm, string legacyOpaqueForm, string stage, CancellationToken ct)
+        IReadOnlyList<string> tokenizedForm, string legacyOpaqueForm, string stage, CancellationToken ct,
+        string phase = PreparationPhase)
     {
         ConfigRepoOpResult result;
         try
@@ -1158,18 +1677,18 @@ public sealed class TaskExecutor(
             // cancellation does not enter this filter and propagates to the outer
             // ct.IsCancellationRequested guard unchanged.
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo preparation {stage} failed (cancelled) [{safe}]");
+            LogPhaseError(phase, $"Config repo {phase} {stage} failed (cancelled) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation {stage} was interrupted without a requested cancellation [{safe}].");
+                reason: $"Config repo {phase} {stage} was interrupted without a requested cancellation [{safe}].");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo preparation {stage} failed (error) [{safe}]");
+            LogPhaseError(phase, $"Config repo {phase} {stage} failed (error) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation {stage} failed with an error [{safe}].");
+                reason: $"Config repo {phase} {stage} failed with an error [{safe}].");
         }
 
         if (result.Success)
@@ -1177,10 +1696,10 @@ public sealed class TaskExecutor(
 
         // git echoes the credential-bearing config-repo remote in both streams, so the LOG
         // rendering is redacted AND control-character sanitized. The raw values are untouched.
-        _log.Error($"Config repo preparation {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+        LogPhaseError(phase, $"Config repo {phase} {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
         throw new ConfigRepoPublicationException(
             preservedOutput: "",
-            reason: $"Config repo preparation {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+            reason: $"Config repo {phase} {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
     }
 
     /// <summary>
@@ -1198,15 +1717,15 @@ public sealed class TaskExecutor(
     /// admits internal whitespace ONLY.
     /// </para>
     /// </summary>
-    private void VerifyWorktreeRoot(string toplevelStdout)
+    private void VerifyWorktreeRoot(string toplevelStdout, string phase = PreparationPhase)
     {
         var reported = ExactSingleLineContent(toplevelStdout);
         if (reported is null)
         {
-            _log.Error("Config repo preparation rejected: the worktree root could not be determined");
+            LogPhaseError(phase, $"Config repo {phase} rejected: the worktree root could not be determined");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: "Config repo preparation rejected: the worktree root could not be determined.");
+                reason: $"Config repo {phase} rejected: the worktree root could not be determined.");
         }
 
         string canonicalReported;
@@ -1219,10 +1738,10 @@ public sealed class TaskExecutor(
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or IOException)
         {
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo preparation rejected: the worktree root could not be canonicalized [{safe}]");
+            LogPhaseError(phase, $"Config repo {phase} rejected: the worktree root could not be canonicalized [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation rejected: the worktree root could not be canonicalized [{safe}].");
+                reason: $"Config repo {phase} rejected: the worktree root could not be canonicalized [{safe}].");
         }
 
         var comparison = OperatingSystem.IsWindows()
@@ -1231,10 +1750,10 @@ public sealed class TaskExecutor(
 
         if (!canonicalReported.Equals(canonicalConfigured, comparison))
         {
-            _log.Error("Config repo preparation rejected: the worktree root is not the configured config repository");
+            LogPhaseError(phase, $"Config repo {phase} rejected: the worktree root is not the configured config repository");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: "Config repo preparation rejected: the worktree root is not the configured config repository.");
+                reason: $"Config repo {phase} rejected: the worktree root is not the configured config repository.");
         }
     }
 
@@ -1259,18 +1778,19 @@ public sealed class TaskExecutor(
     /// multi-line (ambiguous) and malformed outputs are rejected.
     /// </summary>
     private async Task<string> ResolveSingleShaAsync(
-        string revision, string stage, string label, CancellationToken ct)
+        string revision, string stage, string label, CancellationToken ct,
+        string phase = PreparationPhase)
     {
         var result = await RunPreparationCommandAsync(
-            ["rev-parse", "--verify", revision], $"rev-parse --verify {revision}", stage, ct);
+            ["rev-parse", "--verify", revision], $"rev-parse --verify {revision}", stage, ct, phase);
 
         var line = ExactSingleLine(result.Stdout);
         if (line is null || !ConfigRepoGitOperations.IsValidCommitSha(line))
         {
-            _log.Error($"Config repo preparation rejected: {label} did not resolve to a single full commit SHA");
+            LogPhaseError(phase, $"Config repo {phase} rejected: {label} did not resolve to a single full commit SHA");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation rejected: {label} did not resolve to a single full commit SHA.");
+                reason: $"Config repo {phase} rejected: {label} did not resolve to a single full commit SHA.");
         }
 
         return line;
@@ -1290,26 +1810,28 @@ public sealed class TaskExecutor(
     /// Validating here means BOTH routes reach the same verdict before any fetch.
     /// </para>
     /// </summary>
-    private async Task<string> ResolveAttachedBranchAsync(CancellationToken ct)
+    private async Task<string> ResolveAttachedBranchAsync(
+        CancellationToken ct, string phase = PreparationPhase)
     {
         var result = await RunPreparationCommandAsync(
             ["rev-parse", "--symbolic-full-name", "HEAD"],
             "rev-parse --symbolic-full-name HEAD",
             "HEAD branch check",
-            ct);
+            ct,
+            phase);
 
         var line = ExactSingleLine(result.Stdout);
         if (line is null
             || !line.StartsWith(BranchRefPrefix, StringComparison.Ordinal)
             || !IsCarryableBranch(line[BranchRefPrefix.Length..]))
         {
-            _log.Error("Config repo preparation rejected: HEAD is not attached to a usable branch");
+            LogPhaseError(phase, $"Config repo {phase} rejected: HEAD is not attached to a usable branch");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: "Config repo preparation rejected: HEAD is not attached to a usable branch.");
+                reason: $"Config repo {phase} rejected: HEAD is not attached to a usable branch.");
         }
 
-        await ValidateDiscoveredRefAsync(line, ct);
+        await ValidateDiscoveredRefAsync(line, ct, phase);
 
         return line[BranchRefPrefix.Length..];
     }
@@ -1322,7 +1844,8 @@ public sealed class TaskExecutor(
     /// interruption is an ordinary preparation failure, matching
     /// <see cref="RunPreparationCommandAsync"/>'s contract.
     /// </summary>
-    private async Task ValidateDiscoveredRefAsync(string discoveredRef, CancellationToken ct)
+    private async Task ValidateDiscoveredRefAsync(
+        string discoveredRef, CancellationToken ct, string phase = PreparationPhase)
     {
         string? refError;
         try
@@ -1333,27 +1856,27 @@ public sealed class TaskExecutor(
         catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo preparation ref validation failed (cancelled) [{safe}]");
+            LogPhaseError(phase, $"Config repo {phase} ref validation failed (cancelled) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation ref validation was interrupted without a requested cancellation [{safe}].");
+                reason: $"Config repo {phase} ref validation was interrupted without a requested cancellation [{safe}].");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo preparation ref validation failed (error) [{safe}]");
+            LogPhaseError(phase, $"Config repo {phase} ref validation failed (error) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation ref validation failed with an error [{safe}].");
+                reason: $"Config repo {phase} ref validation failed with an error [{safe}].");
         }
 
         if (refError is null)
             return;
 
-        _log.Error($"Config repo preparation rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
+        LogPhaseError(phase, $"Config repo {phase} rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
         throw new ConfigRepoPublicationException(
             preservedOutput: "",
-            reason: $"Config repo preparation rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
+            reason: $"Config repo {phase} rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
     }
 
     /// <summary>
@@ -1362,21 +1885,23 @@ public sealed class TaskExecutor(
     /// different remote, or a mismatched branch name is a topology rejection: this deliberately
     /// supports the ordinary single-origin clone only.
     /// </summary>
-    private async Task VerifyUpstreamAsync(string branch, CancellationToken ct)
+    private async Task VerifyUpstreamAsync(
+        string branch, CancellationToken ct, string phase = PreparationPhase)
     {
         var result = await RunPreparationCommandAsync(
             ["rev-parse", "--symbolic-full-name", ConfigRepoGitOperations.RevUpstream],
             $"rev-parse --symbolic-full-name {ConfigRepoGitOperations.RevUpstream}",
             "upstream check",
-            ct);
+            ct,
+            phase);
 
         var line = ExactSingleLine(result.Stdout);
         if (line is null || !string.Equals(line, UpstreamRefPrefix + branch, StringComparison.Ordinal))
         {
-            _log.Error("Config repo preparation rejected: the branch has no matching origin upstream");
+            LogPhaseError(phase, $"Config repo {phase} rejected: the branch has no matching origin upstream");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: "Config repo preparation rejected: the branch has no matching origin upstream.");
+                reason: $"Config repo {phase} rejected: the branch has no matching origin upstream.");
         }
     }
 
@@ -1500,7 +2025,8 @@ public sealed class TaskExecutor(
     /// changed-file paths on failure so the orchestrator can log a useful warning.
     /// </para>
     /// </summary>
-    private async Task<ConfigRepoPublication> CommitAndPushConfigRepoAsync(CancellationToken ct)
+    private async Task<ConfigRepoPublication> CommitAndPushConfigRepoAsync(
+        CancellationToken ct, ConfigRepoFinalization finalization)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
             return new ConfigRepoPublication(
@@ -1683,6 +2209,33 @@ public sealed class TaskExecutor(
                 $"git pull failed (exit {pullResult.ExitCode}): {RenderForLog(pullResult.SanitizedError)} — push not attempted after the failed pull");
         }
 
+        // ── Publication-HEAD resolution (the EXACT publication evidence) ─────────
+        // After the successful pull and BEFORE the push: the exact publication HEAD is
+        // resolved and validated. If this fails, push NEVER proceeds — publication stops
+        // here as an ordinary failure, never guessing a SHA.
+        //
+        // EVIDENCE PRESERVATION: ResolveSingleShaAsync/RunPreparationCommandAsync signal every
+        // failure form (nonzero exit, thrown command, malformed output) by THROWING a
+        // ConfigRepoPublicationException carrying an EMPTY preservedOutput and no summary.
+        // Letting that escape here would bypass the caller's wrapper — which is what attaches
+        // the accumulated agent/retry output and the staged GitChangeSummary — and return a
+        // result with empty agent evidence and empty Git diagnostics. It is therefore caught
+        // and converted into the ordinary publication FAILURE shape, so the caller's wrapper
+        // attaches the evidence exactly as it does for a failed add/diff/commit/pull/push.
+        string publicationSha;
+        try
+        {
+            publicationSha = await ResolveSingleShaAsync(
+                ConfigRepoGitOperations.RevHeadCommit, "publication HEAD check", "HEAD", ct,
+                phase: PublicationPhase);
+        }
+        catch (ConfigRepoPublicationException ex)
+        {
+            // The stage-boundary reason is already sanitized; the staged summary carries the
+            // diagnostic changed-file paths. Push is NOT attempted after this failure.
+            return new ConfigRepoPublication(stagedSummary, ex.Reason);
+        }
+
         // Push — the FINAL confirmation of publication. A failed or throwing push is a
         // publication FAILURE, never a no-change result, and push acceptance is never inferred
         // from a transport error: Published requires a confirmed exit-0 push.
@@ -1715,7 +2268,20 @@ public sealed class TaskExecutor(
                 $"git push failed (exit {pushResult.ExitCode}): {RenderForLog(pushResult.SanitizedError)}");
         }
 
-        _log.Info("Pushed config repo changes");
-        return new ConfigRepoPublication(stagedSummary with { Pushed = true }, null);
+        // ── CONFIRMED PUBLICATION — retained ATOMICALLY, before ANY fallible work ──
+        // BOTH facts are materialized here, immediately after the confirmed exit-zero push and
+        // BEFORE the (fallible) logging below:
+        //   * the published SHA, so finalization resets to the PUBLISHED tip; and
+        //   * the pushed SUMMARY (Pushed=true), so the confirmed publication survives even if
+        //     the log write, the session save, or any other later step throws.
+        // WorkerLogger.Info writes straight to Console.Out, so a disposed/failing writer would
+        // otherwise throw into the generic handler and produce a result WITHOUT Pushed=true
+        // even though finalization already resets to the published SHA. Every later outcome is
+        // constructed from this retained evidence rather than recomputed.
+        var publishedSummary = stagedSummary with { Pushed = true };
+        finalization.RetainConfirmedPublication(publicationSha, publishedSummary);
+
+        _log.Info($"Pushed config repo changes at {RenderForLog(publicationSha[..Math.Min(publicationSha.Length, 12)])}");
+        return new ConfigRepoPublication(finalization.PublishedSummary!, null);
     }
 }

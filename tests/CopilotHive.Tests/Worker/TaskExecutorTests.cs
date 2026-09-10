@@ -86,6 +86,39 @@ internal static class ConfigRepoPreparationFakes
     ];
 
     /// <summary>
+    /// The LEGACY opaque strings the step-end CLEANUP (finalization) issues, in order. The
+    /// fakes answer every HEAD/FETCH_HEAD probe with <see cref="BaselineSha"/>, so a
+    /// confirmed publication resolves the SAME SHA and the cleanup's reset target is
+    /// <see cref="BaselineSha"/> in every fake-driven flow.
+    /// </summary>
+    internal static string[] LegacyCleanupCommands =>
+    [
+        "rev-parse --show-toplevel",
+        "rev-parse --symbolic-full-name HEAD",
+        "rev-parse --symbolic-full-name @{upstream}",
+        $"reset --hard {BaselineSha}",
+        "clean -fdx",
+        "rev-parse --verify HEAD^{commit}",
+        "status --porcelain=v1 --untracked-files=all --ignored",
+    ];
+
+    /// <summary>
+    /// The TOKENIZED commands the seam launches for the step-end CLEANUP, in order — including
+    /// the trust revalidation's own <c>check-ref-format</c> for the revalidated branch.
+    /// </summary>
+    internal static string[][] SeamCleanupLaunches =>
+    [
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+        ["check-ref-format", "--allow-onelevel", BranchRef],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        ["reset", "--hard", BaselineSha],
+        ["clean", "-fdx"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+    ];
+
+    /// <summary>
     /// The TOKENIZED commands the seam launches for the preparation, in order — including the
     /// PREFLIGHT's own <c>check-ref-format</c> (the complete ref validation run once the branch
     /// is discovered, BEFORE either route builds a fetch form) and the seam's own
@@ -1283,13 +1316,15 @@ public sealed class TaskExecutorTests
         // no post-commit pull, no merge --abort, and no push (full subsequence absence via
         // the shared helper, so a stray merge-abort would fail this test).
         AssertLegacyStoppedAfterCommit(git.GitCommands);
-        // And the exact captured sequence proves nothing beyond the failed commit launched.
+        // And the exact captured sequence proves nothing beyond the failed commit launched —
+        // followed by the step-end cleanup (whose restore target is the captured baseline).
         Assert.Equal(
             [
                 .. ConfigRepoPreparationFakes.LegacyCommands,
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
             git.GitCommands);
         Assert.Equal(TaskOutcome.Failed, result.Status);
@@ -2740,8 +2775,10 @@ public sealed class TaskExecutorTests
             "improver-seam-routing", configRepoDir, seam, fake, git);
 
         // The COMPLETE launch sequence: the pre-run baseline preparation (preflight → fetch →
-        // resolve → destructive restore → verify), then the publication, including the seam's
-        // explicit-origin canonicalization of the positional-free post-commit pull.
+        // resolve → destructive restore → verify), then the publication — including the
+        // publication-HEAD resolution BEFORE the push and the seam's explicit-origin
+        // canonicalization of the positional-free post-commit pull — then the step-end
+        // cleanup (finalization) with the confirmed publication SHA as the reset target.
         AssertLaunchedSequence(fake,
             [
                 .. ConfigRepoPreparationFakes.SeamLaunches,
@@ -2750,9 +2787,11 @@ public sealed class TaskExecutorTests
                 ["commit", "-m", ImproverCommitMessage],
                 ["remote", "get-url", "origin"],
                 ["pull", "--no-rebase", "origin"],
+                ["rev-parse", "--verify", "HEAD^{commit}"],
                 ["check-ref-format", "--allow-onelevel", "HEAD"],
                 ["remote", "get-url", "origin"],
                 ["push", "origin", "HEAD"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
 
         // The legacy path was NEVER consulted.
@@ -2769,8 +2808,9 @@ public sealed class TaskExecutorTests
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
 
         // Stage 6a runs for the THREE transport commands only (the preparation fetch, the
-        // post-commit pull and the push) — every local command, including all five preflight
-        // rev-parse forms and the reset/clean/status, never resolves the URL.
+        // post-commit pull and the push) — every local command, including the preflight and
+        // cleanup rev-parse forms, the publication-HEAD probe, and the reset/clean/status,
+        // never resolves the URL.
         Assert.Equal(3, urlCalls);
     }
 
@@ -2818,7 +2858,7 @@ public sealed class TaskExecutorTests
         }
 
         // The origin inspection happens EXACTLY three times: once per transport command. A
-        // local command never reaches Stage 6d.
+        // local command — including every cleanup command — never reaches Stage 6d.
         Assert.Equal(3, fake.Launched.Count(t => t is ["remote", "get-url", "origin"]));
     }
 
@@ -2860,6 +2900,9 @@ public sealed class TaskExecutorTests
                 .. ConfigRepoPreparationFakes.SeamLaunchesWithOriginRepair(repair),
                 ["add", "agents/*.agents.md"],
                 ["diff", "--cached", "--name-only", "-z"],
+                // The step-end cleanup: the empty staged diff means no confirmed publication,
+                // so the restore target is the captured fetched baseline.
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
     }
 
@@ -2913,6 +2956,8 @@ public sealed class TaskExecutorTests
                 ["checkout", "--", "agents/"],
                 ["add", "agents/*.agents.md"],
                 ["diff", "--cached", "--name-only", "-z"],
+                // The step-end cleanup: no confirmed publication, so the baseline is the target.
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
         Assert.Empty(git.GitCommands);
     }
@@ -2943,6 +2988,8 @@ public sealed class TaskExecutorTests
             "improver-seam-merge-abort", configRepoDir, seam, fake, git);
 
         // The push (and its check-ref-format / origin inspection preamble) is ABSENT.
+        // The step-end cleanup follows the merge abort: no confirmed push, so the captured
+        // fetched baseline is the restore target.
         AssertLaunchedSequence(fake,
             [
                 .. ConfigRepoPreparationFakes.SeamLaunches,
@@ -2952,6 +2999,7 @@ public sealed class TaskExecutorTests
                 ["remote", "get-url", "origin"],
                 ["pull", "--no-rebase", "origin"],
                 ["merge", "--abort"],
+                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
 
         Assert.Contains("git pull failed: merge conflict", FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
@@ -3054,7 +3102,11 @@ public sealed class TaskExecutorTests
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
                 "pull --no-rebase",
+                // The publication HEAD is resolved and validated BEFORE the push.
+                "rev-parse --verify HEAD^{commit}",
                 "push",
+                // The step-end cleanup (finalization) with the publication SHA as target.
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
             git.GitCommands);
         Assert.All(git.WorkDirs, dir => Assert.Equal(configRepoDir, dir));
@@ -3093,6 +3145,9 @@ public sealed class TaskExecutorTests
                 $"commit -m \"{ImproverCommitMessage}\"",
                 "pull --no-rebase",
                 "merge --abort",
+                // The step-end cleanup restores the captured fetched baseline (no confirmed
+                // push after the failed pull).
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
             git.GitCommands);
 
@@ -3180,7 +3235,18 @@ public sealed class TaskExecutorTests
             "improver-seam-token", configRepoDir, seam, fake, git, cts.Token);
 
         Assert.NotEmpty(fake.Tokens);
-        Assert.All(fake.Tokens, t => Assert.Equal(cts.Token, t));
+        // The PREPARATION and PUBLICATION launches forward the execution token verbatim; the
+        // step-end CLEANUP runs on its own independent 30-second budget — never the execution
+        // token — so its launches carry a DIFFERENT token.
+        var preparationAndPublicationCount =
+            ConfigRepoPreparationFakes.SeamLaunches.Length + 9; // add/diff/commit/remote/pull/pubHEAD/ref/remote/push
+        Assert.Equal(
+            preparationAndPublicationCount + ConfigRepoPreparationFakes.SeamCleanupLaunches.Length,
+            fake.Tokens.Count);
+        for (var i = 0; i < preparationAndPublicationCount; i++)
+            Assert.Equal(cts.Token, fake.Tokens[i]);
+        for (var i = preparationAndPublicationCount; i < fake.Tokens.Count; i++)
+            Assert.NotEqual(cts.Token, fake.Tokens[i]);
     }
 
     /// <summary>
@@ -3199,7 +3265,19 @@ public sealed class TaskExecutorTests
         await RunImproverLegacyAsync("improver-legacy-token", configRepoDir, git, cts.Token);
 
         Assert.NotEmpty(git.GitTokens);
-        Assert.All(git.GitTokens, t => Assert.Equal(cts.Token, t));
+        // The PREPARATION and PUBLICATION commands forward the execution token verbatim; the
+        // step-end CLEANUP runs on its own independent 30-second budget — never the execution
+        // token — so its seven commands carry a DIFFERENT token.
+        var preparationAndPublicationCount =
+            ConfigRepoPreparationFakes.LegacyCommands.Length + 6; // add/diff/commit/pull/pubHEAD/push
+        Assert.Equal(preparationAndPublicationCount, ConfigRepoPreparationFakes.LegacyCommands.Length + 6);
+        Assert.Equal(
+            preparationAndPublicationCount + ConfigRepoPreparationFakes.LegacyCleanupCommands.Length,
+            git.GitTokens.Count);
+        for (var i = 0; i < preparationAndPublicationCount; i++)
+            Assert.Equal(cts.Token, git.GitTokens[i]);
+        for (var i = preparationAndPublicationCount; i < git.GitTokens.Count; i++)
+            Assert.NotEqual(cts.Token, git.GitTokens[i]);
     }
 
     /// <summary>
@@ -3931,7 +4009,13 @@ public sealed class TaskExecutorTests
         // No diff, no commit, no post-commit pull, no merge --abort, no push.
         AssertLegacyStoppedAfterAdd(git.GitCommands);
         Assert.Equal(
-            [.. ConfigRepoPreparationFakes.LegacyCommands, "add agents/*.agents.md"],
+            [
+                .. ConfigRepoPreparationFakes.LegacyCommands,
+                "add agents/*.agents.md",
+                // The step-end cleanup: no confirmed publication after the failed add, so the
+                // restore target is the captured fetched baseline.
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
+            ],
             git.GitCommands);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
@@ -4269,6 +4353,9 @@ public sealed class TaskExecutorTests
                 .. ConfigRepoPreparationFakes.LegacyCommands,
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
+                // The step-end cleanup: the empty staged diff means no confirmed publication,
+                // so the restore target is the captured fetched baseline.
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
             git.GitCommands);
         Assert.Contains(
@@ -4490,8 +4577,9 @@ public sealed class TaskExecutorTests
 
         AssertPreparationRejected(
             result, agentRunner, "HEAD does not match the fetched baseline after the restore");
-        // No second forced clean and no publication after the mismatch.
-        Assert.Single(fake.Launched, t => t is ["clean", ..]);
+        // No second forced clean during PREPARATION and no publication after the mismatch.
+        // (The step-end cleanup's own clean is a separate, later, verified sequence.)
+        Assert.Equal(2, fake.Launched.Count(t => t is ["clean", ..]));
         Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
     }
 
@@ -4519,9 +4607,11 @@ public sealed class TaskExecutorTests
 
         AssertPreparationRejected(
             result, agentRunner, "the working tree is not clean after the restore");
-        // NO ESCALATION: exactly one clean, one status, no publication.
-        Assert.Single(fake.Launched, t => t is ["clean", ..]);
-        Assert.Single(fake.Launched, t => t is ["status", ..]);
+        // NO ESCALATION: exactly one PREPARATION clean and one PREPARATION status, no
+        // publication. (The step-end cleanup's own clean + status are a separate, later,
+        // verified sequence.)
+        Assert.Equal(2, fake.Launched.Count(t => t is ["clean", ..]));
+        Assert.Equal(2, fake.Launched.Count(t => t is ["status", ..]));
         Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
     }
 
@@ -4570,7 +4660,14 @@ public sealed class TaskExecutorTests
 
         AssertPreparationRejected(
             result, agentRunner, "the working tree is not clean after the restore");
-        Assert.Equal(ConfigRepoPreparationFakes.LegacyCommands, git.GitCommands);
+        // The PREPARATION sequence plus the step-end cleanup (whose restore target is the
+        // captured fetched baseline, and whose status oracle is exercised verbatim here).
+        Assert.Equal(
+            [
+                .. ConfigRepoPreparationFakes.LegacyCommands,
+                .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
+            ],
+            git.GitCommands);
         Assert.DoesNotContain("add agents/*.agents.md", git.GitCommands);
     }
 
@@ -4899,8 +4996,9 @@ public sealed class TaskExecutorTests
             // The clean never ran after the failed reset, and nothing was published.
             Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
             AssertNoPublicationLaunched(fake);
-            // Exactly ONE reset attempt — no retry, no escalation.
-            Assert.Single(fake.Launched, t => t is ["reset", ..]);
+            // Exactly ONE preparation reset attempt — no retry, no escalation. (The step-end
+            // cleanup's own verified reset is a separate, later, verified sequence.)
+            Assert.Equal(2, fake.Launched.Count(t => t is ["reset", ..]));
         }
         else
         {
@@ -4918,7 +5016,9 @@ public sealed class TaskExecutorTests
                 result, agentRunner, "Config repo preparation reset failed (exit 128)");
             Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
             AssertNoLegacyPublication(git);
-            Assert.Single(git.GitCommands, c => c.StartsWith("reset ", StringComparison.Ordinal));
+            // Exactly ONE preparation reset attempt — no retry, no escalation. (The step-end
+            // cleanup's own verified reset is a separate, later, verified sequence.)
+            Assert.Equal(2, git.GitCommands.Count(c => c.StartsWith("reset ", StringComparison.Ordinal)));
         }
     }
 
@@ -4956,11 +5056,16 @@ public sealed class TaskExecutorTests
             AssertPreparationRejected(
                 result, agentRunner, "Config repo preparation clean failed (exit 1)");
 
-            // NO ESCALATION: exactly one clean, and it was the single-force `-fdx` form only.
-            Assert.Single(fake.Launched, t => t is ["clean", ..]);
-            Assert.Equal(["clean", "-fdx"], fake.Launched.Single(t => t is ["clean", ..]));
+            // NO ESCALATION: exactly one PREPARATION clean, and it was the single-force
+            // `-fdx` form only. (The step-end cleanup's own verified clean is a separate,
+            // later, verified sequence.)
+            Assert.Equal(2, fake.Launched.Count(t => t is ["clean", ..]));
+            Assert.All(
+                fake.Launched.Where(t => t is ["clean", ..]),
+                t => Assert.Equal(["clean", "-fdx"], t));
             Assert.DoesNotContain(fake.Launched, t => t is ["clean", "-ffdx"]);
-            // The post-restore verification never ran on an unclean tree, and nothing published.
+            // Neither phase's post-restore verification ever ran on an unclean tree, and
+            // nothing was published.
             Assert.DoesNotContain(fake.Launched, t => t is ["status", ..]);
             AssertNoPublicationLaunched(fake);
         }
@@ -4978,12 +5083,11 @@ public sealed class TaskExecutorTests
 
             AssertPreparationRejected(
                 result, agentRunner, "Config repo preparation clean failed (exit 1)");
-            Assert.Single(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
-            Assert.Equal(
-                "clean -fdx",
-                git.GitCommands.Single(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            Assert.Equal(2, git.GitCommands.Count(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            Assert.All(
+                git.GitCommands.Where(c => c.StartsWith("clean", StringComparison.Ordinal)),
+                c => Assert.Equal("clean -fdx", c));
             Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
-            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("status", StringComparison.Ordinal));
             AssertNoLegacyPublication(git);
         }
     }
@@ -5022,10 +5126,12 @@ public sealed class TaskExecutorTests
         Assert.Contains(result.Metrics!.Issues, i => i.Contains("IOException", StringComparison.Ordinal));
         Assert.DoesNotContain(result.Metrics.Issues, i => i.Contains("not a directory", StringComparison.Ordinal));
 
-        // The reset/clean ran (they precede the creation) but the VERIFICATION never did.
+        // The reset/clean ran (they precede the creation), but the agents-directory creation
+        // happens BEFORE any restore evidence is captured — so no cleanup target exists and
+        // the step-end cleanup must NEVER run (fail-before-mutation is preserved).
         Assert.Contains(fake.Launched, t => t is ["reset", ..]);
         Assert.Contains(fake.Launched, t => t is ["clean", ..]);
-        Assert.DoesNotContain(fake.Launched, t => t is ["status", ..]);
+        Assert.Single(fake.Launched, t => t is ["status", ..]);
         AssertNoPublicationLaunched(fake);
     }
 
@@ -5268,7 +5374,11 @@ public sealed class TaskExecutorTests
         Assert.True(
             agentsDirExistedAtPrompt,
             "the agents working directory did not exist when the agent was prompted");
-        Assert.True(Directory.Exists(agentsDir));
+        // The step-end cleanup runs its own `clean -fdx` against an UNTRACKED agents/ folder
+        // (per this fake's model), so the verified-clean end state legitimately has no agents
+        // directory — the workspace is left at the baseline, and the verified-clean status
+        // oracle is what preparation recreates the directory BEFORE, at prompt time.
+        Assert.False(Directory.Exists(agentsDir));
     }
 
     // ── Shared assertions for the round-2 vectors ────────────────────────────
@@ -5888,10 +5998,14 @@ public sealed class TaskExecutorTests
                 $"improver-seam-wsstatus-{statusStdout.Length}-{statusStdout.GetHashCode()}",
                 configRepoDir, seam, fake, git, agentRunner: agentRunner);
 
-            // NO ESCALATION: exactly one clean and one status, and nothing published.
-            Assert.Single(fake.Launched, t => t is ["clean", ..]);
-            Assert.Equal(["clean", "-fdx"], fake.Launched.Single(t => t is ["clean", ..]));
-            Assert.Single(fake.Launched, t => t is ["status", ..]);
+            // NO ESCALATION: exactly one PREPARATION clean and one PREPARATION status, and
+            // nothing published. (The step-end cleanup's own clean + status are a separate,
+            // later, verified sequence.)
+            Assert.Equal(2, fake.Launched.Count(t => t is ["clean", ..]));
+            Assert.All(
+                fake.Launched.Where(t => t is ["clean", ..]),
+                t => Assert.Equal(["clean", "-fdx"], t));
+            Assert.Equal(2, fake.Launched.Count(t => t is ["status", ..]));
             AssertNoPublicationLaunched(fake);
         }
         else
@@ -5907,10 +6021,12 @@ public sealed class TaskExecutorTests
                 $"improver-legacy-wsstatus-{statusStdout.Length}-{statusStdout.GetHashCode()}",
                 configRepoDir, git, agentRunner: agentRunner);
 
-            Assert.Single(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
-            Assert.Equal(
-                "clean -fdx",
-                git.GitCommands.Single(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            // NO ESCALATION: exactly one PREPARATION clean, never `-ffdx`. (The step-end
+            // cleanup's own clean is a separate, later, verified sequence.)
+            Assert.Equal(2, git.GitCommands.Count(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            Assert.All(
+                git.GitCommands.Where(c => c.StartsWith("clean", StringComparison.Ordinal)),
+                c => Assert.Equal("clean -fdx", c));
             Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
             AssertNoLegacyPublication(git);
         }
@@ -6654,14 +6770,16 @@ public sealed class TaskExecutorTests
         Assert.False(File.Exists(Path.Combine(worker, "ordinary-dirt.txt")));
 
         // NO ESCALATION on the legacy route, where the issued command strings are observable:
-        // exactly one clean, spelled `clean -fdx`, and never `-ffdx`.
+        // each phase issues exactly ONE clean, spelled `clean -fdx`, and never `-ffdx`. (The
+        // step-end cleanup runs its own verified clean after the preparation rejection, since
+        // the restore evidence was already captured; the nested repo survives BOTH.)
         if (!viaSeam)
         {
             var cleans = legacyCommands
                 .Where(c => c.StartsWith("clean", StringComparison.Ordinal))
                 .ToArray();
-            Assert.Single(cleans);
-            Assert.Equal("clean -fdx", cleans[0]);
+            Assert.Equal(2, cleans.Length);
+            Assert.All(cleans, c => Assert.Equal("clean -fdx", c));
             Assert.DoesNotContain(legacyCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
             // Nothing was published either.
             Assert.DoesNotContain(legacyCommands, c => c.StartsWith("push", StringComparison.Ordinal));
@@ -6847,9 +6965,15 @@ public sealed class TaskExecutorTests
         else
             Assert.NotEmpty(run1LegacyCommands);
 
-        // The agent ran, and the publication stage really committed its edit.
+        // The agent ran, and the publication stage really committed its edit. The abandoned
+        // commit is recovered from the reflog: the newest entry is the step-end cleanup's
+        // verified reset to the baseline, and the entry beneath it is the abandoned
+        // publication commit.
         Assert.Single(run1Agent.PromptCalls);
-        var abandonedSha = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+        var reflogShas = RealGitOutput(worker, "reflog", "--format=%H")
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.True(reflogShas.Length >= 2, "the run-1 reflog is missing the cleanup and commit entries");
+        var abandonedSha = reflogShas[1];
         Assert.True(playground.WorkerHasCommit(abandonedSha));
         Assert.Equal(
             "RUN1-IMPROVER-EDIT\n",
@@ -6861,6 +6985,13 @@ public sealed class TaskExecutorTests
         Assert.False(run1Result.GitStatus!.Pushed);
         Assert.DoesNotContain("fatal:", run1Result.Output, StringComparison.Ordinal);
 
+        // CLEAN-AT-STEP-END: the rejected push had no confirmed publication, so run 1's own
+        // finalization already restored the checkout to the captured fetched baseline — the
+        // abandoned commit is neither HEAD nor reachable from it, though its object still
+        // exists (unreachable) exactly as the reflog witness above shows.
+        Assert.Equal(remoteShaBeforeRun1, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.NotEqual(abandonedSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+
         // ── Boundary 1: the remote advanced to the interloper, NOT to run 1 ───
         var remoteShaAfterRun1 = playground.RemoteMainSha();
         Assert.NotEqual(remoteShaBeforeRun1, remoteShaAfterRun1);
@@ -6869,10 +7000,9 @@ public sealed class TaskExecutorTests
             playground.RemoteMainContains(abandonedSha),
             "the abandoned run-1 commit reached the remote");
 
-        // The abandoned commit still exists LOCALLY — this is exactly the danger the
-        // fetch-first preparation exists to neutralize.
-        Assert.True(playground.WorkerHasCommit(abandonedSha));
-        Assert.Equal(abandonedSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        // The abandoned commit still exists LOCALLY as an unreachable object — this is exactly
+        // the danger the fetch-first preparation neutralizes, and run 1's own finalization has
+        // already restored the branch. Run 2's preparation still re-fetches and re-restores.
 
         // ── RUN 2: preparation must discard the abandoned commit ─────────────
         var remoteShaBeforeRun2 = playground.RemoteMainSha();
@@ -6931,8 +7061,1966 @@ public sealed class TaskExecutorTests
             "RUN2-IMPROVER-EDIT\n",
             RealGitOutput(playground.RemoteDir, "show", "main:agents/coder.agents.md"));
 
+        // CLEAN-AT-STEP-END for run 2: the confirmed publication means finalization restored
+        // the checkout to the PUBLISHED tip (not the older baseline), leaving a verified-clean
+        // tree whose HEAD equals the remote.
+        var finalHead = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+        Assert.Equal(remoteShaAfterRun2, finalHead);
+        Assert.Equal("RUN2-IMPROVER-EDIT\n", RealGitOutput(worker, "show", "HEAD:agents/coder.agents.md"));
+        Assert.Equal("", playground.WorkerVerboseStatus());
+
         // Remote refs agree at the final boundary.
         Assert.Equal(remoteShaAfterRun2, playground.WorkerOriginMainSha());
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // FINALIZATION (clean-at-step-end) — the shared finalization path
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The distinct PUBLICATION SHA used to expose erroneous rollback of success: the fake
+    /// reports this SHA for the publication-HEAD probe (after the pull), so the confirmed push
+    /// publishes at <see cref="PublicationSha"/> while the captured baseline is
+    /// <see cref="ConfigRepoPreparationFakes.BaselineSha"/>. A finalization that rolls the
+    /// checkout back to the BASELINE on a confirmed success fails every published-tip check.
+    /// </summary>
+    private const string PublicationSha = "5555555555555555555555555555555555555555";
+
+    /// <summary>
+    /// The step-end cleanup's EXACT sequence on the LEGACY route for a confirmed publication
+    /// whose resolved publication HEAD is <see cref="PublicationSha"/>: the trust revalidation
+    /// (root, branch, upstream), the reset to the PUBLISHED SHA (never the baseline), the
+    /// single clean, and the two verification probes.
+    /// </summary>
+    private static string[] LegacyCleanupCommandsAt(string sha) =>
+    [
+        "rev-parse --show-toplevel",
+        "rev-parse --symbolic-full-name HEAD",
+        "rev-parse --symbolic-full-name @{upstream}",
+        $"reset --hard {sha}",
+        "clean -fdx",
+        "rev-parse --verify HEAD^{commit}",
+        "status --porcelain=v1 --untracked-files=all --ignored",
+    ];
+
+    /// <summary>
+    /// The tokenized step-end cleanup sequence for a confirmed publication whose resolved
+    /// publication HEAD is <paramref name="sha"/>.
+    /// </summary>
+    private static string[][] SeamCleanupLaunchesAt(string sha) =>
+    [
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+        ["check-ref-format", "--allow-onelevel", ConfigRepoPreparationFakes.BranchRef],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        ["reset", "--hard", sha],
+        ["clean", "-fdx"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+    ];
+
+    /// <summary>
+    /// A sequence-aware HEAD-probe responder: the FIRST TWO <c>rev-parse --verify
+    /// HEAD^{commit}</c> probes (the preparation preflight and its post-restore check) answer
+    /// the captured BASELINE, and every LATER probe (the publication-HEAD resolution and the
+    /// cleanup's post-restore verification) answers <see cref="PublicationSha"/> — so the
+    /// confirmed push publishes a DISTINCT SHA from the baseline.
+    /// </summary>
+    private static (Func<IReadOnlyList<string>, GitProcessResult?> Responder, Func<int> HeadProbeCount)
+        PublicationShaSequenceResponder(Func<IReadOnlyList<string>, GitProcessResult?>? inner = null)
+    {
+        var headCalls = 0;
+        Func<IReadOnlyList<string>, GitProcessResult?> responder = tokens =>
+        {
+            if (tokens is ["rev-parse", "--verify", "HEAD^{commit}"])
+            {
+                headCalls++;
+                return new GitProcessResult(0, (headCalls <= 2
+                    ? ConfigRepoPreparationFakes.BaselineSha
+                    : PublicationSha) + "\n", "");
+            }
+
+            return inner?.Invoke(tokens);
+        };
+        return (responder, () => headCalls);
+    }
+
+    /// <summary>
+    /// FINALIZATION SEQUENCE (seam): a confirmed publication resolves a DISTINCT publication
+    /// HEAD, and the step-end cleanup resets to THAT SHA — never to the older baseline. The
+    /// full launch sequence is asserted end to end, with phase-aware cleanup probes.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Finalization_AfterConfirmedPush_ResetsToThePublishedSha()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var (responder, headProbeCount) = PublicationShaSequenceResponder(
+            tokens => tokens[0] == "diff"
+                ? new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), "")
+                : null);
+        var fake = new SeamProcessRunnerFake { Responder = responder };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-fin-published", configRepoDir, seam, fake, git);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(result.GitStatus!.Pushed);
+        // The publication HEAD was resolved exactly once, before the push.
+        Assert.Equal(4, headProbeCount()); // preflight, post-restore, publication, cleanup-verify
+
+        // The CLEANUP's reset target is the PUBLISHED SHA — never the older baseline. (The
+        // PREPARATION's own reset to the baseline is expected and is not a cleanup step.)
+        var preparationLaunchCount = ConfigRepoPreparationFakes.SeamLaunches.Length;
+        var resets = fake.Launched.Where(t => t is ["reset", ..]).ToArray();
+        Assert.Equal(2, resets.Length);
+        Assert.Equal(["reset", "--hard", ConfigRepoPreparationFakes.BaselineSha], resets[0]);
+        Assert.Equal(["reset", "--hard", PublicationSha], resets[1]);
+        // Exactly ONE cleanup clean (in addition to the preparation clean).
+        Assert.Equal(2, fake.Launched.Count(t => t is ["clean", ..]));
+        // The trailing cleanup sequence is exactly the expected tokenized form.
+        var expectedCleanup = SeamCleanupLaunchesAt(PublicationSha);
+        var trailing = fake.Launched[^expectedCleanup.Length..];
+        for (var i = 0; i < trailing.Count; i++)
+            Assert.Equal(expectedCleanup[i], trailing[i]);
+    }
+
+    /// <summary>
+    /// FINALIZATION SEQUENCE (legacy): the same phase-aware command contract over the opaque
+    /// route — the publication HEAD is resolved BEFORE the push, and the cleanup resets to the
+    /// published SHA with EXACTLY one clean spelled <c>clean -fdx</c>.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Finalization_AfterConfirmedPush_ResetsToThePublishedSha()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                // The first two HEAD probes (the preparation preflight and its post-restore
+                // check) answer the BASELINE; the publication HEAD probe and the cleanup's
+                // post-restore verification answer the DISTINCT PUBLICATION SHA.
+                "rev-parse --verify HEAD^{commit}" =>
+                    (0, (++headCalls <= 2
+                        ? ConfigRepoPreparationFakes.BaselineSha
+                        : PublicationSha) + "\n", ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-published", configRepoDir, git);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal(4, headCalls); // preflight, post-restore, publication, cleanup-verify
+
+        var expected = new List<string>(ConfigRepoPreparationFakes.LegacyCommands)
+        {
+            "add agents/*.agents.md",
+            "diff --cached --name-only -z",
+            "commit -m \"" + ImproverCommitMessage + "\"",
+            "pull --no-rebase",
+            "rev-parse --verify HEAD^{commit}", // the publication HEAD BEFORE the push
+            "push",
+        };
+        expected.AddRange(LegacyCleanupCommandsAt(PublicationSha));
+        Assert.Equal(expected, git.GitCommands);
+
+        var cleans = git.GitCommands.Where(c => c.StartsWith("clean", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(2, cleans.Length);
+        Assert.All(cleans, c => Assert.Equal("clean -fdx", c));
+        Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Installs a REAL <c>pre-push</c> hook that unconditionally rejects the push with git's
+    /// own non-fast-forward refusal, so the publication genuinely fails without simulating
+    /// the failure at a fake boundary.
+    /// </summary>
+    private static void InstallRejectingPrePushHook(RealGitPlayground playground, string why)
+    {
+        var worker = playground.WorkerDir;
+        var hookPath = Path.Combine(worker, ".git", "hooks", "pre-push");
+        File.WriteAllText(hookPath, $"#!/bin/sh\necho 'rejected: {why}' >&2\nexit 1\n".Replace("\r\n", "\n"));
+        RealGitResult(worker, "update-index", "--chmod=+x", "--", ".git/hooks/pre-push");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                hookPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+    }
+
+    /// <summary>
+    /// FINALIZATION WITHOUT PUBLICATION (both routes): a genuinely REJECTED push (a real git
+    /// pre-push hook) is a truthful publication failure, and the step-end cleanup still
+    /// restores the captured BASELINE — the residue the agent created during the run is gone
+    /// from the verified end state.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Finalization_AgentFailure_RestoresTheCapturedBaseline(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"fin-baseline-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+        InstallRejectingPrePushHook(playground, "finalization fixture");
+
+        // The agent creates residue DURING the run: an edit to the tracked guidance file
+        // (left UNCOMMITTED — the publication stage does the commit), an untracked file and
+        // an ignored file.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "AGENT-DIRTY-EDIT\n");
+                File.WriteAllText(Path.Combine(worker, "untracked-fin.txt"), "residue\n");
+                File.WriteAllText(Path.Combine(worker, "ignored-fin.txt"), "ignored residue\n");
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-fin-baseline-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // The publication stage committed the edit, then the push was rejected → Failed.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // THE END STATE AT RETURN: restored to the captured fetched baseline, verified clean.
+        Assert.Equal(baselineSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.Equal("REMOTE-BASELINE-V1\n", File.ReadAllText(playground.GuidancePath));
+        Assert.False(File.Exists(Path.Combine(worker, "untracked-fin.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ignored-fin.txt")));
+        // The agent's output evidence and the failure reason survive composition.
+        Assert.Contains("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// NEGATIVE CONTROL (a): removing the finalization call leaves the agent-created residue
+    /// in place, so the end-state assertions fail. This test asserts the RESTORED (green)
+    /// behavior — the verified-clean end state — and is the test that FAILS under the mutant.
+    /// The mutant demonstration itself is a bash-driven build/test cycle: production is
+    /// temporarily patched (the finalization call replaced by a bare passthrough), rebuilt,
+    /// and this exact test re-run — the end-state assertion fails with residue still present —
+    /// after which production is RESTORED and this test is green again.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task NegativeControl_RemovedFinalization_LeavesResidue(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"negctrl-removed-finalization-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        InstallRejectingPrePushHook(playground, "negative-control fixture");
+
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "CONTROL-DIRTY-EDIT\n");
+                File.WriteAllText(Path.Combine(worker, "negctrl-residue.txt"), "residue\n");
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            "negctrl-probe", playground, viaSeam, agentRunner);
+
+        // The push was genuinely rejected, so the outcome is Failed on both forms.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // THE END-STATE ASSERTION the mutant fails: the verified-clean tree at return.
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.Equal(
+            playground.RemoteMainSha(),
+            RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.False(File.Exists(Path.Combine(worker, "negctrl-residue.txt")));
+    }
+
+    /// <summary>
+    /// NEGATIVE CONTROL (b): rolling a confirmed success back to the BASELINE (instead of the
+    /// published tip) fails the distinct published-tip check. This test asserts the RESTORED
+    /// (green) behavior — the final HEAD equals the remote's published tip — and is the test
+    /// that FAILS under the mutant (production temporarily patched so finalization always
+    /// resets to the baseline; the mutant leaves the checkout behind the published tip).
+    /// </summary>
+    [Fact]
+    public async Task NegativeControl_BaselineOnSuccess_FailsThePublishedTipCheck()
+    {
+        using var playground = RealGitPlayground.Create(
+            "negctrl-baselineonsuccess", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "SUCCESS-EDIT\n");
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            "negctrl-baselineonsuccess", playground, viaSeam: true, agentRunner);
+
+        // The push itself was confirmed.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(result.GitStatus!.Pushed);
+
+        var remoteSha = playground.RemoteMainSha();
+        Assert.NotEqual(baselineSha, remoteSha);
+
+        // THE DISTINCT PUBLISHED-TIP CHECK the mutant fails: the final HEAD is the published
+        // tip — NOT the older baseline.
+        Assert.Equal(remoteSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.Equal("SUCCESS-EDIT\n", RealGitOutput(worker, "show", "HEAD:agents/coder.agents.md"));
+        Assert.Equal("", playground.WorkerVerboseStatus());
+    }
+
+    // ── Finalization failure vectors: never claim cleanliness unverified ──────
+
+    /// <summary>
+    /// A CLEANUP verification failure is composed ONTO the confirmed publication: the
+    /// result stays truthful with <c>Pushed=true</c> and the agent evidence preserved, but a
+    /// normal completion whose cleanup failed is reported Failed/FAIL with the sanitized
+    /// cleanup reason appended — never Completed with an unverified "clean" claim.
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConfirmedPublication_PlusCleanupFailure_ReportsBoth()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var resetCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+            // Only the SECOND reset (the cleanup's) throws; the preparation's succeeds.
+            GitCommandThrower = args => args.StartsWith("reset --hard", StringComparison.Ordinal)
+                && ++resetCalls == 2
+                ? new InvalidOperationException("cleanup reset exploded")
+                : null,
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-cleanup-fail", configRepoDir, git);
+
+        // TRUTHFUL COMPOSITION: the push was confirmed (Pushed=true survives) but the
+        // normal completion was downgraded to Failed/FAIL because cleanup could not verify.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        // The agent evidence AND the original publication evidence survive, with the cleanup
+        // diagnostics APPENDED.
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output);
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup reset failed", StringComparison.Ordinal)
+                && !i.Contains("exploded", StringComparison.Ordinal));
+    }
+
+    /// <summary>Counts the reset commands issued so far on the legacy mock.</summary>
+    private static int CountResets(MockGitOperations git) =>
+        git.GitCommands.Count(c => c.StartsWith("reset ", StringComparison.Ordinal));
+
+    /// <summary>
+    /// A CLEANUP trust rejection — here a nonempty post-restore status (the protected
+    /// nested-repo shape) — is a truthful cleanup failure on a confirmed publication: Failed
+    /// with <c>Pushed=true</c> retained, and NO second forced clean on the cleanup path.
+    /// </summary>
+    [Fact]
+    public async Task Improver_CleanupNonEmptyStatus_IsATruthfulCleanupFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var statusCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                "status --porcelain=v1 --untracked-files=all --ignored" =>
+                    (0, (++statusCalls == 1 ? "" : "?? nested/\n"), ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-dirty-status", configRepoDir, git);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup rejected: the working tree is not clean", StringComparison.Ordinal));
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        // Exactly TWO cleans (preparation + cleanup), never `-ffdx`: no escalation.
+        var cleans = git.GitCommands.Where(c => c.StartsWith("clean", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(2, cleans.Length);
+        Assert.All(cleans, c => Assert.Equal("clean -fdx", c));
+        Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A CLEANUP verification probe with MALFORMED output (a padded HEAD SHA) is a truthful
+    /// cleanup failure: the HEAD equality can never be verified, so the normal completion is
+    /// failed with the sanitized cleanup diagnostics and the confirmed Pushed=true retained.
+    /// </summary>
+    [Fact]
+    public async Task Improver_CleanupMalformedHeadVerification_IsATruthfulCleanupFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                // The CLEANUP's post-restore HEAD probe (4th) is PADDED — malformed.
+                "rev-parse --verify HEAD^{commit}" => (0, (++headCalls == 4
+                    ? " " + ConfigRepoPreparationFakes.BaselineSha + " \n"
+                    : ConfigRepoPreparationFakes.BaselineSha + "\n"), ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-malformed-head", configRepoDir, git);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup rejected: HEAD did not resolve to a single full commit SHA", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A CLEANUP stage COMMAND failure (a non-zero reset) is a truthful cleanup failure, and
+    /// the sequence STOPS: no clean, no verification, and no publication follow the failed
+    /// cleanup reset.
+    /// </summary>
+    [Fact]
+    public async Task Improver_CleanupFailedReset_StopsTheCleanupSequence()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var resetCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                // The CLEANUP's reset (the 2nd) fails with a non-zero exit.
+                var r when r.StartsWith("reset ", StringComparison.Ordinal) =>
+                    (++resetCalls == 2 ? (128, "", "fatal: cleanup reset refused") : (0, "", "")),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-reset-fail", configRepoDir, git);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup reset failed (exit 128)", StringComparison.Ordinal));
+        // The failed cleanup reset stopped the cleanup sequence: only the PREPARATION clean
+        // and the PREPARATION status ran (the cleanup's clean and status never launched).
+        Assert.Single(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+        Assert.Single(git.GitCommands, c => c.StartsWith("status", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A cleanup stage that THROWS (an ordinary exception) is a sanitized cleanup failure —
+    /// the exception classification only, never the raw message.
+    /// </summary>
+    [Fact]
+    public async Task Improver_CleanupThrownCommand_IsSanitizedCleanupFailure()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var cleanCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+            GitCommandThrower = args => args.StartsWith("clean", StringComparison.Ordinal)
+                && ++cleanCalls == 2
+                ? new InvalidOperationException("cleanup clean exploded")
+                : null,
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-clean-throw", configRepoDir, git);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup clean failed with an error [InvalidOperationException]", StringComparison.Ordinal)
+                && !i.Contains("exploded", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// (a) A GENUINELY REQUESTED execution cancellation — raised after the agent prompt has
+    /// returned — keeps Cancelled/CANCELLED, and the step-end cleanup STILL runs afterwards on
+    /// its OWN independent budget token rather than the cancelled execution token.
+    /// <para>
+    /// The previous form of this test never cancelled its CTS and asserted a Failed/FAIL
+    /// outcome after a nonzero pull, so it proved only that two token values differ — it could
+    /// not fail if cleanup started honouring the cancelled token, because that token was never
+    /// cancelled. Here the execution token is REALLY cancelled inside the publication stage, so
+    /// a cleanup that used it would be pre-cancelled and could not issue a single command.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF on three axes: (1) the Cancelled/CANCELLED classification, (2) the cleanup
+    /// commands actually issued AFTER the cancellation (a cleanup on the execution token issues
+    /// none), and (3) the explicit cleanup-failure report on the cancellation path.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_CleanupRunsOnItsOwnBudget_AfterExecutionCancellation()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        const string agentSegment = "Improver analysis completed before the shutdown signal";
+        var statusCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+            {
+                // The publication's FIRST command REQUESTS the execution cancellation — after
+                // the agent prompt already returned real output.
+                if (args == "add agents/*.agents.md")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                // The CLEANUP's status (the 2nd overall) reports residue, so the cancellation
+                // path must ALSO report the cleanup failure explicitly.
+                if (args == "status --porcelain=v1 --untracked-files=all --ignored")
+                    return (0, ++statusCalls == 1 ? "" : "?? residue.txt\n", "");
+
+                return null;
+            },
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-fin-cancelled", configRepoDir, git, cts.Token, agentRunner);
+
+        // NON-VACUITY: the execution token really WAS cancelled, and the agent really ran
+        // before it happened.
+        Assert.True(cts.IsCancellationRequested, "the execution token was never cancelled — the test is vacuous");
+        Assert.Single(agentRunner.PromptCalls);
+
+        // (1) CANCELLED SEMANTICS PRESERVED — never reclassified into an ordinary failure.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+
+        // (2) THE CLEANUP RAN ON ITS OWN BUDGET. Every cleanup command was issued AFTER the
+        // cancellation was requested; a cleanup that used the (now cancelled) execution token
+        // would have been pre-cancelled and issued NOTHING.
+        var addIndex = git.GitCommands.IndexOf("add agents/*.agents.md");
+        Assert.True(addIndex >= 0, "the publication stage never started");
+        var afterCancellation = git.GitCommands.Skip(addIndex + 1).ToArray();
+        Assert.Equal(ConfigRepoPreparationFakes.LegacyCleanupCommands, afterCancellation);
+
+        // The cleanup's own token is NOT the cancelled execution token, and is not already
+        // cancelled when the commands are issued.
+        for (var i = addIndex + 1; i < git.GitTokens.Count; i++)
+        {
+            Assert.NotEqual(cts.Token, git.GitTokens[i]);
+            Assert.False(
+                git.GitTokens[i].IsCancellationRequested,
+                "the cleanup command carried an already-cancelled token");
+        }
+
+        // (3) THE CLEANUP FAILURE IS REPORTED EXPLICITLY on the cancellation path, and the
+        // agent's accumulated evidence survives alongside it.
+        Assert.Contains(agentSegment, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup rejected", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// (a, seam converse) The same genuinely-cancelled vector on the TOKENIZED seam route, with
+    /// a cleanup that SUCCEEDS: Cancelled/CANCELLED is preserved and the cleanup still issues
+    /// its full tokenized sequence on the independent budget token.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_CleanupRunsOnItsOwnBudget_AfterExecutionCancellation()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens =>
+            {
+                if (tokens is ["add", ..])
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                return null;
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-fin-cancelled", configRepoDir, seam, fake, git, cts.Token, agentRunner);
+
+        Assert.True(cts.IsCancellationRequested, "the execution token was never cancelled — the test is vacuous");
+        Assert.Single(agentRunner.PromptCalls);
+
+        // Cancelled semantics preserved; a SUCCESSFUL cleanup adds no failure diagnostics.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+
+        // The cleanup issued its FULL tokenized sequence after the cancellation.
+        var addIndex = fake.Launched.FindIndex(t => t is ["add", ..]);
+        Assert.True(addIndex >= 0, "the publication stage never started");
+        var afterCancellation = fake.Launched.Skip(addIndex + 1).ToArray();
+        Assert.Equal(ConfigRepoPreparationFakes.SeamCleanupLaunches.Length, afterCancellation.Length);
+        for (var i = 0; i < afterCancellation.Length; i++)
+            Assert.Equal(ConfigRepoPreparationFakes.SeamCleanupLaunches[i], afterCancellation[i]);
+
+        // Every post-cancellation launch used a live, independent token.
+        for (var i = addIndex + 1; i < fake.Tokens.Count; i++)
+        {
+            Assert.NotEqual(cts.Token, fake.Tokens[i]);
+            Assert.False(
+                fake.Tokens[i].IsCancellationRequested,
+                "the cleanup launch carried an already-cancelled token");
+        }
+    }
+
+    /// <summary>
+    /// (b) PARTIAL PREPARATION INTERRUPTED BY A REAL REQUESTED CANCELLATION, AFTER TARGET
+    /// CAPTURE. The preflight, the fetch and the FETCH_HEAD validation all succeed — so the
+    /// trusted restore target is already captured — and the destructive restore's reset is then
+    /// interrupted by a genuinely requested execution cancellation.
+    /// <para>
+    /// The previous form injected a NONZERO reset (an ordinary command failure), which never
+    /// exercised the cancellation path this test claims to cover. Here the execution token is
+    /// really cancelled mid-preparation, so the outcome is Cancelled/CANCELLED and finalization
+    /// must still complete the restore TOWARD THE CAPTURED TARGET on its independent budget.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_PartialPreparationCancelledAfterTargetCapture_IsFinalizedToTheTarget()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        var resetCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+            {
+                // The PREPARATION's reset (the 1st) is interrupted by a REQUESTED cancellation,
+                // after the fetch + FETCH_HEAD validation already captured the target.
+                if (args.StartsWith("reset ", StringComparison.Ordinal) && ++resetCalls == 1)
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                return null;
+            },
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-partial-prep-cancelled", configRepoDir, git, cts.Token, agentRunner);
+
+        // NON-VACUITY: a REAL requested cancellation, raised after target capture.
+        Assert.True(cts.IsCancellationRequested, "the execution token was never cancelled — the test is vacuous");
+        // The agent was never prompted: preparation was interrupted before the prompt.
+        Assert.Empty(agentRunner.PromptCalls);
+
+        // The requested cancellation keeps its established semantics.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+
+        // FINALIZATION COMPLETED THE RESTORE TOWARD THE CAPTURED TARGET: the cleanup issued its
+        // full sequence, resetting to the captured fetched baseline (never a guess), after the
+        // interrupted preparation.
+        string[] preparationPrefix =
+        [
+            "rev-parse --show-toplevel",
+            "rev-parse --verify HEAD^{commit}",
+            "rev-parse --symbolic-full-name HEAD",
+            "rev-parse --symbolic-full-name @{upstream}",
+            $"fetch origin \"{ConfigRepoPreparationFakes.BranchRef}\"",
+            "rev-parse --verify FETCH_HEAD^{commit}",
+            $"reset --hard {ConfigRepoPreparationFakes.BaselineSha}",
+        ];
+        Assert.Equal(
+            [.. preparationPrefix, .. ConfigRepoPreparationFakes.LegacyCleanupCommands],
+            git.GitCommands);
+
+        // The cleanup's own commands ran on a LIVE, independent token after the interruption.
+        var interruptedIndex = preparationPrefix.Length - 1;
+        for (var i = interruptedIndex + 1; i < git.GitTokens.Count; i++)
+        {
+            Assert.NotEqual(cts.Token, git.GitTokens[i]);
+            Assert.False(
+                git.GitTokens[i].IsCancellationRequested,
+                "the cleanup command carried an already-cancelled token");
+        }
+
+        // The cleanup SUCCEEDED, so no cleanup-failure diagnostics are reported.
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// (b, ordinary-failure converse) The pre-existing partial-preparation vector, kept as the
+    /// NON-cancellation cell: a nonzero preparation reset after target capture is an ordinary
+    /// Failed/FAIL outcome, and finalization still completes the restore to the captured target.
+    /// </summary>
+    [Fact]
+    public async Task Improver_PartialPreparationAfterTargetCapture_IsFinalizedToTheTarget()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var resetCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                // The PREPARATION's reset (the 1st) fails after the fetch + SHA validation
+                // succeeded — a partial preparation with the target ALREADY captured.
+                var r when r.StartsWith("reset ", StringComparison.Ordinal) =>
+                    (++resetCalls == 1 ? (128, "", "fatal: partial restore refused") : (0, "", "")),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-partial-prep", configRepoDir, git);
+
+        // The preparation failure is truthful, and the CLEANUP completed the restore to the
+        // captured baseline afterwards.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        // The cleanup's reset (the 2nd) ran to the SAME captured target and its verification
+        // probes followed. (The PREPARATION's clean never ran — it follows the failed reset —
+        // so exactly ONE clean exists, the cleanup's.)
+        Assert.Equal(2, git.GitCommands.Count(c => c.StartsWith("reset ", StringComparison.Ordinal)));
+        Assert.Equal(1, git.GitCommands.Count(c => c.StartsWith("clean", StringComparison.Ordinal)));
+        // The preflight HEAD probe + the cleanup's post-restore verification probe (the
+        // preparation's own post-restore probe never ran after the failed reset).
+        Assert.Equal(2, git.GitCommands.Count(c => c == "rev-parse --verify HEAD^{commit}"));
+        Assert.Single(git.GitCommands, c => c.StartsWith("status", StringComparison.Ordinal));
+        // The captured baseline SHA was the CLEANUP's reset target (never a guess).
+        Assert.Contains($"reset --hard {ConfigRepoPreparationFakes.BaselineSha}", git.GitCommands);
+        // The preparation failure evidence is preserved; the cleanup diagnostics are absent
+        // because the cleanup SUCCEEDED.
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// REAL GIT: the step-end cleanup after a REJECTED push removes every residue class the
+    /// agent created during the run, restores the captured baseline, and leaves the OUTSIDE
+    /// sentinel and the protected nested repository untouched (the nested repo's residual
+    /// status is a truthful cleanup FAILURE, never a forced deletion).
+    /// </summary>
+    [Fact]
+    public async Task RealGit_Finalization_ProtectedNestedRepo_IsReportedAndNeverDeleted()
+    {
+        using var playground = RealGitPlayground.Create(
+            "fin-nested-protected", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+        InstallRejectingPrePushHook(playground, "finalization fixture");
+
+        // A NESTED repository with its own committed content, created DURING the agent run.
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "AGENT-DIRTY-EDIT\n");
+                File.WriteAllText(Path.Combine(worker, "untracked-ordinary.txt"), "ordinary\n");
+                var nestedDir = Path.Combine(worker, "nested-repo");
+                Directory.CreateDirectory(nestedDir);
+                RealGit(nestedDir, "init", "-b", "main");
+                File.WriteAllText(Path.Combine(nestedDir, "nested-content.txt"), "nested-precious\n");
+                RealGit(nestedDir, "add", "-A");
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            "realgit-fin-nested", playground, viaSeam: false, agentRunner);
+
+        // The push was rejected → Failed, AND the cleanup could not verify cleanliness
+        // because the protected nested repository leaves residual status — a truthful
+        // cleanup failure composed onto the outcome.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.False(result.GitStatus is null ? true : result.GitStatus.Pushed);
+        Assert.NotNull(result.Metrics);
+        Assert.Contains(
+            result.Metrics!.Issues,
+            i => i.Contains("Config repo cleanup", StringComparison.Ordinal));
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+
+        // THE PROTECTED NESTED REPOSITORY SURVIVED, intact.
+        var nested = Path.Combine(worker, "nested-repo");
+        Assert.True(Directory.Exists(nested));
+        Assert.True(Directory.Exists(Path.Combine(nested, ".git")));
+        Assert.True(File.Exists(Path.Combine(nested, "nested-content.txt")));
+        Assert.Equal("nested-precious\n", File.ReadAllText(Path.Combine(nested, "nested-content.txt")));
+
+        // The ordinary residue WAS removed by the cleanup's clean before the nested-repo
+        // status failure.
+        Assert.False(File.Exists(Path.Combine(worker, "untracked-ordinary.txt")));
+
+        // THE OUTSIDE SENTINEL is untouched, byte for byte.
+        Assert.True(File.Exists(playground.OutsideSentinelPath));
+        Assert.Equal("outside-untouched\n", File.ReadAllText(playground.OutsideSentinelPath));
+
+        // The reset target was the captured baseline, not HEAD-at-entry.
+        var reflog = RealGitOutput(worker, "reflog", "--format=%gs");
+        Assert.Contains("reset", reflog, StringComparison.Ordinal);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ITERATION 2 — regression tests for the four production defects
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── MAJOR-1: a publication-HEAD failure must keep the agent/Git evidence ──
+
+    /// <summary>
+    /// MAJOR-1 (legacy route). The publication-HEAD probe runs after the successful pull and
+    /// before the push. When it fails, its stage helper THROWS a ConfigRepoPublicationException
+    /// carrying an EMPTY preservedOutput and no summary — so letting it escape bypasses the
+    /// caller's wrapper and returns empty agent evidence plus empty Git diagnostics.
+    /// <para>
+    /// REMOVAL-PROOF: the failure must be converted into the ordinary publication-failure shape
+    /// so the wrapper attaches BOTH the accumulated agent output AND the staged
+    /// <see cref="GitChangeSummary"/>. Reintroducing the defect (removing the catch around the
+    /// publication-HEAD probe) empties Output and ChangedFiles and fails every assertion below.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(128, "", "fatal: publication HEAD refused")]      // nonzero exit
+    [InlineData(0, "  not-a-sha  \n", "")]                        // malformed (padded) output
+    [InlineData(0, "", "")]                                       // exit-zero, empty output
+    public async Task Improver_LegacyPath_PublicationHeadFailure_PreservesAgentAndGitEvidence(
+        int exitCode, string stdout, string stderr)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] staged = ["agents/coder.agents.md", "agents/tester.agents.md"];
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput(staged), ""),
+                // The preparation's two HEAD probes succeed; the PUBLICATION HEAD probe (3rd)
+                // fails in the shape under test.
+                "rev-parse --verify HEAD^{commit}" => ++headCalls == 3
+                    ? (exitCode, stdout, stderr)
+                    : (0, ConfigRepoPreparationFakes.BaselineSha + "\n", ""),
+                _ => null,
+            },
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("Improver analysis of the guidance files"),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            $"improver-legacy-pubhead-{exitCode}-{stdout.Length}", configRepoDir, git,
+            agentRunner: agentRunner);
+
+        // Truthful publication failure.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // THE AGENT EVIDENCE SURVIVES — never an empty output.
+        Assert.StartsWith("Improver analysis of the guidance files", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+
+        // THE GIT DIAGNOSTICS SURVIVE — the staged summary reaches the orchestrator.
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // The sanitized publication-stage reason is reported.
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo publication", StringComparison.Ordinal));
+
+        // PUSH STAYS BLOCKED after the publication-HEAD failure.
+        Assert.DoesNotContain(git.GitCommands, c => c == "push");
+    }
+
+    /// <summary>
+    /// MAJOR-1 (seam route): the converse cell. A publication-HEAD probe that the seam cannot
+    /// even launch (a throwing command mapped to the seam's exit -1 rejection) must equally
+    /// preserve the accumulated agent output and the staged summary, and must not push.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_PublicationHeadThrow_PreservesAgentAndGitEvidence()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["rev-parse", "--verify", "HEAD^{commit}"] => ++headCalls == 3
+                    ? throw new InvalidOperationException("publication head probe exploded")
+                    : new GitProcessResult(0, ConfigRepoPreparationFakes.BaselineSha + "\n", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("Seam improver analysis"),
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-pubhead-throw", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // Evidence preserved on BOTH axes.
+        Assert.StartsWith("Seam improver analysis", result.Output, StringComparison.Ordinal);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+
+        // SANITIZED: the seam's fixed rejection classification, never the raw message.
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo publication", StringComparison.Ordinal)
+                && !i.Contains("exploded", StringComparison.Ordinal));
+
+        // Push never launched.
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    /// <summary>
+    /// (c) The REMAINING publication-HEAD cells, completing the matrix over both routes and
+    /// both failure forms. Round 1 covered the legacy NONZERO/MALFORMED/EMPTY probe and the
+    /// seam THROW; these are the converse cells — the legacy THROW and the seam
+    /// NONZERO/MALFORMED probe.
+    /// <para>
+    /// Every cell asserts the SAME contract: the accumulated agent output and the staged
+    /// <see cref="GitChangeSummary"/> both survive (never empty evidence), the reason is the
+    /// sanitized publication-stage classification, and push stays blocked.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_PublicationHeadThrow_PreservesAgentAndGitEvidence()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] staged = ["agents/coder.agents.md", "agents/reviewer.agents.md"];
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, StagedOutput(staged), "")
+                : null,
+            // The PUBLICATION HEAD probe (the 3rd HEAD probe) THROWS an ordinary exception.
+            GitCommandThrower = args => args == "rev-parse --verify HEAD^{commit}" && ++headCalls == 3
+                ? new InvalidOperationException("legacy publication head probe exploded")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("Legacy improver analysis segment"),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-pubhead-throw", configRepoDir, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // EVIDENCE PRESERVED on both axes — never an empty output, never empty diagnostics.
+        Assert.StartsWith("Legacy improver analysis segment", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Equal(2, result.GitStatus.FilesChanged);
+        Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // SANITIZED: the classification only — the raw exception message never escapes.
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo publication", StringComparison.Ordinal)
+                && i.Contains("InvalidOperationException", StringComparison.Ordinal)
+                && !i.Contains("exploded", StringComparison.Ordinal));
+
+        // PUSH STAYS BLOCKED.
+        Assert.DoesNotContain(git.GitCommands, c => c == "push");
+    }
+
+    /// <summary>
+    /// (c) The seam converse of the nonzero/malformed publication-HEAD probe.
+    /// </summary>
+    [Theory]
+    [InlineData(128, "", "fatal: publication HEAD refused")]  // nonzero exit
+    [InlineData(0, "  not-a-sha  \n", "")]                    // malformed (padded) output
+    [InlineData(0, "", "")]                                   // exit-zero, empty output
+    public async Task Improver_SeamPath_PublicationHeadNonzeroOrMalformed_PreservesEvidence(
+        int exitCode, string stdout, string stderr)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                // The PUBLICATION HEAD probe (the 3rd) fails in the shape under test.
+                ["rev-parse", "--verify", "HEAD^{commit}"] => ++headCalls == 3
+                    ? new GitProcessResult(exitCode, stdout, stderr)
+                    : new GitProcessResult(0, ConfigRepoPreparationFakes.BaselineSha + "\n", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("Seam improver analysis segment"),
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-seam-pubhead-{exitCode}-{stdout.Length}", configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // EVIDENCE PRESERVED on both axes.
+        Assert.StartsWith("Seam improver analysis segment", result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Git Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Equal(1, result.GitStatus.FilesChanged);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+
+        // The sanitized publication-stage reason is reported.
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo publication", StringComparison.Ordinal));
+
+        // PUSH STAYS BLOCKED after the publication-HEAD failure.
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    // ── MAJOR-2: confirmed publication survives a throwing post-push log ──────
+
+    /// <summary>
+    /// A <see cref="TextWriter"/> that throws on the FIRST write matching a needle, then
+    /// behaves normally. It models a disposed/failing console writer at one precise point —
+    /// exactly what <see cref="WorkerLogger"/> (which writes straight to Console) exposes the
+    /// production code to.
+    /// </summary>
+    private sealed class ThrowOnNeedleWriter(string needle) : TextWriter
+    {
+        private readonly StringWriter _inner = new();
+        private bool _fired;
+
+        public override System.Text.Encoding Encoding => _inner.Encoding;
+
+        /// <summary>Whether the injected failure actually fired (guards against a vacuous test).</summary>
+        public bool Fired => _fired;
+
+        public override void WriteLine(string? value)
+        {
+            if (!_fired && value is not null && value.Contains(needle, StringComparison.Ordinal))
+            {
+                _fired = true;
+                throw new IOException($"simulated writer failure on '{needle}'");
+            }
+
+            _inner.WriteLine(value);
+        }
+
+        public override void Write(char value) => _inner.Write(value);
+
+        public override string ToString() => _inner.ToString();
+    }
+
+    /// <summary>
+    /// MAJOR-2. After a CONFIRMED exit-zero push the production code logs
+    /// <c>Pushed config repo changes …</c> through <see cref="WorkerLogger.Info"/>, which writes
+    /// straight to <see cref="Console.Out"/>. A failing writer therefore throws into the generic
+    /// handler AFTER the publication was confirmed.
+    /// <para>
+    /// REMOVAL-PROOF: both publication facts (the published SHA and the <c>Pushed=true</c>
+    /// summary) must be retained BEFORE that fallible log, and every later outcome constructed
+    /// from the retained evidence. Reintroducing the defect (materializing <c>Pushed=true</c>
+    /// only at the return statement) yields a result whose GitStatus is null/unpushed even
+    /// though finalization reset to the published SHA — failing the assertions below.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_ConfirmedPush_ThrowingPostPushLog_StillReportsPushed()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] staged = ["agents/coder.agents.md"];
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput(staged), ""),
+                "rev-parse --verify HEAD^{commit}" => (0, (++headCalls <= 2
+                    ? ConfigRepoPreparationFakes.BaselineSha
+                    : PublicationSha) + "\n", ""),
+                _ => null,
+            },
+        };
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        // The FIRST post-push info line is the one that throws.
+        var throwingOut = new ThrowOnNeedleWriter("Pushed config repo changes");
+        using var errWriter = new StringWriter();
+        TaskResult result;
+        try
+        {
+            Console.SetOut(throwingOut);
+            Console.SetError(errWriter);
+
+            var executor = new TaskExecutor(
+                new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
+            result = await executor.ExecuteAsync(
+                BuildImproverTask("improver-pushlog-throws"), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+
+        // NON-VACUITY: the injected failure really fired on the post-push log line.
+        Assert.True(throwingOut.Fired, "the post-push log write did not throw — the test is vacuous");
+
+        // THE CONFIRMED PUBLICATION SURVIVES the throwing log.
+        Assert.NotNull(result.GitStatus);
+        Assert.True(result.GitStatus!.Pushed, "Pushed=true was lost when the post-push log threw");
+        Assert.Equal(staged, result.GitStatus.ChangedFiles);
+
+        // And the step-end cleanup used the PUBLISHED SHA (the retained selection), proving the
+        // two facts were retained together.
+        Assert.Contains($"reset --hard {PublicationSha}", git.GitCommands);
+        Assert.DoesNotContain(
+            git.GitCommands,
+            c => c == $"reset --hard {ConfigRepoPreparationFakes.BaselineSha}"
+                && git.GitCommands.IndexOf(c) > git.GitCommands.IndexOf("push"));
+    }
+
+    // ── MAJOR-3: finalization is exception-safe against its own diagnostics ───
+
+    /// <summary>
+    /// MAJOR-3 (successful cleanup). The verified-clean path logs
+    /// <c>Config repo cleanup verified …</c>. Through <see cref="WorkerLogger.Info"/> that write
+    /// goes straight to <see cref="Console.Out"/>, so a failing writer would escape
+    /// <c>FinalizeImproverOutcomeAsync</c> and hide the primary result — or turn a VERIFIED
+    /// cleanup into a cleanup failure.
+    /// <para>
+    /// REMOVAL-PROOF: the diagnostic must go through a nonthrowing boundary. Reintroducing the
+    /// defect (calling <c>_log.Info</c>/<c>_log.Error</c> directly) makes the throw escape and
+    /// this test fail — the result is no longer the primary Completed outcome.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_ThrowingCleanupSuccessLog_StillReturnsThePrimaryResult()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, "", "") // a genuine no-change completion
+                : null,
+        };
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        var throwingOut = new ThrowOnNeedleWriter("Config repo cleanup verified");
+        using var errWriter = new StringWriter();
+        TaskResult result;
+        try
+        {
+            Console.SetOut(throwingOut);
+            Console.SetError(errWriter);
+
+            var executor = new TaskExecutor(
+                new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
+            result = await executor.ExecuteAsync(
+                BuildImproverTask("improver-cleanuplog-throws"), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+
+        Assert.True(throwingOut.Fired, "the cleanup success log did not throw — the test is vacuous");
+
+        // THE PRIMARY RESULT SURVIVES: a verified cleanup stays a normal completion — the
+        // failing diagnostic neither escapes nor manufactures a cleanup failure.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// MAJOR-3 (failed cleanup). The cleanup-failure diagnostic is written from inside a catch
+    /// body. A throwing writer there would escape <c>FinalizeImproverOutcomeAsync</c> entirely
+    /// and hide the primary result.
+    /// <para>
+    /// REMOVAL-PROOF: with the nonthrowing boundary the primary outcome still surfaces AND the
+    /// cleanup failure is still composed onto it. Reintroducing the defect propagates the
+    /// writer's IOException out of ExecuteAsync (or replaces the outcome), failing this test.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_ThrowingCleanupFailureLog_StillReturnsComposedResult()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var statusCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                // The CLEANUP's status (the 2nd) reports residue: the cleanup FAILS, so the
+                // failure diagnostic is written from inside the catch body.
+                "status --porcelain=v1 --untracked-files=all --ignored" =>
+                    (0, ++statusCalls == 1 ? "" : "?? residue.txt\n", ""),
+                _ => null,
+            },
+        };
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        using var outWriter = new StringWriter();
+        var throwingErr = new ThrowOnNeedleWriter("Config repo cleanup rejected");
+        TaskResult result;
+        try
+        {
+            Console.SetOut(outWriter);
+            Console.SetError(throwingErr);
+
+            var executor = new TaskExecutor(
+                new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
+            result = await executor.ExecuteAsync(
+                BuildImproverTask("improver-cleanupfaillog-throws"), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+
+        Assert.True(throwingErr.Fired, "the cleanup failure log did not throw — the test is vacuous");
+
+        // THE PRIMARY RESULT SURVIVES and the cleanup failure is composed onto it: the
+        // confirmed publication is retained, and the outcome is the truthful Failed/FAIL.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup rejected", StringComparison.Ordinal));
+    }
+
+    // ── MAJOR-4: cancellation/retry paths keep the accumulated agent output ───
+
+    /// <summary>
+    /// MAJOR-4 (requested cancellation). Once the initial prompt has returned, a cancellation
+    /// during size enforcement or publication must not replace the agent's real output with the
+    /// bare <c>"Task was cancelled."</c> notice — finalization would then compose its cleanup
+    /// diagnostics onto an impoverished result.
+    /// <para>
+    /// REMOVAL-PROOF: the accumulated initial/retry output must be preserved ahead of the
+    /// notice, with Cancelled/CANCELLED semantics unchanged. Reintroducing the defect (a bare
+    /// <c>Output = "Task was cancelled."</c>) drops the agent segments and fails this test.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_CancellationAfterPrompt_PreservesAccumulatedAgentOutput()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        const string agentSegment = "Improver reviewed every guidance file and appended a lesson";
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+            {
+                // The publication's first command cancels the execution token — AFTER the
+                // agent already produced its output.
+                if (args == "add agents/*.agents.md")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                return null;
+            },
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-cancel-preserves-output", configRepoDir, git, cts.Token, agentRunner);
+
+        // NON-VACUITY: the agent really ran before the cancellation.
+        Assert.Single(agentRunner.PromptCalls);
+
+        // CANCELLED SEMANTICS UNCHANGED.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+
+        // THE ACCUMULATED AGENT OUTPUT SURVIVES, with the notice retained too.
+        Assert.Contains(agentSegment, result.Output, StringComparison.Ordinal);
+        Assert.Contains("Task was cancelled.", result.Output, StringComparison.Ordinal);
+        Assert.StartsWith(agentSegment, result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// MAJOR-4 (retry exception). A later exception — here thrown by the size-enforcement
+    /// RETRY prompt, after the initial prompt already returned — must not discard the
+    /// accumulated initial output.
+    /// <para>
+    /// REMOVAL-PROOF: the generic handler must compose its sanitized diagnostic ONTO the
+    /// accumulated evidence. Reintroducing the defect (a bare <c>Output = $"Error [{safe}]"</c>)
+    /// loses the initial segment and fails this test. The diagnostic itself stays sanitized:
+    /// the raw exception message never appears.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_RetryException_PreservesAccumulatedAgentOutput()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string initialSegment = "Initial improver analysis of every guidance file";
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = async (prompt, _, ct) =>
+            {
+                if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                {
+                    // The size-enforcement RETRY throws — after the initial output exists.
+                    throw new InvalidOperationException("condensation prompt exploded");
+                }
+
+                // The improver's own oversized edit, written from inside the agent callback.
+                await File.WriteAllTextAsync(
+                    filePath, new string('x', WorkerConstants.AgentsMdMaxCharacters + 1), ct);
+                return initialSegment;
+            },
+        };
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-retry-throw-preserves-output", configRepoDir, git, agentRunner: agentRunner);
+
+        // NON-VACUITY: both the initial prompt and the throwing retry prompt were delivered.
+        Assert.Equal(2, agentRunner.PromptCalls.Count);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+
+        // THE ACCUMULATED INITIAL OUTPUT SURVIVES the later retry exception.
+        Assert.Contains(initialSegment, result.Output, StringComparison.Ordinal);
+        Assert.StartsWith(initialSegment, result.Output, StringComparison.Ordinal);
+
+        // SANITIZED: the classification only — the raw exception message never escapes.
+        Assert.Contains("InvalidOperationException", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("exploded", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// MAJOR-4 + AC5 composition: a cancellation whose step-end cleanup ALSO fails keeps
+    /// Cancelled/CANCELLED, preserves the accumulated agent output, AND reports the cleanup
+    /// failure explicitly — all three at once.
+    /// </summary>
+    [Fact]
+    public async Task Improver_CancellationWithCleanupFailure_KeepsOutputStatusAndDiagnostics()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        const string agentSegment = "Improver produced real analysis before the shutdown";
+        var statusCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+            {
+                if (args == "add agents/*.agents.md")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                // The CLEANUP's status (the 2nd) reports residue → cleanup failure.
+                if (args == "status --porcelain=v1 --untracked-files=all --ignored")
+                    return (0, ++statusCalls == 1 ? "" : "?? residue.txt\n", "");
+
+                return null;
+            },
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-cancel-plus-cleanup-fail", configRepoDir, git, cts.Token, agentRunner);
+
+        // Cancelled semantics preserved.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+
+        // Agent evidence preserved.
+        Assert.Contains(agentSegment, result.Output, StringComparison.Ordinal);
+
+        // Cleanup failure reported EXPLICITLY (AC5) rather than silently swallowed.
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo cleanup rejected", StringComparison.Ordinal));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (d) + (e) REAL-GIT residue cells: residue created DURING the agent run
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// (d) REAL GIT — THE NO-CHANGE CELL. The agent makes NO guidance edit (so the staged diff
+    /// is genuinely empty and the run is a normal no-change completion) but leaves every
+    /// residue class behind DURING its run: a modified tracked file that it reverts to the
+    /// baseline bytes, an untracked file and an ignored file.
+    /// <para>
+    /// The residue is created INSIDE the agent callback — i.e. AFTER the pre-run preparation's
+    /// own <c>clean -fdx</c> — so only the STEP-END cleanup can remove it. That is exactly what
+    /// this test pins: at ExecuteAsync RETURN the verbose porcelain status is EMPTY, the residue
+    /// files are gone from disk, HEAD is still the baseline, and nothing was published.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF: without the step-end cleanup the untracked/ignored files survive to the
+    /// end state and the status assertion fails.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // tokenized seam route
+    [InlineData(false)]  // legacy opaque route
+    public async Task RealGit_Finalization_NoChangeRun_RemovesResidueCreatedDuringTheAgentRun(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"fin-nochange-{(viaSeam ? "seam" : "legacy")}",
+            "REMOTE-BASELINE-V1\n",
+            seedIgnoreRuleAndStagedBaseline: true);
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+        var outsideSentinelBefore = File.ReadAllText(playground.OutsideSentinelPath);
+
+        // The agent creates residue DURING the run and makes NO net guidance change: the
+        // guidance file is written and then restored to its baseline bytes, so the staged diff
+        // is empty and this is a genuine no-change completion.
+        string? seenStatusDuringRun = null;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "TRANSIENT-EDIT\n");
+                File.WriteAllText(Path.Combine(worker, "untracked-nochange.txt"), "untracked residue\n");
+                File.WriteAllText(Path.Combine(worker, "ignored.txt"), "ignored residue\n");
+                // Revert the tracked file so the publication stage sees an EMPTY staged diff.
+                File.WriteAllText(playground.GuidancePath, "REMOTE-BASELINE-V1\n");
+                // The residue is genuinely present at the end of the agent's turn.
+                seenStatusDuringRun = playground.WorkerVerboseStatus();
+                return Task.FromResult("No guidance changes were necessary");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-fin-nochange-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // NON-VACUITY: the residue really existed when the agent finished.
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.NotNull(seenStatusDuringRun);
+        Assert.Contains("untracked-nochange.txt", seenStatusDuringRun!, StringComparison.Ordinal);
+        Assert.Contains("ignored.txt", seenStatusDuringRun!, StringComparison.Ordinal);
+
+        // A genuine NO-CHANGE completion: nothing staged, nothing published.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+
+        // ── THE END STATE AT ExecuteAsync RETURN ──────────────────────────────
+        // Every residue class the agent created is gone, and the tree is verified clean.
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.False(File.Exists(Path.Combine(worker, "untracked-nochange.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ignored.txt")));
+
+        // The checkout still sits on the captured baseline with the baseline guidance content,
+        // and the remote was never advanced.
+        Assert.Equal(baselineSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.Equal("REMOTE-BASELINE-V1\n", File.ReadAllText(playground.GuidancePath));
+        Assert.Equal(baselineSha, playground.RemoteMainSha());
+
+        // The OUTSIDE sentinel is untouched, byte for byte.
+        Assert.Equal(outsideSentinelBefore, File.ReadAllText(playground.OutsideSentinelPath));
+    }
+
+    /// <summary>
+    /// (e) REAL GIT — THE CONFIRMED-SUCCESS CELL. The agent publishes a real guidance edit AND
+    /// leaves UNRELATED residue behind during its run: an unstaged edit to a tracked file that
+    /// is not part of the publication, an untracked file, and an ignored file.
+    /// <para>
+    /// After the confirmed push, finalization must reset to the PUBLISHED tip (not the older
+    /// baseline), so the published guidance survives in the working tree while every unrelated
+    /// residue class is removed. This is the cell that distinguishes "clean up everything" from
+    /// "clean up to the published state".
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF on two axes: dropping the cleanup leaves the unrelated residue behind, and
+    /// resetting to the BASELINE instead of the published tip loses the published guidance from
+    /// the working tree (and moves HEAD off the remote's tip).
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]   // tokenized seam route
+    [InlineData(false)]  // legacy opaque route
+    public async Task RealGit_Finalization_ConfirmedSuccess_KeepsPublishedTipAndCleansUnrelatedResidue(
+        bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"fin-success-residue-{(viaSeam ? "seam" : "legacy")}",
+            "REMOTE-BASELINE-V1\n",
+            seedIgnoreRuleAndStagedBaseline: true);
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+        var outsideSentinelBefore = File.ReadAllText(playground.OutsideSentinelPath);
+
+        const string publishedGuidance = "PUBLISHED-GUIDANCE-V2\n";
+        string? seenStatusDuringRun = null;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                // The improver's REAL job: edit the guidance file (the publication stage
+                // stages/commits/pushes only agents/*.agents.md).
+                File.WriteAllText(playground.GuidancePath, publishedGuidance);
+
+                // UNRELATED residue created during the same run — none of it is published.
+                File.WriteAllText(Path.Combine(worker, "staged.txt"), "UNRELATED-TRACKED-EDIT\n");
+                File.WriteAllText(Path.Combine(worker, "untracked-unrelated.txt"), "untracked residue\n");
+                File.WriteAllText(Path.Combine(worker, "ignored.txt"), "ignored residue\n");
+                seenStatusDuringRun = playground.WorkerVerboseStatus();
+                return Task.FromResult("Improver published a guidance update");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-fin-success-residue-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // NON-VACUITY: the unrelated residue really existed when the agent finished.
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.NotNull(seenStatusDuringRun);
+        Assert.Contains("untracked-unrelated.txt", seenStatusDuringRun!, StringComparison.Ordinal);
+        Assert.Contains("staged.txt", seenStatusDuringRun!, StringComparison.Ordinal);
+        Assert.Contains("ignored.txt", seenStatusDuringRun!, StringComparison.Ordinal);
+
+        // CONFIRMED PUBLICATION.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.Equal([RealGitPlayground.GuidanceRelativePath], result.GitStatus.ChangedFiles);
+        Assert.DoesNotContain("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+
+        // ── THE END STATE AT ExecuteAsync RETURN ──────────────────────────────
+        // THE PUBLISHED GUIDANCE SURVIVES in the working tree...
+        Assert.Equal(publishedGuidance, File.ReadAllText(playground.GuidancePath));
+        // ...and on the remote, which really advanced past the baseline.
+        var remoteShaAfter = playground.RemoteMainSha();
+        Assert.NotEqual(baselineSha, remoteShaAfter);
+        Assert.Equal(
+            publishedGuidance,
+            RealGitOutput(playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath));
+
+        // THE LOCAL PUBLISHED TIP survives — finalization reset to the PUBLISHED SHA, never
+        // back to the older baseline.
+        var finalHead = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+        Assert.Equal(remoteShaAfter, finalHead);
+        Assert.NotEqual(baselineSha, finalHead);
+
+        // EVERY UNRELATED RESIDUE CLASS IS CLEANED, and the tree is verified clean.
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.False(File.Exists(Path.Combine(worker, "untracked-unrelated.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ignored.txt")));
+        // The unrelated TRACKED file is restored to its committed content (the edit is gone).
+        Assert.Equal(
+            RealGitPlayground.StagedBaselineContent,
+            File.ReadAllText(Path.Combine(worker, "staged.txt")));
+
+        // The OUTSIDE sentinel is untouched, byte for byte.
+        Assert.Equal(outsideSentinelBefore, File.ReadAllText(playground.OutsideSentinelPath));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ITERATION 3 — the evidence composition is scoped to the IMPROVER only
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Builds a NON-IMPROVER task for the given role, with one repository and a feature branch
+    /// so the ordinary (non-Improver) execution path runs.
+    /// </summary>
+    private static WorkTask BuildNonImproverTask(string id, WorkerRole role) => new()
+    {
+        TaskId = id,
+        GoalId = $"goal-{id}",
+        GoalDescription = "Test goal",
+        Prompt = "Do the work",
+        Role = role,
+        Repositories = [Repo("repoA")],
+        BranchInfo = new BranchSpec
+        {
+            Action = BranchAction.Checkout, BaseBranch = "main", FeatureBranch = "feature-branch",
+        },
+    };
+
+    /// <summary>
+    /// (b) NON-IMPROVER ROLES KEEP THEIR BASE CANCELLATION OUTPUT, BYTE FOR BYTE.
+    /// <para>
+    /// The Improver's evidence accumulator must NOT leak into other roles. A Coder, Tester or
+    /// Reviewer that is cancelled AFTER its initial prompt returned real agent output must
+    /// still return the BARE "Task was cancelled." notice — not the agent output plus the
+    /// notice.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF: the assertion pins the EXACT output string with Assert.Equal. Un-scoping
+    /// the composition (letting the accumulator record/compose for every role) makes Output
+    /// become "&lt;agent output&gt;\n\nTask was cancelled." and fails this test — a vague
+    /// non-containment assertion would not.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    public async Task NonImprover_CancelledAfterPrompt_ReturnsBareBaseCancellationOutput(WorkerRole role)
+    {
+        using var cts = new CancellationTokenSource();
+        const string agentSegment = "Non-improver agent produced substantial output before shutdown";
+
+        // The git status call runs AFTER the prompt on every non-Improver role; cancelling
+        // there reproduces "cancelled after the initial prompt returned".
+        var git = new CancellingStatusGit(cts);
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildNonImproverTask($"nonimprover-cancel-{role}", role), cts.Token);
+
+        // NON-VACUITY: the agent really ran and produced output before the cancellation. The
+        // Tester additionally fires its metrics-enforcement retry before the status probe, so
+        // the expected prompt count is role-dependent.
+        Assert.Equal(role == WorkerRole.Tester ? 2 : 1, agentRunner.PromptCalls.Count);
+        Assert.True(cts.IsCancellationRequested, "the execution token was never cancelled — the test is vacuous");
+
+        // BASE BEHAVIOR, EXACTLY: status, verdict and the BARE notice.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        Assert.Equal("Task was cancelled.", result.Output);
+        // The base cancellation result carries no GitStatus either.
+        Assert.Null(result.GitStatus);
+    }
+
+    /// <summary>
+    /// (b) NON-IMPROVER ROLES KEEP THEIR BASE FAILURE OUTPUT, BYTE FOR BYTE: the sanitized
+    /// diagnostic ALONE, with no accumulated agent output prepended.
+    /// <para>
+    /// REMOVAL-PROOF: the exact output string is pinned. Un-scoping the composition prepends
+    /// the agent's output and fails this test.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerRole.Coder)]
+    [InlineData(WorkerRole.Tester)]
+    [InlineData(WorkerRole.Reviewer)]
+    public async Task NonImprover_FailureAfterPrompt_ReturnsSanitizedErrorAlone(WorkerRole role)
+    {
+        const string agentSegment = "Non-improver agent produced substantial output before failing";
+        var git = new ThrowingStatusGit(new InvalidOperationException("status probe exploded"));
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildNonImproverTask($"nonimprover-fail-{role}", role),
+            TestContext.Current.CancellationToken);
+
+        // NON-VACUITY: the agent really ran and produced output before the failure. (The
+        // Tester additionally fires its metrics-enforcement retry before the status probe.)
+        Assert.Equal(role == WorkerRole.Tester ? 2 : 1, agentRunner.PromptCalls.Count);
+
+        // BASE BEHAVIOR, EXACTLY: the sanitized classification ALONE.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Equal($"Error [{nameof(InvalidOperationException)}]", result.Output);
+        // SANITIZED: neither the raw message nor the agent output leaks into the result.
+        Assert.DoesNotContain("exploded", result.Output, StringComparison.Ordinal);
+        Assert.Null(result.GitStatus);
+    }
+
+    /// <summary>
+    /// (b) The NON-CANCELLATION OperationCanceledException boundary (an API timeout) keeps its
+    /// base output for non-Improver roles too: the sanitized diagnostic alone, with the exact
+    /// base wording.
+    /// </summary>
+    [Fact]
+    public async Task NonImprover_ApiTimeoutAfterPrompt_ReturnsSanitizedTimeoutErrorAlone()
+    {
+        using var unrelatedCts = new CancellationTokenSource();
+        var git = new ThrowingStatusGit(
+            new OperationCanceledException("simulated timeout", unrelatedCts.Token));
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult("Coder output before the API timeout"),
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildNonImproverTask("nonimprover-timeout", WorkerRole.Coder),
+            TestContext.Current.CancellationToken);
+
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        // BASE BEHAVIOR, EXACTLY — the diagnostic alone, no agent output prepended.
+        Assert.Equal(
+            $"Error: API call failed or timed out [{nameof(OperationCanceledException)}]",
+            result.Output);
+    }
+
+    /// <summary>
+    /// (b) THE NON-IMPROVER RETRY-PATH FORMATTING is unchanged: with an EMPTY initial agent
+    /// output, the tester's metrics-enforcement retry still produces the base
+    /// "\n\n[Test metrics enforcement]\n&lt;retry&gt;" shape — i.e. a LEADING blank separator —
+    /// rather than the accumulator's "first segment wins" shape.
+    /// <para>
+    /// REMOVAL-PROOF: rewriting the helper to accumulate through the evidence object drops the
+    /// leading separator (the empty initial output is skipped), so this exact assertion fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task NonImprover_TesterRetryWithEmptyInitialOutput_KeepsBaseFormatting()
+    {
+        const string retrySegment = "Tester retry produced the metrics";
+        var promptCount = 0;
+        var git = new MockGitOperations { FilesChanged = 0 };
+        var agentRunner = new MockAgentRunner
+        {
+            // The INITIAL prompt returns EMPTY output; the metrics-enforcement retry returns
+            // real text. The base helper concatenates onto the empty string, keeping the
+            // leading "\n\n" separator.
+            PromptResponder = (_, _, _) =>
+                Task.FromResult(++promptCount == 1 ? string.Empty : retrySegment),
+        };
+        var executor = new TaskExecutor(agentRunner, gitOperations: git);
+
+        var result = await executor.ExecuteAsync(
+            BuildNonImproverTask("nonimprover-tester-retry", WorkerRole.Tester),
+            TestContext.Current.CancellationToken);
+
+        // NON-VACUITY: the metrics-enforcement retry really fired.
+        Assert.Equal(2, agentRunner.PromptCalls.Count);
+
+        // BASE FORMATTING, EXACTLY: the empty initial output still contributes its separator.
+        Assert.Equal($"\n\n[Test metrics enforcement]\n{retrySegment}", result.Output);
+    }
+
+    /// <summary>
+    /// (a) THE IMPROVER SIDE STILL COMPOSES. The same "cancelled after the prompt" shape that
+    /// returns the bare notice for a Coder/Tester/Reviewer must STILL preserve the accumulated
+    /// agent output for the Improver — the scoping fixed the leak without weakening the
+    /// Improver contract.
+    /// <para>
+    /// REMOVAL-PROOF: dropping the Improver-scoped composition (disabling the accumulator for
+    /// every role) makes Output the bare notice and fails this test, which is the exact
+    /// converse of the non-Improver tests above.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Improver_CancelledAfterPrompt_StillComposesAccumulatedOutput()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        const string agentSegment = "Improver analysis retained across the cancellation";
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+            {
+                if (args == "add agents/*.agents.md")
+                {
+                    cts.Cancel();
+                    throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                return null;
+            },
+        };
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) => Task.FromResult(agentSegment),
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-scoped-cancel", configRepoDir, git, cts.Token, agentRunner);
+
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.True(cts.IsCancellationRequested);
+
+        // Cancelled semantics preserved, AND the accumulated evidence is composed with the
+        // notice — the exact opposite of the non-Improver contract.
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        Assert.Equal($"{agentSegment}\n\nTask was cancelled.", result.Output);
+    }
+
+    /// <summary>
+    /// (a) The Improver's RETRY-exception path likewise still composes: an exception thrown by
+    /// the size-enforcement retry keeps the accumulated initial output ahead of the sanitized
+    /// diagnostic.
+    /// </summary>
+    [Fact]
+    public async Task Improver_RetryExceptionAfterPrompt_StillComposesAccumulatedOutput()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "coder.agents.md");
+        const string initialSegment = "Improver initial analysis retained across the retry throw";
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = async (prompt, _, ct) =>
+            {
+                if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                    throw new InvalidOperationException("condensation prompt exploded");
+
+                await File.WriteAllTextAsync(
+                    filePath, new string('x', WorkerConstants.AgentsMdMaxCharacters + 1), ct);
+                return initialSegment;
+            },
+        };
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-scoped-retry-throw", configRepoDir, git, agentRunner: agentRunner);
+
+        Assert.Equal(2, agentRunner.PromptCalls.Count);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+
+        // The accumulated output is composed with the sanitized diagnostic, exactly.
+        Assert.Equal(
+            $"{initialSegment}\n\nError [{nameof(InvalidOperationException)}]",
+            result.Output);
+        Assert.DoesNotContain("exploded", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An <see cref="IGitOperations"/> whose status probe REQUESTS the execution cancellation
+    /// and throws — reproducing "cancelled after the initial prompt returned" on the ordinary
+    /// non-Improver path. Everything else behaves like a no-op clone/branch transport.
+    /// </summary>
+    private sealed class CancellingStatusGit(CancellationTokenSource cts) : IGitOperations
+    {
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct) => Task.CompletedTask;
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => Task.FromResult<string?>(null);
+        public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+            string workDir, string args, CancellationToken ct)
+            => Task.FromResult((0, string.Empty, string.Empty));
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
+
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+        {
+            cts.Cancel();
+            throw new OperationCanceledException("shutdown", cts.Token);
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="IGitOperations"/> whose status probe THROWS the supplied exception — the
+    /// failure counterpart of <see cref="CancellingStatusGit"/>.
+    /// </summary>
+    private sealed class ThrowingStatusGit(Exception failure) : IGitOperations
+    {
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct) => Task.CompletedTask;
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => Task.FromResult<string?>(null);
+        public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+            string workDir, string args, CancellationToken ct)
+            => Task.FromResult((0, string.Empty, string.Empty));
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
+
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+            => throw failure;
+    }
 }
