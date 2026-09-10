@@ -53,6 +53,9 @@ public sealed class TaskExecutorSessionTests
         /// <summary>Last session JSON passed to <see cref="SaveSessionAsync"/>.</summary>
         public string? LastSavedJson { get; private set; }
 
+        /// <summary>Optional observation invoked synchronously when a save is attempted.</summary>
+        public Action? BeforeSave { get; set; }
+
         /// <summary>Seeds the store with pre-existing session JSON for the given session ID.</summary>
         public void Seed(string sessionId, string json) => _store[sessionId] = json;
 
@@ -70,6 +73,7 @@ public sealed class TaskExecutorSessionTests
         public Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct)
         {
             SaveCallCount++;
+            BeforeSave?.Invoke();
             if (SaveShouldThrowCancelled) throw new OperationCanceledException("Simulated cancellation during SaveSession");
             if (SaveShouldFail) throw new InvalidOperationException("Simulated SaveSession failure");
             _store[sessionId] = sessionJson;
@@ -120,23 +124,27 @@ public sealed class TaskExecutorSessionTests
 
         public int GetContextUsagePercent() => 0;
 
+        public int PromptCallCount { get; private set; }
+
+        public Func<string, string, CancellationToken, Task<string>>? PromptResponder { get; set; }
+
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default) => Task.CompletedTask;
 
-        public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+        public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
-            // Simulate the runner updating the session after execution
-            if (_session is AgentSession existingSession)
+            PromptCallCount++;
+            // Simulate the runner updating the session after execution.
+            if (_session is not AgentSession)
             {
-                // session already set; no-op (in-place update would happen via CodingAgent in real code)
-            }
-            else
-            {
-                // Create a new session as SharpCoderRunner would
+                // Create a new session as SharpCoderRunner would.
                 _session = AgentSession.Create("runner-created-" + Guid.NewGuid().ToString("N")[..8]);
             }
-            return Task.FromResult("Mock response");
+
+            return PromptResponder is null
+                ? "Mock response"
+                : await PromptResponder(prompt, workDir, ct);
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -596,6 +604,68 @@ public sealed class TaskExecutorSessionTests
                 ? Task.FromResult((128, "", "fatal: could not read from remote repository"))
                 : Task.FromResult(
                     ConfigRepoPreparationFakes.LegacyAnswer(workDir, args) ?? (0, "", ""));
+    }
+
+    /// <summary>
+    /// Exhausted Improver compression still reaches the common session epilogue exactly once,
+    /// after the initial prompt and all three condensation prompts. The runner creates a real
+    /// session on its first prompt, so this does not rely on a no-session short-circuit.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverExhaustion_SavesSessionOnceAfterAllPrompts()
+    {
+        var configRepo = Path.Combine(Path.GetTempPath(), $"CfgRepoSessionSkip_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepo, ".git"));
+        Directory.CreateDirectory(Path.Combine(configRepo, "agents"));
+        try
+        {
+            var oversizedPath = Path.Combine(configRepo, "agents", "session-blocker.agents.md");
+            var sessionClient = new FakeSessionClient();
+            var runner = new SessionTrackingAgentRunner();
+            var responseCount = 0;
+            runner.PromptResponder = async (_, _, ct) =>
+            {
+                responseCount++;
+                if (responseCount == 1)
+                {
+                    await File.WriteAllTextAsync(
+                        oversizedPath,
+                        new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
+                        ct);
+                }
+                return $"session-segment-{responseCount}";
+            };
+            sessionClient.BeforeSave = () => Assert.Equal(4, runner.PromptCallCount);
+
+            var executor = new TaskExecutor(
+                runner,
+                gitOperations: new NoOpGitOperations(),
+                sessionClient: sessionClient,
+                configRepoDir: configRepo);
+            var task = BuildTask("goal-improver-exhausted-session") with
+            {
+                Role = WorkerRole.Improver,
+                Repositories = [],
+            };
+
+            var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+            Assert.Equal(TaskOutcome.Completed, result.Status);
+            Assert.Equal("SKIP", result.Metrics!.Verdict);
+            Assert.Equal(4, runner.PromptCallCount);
+            Assert.Equal(4, responseCount);
+            Assert.Equal(1, sessionClient.GetCallCount);
+            Assert.Equal(1, sessionClient.SaveCallCount);
+            Assert.Equal("goal-improver-exhausted-session", sessionClient.LastSavedSessionId);
+            Assert.NotNull(sessionClient.LastSavedJson);
+            Assert.NotNull(JsonSerializer.Deserialize<AgentSession>(
+                sessionClient.LastSavedJson!, AIJsonUtilities.DefaultOptions));
+        }
+        finally
+        {
+            if (Directory.Exists(configRepo))
+                TestHelpers.ForceDeleteDirectory(configRepo);
+        }
     }
 
     /// <summary>

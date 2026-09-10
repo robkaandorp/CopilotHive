@@ -515,32 +515,77 @@ public sealed class TaskExecutor(
             GitChangeSummary? aggregatedStatus = null;
             List<string> pushErrors = [];
 
+            // Non-null EXACTLY when this Improver exhausted its guidance-compression retries
+            // and therefore published nothing. It carries the generated exhaustion warning and
+            // drives the AUTHORITATIVE SKIP verdict selected after the ordinary report/default
+            // metric selection below.
+            string? improverSkipWarning = null;
+
             if (isImprover)
             {
                 // Enforce character limit on *.agents.md files before committing.
-                // Re-prompts Copilot in the same session to condense if over limit.
-                copilotOutput = await EnsureAgentsMdWithinLimitsAsync(agentEvidence, ct);
+                // Re-prompts Copilot in the same session to condense if over limit, and
+                // returns the EXPLICIT limits-satisfied / exhausted decision this branch acts
+                // on. Every returned agent segment is already recorded in agentEvidence.
+                var limits = await EnsureAgentsMdWithinLimitsAsync(agentEvidence, ct);
 
-                // Improver: commit and push changes to the config repo agents folder.
-                // The result distinguishes a successful EMPTY staged diff (a genuine no-change
-                // completion) from every FAILED preparation command. A failed add/diff/commit/
-                // pull/push is a publication FAILURE: the accumulated agent/retry output is
-                // preserved verbatim and a sanitized stage-specific reason is appended, and the
-                // throw is mapped to TaskOutcome.Failed + an authoritative FAIL verdict below —
-                // regardless of any test/worker report or the default Improver PASS.
-                var publication = await CommitAndPushConfigRepoAsync(ct, finalization);
-                if (publication.FailureReason is { } failureReason)
+                // The accumulated evidence (initial output plus every returned retry segment,
+                // verbatim and in order) is the Improver's output on BOTH decisions.
+                copilotOutput = agentEvidence.Snapshot;
+
+                if (limits.Satisfied)
                 {
-                    // A failed add/diff/commit/pull/push — AND a failed publication-HEAD
-                    // resolution — is a PUBLICATION FAILURE, never a successful no-change
-                    // completion. The accumulated agent/retry output and the staged summary are
-                    // carried on the exception so the catch below preserves them VERBATIM and
-                    // appends only the sanitized stage reason — never replacing the evidence.
-                    throw new ConfigRepoPublicationException(
-                        agentEvidence.Snapshot, failureReason, publication.Summary);
-                }
+                    // Improver: commit and push changes to the config repo agents folder.
+                    // The result distinguishes a successful EMPTY staged diff (a genuine
+                    // no-change completion) from every FAILED preparation command. A failed
+                    // add/diff/commit/pull/push is a publication FAILURE: the accumulated
+                    // agent/retry output is preserved verbatim and a sanitized stage-specific
+                    // reason is appended, and the throw is mapped to TaskOutcome.Failed + an
+                    // authoritative FAIL verdict below — regardless of any test/worker report
+                    // or the default Improver PASS.
+                    var publication = await CommitAndPushConfigRepoAsync(ct, finalization);
+                    if (publication.FailureReason is { } failureReason)
+                    {
+                        // A failed add/diff/commit/pull/push — AND a failed publication-HEAD
+                        // resolution — is a PUBLICATION FAILURE, never a successful no-change
+                        // completion. The accumulated agent/retry output and the staged summary
+                        // are carried on the exception so the catch below preserves them
+                        // VERBATIM and appends only the sanitized stage reason — never
+                        // replacing the evidence.
+                        throw new ConfigRepoPublicationException(
+                            agentEvidence.Snapshot, failureReason, publication.Summary);
+                    }
 
-                aggregatedStatus = publication.Summary;
+                    aggregatedStatus = publication.Summary;
+                }
+                else
+                {
+                    // ── EXHAUSTED GUIDANCE COMPRESSION: publish NOTHING ────────────────
+                    // The initial prompt plus the three condensation retries left at least one
+                    // *.agents.md file over the limit, so the WHOLE update is skipped: none of
+                    // the publication-stage commands (add, staged diff, commit, pull, push)
+                    // runs at all — this is not a publication that is merely reported as
+                    // "not pushed". The existing preparation fetch already ran, and the shared
+                    // finalization below still restores and VERIFIES the baseline.
+                    //
+                    // TOKEN OBSERVATION: skipping publication removes every token-observing
+                    // await from this path, so the execution token is observed EXPLICITLY here.
+                    // A requested cancellation (including one requested by the final
+                    // condensation response) therefore stays Cancelled/CANCELLED and is never
+                    // reported as a benign skip.
+                    ct.ThrowIfCancellationRequested();
+
+                    improverSkipWarning = BuildAgentsMdExhaustionWarning(limits.Remaining);
+
+                    // The GENERATED diagnostic is appended AFTER the agent's own evidence,
+                    // which is never truncated or sanitized.
+                    agentEvidence.Append(improverSkipWarning);
+                    copilotOutput = agentEvidence.Snapshot;
+
+                    // No publication happened: no files changed, nothing pushed. Cleanliness is
+                    // NOT claimed here — only the finalization below may verify it.
+                    aggregatedStatus = new GitChangeSummary();
+                }
             }
             else
             {
@@ -746,6 +791,25 @@ public sealed class TaskExecutor(
 
             foreach (var err in pushErrors)
                 metrics.Issues.Add(err);
+
+            if (improverSkipWarning is not null)
+            {
+                // AUTHORITATIVE SKIP for the exhausted Improver, applied AFTER the ordinary
+                // report/default selection above so an incidental worker/test report (or the
+                // default Improver PASS) can never override it. The existing fields and issues
+                // stay where they are meaningful — only the verdict and the summary are forced:
+                //   * the warning is added to Issues so the orchestrator sees the reason; and
+                //   * the Summary carries the COMPLETE accumulated evidence plus the warning,
+                //     so the receiver's nonblank-summary precedence cannot hide the evidence.
+                // No fabricated test counts are introduced; the counts that a report genuinely
+                // produced are left untouched.
+                metrics = metrics with
+                {
+                    Verdict = "SKIP",
+                    Issues = [.. metrics.Issues, improverSkipWarning],
+                    Summary = copilotOutput,
+                };
+            }
 
             // Persist updated session so future tasks in the same goal can resume context
             if (sessionClient != null && !string.IsNullOrEmpty(task.SessionId))
@@ -1023,26 +1087,55 @@ public sealed class TaskExecutor(
     }
 
     /// <summary>
+    /// The EXPLICIT decision the size-enforcement helper hands back to the Improver branch:
+    /// either the limits are SATISFIED (publication may proceed) or the guidance-compression
+    /// retries were EXHAUSTED with at least one file still over the limit (publication is
+    /// skipped entirely). There is no third, implicit state and no rollback side effect.
+    /// </summary>
+    /// <param name="Satisfied">
+    /// <c>true</c> when NO <c>*.agents.md</c> file exceeds the limit at the decision point —
+    /// including a repair achieved by the THIRD retry, which is success, not exhaustion.
+    /// </param>
+    /// <param name="Remaining">
+    /// The files still over the limit when <paramref name="Satisfied"/> is <c>false</c>, with
+    /// their character counts. Empty when the limits are satisfied.
+    /// </param>
+    private sealed record AgentsMdLimitDecision(
+        bool Satisfied, IReadOnlyList<(string FileName, int CharCount)> Remaining)
+    {
+        /// <summary>The satisfied decision — nothing remains over the limit.</summary>
+        public static readonly AgentsMdLimitDecision LimitsSatisfied = new(true, []);
+    }
+
+    /// <summary>
     /// Checks all *.agents.md files in the config repo agents folder against the character limit.
-    /// If any file exceeds the limit, re-prompts Copilot in the same session to condense it.
-    /// After max retries, discards all changes to keep the config repo clean.
+    /// If any file exceeds the limit, re-prompts Copilot in the same session to condense it:
+    /// the check runs BEFORE each retry and once more AFTER the third retry, so the agent
+    /// receives the initial prompt plus AT MOST three condensation prompts.
+    /// <para>
+    /// Returns the EXPLICIT <see cref="AgentsMdLimitDecision"/> the caller acts on. This helper
+    /// performs NO rollback and issues NO git command of its own: when the retries are
+    /// exhausted the caller skips the entire update — including otherwise-valid edits to files
+    /// that are within the limit — and the shared finalization restores and VERIFIES the
+    /// baseline afterwards.
+    /// </para>
     /// <para>
     /// Each condensation segment is recorded into <paramref name="evidence"/> AS IT ARRIVES, so
-    /// a cancellation or throw during a later retry (or during the discard) cannot discard the
-    /// segments the agent already produced.
+    /// a cancellation or throw during a later retry cannot discard the segments the agent
+    /// already produced.
     /// </para>
     /// </summary>
-    private async Task<string> EnsureAgentsMdWithinLimitsAsync(
+    private async Task<AgentsMdLimitDecision> EnsureAgentsMdWithinLimitsAsync(
         AgentOutputEvidence evidence, CancellationToken ct)
     {
         if (!Directory.Exists(_configAgentsDir))
-            return evidence.Snapshot;
+            return AgentsMdLimitDecision.LimitsSatisfied;
 
         for (var attempt = 0; attempt < WorkerConstants.AgentsMdMaxRetries; attempt++)
         {
             var violations = GetAgentsMdViolations();
             if (violations.Count == 0)
-                return evidence.Snapshot;
+                return AgentsMdLimitDecision.LimitsSatisfied;
 
             _log.Info($"Agents.md size check (attempt {attempt + 1}/{WorkerConstants.AgentsMdMaxRetries}): " +
                       $"{violations.Count} file(s) over {WorkerConstants.AgentsMdMaxCharacters} chars");
@@ -1080,20 +1173,51 @@ public sealed class TaskExecutor(
             evidence.Append("[Agents.md size enforcement]\n" + condenseOutput);
         }
 
-        // Final check after all retries
+        // Final check after all retries: a repair achieved by the THIRD retry is SUCCESS.
         var remaining = GetAgentsMdViolations();
-        if (remaining.Count > 0)
-        {
-            var fileNames = string.Join(", ", remaining.Select(v => $"{v.FileName} ({v.CharCount} chars)"));
-            _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}. Discarding all changes.");
+        if (remaining.Count == 0)
+            return AgentsMdLimitDecision.LimitsSatisfied;
 
-            // Discard all agents.md changes to keep config repo clean
-            await RunConfigRepoCommandAsync(["checkout", "--", "agents/"], "checkout -- agents/", ct);
-            evidence.Append(
-                $"[Agents.md changes discarded — files still over {WorkerConstants.AgentsMdMaxCharacters}-char limit after {WorkerConstants.AgentsMdMaxRetries} retries: {fileNames}]");
-        }
+        _log.Error($"Agents.md still over limit after {WorkerConstants.AgentsMdMaxRetries} retries: " +
+                   $"{RenderRemainingViolationsForLog(remaining)}. Skipping the guidance update.");
 
-        return evidence.Snapshot;
+        return new AgentsMdLimitDecision(false, remaining);
+    }
+
+    /// <summary>
+    /// Renders the still-violating filenames with their character counts for a LOG line. The
+    /// filenames come from the filesystem and are therefore untrusted, so each one is
+    /// SANITIZED with the shared helper — the counts are integers and need none.
+    /// </summary>
+    private static string RenderRemainingViolationsForLog(
+        IReadOnlyList<(string FileName, int CharCount)> remaining) =>
+        string.Join(", ", remaining.Select(v =>
+            $"{LogSanitizer.SanitizePath(v.FileName)} ({v.CharCount} chars)"));
+
+    /// <summary>
+    /// Builds the GENERATED exhaustion warning appended to the agent's own (never truncated,
+    /// never sanitized) evidence and carried in the SKIP metrics. It identifies the exhaustion,
+    /// the remaining filenames with their character counts, the configured character limit, the
+    /// retry count, and that publication is SKIPPED. Untrusted filenames are sanitized with the
+    /// existing helper. Cleanup is deliberately NOT claimed here — only the shared finalization
+    /// may verify it.
+    /// </summary>
+    private static string BuildAgentsMdExhaustionWarning(
+        IReadOnlyList<(string FileName, int CharCount)> remaining)
+    {
+        var files = string.Join("\n", remaining.Select(v =>
+            $"  - {LogSanitizer.SanitizePath(v.FileName)}: {v.CharCount} characters " +
+            $"(limit: {WorkerConstants.AgentsMdMaxCharacters})"));
+
+        return $"""
+            [WARNING: agents.md guidance update SKIPPED — compression retries exhausted]
+            After the initial prompt and {WorkerConstants.AgentsMdMaxRetries} condensation retries the following
+            file(s) still exceed the {WorkerConstants.AgentsMdMaxCharacters}-character limit:
+            {files}
+            No agents.md change was published: the entire guidance update was skipped, including
+            edits to files that are within the limit. No add, staged diff, commit, pull or push
+            was performed for this Improver run.
+            """;
     }
 
     /// <summary>

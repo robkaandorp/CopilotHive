@@ -2907,59 +2907,335 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// The oversized-agent-file DISCARD path routes through the seam as the tokenized
-    /// <c>checkout -- agents/</c> local command.
+    /// A <see cref="MockAgentRunner"/> that writes one valid edit and one persistently oversized
+    /// guidance file from its initial prompt, then returns a distinct segment for every
+    /// condensation retry without repairing the violation.
     /// </summary>
-    /// <summary>
-    /// A <see cref="MockAgentRunner"/> that writes an OVERSIZED <c>coder.agents.md</c> from
-    /// inside its FIRST prompt — i.e. AFTER the pre-run baseline preflight, which deliberately
-    /// clears untracked residue, so the overflow is the improver's own edit rather than
-    /// pre-seeded residue that preparation would legitimately remove.
-    /// </summary>
-    private static MockAgentRunner OversizedAgentsFileWriter(string configRepoDir) =>
-        new()
+    private static MockAgentRunner ExhaustingAgentsFileWriter(
+        string configRepoDir,
+        IReadOnlyList<string> segments,
+        TestResultReport? incidentalReport = null)
+    {
+        var call = 0;
+        return new MockAgentRunner
         {
-            PromptResponder = async (prompt, _, ct) =>
+            TestReportToReturn = incidentalReport,
+            PromptResponder = async (_, _, ct) =>
             {
-                if (!prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                if (call == 0)
                 {
                     Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
                     await File.WriteAllTextAsync(
-                        Path.Combine(configRepoDir, "agents", "coder.agents.md"),
-                        new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
-                        ct);
+                        Path.Combine(configRepoDir, "agents", "valid-edit.agents.md"),
+                        "otherwise valid guidance edit", ct);
+                    await File.WriteAllTextAsync(
+                        Path.Combine(configRepoDir, "agents", "blocker.agents.md"),
+                        new string('x', WorkerConstants.AgentsMdMaxCharacters + 7), ct);
                 }
 
-                return "Mock agent response";
+                return segments[call++];
             },
         };
+    }
 
-    [Fact]
-    public async Task Improver_SeamPath_OversizedAgentsFile_DiscardsThroughTheSeam()
+    private static string ExhaustionWarning(string fileName, int characterCount) => $"""
+        [WARNING: agents.md guidance update SKIPPED — compression retries exhausted]
+        After the initial prompt and {WorkerConstants.AgentsMdMaxRetries} condensation retries the following
+        file(s) still exceed the {WorkerConstants.AgentsMdMaxCharacters}-character limit:
+          - {fileName}: {characterCount} characters (limit: {WorkerConstants.AgentsMdMaxCharacters})
+        No agents.md change was published: the entire guidance update was skipped, including
+        edits to files that are within the limit. No add, staged diff, commit, pull or push
+        was performed for this Improver run.
+        """;
+
+    /// <summary>
+    /// Persistent overflow exhausts exactly three retries on BOTH config-Git routes. The whole
+    /// mixed update is skipped, every response is selected verbatim and in order, an incidental
+    /// FAIL test report cannot override SKIP, and no publication command (including the deleted
+    /// checkout-discard command) is issued.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_ExhaustedCompression_PublishesNothingAndReportsAuthoritativeSkip(bool viaSeam)
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
-
-        var fake = new SeamProcessRunnerFake
+        string[] segments =
+        [
+            "INITIAL:\nreviewed every file verbatim",
+            "RETRY-ONE:\nprotected constraints still do not fit",
+            "RETRY-TWO:\nolder rules were consolidated but remain too large",
+            "RETRY-THREE:\nfinal blocker report, no content sacrificed",
+        ];
+        var incidental = new TestResultReport
         {
-            Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+            Verdict = TaskVerdict.Fail,
+            BuildSuccess = false,
+            TotalTests = 9,
+            PassedTests = 2,
+            FailedTests = 7,
+            Summary = "INCIDENTAL TEST SUMMARY MUST NOT WIN",
+            Issues = ["incidental test issue"],
         };
-        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var runner = ExhaustingAgentsFileWriter(configRepoDir, segments, incidental);
         var git = new MockGitOperations();
+        TaskResult result;
 
-        await RunImproverWithSeamAsync(
-            "improver-seam-discard", configRepoDir, seam, fake, git,
-            agentRunner: OversizedAgentsFileWriter(configRepoDir));
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake();
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-exhausted", configRepoDir, seam, fake, git,
+                agentRunner: runner);
 
-        AssertLaunchedSequence(fake,
-            [
-                .. ConfigRepoPreparationFakes.SeamLaunches,
-                ["checkout", "--", "agents/"],
-                ["add", "agents/*.agents.md"],
-                ["diff", "--cached", "--name-only", "-z"],
-                // The step-end cleanup: no confirmed publication, so the baseline is the target.
-                .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
-            ]);
-        Assert.Empty(git.GitCommands);
+            AssertLaunchedSequence(fake,
+                [.. ConfigRepoPreparationFakes.SeamLaunches,
+                 .. ConfigRepoPreparationFakes.SeamCleanupLaunches]);
+            AssertNoPublicationLaunched(fake);
+            Assert.Empty(git.GitCommands);
+        }
+        else
+        {
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-exhausted", configRepoDir, git, agentRunner: runner);
+
+            Assert.Equal(
+                [.. ConfigRepoPreparationFakes.LegacyCommands,
+                 .. ConfigRepoPreparationFakes.LegacyCleanupCommands],
+                git.GitCommands);
+            AssertNoLegacyPublication(git);
+        }
+
+        Assert.Equal(1 + WorkerConstants.AgentsMdMaxRetries, runner.PromptCalls.Count);
+        Assert.All(runner.PromptCalls.Skip(1), call =>
+            Assert.Contains("append-new/compress-old policy", call.Prompt, StringComparison.Ordinal));
+
+        var warning = ExhaustionWarning(
+            "blocker.agents.md", WorkerConstants.AgentsMdMaxCharacters + 7);
+        var expected = string.Join("\n\n",
+            segments[0],
+            "[Agents.md size enforcement]\n" + segments[1],
+            "[Agents.md size enforcement]\n" + segments[2],
+            "[Agents.md size enforcement]\n" + segments[3],
+            warning);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("SKIP", result.Metrics!.Verdict);
+        Assert.Equal(expected, result.Output);
+        Assert.Equal(expected, result.Metrics.Summary);
+        Assert.DoesNotContain("INCIDENTAL TEST SUMMARY", result.Metrics.Summary, StringComparison.Ordinal);
+        Assert.Equal(9, result.Metrics.TotalTests);
+        Assert.Contains("incidental test issue", result.Metrics.Issues);
+        Assert.Contains(warning, result.Metrics.Issues);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(0, result.GitStatus.FilesChanged);
+        Assert.Empty(result.GitStatus.ChangedFiles);
+
+        // The valid edit genuinely coexists with the remaining oversized blocker. Command
+        // absence therefore proves the blocker skipped the ENTIRE update, not only itself.
+        Assert.Equal(
+            "otherwise valid guidance edit",
+            await File.ReadAllTextAsync(
+                Path.Combine(configRepoDir, "agents", "valid-edit.agents.md"),
+                TestContext.Current.CancellationToken));
+        Assert.Equal(
+            WorkerConstants.AgentsMdMaxCharacters + 7,
+            (await File.ReadAllTextAsync(
+                Path.Combine(configRepoDir, "agents", "blocker.agents.md"),
+                TestContext.Current.CancellationToken)).Length);
+    }
+
+    /// <summary>
+    /// A repair returned by the THIRD condensation retry is still success. Both routes must run
+    /// all four prompts and then publish, rather than misclassifying the final repair as SKIP.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_FinalCompressionRetryRepairsViolation_PublicationSucceeds(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var filePath = Path.Combine(configRepoDir, "agents", "final-retry.agents.md");
+        var call = 0;
+        var runner = new MockAgentRunner
+        {
+            PromptResponder = async (_, _, ct) =>
+            {
+                call++;
+                await File.WriteAllTextAsync(
+                    filePath,
+                    call == 4 ? "repaired on final retry" : new string('x', 8_001),
+                    ct);
+                return $"segment-{call}";
+            },
+        };
+        var git = new MockGitOperations();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["diff", ..]
+                    ? new GitProcessResult(0, StagedOutput("agents/final-retry.agents.md"), "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-final-retry", configRepoDir, seam, fake, git,
+                agentRunner: runner);
+
+            Assert.Contains(fake.Launched, tokens => tokens is ["add", "agents/*.agents.md"]);
+            Assert.Contains(fake.Launched, tokens => tokens is ["commit", ..]);
+            Assert.Contains(fake.Launched, tokens => tokens is ["pull", "--no-rebase", ..]);
+            Assert.Contains(fake.Launched, tokens => tokens is ["push", "origin", "HEAD"]);
+        }
+        else
+        {
+            git.GitCommandResponder = ConfigRepoResponder(
+                ["agents/final-retry.agents.md"], pushFails: false);
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-final-retry", configRepoDir, git, agentRunner: runner);
+
+            Assert.Contains("add agents/*.agents.md", git.GitCommands);
+            Assert.Contains(git.GitCommands, command => command.StartsWith("commit -m", StringComparison.Ordinal));
+            Assert.Contains("pull --no-rebase", git.GitCommands);
+            Assert.Contains("push", git.GitCommands);
+        }
+
+        Assert.Equal(4, runner.PromptCalls.Count);
+        Assert.Equal("repaired on final retry", await File.ReadAllTextAsync(
+            filePath, TestContext.Current.CancellationToken));
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.True(result.GitStatus!.Pushed);
+        Assert.DoesNotContain("guidance update SKIPPED", result.Output, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Exhaustion followed by cleanup failure preserves the complete SKIP warning and agent
+    /// evidence, but truthfully downgrades the completed outcome to Failed/FAIL. Both config-Git
+    /// routes are exercised without copying the finalizer's wider matrix.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_ExhaustionWithCleanupFailure_PreservesEvidenceAndReturnsFail(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        string[] segments = ["initial-evidence", "retry-one", "retry-two", "retry-three"];
+        var runner = ExhaustingAgentsFileWriter(configRepoDir, segments);
+        var warning = ExhaustionWarning("blocker.agents.md", 8_007);
+        var git = new MockGitOperations();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var statusCalls = 0;
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["status", "--porcelain=v1", ..]
+                    ? new GitProcessResult(0, ++statusCalls == 1 ? "" : "?? cleanup-residue.txt\n", "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-exhaust-cleanup-fail", configRepoDir, seam, fake, git,
+                agentRunner: runner);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var statusCalls = 0;
+            git.GitCommandResponder = args =>
+                args == "status --porcelain=v1 --untracked-files=all --ignored"
+                    ? (0, ++statusCalls == 1 ? "" : "?? cleanup-residue.txt\n", "")
+                    : null;
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-exhaust-cleanup-fail", configRepoDir, git,
+                agentRunner: runner);
+            AssertNoLegacyPublication(git);
+        }
+
+        Assert.Equal(4, runner.PromptCalls.Count);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.StartsWith("initial-evidence", result.Output, StringComparison.Ordinal);
+        Assert.Contains("retry-three", result.Output, StringComparison.Ordinal);
+        Assert.Contains(warning, result.Output, StringComparison.Ordinal);
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+        Assert.Contains(warning, result.Metrics.Issues);
+        Assert.Contains(result.Metrics.Issues,
+            issue => issue.Contains("Config repo cleanup rejected", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Requested cancellation during a later retry or by the FINAL returned condensation response
+    /// is always Cancelled/CANCELLED, never a benign exhausted SKIP. Each timing is proven on both
+    /// routes; the final-response case verifies the explicit token observation after retry three.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task Improver_RequestedCancellationDuringLaterCompression_NeverReportsSkip(
+        bool viaSeam, bool cancelByFinalResponse)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        using var cts = new CancellationTokenSource();
+        var filePath = Path.Combine(configRepoDir, "agents", "cancelled.agents.md");
+        var call = 0;
+        var runner = new MockAgentRunner
+        {
+            PromptResponder = async (_, _, ct) =>
+            {
+                call++;
+                if (call == 1)
+                    await File.WriteAllTextAsync(filePath, new string('x', 8_001), ct);
+
+                if ((!cancelByFinalResponse && call == 3) || (cancelByFinalResponse && call == 4))
+                {
+                    cts.Cancel();
+                    if (!cancelByFinalResponse)
+                        throw new OperationCanceledException("shutdown", cts.Token);
+                }
+
+                return $"cancel-segment-{call}";
+            },
+        };
+        var git = new MockGitOperations();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake();
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-compression-cancel-{cancelByFinalResponse}",
+                configRepoDir, seam, fake, git, cts.Token, runner);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-compression-cancel-{cancelByFinalResponse}",
+                configRepoDir, git, cts.Token, runner);
+            AssertNoLegacyPublication(git);
+        }
+
+        Assert.True(cts.IsCancellationRequested);
+        Assert.Equal(cancelByFinalResponse ? 4 : 3, runner.PromptCalls.Count);
+        Assert.Equal(TaskOutcome.Cancelled, result.Status);
+        Assert.Equal("CANCELLED", result.Metrics!.Verdict);
+        Assert.NotEqual("SKIP", result.Metrics.Verdict);
+        Assert.Contains("cancel-segment-1", result.Output, StringComparison.Ordinal);
+        if (cancelByFinalResponse)
+            Assert.Contains("cancel-segment-4", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Task was cancelled.", result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("guidance update SKIPPED", result.Output, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -3113,12 +3389,12 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// The legacy DISCARD and <c>merge --abort</c> opaque strings, which the happy path never
-    /// reaches. After the failed pull and its abort, push is NEVER attempted — the bare
-    /// <c>push</c> string is deliberately absent from the recorded commands.
+    /// The legacy failed-pull/merge-abort behavior remains independently covered with a
+    /// NON-OVERFLOW runner. Limits are satisfied, so publication reaches the failed pull,
+    /// launches the exact opaque merge-abort command, and never pushes.
     /// </summary>
     [Fact]
-    public async Task Improver_LegacyPath_DiscardAndMergeAbort_UseTheExactOpaqueStrings()
+    public async Task Improver_LegacyPath_FailedPull_UsesExactOpaqueMergeAbortAndNeverPushes()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
@@ -3134,24 +3410,22 @@ public sealed class TaskExecutorTests
 
         var (result, _, _) = await RunImproverLegacyAsync(
             "improver-legacy-abort", configRepoDir, git,
-            agentRunner: OversizedAgentsFileWriter(configRepoDir));
+            agentRunner: new MockAgentRunner());
 
         Assert.Equal(
             [
                 .. ConfigRepoPreparationFakes.LegacyCommands,
-                "checkout -- agents/",
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
                 "pull --no-rebase",
                 "merge --abort",
-                // The step-end cleanup restores the captured fetched baseline (no confirmed
-                // push after the failed pull).
                 .. ConfigRepoPreparationFakes.LegacyCleanupCommands,
             ],
             git.GitCommands);
 
-        // TRUTHFUL PUBLICATION: the failed pull fails the task; no push ever ran.
+        Assert.DoesNotContain("checkout -- agents/", git.GitCommands);
+        Assert.DoesNotContain("push", git.GitCommands);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.False(result.GitStatus!.Pushed);
@@ -8710,6 +8984,91 @@ public sealed class TaskExecutorTests
 
         // The OUTSIDE sentinel is untouched, byte for byte.
         Assert.Equal(outsideSentinelBefore, File.ReadAllText(playground.OutsideSentinelPath));
+    }
+
+    /// <summary>
+    /// REAL GIT exhaustion on BOTH routes. After preparation, the agent creates a persistently
+    /// oversized tracked guidance edit plus an independent staged delta, untracked residue, and
+    /// ignored residue. One ExecuteAsync call must return Completed/SKIP only after finalization
+    /// restores the exact baseline and strict-empty status; the bare remote must be unchanged.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RealGit_ExhaustedCompression_RestoresBaselineAndLeavesRemoteUnchanged(bool viaSeam)
+    {
+        const string baselineContent = "REMOTE-BASELINE-V1\n";
+        using var playground = RealGitPlayground.Create(
+            $"exhausted-skip-{(viaSeam ? "seam" : "legacy")}",
+            baselineContent,
+            seedIgnoreRuleAndStagedBaseline: true);
+        var worker = playground.WorkerDir;
+        var baselineSha = playground.RemoteMainSha();
+        var remoteGuidanceBefore = RealGitOutput(
+            playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath);
+        string? residueStatus = null;
+        var call = 0;
+        var runner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                call++;
+                if (call == 1)
+                {
+                    // TRACKED oversized guidance edit.
+                    File.WriteAllText(playground.GuidancePath, new string('x', 8_001));
+                    // STAGED index delta independent of the guidance edit.
+                    File.WriteAllText(Path.Combine(worker, "staged.txt"), "STAGED-RESIDUE\n");
+                    RealGit(worker, "add", "staged.txt");
+                    // UNTRACKED and IGNORED residue.
+                    File.WriteAllText(Path.Combine(worker, "untracked-exhausted.txt"), "untracked\n");
+                    File.WriteAllText(Path.Combine(worker, "ignored.txt"), "ignored\n");
+                    residueStatus = playground.WorkerVerboseStatus();
+                }
+
+                return Task.FromResult($"real-git-segment-{call}");
+            },
+        };
+
+        var (result, _, legacyCommands) = await RunRealGitImproverAsync(
+            $"realgit-exhausted-skip-{viaSeam}", playground, viaSeam, runner);
+
+        Assert.Equal(4, runner.PromptCalls.Count);
+        Assert.NotNull(residueStatus);
+        var residue = ParsePorcelain(residueStatus!);
+        Assert.Equal(" M", residue[RealGitPlayground.GuidanceRelativePath]);
+        Assert.Equal("M ", residue["staged.txt"]);
+        Assert.Equal("??", residue["untracked-exhausted.txt"]);
+        Assert.Equal("!!", residue["ignored.txt"]);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("SKIP", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Contains("guidance update SKIPPED", result.Output, StringComparison.Ordinal);
+
+        // Exact local baseline and strict-empty status at the ExecuteAsync return boundary.
+        Assert.Equal(baselineSha, playground.WorkerHeadSha());
+        Assert.Equal(baselineContent, File.ReadAllText(playground.GuidancePath));
+        Assert.Equal(RealGitPlayground.StagedBaselineContent,
+            File.ReadAllText(Path.Combine(worker, "staged.txt")));
+        Assert.Equal("", playground.WorkerVerboseStatus());
+        Assert.False(File.Exists(Path.Combine(worker, "untracked-exhausted.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ignored.txt")));
+
+        // Publication was never entered and the remote did not change.
+        Assert.Equal(baselineSha, playground.RemoteMainSha());
+        Assert.Equal(remoteGuidanceBefore, RealGitOutput(
+            playground.RemoteDir, "show", "main:" + RealGitPlayground.GuidanceRelativePath));
+        if (viaSeam)
+            Assert.Empty(legacyCommands);
+        else
+        {
+            Assert.DoesNotContain(legacyCommands, command => command.StartsWith("add ", StringComparison.Ordinal));
+            Assert.DoesNotContain(legacyCommands, command => command.StartsWith("diff --cached", StringComparison.Ordinal));
+            Assert.DoesNotContain(legacyCommands, command => command.StartsWith("commit ", StringComparison.Ordinal));
+            Assert.DoesNotContain(legacyCommands, command => command.StartsWith("pull", StringComparison.Ordinal));
+            Assert.DoesNotContain(legacyCommands, command => command.StartsWith("push", StringComparison.Ordinal));
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
