@@ -2515,3 +2515,385 @@ public sealed class PipelineStoreAdmissionOwnershipDirectContextTests : IDisposa
         }
     }
 }
+
+/// <summary>
+/// Direct-context contracts for <see cref="PipelineStore.CommitPendingAdmissionRollback"/>, the
+/// store-only durable inverse of an intact pending admission: every invalid input throws BEFORE
+/// context acquisition, the compare-and-swap expectation is the ORIGINAL supplied JSON text, and
+/// the key-scoped tracker detach discards the affected pending entries while unrelated tracked
+/// edits remain unflushed.
+/// </summary>
+public sealed class PipelineStorePendingRollbackDirectContextTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-pending-rollback-direct-{Guid.NewGuid():N}?mode=memory&cache=shared";
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public PipelineStorePendingRollbackDirectContextTests()
+    {
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    private CopilotHiveDbContext CreateContext()
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private static Goal Goal(string id) =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    /// <summary>
+    /// Builds a REAL captured Pending admission through the production allocation, claim and
+    /// abandon paths, so the decoded candidate carries genuine history.
+    /// </summary>
+    private static AdmissionOwnershipSnapshot RichPending(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(Goal(goalId));
+        pipeline.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("history-recorded", new WorkSlotPosition(1, GoalPhase.Improve, 1), 2),
+                WorkSlotState.Recorded)],
+            [new WorkSlotRegistryAttemptEntry(new WorkSlotPosition(1, GoalPhase.Improve, 1), 5),
+             new WorkSlotRegistryAttemptEntry(new WorkSlotPosition(2, GoalPhase.Testing, 1), 1)]));
+        pipeline.AllocateAttemptAndRegisterSlot("history-abandoned", new WorkSlotPosition(2, GoalPhase.Testing, 1));
+        Assert.True(pipeline.AbandonSlot("history-abandoned"));
+
+        var active = pipeline.AllocateAttemptAndRegisterSlot(taskId, new WorkSlotPosition(3, GoalPhase.Coding, 1));
+        Assert.Equal(1, active.Attempt);
+        pipeline.SetActiveTask(taskId);
+        return pipeline.CaptureAdmissionOwnership();
+    }
+
+    private void SeedIdleRow(string goalId, string? blob)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        store.SavePipeline(new GoalPipeline(Goal(goalId)));
+        if (blob is not null)
+        {
+            context.Database.ExecuteSqlRaw(
+                "UPDATE pipelines SET work_slot_registry_json = {0} WHERE goal_id = {1}", blob, goalId);
+        }
+    }
+
+    private object? Scalar(string sql, string value)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$value", value);
+        return command.ExecuteScalar() is DBNull ? null : command.ExecuteScalar();
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_InvalidInputs_NeverAcquireContext()
+    {
+        var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+        var validJson = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("task-rollback", position, 1), WorkSlotState.Pending)],
+            [new WorkSlotRegistryAttemptEntry(position, 1)]));
+
+        // A registry whose HISTORY is malformed (the Pending slot has no high-water entry for
+        // its position) decodes fine but must be rejected by the preflight — before any context.
+        var malformedHistoryJson = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("task-rollback", position, 1), WorkSlotState.Pending)],
+            []));
+
+        var cases = new (string Name, string? GoalId, string? TaskId, string? Json, Type Type, string Message)[]
+        {
+            ("null-goal", null, "task-rollback", validJson, typeof(ArgumentException), "goal ID must be a non-blank"),
+            ("blank-goal", "   ", "task-rollback", validJson, typeof(ArgumentException), "goal ID must be a non-blank"),
+            ("null-task", "goal-rollback", null, validJson, typeof(ArgumentException), "task ID must be a non-blank"),
+            ("blank-task", "goal-rollback", " ", validJson, typeof(ArgumentException), "task ID must be a non-blank"),
+            ("null-json", "goal-rollback", "task-rollback", null, typeof(ArgumentNullException), "expectedRegistryJson"),
+            ("malformed-json", "goal-rollback", "task-rollback", "{not json", typeof(WorkSlotRegistryCodecException), "not valid JSON"),
+            ("non-object-root", "goal-rollback", "task-rollback", "[1,2]", typeof(WorkSlotRegistryCodecException), "root must be a JSON object"),
+            ("unsupported-version", "goal-rollback", "task-rollback",
+                "{\"version\":2,\"slots\":[],\"dispatchAttempts\":[]}",
+                typeof(WorkSlotRegistryCodecException), "Unsupported work-slot registry payload version"),
+            ("malformed-history", "goal-rollback", "task-rollback", malformedHistoryJson,
+                typeof(ArgumentException), "has no attempt entry for its position"),
+            ("absent-target", "goal-rollback", "task-rollback",
+                WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+                    [new WorkSlotView(new WorkSlot("other-task", position, 1), WorkSlotState.Pending)],
+                    [new WorkSlotRegistryAttemptEntry(position, 1)])),
+                typeof(ArgumentException), "has no matching slot in the registry"),
+            ("non-pending-target", "goal-rollback", "task-rollback",
+                WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+                    [new WorkSlotView(new WorkSlot("task-rollback", position, 1), WorkSlotState.Claimed)],
+                    [new WorkSlotRegistryAttemptEntry(position, 1)])),
+                typeof(ArgumentException), "not Pending"),
+        };
+
+        foreach (var item in cases)
+        {
+            var factory = new CountingThrowingFactory();
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+
+            var thrown = Record.Exception(() =>
+                store.CommitPendingAdmissionRollback(item.GoalId, item.TaskId, item.Json));
+
+            Assert.NotNull(thrown);
+            Assert.Equal(item.Type, thrown!.GetType());
+            Assert.Contains(item.Message, thrown.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, factory.AcquisitionCount);
+        }
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_NoncanonicalValidJson_CommitsAndOriginalTextIsTheCasExpectation()
+    {
+        const string goalId = "goal-rollback-noncanon";
+        const string taskId = "task-rollback-noncanon";
+        var candidate = RichPending(goalId, taskId);
+
+        // The captured registry re-encoded is canonical; a SEMANTICALLY-EQUIVALENT but textually
+        // DIFFERENT payload (different member order and whitespace) must still COMMIT, because
+        // the decode+preflight validate VALUES while the CAS guard compares the ORIGINAL text.
+        var noncanonical = "{ \"dispatchAttempts\" : [ { \"position\" : { \"iteration\" : 1 , " +
+            "\"phase\" : \"Improve\" , \"occurrence\" : 1 }, \"highWaterAttempt\" : 5 } , " +
+            "{ \"position\": {\"iteration\":2,\"phase\":\"Testing\",\"occurrence\":1}, \"highWaterAttempt\": 1 } , " +
+            "{ \"position\": {\"iteration\":3,\"phase\":\"Coding\",\"occurrence\":1}, \"highWaterAttempt\": 1 } ], " +
+            "\"version\" : 1 , \"slots\" : [ " +
+            "{\"taskId\":\"history-recorded\",\"position\":{\"iteration\":1,\"phase\":\"Improve\",\"occurrence\":1},\"attempt\":2,\"state\":\"Recorded\"} , " +
+            "{\"taskId\":\"history-abandoned\",\"position\":{\"iteration\":2,\"phase\":\"Testing\",\"occurrence\":1},\"attempt\":1,\"state\":\"Abandoned\"} , " +
+            "{\"taskId\":\"task-rollback-noncanon\",\"position\":{\"iteration\":3,\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"} ] }";
+        SeedIdleRow(goalId, noncanonical);
+        using (var connection = new SqliteConnection(_connectionString))
+        {
+            connection.Open();
+            using var pointer = connection.CreateCommand();
+            pointer.CommandText = "UPDATE pipelines SET active_task_id = $task WHERE goal_id = $goal";
+            pointer.Parameters.AddWithValue("$task", taskId);
+            pointer.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, pointer.ExecuteNonQuery());
+            using var mapping = connection.CreateCommand();
+            mapping.CommandText = "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)";
+            mapping.Parameters.AddWithValue("$task", taskId);
+            mapping.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, mapping.ExecuteNonQuery());
+        }
+        var original = Scalar(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $value", goalId);
+        Assert.Equal(noncanonical, original as string);
+
+        var context = CreateContext();
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, noncanonical);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+        var blob = Scalar(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $value", goalId);
+        var decoded = WorkSlotRegistryCodec.Decode(blob as string ?? throw new InvalidOperationException("blob"));
+        var target = Assert.Single(decoded.Slots, s => s.Slot.TaskId == taskId);
+        Assert.Equal(WorkSlotState.Abandoned, target.State);
+        Assert.Equal(1, target.Slot.Attempt);
+        Assert.Equal(new WorkSlotPosition(3, GoalPhase.Coding, 1), target.Slot.Position);
+        Assert.Null(Scalar("SELECT active_task_id FROM pipelines WHERE goal_id = $value", goalId));
+        Assert.Null(Scalar("SELECT goal_id FROM task_mappings WHERE task_id = $value", taskId));
+
+        // The replacement encoded from the DECODED values matches the canonical re-encoding of the
+        // decoded registry with only the target state changed — not the raw input, and not the
+        // separately captured candidate (which this test only uses as evidence the JSON is real).
+        var decodedPrior = WorkSlotRegistryCodec.Decode(noncanonical);
+        var expectedReplacement = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+            decodedPrior.Slots.Select(s => s.Slot.TaskId == taskId
+                ? new WorkSlotView(s.Slot, WorkSlotState.Abandoned) : s).ToList(),
+            decodedPrior.DispatchAttempts.ToList()));
+        Assert.Equal(expectedReplacement, blob);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_SemanticallyEquivalentButDifferentText_Refused()
+    {
+        const string goalId = "goal-rollback-cas";
+        const string taskId = "task-rollback-cas";
+        // The row is seeded in the FULLY ADMITTED state the rollback expects: the pending
+        // candidate's registry EXACTLY as captured, the pointer on the task, the mapping present.
+        var candidate = RichPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        SeedIdleRow(goalId, stored);
+        using (var connection = new SqliteConnection(_connectionString))
+        {
+            connection.Open();
+            using var pointer = connection.CreateCommand();
+            pointer.CommandText = "UPDATE pipelines SET active_task_id = $task WHERE goal_id = $goal";
+            pointer.Parameters.AddWithValue("$task", taskId);
+            pointer.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, pointer.ExecuteNonQuery());
+            using var mapping = connection.CreateCommand();
+            mapping.CommandText = "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)";
+            mapping.Parameters.AddWithValue("$task", taskId);
+            mapping.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, mapping.ExecuteNonQuery());
+        }
+
+        // The SUPPLIED expectation is a semantically-EQUIVALENT but textually DIFFERENT payload
+        // (re-ordered members and whitespace) — every other guard (goal, pointer, mapping, target)
+        // matches, so a refusal is isolated to the CAS-text mismatch alone.
+        var equivalentButDifferentText = "{ \"dispatchAttempts\" : [ " +
+            "{ \"position\": {\"iteration\":1,\"phase\":\"Improve\",\"occurrence\":1}, \"highWaterAttempt\": 5 } , " +
+            "{ \"position\": {\"iteration\":2,\"phase\":\"Testing\",\"occurrence\":1}, \"highWaterAttempt\": 2 } , " +
+            "{ \"position\": {\"iteration\":3,\"phase\":\"Coding\",\"occurrence\":1}, \"highWaterAttempt\": 1 } ], " +
+            "\"version\" : 1 , \"slots\" : [ " +
+            "{\"taskId\":\"history-recorded\",\"position\":{\"iteration\":1,\"phase\":\"Improve\",\"occurrence\":1},\"attempt\":2,\"state\":\"Recorded\"} , " +
+            "{\"taskId\":\"history-abandoned\",\"position\":{\"iteration\":2,\"phase\":\"Testing\",\"occurrence\":1},\"attempt\":2,\"state\":\"Abandoned\"} , " +
+            "{\"taskId\":\"" + taskId + "\",\"position\":{\"iteration\":3,\"phase\":\"Coding\",\"occurrence\":1},\"attempt\":1,\"state\":\"Pending\"} ] }";
+        // The repair's non-vacuity: the equivalent payload decodes to the SAME values as the row
+        // (compared through the canonical encoding — the snapshot's collections are fresh lists).
+        Assert.Equal(stored, WorkSlotRegistryCodec.Encode(
+            WorkSlotRegistryCodec.Decode(equivalentButDifferentText)));
+
+        var context = CreateContext();
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, equivalentButDifferentText);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+        // NOTHING durably changed — the refusal is purely the CAS-text mismatch.
+        Assert.Equal(stored,
+            Scalar("SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $value", goalId));
+        Assert.Equal(taskId,
+            Scalar("SELECT active_task_id FROM pipelines WHERE goal_id = $value", goalId) as string);
+        Assert.Equal(goalId,
+            Scalar("SELECT goal_id FROM task_mappings WHERE task_id = $value", taskId) as string);
+    }
+
+    [Theory]
+    [InlineData(EntityState.Added)]
+    [InlineData(EntityState.Unchanged)]
+    [InlineData(EntityState.Modified)]
+    [InlineData(EntityState.Deleted)]
+    public void CommitPendingAdmissionRollback_AffectedTrackerEntriesDiscarded_UnrelatedEditsRemainPending(
+        EntityState state)
+    {
+        var goalId = "goal-rollback-tracker-" + state;
+        var taskId = "task-rollback-tracker-" + state;
+        var candidate = RichPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        SeedIdleRow(goalId, stored);
+
+        var context = CreateContext();
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var stalePipeline = NewPipelineEntity(goalId);
+        stalePipeline.ActiveTaskId = "stale-pointer";
+        stalePipeline.WorkSlotRegistryJson = "stale-tracked-blob";
+        context.Attach(stalePipeline);
+        context.Entry(stalePipeline).State = state;
+
+        var staleMapping = new TaskMappingEntity { TaskId = taskId, GoalId = "stale-tracked-goal" };
+        context.Attach(staleMapping);
+        context.Entry(staleMapping).State = state;
+
+        // The durable mapping row statement 2 must delete (the stale tracked copy is a separate,
+        // later-discarded entry for the SAME task id), and the pointer must still name the task.
+        using (var connection = new SqliteConnection(_connectionString))
+        {
+            connection.Open();
+            using var pointer = connection.CreateCommand();
+            pointer.CommandText = "UPDATE pipelines SET active_task_id = $task WHERE goal_id = $goal";
+            pointer.Parameters.AddWithValue("$task", taskId);
+            pointer.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, pointer.ExecuteNonQuery());
+            using var mapping = connection.CreateCommand();
+            mapping.CommandText = "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)";
+            mapping.Parameters.AddWithValue("$task", taskId);
+            mapping.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, mapping.ExecuteNonQuery());
+        }
+
+        var unrelatedGoal = "unrelated-goal-" + state;
+        var unrelatedTask = "unrelated-task-" + state;
+        context.Add(NewPipelineEntity(unrelatedGoal));
+        context.Add(new TaskMappingEntity { TaskId = unrelatedTask, GoalId = unrelatedGoal });
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.Entity.GoalId == goalId);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            e => e.Entity.TaskId == taskId);
+
+        var pendingPipeline = Assert.Single(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.Entity.GoalId == unrelatedGoal);
+        var pendingMapping = Assert.Single(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            e => e.Entity.TaskId == unrelatedTask);
+        Assert.Equal(EntityState.Added, pendingPipeline.State);
+        Assert.Equal(EntityState.Added, pendingMapping.State);
+        Assert.Equal(0L, Scalar("SELECT COUNT(*) FROM pipelines WHERE goal_id = $value", unrelatedGoal));
+
+        // A later caller-owned flush writes ONLY the unrelated edits — the discarded affected
+        // entries can never resurrect rolled-back state (Deleted would erase, Modified would
+        // overwrite the NULL pointer back).
+        context.SaveChanges();
+        Assert.Equal(1L, Scalar("SELECT COUNT(*) FROM pipelines WHERE goal_id = $value", unrelatedGoal));
+        Assert.Equal(unrelatedGoal, Scalar("SELECT goal_id FROM task_mappings WHERE task_id = $value", unrelatedTask));
+        Assert.Null(Scalar("SELECT active_task_id FROM pipelines WHERE goal_id = $value", goalId));
+        Assert.Equal(WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+            candidate.Registry.Slots.Select(s => s.Slot.TaskId == taskId
+                ? new WorkSlotView(s.Slot, WorkSlotState.Abandoned) : s).ToList(),
+            candidate.Registry.DispatchAttempts.ToList())),
+            Scalar("SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $value", goalId));
+    }
+
+    private static PipelineEntity NewPipelineEntity(string goalId) => new()
+    {
+        GoalId = goalId,
+        Description = "tracked " + goalId,
+        GoalJson = "{}",
+        Phase = "Planning",
+        Iteration = 1,
+        MaxRetries = 3,
+        MaxIterations = 3,
+        PhaseOutputs = "{}",
+        MetricsJson = "{}",
+        CreatedAt = "2026-01-01T00:00:00.0000000Z",
+        RoleSessionsJson = "[]",
+        PhaseOccurrence = 1,
+    };
+
+    private sealed class CountingThrowingFactory : IDbContextFactory<CopilotHiveDbContext>
+    {
+        private readonly Exception _sentinel;
+        private int _acquisitionCount;
+
+        public CountingThrowingFactory(Exception? sentinel = null) =>
+            _sentinel = sentinel ?? new InvalidOperationException(
+                "context factory must not be reached during preflight");
+
+        public int AcquisitionCount => Volatile.Read(ref _acquisitionCount);
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            Interlocked.Increment(ref _acquisitionCount);
+            throw _sentinel;
+        }
+    }
+}

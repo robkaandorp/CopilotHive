@@ -3699,3 +3699,1049 @@ internal abstract class AdmissionTransactionConnectionBase : DbConnection
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
     }
 }
+
+/// <summary>
+/// Regression matrix for <see cref="PipelineStore.CommitPendingAdmissionRollback"/> against a REAL,
+/// file-backed SQLite database: the admitted-then-rolled-back lifecycle read back through a FRESH
+/// context, the exact-text CAS, both one-row rules, the between-statement rollback, the
+/// commit/rollback uncertainty evidence, the consumed attempt never reused, and the unchanged
+/// unrelated durable state.
+/// </summary>
+public sealed class PipelineStorePendingRollbackIntegrationTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"copilothive-pending-rollback-{Guid.NewGuid():N}.db");
+
+    public PipelineStorePendingRollbackIntegrationTests()
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection);
+        context.Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch
+            {
+                // Best-effort deletion of a test-only temporary database.
+            }
+        }
+    }
+
+    private string ConnectionString => $"Data Source={_dbPath};Pooling=False";
+
+    private SqliteConnection OpenConnection()
+    {
+        var connection = new SqliteConnection(ConnectionString);
+        connection.Open();
+        return connection;
+    }
+
+    private static CopilotHiveDbContext ContextOn(DbConnection connection, IInterceptor? interceptor = null)
+    {
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+        return new CopilotHiveDbContext(builder.Options);
+    }
+
+    private T WithStore<T>(Func<PipelineStore, CopilotHiveDbContext, T> action, IInterceptor? interceptor = null)
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection, interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        return action(store, context);
+    }
+
+    private static Goal Goal(string goalId) =>
+        new() { Id = goalId, Description = "goal " + goalId, RepositoryNames = ["repo-a", "repo-b"] };
+
+    private static WorkSlotPosition Pos(int occurrence, GoalPhase phase = GoalPhase.Coding, int iteration = 1) =>
+        new(iteration, phase, occurrence);
+
+    /// <summary>
+    /// Admits a REAL Pending candidate through the production paths, persists the pipeline row,
+    /// the pointer, the mapping row and the registry blob, and returns the admitted candidate so
+    /// the test owns the exact prior state.
+    /// </summary>
+    private AdmissionOwnershipSnapshot AdmitPending(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(Goal(goalId), maxRetries: 8, maxIterations: 6);
+        pipeline.SetPlan(new IterationPlan
+        {
+            Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
+        });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.IterationBudget.TryConsume();
+        pipeline.Conversation.Add(new ConversationEntry("user", "preserved conversation one"));
+        pipeline.Conversation.Add(new ConversationEntry("assistant", "preserved conversation two"));
+
+        var historical = pipeline.AllocateAttemptAndRegisterSlot("historical-recorded", Pos(1, GoalPhase.Review, 1));
+        Assert.Equal(1, historical.Attempt);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("historical-recorded"));
+        pipeline.RecordSlot("historical-recorded");
+
+        var admitted = pipeline.AllocateAttemptAndRegisterSlot(taskId, Pos(2));
+        Assert.Equal(1, admitted.Attempt);
+        pipeline.SetActiveTask(taskId, "coder/preserved-branch");
+        var candidate = pipeline.CaptureAdmissionOwnership();
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+
+        WithStore<object?>((store, _) =>
+        {
+            store.SavePipeline(pipeline);
+            store.SaveTaskMapping(taskId, goalId);
+            return null;
+        });
+        SetBlob(goalId, stored);
+        SetPointer(goalId, taskId);
+        return candidate;
+    }
+
+    private void SetBlob(string goalId, string? blob)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "UPDATE pipelines SET work_slot_registry_json = $blob WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue("$blob", (object?)blob ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private void SetPointer(string goalId, string? taskId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE pipelines SET active_task_id = $task WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue("$task", (object?)taskId ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private void InsertMapping(string taskId, string goalId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)";
+        command.Parameters.AddWithValue("$task", taskId);
+        command.Parameters.AddWithValue("$goal", goalId);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private RollbackRows ReadRollback(string goalId, string taskId)
+    {
+        using var connection = OpenConnection();
+        using var pipeline = connection.CreateCommand();
+        pipeline.CommandText =
+            "SELECT active_task_id, work_slot_registry_json, phase, iteration, max_retries, max_iterations, coder_branch, phase_log_json, goal_json, metrics_json FROM pipelines WHERE goal_id = $goal";
+        pipeline.Parameters.AddWithValue("$goal", goalId);
+        using var reader = pipeline.ExecuteReader();
+        var rowExists = reader.Read();
+        var pointer = rowExists && !reader.IsDBNull(0) ? reader.GetString(0) : null;
+        var blob = rowExists && !reader.IsDBNull(1) ? reader.GetString(1) : null;
+        var phase = rowExists ? reader.GetString(2) : null;
+        var iteration = rowExists ? reader.GetInt32(3) : -1;
+        var maxRetries = rowExists ? reader.GetInt32(4) : -1;
+        var maxIterations = rowExists ? reader.GetInt32(5) : -1;
+        var coderBranch = rowExists && !reader.IsDBNull(6) ? reader.GetString(6) : null;
+        var phaseLog = rowExists && !reader.IsDBNull(7) ? reader.GetString(7) : null;
+        var goalJson = rowExists && !reader.IsDBNull(8) ? reader.GetString(8) : null;
+        var metricsJson = rowExists && !reader.IsDBNull(9) ? reader.GetString(9) : null;
+        reader.Close();
+
+        using var mapping = connection.CreateCommand();
+        mapping.CommandText = "SELECT goal_id FROM task_mappings WHERE task_id = $task";
+        mapping.Parameters.AddWithValue("$task", taskId);
+        var mapped = mapping.ExecuteScalar();
+        return new RollbackRows(rowExists, pointer, blob, mapped is DBNull or null ? null : (string)mapped,
+            phase, iteration, maxRetries, maxIterations, coderBranch, phaseLog, goalJson, metricsJson);
+    }
+
+    private string? Scalar(string sql, string value)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$value", value);
+        var result = command.ExecuteScalar();
+        return result is null or DBNull ? null : (string)result;
+    }
+
+    private long Count(string sql, string value)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$value", value);
+        return (long)command.ExecuteScalar()!;
+    }
+
+    private sealed record RollbackRows(
+        bool RowExists,
+        string? Pointer,
+        string? Blob,
+        string? MappingGoal,
+        string? Phase,
+        int Iteration,
+        int MaxRetries,
+        int MaxIterations,
+        string? CoderBranch,
+        string? PhaseLogJson,
+        string? GoalJson,
+        string? MetricsJson);
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_RealAdmittedPending_RollbackDurablyAndFreshContextReadback()
+    {
+        const string goalId = "rollback-durable";
+        const string taskId = "task-rollback-durable";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+
+        var beforeRow = WithStore((store, _) => ReadRollback(goalId, taskId));
+        var result = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+
+        // FRESH-CONTEXT READBACK (a brand-new connection over the file).
+        var after = ReadRollback(goalId, taskId);
+        Assert.True(after.RowExists);
+        Assert.Null(after.Pointer);
+        Assert.Null(after.MappingGoal);
+        Assert.NotNull(after.Blob);
+        var decoded = WorkSlotRegistryCodec.Decode(after.Blob!);
+        var target = Assert.Single(decoded.Slots, s => s.Slot.TaskId == taskId);
+        Assert.Equal(WorkSlotState.Abandoned, target.State);
+        Assert.Equal(1, target.Slot.Attempt);
+        Assert.Equal(Pos(2), target.Slot.Position); // the admitted position, identity preserved
+
+        // The OTHER slots and every high-water entry preserved EXACTLY.
+        Assert.Equal(2, decoded.Slots.Count);
+        Assert.Contains(decoded.Slots, s => s.Slot.TaskId == "historical-recorded"
+            && s.State == WorkSlotState.Recorded && s.Slot.Attempt == 1);
+        Assert.Equal(candidate.Registry.DispatchAttempts, decoded.DispatchAttempts);
+
+        // UNRELATED columns and the conversation untouched.
+        Assert.Equal("Coding", after.Phase);
+        Assert.Equal(beforeRow.Iteration, after.Iteration);
+        Assert.Equal(beforeRow.MaxRetries, after.MaxRetries);
+        Assert.Equal(beforeRow.MaxIterations, after.MaxIterations);
+        Assert.Equal("coder/preserved-branch", after.CoderBranch);
+
+        var conversation = WithStore((store, _) => store.GetConversation(goalId).ToList());
+        Assert.Collection(conversation,
+            entry => Assert.Equal("preserved conversation one", entry.Content),
+            entry => Assert.Equal("preserved conversation two", entry.Content));
+
+        // The unrelated mapping row (if any) is untouched; the affected mapping is gone.
+        Assert.Equal(0, Count("SELECT COUNT(*) FROM task_mappings WHERE task_id = $value", taskId));
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_ConsumedAttemptIsNotReusedAfterRollback()
+    {
+        // TEST-ONLY explicit restore/allocation: restore the rolled-back registry into a fresh
+        // pipeline and prove the next allocation for the SAME position gets attempt 2, not 1.
+        const string goalId = "rollback-attempt-reuse";
+        const string taskId = "task-rollback-attempt-reuse";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+
+        var result = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+
+        var blob = ReadRollback(goalId, taskId).Blob!;
+        var restored = new GoalPipeline(Goal(goalId));
+        restored.RestoreRegistry(WorkSlotRegistryCodec.Decode(blob));
+        Assert.True(restored.IsSlotAbandoned(taskId));
+
+        var next = restored.AllocateAttemptAndRegisterSlot("next-task-after-rollback", Pos(2));
+        Assert.Equal(2, next.Attempt); // the consumed attempt 1 is NOT reused
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_RepeatedInvocationAlreadyRetired_RefusedWithoutRepair()
+    {
+        const string goalId = "rollback-repeat";
+        const string taskId = "task-rollback-repeat";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+
+        var first = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, first.Status);
+
+        // The SECOND invocation is a repeated request against the already-retired state: the
+        // pointer no longer matches, so it refuses WITHOUT repair (no reconstruction, no retry).
+        var second = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, second.Status);
+        Assert.Null(second.PrimaryException);
+        Assert.Null(second.RollbackException);
+
+        var after = ReadRollback(goalId, taskId);
+        Assert.Null(after.Pointer);
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(
+            WorkSlotRegistryCodec.Decode(after.Blob!).Slots, s => s.Slot.TaskId == taskId).State);
+        Assert.Null(after.MappingGoal);
+    }
+
+    [Theory]
+    [InlineData("update", -1)]
+    [InlineData("update", 2)]
+    [InlineData("delete", -1)]
+    [InlineData("delete", 2)]
+    public void CommitPendingAdmissionRollback_UnexpectedStatementRowCount_IsErrorAndRollsBack(
+        string statement, int forcedCount)
+    {
+        var goalId = $"rollback-count-{statement}-{forcedCount}";
+        var taskId = $"task-rollback-count-{statement}-{forcedCount}";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var interceptor = new RollbackRowCountInterceptor(statement, forcedCount);
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => WithStore(
+            (store, _) => store.CommitPendingAdmissionRollback(goalId, taskId, stored), interceptor));
+
+        Assert.Equal(1, interceptor.OverrideCount);
+        Assert.Contains(forcedCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            thrown.Message, StringComparison.Ordinal);
+        Assert.Contains("expected exactly 0 or 1", thrown.Message, StringComparison.Ordinal);
+        Assert.Contains(statement == "update" ? "rollback guard updated" : "rollback mapping delete affected",
+            thrown.Message, StringComparison.Ordinal);
+        // NOTHING durably changed — the rollback confirmed.
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer);
+        Assert.Equal(stored, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_MappingDeleteMissesOrForeign_BetweenStatementRollback()
+    {
+        foreach (var kind in new[] { "missing", "foreign" })
+        {
+            var goalId = $"rollback-between-{kind}";
+            var taskId = $"task-rollback-between-{kind}";
+            var candidate = AdmitPending(goalId, taskId);
+            var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+            if (kind == "missing")
+            {
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "DELETE FROM task_mappings WHERE task_id = $task";
+                command.Parameters.AddWithValue("$task", taskId);
+                Assert.Equal(1, command.ExecuteNonQuery());
+            }
+            else
+            {
+                // Re-point the mapping to a FOREIGN goal (same task id, a newer owner).
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "UPDATE task_mappings SET goal_id = 'newer-foreign-goal' WHERE task_id = $task";
+                command.Parameters.AddWithValue("$task", taskId);
+                Assert.Equal(1, command.ExecuteNonQuery());
+            }
+
+            var result = WithStore((store, _) =>
+                store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+            Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+            // The preceding UPDATE was rolled back — the durable state is EXACTLY as admitted.
+            var after = ReadRollback(goalId, taskId);
+            Assert.Equal(taskId, after.Pointer);
+            Assert.Equal(stored, after.Blob);
+            // "foreign": the newer goal's row SURVIVES (never a steal); "missing": still absent.
+            Assert.Equal(kind == "foreign" ? "newer-foreign-goal" : null, after.MappingGoal);
+        }
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_CommitThrowsBeforeAndAfterUnderlyingCommit_Indeterminate()
+    {
+        foreach (var throwAfterCommit in new[] { false, true })
+        {
+            var goalId = $"rollback-commit-{throwAfterCommit}";
+            var taskId = $"task-rollback-commit-{throwAfterCommit}";
+            var candidate = AdmitPending(goalId, taskId);
+            var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+            using var connection = new AdmissionCommitFaultConnection(ConnectionString, throwAfterCommit);
+            connection.Open();
+            using var context = ContextOn(connection);
+            var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+            var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+            Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+            Assert.Same(connection.CommitSentinel, result.PrimaryException);
+            Assert.Equal(1, connection.CommitAttemptCount);
+            var durable = ReadRollback(goalId, taskId);
+            if (throwAfterCommit)
+            {
+                // The commit landed underneath — but the store still reports Indeterminate.
+                Assert.Null(durable.Pointer);
+                Assert.Null(durable.MappingGoal);
+                var decoded = WorkSlotRegistryCodec.Decode(durable.Blob!);
+                Assert.Equal(WorkSlotState.Abandoned,
+                    Assert.Single(decoded.Slots, s => s.Slot.TaskId == taskId).State);
+            }
+            else
+            {
+                Assert.Equal(taskId, durable.Pointer);
+                Assert.Equal(stored, durable.Blob);
+                Assert.Equal(goalId, durable.MappingGoal);
+            }
+        }
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_RollbackFailure_IndeterminateWithExactPrimaryAndRollbackEvidence()
+    {
+        const string goalId = "rollback-rollback-throws";
+        const string taskId = "task-rollback-rollback-throws";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        // The pointer is moved away so the guard matches zero rows (a clean refusal body) while
+        // the rollback — forced to throw — makes the outcome uncertain.
+        SetPointer(goalId, "newer-owner");
+        using var connection = new RollbackThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal("newer-owner", after.Pointer);
+        Assert.Equal(stored, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_BodyErrorWithConfirmedRollback_PropagatesExactException()
+    {
+        const string goalId = "rollback-body-error";
+        const string taskId = "task-rollback-body-error";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var interceptor = new RegistryUpdateThrowInterceptor();
+        // The UPDATE itself throws a SqliteException — a body error, NOT a refusal.
+        var thrown = Assert.Throws<SqliteException>(() => WithStore(
+            (store, _) => store.CommitPendingAdmissionRollback(goalId, taskId, stored), interceptor));
+
+        Assert.Same(interceptor.Sentinel, thrown);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer);
+        Assert.Equal(stored, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_MissingPipelineRow_RefusedWithoutCreatingAnything()
+    {
+        var goalId = "rollback-missing";
+        var taskId = "task-rollback-missing";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        WithStore<object?>((store, _) =>
+        {
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM pipelines WHERE goal_id = $goal";
+            command.Parameters.AddWithValue("$goal", goalId);
+            Assert.Equal(1, command.ExecuteNonQuery());
+            return null;
+        });
+
+        var result = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+        // A missing pipeline row refuses without creating anything; the mapping row is left
+        // UNTOUCHED (a refusal never repairs or erases durable state).
+        Assert.Equal(new RollbackRows(false, null, null, goalId, null, -1, -1, -1, null, null, null, null),
+            ReadRollback(goalId, taskId));
+        Assert.Equal(goalId, Scalar("SELECT goal_id FROM task_mappings WHERE task_id = $value", taskId));
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_NullOrNewerPointer_RefusedAndTupleUnchanged()
+    {
+        foreach (var kind in new[] { "null-pointer", "newer-pointer" })
+        {
+            var goalId = $"rollback-pointer-{kind}";
+            var taskId = $"task-rollback-pointer-{kind}";
+            var candidate = AdmitPending(goalId, taskId);
+            var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+            SetPointer(goalId, kind == "null-pointer" ? null : "newer-owner");
+
+            var result = WithStore((store, _) =>
+                store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+            Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+            var after = ReadRollback(goalId, taskId);
+            Assert.Equal(kind == "null-pointer" ? null : "newer-owner", after.Pointer);
+            Assert.Equal(stored, after.Blob);
+            Assert.Equal(goalId, after.MappingGoal);
+        }
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_StaleRegistryText_RefusedAndTupleUnchanged()
+    {
+        const string goalId = "rollback-stale-text";
+        const string taskId = "task-rollback-stale-text";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        const string tampered = "rollback-stale-text-blob";
+        SetBlob(goalId, tampered);
+
+        var result = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer);
+        Assert.Equal(tampered, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_ExecutesExactlyUpdateThenDelete_WithNarrowParameterizedShapeAndNoReads()
+    {
+        const string goalId = "rollback-sql-shape";
+        const string taskId = "task-rollback-sql-shape";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var capture = new AdmissionOwnershipCommandCaptureInterceptor();
+
+        var result = WithStore(
+            (store, _) => store.CommitPendingAdmissionRollback(goalId, taskId, stored), capture);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Collection(capture.Commands,
+            update =>
+            {
+                Assert.Equal("NonQuery", update.Kind);
+                Assert.StartsWith("UPDATE pipelines", update.Sql.TrimStart(), StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("SET active_task_id = NULL, work_slot_registry_json = $registry",
+                    update.Sql, StringComparison.Ordinal);
+                Assert.Contains("active_task_id = $task", update.Sql, StringComparison.Ordinal);
+                Assert.Contains("work_slot_registry_json IS $expected COLLATE BINARY",
+                    update.Sql, StringComparison.Ordinal);
+                Assert.Equal(new[] { "$expected", "$goal", "$registry", "$task" },
+                    update.Parameters.Keys.Order(StringComparer.Ordinal).ToArray());
+                Assert.Equal(goalId, update.Parameters["$goal"]);
+                Assert.Equal(taskId, update.Parameters["$task"]);
+                Assert.Equal(WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+                    WorkSlotRegistryCodec.Decode(stored).Slots.Select(s => s.Slot.TaskId == taskId
+                        ? new WorkSlotView(s.Slot, WorkSlotState.Abandoned) : s).ToList(),
+                    WorkSlotRegistryCodec.Decode(stored).DispatchAttempts.ToList())),
+                    update.Parameters["$registry"]);
+                Assert.Equal(stored, update.Parameters["$expected"]);
+            },
+            delete =>
+            {
+                Assert.Equal("NonQuery", delete.Kind);
+                Assert.StartsWith("DELETE FROM task_mappings", delete.Sql.TrimStart(),
+                    StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("task_id = $task", delete.Sql, StringComparison.Ordinal);
+                Assert.Contains("goal_id = $goal", delete.Sql, StringComparison.Ordinal);
+                Assert.Equal(new[] { "$goal", "$task" },
+                    delete.Parameters.Keys.Order(StringComparer.Ordinal).ToArray());
+                Assert.Equal(taskId, delete.Parameters["$task"]);
+                Assert.Equal(goalId, delete.Parameters["$goal"]);
+            });
+        Assert.DoesNotContain(capture.Commands,
+            command => command.Kind is "Reader" or "Scalar"
+                || command.Sql.Contains("SELECT", StringComparison.OrdinalIgnoreCase));
+        Assert.All(capture.Commands, command =>
+        {
+            Assert.DoesNotContain(goalId, command.Sql, StringComparison.Ordinal);
+            Assert.DoesNotContain(taskId, command.Sql, StringComparison.Ordinal);
+            Assert.DoesNotContain(stored, command.Sql, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_CommitConfirmedDespiteCleanupFailure_RemainsCommittedAndDurable()
+    {
+        const string goalId = "rollback-cleanup-fails";
+        const string taskId = "task-rollback-cleanup-fails";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var logger = new ThrowingLogger<PipelineStore>();
+        using var connection = new DisposeThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, logger);
+        logger.Arm();
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Equal(1, connection.DisposeAttemptCount);
+        Assert.True(logger.ThrowCount >= 1);
+        var durable = ReadRollback(goalId, taskId);
+        Assert.Null(durable.Pointer);
+        Assert.Null(durable.MappingGoal);
+        Assert.Contains(WorkSlotState.Abandoned,
+            WorkSlotRegistryCodec.Decode(durable.Blob!).Slots.Select(s => s.State).Where(st => st == WorkSlotState.Abandoned).ToList());
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_PreflightContextAcquisitionThrows_ExactExceptionNoMasking()
+    {
+        const string goalId = "rollback-acquire-fails";
+        const string taskId = "task-rollback-acquire-fails";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var acquisitionSentinel = new InvalidOperationException("pending-rollback acquisition sentinel");
+        var cleanupSentinel = new InvalidOperationException("pending-rollback cleanup sentinel");
+        var innerContext = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(OpenConnection()).Options);
+        var factory = new SingleContextFactory(innerContext);
+        var store = new PipelineStore(new AcquisitionThrowingFactory(factory, acquisitionSentinel),
+            NullLogger<PipelineStore>.Instance);
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ =>
+        {
+            disposerCalls++;
+            throw cleanupSentinel;
+        };
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+        Assert.Same(acquisitionSentinel, thrown);
+        Assert.Equal(0, disposerCalls); // no context existed, so cleanup cannot replace the primary
+        innerContext.Dispose();
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_ThrowingMessageCleanupException_RecordedResultNotMasked()
+    {
+        // RECORDED-RESULT PATH (Committed): the factory-owned context disposal throws an exception
+        // whose Message GETTER itself throws — injectable through the context-disposal seam. The
+        // authoritative Committed result must survive the cleanup path untouched.
+        const string goalId = "rollback-message-throws-commit";
+        const string taskId = "task-rollback-message-throws-commit";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var factory = new OwnedConnectionContextFactory(ConnectionString);
+        AdmissionOwnershipCommitResult result;
+        try
+        {
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+            store.ContextDisposerForTest = _ => throw new ThrowingMessageException();
+
+            result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+        }
+        finally
+        {
+            factory.Dispose();
+        }
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+        var durable = ReadRollback(goalId, taskId);
+        Assert.Null(durable.Pointer);
+        Assert.Null(durable.MappingGoal);
+        Assert.Equal(WorkSlotState.Abandoned,
+            Assert.Single(WorkSlotRegistryCodec.Decode(durable.Blob!).Slots,
+                s => s.Slot.TaskId == taskId).State);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_ThrowingMessageCleanupException_RefusedResultNotMasked()
+    {
+        // RECORDED-RESULT PATH (Refused): the tracker-detach seam throws a throwing-Message
+        // exception on a confirmed-rollback refusal path — the Refused result must survive.
+        const string goalId = "rollback-message-throws-refused";
+        const string taskId = "task-rollback-message-throws-refused";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        // Move the pointer away: the goal, mapping and registry-text guards all still match, so
+        // the guard refuses on the pointer alone — a confirmed-rollback REFUSAL — while the
+        // tracker-detach cleanup throws a throwing-Message exception.
+        SetPointer(goalId, "newer-owner");
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        var detachCalls = 0;
+        store.TrackerDetachForTest = (_, _) =>
+        {
+            detachCalls++;
+            throw new ThrowingMessageException("the tracker detach cleanup failed");
+        };
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(1, detachCalls);
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+        var durable = ReadRollback(goalId, taskId);
+        Assert.Equal("newer-owner", durable.Pointer);
+        Assert.Equal(stored, durable.Blob);
+        Assert.Equal(goalId, durable.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_ThrowingMessageCleanupException_PrimaryExceptionNotMasked()
+    {
+        // PROPAGATING-PRIMARY PATH: the body's first UPDATE throws the exact sentinel, the rollback
+        // CONFIRMS, and the tracker-detach cleanup then throws a throwing-Message exception. The
+        // EXACT original body exception (instance identity, not just type) must still propagate.
+        const string goalId = "rollback-message-throws-primary";
+        const string taskId = "task-rollback-message-throws-primary";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var updateThrow = new RegistryUpdateThrowInterceptor();
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection, updateThrow);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        store.TrackerDetachForTest = (_, _) => throw new ThrowingMessageException("the tracker detach cleanup failed");
+
+        var thrown = Assert.Throws<SqliteException>(() =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+        Assert.Same(updateThrow.Sentinel, thrown);
+        var durable = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, durable.Pointer);
+        Assert.Equal(stored, durable.Blob);
+        Assert.Equal(goalId, durable.MappingGoal);
+    }
+
+    /// <summary>
+    /// A minimal factory handing out store-OWNED contexts (the <c>ownsContext = true</c> path), each
+    /// on its own connection to the file-backed database. The contexts do not own their
+    /// connections, so <see cref="Dispose"/> closes them explicitly — the readback after the
+    /// operation re-opens the file genuinely.
+    /// </summary>
+    private sealed class OwnedConnectionContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly string _connectionString;
+        private readonly List<CopilotHiveDbContext> _contexts = [];
+        private readonly List<SqliteConnection> _connections = [];
+
+        public OwnedConnectionContextFactory(string connectionString) => _connectionString = connectionString;
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            _connections.Add(connection);
+            var context = ContextOn(connection);
+            _contexts.Add(context);
+            return context;
+        }
+
+        public void Dispose()
+        {
+            foreach (var context in _contexts)
+                context.Dispose();
+            foreach (var connection in _connections)
+            {
+                connection.Close();
+                connection.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_BeginTransactionThrows_PropagatesExactException_NoBodyWriteNoDetach()
+    {
+        const string goalId = "rollback-begin-fails";
+        const string taskId = "task-rollback-begin-fails";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        using var beginConnection = OpenConnection();
+        var capture = new AdmissionOwnershipCommandCaptureInterceptor();
+        var beginInterceptor = new AdmissionBeginThrowingInterceptor();
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(beginConnection)
+                .AddInterceptors(capture, beginInterceptor)
+                .Options);
+        var factory = new SingleContextFactory(context);
+        var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+        var trackerDetachCalls = 0;
+        store.TrackerDetachForTest = (_, _) =>
+        {
+            trackerDetachCalls++;
+            throw new InvalidOperationException("tracker cleanup must not run before a body attempt");
+        };
+        var contextDisposeCalls = 0;
+        var cleanupSentinel = new InvalidOperationException("rollback begin path context cleanup sentinel");
+        store.ContextDisposerForTest = ownedContext =>
+        {
+            contextDisposeCalls++;
+            ownedContext.Dispose();
+            throw cleanupSentinel;
+        };
+
+        try
+        {
+            var thrown = Assert.Throws<InvalidOperationException>(() =>
+                store.CommitPendingAdmissionRollback(goalId, taskId, stored));
+
+            // The EXACT begin exception propagates — no cleanup step can mask it.
+            Assert.Same(beginInterceptor.BeginSentinel, thrown);
+            Assert.Equal(1, beginInterceptor.BeginAttemptCount);
+            // NO body statement was ever issued and the tracker detach never ran.
+            Assert.Empty(capture.Commands);
+            Assert.Equal(0, trackerDetachCalls);
+            // The factory-owned context is still disposed on this pre-body path.
+            Assert.Equal(1, contextDisposeCalls);
+            // NOTHING durably changed.
+            var after = ReadRollback(goalId, taskId);
+            Assert.Equal(taskId, after.Pointer);
+            Assert.Equal(stored, after.Blob);
+            Assert.Equal(goalId, after.MappingGoal);
+        }
+        finally
+        {
+            context.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A minimal valid tracked <see cref="PipelineEntity"/> for the affected-goal detach vectors.
+    /// </summary>
+    private static PipelineEntity TrackedPipelineEntity(string goalId) => new()
+    {
+        GoalId = goalId,
+        Description = "tracked " + goalId,
+        GoalJson = "{}",
+        Phase = "Coding",
+        Iteration = 1,
+        MaxRetries = 3,
+        MaxIterations = 3,
+        PhaseOutputs = "{}",
+        MetricsJson = "{}",
+        CreatedAt = "2026-01-01T00:00:00.0000000Z",
+        RoleSessionsJson = "[]",
+        PhaseOccurrence = 1,
+    };
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_CommitAndRollbackThrow_IndeterminateWithBothExactInstances()
+    {
+        const string goalId = "rollback-commit-and-rollback-throw";
+        const string taskId = "task-rollback-commit-and-rollback-throw";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        using var connection = new AdmissionCommitAndRollbackThrowConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var stalePipeline = TrackedPipelineEntity(goalId);
+        stalePipeline.ActiveTaskId = "stale-tracked-pointer";
+        stalePipeline.WorkSlotRegistryJson = "stale-tracked-blob";
+        context.Attach(stalePipeline);
+        var staleMapping = new TaskMappingEntity { TaskId = taskId, GoalId = "stale-tracked-goal" };
+        context.Attach(staleMapping);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        // EXCEPTION IDENTITY: both exact caught instances are preserved, not merely their types.
+        Assert.Same(connection.CommitSentinel, result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, connection.CommitAttemptCount);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        // The statement WAS attempted, so the affected tracker entries were detached even on this
+        // uncertain path.
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            entry => entry.Entity.GoalId == goalId);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            entry => entry.Entity.TaskId == taskId);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer);
+        Assert.Equal(stored, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_BodyErrorAndRollbackThrow_IndeterminateWithBothExactInstances()
+    {
+        const string goalId = "rollback-body-and-rollback-throw";
+        const string taskId = "task-rollback-body-and-rollback-throw";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var updateThrow = new RegistryUpdateThrowInterceptor();
+        using var connection = new RollbackThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection, updateThrow);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        // The UPDATE throws (a body error, NOT a refusal) and the forced rollback ALSO throws —
+        // the transaction's fate is unknown, so the outcome is Indeterminate carrying BOTH exact
+        // instances (the primary body exception is not null here, unlike the clean-refusal case).
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Same(updateThrow.Sentinel, result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, updateThrow.ThrowCount);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer);
+        Assert.Equal(stored, after.Blob);
+        Assert.Equal(goalId, after.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_CleanupWarnings_CarryRollbackSpecificDiagnosticsNotAdmissionOnes()
+    {
+        const string goalId = "rollback-diagnostics";
+        const string taskId = "task-rollback-diagnostics";
+        var candidate = AdmitPending(goalId, taskId);
+        var stored = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var logger = new TestLogger<PipelineStore>();
+        using var connection = new DisposeThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, logger);
+
+        var result = store.CommitPendingAdmissionRollback(goalId, taskId, stored);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, result.Status);
+        Assert.Equal(1, connection.DisposeAttemptCount);
+        // The ROLLBACK path's own diagnostics, never the admission operation's templates.
+        Assert.Contains(logger.LogEntries, entry => entry.LogLevel == LogLevel.Warning
+            && entry.Message.Contains("pending-rollback-transaction-dispose", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries,
+            entry => entry.Message.Contains("admission-ownership-", StringComparison.Ordinal));
+        // A committed transaction must never be reported as refused or rolled back.
+        Assert.DoesNotContain(logger.LogEntries,
+            entry => entry.Message.Contains("pending-rollback-detach", StringComparison.Ordinal));
+        var durable = ReadRollback(goalId, taskId);
+        Assert.Null(durable.Pointer);
+        Assert.Null(durable.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitPendingAdmissionRollback_StoredTextSemanticallyEquivalentButDifferent_Refused()
+    {
+        // THE CAS EXACTNESS COMPLEMENT: the row holds the canonical encoding while the expectation
+        // is the SAME registry re-serialized with different whitespace — semantically equivalent,
+        // textually different. The CAS is TEXTUAL, so this must refuse; a mutant that decodes both
+        // sides and compares values would wrongly commit here.
+        const string goalId = "rollback-cas-equivalent";
+        const string taskId = "task-rollback-cas-equivalent";
+        var candidate = AdmitPending(goalId, taskId);
+        var canonical = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        Assert.Equal(canonical, ReadRollback(goalId, taskId).Blob); // AdmitPending stored the canonical text
+        var equivalentIndented = JsonSerializer.Serialize(
+            System.Text.Json.Nodes.JsonNode.Parse(canonical),
+            new JsonSerializerOptions { WriteIndented = true });
+        Assert.NotEqual(canonical, equivalentIndented);
+
+        var result = WithStore((store, _) =>
+            store.CommitPendingAdmissionRollback(goalId, taskId, equivalentIndented));
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Refused, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+        var after = ReadRollback(goalId, taskId);
+        Assert.Equal(taskId, after.Pointer); // the pointer was NOT cleared
+        Assert.Equal(canonical, after.Blob); // the blob was NOT replaced
+        Assert.Equal(goalId, after.MappingGoal); // the mapping was NOT deleted
+    }
+
+    private sealed class AcquisitionThrowingFactory : IDbContextFactory<CopilotHiveDbContext>
+    {
+        private readonly IDbContextFactory<CopilotHiveDbContext> _inner;
+        private readonly Exception _sentinel;
+
+        public AcquisitionThrowingFactory(IDbContextFactory<CopilotHiveDbContext> inner, Exception sentinel)
+        {
+            _inner = inner;
+            _sentinel = sentinel;
+        }
+
+        public CopilotHiveDbContext CreateDbContext() => throw _sentinel;
+    }
+}
+
+/// <summary>
+/// Substitutes the provider's post-execution affected-row count for ONE pending-rollback statement
+/// (the pipelines UPDATE or the task_mappings DELETE) — the any-other-count-is-an-error vectors.
+/// </summary>
+internal sealed class RollbackRowCountInterceptor : DbCommandInterceptor
+{
+    private readonly string _statement;
+    private readonly int _forcedCount;
+    private int _overrideCount;
+
+    public RollbackRowCountInterceptor(string statement, int forcedCount)
+    {
+        if (statement is not ("update" or "delete"))
+            throw new ArgumentException("Statement must be 'update' or 'delete'.", nameof(statement));
+        _statement = statement;
+        _forcedCount = forcedCount;
+    }
+
+    public int OverrideCount => Volatile.Read(ref _overrideCount);
+
+    public override int NonQueryExecuted(DbCommand command, CommandExecutedEventData eventData, int result)
+    {
+        var sql = command.CommandText.TrimStart();
+        var targeted = _statement == "update"
+            ? sql.StartsWith("UPDATE pipelines", StringComparison.OrdinalIgnoreCase)
+            : sql.StartsWith("DELETE FROM task_mappings", StringComparison.OrdinalIgnoreCase);
+        if (!targeted)
+            return result;
+
+        Interlocked.Increment(ref _overrideCount);
+        return _forcedCount;
+    }
+}
+
+/// <summary>
+/// An exception whose <see cref="Exception.Message"/> GETTER ITSELF THROWS — the genuine mechanism
+/// for the never-masked-cleanup vectors: <c>Exception.Message</c> is virtual, so a cleanup catch
+/// that reads the message BEFORE entering its no-throw guard would let this escape the finally and
+/// mask the authoritative outcome. The default instance throws on <c>Message</c> AND on
+/// <see cref="Exception.ToString"/>; an optional wrapped cause is supported for diagnostics.
+/// </summary>
+internal sealed class ThrowingMessageException : Exception
+{
+    private static readonly string MessageSentinel = "the Message getter itself threw SENTINEL";
+    private readonly string? _innerMessage;
+
+    /// <summary>Creates the exception whose <c>Message</c> getter throws (no wrapped cause).</summary>
+    public ThrowingMessageException() { }
+
+    /// <summary>Creates the exception whose <c>Message</c> getter throws after reporting the cause.</summary>
+    public ThrowingMessageException(string innerMessage) => _innerMessage = innerMessage;
+
+    public override string Message =>
+        throw new InvalidOperationException(
+            _innerMessage is null ? MessageSentinel : _innerMessage + " / " + MessageSentinel);
+
+    public override string ToString() =>
+        _innerMessage is null
+            ? "ThrowingMessageException (ToString also throws)"
+            : _innerMessage + " / ThrowinigMessageException (ToString also throws)";
+}
