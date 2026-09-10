@@ -2527,3 +2527,1175 @@ internal sealed class RegistryUpdateThrowInterceptor : DbCommandInterceptor
         return ValueTask.FromResult(result);
     }
 }
+/// <summary>
+/// Regression matrix for <see cref="PipelineStore.CommitAdmissionOwnership"/> against a real,
+/// file-backed SQLite database. Every durable assertion is made after the operation's connection
+/// has closed and a fresh connection has reopened the file.
+/// </summary>
+public sealed class PipelineStoreAdmissionOwnershipIntegrationTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"copilothive-admission-ownership-{Guid.NewGuid():N}.db");
+
+    public PipelineStoreAdmissionOwnershipIntegrationTests()
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection);
+        context.Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch
+            {
+                // Best-effort deletion of a test-only temporary database.
+            }
+        }
+    }
+
+    private string ConnectionString => $"Data Source={_dbPath};Pooling=False";
+
+    private SqliteConnection OpenConnection()
+    {
+        var connection = new SqliteConnection(ConnectionString);
+        connection.Open();
+        return connection;
+    }
+
+    private static CopilotHiveDbContext ContextOn(DbConnection connection, IInterceptor? interceptor = null)
+    {
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+        return new CopilotHiveDbContext(builder.Options);
+    }
+
+    private T WithStore<T>(Func<PipelineStore, CopilotHiveDbContext, T> action, IInterceptor? interceptor = null)
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection, interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        return action(store, context);
+    }
+
+    private static Goal Goal(string goalId) =>
+        new() { Id = goalId, Description = "goal " + goalId, RepositoryNames = ["repo-a", "repo-b"] };
+
+    private static WorkSlotPosition Pos(int occurrence, GoalPhase phase = GoalPhase.Coding, int iteration = 1) =>
+        new(iteration, phase, occurrence);
+
+    /// <summary>
+    /// Produces a genuine captured Pending admission with all lifecycle states, history, a
+    /// counter-only entry, and a high-water value above its slot attempt.
+    /// </summary>
+    private static AdmissionOwnershipSnapshot RichCandidate(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(Goal(goalId));
+        var high = Pos(1, GoalPhase.Improve);
+        var counterOnly = Pos(2, GoalPhase.Merging);
+        pipeline.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("historical-recorded", high, 2), WorkSlotState.Recorded)],
+            [new WorkSlotRegistryAttemptEntry(high, 9),
+             new WorkSlotRegistryAttemptEntry(counterOnly, 7)]));
+
+        var claimed = pipeline.AllocateAttemptAndRegisterSlot("historical-claimed", Pos(3));
+        Assert.Equal(1, claimed.Attempt);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("historical-claimed"));
+
+        var abandoned = pipeline.AllocateAttemptAndRegisterSlot("historical-abandoned", Pos(4, GoalPhase.Testing));
+        Assert.Equal(1, abandoned.Attempt);
+        Assert.True(pipeline.AbandonSlot("historical-abandoned"));
+
+        var active = pipeline.AllocateAttemptAndRegisterSlot(taskId, Pos(5, GoalPhase.Review, 2));
+        Assert.Equal(1, active.Attempt);
+        pipeline.SetActiveTask(taskId);
+        return pipeline.CaptureAdmissionOwnership();
+    }
+
+    private void SeedRichIdleRow(string goalId, string? blob)
+    {
+        WithStore<object?>((store, _) =>
+        {
+            var pipeline = new GoalPipeline(Goal(goalId), maxRetries: 8, maxIterations: 6);
+            pipeline.SetPlan(new IterationPlan
+            {
+                Phases = [GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review],
+            });
+            pipeline.AdvanceTo(GoalPhase.Coding);
+            pipeline.IterationBudget.TryConsume();
+            pipeline.ReviewRetryBudget.TryConsume();
+            pipeline.SetActiveTask("temporary-pointer", "coder/preserved-branch");
+            Assert.True(pipeline.ClearActiveTaskIfCurrent("temporary-pointer"));
+            pipeline.Conversation.Add(new ConversationEntry("user", "preserved conversation one"));
+            pipeline.Conversation.Add(new ConversationEntry("assistant", "preserved conversation two"));
+            store.SavePipeline(pipeline);
+            store.SaveTaskMapping("unrelated-mapping", goalId);
+            return null;
+        });
+        SetBlob(goalId, blob);
+    }
+
+    private void SetBlob(string goalId, string? blob)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "UPDATE pipelines SET work_slot_registry_json = $blob WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue("$blob", (object?)blob ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private void SetPointer(string goalId, string? taskId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE pipelines SET active_task_id = $task WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue("$task", (object?)taskId ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private void InsertMapping(string taskId, string goalId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)";
+        command.Parameters.AddWithValue("$task", taskId);
+        command.Parameters.AddWithValue("$goal", goalId);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    private Dictionary<string, object?> ReadWholeRow(string goalId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM pipelines WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read(), $"missing pipeline row '{goalId}'");
+        var row = new Dictionary<string, object?>(StringComparer.Ordinal);
+        for (var i = 0; i < reader.FieldCount; i++)
+            row.Add(reader.GetName(i), reader.IsDBNull(i) ? null : reader.GetValue(i));
+        return row;
+    }
+
+    private OwnershipRows ReadOwnership(string goalId, string taskId)
+    {
+        using var connection = OpenConnection();
+        using var pipeline = connection.CreateCommand();
+        pipeline.CommandText =
+            "SELECT active_task_id, work_slot_registry_json FROM pipelines WHERE goal_id = $goal";
+        pipeline.Parameters.AddWithValue("$goal", goalId);
+        using var reader = pipeline.ExecuteReader();
+        var rowExists = reader.Read();
+        var pointer = rowExists && !reader.IsDBNull(0) ? reader.GetString(0) : null;
+        var blob = rowExists && !reader.IsDBNull(1) ? reader.GetString(1) : null;
+        reader.Close();
+
+        using var mapping = connection.CreateCommand();
+        mapping.CommandText = "SELECT goal_id FROM task_mappings WHERE task_id = $task";
+        mapping.Parameters.AddWithValue("$task", taskId);
+        var mapped = mapping.ExecuteScalar();
+        return new OwnershipRows(rowExists, pointer, blob, mapped is DBNull or null ? null : (string)mapped);
+    }
+
+    private static void AssertConfirmed(AdmissionOwnershipCommitResult result, AdmissionOwnershipCommitStatus status)
+    {
+        Assert.Equal(status, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Null(result.RollbackException);
+    }
+
+    private sealed record OwnershipRows(bool RowExists, string? Pointer, string? Blob, string? MappingGoal);
+
+    public static IEnumerable<object?[]> PriorBlobCases()
+    {
+        yield return ["sql-null", null];
+        yield return ["nonempty", WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot([], []))];
+    }
+
+    [Theory]
+    [MemberData(nameof(PriorBlobCases))]
+    public void CommitAdmissionOwnership_RealCapturedPending_FromNullOrNonemptyPrior_PreservesCandidateAndUnrelatedState(
+        string label, string? priorBlob)
+    {
+        var goalId = "ownership-success-" + label;
+        var taskId = "task-success-" + label;
+        SeedRichIdleRow(goalId, priorBlob);
+        var before = ReadWholeRow(goalId);
+        var candidate = RichCandidate(goalId, taskId);
+        var expectedSlots = candidate.Registry.Slots.ToList();
+        var expectedAttempts = candidate.Registry.DispatchAttempts.ToList();
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, priorBlob));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        var durable = ReadOwnership(goalId, taskId); // fresh connection after operation closed
+        Assert.True(durable.RowExists);
+        Assert.Equal(taskId, durable.Pointer);
+        Assert.Equal(goalId, durable.MappingGoal);
+        Assert.NotNull(durable.Blob);
+
+        var decoded = WorkSlotRegistryCodec.Decode(durable.Blob!);
+        Assert.Equal(expectedSlots, decoded.Slots);
+        Assert.Equal(expectedAttempts, decoded.DispatchAttempts);
+        Assert.Contains(decoded.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
+        Assert.Contains(decoded.Slots, s => s.State == WorkSlotState.Claimed);
+        Assert.Contains(decoded.Slots, s => s.State == WorkSlotState.Recorded);
+        Assert.Contains(decoded.Slots, s => s.State == WorkSlotState.Abandoned);
+        Assert.Contains(decoded.DispatchAttempts, a => a.HighWaterAttempt == 9);
+        Assert.Contains(decoded.DispatchAttempts,
+            a => a.HighWaterAttempt == 7 && decoded.Slots.All(s => s.Slot.Position != a.Position));
+
+        var after = ReadWholeRow(goalId);
+        Assert.Equal(before.Count, after.Count);
+        foreach (var (column, value) in before)
+        {
+            if (column is "active_task_id" or "work_slot_registry_json")
+                continue;
+            Assert.Equal(value, after[column]);
+        }
+        var conversation = WithStore((store, _) => store.GetConversation(goalId).ToList());
+        Assert.Collection(conversation,
+            entry =>
+            {
+                Assert.Equal("user", entry.Role);
+                Assert.Equal("preserved conversation one", entry.Content);
+            },
+            entry =>
+            {
+                Assert.Equal("assistant", entry.Role);
+                Assert.Equal("preserved conversation two", entry.Content);
+            });
+        Assert.Equal(goalId, Scalar<string>(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $value", "unrelated-mapping"));
+    }
+
+    public static IEnumerable<object?[]> RawRegistryIdentityCases()
+    {
+        var encodedEmpty = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot([], []));
+        foreach (var expected in new (string Name, string? Value)[]
+        {
+            ("null", null), ("empty", ""), ("encoded-empty", encodedEmpty),
+        })
+        foreach (var actual in new (string Name, string? Value)[]
+        {
+            ("null", null), ("empty", ""), ("encoded-empty", encodedEmpty),
+        })
+            yield return [expected.Name, expected.Value, actual.Name, actual.Value];
+    }
+
+    [Theory]
+    [MemberData(nameof(RawRegistryIdentityCases))]
+    public void CommitAdmissionOwnership_NullEmptyAndEncodedEmpty_ArePairwiseDistinct(
+        string expectedName, string? expected, string actualName, string? actual)
+    {
+        var suffix = expectedName + "-vs-" + actualName;
+        var goalId = "ownership-identity-" + suffix;
+        var taskId = "task-identity-" + suffix;
+        SeedRichIdleRow(goalId, actual);
+        var candidate = RichCandidate(goalId, taskId);
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, expected));
+        var durable = ReadOwnership(goalId, taskId);
+
+        if (expectedName == actualName)
+        {
+            AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+            Assert.Equal(taskId, durable.Pointer);
+            Assert.Equal(goalId, durable.MappingGoal);
+            Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), durable.Blob);
+        }
+        else
+        {
+            AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+            Assert.Null(durable.Pointer);
+            Assert.Equal(actual, durable.Blob);
+            Assert.Null(durable.MappingGoal);
+        }
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_MissingPipelineRow_RefusedWithoutCreatingAnything()
+    {
+        var candidate = RichCandidate("ownership-missing", "task-missing");
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, null));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+        Assert.Equal(new OwnershipRows(false, null, null, null),
+            ReadOwnership("ownership-missing", "task-missing"));
+    }
+
+    [Theory]
+    [InlineData("task-occupied", "task-occupied")]
+    [InlineData("task-other", "task-occupied-other")]
+    public void CommitAdmissionOwnership_OccupiedPointerIncludingSameTask_RefusedAndTupleUnchanged(
+        string occupiedBy, string taskId)
+    {
+        var goalId = "ownership-occupied-" + occupiedBy;
+        const string oldBlob = "occupied-raw-blob";
+        SeedRichIdleRow(goalId, oldBlob);
+        SetPointer(goalId, occupiedBy);
+        var candidate = RichCandidate(goalId, taskId);
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, oldBlob));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+        Assert.Equal(new OwnershipRows(true, occupiedBy, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_StaleRawRegistryWhilePointerNull_RefusedAndTupleUnchanged()
+    {
+        const string goalId = "ownership-stale-blob";
+        const string taskId = "task-stale-blob";
+        const string actual = "{\"sameValues\":true,\"order\":1}";
+        const string staleExpected = "{\"order\":1,\"sameValues\":true}";
+        SeedRichIdleRow(goalId, actual);
+        var candidate = RichCandidate(goalId, taskId);
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, staleExpected));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+        Assert.Equal(new OwnershipRows(true, null, actual, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CommitAdmissionOwnership_ExistingSameOrForeignMapping_RefusedAndUpdateRolledBack(bool foreign)
+    {
+        var goalId = foreign ? "ownership-map-foreign" : "ownership-map-same";
+        var taskId = foreign ? "task-map-foreign" : "task-map-same";
+        const string oldBlob = "mapping-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var mappedGoal = foreign ? "newer-foreign-goal" : goalId;
+        InsertMapping(taskId, mappedGoal);
+        var candidate = RichCandidate(goalId, taskId);
+
+        var result = WithStore((store, _) => store.CommitAdmissionOwnership(candidate, oldBlob));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, mappedGoal), ReadOwnership(goalId, taskId));
+    }
+
+    [Theory]
+    [InlineData("newer-pointer")]
+    [InlineData("newer-blob")]
+    [InlineData("newer-mapping")]
+    public void CommitAdmissionOwnership_StaleRequestRacedWithNewerAdmission_RefusesWithoutOverwriting(string race)
+    {
+        var goalId = "ownership-race-" + race;
+        var taskId = "task-race-" + race;
+        const string expectedBlob = "stale-request-blob";
+        SeedRichIdleRow(goalId, expectedBlob);
+        string? pointer = null;
+        var actualBlob = expectedBlob;
+        string? mapping = null;
+        switch (race)
+        {
+            case "newer-pointer":
+                pointer = "newer-task";
+                SetPointer(goalId, pointer);
+                break;
+            case "newer-blob":
+                actualBlob = "newer-registry-blob";
+                SetBlob(goalId, actualBlob);
+                break;
+            case "newer-mapping":
+                mapping = "newer-goal";
+                InsertMapping(taskId, mapping);
+                break;
+            default:
+                throw new InvalidOperationException("Unhandled race: " + race);
+        }
+
+        var result = WithStore((store, _) =>
+            store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), expectedBlob));
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Refused);
+        Assert.Equal(new OwnershipRows(true, pointer, actualBlob, mapping), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_ExecutesExactlyUpdateThenInsert_WithNarrowParameterizedShapeAndNoReads()
+    {
+        const string goalId = "ownership-sql-shape";
+        const string taskId = "task-sql-shape";
+        const string oldBlob = "shape-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var candidate = RichCandidate(goalId, taskId);
+        var encoded = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var capture = new AdmissionOwnershipCommandCaptureInterceptor();
+
+        var result = WithStore(
+            (store, _) => store.CommitAdmissionOwnership(candidate, oldBlob), capture);
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        Assert.Collection(capture.Commands,
+            update =>
+            {
+                Assert.Equal("NonQuery", update.Kind);
+                Assert.StartsWith("UPDATE pipelines", update.Sql.TrimStart(), StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("SET active_task_id = $task, work_slot_registry_json = $registry",
+                    update.Sql, StringComparison.Ordinal);
+                Assert.Contains("active_task_id IS NULL", update.Sql, StringComparison.Ordinal);
+                Assert.Contains("work_slot_registry_json IS $expected COLLATE BINARY",
+                    update.Sql, StringComparison.Ordinal);
+                Assert.Equal(new[] { "$expected", "$goal", "$registry", "$task" },
+                    update.Parameters.Keys.Order(StringComparer.Ordinal).ToArray());
+                Assert.Equal(goalId, update.Parameters["$goal"]);
+                Assert.Equal(taskId, update.Parameters["$task"]);
+                Assert.Equal(encoded, update.Parameters["$registry"]);
+                Assert.Equal(oldBlob, update.Parameters["$expected"]);
+            },
+            insert =>
+            {
+                Assert.Equal("NonQuery", insert.Kind);
+                Assert.StartsWith("INSERT INTO task_mappings", insert.Sql.TrimStart(),
+                    StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("ON CONFLICT(task_id) DO NOTHING", insert.Sql, StringComparison.Ordinal);
+                Assert.Equal(new[] { "$goal", "$task" },
+                    insert.Parameters.Keys.Order(StringComparer.Ordinal).ToArray());
+                Assert.Equal(taskId, insert.Parameters["$task"]);
+                Assert.Equal(goalId, insert.Parameters["$goal"]);
+            });
+        Assert.DoesNotContain(capture.Commands,
+            command => command.Kind is "Reader" or "Scalar"
+                || command.Sql.Contains("SELECT", StringComparison.OrdinalIgnoreCase));
+        Assert.All(capture.Commands, command =>
+        {
+            Assert.DoesNotContain(goalId, command.Sql, StringComparison.Ordinal);
+            Assert.DoesNotContain(taskId, command.Sql, StringComparison.Ordinal);
+            Assert.DoesNotContain(encoded, command.Sql, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_BeginTransactionThrows_ExactExceptionNoBodyWriteAndCleanupCannotMask()
+    {
+        const string goalId = "ownership-begin-fails";
+        const string taskId = "task-begin-fails";
+        const string oldBlob = "begin-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        using var beginConnection = OpenConnection();
+        var capture = new AdmissionOwnershipCommandCaptureInterceptor();
+        var beginInterceptor = new AdmissionBeginThrowingInterceptor();
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(beginConnection)
+                .AddInterceptors(capture, beginInterceptor)
+                .Options);
+        var factory = new SingleContextFactory(context);
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(factory, logger);
+        var cleanupSentinel = new InvalidOperationException("begin path context cleanup sentinel");
+        var trackerDetachCalls = 0;
+        store.TrackerDetachForTest = (_, _) =>
+        {
+            trackerDetachCalls++;
+            throw new InvalidOperationException("tracker cleanup must not run before a body attempt");
+        };
+        var contextDisposeCalls = 0;
+        store.ContextDisposerForTest = ownedContext =>
+        {
+            contextDisposeCalls++;
+            ownedContext.Dispose();
+            throw cleanupSentinel;
+        };
+
+        try
+        {
+            var thrown = Assert.Throws<InvalidOperationException>(() =>
+                store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob));
+
+            Assert.Same(beginInterceptor.BeginSentinel, thrown);
+            Assert.Equal(1, beginInterceptor.BeginAttemptCount);
+            Assert.Empty(capture.Commands);
+            Assert.Equal(0, trackerDetachCalls);
+            Assert.Equal(1, contextDisposeCalls);
+            Assert.Contains(logger.LogEntries, entry => entry.LogLevel == LogLevel.Warning
+                && entry.Message.Contains("admission-ownership-context-dispose", StringComparison.Ordinal));
+            Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+        }
+        finally
+        {
+            context.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData("update", -1)]
+    [InlineData("update", 2)]
+    [InlineData("insert", -1)]
+    [InlineData("insert", 2)]
+    public void CommitAdmissionOwnership_UnexpectedStatementRowCount_IsErrorAndRollsBackTuple(
+        string statement, int forcedCount)
+    {
+        var goalId = $"ownership-count-{statement}-{forcedCount}";
+        var taskId = $"task-count-{statement}-{forcedCount}";
+        const string oldBlob = "row-count-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var interceptor = new AdmissionOwnershipRowCountInterceptor(statement, forcedCount);
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => WithStore(
+            (store, _) => store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob), interceptor));
+
+        Assert.Equal(1, interceptor.OverrideCount);
+        Assert.Contains(forcedCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            thrown.Message, StringComparison.Ordinal);
+        Assert.Contains("expected exactly 0 or 1", thrown.Message, StringComparison.Ordinal);
+        Assert.Contains(statement == "update" ? "guard updated" : "mapping insert affected",
+            thrown.Message, StringComparison.Ordinal);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_SqlFailureBetweenUpdateAndInsert_PropagatesOriginalAndRollsBackTuple()
+    {
+        const string goalId = "ownership-between-statements";
+        const string taskId = "task-between-statements";
+        const string oldBlob = "between-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var interceptor = new AdmissionOwnershipCommandCaptureInterceptor(throwOnInsert: true);
+
+        var thrown = Assert.Throws<SqliteException>(() => WithStore(
+            (store, _) => store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob), interceptor));
+
+        Assert.Same(interceptor.InsertSentinel, thrown);
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Equal(2, interceptor.Commands.Count);
+        Assert.StartsWith("UPDATE pipelines", interceptor.Commands[0].Sql.TrimStart(),
+            StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("INSERT INTO task_mappings", interceptor.Commands[1].Sql.TrimStart(),
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_RefusalAndRollbackThrow_IndeterminateWithRollbackEvidence()
+    {
+        const string goalId = "ownership-refusal-rollback-throws";
+        const string taskId = "task-refusal-rollback-throws";
+        const string oldBlob = "rollback-refusal-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        SetPointer(goalId, "newer-owner");
+        using var connection = new RollbackThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Null(result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        Assert.Equal(new OwnershipRows(true, "newer-owner", oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_BodyErrorBeforeFirstWriteAndRollbackThrow_IndeterminateWithBothEvidence()
+    {
+        const string goalId = "ownership-body-before-write";
+        const string taskId = "task-body-before-write";
+        const string oldBlob = "before-write-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 5, 5);
+        using var connection = new RollbackThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection, interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Same(interceptor.Sentinel, result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CommitAdmissionOwnership_CommitThrowsBeforeOrAfterUnderlyingCommit_IndeterminateWithDifferentDurability(
+        bool throwAfterCommit)
+    {
+        var suffix = throwAfterCommit ? "after" : "before";
+        var goalId = "ownership-commit-" + suffix;
+        var taskId = "task-commit-" + suffix;
+        const string oldBlob = "commit-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var candidate = RichCandidate(goalId, taskId);
+        using var connection = new AdmissionCommitFaultConnection(ConnectionString, throwAfterCommit);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitAdmissionOwnership(candidate, oldBlob);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Same(connection.CommitSentinel, result.PrimaryException);
+        Assert.Equal(1, connection.CommitAttemptCount);
+        var durable = ReadOwnership(goalId, taskId);
+        if (throwAfterCommit)
+        {
+            Assert.Equal(taskId, durable.Pointer);
+            Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), durable.Blob);
+            Assert.Equal(goalId, durable.MappingGoal);
+        }
+        else
+        {
+            Assert.Equal(new OwnershipRows(true, null, oldBlob, null), durable);
+        }
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_CommitAndRollbackThrow_RetainsBothExactExceptionsAndDetachesAffectedTracker()
+    {
+        const string goalId = "ownership-commit-and-rollback-throw";
+        const string taskId = "task-commit-and-rollback-throw";
+        const string oldBlob = "commit-rollback-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        using var connection = new AdmissionCommitAndRollbackThrowConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var stalePipeline = TrackedPipelineEntity(goalId);
+        stalePipeline.ActiveTaskId = "stale-tracked-pointer";
+        stalePipeline.WorkSlotRegistryJson = "stale-tracked-blob";
+        context.Attach(stalePipeline);
+        var staleMapping = new TaskMappingEntity { TaskId = taskId, GoalId = "stale-tracked-goal" };
+        context.Attach(staleMapping);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        Assert.Equal(AdmissionOwnershipCommitStatus.Indeterminate, result.Status);
+        Assert.Same(connection.CommitSentinel, result.PrimaryException);
+        Assert.Same(connection.RollbackSentinel, result.RollbackException);
+        Assert.Equal(1, connection.CommitAttemptCount);
+        Assert.Equal(1, connection.RollbackAttemptCount);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            entry => entry.Entity.GoalId == goalId);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            entry => entry.Entity.TaskId == taskId);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_GoalDetachAndWarningLoggerThrow_TaskDetachAndLaterCleanupStillRun()
+    {
+        const string goalId = "ownership-cleanup-chain";
+        const string taskId = "task-cleanup-chain";
+        const string oldBlob = "cleanup-chain-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var logger = new ThrowingLogger<PipelineStore>();
+        using var connection = new DisposeThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var stalePipeline = TrackedPipelineEntity(goalId);
+        var staleMapping = new TaskMappingEntity { TaskId = taskId, GoalId = "stale-tracked-goal" };
+        context.Attach(stalePipeline);
+        context.Attach(staleMapping);
+        var store = new PipelineStore(context, logger);
+        var goalDetachCalls = 0;
+        string? detachedGoal = null;
+        store.TrackerDetachForTest = (_, detachedGoalId) =>
+        {
+            goalDetachCalls++;
+            detachedGoal = detachedGoalId;
+            throw new InvalidOperationException("goal detach sentinel");
+        };
+        logger.Arm();
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        Assert.Equal(1, goalDetachCalls);
+        Assert.Equal(goalId, detachedGoal);
+        Assert.Contains(context.ChangeTracker.Entries<PipelineEntity>(),
+            entry => entry.Entity.GoalId == goalId); // the injected goal-detach failure was real
+        Assert.DoesNotContain(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            entry => entry.Entity.TaskId == taskId); // independent task detach still ran
+        Assert.Equal(1, connection.DisposeAttemptCount); // later transaction cleanup also ran
+        Assert.True(logger.ThrowCount >= 2,
+            "both guarded warnings should reach the throwing logger without masking the result");
+        var durable = ReadOwnership(goalId, taskId);
+        Assert.Equal(taskId, durable.Pointer);
+        Assert.Equal(goalId, durable.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_CommitReturnsThenTransactionDisposeThrows_RemainsCommittedAndDurable()
+    {
+        const string goalId = "ownership-dispose-after-commit";
+        const string taskId = "task-dispose-after-commit";
+        const string oldBlob = "dispose-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var logger = new TestLogger<PipelineStore>();
+        using var connection = new DisposeThrowingConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, logger);
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        Assert.Equal(1, connection.DisposeAttemptCount);
+        Assert.Contains(logger.LogEntries, e => e.LogLevel == LogLevel.Warning
+            && e.Message.Contains("admission-ownership-transaction-dispose", StringComparison.Ordinal));
+        var durable = ReadOwnership(goalId, taskId);
+        Assert.Equal(taskId, durable.Pointer);
+        Assert.Equal(goalId, durable.MappingGoal);
+        Assert.NotEqual(oldBlob, durable.Blob);
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_FactoryContextDisposeThrows_RemainsCommittedAndDurable()
+    {
+        const string goalId = "ownership-context-dispose";
+        const string taskId = "task-context-dispose";
+        const string oldBlob = "context-dispose-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        var logger = new TestLogger<PipelineStore>();
+        var factory = new RecordingContextFactory(ConnectionString);
+        AdmissionOwnershipCommitResult result;
+        var calls = 0;
+        try
+        {
+            var store = new PipelineStore(factory, logger);
+            var sentinel = new InvalidOperationException("context dispose after commit sentinel");
+            store.ContextDisposerForTest = context =>
+            {
+                calls++;
+                context.Dispose();
+                throw sentinel;
+            };
+
+            result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+        }
+        finally
+        {
+            // EVERY factory-opened connection is CLOSED here — the contexts never owned them, so
+            // the readback below is a genuine fresh open of the file, not a read through a handle
+            // the test left dangling.
+            factory.Dispose();
+        }
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        Assert.Equal(1, calls);
+        Assert.Contains(logger.LogEntries, e => e.LogLevel == LogLevel.Warning
+            && e.Message.Contains("admission-ownership-context-dispose", StringComparison.Ordinal));
+        var durable = ReadOwnership(goalId, taskId);
+        Assert.Equal(taskId, durable.Pointer);
+        Assert.Equal(goalId, durable.MappingGoal);
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_CommitReturnRecordedBeforeDisposeInducedRollback_RemainsCommitted()
+    {
+        const string goalId = "ownership-dispose-rollback";
+        const string taskId = "task-dispose-rollback";
+        const string oldBlob = "dispose-rollback-prior";
+        SeedRichIdleRow(goalId, oldBlob);
+        using var connection = new CommitReturningWithoutCommitConnection(ConnectionString);
+        connection.Open();
+        using var context = ContextOn(connection);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.CommitAdmissionOwnership(RichCandidate(goalId, taskId), oldBlob);
+
+        AssertConfirmed(result, AdmissionOwnershipCommitStatus.Committed);
+        Assert.Equal(1, connection.CommitReturnCount);
+        Assert.Equal(1, connection.DisposeRollbackCount);
+        Assert.Equal(new OwnershipRows(true, null, oldBlob, null), ReadOwnership(goalId, taskId));
+    }
+
+    private static PipelineEntity TrackedPipelineEntity(string goalId) => new()
+    {
+        GoalId = goalId,
+        Description = "tracked " + goalId,
+        GoalJson = "{}",
+        Phase = "Planning",
+        Iteration = 1,
+        MaxRetries = 3,
+        MaxIterations = 3,
+        PhaseOutputs = "{}",
+        MetricsJson = "{}",
+        CreatedAt = "2026-01-01T00:00:00.0000000Z",
+        RoleSessionsJson = "[]",
+        PhaseOccurrence = 1,
+    };
+
+    private T? Scalar<T>(string sql, string value)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$value", value);
+        var result = command.ExecuteScalar();
+        return result is null or DBNull ? default : (T)result;
+    }
+
+    /// <summary>
+    /// A factory handing out contexts the STORE owns (the <c>ownsContext = true</c> path), each on
+    /// its OWN connection to the file-backed database.
+    /// <para>
+    /// THE CONNECTIONS ARE TRACKED AND CLOSED HERE. A context configured with an EXTERNALLY
+    /// supplied connection does not own it, so <c>context.Dispose()</c> — the store's disposal, or
+    /// the throwing <c>ContextDisposerForTest</c> substitute — leaves the underlying file
+    /// connection OPEN. Without this tracking a factory-context test would leak an open handle on
+    /// the temporary database and its close/reopen readback claim would be hollow (and the file
+    /// deletion in the fixture's Dispose would fail on Windows). Disposing the factory therefore
+    /// disposes every context AND then every connection it opened, so the later fresh-connection
+    /// readback genuinely re-opens the file.
+    /// </para>
+    /// </summary>
+    private sealed class RecordingContextFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly string _connectionString;
+        private readonly List<CopilotHiveDbContext> _contexts = [];
+        private readonly List<SqliteConnection> _connections = [];
+
+        public RecordingContextFactory(string connectionString) => _connectionString = connectionString;
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            _connections.Add(connection);
+            var context = ContextOn(connection);
+            _contexts.Add(context);
+            return context;
+        }
+
+        public void Dispose()
+        {
+            foreach (var context in _contexts)
+                context.Dispose();
+
+            // The contexts never owned these connections — close them explicitly so no open handle
+            // survives the test.
+            foreach (var connection in _connections)
+            {
+                connection.Close();
+                connection.Dispose();
+            }
+        }
+    }
+}
+
+internal sealed record AdmissionCapturedCommand(
+    string Kind,
+    string Sql,
+    IReadOnlyDictionary<string, object?> Parameters);
+
+/// <summary>Captures every command attempt and can throw exactly when the mapping INSERT is reached.</summary>
+internal sealed class AdmissionOwnershipCommandCaptureInterceptor : DbCommandInterceptor
+{
+    private readonly bool _throwOnInsert;
+    private readonly List<AdmissionCapturedCommand> _commands = [];
+    private int _throwCount;
+
+    public AdmissionOwnershipCommandCaptureInterceptor(bool throwOnInsert = false) =>
+        _throwOnInsert = throwOnInsert;
+
+    public IReadOnlyList<AdmissionCapturedCommand> Commands => _commands;
+    public SqliteException InsertSentinel { get; } =
+        new("admission ordered insert sentinel", 5, 5);
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    private void Record(DbCommand command, string kind)
+    {
+        var parameters = command.Parameters.Cast<DbParameter>().ToDictionary(
+            parameter => parameter.ParameterName,
+            parameter => parameter.Value,
+            StringComparer.Ordinal);
+        _commands.Add(new AdmissionCapturedCommand(kind, command.CommandText, parameters));
+
+        if (_throwOnInsert
+            && command.CommandText.TrimStart().StartsWith(
+                "INSERT INTO task_mappings", StringComparison.OrdinalIgnoreCase))
+        {
+            Interlocked.Increment(ref _throwCount);
+            throw InsertSentinel;
+        }
+    }
+
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        Record(command, "NonQuery");
+        return result;
+    }
+
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        Record(command, "Reader");
+        return result;
+    }
+
+    public override InterceptionResult<object> ScalarExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+    {
+        Record(command, "Scalar");
+        return result;
+    }
+}
+
+/// <summary>Substitutes the provider's post-execution affected-row count for one admission statement.</summary>
+internal sealed class AdmissionOwnershipRowCountInterceptor : DbCommandInterceptor
+{
+    private readonly string _statement;
+    private readonly int _forcedCount;
+    private int _overrideCount;
+
+    public AdmissionOwnershipRowCountInterceptor(string statement, int forcedCount)
+    {
+        if (statement is not ("update" or "insert"))
+            throw new ArgumentException("Statement must be 'update' or 'insert'.", nameof(statement));
+        _statement = statement;
+        _forcedCount = forcedCount;
+    }
+
+    public int OverrideCount => Volatile.Read(ref _overrideCount);
+
+    public override int NonQueryExecuted(DbCommand command, CommandExecutedEventData eventData, int result)
+    {
+        var sql = command.CommandText.TrimStart();
+        var targeted = _statement == "update"
+            ? sql.StartsWith("UPDATE pipelines", StringComparison.OrdinalIgnoreCase)
+            : sql.StartsWith("INSERT INTO task_mappings", StringComparison.OrdinalIgnoreCase);
+        if (!targeted)
+            return result;
+
+        Interlocked.Increment(ref _overrideCount);
+        return _forcedCount;
+    }
+}
+
+/// <summary>Throws a pre-created exception before the provider begins a transaction.</summary>
+internal sealed class AdmissionBeginThrowingInterceptor : DbTransactionInterceptor
+{
+    private int _beginAttemptCount;
+    public InvalidOperationException BeginSentinel { get; } =
+        new("admission begin-transaction sentinel");
+    public int BeginAttemptCount => Volatile.Read(ref _beginAttemptCount);
+
+    public override InterceptionResult<DbTransaction> TransactionStarting(
+        DbConnection connection,
+        TransactionStartingEventData eventData,
+        InterceptionResult<DbTransaction> result)
+    {
+        Interlocked.Increment(ref _beginAttemptCount);
+        throw BeginSentinel;
+    }
+}
+
+/// <summary>A one-shot factory exposing a caller-created context through the store-owned path.</summary>
+internal sealed class SingleContextFactory : IDbContextFactory<CopilotHiveDbContext>
+{
+    private readonly CopilotHiveDbContext _context;
+    public SingleContextFactory(CopilotHiveDbContext context) => _context = context;
+    public CopilotHiveDbContext CreateDbContext() => _context;
+}
+
+/// <summary>Both commit and rollback throw distinct, pre-created exceptions before reaching SQLite.</summary>
+internal sealed class AdmissionCommitAndRollbackThrowConnection : AdmissionTransactionConnectionBase
+{
+    private int _commitAttemptCount;
+    private int _rollbackAttemptCount;
+
+    public AdmissionCommitAndRollbackThrowConnection(string connectionString) : base(connectionString) { }
+
+    public InvalidOperationException CommitSentinel { get; } = new("admission combined commit sentinel");
+    public InvalidOperationException RollbackSentinel { get; } = new("admission combined rollback sentinel");
+    public int CommitAttemptCount => _commitAttemptCount;
+    public int RollbackAttemptCount => _rollbackAttemptCount;
+
+    protected override DbTransaction WrapTransaction(SqliteTransaction transaction) =>
+        new FaultTransaction(this, transaction);
+
+    private sealed class FaultTransaction : DbTransaction
+    {
+        private readonly AdmissionCommitAndRollbackThrowConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public FaultTransaction(AdmissionCommitAndRollbackThrowConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection DbConnection => _owner;
+        public override void Commit()
+        {
+            _owner._commitAttemptCount++;
+            throw _owner.CommitSentinel;
+        }
+        public override void Rollback()
+        {
+            _owner._rollbackAttemptCount++;
+            throw _owner.RollbackSentinel;
+        }
+        protected override void Dispose(bool disposing) => _inner.Dispose();
+    }
+}
+
+/// <summary>A transaction wrapper that throws either immediately before or immediately after the real commit.</summary>
+internal sealed class AdmissionCommitFaultConnection : AdmissionTransactionConnectionBase
+{
+    private readonly bool _throwAfterCommit;
+    private int _commitAttemptCount;
+
+    public AdmissionCommitFaultConnection(string connectionString, bool throwAfterCommit)
+        : base(connectionString) => _throwAfterCommit = throwAfterCommit;
+
+    public InvalidOperationException CommitSentinel { get; } = new("admission commit timing sentinel");
+    public int CommitAttemptCount => _commitAttemptCount;
+
+    protected override DbTransaction WrapTransaction(SqliteTransaction transaction) =>
+        new FaultTransaction(this, transaction);
+
+    private sealed class FaultTransaction : DbTransaction
+    {
+        private readonly AdmissionCommitFaultConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public FaultTransaction(AdmissionCommitFaultConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection DbConnection => _owner;
+        public override void Commit()
+        {
+            _owner._commitAttemptCount++;
+            if (!_owner._throwAfterCommit)
+                throw _owner.CommitSentinel;
+            _inner.Commit();
+            throw _owner.CommitSentinel;
+        }
+        public override void Rollback() => _inner.Rollback();
+        protected override void Dispose(bool disposing) => _inner.Dispose();
+    }
+}
+
+/// <summary>
+/// A deliberately adversarial transaction: Commit returns without touching SQLite; disposal then
+/// releases the still-active transaction, causing the provider's rollback. This pins outcome timing,
+/// not a claim that such a provider is well-behaved.
+/// </summary>
+internal sealed class CommitReturningWithoutCommitConnection : AdmissionTransactionConnectionBase
+{
+    private int _commitReturnCount;
+    private int _disposeRollbackCount;
+
+    public CommitReturningWithoutCommitConnection(string connectionString) : base(connectionString) { }
+    public int CommitReturnCount => _commitReturnCount;
+    public int DisposeRollbackCount => _disposeRollbackCount;
+
+    protected override DbTransaction WrapTransaction(SqliteTransaction transaction) =>
+        new NoCommitTransaction(this, transaction);
+
+    private sealed class NoCommitTransaction : DbTransaction
+    {
+        private readonly CommitReturningWithoutCommitConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public NoCommitTransaction(CommitReturningWithoutCommitConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection DbConnection => _owner;
+        public override void Commit() => _owner._commitReturnCount++;
+        public override void Rollback() => _inner.Rollback();
+        protected override void Dispose(bool disposing)
+        {
+            if (!disposing)
+                return;
+            _inner.Dispose();
+            _owner._disposeRollbackCount++;
+        }
+    }
+}
+
+/// <summary>Shared forwarding connection for narrow admission transaction timing tests.</summary>
+internal abstract class AdmissionTransactionConnectionBase : DbConnection
+{
+    private readonly SqliteConnection _inner;
+
+    protected AdmissionTransactionConnectionBase(string connectionString) =>
+        _inner = new SqliteConnection(connectionString);
+
+    [AllowNull]
+    public override string ConnectionString
+    {
+        get => _inner.ConnectionString;
+        set => _inner.ConnectionString = value ?? throw new ArgumentNullException(nameof(value));
+    }
+    public override string Database => _inner.Database;
+    public override string DataSource => _inner.DataSource;
+    public override string ServerVersion => _inner.ServerVersion;
+    public override int ConnectionTimeout => _inner.ConnectionTimeout;
+    public override ConnectionState State => _inner.State;
+    public override void ChangeDatabase(string databaseName) => _inner.ChangeDatabase(databaseName);
+    public override void Close() => _inner.Close();
+    public override void Open() => _inner.Open();
+
+    protected sealed override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+        WrapTransaction((SqliteTransaction)_inner.BeginTransaction(isolationLevel));
+
+    protected abstract DbTransaction WrapTransaction(SqliteTransaction transaction);
+
+    protected override DbCommand CreateDbCommand() => new ShieldedCommand(_inner.CreateCommand());
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+            _inner.Dispose();
+        base.Dispose(disposing);
+    }
+
+    private sealed class ShieldedCommand : DbCommand
+    {
+        private readonly DbCommand _inner;
+        public ShieldedCommand(DbCommand inner) => _inner = inner;
+        [AllowNull]
+        public override string CommandText { get => _inner.CommandText; set => _inner.CommandText = value ?? ""; }
+        public override int CommandTimeout { get => _inner.CommandTimeout; set => _inner.CommandTimeout = value; }
+        public override CommandType CommandType { get => _inner.CommandType; set => _inner.CommandType = value; }
+        [AllowNull]
+        protected override DbConnection DbConnection { get => _inner.Connection!; set { } }
+        protected override DbParameterCollection DbParameterCollection => _inner.Parameters;
+        protected override DbTransaction? DbTransaction { get => _inner.Transaction; set { } }
+        public override bool DesignTimeVisible { get => false; set { } }
+        public override UpdateRowSource UpdatedRowSource { get => _inner.UpdatedRowSource; set => _inner.UpdatedRowSource = value; }
+        public override void Cancel() => _inner.Cancel();
+        public override int ExecuteNonQuery() => _inner.ExecuteNonQuery();
+        public override object? ExecuteScalar() => _inner.ExecuteScalar();
+        public override void Prepare() => _inner.Prepare();
+        protected override DbParameter CreateDbParameter() => _inner.CreateParameter();
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => _inner.ExecuteReader(behavior);
+    }
+}

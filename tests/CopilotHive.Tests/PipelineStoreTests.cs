@@ -2243,3 +2243,275 @@ public sealed class PipelineStoreAdmissionSnapshotTests : IDisposable
             "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ordinary'"));
     }
 }
+
+/// <summary>
+/// Direct-context contracts for <see cref="PipelineStore.CommitAdmissionOwnership"/>: preflight
+/// remains entirely ahead of context acquisition, and raw-SQL success/refusal detaches every stale
+/// affected tracker state without flushing unrelated pending edits.
+/// </summary>
+public sealed class PipelineStoreAdmissionOwnershipDirectContextTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-admission-ownership-direct-{Guid.NewGuid():N}?mode=memory&cache=shared";
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public PipelineStoreAdmissionOwnershipDirectContextTests()
+    {
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    private CopilotHiveDbContext CreateContext()
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private static Goal Goal(string id) =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    private static AdmissionOwnershipSnapshot Candidate(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(Goal(goalId));
+        pipeline.AllocateAttemptAndRegisterSlot(taskId,
+            new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        pipeline.SetActiveTask(taskId);
+        return pipeline.CaptureAdmissionOwnership();
+    }
+
+    private void SeedIdleRow(string goalId, string? blob = null)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        store.SavePipeline(new GoalPipeline(Goal(goalId)));
+        if (blob is not null)
+        {
+            context.Database.ExecuteSqlRaw(
+                "UPDATE pipelines SET work_slot_registry_json = {0} WHERE goal_id = {1}", blob, goalId);
+        }
+    }
+
+    private object? Scalar(string sql, string value)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$value", value);
+        var result = command.ExecuteScalar();
+        return result is DBNull ? null : result;
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_InvalidBlankAndMalformedCandidates_NeverAcquireContext()
+    {
+        var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+        var validRegistry = new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("task-preflight", position, 1), WorkSlotState.Pending)],
+            [new WorkSlotRegistryAttemptEntry(position, 1)]);
+        var malformedRegistry = new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("task-preflight", position, 1), WorkSlotState.Pending)],
+            []);
+        var nonPendingRegistry = new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("task-preflight", position, 1), WorkSlotState.Claimed)],
+            [new WorkSlotRegistryAttemptEntry(position, 1)]);
+
+        var cases = new (string Name, AdmissionOwnershipSnapshot? Candidate, Type Type, string Message)[]
+        {
+            ("null-candidate", null, typeof(ArgumentNullException), "candidate"),
+            ("blank-goal", new AdmissionOwnershipSnapshot("   ", "task-preflight", validRegistry),
+                typeof(ArgumentException), "Admission goal ID must be a non-blank string"),
+            ("blank-active", new AdmissionOwnershipSnapshot("goal-preflight", " ", validRegistry),
+                typeof(ArgumentException), "Admission active task ID must be a non-blank string"),
+            ("null-registry", new AdmissionOwnershipSnapshot("goal-preflight", "task-preflight", null!),
+                typeof(ArgumentNullException), "snapshot"),
+            ("malformed-registry", new AdmissionOwnershipSnapshot(
+                    "goal-preflight", "task-preflight", malformedRegistry),
+                typeof(ArgumentException), "has no attempt entry for its position"),
+            ("no-matching-slot", new AdmissionOwnershipSnapshot(
+                    "goal-preflight", "missing-task", validRegistry),
+                typeof(ArgumentException), "has no matching slot in the registry"),
+            ("matching-non-pending", new AdmissionOwnershipSnapshot(
+                    "goal-preflight", "task-preflight", nonPendingRegistry),
+                typeof(ArgumentException), "not Pending"),
+        };
+
+        foreach (var item in cases)
+        {
+            var factory = new CountingThrowingFactory();
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+
+            var thrown = Record.Exception(() => store.CommitAdmissionOwnership(item.Candidate, null));
+
+            Assert.NotNull(thrown);
+            Assert.Equal(item.Type, thrown!.GetType());
+            Assert.Contains(item.Message, thrown.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, factory.AcquisitionCount);
+        }
+    }
+
+    [Fact]
+    public void CommitAdmissionOwnership_ValidCandidateContextAcquisitionThrows_ExactExceptionAndNoCleanupMasking()
+    {
+        var acquisitionSentinel = new InvalidOperationException("context acquisition sentinel");
+        var cleanupSentinel = new InvalidOperationException("owned context cleanup sentinel");
+        var factory = new CountingThrowingFactory(acquisitionSentinel);
+        var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+        var disposerCalls = 0;
+        store.ContextDisposerForTest = _ =>
+        {
+            disposerCalls++;
+            throw cleanupSentinel;
+        };
+
+        var thrown = Assert.Throws<InvalidOperationException>(() =>
+            store.CommitAdmissionOwnership(Candidate("goal-acquire-fails", "task-acquire-fails"), null));
+
+        Assert.Same(acquisitionSentinel, thrown);
+        Assert.Equal(1, factory.AcquisitionCount);
+        Assert.Equal(0, disposerCalls); // no context existed, so cleanup cannot replace the primary failure
+    }
+
+    public static IEnumerable<object[]> TrackerStatesAndOutcomes()
+    {
+        foreach (var state in new[]
+        {
+            EntityState.Added, EntityState.Modified, EntityState.Deleted, EntityState.Unchanged,
+        })
+        {
+            yield return [state, true];
+            yield return [state, false];
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(TrackerStatesAndOutcomes))]
+    public void CommitAdmissionOwnership_PretrackedAffectedEntriesCannotResurrect_UnrelatedEditsRemainPending(
+        EntityState state, bool commit)
+    {
+        var suffix = state + (commit ? "-commit" : "-rollback");
+        var goalId = "ownership-tracker-" + suffix;
+        var taskId = "task-tracker-" + suffix;
+        var oldBlob = commit ? null : "durable-old-blob";
+        SeedIdleRow(goalId, oldBlob);
+        var context = CreateContext();
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var stalePipeline = NewPipelineEntity(goalId);
+        stalePipeline.ActiveTaskId = "stale-pointer";
+        stalePipeline.WorkSlotRegistryJson = "stale-tracked-blob";
+        context.Attach(stalePipeline);
+        context.Entry(stalePipeline).State = state;
+
+        var staleMapping = new TaskMappingEntity { TaskId = taskId, GoalId = "stale-tracked-goal" };
+        context.Attach(staleMapping);
+        context.Entry(staleMapping).State = state;
+
+        var unrelatedGoal = "unrelated-goal-" + suffix;
+        var unrelatedTask = "unrelated-task-" + suffix;
+        var unrelatedPipeline = NewPipelineEntity(unrelatedGoal);
+        var unrelatedMapping = new TaskMappingEntity { TaskId = unrelatedTask, GoalId = unrelatedGoal };
+        context.Add(unrelatedPipeline);
+        context.Add(unrelatedMapping);
+
+        var candidate = Candidate(goalId, taskId);
+        var result = store.CommitAdmissionOwnership(candidate, commit ? null : "stale-request");
+
+        Assert.Equal(commit ? AdmissionOwnershipCommitStatus.Committed : AdmissionOwnershipCommitStatus.Refused,
+            result.Status);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.Entity.GoalId == goalId);
+        Assert.DoesNotContain(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            e => e.Entity.TaskId == taskId);
+
+        var pendingPipeline = Assert.Single(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.Entity.GoalId == unrelatedGoal);
+        var pendingMapping = Assert.Single(context.ChangeTracker.Entries<TaskMappingEntity>(),
+            e => e.Entity.TaskId == unrelatedTask);
+        Assert.Equal(EntityState.Added, pendingPipeline.State);
+        Assert.Equal(EntityState.Added, pendingMapping.State);
+        Assert.Equal(0L, Scalar(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = $value", unrelatedGoal));
+        Assert.Equal(0L, Scalar(
+            "SELECT COUNT(*) FROM task_mappings WHERE task_id = $value", unrelatedTask));
+
+        // A later caller-owned flush writes only the unrelated edits. If either affected stale
+        // entry survived, Added would conflict, Modified would overwrite, and Deleted would erase.
+        context.SaveChanges();
+        Assert.Equal(1L, Scalar(
+            "SELECT COUNT(*) FROM pipelines WHERE goal_id = $value", unrelatedGoal));
+        Assert.Equal(unrelatedGoal, Scalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $value", unrelatedTask));
+
+        var durablePointer = Scalar(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = $value", goalId);
+        var durableBlob = Scalar(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $value", goalId);
+        var durableMapping = Scalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $value", taskId);
+        if (commit)
+        {
+            Assert.Equal(taskId, durablePointer);
+            Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), durableBlob);
+            Assert.Equal(goalId, durableMapping);
+        }
+        else
+        {
+            Assert.Null(durablePointer);
+            Assert.Equal(oldBlob, durableBlob);
+            Assert.Null(durableMapping);
+        }
+    }
+
+    private static PipelineEntity NewPipelineEntity(string goalId) => new()
+    {
+        GoalId = goalId,
+        Description = "tracked " + goalId,
+        GoalJson = "{}",
+        Phase = "Planning",
+        Iteration = 1,
+        MaxRetries = 3,
+        MaxIterations = 3,
+        PhaseOutputs = "{}",
+        MetricsJson = "{}",
+        CreatedAt = "2026-01-01T00:00:00.0000000Z",
+        RoleSessionsJson = "[]",
+        PhaseOccurrence = 1,
+    };
+
+    private sealed class CountingThrowingFactory : IDbContextFactory<CopilotHiveDbContext>
+    {
+        private readonly Exception _sentinel;
+        private int _acquisitionCount;
+
+        public CountingThrowingFactory(Exception? sentinel = null) =>
+            _sentinel = sentinel ?? new InvalidOperationException(
+                "context factory must not be reached during preflight");
+
+        public int AcquisitionCount => Volatile.Read(ref _acquisitionCount);
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            Interlocked.Increment(ref _acquisitionCount);
+            throw _sentinel;
+        }
+    }
+}

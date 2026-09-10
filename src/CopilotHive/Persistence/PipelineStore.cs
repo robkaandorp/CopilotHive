@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CopilotHive.Goals;
@@ -91,7 +92,8 @@ public sealed class PipelineStore : IAsyncDisposable
 
     /// <summary>
     /// THE DISPOSAL SEAM for the factory-owned contexts — used by
-    /// <see cref="SaveAdmissionWithPointer"/> and <see cref="ClearActiveTaskIdIfMatches"/>. When
+    /// <see cref="SaveAdmissionWithPointer"/>, <see cref="ClearActiveTaskIdIfMatches"/> and
+    /// <see cref="CommitAdmissionOwnership"/>. When
     /// installed, it SUBSTITUTES the fallible
     /// dispose operation (<see cref="CopilotHiveDbContext"/> is sealed, so its
     /// <c>Dispose</c> cannot be overridden and EF never closes an externally supplied
@@ -104,8 +106,10 @@ public sealed class PipelineStore : IAsyncDisposable
     /// </summary>
     internal Action<CopilotHiveDbContext>? ContextDisposerForTest;
 
-    /// <summary>Test seam: substitutes the tracker-detach step for ClearActiveTaskIdIfMatches's
-    /// hygiene phase. Null in production (the real DetachTrackedPipeline runs); a test-installed
+    /// <summary>Test seam: substitutes the tracker-detach step for the hygiene phases of
+    /// ClearActiveTaskIdIfMatches (whose null-default is the single-entry DetachTrackedPipeline)
+    /// and CommitAdmissionOwnership (whose null-default is the all-states
+    /// DetachTrackedPipelinesForGoal). Null in production (the real detach runs); a test-installed
     /// delegate replaces the whole step (the forced-failure injection).</summary>
     internal Action<CopilotHiveDbContext, string>? TrackerDetachForTest;
 
@@ -345,6 +349,22 @@ public sealed class PipelineStore : IAsyncDisposable
             .FirstOrDefault(e => e.Entity.GoalId == goalId);
         if (entry is not null)
             db.Entry(entry.Entity).State = EntityState.Detached;
+    }
+
+    /// <summary>
+    /// Detaches EVERY tracked <see cref="PipelineEntity"/> carrying <paramref name="goalId"/>, in
+    /// ANY state (Added/Modified/Deleted/Unchanged) — the key-scoped form
+    /// <see cref="CommitAdmissionOwnership"/> needs after its raw statements bypassed the change
+    /// tracker. Detaching an Added/Modified/Deleted entry INTENTIONALLY DISCARDS its pending change
+    /// so it can never be flushed later; entries for other goals are left tracked untouched.
+    /// </summary>
+    private static void DetachTrackedPipelinesForGoal(CopilotHiveDbContext db, string goalId)
+    {
+        foreach (var entry in db.ChangeTracker.Entries<PipelineEntity>().ToList())
+        {
+            if (string.Equals(entry.Entity.GoalId, goalId, StringComparison.Ordinal))
+                db.Entry(entry.Entity).State = EntityState.Detached;
+        }
     }
 
     /// <summary>Remove a completed/failed pipeline from the store.</summary>
@@ -694,6 +714,330 @@ public sealed class PipelineStore : IAsyncDisposable
                                                               // the caller-owned direct context NEVER disposed
         }
         return cleared ? PointerRollbackResult.Cleared : PointerRollbackResult.NotMatched;
+    }
+
+    /// <summary>
+    /// THE ADMISSION-OWNERSHIP GUARD statement: takes the active pointer AND installs the encoded
+    /// registry blob on an EXISTING pipeline row, but ONLY while the row still carries no pointer
+    /// and its stored registry text is EXACTLY the expected prior text.
+    /// <para>
+    /// <c>IS ... COLLATE BINARY</c> is the null-safe BYTE-EXACT comparison: SQL NULL matches only a
+    /// <c>null</c> expectation, an empty string matches only an empty string, and an encoded empty
+    /// registry (a version-1 envelope with two empty arrays) matches neither. Two JSON-EQUIVALENT
+    /// but textually different payloads do NOT match — no decode, no normalization, no repair.
+    /// </para>
+    /// </summary>
+    private const string AdmissionOwnershipGuardSql =
+        """
+        UPDATE pipelines
+        SET active_task_id = $task, work_slot_registry_json = $registry
+        WHERE goal_id = $goal
+          AND active_task_id IS NULL
+          AND work_slot_registry_json IS $expected COLLATE BINARY
+        """;
+
+    /// <summary>
+    /// THE ADMISSION MAPPING statement: inserts the task → goal routing row, doing NOTHING when a
+    /// row for the task id already exists. NEVER a REPLACE, an upsert or a steal — an existing row
+    /// (even one already pointing at the SAME goal) yields zero inserted rows and is a refusal
+    /// candidate, so re-admission of an already-mapped task is never silently idempotent.
+    /// </summary>
+    private const string AdmissionOwnershipMappingSql =
+        """
+        INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, $goal)
+        ON CONFLICT(task_id) DO NOTHING
+        """;
+
+    private const string AdmissionOwnershipDetachTemplate =
+        "WorkSlotIntegrity: admission-ownership-detach goal={GoalId} task={TaskId} — the key-scoped tracker detach failed; the context state is SUSPECT and its further usability is NOT guaranteed: {Message}";
+    private const string AdmissionOwnershipTransactionDisposeTemplate =
+        "WorkSlotIntegrity: admission-ownership-transaction-dispose goal={GoalId} task={TaskId} — the transaction dispose failed; the outcome already recorded stands: {Message}";
+    private const string AdmissionOwnershipContextDisposeTemplate =
+        "WorkSlotIntegrity: admission-ownership-context-dispose goal={GoalId} task={TaskId} — the factory-owned context dispose failed; the outcome already recorded stands: {Message}";
+
+    /// <summary>
+    /// Commits a VALIDATED admission ownership candidate — the active-task pointer, the encoded
+    /// work-slot registry blob and the task → goal mapping row — in ONE explicit transaction built
+    /// from TWO narrow parameterized statements.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// VALIDATE-AND-ENCODE BEFORE ANY CONTEXT EXISTS. <see cref="GoalPipeline.PreflightAdmissionOwnership"/>
+    /// (reused verbatim — the validator is never duplicated here) proves the detached candidate,
+    /// then <see cref="WorkSlotRegistryCodec.Encode"/> runs EXACTLY ONCE, and only afterwards is a
+    /// context resolved. No temporary pipeline is built, no live pipeline is read, no task or
+    /// attempt is allocated, no counter is reconstructed and no task id is parsed. A null, blank or
+    /// malformed candidate therefore THROWS through the existing preflight/codec contracts
+    /// (<see cref="ArgumentNullException"/> / <see cref="ArgumentException"/> /
+    /// <c>WorkSlotRegistryCodecException</c>) having created no context and issued no statement — it
+    /// is NEVER reported as a database refusal.
+    /// </para>
+    /// <para>
+    /// THE EXPECTED PRIOR TEXT IS CARRIED VERBATIM. <paramref name="expectedRegistryJson"/> is
+    /// passed to the guard exactly as supplied — never decoded, re-encoded, trimmed or repaired —
+    /// and compared byte-exactly and null-safely (see <see cref="AdmissionOwnershipGuardSql"/>).
+    /// </para>
+    /// <para>
+    /// THE BODY. Statement 1 is the conditional pointer+blob UPDATE; statement 2 is the
+    /// conflict-tolerant mapping INSERT. EXACTLY ONE affected row is the only success count for
+    /// EITHER statement, and EXACTLY ZERO is the only REFUSAL CANDIDATE — no read-back is performed
+    /// to invent a reason. EVERY other count (a negative provider count such as <c>-1</c> just as
+    /// much as a count above 1) and every other SQL failure is an ERROR, never a refusal and never
+    /// a commit. The commit happens ONLY after both statements succeeded;
+    /// a refusal rolls the earlier UPDATE back. Nothing else is ever written: no new pipeline row,
+    /// no scalars, phase, plan, timestamps, conversation entries or historical mappings.
+    /// </para>
+    /// <para>
+    /// THE OUTCOME PRECEDENCE, exactly: (A) anything failing BEFORE the transaction is acquired —
+    /// validation, encoding, context acquisition, <c>BeginTransaction</c> — propagates the EXACT
+    /// caught exception, and the guarded owned-context disposal cannot mask it; (B) once a
+    /// transaction exists, a THROWING rollback yields <see cref="AdmissionOwnershipCommitStatus.Indeterminate"/>
+    /// even if the body mutated nothing, retaining the body exception (or <c>null</c>) plus the
+    /// exact rollback exception; (C) with a CONFIRMED rollback and no commit attempt only a
+    /// zero-row guard or zero-row mapping insert is <see cref="AdmissionOwnershipCommitStatus.Refused"/>
+    /// while ordinary body errors propagate unchanged; (D) ANY commit exception is
+    /// <see cref="AdmissionOwnershipCommitStatus.Indeterminate"/> carrying that exact exception —
+    /// a throw can happen AFTER the underlying commit, so a later rollback success proves nothing;
+    /// (E) once <c>Commit</c> RETURNS, the confirmation is recorded immediately and
+    /// <see cref="AdmissionOwnershipCommitStatus.Committed"/> is returned — later tracker, dispose
+    /// or logger failures are guarded warnings that can never downgrade or undo it.
+    /// </para>
+    /// <para>
+    /// EXCEPTION IDENTITY is preserved: the exact object caught (EF wrapper included) is retained or
+    /// rethrown; no message is reconstructed, no sentinel is unwrapped and no
+    /// <see cref="AggregateException"/> is substituted. No retry, repair, reconciliation or caller
+    /// policy is introduced here.
+    /// </para>
+    /// <para>
+    /// THE DIRECT-CONTEXT TRACKER POLICY. After the body's first SQL attempt the tracked entries for
+    /// THIS goal and THIS task are detached in EVERY state (Added/Modified/Deleted/Unchanged),
+    /// because the raw statements bypassed the change tracker: a stale pointer/blob copy or a
+    /// pending mapping change must never be flushed by a later unrelated <c>SaveChanges</c>. This
+    /// INTENTIONALLY DISCARDS pending changes on those affected tracked entities. Unrelated tracked
+    /// entities are left alone and are never flushed here. No candidate state is installed into the
+    /// tracker before the commit and no assumed state is reloaded after uncertainty. Each cleanup
+    /// step is guarded independently; a hygiene failure warns that the context is SUSPECT and does
+    /// NOT guarantee that the context stays usable.
+    /// </para>
+    /// <para>
+    /// LIFETIME. A caller-owned direct context is NEVER disposed (the <c>ownsContext</c> gate);
+    /// factory-owned contexts and the transaction are disposed on ALL paths, always guarded so the
+    /// recorded outcome or the propagating exception is never masked.
+    /// </para>
+    /// <para>
+    /// SCOPE, honestly. The mapping row is task → goal ROUTING only — not durable worker identity
+    /// and not a payload. This is not a whole-pipeline or phase checkpoint, not an enqueue
+    /// transaction, not a completion receipt, not Claimed/Recorded persistence and not a restart
+    /// activation. INERT BY DESIGN: nothing in production calls this yet.
+    /// </para>
+    /// </remarks>
+    /// <param name="candidate">The detached admission-ownership candidate to validate and persist.</param>
+    /// <param name="expectedRegistryJson">The RAW registry text the row must currently hold, or
+    /// <c>null</c> when the column must currently be SQL NULL.</param>
+    /// <returns>The recorded outcome and, when the outcome is uncertain, the exception evidence.</returns>
+    /// <exception cref="ArgumentNullException">The candidate or one of its required members is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The candidate is blank, malformed, or has no matching Pending slot.</exception>
+    internal AdmissionOwnershipCommitResult CommitAdmissionOwnership(
+        AdmissionOwnershipSnapshot? candidate,
+        string? expectedRegistryJson)
+    {
+        // PHASE 1 — THE PREFLIGHT (reused verbatim) and THE SINGLE ENCODE, both BEFORE any
+        // database interaction. Every rejection escapes here: no context, no statement, no refusal.
+        var validated = GoalPipeline.PreflightAdmissionOwnership(candidate);
+        var encoded = WorkSlotRegistryCodec.Encode(validated.Registry);
+
+        var goalId = validated.GoalId;
+        var taskId = validated.ActiveTaskId!; // the preflight proved it non-null and non-blank
+
+        // PHASE 2 — THE CONTEXT. An acquisition failure propagates with nothing to clean up.
+        var (db, ownsContext) = ResolveDbContext();
+
+        IDbContextTransaction? transaction = null;
+        var sqlAttempted = false;
+        try
+        {
+            // PHASE 3 — THE TRANSACTION. A Begin failure is still outcome (A): it propagates, and
+            // the finally below only disposes what was actually acquired.
+            transaction = db.Database.BeginTransaction();
+
+            // PHASE 4 — THE BODY. Every fault is CAPTURED (never rethrown from inside), so the
+            // rollback/commit sequencing below decides the outcome in one place.
+            Exception? bodyException = null;
+            var refused = false;
+            try
+            {
+                sqlAttempted = true;
+                var pipelineRows = db.Database.ExecuteSqlRaw(
+                    AdmissionOwnershipGuardSql,
+                    new SqliteParameter("$goal", goalId),
+                    new SqliteParameter("$task", taskId),
+                    new SqliteParameter("$registry", encoded),
+                    new SqliteParameter("$expected", (object?)expectedRegistryJson ?? DBNull.Value));
+
+                if (pipelineRows is not (0 or 1))
+                {
+                    // NOT a refusal: the goal id is the primary key, so ANY count other than the
+                    // two legal ones — a negative provider count (e.g. -1, "unknown") just as much
+                    // as a count above 1 — is an integrity surprise the caller must see as an
+                    // ERROR. It must never reach the commit and must never become a refusal.
+                    throw new InvalidOperationException(
+                        $"Admission ownership guard updated {pipelineRows} pipeline rows for goal '{goalId}' (expected exactly 0 or 1).");
+                }
+
+                if (pipelineRows == 0)
+                {
+                    // THE REFUSAL CANDIDATE — the row is missing, the pointer is already taken, or
+                    // the stored registry text is not the expected one. No read-back is issued to
+                    // guess WHICH: the store reports a refusal, not a reason taxonomy.
+                    refused = true;
+                }
+                else
+                {
+                    // EXACTLY ONE pipeline row was updated — the only success count.
+                    var mappingRows = db.Database.ExecuteSqlRaw(
+                        AdmissionOwnershipMappingSql,
+                        new SqliteParameter("$task", taskId),
+                        new SqliteParameter("$goal", goalId));
+
+                    if (mappingRows is not (0 or 1))
+                    {
+                        // The same rule as the guard: every count other than 0 and 1 — negative
+                        // counts included — is an ERROR, never a refusal and never a commit.
+                        throw new InvalidOperationException(
+                            $"Admission ownership mapping insert affected {mappingRows} rows for task '{taskId}' (expected exactly 0 or 1).");
+                    }
+
+                    // Zero inserted rows means a mapping for this task ALREADY exists — for ANY
+                    // goal, the same one included. A refusal candidate, never a steal. Exactly one
+                    // inserted row is the only success count.
+                    refused = mappingRows == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                bodyException = ex; // the EXACT object; never re-created, never unwrapped
+            }
+
+            // PHASE 5 — THE COMMIT, only when the body both succeeded and did not refuse.
+            Exception? commitException = null;
+            var commitConfirmed = false;
+            if (bodyException is null && !refused)
+            {
+                try
+                {
+                    transaction.Commit();
+                    commitConfirmed = true; // (E) recorded IMMEDIATELY — nothing may downgrade it
+                }
+                catch (Exception ex)
+                {
+                    commitException = ex;
+                }
+            }
+
+            // PHASE 6 — THE ROLLBACK. Required for every error/refusal, and attempted best-effort
+            // after a throwing commit (which may already have committed underneath).
+            Exception? rollbackException = null;
+            if (!commitConfirmed)
+            {
+                try
+                {
+                    transaction.Rollback();
+                }
+                catch (Exception ex)
+                {
+                    rollbackException = ex;
+                }
+            }
+
+            // PHASE 7 — THE OUTCOME, in the exact precedence order (E) → (D) → (B) → (C).
+            if (commitConfirmed)
+                return AdmissionOwnershipCommitResult.Committed();
+
+            if (commitException is not null)
+            {
+                // (D) The commit MAY have landed underneath; a rollback that "succeeded" afterwards
+                // proves nothing, so neither success nor no-change is inferred.
+                return AdmissionOwnershipCommitResult.Uncertain(commitException, rollbackException);
+            }
+
+            if (rollbackException is not null)
+            {
+                // (B) Overrides every ordinary error/refusal outcome, even when the body had not
+                // mutated anything: the transaction's fate is unknown.
+                return AdmissionOwnershipCommitResult.Uncertain(bodyException, rollbackException);
+            }
+
+            // The rollback is CONFIRMED from here on.
+            if (bodyException is not null)
+            {
+                // (C) Ordinary body errors propagate UNCHANGED — the exact object, its stack kept.
+                ExceptionDispatchInfo.Capture(bodyException).Throw();
+            }
+
+            if (refused)
+                return AdmissionOwnershipCommitResult.RefusedResult();
+
+            // Unreachable: a non-refusing, non-throwing body always attempts the commit above.
+            throw new InvalidOperationException(
+                $"Admission ownership transaction for goal '{goalId}' reached no outcome (task '{taskId}').");
+        }
+        finally
+        {
+            // THE GUARDED CLEANUP — every step independently, on EVERY path, never masking the
+            // recorded outcome or a propagating exception.
+
+            // (a) THE KEY-SCOPED TRACKER HYGIENE, only once a statement was actually attempted.
+            //     The raw statements bypassed the tracker, so the affected goal's and task's
+            //     tracked copies are DETACHED IN EVERY STATE — intentionally DISCARDING their
+            //     pending changes. Unrelated tracked entities are untouched and unflushed.
+            if (sqlAttempted)
+            {
+                try
+                {
+                    (TrackerDetachForTest ?? DetachTrackedPipelinesForGoal)(db, goalId);
+                }
+                catch (Exception detachEx)
+                {
+                    BestEffortWarning(AdmissionOwnershipDetachTemplate, goalId, taskId, detachEx.Message);
+                }
+
+                try
+                {
+                    DetachTrackedTaskMapping(db, taskId);
+                }
+                catch (Exception detachEx)
+                {
+                    BestEffortWarning(AdmissionOwnershipDetachTemplate, goalId, taskId, detachEx.Message);
+                }
+            }
+
+            // (b) THE TRANSACTION disposal — including after a confirmed commit (a committed
+            //     transaction must not leak). Never present when Begin itself failed.
+            try
+            {
+                transaction?.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                BestEffortWarning(
+                    AdmissionOwnershipTransactionDisposeTemplate, goalId, taskId, disposeEx.Message);
+            }
+
+            // (c) THE CONTEXT disposal — factory-owned only. The caller-owned direct context is
+            //     NEVER disposed here (the ownsContext gate).
+            if (ownsContext)
+            {
+                try
+                {
+                    (ContextDisposerForTest ?? (context => context.Dispose()))(db);
+                }
+                catch (Exception contextDisposeEx)
+                {
+                    BestEffortWarning(
+                        AdmissionOwnershipContextDisposeTemplate, goalId, taskId, contextDisposeEx.Message);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -1129,3 +1473,73 @@ internal enum AdmissionStoreResult
 /// Failed: a guarded phase threw (the acquisition, the SQL) — the row's state is UNKNOWN; the
 /// (a) WARNING emitted; the durable-reconciliation successor owns the residue.</remarks>
 internal enum PointerRollbackResult { Cleared, NotMatched, Failed }
+
+/// <summary>
+/// The recorded outcome of <see cref="PipelineStore.CommitAdmissionOwnership"/> — three truths,
+/// deliberately including the one that cannot be resolved from inside the store.
+/// </summary>
+internal enum AdmissionOwnershipCommitStatus
+{
+    /// <summary>
+    /// <c>Commit</c> RETURNED: the pointer, the registry blob and the mapping row landed together.
+    /// Recorded the instant the commit returned — no later cleanup, disposal or logging failure can
+    /// downgrade or undo it.
+    /// </summary>
+    Committed,
+
+    /// <summary>
+    /// A guard said no and the rollback was CONFIRMED: either the conditional pipeline UPDATE
+    /// matched no row (missing row, pointer already taken, or a registry text that is not the
+    /// expected one) or the mapping insert inserted nothing because a row for the task already
+    /// existed (for ANY goal, the same one included). NO reason taxonomy is offered and no
+    /// read-back is performed to invent one. The no-durable-change guarantee applies ONLY to this
+    /// confirmed-rollback path.
+    /// </summary>
+    Refused,
+
+    /// <summary>
+    /// The transaction's fate is UNKNOWN — a throwing rollback (whatever the body did, even
+    /// nothing) or ANY exception from <c>Commit</c>, which can be raised AFTER the underlying
+    /// commit already landed. Neither success nor absence of change may be inferred; the store
+    /// performs no retry, repair or reconciliation, and the caller owns the policy.
+    /// </summary>
+    Indeterminate,
+}
+
+/// <summary>
+/// The result of <see cref="PipelineStore.CommitAdmissionOwnership"/>: the recorded
+/// <see cref="Status"/> plus, for the uncertain outcomes, the EXACT exception objects the store
+/// caught.
+/// </summary>
+/// <remarks>
+/// EXCEPTION IDENTITY, not description: both properties carry the exact caught instances (any EF
+/// wrapper included). Nothing is re-created, re-messaged, unwrapped or aggregated, so a caller can
+/// assert identity. Both are <c>null</c> for <see cref="AdmissionOwnershipCommitStatus.Committed"/>
+/// and <see cref="AdmissionOwnershipCommitStatus.Refused"/>; for
+/// <see cref="AdmissionOwnershipCommitStatus.Indeterminate"/>, <see cref="PrimaryException"/> is
+/// the commit exception or the original body exception when one exists (otherwise <c>null</c> — a
+/// rollback can throw after a clean body) and <see cref="RollbackException"/> is retained
+/// SEPARATELY.
+/// </remarks>
+/// <param name="Status">The recorded outcome.</param>
+/// <param name="PrimaryException">The exact commit or body exception, when one was caught.</param>
+/// <param name="RollbackException">The exact rollback exception, when the rollback threw.</param>
+internal sealed record AdmissionOwnershipCommitResult(
+    AdmissionOwnershipCommitStatus Status,
+    Exception? PrimaryException,
+    Exception? RollbackException)
+{
+    /// <summary>The confirmed-commit result — no exception evidence.</summary>
+    internal static AdmissionOwnershipCommitResult Committed() =>
+        new(AdmissionOwnershipCommitStatus.Committed, null, null);
+
+    /// <summary>The confirmed-rollback guard refusal — no exception evidence, no reason.</summary>
+    internal static AdmissionOwnershipCommitResult RefusedResult() =>
+        new(AdmissionOwnershipCommitStatus.Refused, null, null);
+
+    /// <summary>The unresolvable outcome, retaining the exact evidence objects as caught.</summary>
+    /// <param name="primary">The commit or body exception, or <c>null</c> when there was none.</param>
+    /// <param name="rollback">The rollback exception, or <c>null</c> when the rollback did not throw.</param>
+    internal static AdmissionOwnershipCommitResult Uncertain(Exception? primary, Exception? rollback) =>
+        new(AdmissionOwnershipCommitStatus.Indeterminate, primary, rollback);
+}
