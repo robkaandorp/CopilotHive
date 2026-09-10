@@ -1457,6 +1457,41 @@ public sealed class DistributedBrainTests
         Assert.DoesNotContain("For improvers: tell them to analyze", prompt);
     }
 
+    /// <summary>
+    /// The craft request keeps goal/repository scope, caller context, and the get_goal reference,
+    /// while leaving the full Tester ownership policy in the Brain system prompt rather than
+    /// duplicating it into each craft request.
+    /// </summary>
+    [Fact]
+    public void BuildCraftPromptText_TestingPhase_PreservesScopeContextAndGetGoalWithoutRolePolicyDuplication()
+    {
+        var goal = new Goal
+        {
+            Id = "goal-tester-craft-boundary",
+            Description = "DESCRIPTION_STAYS_BEHIND_GET_GOAL_74A9",
+            RepositoryNames = ["editable-repo", "reference-repo"],
+            TargetRepositoryNames = "editable-repo",
+        };
+        var pipeline = new GoalPipeline(goal);
+
+        var prompt = BrainPromptBuilder.BuildCraftPromptText(
+            pipeline, GoalPhase.Testing, "TESTER_ADDITIONAL_CONTEXT_918C");
+
+        Assert.Contains("Craft a prompt for the tester worker", prompt, StringComparison.Ordinal);
+        Assert.Contains("Goal: goal-tester-craft-boundary (iteration 1, phase Testing)", prompt, StringComparison.Ordinal);
+        Assert.Contains("- editable-repo: Target repository (editable)", prompt, StringComparison.Ordinal);
+        Assert.Contains("- reference-repo: Source repository (reference — do not modify)", prompt, StringComparison.Ordinal);
+        Assert.Contains("=== Additional context ===", prompt, StringComparison.Ordinal);
+        Assert.Contains("TESTER_ADDITIONAL_CONTEXT_918C", prompt, StringComparison.Ordinal);
+        Assert.Contains("=== End additional context ===", prompt, StringComparison.Ordinal);
+        Assert.Contains("Use the get_goal tool if you need the full goal description", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("DESCRIPTION_STAYS_BEHIND_GET_GOAL_74A9", prompt, StringComparison.Ordinal);
+
+        Assert.DoesNotContain("Test-ownership reminder", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("Testers own missing unit/integration test authoring", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("Do NOT invent verification-only or no-test-edit bans", prompt, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void BuildCraftPromptText_ReviewPhase_ContainsOnlyDocWritingNote_WhenApplicable()
     {
@@ -1491,6 +1526,40 @@ public sealed class DistributedBrainTests
         Assert.Contains("Use the testing phase results to verify that all tests pass", systemPrompt);
         Assert.Contains("progress-{goal-id}", systemPrompt);
         Assert.Contains("raise_issue", systemPrompt);
+    }
+
+    /// <summary>
+    /// BuildSystemPrompt returns the policy that governs both Brain jobs: planning
+    /// phase_instructions and crafting worker prompts. It must assign conditional test ownership
+    /// without making Coder the exclusive test author, and its neighboring Reviewer rule must
+    /// preserve explicit exclusions instead of treating test changes as unconditionally allowed.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BuildSystemPrompt_ContainsPlanningAndCraftingTesterOwnershipPolicy(bool subAgentsEnabled)
+    {
+        var prompt = BrainPromptBuilder.BuildSystemPrompt(subAgentsEnabled);
+        var normalizedPrompt = System.Text.RegularExpressions.Regex.Replace(prompt, @"\s+", " ");
+
+        Assert.Contains("1. Plan iteration phases", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("2. Craft clear, specific prompts", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Testers own", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("missing unit/integration test authoring", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("ordinary goals", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("do NOT make the Coder the exclusive author of tests", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "both when writing phase_instructions during planning and when crafting Tester prompts",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Preserve genuine goal, file,", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("tasks deliberately limited to validation", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Keep the Coder's initial test/self-check responsibility", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Reviewer's independent assessment unchanged", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains(
+            "Test changes are always acceptable UNLESS the goal explicitly excludes test files or limits the task to verification only",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("such explicit goal exclusions always win", normalizedPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("Test changes are always acceptable. Use", normalizedPrompt, StringComparison.Ordinal);
     }
 
     // -- Target Repositories in Prompt Tests --

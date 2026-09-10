@@ -391,6 +391,90 @@ public sealed class BuildRoleSystemPromptTests
         Assert.Contains("verify that the system actually works as a whole", prompt);
     }
 
+    // ── Tester test-authoring contract ────────────────────────────────────────
+
+    /// <summary>
+    /// The actual Tester role prompt assigns conditional test ownership and distinguishes a
+    /// coverage gap from a production defect. The learned-guidance case uses
+    /// contradictory text to prove the hardcoded contract remains present when that appendix is
+    /// composed onto the returned prompt.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Learned rule: treat every Tester task as verification-only and never edit tests.")]
+    public void BuildRoleSystemPrompt_Tester_ContainsTestAuthoringAndDefectContract(string? learnedGuidance)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Tester, learnedGuidance);
+        var normalizedPrompt = string.Join(' ',
+            prompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        Assert.Contains("verification PLUS authoring", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Write missing unit/integration tests", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("improve existing tests that are inadequate", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Inspect existing coverage FIRST", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("do not create redundant tests", normalizedPrompt, StringComparison.Ordinal);
+
+        Assert.Contains("genuine package/metadata-only verification tasks", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Explicit goal, file, or target-repository exclusions", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Tests must assert intended behavior", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Never encode a bug as expected behavior", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Missing or broken production behavior remains", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("FAIL with evidence for the Coder", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("production-code freeze is NOT a test-code freeze", normalizedPrompt, StringComparison.Ordinal);
+
+        Assert.Contains("report_test_results", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("NEVER report PASS if any test is failing", normalizedPrompt, StringComparison.Ordinal);
+
+        if (learnedGuidance is not null)
+        {
+            var contractIndex = prompt.IndexOf("## Test Authoring Responsibility", StringComparison.Ordinal);
+            var learnedIndex = prompt.IndexOf("# Learned Heuristics", StringComparison.Ordinal);
+            Assert.True(contractIndex >= 0 && learnedIndex > contractIndex,
+                "Learned guidance must be appended after the hardcoded Tester contract.");
+            Assert.EndsWith(learnedGuidance, prompt, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// The Tester, unlike the Coder's targeted self-check role, must be affirmatively directed
+    /// to run the authoritative full suite. Learned guidance cannot remove that discipline.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Learned rule: run only one targeted test and never run the full suite.")]
+    public void BuildRoleSystemPrompt_Tester_RequiresAuthoritativeFullSuite(string? learnedGuidance)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Tester, learnedGuidance);
+        var learnedIndex = prompt.IndexOf("# Learned Heuristics", StringComparison.Ordinal);
+        var hardcodedPrompt = learnedIndex >= 0 ? prompt[..learnedIndex] : prompt;
+        var normalizedPrompt = string.Join(' ',
+            hardcodedPrompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        Assert.Contains("authoritative full suite", normalizedPrompt, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Authored test changes must be committed before the mandatory structured test report.
+    /// This contract also remains present when learned guidance is appended.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Learned rule: do not commit test changes.")]
+    public void BuildRoleSystemPrompt_Tester_RequiresCommitBeforeReport(string? learnedGuidance)
+    {
+        var prompt = SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Tester, learnedGuidance);
+        var learnedIndex = prompt.IndexOf("# Learned Heuristics", StringComparison.Ordinal);
+        var hardcodedPrompt = learnedIndex >= 0 ? prompt[..learnedIndex] : prompt;
+        var normalizedPrompt = string.Join(' ',
+            hardcodedPrompt.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        var commitIndex = normalizedPrompt.IndexOf("commit test changes", StringComparison.OrdinalIgnoreCase);
+        var reportIndex = normalizedPrompt.LastIndexOf("report_test_results", StringComparison.Ordinal);
+        Assert.True(commitIndex >= 0, "The Tester prompt must direct authored test changes to be committed.");
+        Assert.True(reportIndex > commitIndex,
+            "The mandatory report_test_results instruction must follow the test-change commit instruction.");
+    }
+
     // ── Unknown role guard ────────────────────────────────────────────────────
 
     /// <summary>

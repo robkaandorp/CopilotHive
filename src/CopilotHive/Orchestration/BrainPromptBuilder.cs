@@ -56,8 +56,17 @@ public static class BrainPromptBuilder
         WORKER PROMPT RULES:
         When crafting worker prompts, follow these rules per role:
         - Coders: Tell them to implement immediately, read files, use build/test skills, commit with git add -A && git commit. Never include git branch or push commands.
-        - Testers: Tell them to build, run test skill, write integration tests, call report_test_results. Never tell them to create report files.
-        - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
+        - Testers: Tell them to build, run test skill, call report_test_results. Testers own
+          missing unit/integration test authoring for ordinary goals: when the goal's changed
+          behavior or acceptance criteria lack coverage, tell the Tester to write/repair those
+          tests — do NOT invent verification-only or no-test-edit bans the goal does not state,
+          and do NOT make the Coder the exclusive author of tests. Preserve genuine goal, file,
+          or target-repository exclusions and tasks deliberately limited to validation
+          (e.g. package/metadata-only verification). Keep the Coder's initial test/self-check
+          responsibility and the Reviewer's independent assessment unchanged. This rule applies
+          both when writing phase_instructions during planning and when crafting Tester prompts.
+          Never tell them to create report files.
+        - Reviewers: Do NOT include git diff commands — the worker's workspace context provides the correct diff. Tell them to review using their workspace diff commands, focus on +/- lines, call report_review_verdict. Files to change is guidance, Files NOT to change is strict. Test changes are always acceptable UNLESS the goal explicitly excludes test files or limits the task to verification only — such explicit goal exclusions always win. Use the testing phase results to verify that all tests pass — do NOT reject because you cannot run tests yourself.
         - DocWriters: Do NOT include git diff commands. Tell them to use workspace context diff, update only requested docs, build to verify, call report_doc_changes.
         - Improvers: Tell them to analyze results and update *.agents.md files using file tools. No git commands. Before crafting the improver prompt, use `list_config_files("agents")` and `read_config_file` to read the current agents.md content from the config repo — the improver works on the config repo's agents/ folder, not the project repos.
 
@@ -358,6 +367,15 @@ public static class BrainPromptBuilder
             {{previousIterationContext}}
             {{clarificationSection}}
             {{recordedContextSection}}
+
+            Test-ownership reminder (applies to both first plans and retry plans): for ordinary
+            implementation goals, the Tester owns missing unit/integration test authoring and
+            inadequate-test repair. Do NOT invent verification-only or no-test-edit bans the goal
+            does not state, and do NOT route missing coverage back to the Coder as its exclusive
+            responsibility. Preserve explicit goal/file/target-repository exclusions and tasks
+            deliberately limited to validation. The full worker role policy lives in your system
+            prompt — workers receive their own hardcoded role prompt, so this reminder is
+            intentionally concise.
 
             Decide the ordered phases for this iteration. Consider:
             - Is this a documentation-only change? (docwriter edits — a docs-only plan is DocWriting → Testing → Review → Merging; Testing is always required after each content block per R2)

@@ -341,6 +341,44 @@ public sealed class BrainPlanningPromptTests
         Assert.Contains("input parsing", prompt);
     }
 
+    // ── Tester ownership reminder ────────────────────────────────────────────
+
+    /// <summary>
+    /// The concise ownership reminder is emitted for both first and retry planning passes.
+    /// A distinctive explicit validation-only restriction in the goal remains verbatim, proving
+    /// the reminder does not parse, strip, or override genuine goal scope.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BuildPlanningPrompt_FirstAndRetryPlans_ContainOwnershipReminderAndPreserveGoalScope(bool retry)
+    {
+        const string ExplicitRestriction =
+            "VALIDATION_ONLY_MARKER: package metadata verification only; test files are explicitly excluded.";
+        var pipeline = new GoalPipeline(new Goal
+        {
+            Id = "test-ownership-scope",
+            Description = ExplicitRestriction,
+            RepositoryNames = ["repo"],
+        });
+        if (retry)
+            pipeline.IterationBudget.TryConsume();
+
+        var prompt = BrainPromptBuilder.BuildPlanningPrompt(pipeline);
+        var normalizedPrompt = System.Text.RegularExpressions.Regex.Replace(prompt, @"\s+", " ");
+
+        Assert.Contains(
+            "Test-ownership reminder (applies to both first plans and retry plans)",
+            normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Tester owns missing unit/integration test authoring", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Do NOT invent verification-only or no-test-edit bans", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("do NOT route missing coverage back to the Coder", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("Preserve explicit goal/file/target-repository exclusions", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains("tasks deliberately limited to validation", normalizedPrompt, StringComparison.Ordinal);
+        Assert.Contains(ExplicitRestriction, prompt, StringComparison.Ordinal);
+        Assert.Contains(retry ? "This is a retry" : "This is the first iteration", normalizedPrompt, StringComparison.Ordinal);
+    }
+
     // ── model_tiers guidance: Merging is a plan phase but NOT a tier key ─────
 
     /// <summary>
