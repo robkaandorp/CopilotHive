@@ -231,13 +231,82 @@ public sealed class WorkerService(
         public ReadyClaim Ready { get; } = readyClaim;
     }
 
+    // ── Assignment ownership slot ───────────────────────────────────────────────
+    //
+    // The retained assignment for this service's current connection. The message loop
+    // (<see cref="ProcessMessagesAsync"/>) is the SOLE transition authority: the slot is
+    // installed, drained and cleared only through the ownership helpers below, never
+    // from any background caller, heartbeat or bridge method. Clearing always happens
+    // AFTER the corresponding <see cref="DrainAssignmentAsync"/> has returned, so the
+    // slot never reads as empty while an assignment is still unwinding. A completed
+    // assignment stays RETAINED — clearing happens on replacement, on a matching cancel,
+    // or on the loop's teardown, never on body completion.
+
+    /// <summary>
+    /// The retained assignment for this connection: the running (or already-finished) task
+    /// body, its assignment-scoped CTS and its single-flight Ready claim. <c>null</c> only
+    /// before the first install and after an ownership clear, and empty again after a
+    /// successful loop teardown.
+    /// </summary>
+    private ActiveAssignment? _activeAssignment;
+
+    /// <summary>
+    /// Ownership transition — INSTALL. Called after the execution task has been OBTAINED from
+    /// <c>Task.Run</c>, so only fully constructed state (task ID, body, CTS, Ready claim) is
+    /// ever published; the body closures capture the assignment-local values, not this slot.
+    /// </summary>
+    private void InstallActiveAssignment(ActiveAssignment assignment) => _activeAssignment = assignment;
+
+    /// <summary>
+    /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits the retained body
+    /// WITHOUT cancelling it (its Ready already flowed, so it is finished or finishing),
+    /// disposes its CTS, and only then clears the slot.
+    /// </summary>
+    private async Task DrainRetainedForReplacementAsync()
+    {
+        var drained = TakeActiveAssignment();
+        await DrainAssignmentAsync(drained, cancelFirst: false);
+        ClearActiveAssignment();
+    }
+
+    /// <summary>
+    /// Ownership transition — MATCHING-CANCEL clear. Cancels and drains the retained
+    /// assignment, disposes its CTS, and only then clears the slot. Returns the drained
+    /// assignment so the caller can still consult its single-flight Ready claim afterwards.
+    /// </summary>
+    private async Task<ActiveAssignment> DrainRetainedForMatchingCancelAsync()
+    {
+        var drained = TakeActiveAssignment();
+        await DrainAssignmentAsync(drained, cancelFirst: true);
+        ClearActiveAssignment();
+        return drained;
+    }
+
+    /// <summary>
+    /// Ownership transition — TEARDOWN clear, called from the message loop's <c>finally</c>.
+    /// Identical to the matching-cancel clear (cancel, drain, dispose, then clear); the
+    /// returned assignment is not used because teardown emits no Ready of its own.
+    /// </summary>
+    private Task DrainRetainedForTeardownAsync() => DrainRetainedForMatchingCancelAsync();
+
+    /// <summary>
+    /// Removes and returns the retained assignment. Failing fast on an empty slot keeps the
+    /// transition authority honest: an empty slot means there is nothing to drain, and any
+    /// caller that thought otherwise is a bug.
+    /// </summary>
+    private ActiveAssignment TakeActiveAssignment() =>
+        _activeAssignment
+        ?? throw new InvalidOperationException(
+            "No retained assignment to drain — the ownership slot is already empty.");
+
+    /// <summary>Clears the ownership slot. Called only AFTER the drain has returned.</summary>
+    private void ClearActiveAssignment() => _activeAssignment = null;
+
     private async Task ProcessMessagesAsync(
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         string assignedId,
         CancellationToken ct)
     {
-        ActiveAssignment? active = null;
-
         try
         {
             await foreach (var message in ReadMessages(stream.ResponseStream, ct))
@@ -250,14 +319,13 @@ public sealed class WorkerService(
                         // the runner is reset. Single-flight Ready (above) ensures the orchestrator
                         // never has two assignments in flight against this worker at once, so this
                         // await cannot starve a previous task of its ToolResponse.
-                        if (active is not null)
+                        if (_activeAssignment is not null)
                         {
                             // Await WITHOUT cancelling: single-flight Ready means a new assignment
                             // only follows a Ready this assignment already emitted, so the body is
                             // finished or finishing. Cancelling here would abort work that the
                             // orchestrator still expects to complete.
-                            await DrainAssignmentAsync(active, cancelFirst: false);
-                            active = null;
+                            await DrainRetainedForReplacementAsync();
                         }
 
                         var assignment = message.Assignment;
@@ -342,30 +410,29 @@ public sealed class WorkerService(
                                 await SendWorkerReady(stream, assignedId, ct);
                         }, ct);
 
-                        active = new ActiveAssignment(domainTask.TaskId, execution, taskCts, readyClaim);
+                        InstallActiveAssignment(
+                            new ActiveAssignment(domainTask.TaskId, execution, taskCts, readyClaim));
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.Cancel:
                         var cancel = message.Cancel;
                         _log.Info($"Cancel requested for task {cancel.TaskId}: {cancel.Reason}");
 
-                        if (active is not null)
+                        if (_activeAssignment is not null)
                         {
                             // Correlate by task ID. A LATE cancel for an already-completed task A
                             // must NOT abort the assignment B that replaced it, and must not
                             // consume B's single-flight Ready claim — doing so would strand B and
                             // desynchronise the orchestrator's view of this worker.
-                            if (!string.Equals(active.TaskId, cancel.TaskId, StringComparison.Ordinal))
+                            if (!string.Equals(_activeAssignment.TaskId, cancel.TaskId, StringComparison.Ordinal))
                             {
                                 _log.Info(
                                     $"Ignoring stale cancel for task {cancel.TaskId} — the active task is " +
-                                    $"{active.TaskId}, which keeps running.");
+                                    $"{_activeAssignment.TaskId}, which keeps running.");
                                 break;
                             }
 
-                            var cancelled = active;
-                            await DrainAssignmentAsync(cancelled, cancelFirst: true);
-                            active = null;
+                            var cancelled = await DrainRetainedForMatchingCancelAsync();
 
                             _currentTaskId = null;
                             _currentRole = null;
@@ -416,12 +483,10 @@ public sealed class WorkerService(
         {
             // Stream shutdown must not leave a task running: Program disposes the runner right
             // after this returns, and a still-running turn holds the client lifecycle lease.
-            // Cancel then drain so the runner is quiescent before disposal.
-            if (active is not null)
-            {
-                await DrainAssignmentAsync(active, cancelFirst: true);
-                active = null;
-            }
+            // Cancel then drain so the runner is quiescent before disposal. The ownership
+            // slot must be empty after successful loop cleanup.
+            if (_activeAssignment is not null)
+                await DrainRetainedForTeardownAsync();
 
             _currentTaskId = null;
             _currentRole = null;
