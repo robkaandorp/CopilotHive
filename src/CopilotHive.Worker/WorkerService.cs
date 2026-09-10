@@ -210,9 +210,56 @@ public sealed class WorkerService(
         public bool TryClaim() => Interlocked.Exchange(ref _claimed, 1) == 0;
     }
 
-    /// <summary>Tracks one assignment's identity, in-flight execution, cancellation scope and Ready claim.</summary>
+    /// <summary>
+    /// The assignment-local slot holding the ONE terminal <see cref="TaskResult"/> an assignment
+    /// produced, separated from the connection-bound reporting of that result.
+    /// <para>
+    /// SINGLE WRITER: only the assignment body publishes, exactly once, with the EXACT complete
+    /// domain result <see cref="TaskExecutor.ExecuteAsync"/> returned — before any payload mapping
+    /// and before any transport await. Reporting then merely consumes what is already retained,
+    /// so a blocked, failed or cancelled completion write cannot lose, truncate or overwrite it.
+    /// A body that throws before producing a result leaves this holder EMPTY: no completion is
+    /// ever fabricated, and no synthesized transport-failure result is stored.
+    /// </para>
+    /// <para>
+    /// Publication is via <see cref="Interlocked"/> / <see cref="Volatile"/>, so a reader on any
+    /// other thread (the message loop after a drain) observes either <c>null</c> or the fully
+    /// constructed, immutable result — never a torn reference. Retention lasts exactly as long as
+    /// the owning <see cref="ActiveAssignment"/>: the EXISTING drain-then-clear ownership
+    /// transition (replacement, matching cancel, teardown) releases it. Nothing here extends the
+    /// assignment's lifetime, adds a queue, or survives the loop's teardown.
+    /// </para>
+    /// </summary>
+    private sealed class TerminalResultHolder
+    {
+        private TaskResult? _result;
+
+        /// <summary>The retained terminal result, or <c>null</c> while none has been produced.</summary>
+        public TaskResult? Result => Volatile.Read(ref _result);
+
+        /// <summary>
+        /// Retains the assignment's terminal result. Called EXACTLY once per assignment, straight
+        /// after the executor returns. A second publish is a bug in the execution boundary (one
+        /// assignment can only produce one terminal result), so it fails fast rather than silently
+        /// replacing what was already retained.
+        /// </summary>
+        public void Publish(TaskResult result)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+
+            if (Interlocked.CompareExchange(ref _result, result, null) is not null)
+                throw new InvalidOperationException(
+                    "A terminal result is already retained for this assignment — it must be published once.");
+        }
+    }
+
+    /// <summary>Tracks one assignment's identity, in-flight execution, cancellation scope, Ready claim and terminal result.</summary>
     private sealed class ActiveAssignment(
-        string taskId, Task execution, CancellationTokenSource cts, ReadyClaim readyClaim)
+        string taskId,
+        Task execution,
+        CancellationTokenSource cts,
+        ReadyClaim readyClaim,
+        TerminalResultHolder terminalResult)
     {
         /// <summary>
         /// The assignment's task ID. A <c>CancelTask</c> is only applied when its
@@ -229,6 +276,15 @@ public sealed class WorkerService(
 
         /// <summary>The shared single-flight Ready claim for this assignment.</summary>
         public ReadyClaim Ready { get; } = readyClaim;
+
+        /// <summary>
+        /// The assignment-local holder carrying the terminal result this assignment produced.
+        /// It is created BEFORE the body starts and captured directly by the body's closure, so
+        /// the body never has to discover its owner through the ownership slot (which may not be
+        /// installed yet when the body first runs). Carried here so the EXISTING drain-then-clear
+        /// ownership transition retains the result for exactly the assignment's own lifetime.
+        /// </summary>
+        public TerminalResultHolder TerminalResult { get; } = terminalResult;
     }
 
     // ── Assignment ownership slot ───────────────────────────────────────────────
@@ -343,11 +399,14 @@ public sealed class WorkerService(
 
                         var taskCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-                        // The Ready claim and the CTS are created BEFORE the body starts, so the
-                        // body never observes a half-initialised assignment. (Capturing a variable
-                        // assigned after Task.Run would race with the body's first statement.)
+                        // The Ready claim, the CTS and the terminal-result holder are created
+                        // BEFORE the body starts, so the body never observes a half-initialised
+                        // assignment. (Capturing a variable assigned after Task.Run would race
+                        // with the body's first statement — and so would reading the ownership
+                        // slot, which is only installed once Task.Run has returned the body.)
                         var readyClaim = new ReadyClaim();
                         var bodyCts = taskCts;
+                        var terminalResult = new TerminalResultHolder();
 
                         // Run task execution concurrently so message loop can process
                         // ToolCallResponse messages from the orchestrator during execution
@@ -364,7 +423,8 @@ public sealed class WorkerService(
                                     var legacyExecutor = new TaskExecutor(
                                         _agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
                                     await ExecuteAndReportAsync(
-                                        legacyExecutor, domainTask, stream, assignedId, bodyCts.Token, ct);
+                                        legacyExecutor, domainTask, stream, assignedId,
+                                        terminalResult, bodyCts.Token, ct);
                                 }
                                 else
                                 {
@@ -388,7 +448,8 @@ public sealed class WorkerService(
                                         _agentRunner, this, gitOperations: null, sessionClient: this,
                                         configRepoDir: _configRepoDir, configRepoSeam: seam);
                                     await ExecuteAndReportAsync(
-                                        executor, domainTask, stream, assignedId, bodyCts.Token, ct);
+                                        executor, domainTask, stream, assignedId,
+                                        terminalResult, bodyCts.Token, ct);
                                 }
                             }
                             catch (OperationCanceledException) { }
@@ -411,7 +472,8 @@ public sealed class WorkerService(
                         }, ct);
 
                         InstallActiveAssignment(
-                            new ActiveAssignment(domainTask.TaskId, execution, taskCts, readyClaim));
+                            new ActiveAssignment(
+                                domainTask.TaskId, execution, taskCts, readyClaim, terminalResult));
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.Cancel:
@@ -538,14 +600,31 @@ public sealed class WorkerService(
     #region Assignment execution and config-repo preparation
 
     /// <summary>
-    /// Runs one assignment through an executor and reports its result upstream. Shared by BOTH
-    /// dispatch forms (the legacy, seam-free executor and the seam-carrying one) so the two can
-    /// never drift apart in what they write or log.
+    /// Runs one assignment through an executor, RETAINS its terminal result under the assignment
+    /// owner, and reports that result upstream. Shared by BOTH dispatch forms (the legacy,
+    /// seam-free executor and the seam-carrying one) so the two can never drift apart in what they
+    /// retain, write or log.
     /// </summary>
+    /// <remarks>
+    /// The produced result is separated from its connection-bound reporting: the EXACT complete
+    /// domain <c>TaskResult</c> the executor returned is published into the assignment-local holder
+    /// ONCE, before any payload mapping and before any transport await, and the send then consumes
+    /// what is already retained. A blocked gate, a failed or cancelled completion write therefore
+    /// changes nothing about retention — the result is neither truncated nor replaced by a
+    /// synthesized transport-failure result, and execution is never retried. Completed, Failed and
+    /// Cancelled results are retained alike. If setup or execution throws before a result exists,
+    /// the holder stays EMPTY rather than carrying a fabricated completion, and the exception
+    /// propagates to the body's existing handlers unchanged.
+    /// </remarks>
     /// <param name="executor">The executor to run — already fully constructed.</param>
     /// <param name="task">The domain task.</param>
     /// <param name="stream">The bidirectional work stream.</param>
     /// <param name="assignedId">This worker's orchestrator-assigned identifier.</param>
+    /// <param name="terminalResult">
+    /// The assignment-local holder this execution publishes its terminal result into. Passed in by
+    /// the body's closure — never discovered through the ownership slot, which may not yet hold
+    /// this assignment when the body starts.
+    /// </param>
     /// <param name="bodyToken">The ASSIGNMENT's token, which cancels the execution itself.</param>
     /// <param name="streamToken">The STREAM's token, used for the completion write.</param>
     private async Task ExecuteAndReportAsync(
@@ -553,10 +632,15 @@ public sealed class WorkerService(
         WorkTask task,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         string assignedId,
+        TerminalResultHolder terminalResult,
         CancellationToken bodyToken,
         CancellationToken streamToken)
     {
         var result = await executor.ExecuteAsync(task, bodyToken);
+
+        // RETAIN FIRST — the exact, complete result, before mapping and before the send can block
+        // or fail. Everything below is reporting of an already-retained result.
+        terminalResult.Publish(result);
 
         await SendAsync(stream, new WorkerMessage
         {
