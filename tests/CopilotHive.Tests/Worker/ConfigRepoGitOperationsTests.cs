@@ -1271,6 +1271,15 @@ public sealed class ConfigRepoGitOperationsTests
         // The cleanup-prerequisite local forms — every hash length and both letter cases.
         { new[] { "status", "--porcelain=v1", "--untracked-files=all", "--ignored" }, LaunchFailed },
         { new[] { "rev-parse", "--verify", "HEAD" }, LaunchFailed },
+        // The PREFLIGHT rev-parse forms — each an exact, literal token shape.
+        { new[] { "rev-parse", "--show-toplevel" }, LaunchFailed },
+        { new[] { "rev-parse", "--verify", "HEAD^{commit}" }, LaunchFailed },
+        { new[] { "rev-parse", "--symbolic-full-name", "HEAD" }, LaunchFailed },
+        { new[] { "rev-parse", "--symbolic-full-name", "@{upstream}" }, LaunchFailed },
+        { new[] { "rev-parse", "--verify", "FETCH_HEAD^{commit}" }, LaunchFailed },
+        // The preparation FETCH form: the already-admitted credential-scoped shape
+        // (fetch + positional `origin` + ref candidate) — no new option tokens.
+        { new[] { "fetch", "origin", "refs/heads/main" }, LaunchFailed },
         { new[] { "reset", "--hard", FullSha40Lower }, LaunchFailed },
         { new[] { "reset", "--hard", FullSha40Upper }, LaunchFailed },
         { new[] { "reset", "--hard", FullSha64Lower }, LaunchFailed },
@@ -1470,6 +1479,39 @@ public sealed class ConfigRepoGitOperationsTests
             AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^"]), FormMismatch("rev-parse"));
             AssertRejected(await RunAsync(seam, ["rev-parse"]), FormMismatch("rev-parse"));
 
+            // rev-parse — the PREFLIGHT near misses. Punctuation and argument boundaries are
+            // decisive: `HEAD^{commit}` and `@{upstream}` are single literal tokens and no
+            // other peel, suffix, abbreviation flag or option combination is admitted.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{tree}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{commit}~1"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{object}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD ^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^", "{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "FETCH_HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "FETCH_HEAD^{tree}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "ORIG_HEAD^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{u}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{upstream}^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{push}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "HEAD~1"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "origin/main"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--abbrev-ref", "HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "--abbrev-ref", "HEAD"]), FormMismatch("rev-parse"));
+            // Options combined in one invocation, and a SECOND ref after an accepted form.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "--symbolic-full-name", "HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "--verify", "HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{commit}", "HEAD"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "HEAD", "@{upstream}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--show-toplevel", "extra"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--show-toplevel", "--verify"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--show-toplevel="]), FormMismatch("rev-parse"));
+            // Empty and missing tokens.
+            AssertRejected(await RunAsync(seam, ["rev-parse", ""]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", ""]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", ""]), FormMismatch("rev-parse"));
+
             // reset — arity and option placement.
             AssertRejected(await RunAsync(seam, ["reset"]), FormMismatch("reset"));
             AssertRejected(await RunAsync(seam, ["reset", FullSha40Lower, "extra"]), FormMismatch("reset"));
@@ -1529,6 +1571,398 @@ public sealed class ConfigRepoGitOperationsTests
 
         Assert.Equal(0, launches);
         Assert.Equal(0, urlCalls);
+    }
+
+    /// <summary>
+    /// The five PREFLIGHT <c>rev-parse</c> forms are accepted EXACTLY, launch the snapshot
+    /// VERBATIM as a single credential-free process, and never read the URL/credential/helper
+    /// resolvers — they are local forms and must never reach Stage 6a.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PreflightRevParseFormCases))]
+    public async Task PreflightRevParseForms_LaunchVerbatimWithZeroResolverReads(string[] args)
+    {
+        var urlCalls = 0;
+        var credentialCalls = 0;
+        var helperCalls = 0;
+        using var seam = new ConfigRepoGitOperations(
+            RepoDir,
+            () => { urlCalls++; return EligibleUrl; },
+            () => { credentialCalls++; return null; },
+            Log(),
+            () => { helperCalls++; return "/helper"; },
+            static () => { });
+
+        var originalRunner = GitOperations.ProcessRunner;
+        var previousEnv = SeedChildEnvVariables();
+        var requests = new List<GitProcessRequest>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                requests.Add(request);
+                return Task.FromResult(new GitProcessResult(0, "refs/heads/main", string.Empty));
+            };
+
+            var result = await RunAsync(seam, args);
+
+            Assert.True(result.Success);
+            Assert.Equal("refs/heads/main", result.Stdout);
+            var request = Assert.Single(requests);
+            Assert.Equal("git", request.Executable);
+            Assert.Empty(request.Args);
+            Assert.Equal(args, request.TokenizedArgs!.ToArray()); // verbatim snapshot
+            AssertChildEnv(request);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+            RestoreChildEnvVariables(previousEnv);
+        }
+
+        Assert.Equal(0, urlCalls);
+        Assert.Equal(0, credentialCalls);
+        Assert.Equal(0, helperCalls);
+    }
+
+    /// <summary>The five exact preflight <c>rev-parse</c> forms.</summary>
+    public static TheoryData<string[]> PreflightRevParseFormCases => new()
+    {
+        new[] { "rev-parse", "--show-toplevel" },
+        new[] { "rev-parse", "--verify", "HEAD^{commit}" },
+        new[] { "rev-parse", "--symbolic-full-name", "HEAD" },
+        new[] { "rev-parse", "--symbolic-full-name", "@{upstream}" },
+        new[] { "rev-parse", "--verify", "FETCH_HEAD^{commit}" },
+    };
+
+    /// <summary>
+    /// The preparation FETCH form <c>fetch origin refs/heads/&lt;branch&gt;</c> is admitted by
+    /// the EXISTING credential-scoped grammar — no new fetch option and no new remote form.
+    /// Because it carries positionals, the seam launches it VERBATIM (no explicit-origin
+    /// canonicalization) after the origin state machine and ref validation.
+    /// </summary>
+    [Fact]
+    public async Task PreparationFetchForm_IsAdmittedByTheExistingCredentialScopedGrammar()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var launched = new List<string[]>();
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!.ToArray();
+                launched.Add(tokens);
+                return Task.FromResult(tokens is ["remote", "get-url", ..]
+                    ? new GitProcessResult(0, EligibleUrl, string.Empty)
+                    : new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, new[] { "fetch", "origin", "refs/heads/main" });
+
+            Assert.True(result.Success, result.SanitizedError);
+            Assert.Contains(launched, t => t is ["check-ref-format", "--allow-onelevel", "refs/heads/main"]);
+            Assert.Contains(launched, t => t is ["fetch", "origin", "refs/heads/main"]);
+            // No canonicalized `origin` was appended — the form already has positionals.
+            Assert.DoesNotContain(launched, t => t is ["fetch", "origin", "refs/heads/main", "origin"]);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>
+    /// ARGUMENT-BOUNDARY contract for the five preflight forms: <c>HEAD^{commit}</c>,
+    /// <c>FETCH_HEAD^{commit}</c> and <c>@{upstream}</c> are SINGLE literal tokens carrying the
+    /// caret/brace punctuation, and the launched <see cref="GitProcessRequest.TokenizedArgs"/>
+    /// preserves that token boundary byte-for-byte — no shell escaping, no re-splitting, no
+    /// brace expansion. Reading the request back through the REAL
+    /// <see cref="GitOperations.CreateProcessStartInfo"/> factory proves the ArgumentList entry
+    /// is the same single token, so the OS receives the punctuation verbatim.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PreflightRevParseFormCases))]
+    public async Task PreflightRevParseForms_PunctuationSurvivesAsOneArgumentListEntry(string[] args)
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        GitProcessRequest? captured = null;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                captured = request;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, args);
+            Assert.True(result.Success, result.SanitizedError);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+
+        Assert.NotNull(captured);
+
+        // The tokenized snapshot is the launch input, one element per argument.
+        var tokens = captured!.TokenizedArgs!.ToArray();
+        Assert.Equal(args, tokens);
+
+        // The REAL factory: each token becomes exactly ONE ArgumentList entry, so a token like
+        // `HEAD^{commit}` is never split on the caret/brace and never quoted.
+        var psi = GitOperations.CreateProcessStartInfo(captured);
+        Assert.Equal(args, psi.ArgumentList.ToArray());
+        Assert.Equal(string.Empty, psi.Arguments);
+        Assert.Equal(args.Length, psi.ArgumentList.Count);
+    }
+
+    /// <summary>
+    /// SEPARATOR/WHITESPACE variants of the punctuation tokens are rejected: an embedded space,
+    /// tab, newline or a split across two tokens never reconstructs an accepted form. Zero
+    /// launches and zero resolver reads (these are local forms).
+    /// </summary>
+    [Fact]
+    public async Task PreflightRevParseForms_SeparatorAndWhitespaceVariants_AreRejected()
+    {
+        var urlCalls = 0;
+        using var seam = new ConfigRepoGitOperations(
+            RepoDir,
+            () => { urlCalls++; return EligibleUrl; },
+            static () => null,
+            Log(),
+            static () => "/helper",
+            static () => { });
+
+        var originalRunner = GitOperations.ProcessRunner;
+        var launches = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (_, _) =>
+            {
+                launches++;
+                return Task.FromResult(new GitProcessResult(0, string.Empty, string.Empty));
+            };
+
+            // Whitespace INSIDE the punctuation token.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{ commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{commit }"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", " HEAD^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{commit}\t"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{commit}\n"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^\t{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "FETCH_HEAD^{ commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "FETCH_HEAD ^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{ upstream}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{upstream} "]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", " @{upstream}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@ {upstream}"]), FormMismatch("rev-parse"));
+
+            // The whole form squashed into ONE token, or split across an extra token.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify HEAD^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name @{upstream}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "FETCH_HEAD^", "{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@", "{upstream}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--show-toplevel", ""]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", " --show-toplevel"]), FormMismatch("rev-parse"));
+
+            // Case variations — the match is ORDINAL.
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "HEAD^{COMMIT}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--verify", "head^{commit}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--symbolic-full-name", "@{UPSTREAM}"]), FormMismatch("rev-parse"));
+            AssertRejected(await RunAsync(seam, ["rev-parse", "--SHOW-TOPLEVEL"]), FormMismatch("rev-parse"));
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+
+        Assert.Equal(0, launches);
+        Assert.Equal(0, urlCalls);
+    }
+
+    /// <summary>
+    /// The preflight forms never enter the Stage 6c ORIGIN GATE: a concurrently held gate (an
+    /// in-flight eligible transport operation) does not block them, proving they take the local
+    /// Branch-B route straight to Stage 7. Without the gate-free routing this test would
+    /// deadlock, so it is bounded by <see cref="AwaitTimeout"/>.
+    /// </summary>
+    [Fact]
+    public async Task PreflightRevParseForms_DoNotEnterTheOriginGate()
+    {
+        var originalRunner = GitOperations.ProcessRunner;
+        var transportEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTransport = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            GitOperations.ProcessRunner = async (request, _) =>
+            {
+                var tokens = request.TokenizedArgs!.ToArray();
+                if (tokens is ["remote", "get-url", ..])
+                {
+                    // The origin inspection runs INSIDE the Stage 6c gate — park here so the
+                    // gate stays held while the local preflight forms run.
+                    transportEntered.TrySetResult();
+                    await releaseTransport.Task;
+                    return new GitProcessResult(0, EligibleUrl, string.Empty);
+                }
+
+                return new GitProcessResult(0, string.Empty, string.Empty);
+            };
+
+            using var seam = CreateSeam();
+
+            // Start an eligible transport op and wait until it is holding the gate.
+            var transport = RunAsync(seam, ["fetch", "origin", "refs/heads/main"]);
+            await transportEntered.Task.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+
+            // Every preflight form completes while the gate is HELD by the transport op.
+            foreach (var form in PreflightRevParseForms)
+            {
+                var local = await RunAsync(seam, form).WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+                Assert.True(local.Success, local.SanitizedError);
+            }
+
+            releaseTransport.TrySetResult();
+            var transportResult = await transport.WaitAsync(AwaitTimeout, TestContext.Current.CancellationToken);
+            Assert.True(transportResult.Success, transportResult.SanitizedError);
+        }
+        finally
+        {
+            releaseTransport.TrySetResult();
+            GitOperations.ProcessRunner = originalRunner;
+        }
+    }
+
+    /// <summary>The five preflight forms as a plain array (the theory data's backing store).</summary>
+    private static readonly string[][] PreflightRevParseForms =
+    [
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+    ];
+
+    // ------------------------------------------------------------------
+    // The LEGACY (opaque-argument) route for the preparation forms.
+    //
+    // TaskExecutor hands the legacy path a single opaque STRING. These
+    // tests pin the round-trip contract at the real factory: the discovered
+    // `refs/heads/<branch>` must survive as ONE argument, and the seam's ref
+    // validation (which the legacy path does NOT perform) still rejects a
+    // malformed ref when the same value is routed through the seam.
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The LEGACY opaque form is assigned VERBATIM to the process <c>Arguments</c> string with
+    /// no splitting and no re-quoting, so the quoted <c>refs/heads/&lt;branch&gt;</c>
+    /// TaskExecutor builds round-trips as a single quoted argument. Branch names carrying
+    /// punctuation the production convention permits (dots, dashes, slashes, underscores,
+    /// plus signs) are covered, and the quoting keeps them one argument.
+    /// </summary>
+    [Theory]
+    [InlineData("main")]
+    [InlineData("release/2024.10")]
+    [InlineData("feature/agents-md_v2")]
+    [InlineData("hotfix.1+build2")]
+    [InlineData("a.b.c/d-e_f")]
+    public void LegacyPreparationFetchForm_CarriesTheDiscoveredRefAsOneQuotedArgument(string branch)
+    {
+        var branchRef = "refs/heads/" + branch;
+        var opaque = $"fetch origin \"{branchRef}\"";
+
+        var request = new GitProcessRequest(
+            "git", [opaque], RepoDir, new Dictionary<string, string?>());
+        var psi = GitOperations.CreateProcessStartInfo(request);
+
+        // VERBATIM: the opaque string is not split, re-quoted or normalized.
+        Assert.Equal(opaque, psi.Arguments);
+        Assert.Empty(psi.ArgumentList);
+
+        // The ref occupies exactly ONE quoted argument: the quotes bracket the whole ref and
+        // nothing else, so no punctuation inside can start a second argument.
+        Assert.Equal(2, opaque.Count(c => c == '"'));
+        Assert.EndsWith($"\"{branchRef}\"", opaque, StringComparison.Ordinal);
+        Assert.Equal($"fetch origin \"{branchRef}\"", opaque);
+
+        // No unchecked interpolation: the ref contributes no shell metacharacter that the
+        // production `IsCarryableBranch` screen permits through.
+        Assert.DoesNotContain('\\', branchRef);
+        Assert.DoesNotContain('"', branchRef);
+    }
+
+    /// <summary>
+    /// The legacy route performs NO validation of its own — it assigns the opaque string
+    /// verbatim — so a malformed ref would reach git unchecked if TaskExecutor trusted it.
+    /// Routing the SAME malformed ref values through the seam proves the seam still rejects
+    /// them, which is the validation TaskExecutor reuses (<c>ValidateRef</c>) rather than
+    /// trusting the legacy path.
+    /// </summary>
+    [Theory]
+    [InlineData("refs/heads/bad..name")]
+    [InlineData("-refs/heads/leading-dash")]
+    [InlineData("+refs/heads/leading-plus")]
+    [InlineData("refs/heads/has space")]
+    [InlineData("refs/heads/star*glob")]
+    [InlineData("refs/heads/proto://embedded")]
+    [InlineData("refs/heads/tab\there")]
+    [InlineData("")]
+    public async Task LegacyPreparationRef_MalformedValues_AreStillRejectedByTheSeam(string badRef)
+    {
+        // (a) The seam's ref validation rejects the value outright — the same helper
+        // TaskExecutor calls before it builds EITHER dispatch form.
+        Assert.NotNull(ConfigRepoGitOperations.ValidateRef(badRef));
+
+        // (b) End to end through the seam: the fetch carrying the malformed ref is rejected
+        // BEFORE any fetch process launches.
+        var originalRunner = GitOperations.ProcessRunner;
+        var launchedFetches = 0;
+        try
+        {
+            GitOperations.ProcessRunner = (request, _) =>
+            {
+                if (request.TokenizedArgs is ["fetch", ..])
+                    launchedFetches++;
+                return Task.FromResult(new GitProcessResult(0, EligibleUrl, string.Empty));
+            };
+
+            using var seam = CreateSeam();
+            var result = await RunAsync(seam, ["fetch", "origin", badRef]);
+
+            Assert.False(result.Success);
+            Assert.Equal(-1, result.ExitCode);
+        }
+        finally
+        {
+            GitOperations.ProcessRunner = originalRunner;
+        }
+
+        Assert.Equal(0, launchedFetches);
+    }
+
+    /// <summary>
+    /// The legacy opaque form for each PREFLIGHT command is likewise assigned verbatim: the
+    /// punctuation tokens (<c>HEAD^{commit}</c>, <c>@{upstream}</c>) need no quoting because
+    /// they carry no whitespace, and the factory neither splits nor escapes them.
+    /// </summary>
+    [Theory]
+    [InlineData("rev-parse --show-toplevel")]
+    [InlineData("rev-parse --verify HEAD^{commit}")]
+    [InlineData("rev-parse --symbolic-full-name HEAD")]
+    [InlineData("rev-parse --symbolic-full-name @{upstream}")]
+    [InlineData("rev-parse --verify FETCH_HEAD^{commit}")]
+    [InlineData("clean -fdx")]
+    [InlineData("status --porcelain=v1 --untracked-files=all --ignored")]
+    public void LegacyPreparationForms_AreAssignedVerbatim(string opaque)
+    {
+        var request = new GitProcessRequest(
+            "git", [opaque], RepoDir, new Dictionary<string, string?>());
+        var psi = GitOperations.CreateProcessStartInfo(request);
+
+        Assert.Equal(opaque, psi.Arguments);
+        Assert.Empty(psi.ArgumentList);
     }
 
     /// <summary>
@@ -3284,6 +3718,11 @@ public sealed class ConfigRepoGitOperationsTests
         ["status"],
         ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
         ["rev-parse", "--verify", "HEAD"],
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         ["reset", "--hard", FullSha40Lower],
         ["reset", "--hard", FullSha64Upper],
         ["clean", "-fdx"],

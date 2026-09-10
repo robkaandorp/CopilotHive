@@ -299,20 +299,12 @@ internal sealed class ConfigRepoGitOperations : IDisposable
         // over a Stage 6 ref error.
         if (refCandidate is not null)
         {
-            var refError = ValidateRef(refCandidate);
+            // The COMPLETE ref validation — prechecks plus the authoritative check-ref-format
+            // subprocess — through the single shared path that the Improver's preflight also
+            // uses, so the tokenized and legacy routes can never reach different verdicts.
+            var refError = await ValidateRefCompletelyAsync(refCandidate, _configRepoDirCanonical, ct);
             if (refError is not null)
                 return Reject(refError);
-
-            // The prechecks passed — confirm with the subprocess. The ref-validation
-            // subprocess is ALWAYS credential-free: only the scrubbed inherited environment
-            // plus GIT_TERMINAL_PROMPT=0. A non-zero exit rejects the ref.
-            var refValidation = await LaunchGitProcessAsync(
-                new[] { "check-ref-format", "--allow-onelevel", refCandidate }, ct);
-            if (refValidation is null)
-                return Reject("Git process failed to start.");
-
-            if (refValidation.ExitCode != 0)
-                return Reject($"Invalid git ref: '{GitUrlRedactor.Redact(refCandidate)}'.");
         }
 
         // The Stage 7 launch arguments.
@@ -1706,6 +1698,15 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     /// <c>clean -fdx</c>, and the verbose <c>status --porcelain=v1 --untracked-files=all
     /// --ignored</c> alongside the bare <c>status</c>) are LOCAL: they never reach Stage 6a,
     /// never touch the URL/credential resolvers, and launch the snapshot verbatim.
+    /// <para>
+    /// The Improver's PRE-RUN baseline preflight adds four further EXACT <c>rev-parse</c>
+    /// forms (<c>--show-toplevel</c>, <c>--verify HEAD^{commit}</c>,
+    /// <c>--symbolic-full-name HEAD</c>, <c>--symbolic-full-name @{upstream}</c> and
+    /// <c>--verify FETCH_HEAD^{commit}</c>). They are LOCAL for exactly the same reasons —
+    /// no arbitrary revision expression, refspec, abbreviation flag, extra token or option
+    /// permutation is admitted; everything outside the enumerated shapes gets the SAME fixed
+    /// <c>malformed</c> message.
+    /// </para>
     /// </summary>
     private static string? ValidateLocalForm(string subcommand, string[] snapshot)
     {
@@ -1730,9 +1731,7 @@ internal sealed class ConfigRepoGitOperations : IDisposable
                     ? null
                     : malformed;
             case "rev-parse":
-                return snapshot.Length == 3 && snapshot[1] == "--verify" && snapshot[2] == "HEAD"
-                    ? null
-                    : malformed;
+                return IsAcceptedRevParseForm(snapshot) ? null : malformed;
             case "reset":
                 return snapshot.Length == 3 && snapshot[1] == "--hard" && IsValidCommitSha(snapshot[2])
                     ? null
@@ -1745,14 +1744,44 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     }
 
     /// <summary>
+    /// The EXACT accepted <c>rev-parse</c> token forms — the union of the pre-existing
+    /// <c>--verify HEAD</c> shape and the four preflight shapes added for the Improver's
+    /// pre-run baseline restore. The match is positional and literal, so revision
+    /// expressions (<c>HEAD~1</c>, <c>HEAD^{tree}</c>, <c>@{u}</c>), abbreviation flags
+    /// (<c>--abbrev-ref</c>), option combinations, extra refs and missing tokens are all
+    /// rejected.
+    /// </summary>
+    private static bool IsAcceptedRevParseForm(string[] snapshot) =>
+        (snapshot.Length == 2 && snapshot[1] == "--show-toplevel")
+        || (snapshot.Length == 3
+            && ((snapshot[1] == "--verify"
+                    && snapshot[2] is "HEAD" or RevHeadCommit or RevFetchHeadCommit)
+                || (snapshot[1] == "--symbolic-full-name"
+                    && snapshot[2] is "HEAD" or RevUpstream)));
+
+    /// <summary>The peeled-commit spelling of HEAD — one literal token, never shell-escaped.</summary>
+    internal const string RevHeadCommit = "HEAD^{commit}";
+
+    /// <summary>The peeled-commit spelling of FETCH_HEAD — one literal token.</summary>
+    internal const string RevFetchHeadCommit = "FETCH_HEAD^{commit}";
+
+    /// <summary>The upstream revision spelling — one literal token.</summary>
+    internal const string RevUpstream = "@{upstream}";
+
+    /// <summary>
     /// The <c>reset</c> SHA domain: EXACTLY 40 or 64 ASCII hexadecimal characters (upper and
     /// lower case allowed), compared without trimming or normalization. This is SYNTAX
     /// validation only — it does NOT prove the object exists or is a commit; the real
     /// <c>git reset</c> at execution time remains the authority. Abbreviated hashes, HEAD or
     /// branch names, revision expressions (<c>HEAD~1</c>, <c>@</c>, <c>:path</c>), and
     /// option-like tokens all fall outside this domain.
+    /// <para>
+    /// It is <c>internal</c> so the Improver's preflight can validate the SHAs it PARSES out
+    /// of <c>rev-parse</c> output against the very same domain instead of duplicating a
+    /// second, potentially weaker, validator.
+    /// </para>
     /// </summary>
-    private static bool IsValidCommitSha(string value)
+    internal static bool IsValidCommitSha(string value)
     {
         if (value.Length is not (40 or 64))
             return false;
@@ -1896,11 +1925,88 @@ internal sealed class ConfigRepoGitOperations : IDisposable
     }
 
     /// <summary>
-    /// Stage 6 — ref PRECHECKS (the <c>check-ref-format</c> subprocess runs afterwards):
-    /// no <c>..</c>/<c>...</c>, no <c>://</c>, no leading <c>-</c>/<c>+</c>, non-empty, no
-    /// whitespace/control characters, and an explicit <c>*</c> rejection.
+    /// THE SINGLE COMPLETE ref-validation path: the Stage 6 prechecks
+    /// (<see cref="ValidateRef"/>) followed by the AUTHORITATIVE
+    /// <c>git check-ref-format --allow-onelevel &lt;ref&gt;</c> subprocess. Returns the
+    /// rejection message, or <c>null</c> when the ref is fully valid.
+    /// <para>
+    /// It exists so a ref is validated IDENTICALLY no matter which route will carry it. The
+    /// prechecks alone are NOT sufficient — they accept refs that git itself rejects
+    /// (<c>refs/heads/foo.lock</c>, <c>refs/heads/.hidden</c>, <c>refs/heads/foo//bar</c>,
+    /// <c>refs/heads/foo@{bar}</c>), so a route that stopped at the prechecks would launch a
+    /// fetch for a ref git will not accept. The Improver's preflight calls this ONCE for the
+    /// discovered branch ref before EITHER dispatch form is built, and the seam's transport
+    /// path calls the very same method — one implementation, one verdict.
+    /// </para>
+    /// <para>
+    /// The subprocess is ALWAYS credential-free: the scrubbed inherited environment plus
+    /// <c>GIT_TERMINAL_PROMPT=0</c>, and no URL/credential resolver is ever read. An
+    /// <see cref="OperationCanceledException"/> propagates unconditionally; any other launch
+    /// failure yields the fixed <c>Git process failed to start.</c> message and the exception's
+    /// own text is never propagated.
+    /// </para>
     /// </summary>
-    private static string? ValidateRef(string refName)
+    internal static async Task<string?> ValidateRefCompletelyAsync(
+        string refName, string workingDirectory, CancellationToken ct)
+    {
+        var precheckError = ValidateRef(refName);
+        if (precheckError is not null)
+            return precheckError;
+
+        GitProcessResult? validation;
+        try
+        {
+            validation = await GitOperations.ExecuteProcessAsync(
+                new GitProcessRequest(
+                    "git",
+                    Args: Array.Empty<string>(),
+                    WorkingDirectory: workingDirectory,
+                    Env: BuildRefValidationEnv(),
+                    TokenizedArgs: new[] { "check-ref-format", "--allow-onelevel", refName }),
+                ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // A catch-ALL for non-cancellation launch failures — the exception's own text is
+            // NEVER propagated.
+            return "Git process failed to start.";
+        }
+
+        return validation.ExitCode == 0
+            ? null
+            : $"Invalid git ref: '{GitUrlRedactor.Redact(refName)}'.";
+    }
+
+    /// <summary>
+    /// The credential-free child environment for the ref-validation subprocess: the SCRUBBED
+    /// inherited environment plus <c>GIT_TERMINAL_PROMPT=0</c>, and nothing else.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string?> BuildRefValidationEnv()
+    {
+        var scrubbed = GitOperations.SanitizeChildEnv(SnapshotCurrentProcessEnv());
+        var env = new Dictionary<string, string?>(scrubbed)
+        {
+            ["GIT_TERMINAL_PROMPT"] = "0",
+        };
+
+        return env;
+    }
+
+    /// <summary>
+    /// Stage 6 — ref PRECHECKS ONLY (the authoritative <c>check-ref-format</c> subprocess runs
+    /// afterwards, inside <see cref="ValidateRefCompletelyAsync"/>): no <c>..</c>/<c>...</c>,
+    /// no <c>://</c>, no leading <c>-</c>/<c>+</c>, non-empty, no whitespace/control characters,
+    /// and an explicit <c>*</c> rejection.
+    /// <para>
+    /// These prechecks are DELIBERATELY not sufficient on their own — callers must use
+    /// <see cref="ValidateRefCompletelyAsync"/> so git's own verdict is always applied too.
+    /// </para>
+    /// </summary>
+    internal static string? ValidateRef(string refName)
     {
         if (refName.Contains("..") || refName.Contains("://"))
             return $"Invalid git ref: '{GitUrlRedactor.Redact(refName)}'.";

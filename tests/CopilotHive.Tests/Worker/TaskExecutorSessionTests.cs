@@ -155,7 +155,7 @@ public sealed class TaskExecutorSessionTests
         public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
             => Task.FromResult<string?>("abc123def456789012345678");
         public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(string workDir, string args, CancellationToken ct)
-            => Task.FromResult((0, "", ""));
+            => Task.FromResult(ConfigRepoPreparationFakes.LegacyAnswer(workDir, args) ?? (0, "", ""));
         public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
     }
 
@@ -509,8 +509,93 @@ public sealed class TaskExecutorSessionTests
         {
             "diff --cached --name-only -z" => Task.FromResult((0, "agents/coder.agents.md\0", "")),
             "push" => Task.FromResult((1, "", "fatal: remote rejected")),
-            _ => Task.FromResult((0, "", "")),
+            // The Improver preparation commands get EXPLICIT valid answers — an exit-zero,
+            // empty-output response must never become a usable baseline.
+            _ => Task.FromResult(ConfigRepoPreparationFakes.LegacyAnswer(workDir, args) ?? (0, "", "")),
         };
+    }
+
+    /// <summary>
+    /// The session epilogue also runs on a PRE-RUN PREPARATION failure — the baseline restore
+    /// fails before the agent is ever prompted, yet the failure still flows through the same
+    /// <c>ConfigRepoPublicationException</c> catch boundary that saves the session. The
+    /// preparation failure must not bypass the epilogue with an early return.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverPreparationFailure_StillSavesSession()
+    {
+        var configRepo = Path.Combine(Path.GetTempPath(), $"CfgRepoSessionPrep_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepo, ".git"));
+        Directory.CreateDirectory(Path.Combine(configRepo, "agents"));
+        try
+        {
+            var git = new FailingFetchConfigGit();
+            var sessionClient = new FakeSessionClient();
+            // A PERSISTED session exists, so the epilogue has something real to save. Without
+            // it the agent never runs (preparation fails first), GetSession() is null, and the
+            // best-effort helper legitimately short-circuits — which would make the assertion
+            // below vacuous rather than proving the epilogue was reached.
+            sessionClient.Seed(
+                "goal-improver-prep-fail",
+                JsonSerializer.Serialize(
+                    AgentSession.Create("prep-fail-session"), AIJsonUtilities.DefaultOptions));
+            var agentRunner = new SessionTrackingAgentRunner();
+            var executor = new TaskExecutor(
+                agentRunner, gitOperations: git, sessionClient: sessionClient,
+                configRepoDir: configRepo);
+            var task = BuildTask("goal-improver-prep-fail") with
+            {
+                Role = WorkerRole.Improver,
+                Repositories = [],
+            };
+
+            var result = await executor.ExecuteAsync(task, TestContext.Current.CancellationToken);
+
+            // Truthful preparation failure, and the session WAS saved on that path — the
+            // preparation failure did not bypass the epilogue with an early return.
+            Assert.Equal(TaskOutcome.Failed, result.Status);
+            Assert.Equal("FAIL", result.Metrics!.Verdict);
+            Assert.Contains(
+                result.Metrics.Issues,
+                i => i.Contains("Config repo preparation fetch failed", StringComparison.Ordinal));
+            Assert.Equal(1, sessionClient.SaveCallCount);
+            Assert.Equal("goal-improver-prep-fail", sessionClient.LastSavedSessionId);
+
+            // The agent was never prompted: preparation failed before the prompt.
+            Assert.True(agentRunner.SetSessionCalled);
+        }
+        finally
+        {
+            if (Directory.Exists(configRepo))
+                TestHelpers.ForceDeleteDirectory(configRepo);
+        }
+    }
+
+    /// <summary>
+    /// A config-repo <see cref="IGitOperations"/> whose pre-run baseline FETCH fails with a
+    /// non-zero exit code. Every preflight command answers with an explicit valid value so the
+    /// sequence genuinely reaches the fetch — an exit-zero/empty response must never become a
+    /// usable baseline.
+    /// </summary>
+    private sealed class FailingFetchConfigGit : IGitOperations
+    {
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct) => Task.CompletedTask;
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct) => Task.CompletedTask;
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct) => Task.CompletedTask;
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+            => Task.FromResult(new GitChangeSummary { FilesChanged = 1 });
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct) => Task.FromResult(false);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => Task.FromResult<string?>(null);
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5) => Task.CompletedTask;
+
+        public Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+            string workDir, string args, CancellationToken ct) =>
+            args.StartsWith("fetch ", StringComparison.Ordinal)
+                ? Task.FromResult((128, "", "fatal: could not read from remote repository"))
+                : Task.FromResult(
+                    ConfigRepoPreparationFakes.LegacyAnswer(workDir, args) ?? (0, "", ""));
     }
 
     /// <summary>

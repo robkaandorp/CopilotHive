@@ -8,6 +8,119 @@ using Microsoft.Extensions.AI;
 namespace CopilotHive.Tests.Worker;
 
 /// <summary>
+/// The shared PREPARATION answers for the Improver's pre-run baseline restore, reused by every
+/// <see cref="TaskExecutor"/> fake in this test project.
+/// <para>
+/// Every answer is an EXPLICIT valid value — a real worktree root, a full 40-hex commit SHA, an
+/// attached <c>refs/heads/…</c> branch, a matching <c>refs/remotes/origin/…</c> upstream and an
+/// empty verbose status. A bare exit-zero/empty-output response must NEVER become a usable
+/// baseline, so no fixture may rely on the fallthrough success of an unanswered command.
+/// </para>
+/// </summary>
+internal static class ConfigRepoPreparationFakes
+{
+    /// <summary>The full 40-hex SHA the fakes report for HEAD and for the fetched baseline.</summary>
+    internal const string BaselineSha = "1111111111111111111111111111111111111111";
+
+    /// <summary>The attached branch the fakes report from <c>--symbolic-full-name HEAD</c>.</summary>
+    internal const string Branch = "main";
+
+    /// <summary>The full ref of <see cref="Branch"/>.</summary>
+    internal const string BranchRef = "refs/heads/" + Branch;
+
+    /// <summary>The upstream the fakes report from <c>--symbolic-full-name @{upstream}</c>.</summary>
+    internal const string UpstreamRef = "refs/remotes/origin/" + Branch;
+
+    /// <summary>The canonical spelling the production code compares the worktree root against.</summary>
+    internal static string CanonicalRoot(string configRepoDir) =>
+        Path.GetFullPath(configRepoDir)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    /// <summary>
+    /// The LEGACY opaque-argument answers. Returns <c>null</c> for every non-preparation
+    /// command so the caller can fall through to its own scripted behavior.
+    /// </summary>
+    internal static (int ExitCode, string Stdout, string Stderr)? LegacyAnswer(
+        string workDir, string args) => args switch
+    {
+        "rev-parse --show-toplevel" => (0, CanonicalRoot(workDir) + "\n", ""),
+        "rev-parse --verify HEAD^{commit}" => (0, BaselineSha + "\n", ""),
+        "rev-parse --verify FETCH_HEAD^{commit}" => (0, BaselineSha + "\n", ""),
+        "rev-parse --symbolic-full-name HEAD" => (0, BranchRef + "\n", ""),
+        "rev-parse --symbolic-full-name @{upstream}" => (0, UpstreamRef + "\n", ""),
+        "status --porcelain=v1 --untracked-files=all --ignored" => (0, "", ""),
+        _ => null,
+    };
+
+    /// <summary>
+    /// The TOKENIZED answers for the injected seam path. Returns <c>null</c> for every
+    /// non-preparation command.
+    /// </summary>
+    internal static GitProcessResult? SeamAnswer(
+        string workingDirectory, IReadOnlyList<string> tokens) => tokens switch
+    {
+        ["rev-parse", "--show-toplevel"] =>
+            new GitProcessResult(0, CanonicalRoot(workingDirectory) + "\n", ""),
+        ["rev-parse", "--verify", "HEAD^{commit}"] => new GitProcessResult(0, BaselineSha + "\n", ""),
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"] => new GitProcessResult(0, BaselineSha + "\n", ""),
+        ["rev-parse", "--symbolic-full-name", "HEAD"] => new GitProcessResult(0, BranchRef + "\n", ""),
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"] => new GitProcessResult(0, UpstreamRef + "\n", ""),
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"] =>
+            new GitProcessResult(0, "", ""),
+        _ => null,
+    };
+
+    /// <summary>The LEGACY opaque strings the preparation issues, in order.</summary>
+    internal static string[] LegacyCommands =>
+    [
+        "rev-parse --show-toplevel",
+        "rev-parse --verify HEAD^{commit}",
+        "rev-parse --symbolic-full-name HEAD",
+        "rev-parse --symbolic-full-name @{upstream}",
+        $"fetch origin \"{BranchRef}\"",
+        "rev-parse --verify FETCH_HEAD^{commit}",
+        $"reset --hard {BaselineSha}",
+        "clean -fdx",
+        "rev-parse --verify HEAD^{commit}",
+        "status --porcelain=v1 --untracked-files=all --ignored",
+    ];
+
+    /// <summary>
+    /// The TOKENIZED commands the seam launches for the preparation, in order — including the
+    /// PREFLIGHT's own <c>check-ref-format</c> (the complete ref validation run once the branch
+    /// is discovered, BEFORE either route builds a fetch form) and the seam's own
+    /// <c>check-ref-format</c> plus origin-inspection preamble for the fetch itself.
+    /// </summary>
+    internal static string[][] SeamLaunches => SeamLaunchesWithOriginRepair(null);
+
+    /// <summary>
+    /// <see cref="SeamLaunches"/> with an optional Stage 6d origin REPAIR command inserted
+    /// between the origin inspection and the fetch.
+    /// </summary>
+    internal static string[][] SeamLaunchesWithOriginRepair(string[]? repair) =>
+    [
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+        // The PREFLIGHT ref validation: the discovered ref gets git's authoritative verdict
+        // BEFORE the upstream check and before any fetch form exists, so the tokenized and
+        // legacy routes can never disagree about whether the ref is usable.
+        ["check-ref-format", "--allow-onelevel", BranchRef],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        // The seam's own in-transport ref validation for the fetch it is about to launch.
+        ["check-ref-format", "--allow-onelevel", BranchRef],
+        ["remote", "get-url", "origin"],
+        .. repair is null ? Array.Empty<string[]>() : [repair],
+        ["fetch", "origin", BranchRef],
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        ["reset", "--hard", BaselineSha],
+        ["clean", "-fdx"],
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+    ];
+}
+
+/// <summary>
 /// Tests for <see cref="TaskExecutor"/> push error handling.
 /// </summary>
 [Collection("ConsoleOutput")]
@@ -104,7 +217,13 @@ public sealed class TaskExecutorTests
             if (GitCommandThrower?.Invoke(args) is { } ex)
                 throw ex;
             var scripted = GitCommandResponder?.Invoke(args);
-            return Task.FromResult(scripted ?? (0, "", ""));
+            // A test's own script always wins; otherwise the Improver preparation commands get
+            // EXPLICIT valid answers (root/SHA/branch/upstream/empty status). Exit-zero with an
+            // empty stdout is never a usable baseline, so the fallthrough must not supply one.
+            return Task.FromResult(
+                scripted
+                ?? ConfigRepoPreparationFakes.LegacyAnswer(workDir, args)
+                ?? (0, "", ""));
         }
 
         public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
@@ -852,9 +971,8 @@ public sealed class TaskExecutorTests
             + new string('x', WorkerConstants.AgentsMdMaxCharacters + 1
                 - heading.Length - olderBody.Length - appendedSection.Length)
             + appendedSection;
-        await File.WriteAllTextAsync(filePath, oversized, TestContext.Current.CancellationToken);
 
-        var observedLength = File.ReadAllText(filePath).Length;
+        var observedLength = oversized.Length;
         Assert.Equal(8_001, observedLength);
         Assert.Equal(WorkerConstants.AgentsMdMaxCharacters + 1, observedLength);
 
@@ -866,10 +984,24 @@ public sealed class TaskExecutorTests
 
         var agentRunner = new MockAgentRunner
         {
+            // The overflow is the IMPROVER'S OWN edit, written from inside the agent callback —
+            // i.e. AFTER the pre-run baseline preparation, whose `clean -fdx` deliberately
+            // clears untracked residue. Pre-seeding it before ExecuteAsync would describe
+            // residue that preparation legitimately removes, not the agent's work.
             PromptResponder = async (prompt, _, ct) =>
             {
                 if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                {
                     await File.WriteAllTextAsync(filePath, repaired, ct);
+                }
+                else
+                {
+                    await File.WriteAllTextAsync(filePath, oversized, ct);
+                    // The same observable on-disk state the fixture used to pre-seed, produced
+                    // at the point in the flow where the improver would really produce it.
+                    Assert.Equal(observedLength, File.ReadAllText(filePath).Length);
+                }
+
                 return "Mock agent response";
             },
         };
@@ -934,17 +1066,24 @@ public sealed class TaskExecutorTests
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var filePath = Path.Combine(configRepoDir, "agents", "boundary.agents.md");
-        await File.WriteAllTextAsync(
-            filePath, new string('a', characterCount), TestContext.Current.CancellationToken);
-
-        Assert.Equal(characterCount, File.ReadAllText(filePath).Length);
 
         var agentRunner = new MockAgentRunner
         {
+            // Written from the agent callback (post-preparation), not pre-seeded: the pre-run
+            // baseline restore clears untracked residue, so the boundary content must be the
+            // improver's own edit for the size check to describe the right thing.
             PromptResponder = async (prompt, _, ct) =>
             {
                 if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                {
                     await File.WriteAllTextAsync(filePath, "repaired", ct);
+                }
+                else
+                {
+                    await File.WriteAllTextAsync(filePath, new string('a', characterCount), ct);
+                    Assert.Equal(characterCount, File.ReadAllText(filePath).Length);
+                }
+
                 return "Mock agent response";
             },
         };
@@ -971,20 +1110,37 @@ public sealed class TaskExecutorTests
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var filePath = Path.Combine(configRepoDir, "agents", "unicode-boundary.agents.md");
         var content = string.Concat(Enumerable.Repeat("😀", 4_000));
-        await File.WriteAllTextAsync(filePath, content, TestContext.Current.CancellationToken);
 
-        var readBack = File.ReadAllText(filePath);
-        Assert.Equal(8_000, readBack.Length);
-        Assert.Equal(WorkerConstants.AgentsMdMaxCharacters, readBack.Length);
-        Assert.Equal(16_000, System.Text.Encoding.UTF8.GetByteCount(readBack));
-        Assert.Equal(16_000, new FileInfo(filePath).Length);
+        var agentRunner = new MockAgentRunner
+        {
+            // Written from the agent callback (post-preparation): the pre-run baseline restore
+            // clears untracked residue, so the file must be the improver's own edit.
+            PromptResponder = async (_, _, ct) =>
+            {
+                await File.WriteAllTextAsync(filePath, content, ct);
 
-        var agentRunner = new MockAgentRunner();
+                // The SAME observable on-disk state the fixture used to pre-seed, asserted at
+                // the point in the flow where the improver would really produce it.
+                var written = await File.ReadAllTextAsync(filePath, ct);
+                Assert.Equal(8_000, written.Length);
+                Assert.Equal(WorkerConstants.AgentsMdMaxCharacters, written.Length);
+                Assert.Equal(16_000, System.Text.Encoding.UTF8.GetByteCount(written));
+                Assert.Equal(16_000, new FileInfo(filePath).Length);
+
+                return "Mock agent response";
+            },
+        };
         var git = new MockGitOperations();
         var executor = new TaskExecutor(agentRunner, gitOperations: git, configRepoDir: configRepoDir);
 
         await executor.ExecuteAsync(
             BuildImproverTask("improver-unicode-boundary"), TestContext.Current.CancellationToken);
+
+        // The final on-disk state is still the 8,000-code-unit / 16,000-byte file: enforcement
+        // neither compressed nor discarded it.
+        var readBack = await File.ReadAllTextAsync(filePath, TestContext.Current.CancellationToken);
+        Assert.Equal(8_000, readBack.Length);
+        Assert.Equal(16_000, System.Text.Encoding.UTF8.GetByteCount(readBack));
 
         Assert.Single(agentRunner.PromptCalls);
         Assert.DoesNotContain(agentRunner.PromptCalls, call =>
@@ -1130,7 +1286,7 @@ public sealed class TaskExecutorTests
         // And the exact captured sequence proves nothing beyond the failed commit launched.
         Assert.Equal(
             [
-                "pull --ff-only",
+                .. ConfigRepoPreparationFakes.LegacyCommands,
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
@@ -2346,6 +2502,13 @@ public sealed class TaskExecutorTests
         /// <summary>Scripted answer keyed on the tokenized args; null falls through to success.</summary>
         public Func<IReadOnlyList<string>, GitProcessResult?>? Responder { get; set; }
 
+        /// <summary>
+        /// The exit code the <c>check-ref-format</c> subprocess reports. Defaults to 0 (a valid
+        /// ref); a non-zero value models git's own rejection of a malformed ref, which is what
+        /// the preflight's authoritative validation consumes.
+        /// </summary>
+        public int CheckRefFormatExitCode { get; set; }
+
         public Task<GitProcessResult> RunAsync(GitProcessRequest request, CancellationToken ct)
         {
             Requests.Add(request);
@@ -2360,9 +2523,15 @@ public sealed class TaskExecutorTests
             }
 
             if (tokens[0] == "check-ref-format")
-                return Task.FromResult(new GitProcessResult(0, "", ""));
+                return Task.FromResult(new GitProcessResult(CheckRefFormatExitCode, "", ""));
 
-            return Task.FromResult(Responder?.Invoke(tokens) ?? new GitProcessResult(0, "", ""));
+            // A test's own Responder always wins; otherwise the Improver preparation commands
+            // get EXPLICIT valid answers (root/SHA/branch/upstream/empty status). Exit-zero with
+            // an empty stdout is never a usable baseline, so the fallthrough must not supply one.
+            return Task.FromResult(
+                Responder?.Invoke(tokens)
+                ?? ConfigRepoPreparationFakes.SeamAnswer(request.WorkingDirectory, tokens)
+                ?? new GitProcessResult(0, "", ""));
         }
 
         /// <summary>The tokenized command of each recorded request, in launch order.</summary>
@@ -2570,19 +2739,21 @@ public sealed class TaskExecutorTests
         var (result, _, _) = await RunImproverWithSeamAsync(
             "improver-seam-routing", configRepoDir, seam, fake, git);
 
-        // The COMPLETE launch sequence, including the seam's explicit-origin canonicalization
-        // of the two positional-free pulls and the full push sequence.
+        // The COMPLETE launch sequence: the pre-run baseline preparation (preflight → fetch →
+        // resolve → destructive restore → verify), then the publication, including the seam's
+        // explicit-origin canonicalization of the positional-free post-commit pull.
         AssertLaunchedSequence(fake,
-            ["remote", "get-url", "origin"],
-            ["pull", "--ff-only", "origin"],
-            ["add", "agents/*.agents.md"],
-            ["diff", "--cached", "--name-only", "-z"],
-            ["commit", "-m", ImproverCommitMessage],
-            ["remote", "get-url", "origin"],
-            ["pull", "--no-rebase", "origin"],
-            ["check-ref-format", "--allow-onelevel", "HEAD"],
-            ["remote", "get-url", "origin"],
-            ["push", "origin", "HEAD"]);
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ["check-ref-format", "--allow-onelevel", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["push", "origin", "HEAD"],
+            ]);
 
         // The legacy path was NEVER consulted.
         Assert.Empty(git.GitCommands);
@@ -2597,8 +2768,9 @@ public sealed class TaskExecutorTests
         Assert.Equal(2, result.GitStatus.FilesChanged);
         Assert.Equal(staged, result.GitStatus.ChangedFiles);
 
-        // Stage 6a runs for the THREE transport commands only — the local commands
-        // (add/diff/commit) never resolve the URL.
+        // Stage 6a runs for the THREE transport commands only (the preparation fetch, the
+        // post-commit pull and the push) — every local command, including all five preflight
+        // rev-parse forms and the reset/clean/status, never resolves the URL.
         Assert.Equal(3, urlCalls);
     }
 
@@ -2626,7 +2798,7 @@ public sealed class TaskExecutorTests
 
         string[][] credentialCarrying =
         [
-            ["pull", "--ff-only", "origin"],
+            ["fetch", "origin", ConfigRepoPreparationFakes.BranchRef],
             ["pull", "--no-rebase", "origin"],
             ["push", "origin", "HEAD"],
         ];
@@ -2684,25 +2856,45 @@ public sealed class TaskExecutorTests
             : ["remote", "set-url", "origin", SeamEligibleUrl];
 
         AssertLaunchedSequence(fake,
-            ["remote", "get-url", "origin"],
-            repair,
-            ["pull", "--ff-only", "origin"],
-            ["add", "agents/*.agents.md"],
-            ["diff", "--cached", "--name-only", "-z"]);
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunchesWithOriginRepair(repair),
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+            ]);
     }
 
     /// <summary>
     /// The oversized-agent-file DISCARD path routes through the seam as the tokenized
     /// <c>checkout -- agents/</c> local command.
     /// </summary>
+    /// <summary>
+    /// A <see cref="MockAgentRunner"/> that writes an OVERSIZED <c>coder.agents.md</c> from
+    /// inside its FIRST prompt — i.e. AFTER the pre-run baseline preflight, which deliberately
+    /// clears untracked residue, so the overflow is the improver's own edit rather than
+    /// pre-seeded residue that preparation would legitimately remove.
+    /// </summary>
+    private static MockAgentRunner OversizedAgentsFileWriter(string configRepoDir) =>
+        new()
+        {
+            PromptResponder = async (prompt, _, ct) =>
+            {
+                if (!prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
+                {
+                    Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
+                    await File.WriteAllTextAsync(
+                        Path.Combine(configRepoDir, "agents", "coder.agents.md"),
+                        new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
+                        ct);
+                }
+
+                return "Mock agent response";
+            },
+        };
+
     [Fact]
     public async Task Improver_SeamPath_OversizedAgentsFile_DiscardsThroughTheSeam()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
-        await File.WriteAllTextAsync(
-            Path.Combine(configRepoDir, "agents", "coder.agents.md"),
-            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
-            TestContext.Current.CancellationToken);
 
         var fake = new SeamProcessRunnerFake
         {
@@ -2711,14 +2903,17 @@ public sealed class TaskExecutorTests
         using var seam = CreateConfigRepoSeam(configRepoDir);
         var git = new MockGitOperations();
 
-        await RunImproverWithSeamAsync("improver-seam-discard", configRepoDir, seam, fake, git);
+        await RunImproverWithSeamAsync(
+            "improver-seam-discard", configRepoDir, seam, fake, git,
+            agentRunner: OversizedAgentsFileWriter(configRepoDir));
 
         AssertLaunchedSequence(fake,
-            ["remote", "get-url", "origin"],
-            ["pull", "--ff-only", "origin"],
-            ["checkout", "--", "agents/"],
-            ["add", "agents/*.agents.md"],
-            ["diff", "--cached", "--name-only", "-z"]);
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                ["checkout", "--", "agents/"],
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+            ]);
         Assert.Empty(git.GitCommands);
     }
 
@@ -2749,14 +2944,15 @@ public sealed class TaskExecutorTests
 
         // The push (and its check-ref-format / origin inspection preamble) is ABSENT.
         AssertLaunchedSequence(fake,
-            ["remote", "get-url", "origin"],
-            ["pull", "--ff-only", "origin"],
-            ["add", "agents/*.agents.md"],
-            ["diff", "--cached", "--name-only", "-z"],
-            ["commit", "-m", ImproverCommitMessage],
-            ["remote", "get-url", "origin"],
-            ["pull", "--no-rebase", "origin"],
-            ["merge", "--abort"]);
+            [
+                .. ConfigRepoPreparationFakes.SeamLaunches,
+                ["add", "agents/*.agents.md"],
+                ["diff", "--cached", "--name-only", "-z"],
+                ["commit", "-m", ImproverCommitMessage],
+                ["remote", "get-url", "origin"],
+                ["pull", "--no-rebase", "origin"],
+                ["merge", "--abort"],
+            ]);
 
         Assert.Contains("git pull failed: merge conflict", FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
 
@@ -2853,7 +3049,7 @@ public sealed class TaskExecutorTests
 
         Assert.Equal(
             [
-                "pull --ff-only",
+                .. ConfigRepoPreparationFakes.LegacyCommands,
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
                 $"commit -m \"{ImproverCommitMessage}\"",
@@ -2873,10 +3069,6 @@ public sealed class TaskExecutorTests
     public async Task Improver_LegacyPath_DiscardAndMergeAbort_UseTheExactOpaqueStrings()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
-        await File.WriteAllTextAsync(
-            Path.Combine(configRepoDir, "agents", "coder.agents.md"),
-            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
-            TestContext.Current.CancellationToken);
 
         var git = new MockGitOperations
         {
@@ -2888,11 +3080,13 @@ public sealed class TaskExecutorTests
             },
         };
 
-        var (result, _, _) = await RunImproverLegacyAsync("improver-legacy-abort", configRepoDir, git);
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-abort", configRepoDir, git,
+            agentRunner: OversizedAgentsFileWriter(configRepoDir));
 
         Assert.Equal(
             [
-                "pull --ff-only",
+                .. ConfigRepoPreparationFakes.LegacyCommands,
                 "checkout -- agents/",
                 "add agents/*.agents.md",
                 "diff --cached --name-only -z",
@@ -3067,10 +3261,10 @@ public sealed class TaskExecutorTests
 
     /// <summary>
     /// The uniform exit-code handling: a NON-ZERO seam result renders the preserved
-    /// <c>Config repo pull failed (exit N)</c> wording with the seam's exit code.
+    /// <c>Config repo preparation … failed (exit N)</c> wording with the seam's exit code.
     /// </summary>
     [Fact]
-    public async Task Improver_SeamPath_NonZeroPull_LogsThePreservedExitCodeWording()
+    public async Task Improver_SeamPath_NonZeroFetch_LogsThePreservedExitCodeWording()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
 
@@ -3078,7 +3272,7 @@ public sealed class TaskExecutorTests
         {
             Responder = tokens => tokens switch
             {
-                ["pull", "--ff-only", ..] => new GitProcessResult(3, "", "could not fast-forward"),
+                ["fetch", ..] => new GitProcessResult(3, "", "could not fetch"),
                 ["diff", ..] => new GitProcessResult(0, "", ""),
                 _ => null,
             },
@@ -3090,8 +3284,8 @@ public sealed class TaskExecutorTests
             "improver-seam-exit3", configRepoDir, seam, fake, git);
 
         Assert.Contains(
-            "Config repo pull failed (exit 3): could not fast-forward",
-            FindLine(stderr, "Config repo pull failed"),
+            "Config repo preparation fetch failed (exit 3): could not fetch",
+            FindLine(stderr, "Config repo preparation fetch failed"),
             StringComparison.Ordinal);
     }
 
@@ -3113,7 +3307,7 @@ public sealed class TaskExecutorTests
                 : null,
         };
         // No resolved URL: every TRANSPORT command is rejected at Stage 6a — including the
-        // PREPARATION pull, which now truthfully fails the task.
+        // PREPARATION fetch, which truthfully fails the task.
         using var seam = CreateConfigRepoSeam(configRepoDir, resolvedUrlResolver: static () => null);
         var git = new MockGitOperations();
         var agentRunner = new MockAgentRunner();
@@ -3122,19 +3316,26 @@ public sealed class TaskExecutorTests
             "improver-seam-reject", configRepoDir, seam, fake, git, agentRunner: agentRunner);
 
         Assert.Contains(
-            "Config repo pull failed (exit -1): Config repo URL is not available.",
-            FindLine(stderr, "Config repo pull failed"),
+            "Config repo preparation fetch failed (exit -1): Config repo URL is not available.",
+            FindLine(stderr, "Config repo preparation fetch failed"),
             StringComparison.Ordinal);
 
-        // The preparation pull was the ONLY transport attempt — nothing after it launched.
-        Assert.Empty(fake.Launched);
+        // The local preflight ran (it never resolves a URL) — including its own authoritative
+        // check-ref-format for the discovered ref — then the rejected fetch stopped everything:
+        // no reset, no clean, no post-restore verification and no publication.
+        AssertLaunchedSequence(fake,
+            ["rev-parse", "--show-toplevel"],
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            ["rev-parse", "--symbolic-full-name", "HEAD"],
+            ["check-ref-format", "--allow-onelevel", ConfigRepoPreparationFakes.BranchRef],
+            ["rev-parse", "--symbolic-full-name", "@{upstream}"]);
 
         // TRUTHFUL PREPARATION: the task fails BEFORE the agent is prompted.
         Assert.Empty(agentRunner.PromptCalls);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.Contains(result.Metrics.Issues,
-            i => i.Contains("Config repo preparation pull failed (exit -1)"));
+            i => i.Contains("Config repo preparation fetch failed (exit -1)"));
     }
 
     // ── (e) The reachable control-character boundary vector ──────────────────
@@ -3206,16 +3407,17 @@ public sealed class TaskExecutorTests
     // ── (f) Truthful preparation/publication failure semantics ───────────────
 
     /// <summary>
-    /// TRUTHFUL PREPARATION (legacy path): a non-zero preparation pull FAILS the task BEFORE
-    /// the agent is prompted — never a normal no-change completion.
+    /// TRUTHFUL PREPARATION (legacy path): a non-zero preparation FETCH FAILS the task BEFORE
+    /// the agent is prompted — never a normal no-change completion, and no reset is ever
+    /// issued from stale evidence after the failed fetch.
     /// </summary>
     [Fact]
-    public async Task Improver_LegacyPath_FailedPreparationPull_FailsBeforePrompting()
+    public async Task Improver_LegacyPath_FailedPreparationFetch_FailsBeforePrompting()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var git = new MockGitOperations
         {
-            GitCommandResponder = args => args == "pull --ff-only"
+            GitCommandResponder = args => args.StartsWith("fetch ", StringComparison.Ordinal)
                 ? (128, "", "fatal: authentication failed")
                 : null,
         };
@@ -3224,8 +3426,17 @@ public sealed class TaskExecutorTests
         var (result, _, stderr) = await RunImproverLegacyAsync(
             "improver-legacy-prep-fail", configRepoDir, git, agentRunner: agentRunner);
 
-        // The pull was the ONLY command — the publication flow never launched.
-        Assert.Equal(["pull --ff-only"], git.GitCommands);
+        // The preflight plus the failed fetch — nothing after it, so no FETCH_HEAD fallback,
+        // no reset, no clean and no publication flow ever launched.
+        Assert.Equal(
+            [
+                "rev-parse --show-toplevel",
+                "rev-parse --verify HEAD^{commit}",
+                "rev-parse --symbolic-full-name HEAD",
+                "rev-parse --symbolic-full-name @{upstream}",
+                $"fetch origin \"{ConfigRepoPreparationFakes.BranchRef}\"",
+            ],
+            git.GitCommands);
 
         // The agent was never prompted.
         Assert.Empty(agentRunner.PromptCalls);
@@ -3234,23 +3445,26 @@ public sealed class TaskExecutorTests
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.Contains(result.Metrics.Issues,
-            i => i.Contains("Config repo preparation pull failed (exit 128)") && i.Contains("authentication failed"));
-        Assert.Contains("Config repo pull failed (exit 128)", FindLine(stderr, "Config repo pull failed"), StringComparison.Ordinal);
+            i => i.Contains("Config repo preparation fetch failed (exit 128)") && i.Contains("authentication failed"));
+        Assert.Contains(
+            "Config repo preparation fetch failed (exit 128)",
+            FindLine(stderr, "Config repo preparation fetch failed"),
+            StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// TRUTHFUL PREPARATION: a preparation pull that the SEAM cannot even launch is a truthful
+    /// TRUTHFUL PREPARATION: a preparation FETCH that the SEAM cannot even launch is a truthful
     /// failure — the seam maps an unlaunchable transport command to its exit -1 rejection with
     /// a fixed <c>SanitizedError</c>, the task FAILS before the agent is prompted, and no raw
     /// exception text escapes.
     /// </summary>
     [Fact]
-    public async Task Improver_SeamPath_ThrownPreparationPull_IsSanitizedFailure()
+    public async Task Improver_SeamPath_ThrownPreparationFetch_IsSanitizedFailure()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var fake = new SeamProcessRunnerFake
         {
-            Responder = tokens => tokens is ["pull", "--ff-only", ..]
+            Responder = tokens => tokens is ["fetch", ..]
                 ? throw new InvalidOperationException("git binary exploded")
                 : null,
         };
@@ -3266,8 +3480,11 @@ public sealed class TaskExecutorTests
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         // The seam's rejection is the authoritative sanitized classification — no message text.
         Assert.Contains(result.Metrics.Issues,
-            i => i.Contains("Config repo preparation pull failed (exit -1)") && !i.Contains("exploded"));
-        // The preparation pull was the only attempt; nothing launched after the failure.
+            i => i.Contains("Config repo preparation fetch failed (exit -1)") && !i.Contains("exploded"));
+        // No fallback baseline, no destructive restore and no publication after the failure.
+        Assert.DoesNotContain(fake.Launched, t => t is ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
         Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
     }
 
@@ -3379,7 +3596,7 @@ public sealed class TaskExecutorTests
         using var unrelatedCts = new CancellationTokenSource();
         var fake = new SeamProcessRunnerFake
         {
-            Responder = tokens => tokens is ["pull", "--ff-only", ..]
+            Responder = tokens => tokens is ["fetch", ..]
                 ? throw new OperationCanceledException("simulated timeout", unrelatedCts.Token)
                 : null,
         };
@@ -3396,7 +3613,7 @@ public sealed class TaskExecutorTests
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.Contains(result.Metrics.Issues,
-            i => i.Contains("Config repo preparation pull was interrupted without a requested cancellation [OperationCanceledException]"));
+            i => i.Contains("Config repo preparation fetch was interrupted without a requested cancellation [OperationCanceledException]"));
     }
 
     /// <summary>
@@ -3413,7 +3630,7 @@ public sealed class TaskExecutorTests
         {
             Responder = tokens =>
             {
-                if (tokens is ["pull", "--ff-only", ..])
+                if (tokens is ["fetch", ..])
                 {
                     cts.Cancel();
                     throw new OperationCanceledException("shutdown", cts.Token);
@@ -3541,16 +3758,16 @@ public sealed class TaskExecutorTests
     }
 
     /// <summary>
-    /// SEAM path, failed preparation pull THROWN as an ordinary exception at the legacy
-    /// layer: truthful failure with a sanitized classification, before prompting.
+    /// LEGACY path, preparation FETCH THROWN as an ordinary exception: truthful failure with a
+    /// sanitized classification, before prompting and before any destructive restore.
     /// </summary>
     [Fact]
-    public async Task Improver_LegacyPath_ThrownPreparationPull_IsSanitizedFailure()
+    public async Task Improver_LegacyPath_ThrownPreparationFetch_IsSanitizedFailure()
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var git = new MockGitOperations
         {
-            GitCommandThrower = args => args == "pull --ff-only"
+            GitCommandThrower = args => args.StartsWith("fetch ", StringComparison.Ordinal)
                 ? new InvalidOperationException("git binary missing")
                 : null,
         };
@@ -3560,11 +3777,19 @@ public sealed class TaskExecutorTests
             "improver-legacy-prep-throw", configRepoDir, git, agentRunner: agentRunner);
 
         Assert.Empty(agentRunner.PromptCalls);
-        Assert.Equal(["pull --ff-only"], git.GitCommands);
+        Assert.Equal(
+            [
+                "rev-parse --show-toplevel",
+                "rev-parse --verify HEAD^{commit}",
+                "rev-parse --symbolic-full-name HEAD",
+                "rev-parse --symbolic-full-name @{upstream}",
+                $"fetch origin \"{ConfigRepoPreparationFakes.BranchRef}\"",
+            ],
+            git.GitCommands);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.Contains(result.Metrics.Issues,
-            i => i.Contains("Config repo preparation pull failed with an error [InvalidOperationException]")
+            i => i.Contains("Config repo preparation fetch failed with an error [InvalidOperationException]")
                 && !i.Contains("git binary missing"));
     }
 
@@ -3705,7 +3930,9 @@ public sealed class TaskExecutorTests
 
         // No diff, no commit, no post-commit pull, no merge --abort, no push.
         AssertLegacyStoppedAfterAdd(git.GitCommands);
-        Assert.Equal(["pull --ff-only", "add agents/*.agents.md"], git.GitCommands);
+        Assert.Equal(
+            [.. ConfigRepoPreparationFakes.LegacyCommands, "add agents/*.agents.md"],
+            git.GitCommands);
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.False(result.GitStatus!.Pushed);
@@ -3914,24 +4141,32 @@ public sealed class TaskExecutorTests
     {
         using var marker = EnsureConfigRepoMarker(out var configRepoDir);
         var filePath = Path.Combine(configRepoDir, "agents", "coder.agents.md");
-        await File.WriteAllTextAsync(
-            filePath,
-            new string('x', WorkerConstants.AgentsMdMaxCharacters + 1),
-            TestContext.Current.CancellationToken);
 
         const string initialSegment = "Initial improver analysis: reviewed every guidance file.";
         const string retrySegment = "Condensation retry: compressed the older material from the top.";
         var agentRunner = new MockAgentRunner
         {
-            PromptResponder = (prompt, _, ct) =>
+            PromptResponder = async (prompt, _, ct) =>
             {
                 if (prompt.Contains("append-new/compress-old policy", StringComparison.Ordinal))
                 {
                     // The genuine repair the enforcement retry asks for — one retry succeeds.
-                    return File.WriteAllTextAsync(
-                        filePath, "repaired", ct).ContinueWith(_ => retrySegment, ct);
+                    await File.WriteAllTextAsync(filePath, "repaired", ct);
+                    return retrySegment;
                 }
-                return Task.FromResult(initialSegment);
+
+                // The oversized file is the IMPROVER'S OWN edit, written from inside the agent
+                // callback — i.e. AFTER the pre-run baseline preparation, whose `clean -fdx`
+                // deliberately clears untracked residue. This reproduces exactly the state the
+                // fixture used to pre-seed, at the point the improver would really produce it,
+                // so the size-enforcement retry still fires and the multi-part evidence
+                // contract is exercised unchanged.
+                await File.WriteAllTextAsync(
+                    filePath, new string('x', WorkerConstants.AgentsMdMaxCharacters + 1), ct);
+                Assert.Equal(
+                    WorkerConstants.AgentsMdMaxCharacters + 1,
+                    (await File.ReadAllTextAsync(filePath, ct)).Length);
+                return initialSegment;
             },
         };
         var git = new MockGitOperations
@@ -3958,4 +4193,2746 @@ public sealed class TaskExecutorTests
         Assert.False(result.GitStatus!.Pushed);
         Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
     }
+
+    // ── (h) The pre-run baseline PREPARATION sequence ─────────────────────────
+    //
+    // The Improver's preparation replaced the old pull-only step with a verified,
+    // freshly-fetched remote baseline: preflight → fetch → resolve → destructive restore →
+    // verify. Every rejection below happens BEFORE the agent is prompted and BEFORE any
+    // mutation that the rejection is meant to prevent.
+
+    /// <summary>A second, DIFFERENT full 40-hex SHA — the remote baseline in mixed-SHA tests.</summary>
+    private const string RemoteBaselineSha = "2222222222222222222222222222222222222222";
+
+    /// <summary>
+    /// SEAM happy path: the preparation issues the EXACT sequence in order — the four preflight
+    /// rev-parse forms, the fetch of the discovered branch ref, the FETCH_HEAD resolution, the
+    /// destructive reset/clean, and the post-restore HEAD + verbose-status verification —
+    /// BEFORE the agent is prompted.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_RunsTheExactSequenceBeforePrompting()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        List<string[]> launchedBeforePrompt = [];
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                launchedBeforePrompt = [.. fake.Launched];
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-prep-ok", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+
+        // The COMPLETE preparation sequence had already run when the agent was prompted.
+        Assert.Equal(ConfigRepoPreparationFakes.SeamLaunches.Length, launchedBeforePrompt.Count);
+        for (var i = 0; i < ConfigRepoPreparationFakes.SeamLaunches.Length; i++)
+            Assert.Equal(ConfigRepoPreparationFakes.SeamLaunches[i], launchedBeforePrompt[i]);
+
+        // The old pull-only preparation is GONE: no `pull --ff-only` on any path.
+        Assert.DoesNotContain(fake.Launched, t => t is ["pull", "--ff-only", ..]);
+        Assert.Empty(git.GitCommands);
+    }
+
+    /// <summary>
+    /// LEGACY happy path: the SAME sequence arrives as the exact opaque argument strings, with
+    /// the DISCOVERED branch ref carried as ONE quoted argument (never interpolated into a
+    /// shell-sensitive position) and the reset target spelled as the captured full SHA.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Preparation_SendsTheExactOpaqueStrings()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "diff --cached --name-only -z"
+                ? (0, "", "")
+                : null,
+        };
+
+        await RunImproverLegacyAsync("improver-legacy-prep-ok", configRepoDir, git);
+
+        Assert.Equal(
+            [
+                .. ConfigRepoPreparationFakes.LegacyCommands,
+                "add agents/*.agents.md",
+                "diff --cached --name-only -z",
+            ],
+            git.GitCommands);
+        Assert.Contains(
+            $"fetch origin \"{ConfigRepoPreparationFakes.BranchRef}\"", git.GitCommands);
+        Assert.DoesNotContain("pull --ff-only", git.GitCommands);
+        Assert.All(git.WorkDirs, dir => Assert.Equal(configRepoDir, dir));
+    }
+
+    /// <summary>
+    /// THE POINT OF THE FETCH-FIRST SEQUENCE: the reset target is the SHA resolved from THIS
+    /// run's <c>FETCH_HEAD</c> — never the local HEAD. A prior failed-push commit sitting on the
+    /// local branch (a clean-looking checkout!) is therefore discarded, not carried forward.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_ResetsToTheFetchedShaNotTheLocalHead()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var headCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                // The PRE-fetch HEAD is a prior failed-push commit; the POST-restore HEAD is the
+                // fetched baseline.
+                ["rev-parse", "--verify", "HEAD^{commit}"] =>
+                    new GitProcessResult(0, (++headCalls == 1 ? LocalAheadSha : RemoteBaselineSha) + "\n", ""),
+                ["rev-parse", "--verify", "FETCH_HEAD^{commit}"] =>
+                    new GitProcessResult(0, RemoteBaselineSha + "\n", ""),
+                ["diff", ..] => new GitProcessResult(0, "", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-prep-fetched-sha", configRepoDir, seam, fake, git);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Contains(fake.Launched, t => t is ["reset", "--hard", RemoteBaselineSha]);
+        // The local (prior failed-push) commit was NEVER a reset target.
+        Assert.DoesNotContain(fake.Launched, t => t is ["reset", "--hard", LocalAheadSha]);
+    }
+
+    /// <summary>A local-only commit SHA that must never become a reset target.</summary>
+    private const string LocalAheadSha = "3333333333333333333333333333333333333333";
+
+    /// <summary>
+    /// A FOREIGN worktree root (<c>rev-parse --show-toplevel</c> reporting a different
+    /// repository) is rejected BEFORE any mutation: no fetch, no reset, no clean, and the agent
+    /// is never prompted.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_ForeignRoot_IsRejectedBeforeAnyMutation()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--show-toplevel"]
+                ? new GitProcessResult(0, Path.Combine(Path.GetTempPath(), "some-other-repo") + "\n", "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-foreign-root", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(result, agentRunner, "the worktree root is not the configured config repository");
+        AssertNoMutationLaunched(fake);
+        // The top-level probe was the ONLY launch — no further preflight command ran.
+        Assert.Single(fake.Launched, t => t is ["rev-parse", "--show-toplevel"]);
+        Assert.Single(fake.Launched);
+    }
+
+    /// <summary>
+    /// A DETACHED HEAD (<c>rev-parse --symbolic-full-name HEAD</c> reporting the bare
+    /// <c>HEAD</c>) is a topology rejection — no branch is ever guessed.
+    /// </summary>
+    [Theory]
+    [InlineData("HEAD")]
+    [InlineData("refs/remotes/origin/main")]
+    [InlineData("refs/tags/v1")]
+    public async Task Improver_SeamPath_Preparation_DetachedHead_IsRejected(string symbolicName)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--symbolic-full-name", "HEAD"]
+                ? new GitProcessResult(0, symbolicName + "\n", "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-detached-" + symbolicName.Length, configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        AssertPreparationRejected(result, agentRunner, "HEAD is not attached to a usable branch");
+        AssertNoMutationLaunched(fake);
+    }
+
+    /// <summary>
+    /// A MISSING upstream (a non-zero <c>@{upstream}</c>), a DIFFERENT remote, and a MISMATCHED
+    /// branch name are all topology rejections: the ordinary single-origin clone is the only
+    /// supported topology, and no fetch or restore is attempted.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("refs/remotes/upstream/main")]
+    [InlineData("refs/remotes/origin/other")]
+    [InlineData("refs/heads/main")]
+    public async Task Improver_SeamPath_Preparation_UpstreamProblem_IsRejected(string? upstream)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--symbolic-full-name", "@{upstream}"]
+                ? (upstream is null
+                    ? new GitProcessResult(128, "", "fatal: no upstream configured")
+                    : new GitProcessResult(0, upstream + "\n", ""))
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-upstream-" + (upstream?.Length ?? 0), configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        var expected = upstream is null
+            ? "Config repo preparation upstream check failed (exit 128)"
+            : "the branch has no matching origin upstream";
+        AssertPreparationRejected(result, agentRunner, expected);
+        AssertNoMutationLaunched(fake);
+    }
+
+    /// <summary>
+    /// MALFORMED rev-parse SHA output — blank, whitespace-only, ambiguous (two lines),
+    /// abbreviated, or non-hex — is rejected for BOTH the preflight HEAD probe and the fetched
+    /// baseline probe. An exit-zero command with unusable output must never yield a baseline.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "")]
+    [InlineData(true, "   \n")]
+    [InlineData(true, "1111111\n")]
+    [InlineData(true, "not-a-sha-at-all-not-a-sha-at-all-not-hex\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n")]
+    [InlineData(false, "")]
+    [InlineData(false, "1111111\n")]
+    [InlineData(false, "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n")]
+    public async Task Improver_SeamPath_Preparation_MalformedShaOutput_IsRejected(
+        bool preflightHead, string stdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var target = preflightHead ? "HEAD^{commit}" : "FETCH_HEAD^{commit}";
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens =>
+                tokens.Count == 3 && tokens[0] == "rev-parse" && tokens[1] == "--verify" && tokens[2] == target
+                    ? new GitProcessResult(0, stdout, "")
+                    : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-seam-badsha-{preflightHead}-{stdout.Length}", configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        var label = preflightHead ? "HEAD" : "FETCH_HEAD";
+        AssertPreparationRejected(
+            result, agentRunner, $"{label} did not resolve to a single full commit SHA");
+
+        if (preflightHead)
+        {
+            // The malformed PREFLIGHT HEAD stops everything before any mutation.
+            AssertNoMutationLaunched(fake);
+        }
+        else
+        {
+            // The malformed FETCHED baseline stops the restore — no reset from stale evidence.
+            Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+            Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+        }
+    }
+
+    /// <summary>
+    /// After the restore, a HEAD that does NOT equal the captured baseline SHA is a truthful
+    /// preparation failure — the agent is never prompted on an unverified checkout.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_HeadMismatchAfterRestore_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--verify", "HEAD^{commit}"]
+                // The POST-restore HEAD disagrees with the fetched baseline.
+                ? new GitProcessResult(
+                    0,
+                    (++headCalls == 1 ? ConfigRepoPreparationFakes.BaselineSha : LocalAheadSha) + "\n",
+                    "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-head-mismatch", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "HEAD does not match the fetched baseline after the restore");
+        // No second forced clean and no publication after the mismatch.
+        Assert.Single(fake.Launched, t => t is ["clean", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
+    }
+
+    /// <summary>
+    /// RESIDUAL working-tree content after the restore (e.g. a protected nested repository the
+    /// single-force clean cannot remove) is reported TRUTHFULLY: no second forced clean, no
+    /// recursive deletion, no quarantine flag — and the agent is never prompted.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_NonEmptyStatus_IsRejectedWithoutEscalation()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["status", "--porcelain=v1", ..]
+                ? new GitProcessResult(0, "?? nested/\n", "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-dirty-status", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "the working tree is not clean after the restore");
+        // NO ESCALATION: exactly one clean, one status, no publication.
+        Assert.Single(fake.Launched, t => t is ["clean", ..]);
+        Assert.Single(fake.Launched, t => t is ["status", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
+    }
+
+    /// <summary>
+    /// LEGACY path converse of the foreign-root rejection: the same lexical trust boundary
+    /// applies when the commands are routed as opaque argument strings.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Preparation_ForeignRoot_IsRejectedBeforeAnyMutation()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "rev-parse --show-toplevel"
+                ? (0, Path.Combine(Path.GetTempPath(), "some-other-repo") + "\n", "")
+                : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-foreign-root", configRepoDir, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "the worktree root is not the configured config repository");
+        Assert.Equal(["rev-parse --show-toplevel"], git.GitCommands);
+    }
+
+    /// <summary>
+    /// LEGACY path converse of the residual-status rejection.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Preparation_NonEmptyStatus_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args =>
+                args == "status --porcelain=v1 --untracked-files=all --ignored"
+                    ? (0, "?? nested/\n", "")
+                    : null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-dirty-status", configRepoDir, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "the working tree is not clean after the restore");
+        Assert.Equal(ConfigRepoPreparationFakes.LegacyCommands, git.GitCommands);
+        Assert.DoesNotContain("add agents/*.agents.md", git.GitCommands);
+    }
+
+    /// <summary>
+    /// A preparation rejection is a truthful Failed/FAIL outcome whose sanitized reason carries
+    /// the expected stage wording, and the agent was NEVER prompted.
+    /// </summary>
+    private static void AssertPreparationRejected(
+        TaskResult result, MockAgentRunner agentRunner, string expectedReasonFragment)
+    {
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(result.Metrics.Issues,
+            i => i.Contains(expectedReasonFragment, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A preflight rejection precedes EVERY mutation: no fetch, no reset, no clean, and no
+    /// publication command was ever launched.
+    /// </summary>
+    private static void AssertNoMutationLaunched(SeamProcessRunnerFake fake)
+    {
+        Assert.DoesNotContain(fake.Launched, t => t is ["fetch", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["checkout", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["commit", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    // ── (i) Preparation sequence: exhaustive failure vectors (round 2) ────────
+    //
+    // Every vector below asserts the SAME three invariants beyond its own subject:
+    //   * the agent runner was NEVER invoked (zero prompts),
+    //   * no publication command ever ran (no add/diff/commit/pull/push),
+    //   * the outcome is the sanitized ConfigRepoPublicationException preparation
+    //     failure (Failed + FAIL) carrying no raw stderr and no exception message.
+
+    /// <summary>
+    /// THE DISTINCTION THAT MATTERS: the preflight peels HEAD to a COMMIT
+    /// (<c>rev-parse --verify HEAD^{commit}</c>). A checkout whose bare <c>HEAD</c> resolves
+    /// fine (e.g. it names a tag or another non-commit object) but whose peeled commit form
+    /// FAILS must be rejected — proving the bare form is not, and never was, a substitute.
+    /// The fake answers the bare form with a valid SHA to make the point unambiguous.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_BareHeadResolvesButPeeledCommitFails_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                // The BARE form would happily succeed — a tag object satisfies it.
+                ["rev-parse", "--verify", "HEAD"] =>
+                    new GitProcessResult(0, ConfigRepoPreparationFakes.BaselineSha + "\n", ""),
+                // The PEELED-COMMIT form is what production actually issues, and it fails.
+                ["rev-parse", "--verify", "HEAD^{commit}"] =>
+                    new GitProcessResult(128, "", "fatal: Needed a single revision"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-bare-head-only", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "Config repo preparation HEAD commit check failed (exit 128)");
+        AssertNoMutationLaunched(fake);
+        AssertNoPublicationLaunched(fake);
+
+        // Production never falls back to the bare form: it was never even issued.
+        Assert.DoesNotContain(fake.Launched, t => t is ["rev-parse", "--verify", "HEAD"]);
+        Assert.Contains(fake.Launched, t => t is ["rev-parse", "--verify", "HEAD^{commit}"]);
+    }
+
+    /// <summary>
+    /// An UNBORN repository (a fresh clone/init with no commit) fails
+    /// <c>rev-parse --verify HEAD^{commit}</c>. It is rejected before any mutation — never
+    /// "prepared" into an empty baseline.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_UnbornRepository_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--verify", "HEAD^{commit}"]
+                ? new GitProcessResult(128, "", "fatal: ambiguous argument 'HEAD': unknown revision")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-unborn", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "Config repo preparation HEAD commit check failed (exit 128)");
+        AssertNoMutationLaunched(fake);
+        AssertNoPublicationLaunched(fake);
+        // The sanitized stderr is rendered through RenderForLog — one line, no forged lines.
+        Assert.Contains(
+            "Config repo preparation HEAD commit check failed (exit 128)",
+            FindLine(stderr, "HEAD commit check failed"),
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// LEGACY converses of the preflight rejections that round 1 covered only on the seam path:
+    /// a detached HEAD must fail identically when the commands are routed as opaque strings.
+    /// </summary>
+    [Theory]
+    [InlineData("HEAD")]
+    [InlineData("refs/tags/v1")]
+    public async Task Improver_LegacyPath_Preparation_DetachedHead_IsRejected(string symbolicName)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "rev-parse --symbolic-full-name HEAD"
+                ? (0, symbolicName + "\n", "")
+                : ((int, string, string)?)null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-detached-" + symbolicName.Length, configRepoDir, git,
+            agentRunner: agentRunner);
+
+        AssertPreparationRejected(result, agentRunner, "HEAD is not attached to a usable branch");
+        AssertNoLegacyMutationOrPublication(git);
+    }
+
+    /// <summary>
+    /// LEGACY converse of the upstream topology rejection: missing, non-origin remote, and a
+    /// mismatched branch name.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("refs/remotes/upstream/main")]
+    [InlineData("refs/remotes/origin/other")]
+    public async Task Improver_LegacyPath_Preparation_UpstreamProblem_IsRejected(string? upstream)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "rev-parse --symbolic-full-name @{upstream}"
+                ? (upstream is null
+                    ? (128, "", "fatal: no upstream configured for branch 'main'")
+                    : (0, upstream + "\n", ""))
+                : ((int, string, string)?)null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-upstream-" + (upstream?.Length ?? 0), configRepoDir, git,
+            agentRunner: agentRunner);
+
+        var expected = upstream is null
+            ? "Config repo preparation upstream check failed (exit 128)"
+            : "the branch has no matching origin upstream";
+        AssertPreparationRejected(result, agentRunner, expected);
+        AssertNoLegacyMutationOrPublication(git);
+    }
+
+    // ── Fetch failure: no stale FETCH_HEAD may ever be consulted ──────────────
+
+    /// <summary>
+    /// THE CRITICAL FETCH-FAILURE INVARIANT. When the exact-branch fetch fails, a
+    /// <c>FETCH_HEAD</c> left over from a PREVIOUS successful fetch must never be resolved: the
+    /// fake would happily answer <c>rev-parse --verify FETCH_HEAD^{commit}</c> with a perfectly
+    /// valid stale SHA, and a <c>reset --hard</c> to it would look successful. Production must
+    /// abort at the failed fetch, so that resolution is NEVER issued, no reset happens from
+    /// local or remote-tracking evidence, and nothing is published.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]  // seam (tokenized) route
+    [InlineData(false)] // legacy (opaque) route
+    public async Task Improver_Preparation_FailedFetch_NeverResolvesAStaleFetchHead(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+        List<string> issuedCommands;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens switch
+                {
+                    ["fetch", ..] => new GitProcessResult(128, "", "fatal: could not read from remote"),
+                    // A STALE but perfectly valid FETCH_HEAD from an earlier run. If production
+                    // ever asked, it would get a usable SHA — it must never ask.
+                    ["rev-parse", "--verify", "FETCH_HEAD^{commit}"] =>
+                        new GitProcessResult(0, StaleFetchHeadSha + "\n", ""),
+                    _ => null,
+                },
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-fetch-fail-stale", configRepoDir, seam, fake, git,
+                agentRunner: agentRunner);
+
+            Assert.Empty(git.GitCommands);
+            AssertNoPublicationLaunched(fake);
+            Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+            Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+            issuedCommands = [.. fake.Launched.Select(t => string.Join(' ', t))];
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args.StartsWith("fetch ", StringComparison.Ordinal)
+                    ? (128, "", "fatal: could not read from remote")
+                    : args == "rev-parse --verify FETCH_HEAD^{commit}"
+                        ? (0, StaleFetchHeadSha + "\n", "")
+                        : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-fetch-fail-stale", configRepoDir, git, agentRunner: agentRunner);
+
+            AssertNoLegacyPublication(git);
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("reset", StringComparison.Ordinal));
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+            issuedCommands = git.GitCommands;
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "Config repo preparation fetch failed (exit 128)");
+
+        // THE POINT: the stale FETCH_HEAD was never resolved after the failed fetch, and the
+        // stale SHA never appeared in ANY issued command (so no reset could target it).
+        Assert.DoesNotContain(
+            issuedCommands, c => c.Contains("FETCH_HEAD", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            issuedCommands, c => c.Contains(StaleFetchHeadSha, StringComparison.Ordinal));
+
+        // The fetch itself was attempted exactly once — no retry from stale evidence.
+        Assert.Single(issuedCommands, c => c.StartsWith("fetch", StringComparison.Ordinal));
+    }
+
+    /// <summary>A valid-looking SHA left in FETCH_HEAD by a PREVIOUS run — never a usable baseline.</summary>
+    private const string StaleFetchHeadSha = "4444444444444444444444444444444444444444";
+
+    /// <summary>
+    /// FETCH_HEAD output quality: every malformed shape is rejected with the same single-line
+    /// 40/64-hex rule that governs <c>HEAD^{commit}</c>. Exit zero is NOT enough.
+    /// </summary>
+    [Theory]
+    [InlineData("")]                                                              // blank
+    [InlineData("\n")]                                                            // newline only
+    [InlineData("   \t  \n")]                                                     // whitespace only
+    [InlineData("4444444\n")]                                                     // abbreviated
+    [InlineData("444444444444444444444444444444444444444\n")]                     // 39 chars
+    [InlineData("44444444444444444444444444444444444444444\n")]                   // 41 chars
+    [InlineData("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n")]                    // non-hex
+    [InlineData("refs/heads/main\n")]                                             // a ref, not a SHA
+    [InlineData(
+        "4444444444444444444444444444444444444444\n5555555555555555555555555555555555555555\n")] // ambiguous
+    public async Task Improver_SeamPath_Preparation_MalformedFetchHeadOutput_IsRejected(string stdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+                ? new GitProcessResult(0, stdout, "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-seam-badfetchhead-{stdout.Length}", configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "FETCH_HEAD did not resolve to a single full commit SHA");
+
+        // The malformed baseline stops the restore: no reset from unusable evidence.
+        Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+        AssertNoPublicationLaunched(fake);
+    }
+
+    // ── Destructive/verification step failures ───────────────────────────────
+
+    /// <summary>
+    /// A failed <c>reset --hard</c> is a truthful preparation failure: the clean never runs
+    /// (there is nothing verified to clean up to), and nothing is published.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_FailedReset_IsSanitizedFailure(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["reset", ..]
+                    ? new GitProcessResult(128, "", "fatal: Could not reset index file to revision")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+
+            var (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-reset-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+            AssertPreparationRejected(
+                result, agentRunner, "Config repo preparation reset failed (exit 128)");
+            // The clean never ran after the failed reset, and nothing was published.
+            Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+            AssertNoPublicationLaunched(fake);
+            // Exactly ONE reset attempt — no retry, no escalation.
+            Assert.Single(fake.Launched, t => t is ["reset", ..]);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args.StartsWith("reset ", StringComparison.Ordinal)
+                    ? (128, "", "fatal: Could not reset index file to revision")
+                    : ((int, string, string)?)null,
+            };
+
+            var (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-reset-fail", configRepoDir, git, agentRunner: agentRunner);
+
+            AssertPreparationRejected(
+                result, agentRunner, "Config repo preparation reset failed (exit 128)");
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+            AssertNoLegacyPublication(git);
+            Assert.Single(git.GitCommands, c => c.StartsWith("reset ", StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>
+    /// A failed <c>clean -fdx</c> — the PROTECTED NESTED REPOSITORY case, where git refuses to
+    /// remove a nested repository — is reported truthfully. Critically there is NO second,
+    /// escalated clean (<c>-ffdx</c> or any repeat), no arbitrary recursive deletion, and no
+    /// publication: production reports the failure instead of guessing that force would work.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_FailedClean_NestedRepo_ReportsTruthfullyWithoutEscalation(
+        bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string nestedRepoStderr =
+            "warning: failed to remove nested-repo/: Directory not empty";
+        var agentRunner = new MockAgentRunner();
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["clean", ..]
+                    ? new GitProcessResult(1, "", nestedRepoStderr)
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+
+            var (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-clean-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+            AssertPreparationRejected(
+                result, agentRunner, "Config repo preparation clean failed (exit 1)");
+
+            // NO ESCALATION: exactly one clean, and it was the single-force `-fdx` form only.
+            Assert.Single(fake.Launched, t => t is ["clean", ..]);
+            Assert.Equal(["clean", "-fdx"], fake.Launched.Single(t => t is ["clean", ..]));
+            Assert.DoesNotContain(fake.Launched, t => t is ["clean", "-ffdx"]);
+            // The post-restore verification never ran on an unclean tree, and nothing published.
+            Assert.DoesNotContain(fake.Launched, t => t is ["status", ..]);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args.StartsWith("clean", StringComparison.Ordinal)
+                    ? (1, "", nestedRepoStderr)
+                    : ((int, string, string)?)null,
+            };
+
+            var (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-clean-fail", configRepoDir, git, agentRunner: agentRunner);
+
+            AssertPreparationRejected(
+                result, agentRunner, "Config repo preparation clean failed (exit 1)");
+            Assert.Single(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+            Assert.Equal(
+                "clean -fdx",
+                git.GitCommands.Single(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("status", StringComparison.Ordinal));
+            AssertNoLegacyPublication(git);
+        }
+    }
+
+    /// <summary>
+    /// The agents working directory is recreated after <c>clean -fdx</c>. When that creation
+    /// FAILS — here because a FILE already occupies the agents path, so
+    /// <see cref="Directory.CreateDirectory(string)"/> throws — preparation fails truthfully
+    /// with the sanitized classification (type name only, no raw message), the post-restore
+    /// verification never runs, and nothing is published.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_AgentsDirCreationFailure_IsSanitizedFailure()
+    {
+        var configRepoDir = Path.Combine(
+            Path.GetTempPath(), $"copilothive-test-agentsfile-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepoDir, ".git"));
+        using var remover = new DirectoryRemover(configRepoDir);
+
+        // A FILE where the agents DIRECTORY must be: Directory.CreateDirectory throws IOException.
+        await File.WriteAllTextAsync(
+            Path.Combine(configRepoDir, "agents"), "not a directory",
+            TestContext.Current.CancellationToken);
+
+        var fake = new SeamProcessRunnerFake();
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-agentsdir-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "failed to create the agents working directory");
+        // SANITIZED: an exception CLASSIFICATION only — no raw filesystem message text.
+        Assert.Contains(result.Metrics!.Issues, i => i.Contains("IOException", StringComparison.Ordinal));
+        Assert.DoesNotContain(result.Metrics.Issues, i => i.Contains("not a directory", StringComparison.Ordinal));
+
+        // The reset/clean ran (they precede the creation) but the VERIFICATION never did.
+        Assert.Contains(fake.Launched, t => t is ["reset", ..]);
+        Assert.Contains(fake.Launched, t => t is ["clean", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["status", ..]);
+        AssertNoPublicationLaunched(fake);
+    }
+
+    /// <summary>
+    /// LEGACY converse of the post-restore HEAD mismatch: the restored HEAD differs from the
+    /// captured fetched baseline, so preparation fails before prompting.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Preparation_HeadMismatchAfterRestore_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var headCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "rev-parse --verify HEAD^{commit}"
+                ? (0,
+                   (++headCalls == 1 ? ConfigRepoPreparationFakes.BaselineSha : LocalAheadSha) + "\n",
+                   "")
+                : ((int, string, string)?)null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-head-mismatch", configRepoDir, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "HEAD does not match the fetched baseline after the restore");
+        // The status verification never ran, and nothing was published.
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("status", StringComparison.Ordinal));
+        AssertNoLegacyPublication(git);
+    }
+
+    /// <summary>
+    /// A failing post-restore verification COMMAND (not merely dirty output): a non-zero
+    /// verbose <c>status</c> is a preparation failure too — success is never assumed from an
+    /// unreadable status.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_FailedStatusCommand_IsRejected()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens is ["status", ..]
+                ? new GitProcessResult(128, "", "fatal: unable to read index")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-status-cmd-fail", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "Config repo preparation post-restore status check failed (exit 128)");
+        AssertNoPublicationLaunched(fake);
+    }
+
+    // ── Exit-zero-with-empty-output must never become a usable baseline ───────
+
+    /// <summary>
+    /// NO STALE-BASELINE ACCEPTANCE. For EVERY output-consuming preparation step, a command
+    /// that succeeds (exit 0) but returns EMPTY output must be rejected — an exit code alone is
+    /// never evidence. One vector per consuming step: top-level, HEAD^{commit},
+    /// symbolic-full-name HEAD, @{upstream}, FETCH_HEAD^{commit}.
+    /// </summary>
+    [Theory]
+    [InlineData("toplevel", "the worktree root could not be determined")]
+    [InlineData("head", "HEAD did not resolve to a single full commit SHA")]
+    [InlineData("symbolic", "HEAD is not attached to a usable branch")]
+    [InlineData("upstream", "the branch has no matching origin upstream")]
+    [InlineData("fetchhead", "FETCH_HEAD did not resolve to a single full commit SHA")]
+    public async Task Improver_SeamPath_Preparation_ExitZeroEmptyOutput_IsNeverAUsableBaseline(
+        string step, string expectedReason)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            // Exit ZERO with EMPTY stdout for exactly the step under test.
+            Responder = tokens => MatchesPreparationStep(tokens, step)
+                ? new GitProcessResult(0, "", "")
+                : null,
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-seam-emptyout-{step}", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(result, agentRunner, expectedReason);
+        AssertNoPublicationLaunched(fake);
+
+        // The steps BEFORE the destructive restore must additionally have mutated nothing.
+        if (step is not "fetchhead")
+            Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+    }
+
+    /// <summary>
+    /// The LEGACY converse of the exit-zero/empty-output rule, over the same five consuming
+    /// steps — the opaque route has no validation of its own, so TaskExecutor's own checks are
+    /// the only thing standing between blank output and a bogus baseline.
+    /// </summary>
+    [Theory]
+    [InlineData("toplevel", "the worktree root could not be determined")]
+    [InlineData("head", "HEAD did not resolve to a single full commit SHA")]
+    [InlineData("symbolic", "HEAD is not attached to a usable branch")]
+    [InlineData("upstream", "the branch has no matching origin upstream")]
+    [InlineData("fetchhead", "FETCH_HEAD did not resolve to a single full commit SHA")]
+    public async Task Improver_LegacyPath_Preparation_ExitZeroEmptyOutput_IsNeverAUsableBaseline(
+        string step, string expectedReason)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var opaque = step switch
+        {
+            "toplevel" => "rev-parse --show-toplevel",
+            "head" => "rev-parse --verify HEAD^{commit}",
+            "symbolic" => "rev-parse --symbolic-full-name HEAD",
+            "upstream" => "rev-parse --symbolic-full-name @{upstream}",
+            "fetchhead" => "rev-parse --verify FETCH_HEAD^{commit}",
+            _ => throw new ArgumentOutOfRangeException(nameof(step), step, "unknown preparation step"),
+        };
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == opaque ? (0, "", "") : ((int, string, string)?)null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            $"improver-legacy-emptyout-{step}", configRepoDir, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(result, agentRunner, expectedReason);
+        AssertNoLegacyPublication(git);
+
+        if (step is not "fetchhead")
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("reset", StringComparison.Ordinal));
+    }
+
+    /// <summary>Whether the tokenized command is the preparation step named by <paramref name="step"/>.</summary>
+    private static bool MatchesPreparationStep(IReadOnlyList<string> tokens, string step) => step switch
+    {
+        "toplevel" => tokens is ["rev-parse", "--show-toplevel"],
+        "head" => tokens is ["rev-parse", "--verify", "HEAD^{commit}"],
+        "symbolic" => tokens is ["rev-parse", "--symbolic-full-name", "HEAD"],
+        "upstream" => tokens is ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        "fetchhead" => tokens is ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        _ => throw new ArgumentOutOfRangeException(nameof(step), step, "unknown preparation step"),
+    };
+
+    // ── Happy path: a fully valid sequence lets the agent run ─────────────────
+
+    /// <summary>
+    /// HAPPY PATH on BOTH routes: with every preparation command answering validly, the agent
+    /// callback IS invoked (exactly once for the improver's single prompt), the working
+    /// directory handed to it is the agents folder, and the task completes with no preparation
+    /// failure recorded.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_ValidSequence_LetsTheAgentRun(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-happy", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args =>
+                    args == "diff --cached --name-only -z" ? (0, "", "") : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-happy", configRepoDir, git, agentRunner: agentRunner);
+        }
+
+        // The agent RAN — preparation did not block it.
+        var call = Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal(Path.Combine(configRepoDir, "agents"), call.WorkDir);
+
+        // A genuine no-change completion, with no preparation failure anywhere in the result.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("PASS", result.Metrics!.Verdict);
+        Assert.DoesNotContain(
+            result.Metrics.Issues, i => i.Contains("Config repo preparation", StringComparison.Ordinal));
+        Assert.DoesNotContain("[Config Repo Git Failure]", result.Output);
+        Assert.Equal("Mock agent response", result.Output);
+    }
+
+    /// <summary>
+    /// The agents working directory is RECREATED by preparation when <c>clean -fdx</c> would
+    /// have removed it, so the agent is always prompted into an existing directory.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_Preparation_RecreatesTheAgentsDirectoryBeforePrompting()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentsDir = Path.Combine(configRepoDir, "agents");
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens =>
+            {
+                // Simulate what a real `clean -fdx` does to an untracked agents/ folder.
+                if (tokens is ["clean", ..] && Directory.Exists(agentsDir))
+                    Directory.Delete(agentsDir, recursive: true);
+                return tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null;
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentsDirExistedAtPrompt = false;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, workDir, _) =>
+            {
+                agentsDirExistedAtPrompt = Directory.Exists(workDir);
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            "improver-seam-agentsdir-recreated", configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.True(
+            agentsDirExistedAtPrompt,
+            "the agents working directory did not exist when the agent was prompted");
+        Assert.True(Directory.Exists(agentsDir));
+    }
+
+    // ── Shared assertions for the round-2 vectors ────────────────────────────
+
+    /// <summary>No publication command was launched through the SEAM.</summary>
+    private static void AssertNoPublicationLaunched(SeamProcessRunnerFake fake)
+    {
+        Assert.DoesNotContain(fake.Launched, t => t is ["add", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["diff", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["commit", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["pull", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["checkout", ..]);
+    }
+
+    /// <summary>No publication command was issued on the LEGACY opaque route.</summary>
+    private static void AssertNoLegacyPublication(MockGitOperations git)
+    {
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("add ", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("diff ", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("commit ", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("pull", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("push", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("checkout", StringComparison.Ordinal));
+    }
+
+    /// <summary>A LEGACY preflight rejection mutated nothing and published nothing.</summary>
+    private static void AssertNoLegacyMutationOrPublication(MockGitOperations git)
+    {
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("fetch", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("reset", StringComparison.Ordinal));
+        Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+        AssertNoLegacyPublication(git);
+    }
+
+    // ── (l) Iteration-3 fix 1: the ROOT consumer accepts INTERNAL whitespace ──
+    //
+    // A legitimate configured repository may live at a path containing an internal
+    // space (`/tmp/config repo`, `C:\Users\Jane Doe\config-repo`). `rev-parse
+    // --show-toplevel` reports that exact path, and canonical equality succeeds, so
+    // preparation must proceed. The SHA/ref consumers keep their stricter
+    // no-whitespace-anywhere domain, and PADDED roots stay rejected for everyone.
+
+    /// <summary>
+    /// FIX 1 (isolated): a worktree root containing an INTERNAL space is ACCEPTED — preparation
+    /// runs to completion and the agent is prompted — on BOTH routes. The configured root and
+    /// the reported top-level are the same internal-space path, so canonical equality holds.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_InternalSpaceRoot_IsAcceptedOnBothRoutes(bool viaSeam)
+    {
+        // A configured config-repo directory whose NAME genuinely contains a space.
+        var configRepoDir = Path.Combine(
+            Path.GetTempPath(), $"copilothive test config {Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(configRepoDir, ".git"));
+        Directory.CreateDirectory(Path.Combine(configRepoDir, "agents"));
+        using var remover = new DirectoryRemover(configRepoDir);
+        Assert.Contains(' ', Path.GetFileName(configRepoDir));
+
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-spaceroot", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args =>
+                    args == "diff --cached --name-only -z" ? (0, "", "") : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-spaceroot", configRepoDir, git, agentRunner: agentRunner);
+        }
+
+        // ACCEPTED: preparation completed and the agent was prompted in the agents folder.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        var call = Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal(Path.Combine(configRepoDir, "agents"), call.WorkDir);
+        Assert.DoesNotContain(
+            result.Metrics!.Issues,
+            i => i.Contains("the worktree root", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// FIX 1 boundary: INTERNAL whitespace is legal for the ROOT consumer ONLY. The same
+    /// internal-space value is still MALFORMED for a SHA and for a ref, and a PADDED root is
+    /// still rejected — the widening admits internal whitespace and nothing else.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_InternalWhitespace_StaysIllegalForShaAndRef(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        // (a) A SHA carrying an internal space is malformed.
+        await AssertPreparationStepRejectedAsync(
+            viaSeam, configRepoDir, "head",
+            "1111111111111111111111 111111111111111111\n",
+            "HEAD did not resolve to a single full commit SHA",
+            "spacesha");
+
+        // (b) A REF carrying an internal space is malformed.
+        await AssertPreparationStepRejectedAsync(
+            viaSeam, configRepoDir, "symbolic",
+            "refs/heads/ma in\n",
+            "HEAD is not attached to a usable branch",
+            "spaceref");
+
+        // (c) A PADDED root is STILL rejected — internal-space acceptance did not regress into
+        // accepting leading/trailing whitespace.
+        await AssertPreparationStepRejectedAsync(
+            viaSeam, configRepoDir, "toplevel",
+            "  " + ConfigRepoPreparationFakes.CanonicalRoot(configRepoDir) + "  \n",
+            "the worktree root could not be determined",
+            "paddedroot");
+    }
+
+    /// <summary>
+    /// Drives one preparation step's stdout to <paramref name="stdout"/> on the chosen route and
+    /// asserts the sanitized rejection, with the agent never prompted.
+    /// </summary>
+    private static async Task AssertPreparationStepRejectedAsync(
+        bool viaSeam,
+        string configRepoDir,
+        string step,
+        string stdout,
+        string expectedReason,
+        string label)
+    {
+        var agentRunner = new MockAgentRunner();
+        var opaque = step switch
+        {
+            "toplevel" => "rev-parse --show-toplevel",
+            "head" => "rev-parse --verify HEAD^{commit}",
+            "symbolic" => "rev-parse --symbolic-full-name HEAD",
+            _ => throw new ArgumentOutOfRangeException(nameof(step), step, "unknown preparation step"),
+        };
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => MatchesPreparationStep(tokens, step)
+                    ? new GitProcessResult(0, stdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-{label}", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == opaque ? (0, stdout, "") : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-{label}", configRepoDir, git, agentRunner: agentRunner);
+        }
+
+        AssertPreparationRejected(result, agentRunner, expectedReason);
+    }
+
+    /// <summary>
+    /// FIX 1 end-to-end with REAL GIT: a worker clone whose directory name genuinely contains a
+    /// space. Real <c>rev-parse --show-toplevel</c> reports that exact path, preparation
+    /// succeeds, residue is still fully removed, and the agent is prompted from the remote
+    /// baseline.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RealGit_Preparation_InternalSpaceWorktreeRoot_CompletesAndPrompts(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"spaceroot-{(viaSeam ? "seam" : "legacy")}",
+            "REMOTE-BASELINE-V1\n",
+            workerDirName: "worker clone dir");
+        var worker = playground.WorkerDir;
+
+        // The configured root REALLY contains an internal space, and real git reports it.
+        Assert.Contains(' ', Path.GetFileName(worker));
+        var reportedRoot = RealGitOutput(worker, "rev-parse", "--show-toplevel");
+        Assert.Contains(' ', reportedRoot);
+
+        // Residue must still be removed from a space-named checkout.
+        File.WriteAllText(playground.GuidancePath, "LOCAL-EDIT\n");
+        File.WriteAllText(Path.Combine(worker, "untracked.txt"), "untracked-residue\n");
+        var remoteSha = playground.RemoteMainSha();
+
+        string? seenHead = null;
+        string? seenGuidance = null;
+        string? seenStatus = null;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                seenHead = playground.WorkerHeadSha();
+                seenGuidance = File.ReadAllText(playground.GuidancePath);
+                seenStatus = playground.WorkerVerboseStatus();
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-spaceroot-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // The space-named root did NOT block preparation.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.DoesNotContain(
+            result.Metrics!.Issues,
+            i => i.Contains("the worktree root", StringComparison.Ordinal));
+
+        // The agent still started from the remote baseline with all residue gone.
+        Assert.Equal(remoteSha, seenHead);
+        Assert.Equal("REMOTE-BASELINE-V1\n", seenGuidance);
+        Assert.Equal("", seenStatus);
+        Assert.False(File.Exists(Path.Combine(worker, "untracked.txt")));
+    }
+
+    // ── (j) Iteration-2 defect fixes: strict parsing + complete ref validation ─
+    //
+    // DEFECT 1 — output parsing must be EXACT: only `\n` / `\r\n` terminate the single
+    // line, functional content is never trimmed, and the post-restore status oracle is
+    // strict EMPTY (whitespace-only output is residual dirt, not "clean").
+    //
+    // DEFECT 2 — the discovered ref must get git's AUTHORITATIVE check-ref-format verdict
+    // on BOTH routes before either builds a fetch form.
+
+    /// <summary>
+    /// DEFECT 1 — PADDED SHA. A <c>rev-parse --verify HEAD^{commit}</c> whose output carries
+    /// whitespace around the SHA is MALFORMED and must be rejected, not silently trimmed into a
+    /// valid baseline. Covers leading, trailing and both-sides padding with spaces and tabs, on
+    /// BOTH routes, with zero agent prompts and zero publication.
+    /// </summary>
+    [Theory]
+    [InlineData(true, " 1111111111111111111111111111111111111111 \n")]
+    [InlineData(true, " 1111111111111111111111111111111111111111\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111 \n")]
+    [InlineData(true, "\t1111111111111111111111111111111111111111\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\t\n")]
+    [InlineData(true, "  1111111111111111111111111111111111111111  ")]
+    [InlineData(false, " 1111111111111111111111111111111111111111 \n")]
+    [InlineData(false, " 1111111111111111111111111111111111111111\n")]
+    [InlineData(false, "1111111111111111111111111111111111111111 \n")]
+    [InlineData(false, "\t1111111111111111111111111111111111111111\n")]
+    [InlineData(false, "  1111111111111111111111111111111111111111  ")]
+    public async Task Improver_Preparation_PaddedHeadSha_IsRejectedOnBothRoutes(
+        bool viaSeam, string paddedStdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["rev-parse", "--verify", "HEAD^{commit}"]
+                    ? new GitProcessResult(0, paddedStdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-paddedsha-{paddedStdout.Length}", configRepoDir, seam, fake, git,
+                agentRunner: agentRunner);
+
+            AssertNoMutationLaunched(fake);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == "rev-parse --verify HEAD^{commit}"
+                    ? (0, paddedStdout, "")
+                    : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-paddedsha-{paddedStdout.Length}", configRepoDir, git,
+                agentRunner: agentRunner);
+
+            AssertNoLegacyMutationOrPublication(git);
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "HEAD did not resolve to a single full commit SHA");
+    }
+
+    /// <summary>
+    /// DEFECT 1 — PADDED FETCH_HEAD SHA. The fetched baseline is the ONLY permitted reset
+    /// target, so a padded <c>FETCH_HEAD^{commit}</c> must never be trimmed into one: no reset
+    /// and no clean may follow.
+    /// </summary>
+    [Theory]
+    [InlineData(true, " 2222222222222222222222222222222222222222 \n")]
+    [InlineData(true, "2222222222222222222222222222222222222222 \n")]
+    [InlineData(false, " 2222222222222222222222222222222222222222 \n")]
+    [InlineData(false, "\t2222222222222222222222222222222222222222\n")]
+    public async Task Improver_Preparation_PaddedFetchHeadSha_IsRejectedBeforeAnyReset(
+        bool viaSeam, string paddedStdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+                    ? new GitProcessResult(0, paddedStdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-paddedfetch-{paddedStdout.Length}", configRepoDir, seam, fake, git,
+                agentRunner: agentRunner);
+
+            // The padded value never became a reset target.
+            Assert.DoesNotContain(fake.Launched, t => t is ["reset", ..]);
+            Assert.DoesNotContain(fake.Launched, t => t is ["clean", ..]);
+            Assert.DoesNotContain(
+                fake.Launched,
+                t => t.Any(a => a.Contains("2222222222222222222222222222222222222222", StringComparison.Ordinal)));
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == "rev-parse --verify FETCH_HEAD^{commit}"
+                    ? (0, paddedStdout, "")
+                    : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-paddedfetch-{paddedStdout.Length}", configRepoDir, git,
+                agentRunner: agentRunner);
+
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("reset", StringComparison.Ordinal));
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                git.GitCommands,
+                c => c.Contains("2222222222222222222222222222222222222222", StringComparison.Ordinal));
+            AssertNoLegacyPublication(git);
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "FETCH_HEAD did not resolve to a single full commit SHA");
+    }
+
+    /// <summary>
+    /// DEFECT 1 — PADDED REF. A padded <c>rev-parse --symbolic-full-name HEAD</c> value must be
+    /// rejected rather than trimmed into <c>refs/heads/main</c>: a branch name is functional
+    /// content and is never normalized.
+    /// </summary>
+    [Theory]
+    [InlineData(true, " refs/heads/main \n")]
+    [InlineData(true, " refs/heads/main\n")]
+    [InlineData(true, "refs/heads/main \n")]
+    [InlineData(true, "\trefs/heads/main\n")]
+    [InlineData(false, " refs/heads/main \n")]
+    [InlineData(false, "refs/heads/main \n")]
+    [InlineData(false, "\trefs/heads/main\n")]
+    public async Task Improver_Preparation_PaddedBranchRef_IsRejectedOnBothRoutes(
+        bool viaSeam, string paddedStdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["rev-parse", "--symbolic-full-name", "HEAD"]
+                    ? new GitProcessResult(0, paddedStdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-paddedref-{paddedStdout.Length}", configRepoDir, seam, fake, git,
+                agentRunner: agentRunner);
+
+            AssertNoMutationLaunched(fake);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == "rev-parse --symbolic-full-name HEAD"
+                    ? (0, paddedStdout, "")
+                    : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-paddedref-{paddedStdout.Length}", configRepoDir, git,
+                agentRunner: agentRunner);
+
+            AssertNoLegacyMutationOrPublication(git);
+        }
+
+        AssertPreparationRejected(result, agentRunner, "HEAD is not attached to a usable branch");
+    }
+
+    /// <summary>
+    /// DEFECT 1 — PADDED UPSTREAM and PADDED TOP-LEVEL ROOT. The remaining two output-consuming
+    /// preflight steps reject padding for the same reason.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "upstream")]
+    [InlineData(false, "upstream")]
+    [InlineData(true, "toplevel")]
+    [InlineData(false, "toplevel")]
+    public async Task Improver_Preparation_PaddedUpstreamOrRoot_IsRejectedOnBothRoutes(
+        bool viaSeam, string step)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        var padded = step == "upstream"
+            ? " refs/remotes/origin/main \n"
+            : " " + ConfigRepoPreparationFakes.CanonicalRoot(configRepoDir) + " \n";
+        var expectedReason = step == "upstream"
+            ? "the branch has no matching origin upstream"
+            : "the worktree root could not be determined";
+        var opaque = step == "upstream"
+            ? "rev-parse --symbolic-full-name @{upstream}"
+            : "rev-parse --show-toplevel";
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => MatchesPreparationStep(tokens, step)
+                    ? new GitProcessResult(0, padded, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-padded-{step}", configRepoDir, seam, fake, git,
+                agentRunner: agentRunner);
+
+            AssertNoMutationLaunched(fake);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == opaque ? (0, padded, "") : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-padded-{step}", configRepoDir, git, agentRunner: agentRunner);
+
+            AssertNoLegacyMutationOrPublication(git);
+        }
+
+        AssertPreparationRejected(result, agentRunner, expectedReason);
+    }
+
+    /// <summary>
+    /// DEFECT 1 — EXTRA LINES. A valid SHA followed by a blank, whitespace-only or padded
+    /// second line is AMBIGUOUS output. The old parser discarded empty entries and accepted the
+    /// remaining line; strict parsing rejects every one of these on both routes.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "1111111111111111111111111111111111111111\n\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\n \n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\n\t\n")]
+    [InlineData(true, "\n1111111111111111111111111111111111111111\n")]
+    [InlineData(true, " \n1111111111111111111111111111111111111111\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\r\n\r\n")]
+    [InlineData(true, "1111111111111111111111111111111111111111\n1111111111111111111111111111111111111111\n")]
+    [InlineData(false, "1111111111111111111111111111111111111111\n\n")]
+    [InlineData(false, "1111111111111111111111111111111111111111\n \n")]
+    [InlineData(false, "\n1111111111111111111111111111111111111111\n")]
+    [InlineData(false, "1111111111111111111111111111111111111111\r\n\r\n")]
+    public async Task Improver_Preparation_ExtraLineHeadSha_IsRejectedOnBothRoutes(
+        bool viaSeam, string multilineStdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["rev-parse", "--verify", "HEAD^{commit}"]
+                    ? new GitProcessResult(0, multilineStdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-extraline-{multilineStdout.Length}-{multilineStdout.GetHashCode()}",
+                configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+            AssertNoMutationLaunched(fake);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args => args == "rev-parse --verify HEAD^{commit}"
+                    ? (0, multilineStdout, "")
+                    : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-extraline-{multilineStdout.Length}-{multilineStdout.GetHashCode()}",
+                configRepoDir, git, agentRunner: agentRunner);
+
+            AssertNoLegacyMutationOrPublication(git);
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "HEAD did not resolve to a single full commit SHA");
+    }
+
+    /// <summary>
+    /// DEFECT 1 — the PERMITTED terminators still work. A bare SHA, a <c>\n</c>-terminated SHA
+    /// and a <c>\r\n</c>-terminated SHA are all ACCEPTED, so the strict parser rejects malformed
+    /// output without rejecting the normal shapes git actually emits. The whole preparation
+    /// completes and the agent runs.
+    /// </summary>
+    [Theory]
+    [InlineData("1111111111111111111111111111111111111111")]
+    [InlineData("1111111111111111111111111111111111111111\n")]
+    [InlineData("1111111111111111111111111111111111111111\r\n")]
+    public async Task Improver_SeamPath_Preparation_PermittedTerminators_AreAccepted(string stdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["rev-parse", "--verify", "HEAD^{commit}"] => new GitProcessResult(0, stdout, ""),
+                ["rev-parse", "--verify", "FETCH_HEAD^{commit}"] => new GitProcessResult(0, stdout, ""),
+                ["diff", ..] => new GitProcessResult(0, "", ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, _) = await RunImproverWithSeamAsync(
+            $"improver-seam-terminator-{stdout.Length}", configRepoDir, seam, fake, git,
+            agentRunner: agentRunner);
+
+        // Accepted: the sequence completed and the agent ran.
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Single(agentRunner.PromptCalls);
+        // The reset target is the UNPADDED, unterminated SHA.
+        Assert.Contains(
+            fake.Launched, t => t is ["reset", "--hard", "1111111111111111111111111111111111111111"]);
+    }
+
+    /// <summary>
+    /// DEFECT 1 — WHITESPACE-ONLY STATUS. The verified-clean oracle is strict EMPTY output.
+    /// A status that returns only whitespace is NOT clean: it is unrecognized output and must
+    /// be reported as a residual dirty tree, with NO escalation to a second clean and no
+    /// publication. Both routes.
+    /// </summary>
+    [Theory]
+    [InlineData(true, " ")]
+    [InlineData(true, "\n")]
+    [InlineData(true, "   \n")]
+    [InlineData(true, "\t")]
+    [InlineData(true, "\r\n")]
+    [InlineData(true, " \t \n ")]
+    [InlineData(false, " ")]
+    [InlineData(false, "\n")]
+    [InlineData(false, "   \n")]
+    [InlineData(false, "\t")]
+    [InlineData(false, " \t \n ")]
+    public async Task Improver_Preparation_WhitespaceOnlyStatus_IsResidualDirt(
+        bool viaSeam, string statusStdout)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens is ["status", "--porcelain=v1", ..]
+                    ? new GitProcessResult(0, statusStdout, "")
+                    : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-wsstatus-{statusStdout.Length}-{statusStdout.GetHashCode()}",
+                configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+            // NO ESCALATION: exactly one clean and one status, and nothing published.
+            Assert.Single(fake.Launched, t => t is ["clean", ..]);
+            Assert.Equal(["clean", "-fdx"], fake.Launched.Single(t => t is ["clean", ..]));
+            Assert.Single(fake.Launched, t => t is ["status", ..]);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args =>
+                    args == "status --porcelain=v1 --untracked-files=all --ignored"
+                        ? (0, statusStdout, "")
+                        : ((int, string, string)?)null,
+            };
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-wsstatus-{statusStdout.Length}-{statusStdout.GetHashCode()}",
+                configRepoDir, git, agentRunner: agentRunner);
+
+            Assert.Single(git.GitCommands, c => c.StartsWith("clean", StringComparison.Ordinal));
+            Assert.Equal(
+                "clean -fdx",
+                git.GitCommands.Single(c => c.StartsWith("clean", StringComparison.Ordinal)));
+            Assert.DoesNotContain(git.GitCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
+            AssertNoLegacyPublication(git);
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "the working tree is not clean after the restore");
+    }
+
+    // ── DEFECT 2: the discovered ref gets git's authoritative verdict on BOTH routes ──
+
+    /// <summary>
+    /// DEFECT 2 — MALFORMED DISCOVERED REF. These refs pass the seam's cheap PRECHECKS but are
+    /// rejected by <c>git check-ref-format</c> itself (verified against the real binary:
+    /// <c>refs/heads/foo.lock</c>, <c>refs/heads/.hidden</c>, <c>refs/heads/foo//bar</c> and
+    /// <c>refs/heads/foo@{bar}</c> all exit non-zero). Before the fix the LEGACY route — which
+    /// never ran check-ref-format — happily built and launched a fetch for them. Now the
+    /// preflight applies the authoritative verdict on BOTH routes, so NO fetch is ever
+    /// launched, nothing is mutated, and the agent is never prompted.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "refs/heads/foo.lock")]
+    [InlineData(true, "refs/heads/.hidden")]
+    [InlineData(true, "refs/heads/foo//bar")]
+    [InlineData(true, "refs/heads/foo@{bar}")]
+    [InlineData(false, "refs/heads/foo.lock")]
+    [InlineData(false, "refs/heads/.hidden")]
+    [InlineData(false, "refs/heads/foo//bar")]
+    [InlineData(false, "refs/heads/foo@{bar}")]
+    public async Task Improver_Preparation_MalformedDiscoveredRef_IsRejectedBeforeFetchOnBothRoutes(
+        bool viaSeam, string discoveredRef)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+        var branch = discoveredRef["refs/heads/".Length..];
+        TaskResult result;
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                // The REAL check-ref-format verdict for these refs is a non-zero exit.
+                CheckRefFormatExitCode = 1,
+                // The topology is otherwise PERFECT — the upstream matches the discovered
+                // branch — so the ONLY thing that can stop the fetch is the ref validation.
+                Responder = tokens => tokens switch
+                {
+                    ["rev-parse", "--symbolic-full-name", "HEAD"] =>
+                        new GitProcessResult(0, discoveredRef + "\n", ""),
+                    ["rev-parse", "--symbolic-full-name", "@{upstream}"] =>
+                        new GitProcessResult(0, "refs/remotes/origin/" + branch + "\n", ""),
+                    _ => null,
+                },
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            (result, _, _) = await RunImproverWithSeamAsync(
+                $"improver-seam-badref-{branch.Length}-{branch.GetHashCode()}", configRepoDir,
+                seam, fake, git, agentRunner: agentRunner);
+
+            // The authoritative check ran, and NO fetch followed it.
+            Assert.Contains(
+                fake.Launched, t => t is ["check-ref-format", "--allow-onelevel", _]);
+            Assert.DoesNotContain(fake.Launched, t => t is ["fetch", ..]);
+            AssertNoMutationLaunched(fake);
+            AssertNoPublicationLaunched(fake);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                // The topology is otherwise PERFECT — the upstream matches the discovered
+                // branch — so the ONLY thing that can stop the fetch is the ref validation.
+                GitCommandResponder = args => args switch
+                {
+                    "rev-parse --symbolic-full-name HEAD" => (0, discoveredRef + "\n", ""),
+                    "rev-parse --symbolic-full-name @{upstream}" =>
+                        (0, "refs/remotes/origin/" + branch + "\n", ""),
+                    _ => ((int, string, string)?)null,
+                },
+            };
+            // The LEGACY route runs the real `git check-ref-format` binary through the shared
+            // validation path (GitOperations.ProcessRunner is NOT installed here), so this is
+            // git's own verdict — the exact defect: before the fix this fetched anyway.
+            (result, _, _) = await RunImproverLegacyAsync(
+                $"improver-legacy-badref-{branch.Length}-{branch.GetHashCode()}", configRepoDir,
+                git, agentRunner: agentRunner);
+
+            Assert.DoesNotContain(git.GitCommands, c => c.StartsWith("fetch", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                git.GitCommands, c => c.Contains(discoveredRef, StringComparison.Ordinal));
+            AssertNoLegacyMutationOrPublication(git);
+        }
+
+        AssertPreparationRejected(
+            result, agentRunner, "the discovered branch ref is not a valid git ref");
+    }
+
+    /// <summary>
+    /// DEFECT 2 — the rejection is SANITIZED: the reason names the ref through the seam's
+    /// existing redaction boundary and carries no raw stderr or exception text, and the log
+    /// line cannot be forged into extra lines.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_Preparation_MalformedDiscoveredRef_IsSanitized()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args == "rev-parse --symbolic-full-name HEAD"
+                ? (0, "refs/heads/foo.lock\n", "")
+                : ((int, string, string)?)null,
+        };
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-badref-sanitized", configRepoDir, git, agentRunner: agentRunner);
+
+        AssertPreparationRejected(
+            result, agentRunner, "the discovered branch ref is not a valid git ref");
+
+        // The reason is a single rendered log line — no forged lines, no raw git stderr.
+        var line = FindLine(stderr, "the discovered branch ref is not a valid git ref");
+        Assert.Contains("Invalid git ref", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("fatal:", stderr, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// DEFECT 2 — a VALID discovered ref still proceeds: the authoritative check passes and the
+    /// fetch is launched with that exact ref, so the fix rejects only what git rejects.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Improver_Preparation_ValidDiscoveredRef_StillProceedsToFetch(bool viaSeam)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var agentRunner = new MockAgentRunner();
+
+        if (viaSeam)
+        {
+            var fake = new SeamProcessRunnerFake
+            {
+                Responder = tokens => tokens[0] == "diff" ? new GitProcessResult(0, "", "") : null,
+            };
+            using var seam = CreateConfigRepoSeam(configRepoDir);
+            var git = new MockGitOperations();
+            var (result, _, _) = await RunImproverWithSeamAsync(
+                "improver-seam-goodref", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+            Assert.Equal(TaskOutcome.Completed, result.Status);
+            Assert.Contains(
+                fake.Launched, t => t is ["fetch", "origin", ConfigRepoPreparationFakes.BranchRef]);
+            Assert.Single(agentRunner.PromptCalls);
+        }
+        else
+        {
+            var git = new MockGitOperations
+            {
+                GitCommandResponder = args =>
+                    args == "diff --cached --name-only -z" ? (0, "", "") : ((int, string, string)?)null,
+            };
+            var (result, _, _) = await RunImproverLegacyAsync(
+                "improver-legacy-goodref", configRepoDir, git, agentRunner: agentRunner);
+
+            Assert.Equal(TaskOutcome.Completed, result.Status);
+            Assert.Contains(
+                $"fetch origin \"{ConfigRepoPreparationFakes.BranchRef}\"", git.GitCommands);
+            Assert.Single(agentRunner.PromptCalls);
+        }
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (k) REAL-GIT INTEGRATION MATRIX — the ACTUAL preparation caller
+    //
+    // Every vector below drives TaskExecutor.ExecuteAsync (never a hand-rolled
+    // command recipe) against a real, isolated LOCAL BARE remote and a real
+    // disposable worker clone. No network, no live worker process, no live
+    // config repository, no process-kill. Each test owns its temp tree and
+    // tears it down in a finally block.
+    //
+    // The config repo URL resolver is pointed at the local bare remote path. A
+    // local path sanitizes to an INELIGIBLE (Branch B) transport URL, so the
+    // seam launches the snapshot verbatim with no credential injection — which
+    // is exactly what an offline test needs.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A disposable real-Git playground: an isolated bare remote, a worker clone tracking it,
+    /// and an OUTSIDE sentinel directory that no preparation may ever touch.
+    /// </summary>
+    private sealed class RealGitPlayground : IDisposable
+    {
+        private RealGitPlayground(string root, string remoteDir, string workerDir, string outsideDir)
+        {
+            Root = root;
+            RemoteDir = remoteDir;
+            WorkerDir = workerDir;
+            OutsideDir = outsideDir;
+        }
+
+        public string Root { get; }
+
+        /// <summary>The isolated LOCAL bare remote (the only "remote" any of these tests use).</summary>
+        public string RemoteDir { get; }
+
+        /// <summary>The worker's config-repo clone — the directory preparation operates on.</summary>
+        public string WorkerDir { get; }
+
+        /// <summary>A directory OUTSIDE the worker clone, holding an untouchable sentinel.</summary>
+        public string OutsideDir { get; }
+
+        /// <summary>The sentinel file outside the repository.</summary>
+        public string OutsideSentinelPath => Path.Combine(OutsideDir, "outside-sentinel.txt");
+
+        /// <summary>The committed guidance file, relative to the worker clone.</summary>
+        public const string GuidanceRelativePath = "agents/coder.agents.md";
+
+        public string GuidancePath => Path.Combine(WorkerDir, "agents", "coder.agents.md");
+
+        /// <summary>
+        /// Builds the playground: a bare remote seeded through a staging clone with a committed
+        /// <c>agents/</c> guidance file, then a worker clone of that remote.
+        /// </summary>
+        public static RealGitPlayground Create(
+            string label,
+            string remoteGuidanceContent,
+            string workerDirName = "worker",
+            bool seedIgnoreRuleAndStagedBaseline = false)
+        {
+            var root = Path.Combine(
+                Path.GetTempPath(), $"cghive-realgit-{label}-{Guid.NewGuid():N}");
+            var remoteDir = Path.Combine(root, "remote.git");
+            var stagingDir = Path.Combine(root, "staging");
+            var workerDir = Path.Combine(root, workerDirName);
+            var outsideDir = Path.Combine(root, "outside");
+
+            Directory.CreateDirectory(root);
+            Directory.CreateDirectory(remoteDir);
+            Directory.CreateDirectory(stagingDir);
+            Directory.CreateDirectory(outsideDir);
+
+            RealGit(root, "init", "--bare", "-b", "main", remoteDir);
+
+            RealGit(stagingDir, "init", "-b", "main");
+            ConfigureIdentity(stagingDir);
+            Directory.CreateDirectory(Path.Combine(stagingDir, "agents"));
+            File.WriteAllText(
+                Path.Combine(stagingDir, "agents", "coder.agents.md"), remoteGuidanceContent);
+
+            if (seedIgnoreRuleAndStagedBaseline)
+            {
+                // The ignore RULE is committed to the REMOTE baseline, so `ignored.txt` stays
+                // genuinely IGNORED after `reset --hard` — a local-only .gitignore would be
+                // removed by the restore and the file would degrade into merely-untracked,
+                // collapsing the ignored cell into the untracked one.
+                File.WriteAllText(Path.Combine(stagingDir, ".gitignore"), "ignored.txt\n");
+                // A TRACKED file at the remote baseline, so a later edit + `git add` in the
+                // worker produces a genuine HEAD-vs-index delta (the staged cell).
+                File.WriteAllText(Path.Combine(stagingDir, "staged.txt"), StagedBaselineContent);
+            }
+
+            RealGit(stagingDir, "add", "-A");
+            RealGit(stagingDir, "commit", "-m", "remote baseline");
+            RealGit(stagingDir, "remote", "add", "origin", remoteDir);
+            RealGit(stagingDir, "push", "origin", "main");
+
+            RealGit(root, "clone", remoteDir, workerDir);
+            ConfigureIdentity(workerDir);
+
+            File.WriteAllText(
+                Path.Combine(outsideDir, "outside-sentinel.txt"), "outside-untouched\n");
+
+            return new RealGitPlayground(root, remoteDir, workerDir, outsideDir);
+        }
+
+        /// <summary>The remote-baseline content of the tracked <c>staged.txt</c> fixture file.</summary>
+        public const string StagedBaselineContent = "REMOTE-STAGED-BASELINE\n";
+
+        /// <summary>The bare remote's current <c>main</c> SHA — the authoritative value.</summary>
+        public string RemoteMainSha() => RealGitOutput(RemoteDir, "rev-parse", "main").Trim();
+
+        /// <summary>The worker clone's current HEAD SHA.</summary>
+        public string WorkerHeadSha() => RealGitOutput(WorkerDir, "rev-parse", "HEAD").Trim();
+
+        /// <summary>The worker clone's <c>refs/remotes/origin/main</c> SHA.</summary>
+        public string WorkerOriginMainSha() =>
+            RealGitOutput(WorkerDir, "rev-parse", "refs/remotes/origin/main").Trim();
+
+        /// <summary>The verbose status output — the verified-clean oracle.</summary>
+        public string WorkerVerboseStatus() => RealGitOutput(
+            WorkerDir, "status", "--porcelain=v1", "--untracked-files=all", "--ignored");
+
+        /// <summary>Whether <paramref name="sha"/> is reachable from the bare remote's main.</summary>
+        public bool RemoteMainContains(string sha)
+        {
+            var (exitCode, _, _) = RealGitResult(
+                RemoteDir, "merge-base", "--is-ancestor", sha, "main");
+            return exitCode == 0;
+        }
+
+        /// <summary>Whether the worker clone still has <paramref name="sha"/> as a commit object.</summary>
+        public bool WorkerHasCommit(string sha)
+        {
+            var (exitCode, _, _) = RealGitResult(WorkerDir, "cat-file", "-e", sha + "^{commit}");
+            return exitCode == 0;
+        }
+
+        /// <summary>Advances the bare remote by one commit, through a throwaway staging clone.</summary>
+        public string AdvanceRemote(string newGuidanceContent, string message)
+        {
+            var pusherDir = Path.Combine(Root, $"pusher-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(pusherDir);
+            RealGit(Root, "clone", RemoteDir, pusherDir);
+            ConfigureIdentity(pusherDir);
+            Directory.CreateDirectory(Path.Combine(pusherDir, "agents"));
+            File.WriteAllText(
+                Path.Combine(pusherDir, "agents", "coder.agents.md"), newGuidanceContent);
+            RealGit(pusherDir, "add", "-A");
+            RealGit(pusherDir, "commit", "-m", message);
+            RealGit(pusherDir, "push", "origin", "main");
+            return RemoteMainSha();
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                TestHelpers.ForceDeleteDirectory(Root);
+            }
+            catch (Exception)
+            {
+                // Best-effort cleanup of test scaffolding; never mask a test failure. Leftovers
+                // live under the OS temp directory.
+            }
+        }
+
+        private static void ConfigureIdentity(string workDir)
+        {
+            RealGit(workDir, "config", "user.email", "realgit@copilothive.test");
+            RealGit(workDir, "config", "user.name", "CopilotHive RealGit Tests");
+        }
+    }
+
+    /// <summary>
+    /// Runs a real git subprocess and THROWS when it fails, so fixture setup can never proceed
+    /// on a broken assumption. Pinned config keeps the behaviour identical on any host.
+    /// </summary>
+    private static void RealGit(string workDir, params string[] args)
+    {
+        var (exitCode, stdout, stderr) = RealGitResult(workDir, args);
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"git {string.Join(' ', args)} failed in '{workDir}' (exit {exitCode}).{Environment.NewLine}{stdout}{stderr}");
+        }
+    }
+
+    /// <summary>Runs a real git subprocess and returns stdout, throwing on failure.</summary>
+    private static string RealGitOutput(string workDir, params string[] args)
+    {
+        var (exitCode, stdout, stderr) = RealGitResult(workDir, args);
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"git {string.Join(' ', args)} failed in '{workDir}' (exit {exitCode}).{Environment.NewLine}{stdout}{stderr}");
+        }
+
+        return stdout;
+    }
+
+    /// <summary>
+    /// Runs a real git subprocess and returns its full result WITHOUT throwing. The pinned
+    /// <c>-c</c> settings mirror the repository's existing real-Git helpers: deterministic line
+    /// endings, bare-repository access, and no commit signing (a host with a global
+    /// <c>commit.gpgsign=true</c> would otherwise contend for the GPG agent under parallel runs).
+    /// </summary>
+    private static (int ExitCode, string Stdout, string Stderr) RealGitResult(
+        string workDir, params string[] args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("git")
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("core.autocrlf=false");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("safe.bareRepository=all");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("commit.gpgsign=false");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("protocol.file.allow=always");
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return (process.ExitCode, stdout, stderr);
+    }
+
+    /// <summary>
+    /// Parses verbose porcelain-v1 output into <c>path -&gt; two-character XY status</c>, so each
+    /// residue cell can be pinned INDEPENDENTLY (<c> M</c> tracked-modified, <c>M </c> staged
+    /// index delta, <c>??</c> untracked, <c>!!</c> ignored) rather than by a loose substring.
+    /// </summary>
+    private static Dictionary<string, string> ParsePorcelain(string porcelain)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var line in porcelain.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var entry = line.TrimEnd('\r');
+            if (entry.Length < 4)
+                continue;
+
+            // Format: "XY <path>" — X is the index status, Y the worktree status.
+            map[entry[3..]] = entry[..2];
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// against a real worker clone, with real git subprocesses (the
+    /// <see cref="GitOperations.ProcessRunner"/> seam is NOT installed). Routing is chosen by
+    /// <paramref name="viaSeam"/>: the injected config-repo seam (tokenized) or the public
+    /// constructor (legacy opaque). Console output is captured for the sanitization assertions.
+    /// </summary>
+    private static async Task<(TaskResult Result, string Stderr, IReadOnlyList<string> LegacyCommands)>
+        RunRealGitImproverAsync(
+            string taskId,
+            RealGitPlayground playground,
+            bool viaSeam,
+            MockAgentRunner agentRunner)
+    {
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        using var outWriter = new StringWriter();
+        using var errWriter = new StringWriter();
+
+        // The legacy route runs through the REAL git CLI via DefaultGitOperations, wrapped so the
+        // issued opaque command strings are observable. The seam route uses the mock only as the
+        // unused non-config git dependency.
+        var recordingGit = new RecordingRealGitOperations();
+
+        try
+        {
+            Console.SetOut(outWriter);
+            Console.SetError(errWriter);
+
+            TaskExecutor executor;
+            ConfigRepoGitOperations? seam = null;
+            if (viaSeam)
+            {
+                seam = new ConfigRepoGitOperations(
+                    playground.WorkerDir,
+                    () => playground.RemoteDir,
+                    static () => null,
+                    new WorkerLogger("RealGitTest"),
+                    static () => "/nonexistent-helper",
+                    static () => { });
+                executor = new TaskExecutor(
+                    agentRunner, null, recordingGit, null, playground.WorkerDir, seam);
+            }
+            else
+            {
+                executor = new TaskExecutor(
+                    agentRunner, gitOperations: recordingGit, configRepoDir: playground.WorkerDir);
+            }
+
+            try
+            {
+                var result = await executor.ExecuteAsync(
+                    BuildImproverTask(taskId), TestContext.Current.CancellationToken);
+                return (result, errWriter.ToString(), recordingGit.Commands);
+            }
+            finally
+            {
+                seam?.Dispose();
+            }
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+        }
+    }
+
+    /// <summary>
+    /// A REAL <see cref="IGitOperations"/> (delegating to <see cref="DefaultGitOperations"/>, so
+    /// actual git subprocesses run) that additionally RECORDS every opaque command string the
+    /// legacy config-repo route issues. That recording is what makes "exactly one clean -fdx,
+    /// no -ffdx escalation" and "no reset --hard &lt;stale-SHA&gt;" directly observable.
+    /// </summary>
+    private sealed class RecordingRealGitOperations : IGitOperations
+    {
+        private readonly DefaultGitOperations _inner = new();
+        private readonly List<string> _commands = [];
+
+        public IReadOnlyList<string> Commands => _commands;
+
+        public async Task<(int ExitCode, string Stdout, string Stderr)> RunGitCommandAsync(
+            string workDir, string args, CancellationToken ct)
+        {
+            _commands.Add(args);
+            return await _inner.RunGitCommandAsync(workDir, args, ct);
+        }
+
+        public Task CloneRepositoryAsync(string url, string targetDir, CancellationToken ct)
+            => _inner.CloneRepositoryAsync(url, targetDir, ct);
+        public Task CheckoutBranchAsync(string repoDir, string branch, CancellationToken ct)
+            => _inner.CheckoutBranchAsync(repoDir, branch, ct);
+        public Task CreateBranchAsync(string repoDir, string branchName, string baseBranch, CancellationToken ct)
+            => _inner.CreateBranchAsync(repoDir, branchName, baseBranch, ct);
+        public Task PushBranchAsync(string repoDir, string branch, CancellationToken ct)
+            => _inner.PushBranchAsync(repoDir, branch, ct);
+        public Task<GitChangeSummary> GetGitStatusAsync(string repoDir, string? baseBranch, CancellationToken ct)
+            => _inner.GetGitStatusAsync(repoDir, baseBranch, ct);
+        public Task<bool> HasUncommittedChangesAsync(string repoDir, CancellationToken ct)
+            => _inner.HasUncommittedChangesAsync(repoDir, ct);
+        public Task<string?> GetMergeBaseAsync(string repoDir, string baseBranch, CancellationToken ct)
+            => _inner.GetMergeBaseAsync(repoDir, baseBranch, ct);
+        public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
+            => _inner.ForceDeleteDirectoryAsync(path, maxRetries);
+    }
+
+    // ── (a) Full residue removal before the first prompt ──────────────────────
+
+    /// <summary>
+    /// REAL GIT (a): a checkout carrying EVERY residue class — a modified tracked file, a staged
+    /// file, an untracked file, an ignored file, and a local commit that is either AHEAD of or
+    /// DIVERGED from the remote — is fully restored to the freshly fetched remote baseline
+    /// before the agent's first prompt.
+    /// <para>
+    /// The agent callback observes the working tree AT PROMPT TIME, so the assertions describe
+    /// what the agent actually sees, not merely the end state.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]   // seam route, local commit AHEAD of the remote
+    [InlineData(false, false)]  // legacy route, local commit AHEAD of the remote
+    [InlineData(true, true)]    // seam route, DIVERGED (local commit + remote advanced)
+    [InlineData(false, true)]   // legacy route, DIVERGED
+    public async Task RealGit_Preparation_RemovesEveryResidueClassBeforeTheFirstPrompt(
+        bool viaSeam, bool diverged)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"residue-{(viaSeam ? "seam" : "legacy")}-{(diverged ? "div" : "ahead")}",
+            "REMOTE-BASELINE-V1\n",
+            seedIgnoreRuleAndStagedBaseline: true);
+        var worker = playground.WorkerDir;
+
+        // ── Seed EVERY residue class, in an ORDER that keeps each cell genuine ──
+        //
+        // The ahead-commit is created FIRST so it cannot consume the residue: everything below
+        // is created AFTER it and therefore really is present at preparation entry. (Staging a
+        // file BEFORE the commit and then rewriting the same bytes leaves NO index delta at
+        // all — the porcelain assertion below is what pins that.)
+        //
+        // 1. A local commit AHEAD of the remote (its own file, so no residue is absorbed).
+        File.WriteAllText(Path.Combine(worker, "ahead.txt"), "ahead-commit-content\n");
+        RealGit(worker, "add", "ahead.txt");
+        RealGit(worker, "commit", "-m", "local ahead commit");
+        var localAheadSha = playground.WorkerHeadSha();
+
+        // For the DIVERGED variant the remote independently advances too.
+        var remoteSha = diverged
+            ? playground.AdvanceRemote("REMOTE-BASELINE-V2-ADVANCED\n", "remote advanced")
+            : playground.RemoteMainSha();
+
+        // 2. A modified TRACKED file (worktree-only, uncommitted).
+        File.WriteAllText(playground.GuidancePath, "LOCAL-UNCOMMITTED-EDIT\n");
+        // 3. A genuine STAGED INDEX DELTA: `staged.txt` is tracked at the remote baseline, so
+        //    changing its content and staging it produces a real HEAD-vs-index difference.
+        File.WriteAllText(Path.Combine(worker, "staged.txt"), "STAGED-INDEX-DELTA\n");
+        RealGit(worker, "add", "staged.txt");
+        // 4. An UNTRACKED file.
+        File.WriteAllText(Path.Combine(worker, "untracked.txt"), "untracked-residue\n");
+        // 5. An IGNORED file. The ignore RULE lives in the REMOTE baseline (committed there),
+        //    so `ignored.txt` stays genuinely IGNORED after the reset — it never degrades into
+        //    a merely-untracked file, which would collapse cell 5 into cell 4.
+        File.WriteAllText(Path.Combine(worker, "ignored.txt"), "ignored-residue\n");
+
+        // ── PIN each residue cell INDEPENDENTLY before preparation runs ────────
+        var preStatus = ParsePorcelain(playground.WorkerVerboseStatus());
+        Assert.Equal(" M", preStatus["agents/coder.agents.md"]);   // tracked-modified, worktree only
+        Assert.Equal("M ", preStatus["staged.txt"]);               // STAGED: a real index delta
+        Assert.Equal("??", preStatus["untracked.txt"]);            // untracked
+        Assert.Equal("!!", preStatus["ignored.txt"]);              // genuinely ignored
+        // The staged cell is an INDEX delta, not merely a worktree edit: git diff --cached
+        // names the file, which a commit-consumed staging would not.
+        Assert.Contains(
+            "staged.txt",
+            RealGitOutput(worker, "diff", "--cached", "--name-only"),
+            StringComparison.Ordinal);
+
+        Assert.NotEqual(remoteSha, localAheadSha);
+        var outsideSentinelBefore = File.ReadAllText(playground.OutsideSentinelPath);
+
+        // ── What the AGENT sees at prompt time ────────────────────────────────
+        string? seenGuidance = null;
+        string? seenHead = null;
+        string? seenStatus = null;
+        string? seenStagedDiff = null;
+        var seenStaged = true;
+        var seenUntracked = true;
+        var seenIgnored = true;
+        var agentRunner = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                seenGuidance = File.ReadAllText(playground.GuidancePath);
+                seenHead = playground.WorkerHeadSha();
+                seenStatus = playground.WorkerVerboseStatus();
+                seenStagedDiff = RealGitOutput(worker, "diff", "--cached", "--name-only");
+                seenStaged = File.Exists(Path.Combine(worker, "staged.txt"))
+                    && File.ReadAllText(Path.Combine(worker, "staged.txt")) == "STAGED-INDEX-DELTA\n";
+                seenUntracked = File.Exists(Path.Combine(worker, "untracked.txt"));
+                seenIgnored = File.Exists(Path.Combine(worker, "ignored.txt"));
+                return Task.FromResult("Mock agent response");
+            },
+        };
+
+        var (result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-residue-{viaSeam}-{diverged}", playground, viaSeam, agentRunner);
+
+        // The agent RAN — preparation did not block it.
+        Assert.Single(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+
+        // ── THE RESIDUE CELLS, asserted FIRST (this test's subject) ───────────
+        // PROMPT-TIME STATUS PROVES ALL FOUR CELLS ARE GONE: an EMPTY verbose porcelain means
+        // no tracked-modified, no staged index delta, no untracked and no ignored residue.
+        Assert.Equal("", seenStatus);
+        // The STAGED cell specifically: the index carries no delta at prompt time, and the
+        // tracked file is back at its remote-baseline content (not the staged residue). This
+        // pair is what a restore that skips `reset --hard` cannot satisfy.
+        Assert.Equal("", seenStagedDiff);
+        Assert.False(seenStaged, "the staged residue was visible to the agent");
+        Assert.False(seenUntracked, "the untracked residue was visible to the agent");
+        Assert.False(seenIgnored, "the ignored residue was visible to the agent");
+
+        // THE AGENT'S VISIBLE WORKING TREE STARTS FROM THE REMOTE BASELINE.
+        Assert.Equal(remoteSha, seenHead);
+        Assert.Equal(
+            diverged ? "REMOTE-BASELINE-V2-ADVANCED\n" : "REMOTE-BASELINE-V1\n", seenGuidance);
+
+        // Every residue class is gone from disk, and the local ahead-commit is no longer HEAD.
+        Assert.Equal(remoteSha, playground.WorkerHeadSha());
+        Assert.NotEqual(localAheadSha, playground.WorkerHeadSha());
+        // `staged.txt` is TRACKED at the remote baseline, so it exists again — restored to the
+        // REMOTE's content, with the staged residue discarded.
+        Assert.Equal(
+            RealGitPlayground.StagedBaselineContent,
+            File.ReadAllText(Path.Combine(worker, "staged.txt")));
+        Assert.Empty(RealGitOutput(worker, "diff", "--cached", "--name-only"));
+        Assert.False(File.Exists(Path.Combine(worker, "untracked.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ignored.txt")));
+        Assert.False(File.Exists(Path.Combine(worker, "ahead.txt")));
+        Assert.Equal("", playground.WorkerVerboseStatus());
+
+        // The remote guidance content is present at the REMOTE's version.
+        Assert.Equal(
+            diverged ? "REMOTE-BASELINE-V2-ADVANCED\n" : "REMOTE-BASELINE-V1\n",
+            File.ReadAllText(playground.GuidancePath));
+
+        // The OUTSIDE sentinel is untouched, byte for byte.
+        Assert.True(File.Exists(playground.OutsideSentinelPath), "the outside sentinel was deleted");
+        Assert.Equal(outsideSentinelBefore, File.ReadAllText(playground.OutsideSentinelPath));
+
+        // Remote refs agree with the bare remote at the end boundary.
+        Assert.Equal(remoteSha, playground.RemoteMainSha());
+        Assert.Equal(remoteSha, playground.WorkerOriginMainSha());
+    }
+
+    // ── (b) Protected nested repository survives AND prevents the prompt ──────
+
+    /// <summary>
+    /// REAL GIT (b): a nested git repository inside the worker clone is PROTECTED by
+    /// <c>clean -fdx</c> (git refuses to remove a directory holding its own <c>.git</c>), so it
+    /// survives the clean and is then EXPOSED by the verbose status. Preparation must report
+    /// that truthfully: exactly ONE <c>clean -fdx</c>, NO <c>-ffdx</c> escalation, no recursive
+    /// deletion, a sanitized failure, and the agent NEVER prompted.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RealGit_Preparation_ProtectedNestedRepo_SurvivesAndPreventsThePrompt(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"nested-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+
+        // A NESTED repository with its own committed content, planted as untracked residue.
+        var nestedDir = Path.Combine(worker, "nested-repo");
+        Directory.CreateDirectory(nestedDir);
+        RealGit(nestedDir, "init", "-b", "main");
+        RealGit(nestedDir, "config", "user.email", "nested@copilothive.test");
+        RealGit(nestedDir, "config", "user.name", "Nested");
+        File.WriteAllText(Path.Combine(nestedDir, "nested-content.txt"), "nested-precious\n");
+        RealGit(nestedDir, "add", "-A");
+        RealGit(nestedDir, "commit", "-m", "nested baseline");
+        var nestedHeadBefore = RealGitOutput(nestedDir, "rev-parse", "HEAD").Trim();
+
+        // Ordinary dirty residue too, so the clean demonstrably RAN.
+        File.WriteAllText(Path.Combine(worker, "ordinary-dirt.txt"), "dirt\n");
+        File.WriteAllText(playground.GuidancePath, "LOCAL-EDIT\n");
+
+        var agentRunner = new MockAgentRunner();
+        var (result, stderr, legacyCommands) = await RunRealGitImproverAsync(
+            $"realgit-nested-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // TRUTHFUL FAILURE, and the agent was NEVER prompted.
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("the working tree is not clean after the restore", StringComparison.Ordinal));
+
+        // SANITIZED: no raw git stderr leaked into the log or the persisted result.
+        Assert.DoesNotContain("fatal:", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("fatal:", result.Output, StringComparison.Ordinal);
+
+        // THE NESTED REPOSITORY SURVIVED, intact, with its own content and history.
+        Assert.True(Directory.Exists(nestedDir), "the nested repository directory was deleted");
+        Assert.True(
+            Directory.Exists(Path.Combine(nestedDir, ".git")),
+            "the nested repository's .git directory was removed");
+        Assert.True(
+            File.Exists(Path.Combine(nestedDir, "nested-content.txt")),
+            "the nested repository's content was deleted");
+        Assert.Equal("nested-precious\n", File.ReadAllText(Path.Combine(nestedDir, "nested-content.txt")));
+        Assert.Equal(nestedHeadBefore, RealGitOutput(nestedDir, "rev-parse", "HEAD").Trim());
+
+        // The clean really RAN: ordinary dirt is gone even though the nested repo survived.
+        Assert.False(File.Exists(Path.Combine(worker, "ordinary-dirt.txt")));
+
+        // NO ESCALATION on the legacy route, where the issued command strings are observable:
+        // exactly one clean, spelled `clean -fdx`, and never `-ffdx`.
+        if (!viaSeam)
+        {
+            var cleans = legacyCommands
+                .Where(c => c.StartsWith("clean", StringComparison.Ordinal))
+                .ToArray();
+            Assert.Single(cleans);
+            Assert.Equal("clean -fdx", cleans[0]);
+            Assert.DoesNotContain(legacyCommands, c => c.Contains("-ffdx", StringComparison.Ordinal));
+            // Nothing was published either.
+            Assert.DoesNotContain(legacyCommands, c => c.StartsWith("push", StringComparison.Ordinal));
+            Assert.DoesNotContain(legacyCommands, c => c.StartsWith("add ", StringComparison.Ordinal));
+        }
+    }
+
+    // ── (c) Failed fetch cannot reset to stale evidence ──────────────────────
+
+    /// <summary>
+    /// REAL GIT (c): a FIRST successful fetch leaves a genuine, valid <c>FETCH_HEAD</c> on disk;
+    /// the origin URL is then broken so the SECOND fetch — the one preparation issues — really
+    /// fails. Preparation must abort at the failed fetch: the stale <c>FETCH_HEAD</c> must never
+    /// be resolved, no <c>reset --hard</c> may run, HEAD must be unchanged, and the agent must
+    /// never run.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RealGit_Preparation_FailedFetch_NeverResetsToTheStaleFetchHead(bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"stalefetch-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+
+        // A FIRST, genuinely successful fetch writes a real FETCH_HEAD to disk. Advance the
+        // remote first so the stale FETCH_HEAD is a DIFFERENT commit from the local HEAD —
+        // a reset to it would be plainly observable.
+        var advancedSha = playground.AdvanceRemote("REMOTE-BASELINE-V2\n", "remote advanced");
+        RealGit(worker, "fetch", "origin", "refs/heads/main");
+        var staleFetchHead = RealGitOutput(worker, "rev-parse", "FETCH_HEAD^{commit}").Trim();
+        Assert.Equal(advancedSha, staleFetchHead);
+
+        // Pin the worker back to the ORIGINAL baseline so HEAD != stale FETCH_HEAD.
+        var headBefore = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+        Assert.NotEqual(staleFetchHead, headBefore);
+
+        // BREAK the origin so preparation's own fetch really fails.
+        var brokenRemote = Path.Combine(playground.Root, "does-not-exist.git");
+        RealGit(worker, "remote", "set-url", "origin", brokenRemote);
+
+        var agentRunner = new MockAgentRunner();
+        var (result, stderr, legacyCommands) = await RunRealGitImproverAsync(
+            $"realgit-stalefetch-{viaSeam}", playground, viaSeam, agentRunner);
+
+        // Truthful failure, agent never prompted.
+        Assert.Empty(agentRunner.PromptCalls);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo preparation fetch failed", StringComparison.Ordinal));
+
+        // THE INVARIANT: HEAD is untouched — no reset to the stale FETCH_HEAD ever happened.
+        Assert.Equal(headBefore, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+        Assert.NotEqual(staleFetchHead, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+
+        // The reflog is the independent witness: no reset entry, and the stale SHA never became
+        // a checkout target.
+        var reflog = RealGitOutput(worker, "reflog", "--format=%gs");
+        Assert.DoesNotContain("reset:", reflog, StringComparison.Ordinal);
+        Assert.DoesNotContain(staleFetchHead, reflog, StringComparison.Ordinal);
+
+        // On the legacy route the issued commands prove it directly: no FETCH_HEAD resolution
+        // and no reset at all after the failed fetch.
+        if (!viaSeam)
+        {
+            Assert.DoesNotContain(
+                legacyCommands, c => c.Contains("FETCH_HEAD", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                legacyCommands, c => c.StartsWith("reset", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                legacyCommands, c => c.Contains(staleFetchHead, StringComparison.Ordinal));
+        }
+
+        // Sanitized: the failure reason carries git's stderr through RenderForLog (redacted and
+        // control-sanitized), so it must occupy a SINGLE log line — no forged extra lines — and
+        // must never carry a credential.
+        var fetchFailureLine = FindLine(stderr, "Config repo preparation fetch failed");
+        Assert.Contains("(exit ", fetchFailureLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("x-access-token", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SplitLines(stderr), l => l.Trim().StartsWith("fatal:", StringComparison.Ordinal));
+    }
+
+    // ── (d) The two-sequential-assignments rejected-push scenario ────────────
+
+    /// <summary>
+    /// REAL GIT (d) — THE GOAL'S CORE SCENARIO, end to end with two sequential
+    /// <see cref="TaskExecutor.ExecuteAsync"/> calls against the SAME bare remote and the SAME
+    /// worker clone.
+    /// <para>
+    /// RUN 1: the agent makes a real commit. A <c>pre-push</c> hook in the worker clone advances
+    /// the bare remote between the worker's fetch and its push — the ordinary lost-race — so the
+    /// push is genuinely REJECTED by git (no force push, no remote rollback, no interception of
+    /// the result). The run reports a truthful publication failure and the abandoned commit
+    /// remains locally.
+    /// </para>
+    /// <para>
+    /// RUN 2: preparation must restore the checkout to the FRESHLY FETCHED remote baseline, so
+    /// the abandoned run-1 commit is neither HEAD nor present in the working tree. Run 2 then
+    /// publishes its own change successfully, and the abandoned commit is proven unpublishable:
+    /// it is not on the remote and not reachable from run 2's pushed commit.
+    /// </para>
+    /// <para>
+    /// Run on BOTH routes: the LEGACY opaque route and the PRODUCTION SEAM route (the real
+    /// <see cref="ConfigRepoGitOperations"/>). The local bare-remote path is an INELIGIBLE
+    /// Branch-B transport URL, so the seam launches the snapshot verbatim with no credential
+    /// injection — the production dispatch, fully offline.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false)] // LEGACY opaque route
+    [InlineData(true)]  // production SEAM route (ConfigRepoGitOperations, Branch-B local path)
+    public async Task RealGit_TwoSequentialAssignments_RejectedPush_CannotPublishTheAbandonedCommit(
+        bool viaSeam)
+    {
+        using var playground = RealGitPlayground.Create(
+            $"rejectedpush-{(viaSeam ? "seam" : "legacy")}", "REMOTE-BASELINE-V1\n");
+        var worker = playground.WorkerDir;
+
+        // ── Boundary 0: the starting remote SHA ───────────────────────────────
+        var remoteShaBeforeRun1 = playground.RemoteMainSha();
+
+        // The rejected-push mechanism: a pre-push hook that advances the bare remote ONCE,
+        // between this worker's fetch and its push. Git then refuses the non-fast-forward
+        // update on its own — the rejection is real, not simulated.
+        var interloperContent = "REMOTE-INTERLOPER-V2\n";
+        var hookPath = Path.Combine(worker, ".git", "hooks", "pre-push");
+        var advanceMarker = Path.Combine(worker, ".git", "ADVANCE_ONCE");
+        var pusherScriptDir = Path.Combine(playground.Root, "hook-pusher");
+        Directory.CreateDirectory(pusherScriptDir);
+        File.WriteAllText(
+            hookPath,
+            $"""
+            #!/bin/sh
+            if [ -f '{advanceMarker}' ]; then
+              rm -f '{advanceMarker}'
+              rm -rf '{pusherScriptDir}/clone'
+              git -c protocol.file.allow=always clone -q '{playground.RemoteDir}' '{pusherScriptDir}/clone'
+              cd '{pusherScriptDir}/clone' || exit 0
+              git config user.email hook@copilothive.test
+              git config user.name Hook
+              printf '{interloperContent.Replace("\n", "\\n")}' > agents/coder.agents.md
+              git add -A
+              git -c commit.gpgsign=false commit -qm 'interloper commit'
+              git push -q origin main
+            fi
+            exit 0
+            """.Replace("\r\n", "\n"));
+        RealGitResult(worker, "update-index", "--chmod=+x", "--", ".git/hooks/pre-push");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                hookPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+        File.WriteAllText(advanceMarker, "");
+
+        // ── RUN 1: the improver's own publication commits; the push loses the race ──
+        // The agent EDITS the guidance file (its real job); TaskExecutor's publication stage
+        // then performs the real add/diff/commit/pull/push. The pre-push hook advances the
+        // bare remote in between, so git itself rejects the non-fast-forward update.
+        var run1Agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                File.WriteAllText(playground.GuidancePath, "RUN1-IMPROVER-EDIT\n");
+                return Task.FromResult("Run 1 agent response");
+            },
+        };
+
+        var (run1Result, _, run1LegacyCommands) = await RunRealGitImproverAsync(
+            $"realgit-rejected-run1-{viaSeam}", playground, viaSeam, run1Agent);
+
+        // ROUTE PROOF: on the seam route NOTHING reached the legacy opaque dispatch (so the
+        // production ConfigRepoGitOperations really carried every config-repo command); on the
+        // legacy route it carried them all.
+        if (viaSeam)
+            Assert.Empty(run1LegacyCommands);
+        else
+            Assert.NotEmpty(run1LegacyCommands);
+
+        // The agent ran, and the publication stage really committed its edit.
+        Assert.Single(run1Agent.PromptCalls);
+        var abandonedSha = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+        Assert.True(playground.WorkerHasCommit(abandonedSha));
+        Assert.Equal(
+            "RUN1-IMPROVER-EDIT\n",
+            RealGitOutput(worker, "show", abandonedSha + ":agents/coder.agents.md"));
+
+        // TRUTHFUL PUBLICATION FAILURE: the push was genuinely rejected.
+        Assert.Equal(TaskOutcome.Failed, run1Result.Status);
+        Assert.Equal("FAIL", run1Result.Metrics!.Verdict);
+        Assert.False(run1Result.GitStatus!.Pushed);
+        Assert.DoesNotContain("fatal:", run1Result.Output, StringComparison.Ordinal);
+
+        // ── Boundary 1: the remote advanced to the interloper, NOT to run 1 ───
+        var remoteShaAfterRun1 = playground.RemoteMainSha();
+        Assert.NotEqual(remoteShaBeforeRun1, remoteShaAfterRun1);
+        Assert.NotEqual(abandonedSha, remoteShaAfterRun1);
+        Assert.False(
+            playground.RemoteMainContains(abandonedSha),
+            "the abandoned run-1 commit reached the remote");
+
+        // The abandoned commit still exists LOCALLY — this is exactly the danger the
+        // fetch-first preparation exists to neutralize.
+        Assert.True(playground.WorkerHasCommit(abandonedSha));
+        Assert.Equal(abandonedSha, RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim());
+
+        // ── RUN 2: preparation must discard the abandoned commit ─────────────
+        var remoteShaBeforeRun2 = playground.RemoteMainSha();
+        string? run2SeenHead = null;
+        string? run2SeenGuidance = null;
+        var run2SeenAbandonedReachable = true;
+        var run2Agent = new MockAgentRunner
+        {
+            PromptResponder = (_, _, _) =>
+            {
+                // OBSERVED AT THE SECOND RUN'S START, before the agent changes anything.
+                run2SeenHead = RealGitOutput(worker, "rev-parse", "HEAD^{commit}").Trim();
+                run2SeenGuidance = File.ReadAllText(playground.GuidancePath);
+                var (ancestorExit, _, _) = RealGitResult(
+                    worker, "merge-base", "--is-ancestor", abandonedSha, "HEAD");
+                run2SeenAbandonedReachable = ancestorExit == 0;
+
+                // Run 2 publishes its OWN change — again by EDITING only; the publication
+                // stage does the committing and pushing.
+                File.WriteAllText(playground.GuidancePath, "RUN2-IMPROVER-EDIT\n");
+                return Task.FromResult("Run 2 agent response");
+            },
+        };
+
+        var (run2Result, _, _) = await RunRealGitImproverAsync(
+            $"realgit-rejected-run2-{viaSeam}", playground, viaSeam, run2Agent);
+
+        Assert.Single(run2Agent.PromptCalls);
+
+        // ── THE CORE ASSERTIONS at the second run's start ─────────────────────
+        // HEAD equals the FRESHLY FETCHED remote SHA — never the abandoned commit.
+        Assert.Equal(remoteShaBeforeRun2, run2SeenHead);
+        Assert.NotEqual(abandonedSha, run2SeenHead);
+        // The abandoned change is ABSENT from the working tree; the interloper's is present.
+        Assert.Equal(interloperContent, run2SeenGuidance);
+        Assert.DoesNotContain("RUN1-IMPROVER-EDIT", run2SeenGuidance, StringComparison.Ordinal);
+        // The branch was restored to the remote baseline: the abandoned commit is not an
+        // ancestor of the second run's starting HEAD.
+        Assert.False(
+            run2SeenAbandonedReachable,
+            "the abandoned run-1 commit was still reachable from the second run's HEAD");
+
+        // ── Boundary 2: the abandoned commit can never be published ───────────
+        Assert.Equal(TaskOutcome.Completed, run2Result.Status);
+        Assert.True(run2Result.GitStatus!.Pushed);
+
+        var remoteShaAfterRun2 = playground.RemoteMainSha();
+        Assert.NotEqual(remoteShaBeforeRun2, remoteShaAfterRun2);
+        // The abandoned commit is NOT on the remote and NOT reachable from run 2's push.
+        Assert.False(
+            playground.RemoteMainContains(abandonedSha),
+            "the abandoned run-1 commit became reachable from the remote after run 2");
+        Assert.NotEqual(abandonedSha, remoteShaAfterRun2);
+        // Run 2's own content IS published.
+        Assert.Equal(
+            "RUN2-IMPROVER-EDIT\n",
+            RealGitOutput(playground.RemoteDir, "show", "main:agents/coder.agents.md"));
+
+        // Remote refs agree at the final boundary.
+        Assert.Equal(remoteShaAfterRun2, playground.WorkerOriginMainSha());
+    }
+
 }

@@ -116,7 +116,13 @@ public sealed class TaskExecutorRedactionTests : IDisposable
             GitCommands.Add(args);
             if (GitCommandThrower?.Invoke(args) is { } ex)
                 throw ex;
-            return Task.FromResult(GitCommandResponder?.Invoke(args) ?? (0, string.Empty, string.Empty));
+            // A test's own script always wins; otherwise the Improver preparation commands get
+            // EXPLICIT valid answers (root/SHA/branch/upstream/empty status). Exit-zero with an
+            // empty stdout is never a usable baseline, so the fallthrough must not supply one.
+            return Task.FromResult(
+                GitCommandResponder?.Invoke(args)
+                ?? ConfigRepoPreparationFakes.LegacyAnswer(workDir, args)
+                ?? (0, string.Empty, string.Empty));
         }
 
         public Task ForceDeleteDirectoryAsync(string path, int maxRetries = 5)
@@ -416,12 +422,12 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     // ── Boundary: the improver's config-repo git logs ─────────────────────────
 
     [Fact]
-    public async Task ExecuteAsync_Improver_ConfigRepoPullFailureLog_IsCredentialFree()
+    public async Task ExecuteAsync_Improver_ConfigRepoFetchFailureLog_IsCredentialFree()
     {
         var configRepo = CreateConfigRepoDir();
         var git = new FakeGit
         {
-            GitCommandResponder = args => args.StartsWith("pull --ff-only")
+            GitCommandResponder = args => args.StartsWith("fetch ", StringComparison.Ordinal)
                 ? (1, string.Empty, $"fatal: unable to access '{CredentialUrl}/': 403")
                 : null,
         };
@@ -431,7 +437,7 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         await executor.ExecuteAsync(
             BuildImproverTask(), TestContext.Current.CancellationToken);
 
-        Assert.Contains("Config repo pull failed", AllOutput);
+        Assert.Contains("Config repo preparation fetch failed", AllOutput);
         Assert.DoesNotContain(Token, AllOutput);
         Assert.Contains($"unable to access '{RedactedUrl}/'", AllOutput);
     }
@@ -505,17 +511,122 @@ public sealed class TaskExecutorRedactionTests : IDisposable
     }
 
     /// <summary>
-    /// The improver's successful-pull log renders git STDOUT, which also echoes the remote.
-    /// The stdout VALUE itself is never mutated — only its log rendering is redacted.
+    /// EVERY preparation stage renders its failure through the same redaction boundary, not
+    /// just the fetch: a credential-bearing stderr from the preflight, the baseline resolution,
+    /// the destructive restore or the post-restore verification must never reach the log or the
+    /// task result. The preparation failure is truthful (Failed + FAIL) in every case.
     /// </summary>
-    [Fact]
-    public async Task ExecuteAsync_Improver_ConfigRepoPullSuccessLog_IsCredentialFree()
+    [Theory]
+    [InlineData("rev-parse --show-toplevel", "worktree root check")]
+    [InlineData("rev-parse --verify HEAD^{commit}", "HEAD commit check")]
+    [InlineData("rev-parse --symbolic-full-name HEAD", "HEAD branch check")]
+    [InlineData("rev-parse --symbolic-full-name @{upstream}", "upstream check")]
+    [InlineData("rev-parse --verify FETCH_HEAD^{commit}", "fetched baseline check")]
+    [InlineData("clean -fdx", "clean")]
+    [InlineData("status --porcelain=v1 --untracked-files=all --ignored", "post-restore status check")]
+    public async Task ExecuteAsync_Improver_ConfigRepoPreparationStageFailureLog_IsCredentialFree(
+        string failingCommand, string expectedStage)
     {
         var configRepo = CreateConfigRepoDir();
         var git = new FakeGit
         {
-            GitCommandResponder = args => args.StartsWith("pull --ff-only")
-                ? (0, $"Already up to date with {CredentialUrl}", string.Empty)
+            GitCommandResponder = args => args == failingCommand
+                ? (1, string.Empty, $"fatal: unable to access '{CredentialUrl}/': 403")
+                : null,
+        };
+        var executor = new TaskExecutor(
+            new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
+
+        var result = await executor.ExecuteAsync(
+            BuildImproverTask(), TestContext.Current.CancellationToken);
+
+        Assert.Contains($"Config repo preparation {expectedStage} failed", AllOutput);
+        Assert.DoesNotContain(Token, AllOutput);
+        Assert.DoesNotContain("x-access-token", AllOutput);
+        Assert.Contains($"unable to access '{RedactedUrl}/'", AllOutput);
+
+        // The task result travels to the orchestrator to be logged and persisted — it must be
+        // credential-free too.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.DoesNotContain(Token, result.Output);
+        Assert.DoesNotContain(Token, string.Join('\n', result.Metrics.Issues));
+    }
+
+    /// <summary>
+    /// The reset stage carries the CAPTURED baseline SHA in its command, so its failure line is
+    /// asserted separately (the opaque string is not a fixed literal).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_Improver_ConfigRepoResetFailureLog_IsCredentialFree()
+    {
+        var configRepo = CreateConfigRepoDir();
+        var git = new FakeGit
+        {
+            GitCommandResponder = args => args.StartsWith("reset ", StringComparison.Ordinal)
+                ? (1, string.Empty, $"fatal: unable to access '{CredentialUrl}/': 403")
+                : null,
+        };
+        var executor = new TaskExecutor(
+            new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
+
+        var result = await executor.ExecuteAsync(
+            BuildImproverTask(), TestContext.Current.CancellationToken);
+
+        Assert.Contains("Config repo preparation reset failed", AllOutput);
+        Assert.DoesNotContain(Token, AllOutput);
+        Assert.Contains($"unable to access '{RedactedUrl}/'", AllOutput);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.DoesNotContain(Token, result.Output);
+    }
+
+    /// <summary>
+    /// A THROWN preparation command is rendered through <see cref="SafeExceptionLog.Describe"/>
+    /// — type names only, never the message — so a credential embedded in the exception text
+    /// never reaches the log or the persisted result.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_Improver_ConfigRepoPreparationThrowLog_IsCredentialFree()
+    {
+        var configRepo = CreateConfigRepoDir();
+        var git = new FakeGit
+        {
+            GitCommandThrower = args => args.StartsWith("fetch ", StringComparison.Ordinal)
+                ? new InvalidOperationException($"fetch from {CredentialUrl} exploded")
+                : null,
+        };
+        var executor = new TaskExecutor(
+            new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
+
+        var result = await executor.ExecuteAsync(
+            BuildImproverTask(), TestContext.Current.CancellationToken);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains(
+            result.Metrics.Issues,
+            i => i.Contains("Config repo preparation fetch failed with an error", StringComparison.Ordinal));
+
+        // SANITIZED: classification only — no raw message text, no credential, no bare URL.
+        Assert.DoesNotContain(Token, AllOutput);
+        Assert.DoesNotContain("exploded", AllOutput);
+        Assert.DoesNotContain("fetch from", AllOutput);
+        Assert.DoesNotContain(Token, result.Output);
+        Assert.Contains("InvalidOperationException", result.Output);
+    }
+
+    /// <summary>
+    /// The improver's successful-FETCH log renders git STDOUT, which also echoes the remote.
+    /// The stdout VALUE itself is never mutated — only its log rendering is redacted.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_Improver_ConfigRepoFetchSuccessLog_IsCredentialFree()
+    {
+        var configRepo = CreateConfigRepoDir();
+        var git = new FakeGit
+        {
+            GitCommandResponder = args => args.StartsWith("fetch ", StringComparison.Ordinal)
+                ? (0, $"From {CredentialUrl}", string.Empty)
                 : null,
         };
         var executor = new TaskExecutor(
@@ -524,9 +635,9 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         await executor.ExecuteAsync(
             BuildImproverTask(), TestContext.Current.CancellationToken);
 
-        Assert.Contains("Config repo up to date", AllOutput);
+        Assert.Contains("Config repo fetched", AllOutput);
         Assert.DoesNotContain(Token, AllOutput);
-        Assert.Contains($"Already up to date with {RedactedUrl}", AllOutput);
+        Assert.Contains($"From {RedactedUrl}", AllOutput);
     }
 
     // ── Functional data is never mutated ──────────────────────────────────────

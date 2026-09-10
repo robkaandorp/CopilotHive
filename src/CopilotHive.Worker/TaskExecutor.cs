@@ -236,13 +236,16 @@ public sealed class TaskExecutor(
             }
             else
             {
-                // Improver: pull latest config repo to get freshest agents.md files.
-                // A missing repository or a failed pull is a TRUTHFUL failure: the agent is
-                // never prompted to edit a non-repository directory, and an unsuccessful
+                // Improver: restore the dedicated worker config checkout to a VERIFIED, freshly
+                // fetched remote baseline before the agent is prompted. A missing repository, a
+                // foreign worktree root, a detached/unborn HEAD, a missing or mismatched
+                // upstream, a failed fetch, a malformed rev-parse output, or any residual
+                // working-tree content after the destructive restore is a TRUTHFUL failure: the
+                // agent is never prompted to edit an unverified directory, and an unsuccessful
                 // preparation never masquerades as a normal no-change completion. The thrown
-                // ConfigRepoPreparationException carries the sanitized stage reason and is
+                // ConfigRepoPublicationException carries the sanitized stage reason and is
                 // mapped by the catch blocks below into TaskOutcome.Failed + FAIL.
-                await PullConfigRepoAsync(ct);
+                await PrepareConfigRepoBaselineAsync(ct);
             }
 
             // Compute merge-base for feature branches so reviewers/testers diff only branch changes
@@ -1003,19 +1006,48 @@ public sealed class TaskExecutor(
     }
 
     /// <summary>
-    /// Pulls the latest changes from the config repo so the improver works on fresh agents.md files.
-    /// The config repository is prepared per task assignment — WorkerService performs the
-    /// per-assignment preparation (the probe plus the clone-if-absent) BEFORE this assignment's
-    /// TaskExecutor runs, and <see cref="PullConfigRepoAsync"/> operates on that prepared repository.
+    /// Restores the dedicated worker config checkout to a VERIFIED, freshly fetched remote
+    /// baseline before the improver is prompted. The config repository is prepared per task
+    /// assignment — WorkerService performs the per-assignment preparation (the probe plus the
+    /// clone-if-absent) BEFORE this assignment's TaskExecutor runs, and this method operates on
+    /// that prepared repository; it never clones and never touches paths outside
+    /// <see cref="_configRepoDir"/>.
     /// <para>
-    /// TRUTHFUL PREPARATION: three outcomes are distinguished. An ABSENT repository throws a
-    /// <see cref="ConfigRepoPublicationException"/> BEFORE the agent is prompted — a worker must
-    /// never be given permission to edit a non-repository directory. A FAILED pull (non-zero
-    /// exit, seam rejection, or thrown error) also throws — the Improver path stops with a
-    /// truthful failure instead of logging and continuing. Only a SUCCESSFUL pull proceeds.
+    /// THE SEQUENCE (every command result is checked; the first failure stops everything):
+    /// <list type="number">
+    ///   <item><description>PREFLIGHT, before any mutation: the <c>.git</c> directory must
+    ///   exist; <c>rev-parse --show-toplevel</c> must report exactly the configured config repo
+    ///   root; <c>rev-parse --verify HEAD^{commit}</c> must yield exactly one full 40/64-hex
+    ///   SHA (the bare <c>--verify HEAD</c> would also accept a tag or other non-commit
+    ///   object); <c>rev-parse --symbolic-full-name HEAD</c> must yield an ATTACHED
+    ///   <c>refs/heads/&lt;branch&gt;</c>; and <c>rev-parse --symbolic-full-name @{upstream}</c>
+    ///   must yield exactly <c>refs/remotes/origin/&lt;same branch&gt;</c>. A foreign root, a
+    ///   detached/unborn HEAD, a missing upstream, a different remote or a mismatched branch is
+    ///   rejected BEFORE any reset/clean and before prompting.</description></item>
+    ///   <item><description>FETCH the discovered branch — <c>fetch origin
+    ///   refs/heads/&lt;branch&gt;</c>. A failed fetch is a preparation failure: there is NEVER
+    ///   a fallback to a previous <c>FETCH_HEAD</c>, a local commit or a remote-tracking ref,
+    ///   and no reset is ever issued from stale evidence.</description></item>
+    ///   <item><description>Only after THIS fetch succeeded, resolve the baseline with
+    ///   <c>rev-parse --verify FETCH_HEAD^{commit}</c>; the single full SHA it yields is the
+    ///   ONLY permitted reset target.</description></item>
+    ///   <item><description>RESTORE destructively: <c>reset --hard &lt;SHA&gt;</c>, then
+    ///   <c>clean -fdx</c>, then (idempotently) recreate the agents working directory, then
+    ///   VERIFY that <c>rev-parse --verify HEAD^{commit}</c> equals the captured SHA and that
+    ///   the verbose <c>status</c> reports an EMPTY working tree. Only when every check passes
+    ///   may the agent run.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// An ordinary dirty/ahead/diverged but structurally valid checkout is RESTORED
+    /// automatically — never blocked for manual cleanup — and published remote guidance
+    /// survives, because the target is the freshly fetched remote baseline rather than a
+    /// deletion of history. A protected nested repository or any other cleanup failure is
+    /// reported truthfully instead of escalating: there is no second forced clean, no arbitrary
+    /// recursive deletion, no quarantine flag and no remote rollback or force push.
     /// </para>
     /// </summary>
-    private async Task PullConfigRepoAsync(CancellationToken ct)
+    private async Task PrepareConfigRepoBaselineAsync(CancellationToken ct)
     {
         if (!Directory.Exists(Path.Combine(_configRepoDir, ".git")))
         {
@@ -1025,11 +1057,98 @@ public sealed class TaskExecutor(
                 reason: "Config repo not found — the improver cannot prepare its workspace without the config repository.");
         }
 
-        _log.Info("Pulling latest config repo for improver...");
+        _log.Info("Preparing config repo baseline for improver...");
+
+        // ── Preflight ─────────────────────────────────────────────────────────────
+        var toplevel = await RunPreparationCommandAsync(
+            ["rev-parse", "--show-toplevel"], "rev-parse --show-toplevel", "worktree root check", ct);
+        VerifyWorktreeRoot(toplevel.Stdout);
+
+        var headSha = await ResolveSingleShaAsync(
+            ConfigRepoGitOperations.RevHeadCommit, "HEAD commit check", "HEAD", ct);
+
+        var branch = await ResolveAttachedBranchAsync(ct);
+        await VerifyUpstreamAsync(branch, ct);
+
+        _log.Info($"Config repo baseline preflight passed on branch {RenderForLog(branch)} " +
+                  $"at {RenderForLog(headSha[..Math.Min(headSha.Length, 12)])}");
+
+        // ── Fetch (the ONLY source of the reset target) ───────────────────────────
+        var branchRef = BranchRefPrefix + branch;
+        var fetch = await RunPreparationCommandAsync(
+            ["fetch", "origin", branchRef],
+            $"fetch origin \"{branchRef}\"",
+            "fetch",
+            ct);
+
+        // git echoes the credential-bearing config-repo remote in stdout too, so the LOG
+        // rendering is redacted AND control-character sanitized. The raw value is untouched.
+        _log.Info($"Config repo fetched {RenderForLog(branchRef)}: {RenderForLog(fetch.Stdout)}");
+
+        var baselineSha = await ResolveSingleShaAsync(
+            ConfigRepoGitOperations.RevFetchHeadCommit, "fetched baseline check", "FETCH_HEAD", ct);
+
+        // ── Destructive restore to the fetched baseline ───────────────────────────
+        await RunPreparationCommandAsync(
+            ["reset", "--hard", baselineSha], $"reset --hard {baselineSha}", "reset", ct);
+        await RunPreparationCommandAsync(["clean", "-fdx"], "clean -fdx", "clean", ct);
+
+        EnsureAgentsDirectoryExists();
+
+        // ── Verification: the restore actually took effect ────────────────────────
+        var restoredSha = await ResolveSingleShaAsync(
+            ConfigRepoGitOperations.RevHeadCommit, "post-restore HEAD check", "HEAD", ct);
+        if (!string.Equals(restoredSha, baselineSha, StringComparison.Ordinal))
+        {
+            _log.Error("Config repo preparation rejected: HEAD does not match the fetched baseline after the restore");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo preparation rejected: HEAD does not match the fetched baseline after the restore.");
+        }
+
+        var status = await RunPreparationCommandAsync(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored"],
+            "status --porcelain=v1 --untracked-files=all --ignored",
+            "post-restore status check",
+            ct);
+        if (status.Stdout.Length != 0)
+        {
+            // STRICT EMPTY: the verified-clean oracle is a completely EMPTY status output.
+            // Whitespace-only output is NOT clean — it is output this preparation does not
+            // recognize, so it is reported as a residual dirty tree rather than assumed clean.
+            // A protected nested repository or any other residue the single-force clean cannot
+            // remove is reported TRUTHFULLY — no second forced clean, no recursive deletion.
+            _log.Error($"Config repo preparation rejected: the working tree is not clean after the restore: {RenderForLog(status.Stdout)}");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation rejected: the working tree is not clean after the restore: {RenderForLog(status.Stdout)}");
+        }
+
+        _log.Info($"Config repo restored to the fetched baseline {RenderForLog(baselineSha[..Math.Min(baselineSha.Length, 12)])}");
+    }
+
+    /// <summary>The only accepted <c>symbolic-full-name HEAD</c> prefix — an ATTACHED branch.</summary>
+    private const string BranchRefPrefix = "refs/heads/";
+
+    /// <summary>The only accepted upstream prefix — the ordinary single-origin clone topology.</summary>
+    private const string UpstreamRefPrefix = "refs/remotes/origin/";
+
+    /// <summary>
+    /// Runs ONE preparation command through the shared <see cref="RunConfigRepoCommandAsync"/>
+    /// dispatch (so both the tokenized seam path and the legacy opaque path are exercised) and
+    /// converts every failure form — a thrown exception, a non-requested-cancellation
+    /// <see cref="OperationCanceledException"/>, or a non-zero result — into the sanitized
+    /// preparation failure. A REQUESTED execution cancellation is never converted: it
+    /// propagates to <see cref="ExecuteAsync"/>'s <c>ct.IsCancellationRequested</c> guard and
+    /// stays Cancelled/CANCELLED.
+    /// </summary>
+    private async Task<ConfigRepoOpResult> RunPreparationCommandAsync(
+        IReadOnlyList<string> tokenizedForm, string legacyOpaqueForm, string stage, CancellationToken ct)
+    {
         ConfigRepoOpResult result;
         try
         {
-            result = await RunConfigRepoCommandAsync(["pull", "--ff-only"], "pull --ff-only", ct);
+            result = await RunConfigRepoCommandAsync(tokenizedForm, legacyOpaqueForm, ct);
         }
         catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
@@ -1039,33 +1158,331 @@ public sealed class TaskExecutor(
             // cancellation does not enter this filter and propagates to the outer
             // ct.IsCancellationRequested guard unchanged.
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo pull failed (cancelled) [{safe}]");
+            _log.Error($"Config repo preparation {stage} failed (cancelled) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation pull was interrupted without a requested cancellation [{safe}].");
+                reason: $"Config repo preparation {stage} was interrupted without a requested cancellation [{safe}].");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             var safe = SafeExceptionLog.Describe(ex);
-            _log.Error($"Config repo pull failed (error) [{safe}]");
+            _log.Error($"Config repo preparation {stage} failed (error) [{safe}]");
             throw new ConfigRepoPublicationException(
                 preservedOutput: "",
-                reason: $"Config repo preparation pull failed with an error [{safe}].");
+                reason: $"Config repo preparation {stage} failed with an error [{safe}].");
         }
+
+        if (result.Success)
+            return result;
 
         // git echoes the credential-bearing config-repo remote in both streams, so the LOG
         // rendering is redacted AND control-character sanitized. The raw values are untouched.
-        if (result.Success)
-        {
-            _log.Info($"Config repo up to date: {RenderForLog(result.Stdout)}");
-            return;
-        }
-
-        _log.Error($"Config repo pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+        _log.Error($"Config repo preparation {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
         throw new ConfigRepoPublicationException(
             preservedOutput: "",
-            reason: $"Config repo preparation pull failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
+            reason: $"Config repo preparation {stage} failed (exit {result.ExitCode}): {RenderForLog(result.SanitizedError)}");
     }
+
+    /// <summary>
+    /// The LEXICAL trust boundary (the same convention the config-repo seam uses for its
+    /// containment check): the reported worktree root, canonicalized, must EQUAL the
+    /// canonicalized configured config repo directory. A foreign repository is rejected before
+    /// any mutation. This is not a filesystem-sandbox claim.
+    /// <para>
+    /// The ROOT consumer takes the VERBATIM single-line content: a legitimate configured
+    /// repository may live at a path containing INTERNAL whitespace (<c>/tmp/config repo</c>,
+    /// <c>C:\Users\Jane Doe\config-repo</c>), and <c>rev-parse --show-toplevel</c> reports that
+    /// exact path. Only canonical equality against <see cref="_configRepoDir"/> decides — the
+    /// SHA/ref no-whitespace rule deliberately does NOT apply here. PADDED output
+    /// (<c>  /tmp/root  </c>) is still rejected by the shared extraction, so this widening
+    /// admits internal whitespace ONLY.
+    /// </para>
+    /// </summary>
+    private void VerifyWorktreeRoot(string toplevelStdout)
+    {
+        var reported = ExactSingleLineContent(toplevelStdout);
+        if (reported is null)
+        {
+            _log.Error("Config repo preparation rejected: the worktree root could not be determined");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo preparation rejected: the worktree root could not be determined.");
+        }
+
+        string canonicalReported;
+        string canonicalConfigured;
+        try
+        {
+            canonicalReported = CanonicalizePath(reported);
+            canonicalConfigured = CanonicalizePath(_configRepoDir);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or IOException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo preparation rejected: the worktree root could not be canonicalized [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation rejected: the worktree root could not be canonicalized [{safe}].");
+        }
+
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        if (!canonicalReported.Equals(canonicalConfigured, comparison))
+        {
+            _log.Error("Config repo preparation rejected: the worktree root is not the configured config repository");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo preparation rejected: the worktree root is not the configured config repository.");
+        }
+    }
+
+    /// <summary>
+    /// Canonicalizes a path exactly as the config-repo seam does: the fully-qualified form with
+    /// any trailing separator removed (except for a bare root).
+    /// </summary>
+    private static string CanonicalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full);
+        if (string.Equals(full, root, StringComparison.Ordinal))
+            return full;
+
+        return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// Runs <c>rev-parse --verify &lt;revision&gt;</c> for one of the two admitted peeled-commit
+    /// spellings and requires EXACTLY one non-empty line holding a full 40/64 ASCII-hex SHA
+    /// (the seam's own <c>reset</c> SHA domain — no second, weaker validator). Blank,
+    /// multi-line (ambiguous) and malformed outputs are rejected.
+    /// </summary>
+    private async Task<string> ResolveSingleShaAsync(
+        string revision, string stage, string label, CancellationToken ct)
+    {
+        var result = await RunPreparationCommandAsync(
+            ["rev-parse", "--verify", revision], $"rev-parse --verify {revision}", stage, ct);
+
+        var line = ExactSingleLine(result.Stdout);
+        if (line is null || !ConfigRepoGitOperations.IsValidCommitSha(line))
+        {
+            _log.Error($"Config repo preparation rejected: {label} did not resolve to a single full commit SHA");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation rejected: {label} did not resolve to a single full commit SHA.");
+        }
+
+        return line;
+    }
+
+    /// <summary>
+    /// Reads the ATTACHED branch from <c>rev-parse --symbolic-full-name HEAD</c>. A detached
+    /// HEAD (the bare <c>HEAD</c> output, or any value outside <c>refs/heads/</c>) is rejected;
+    /// the branch is never guessed from a default name, <c>origin/HEAD</c>, or a task id.
+    /// <para>
+    /// The discovered ref is then validated COMPLETELY — the prechecks PLUS the authoritative
+    /// <c>git check-ref-format</c> subprocess, via the seam's single shared
+    /// <see cref="ConfigRepoGitOperations.ValidateRefCompletelyAsync"/> — BEFORE either
+    /// dispatch form is built. The prechecks alone accept refs git itself rejects
+    /// (<c>foo.lock</c>, <c>.hidden</c>, <c>foo//bar</c>, <c>foo@{bar}</c>), so without this
+    /// step the legacy opaque route would launch a fetch for a ref git will not accept.
+    /// Validating here means BOTH routes reach the same verdict before any fetch.
+    /// </para>
+    /// </summary>
+    private async Task<string> ResolveAttachedBranchAsync(CancellationToken ct)
+    {
+        var result = await RunPreparationCommandAsync(
+            ["rev-parse", "--symbolic-full-name", "HEAD"],
+            "rev-parse --symbolic-full-name HEAD",
+            "HEAD branch check",
+            ct);
+
+        var line = ExactSingleLine(result.Stdout);
+        if (line is null
+            || !line.StartsWith(BranchRefPrefix, StringComparison.Ordinal)
+            || !IsCarryableBranch(line[BranchRefPrefix.Length..]))
+        {
+            _log.Error("Config repo preparation rejected: HEAD is not attached to a usable branch");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo preparation rejected: HEAD is not attached to a usable branch.");
+        }
+
+        await ValidateDiscoveredRefAsync(line, ct);
+
+        return line[BranchRefPrefix.Length..];
+    }
+
+    /// <summary>
+    /// Runs the COMPLETE ref validation (prechecks + the authoritative <c>check-ref-format</c>
+    /// subprocess) for the discovered branch ref. A rejection is an ordinary sanitized
+    /// preparation failure raised BEFORE any fetch form is built, so neither route can carry a
+    /// malformed ref. A REQUESTED execution cancellation propagates unchanged; every other
+    /// interruption is an ordinary preparation failure, matching
+    /// <see cref="RunPreparationCommandAsync"/>'s contract.
+    /// </summary>
+    private async Task ValidateDiscoveredRefAsync(string discoveredRef, CancellationToken ct)
+    {
+        string? refError;
+        try
+        {
+            refError = await ConfigRepoGitOperations.ValidateRefCompletelyAsync(
+                discoveredRef, _configRepoDir, ct);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo preparation ref validation failed (cancelled) [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation ref validation was interrupted without a requested cancellation [{safe}].");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo preparation ref validation failed (error) [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation ref validation failed with an error [{safe}].");
+        }
+
+        if (refError is null)
+            return;
+
+        _log.Error($"Config repo preparation rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
+        throw new ConfigRepoPublicationException(
+            preservedOutput: "",
+            reason: $"Config repo preparation rejected: the discovered branch ref is not a valid git ref: {RenderForLog(refError)}");
+    }
+
+    /// <summary>
+    /// Requires <c>rev-parse --symbolic-full-name @{upstream}</c> to be exactly
+    /// <c>refs/remotes/origin/&lt;branch&gt;</c> for the SAME branch. A missing upstream, a
+    /// different remote, or a mismatched branch name is a topology rejection: this deliberately
+    /// supports the ordinary single-origin clone only.
+    /// </summary>
+    private async Task VerifyUpstreamAsync(string branch, CancellationToken ct)
+    {
+        var result = await RunPreparationCommandAsync(
+            ["rev-parse", "--symbolic-full-name", ConfigRepoGitOperations.RevUpstream],
+            $"rev-parse --symbolic-full-name {ConfigRepoGitOperations.RevUpstream}",
+            "upstream check",
+            ct);
+
+        var line = ExactSingleLine(result.Stdout);
+        if (line is null || !string.Equals(line, UpstreamRefPrefix + branch, StringComparison.Ordinal))
+        {
+            _log.Error("Config repo preparation rejected: the branch has no matching origin upstream");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: "Config repo preparation rejected: the branch has no matching origin upstream.");
+        }
+    }
+
+    /// <summary>
+    /// Recreates the agents working directory (idempotent — <c>clean -fdx</c> removes it when
+    /// the baseline tracks no file under it). A failure here is a preparation failure, never a
+    /// silent continuation into a prompt for a directory that does not exist.
+    /// </summary>
+    private void EnsureAgentsDirectoryExists()
+    {
+        try
+        {
+            Directory.CreateDirectory(_configAgentsDir);
+        }
+        catch (Exception ex)
+        {
+            var safe = SafeExceptionLog.Describe(ex);
+            _log.Error($"Config repo preparation failed to create the agents working directory [{safe}]");
+            throw new ConfigRepoPublicationException(
+                preservedOutput: "",
+                reason: $"Config repo preparation failed to create the agents working directory [{safe}].");
+        }
+    }
+
+    /// <summary>
+    /// THE SHARED exact one-line EXTRACTION — structure only, no domain rules.
+    /// <para>
+    /// STRICT: only the permitted Git line terminators (<c>\n</c> and <c>\r\n</c>) are accepted,
+    /// and ONLY as the terminator of the single line — at most one, at the very end. Anything
+    /// else that looks like a terminator (a bare <c>\r</c>, a second terminator, a blank or
+    /// padded second line) stays in the content and is rejected here. LEADING and TRAILING
+    /// whitespace is rejected for EVERY consumer: a value git spells with padding around it
+    /// (<c> 1111…1111 </c>, <c> refs/heads/main </c>, <c>  /tmp/root  </c>) is malformed output
+    /// that this preparation may not act on. Control characters are rejected everywhere too —
+    /// they are a log-forging vector and no legitimate SHA, ref or configured root carries one.
+    /// </para>
+    /// <para>
+    /// The content is returned VERBATIM — never trimmed and never normalized. INTERNAL
+    /// whitespace is deliberately NOT judged here: it is legal for one consumer (a worktree root
+    /// such as <c>/tmp/config repo</c>) and illegal for the others, so each consumer applies its
+    /// OWN domain rule on top of this extraction.
+    /// </para>
+    /// </summary>
+    private static string? ExactSingleLineContent(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return null;
+
+        // Strip AT MOST ONE trailing terminator, and only a permitted one.
+        var content = value;
+        if (content.EndsWith("\r\n", StringComparison.Ordinal))
+            content = content[..^2];
+        else if (content.EndsWith('\n'))
+            content = content[..^1];
+
+        if (content.Length == 0)
+            return null;
+
+        // No embedded terminator may remain: a second line (blank, padded or functional) means
+        // the output was ambiguous or unexpected.
+        if (content.Contains('\n') || content.Contains('\r'))
+            return null;
+
+        // PADDING is malformed for every consumer — this is what keeps `  root  ` rejected even
+        // though an INTERNAL space is legal in a path.
+        if (char.IsWhiteSpace(content[0]) || char.IsWhiteSpace(content[^1]))
+            return null;
+
+        // Control characters are rejected for every consumer (log-forging boundary).
+        foreach (var c in content)
+        {
+            if (char.IsControl(c))
+                return null;
+        }
+
+        return content;
+    }
+
+    /// <summary>
+    /// The SHA/ref domain on top of <see cref="ExactSingleLineContent"/>: the extracted content
+    /// must additionally carry NO whitespace at all. A SHA or a ref never legitimately contains
+    /// one, so any internal whitespace is malformed output.
+    /// </summary>
+    private static string? ExactSingleLine(string? value)
+    {
+        var content = ExactSingleLineContent(value);
+        if (content is null)
+            return null;
+
+        foreach (var c in content)
+        {
+            if (char.IsWhiteSpace(c))
+                return null;
+        }
+
+        return content;
+    }
+
+    /// <summary>
+    /// Whether a discovered branch name can be carried on BOTH dispatch paths: it must be a
+    /// non-empty ref-safe token (the seam's own <see cref="ConfigRepoGitOperations.ValidateRef"/>
+    /// prechecks apply to the full ref) that additionally contains no quote or backslash, so the
+    /// legacy opaque form can carry it as ONE quoted argument without any interpolation risk.
+    /// </summary>
+    private static bool IsCarryableBranch(string branch) =>
+        branch.Length > 0 && !branch.Contains('"') && !branch.Contains('\\');
 
     /// <summary>
     /// Commits and pushes any changes the improver made to *.agents.md files in the config repo.
