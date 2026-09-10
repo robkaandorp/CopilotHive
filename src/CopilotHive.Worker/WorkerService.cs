@@ -36,6 +36,26 @@ public sealed class WorkerService(
     private AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>? _stream;
     private string? _assignedId;
 
+    /// <summary>
+    /// THE OUTBOUND SEND GATE. gRPC's <see cref="IAsyncStreamWriter{T}"/> allows at most ONE
+    /// pending <c>WriteAsync</c> at a time, yet several independent producers write to the work
+    /// stream: the assignment body's completion, the tool-call bridge (progress, narrative and
+    /// response-bearing calls, invoked from agent turns on arbitrary threads), the initial Ready
+    /// and every assignment/cancel Ready. This per-instance semaphore serializes the AWAITED
+    /// write itself — not merely message construction — so at most one underlying write is ever
+    /// outstanding for this service's active connection.
+    /// <para>
+    /// Deliberately NOT disposed: callers may be parked in <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+    /// or unwinding through their <c>finally</c> release while <see cref="Dispose"/> runs, and
+    /// disposing underneath them would introduce an <see cref="ObjectDisposedException"/> failure
+    /// mode (or force a blocking drain). The gate holds no unmanaged resource and no wait handle
+    /// is ever materialised, so leaving it to the GC is safe and keeps it valid until callers
+    /// unwind. It grants NO ordering promise across simultaneous producers beyond serialization,
+    /// and NO reconnect, buffering or retry semantics.
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+
     // The gRPC client, set after successful registration — used by session RPCs
     private HiveOrchestrator.HiveOrchestratorClient? _client;
 
@@ -473,7 +493,7 @@ public sealed class WorkerService(
     {
         var result = await executor.ExecuteAsync(task, bodyToken);
 
-        await stream.RequestStream.WriteAsync(new WorkerMessage
+        await SendAsync(stream, new WorkerMessage
         {
             WorkerId = assignedId,
             Complete = GrpcMapper.ToGrpc(result),
@@ -745,14 +765,25 @@ public sealed class WorkerService(
         }
     }
 
+    /// <summary>
+    /// Builds and sends ONE tool-call request through the shared send boundary.
+    /// </summary>
+    /// <remarks>
+    /// The stream and worker ID are captured into locals BEFORE the gate is awaited, so a send
+    /// that parks behind another writer still targets the connection it was intended for and can
+    /// never be rerouted by a concurrent mutation of <see cref="_stream"/>. The not-connected
+    /// error is unchanged and still raised before any wait.
+    /// </remarks>
     private async Task SendToolCallRequest(string requestId, string taskId, string toolName, string argsJson, CancellationToken ct)
     {
-        if (_stream is null || _assignedId is null)
+        var stream = _stream;
+        var assignedId = _assignedId;
+        if (stream is null || assignedId is null)
             throw new InvalidOperationException("Not connected to orchestrator");
 
-        await _stream.RequestStream.WriteAsync(new WorkerMessage
+        await SendAsync(stream, new WorkerMessage
         {
-            WorkerId = _assignedId,
+            WorkerId = assignedId,
             ToolRequest = new ToolCallRequest
             {
                 RequestId = requestId,
@@ -807,17 +838,56 @@ public sealed class WorkerService(
 
     #endregion
 
-    private static async Task SendWorkerReady(
+    /// <summary>
+    /// THE SINGLE OUTBOUND SEND BOUNDARY. Every WorkStream request write — terminal
+    /// <c>Complete</c>, tool requests and every <c>Ready</c> — goes through here, so at most one
+    /// underlying <c>RequestStream.WriteAsync</c> is outstanding at a time.
+    /// </summary>
+    /// <param name="stream">
+    /// The stream captured by the CALLER before it waits. Passing it explicitly (rather than
+    /// re-reading the mutable <see cref="_stream"/> field after the wait) guarantees a waiting
+    /// send is never rerouted onto a different connection.
+    /// </param>
+    /// <param name="message">The fully built message — construction happens outside the gate.</param>
+    /// <param name="ct">
+    /// Honoured BOTH while waiting for the gate and during the underlying write. A pre-cancelled
+    /// or cancelled-while-waiting call writes nothing, cancels no other sender, and releases no
+    /// permit it never acquired.
+    /// </param>
+    /// <remarks>
+    /// The permit is released in <c>finally</c> AFTER a successful acquisition only — including
+    /// when the underlying write fails synchronously or asynchronously, or is cancelled — so the
+    /// next caller stays usable whenever the stream itself is still usable. Failures propagate
+    /// unchanged to the caller's existing logging/handling: a failed write is never swallowed,
+    /// retried or converted into success. The gate is NOT held across a <c>ToolCallResponse</c>
+    /// await or an assignment drain, and unary RPCs (heartbeat, session, provisioning) plus the
+    /// response reader stay entirely outside it.
+    /// </remarks>
+    private async Task SendAsync(
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId,
+        WorkerMessage message,
         CancellationToken ct)
     {
-        await stream.RequestStream.WriteAsync(new WorkerMessage
+        await _sendGate.WaitAsync(ct);
+        try
+        {
+            await stream.RequestStream.WriteAsync(message, ct);
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    private Task SendWorkerReady(
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        string assignedId,
+        CancellationToken ct) =>
+        SendAsync(stream, new WorkerMessage
         {
             WorkerId = assignedId,
             Ready = new WorkerReady(),
         }, ct);
-    }
 
     private async Task RunHeartbeatAsync(
         HiveOrchestrator.HiveOrchestratorClient client,
