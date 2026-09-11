@@ -1640,4 +1640,356 @@ public sealed class CopilotHiveDbContextTests
             DeleteDbFiles(dbPath);
         }
     }
+
+    // ── 13. completion_receipts (fresh schema, upgrade path, timestamps, no cascades) ──
+
+    /// <summary>
+    /// Fresh database: <c>EnsureCreated</c> must produce <c>completion_receipts</c> with EXACTLY the
+    /// columns <c>task_id</c>, <c>goal_id</c>, <c>payload_json</c>, <c>first_stored_at_utc</c>,
+    /// with <c>task_id</c> as the single-column PRIMARY KEY — no extra columns, no surrogate key,
+    /// and no FK to the pipelines/task-mapping tables.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the <see cref="CompletionReceiptEntity"/> mapping (the
+    /// <c>ConfigureCompletionReceipt</c> call), rename any column mapping, or change the
+    /// <c>HasKey</c> to a different/composite key, and one of the assertions below fails.
+    /// </remarks>
+    [Fact]
+    public void EnsureCreated_CompletionReceiptsTable_HasExactColumnsAndTaskIdPrimaryKey()
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        Assert.Contains("completion_receipts", GetAllTableNames(conn));
+
+        // EXACT column set — no extra columns beyond the four mapped ones.
+        var columns = GetTableColumns(conn, "completion_receipts");
+        Assert.Equal(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "task_id", "goal_id", "payload_json", "first_stored_at_utc",
+            },
+            columns);
+
+        // PRIMARY KEY is exactly task_id, single-column, from the table (not an auto-index).
+        Assert.Equal("task_id", GetPrimaryKeyColumn(conn, "completion_receipts"));
+
+        // NO foreign keys from completion_receipts to any other table.
+        Assert.Empty(GetForeignKeys(conn, "completion_receipts"));
+    }
+
+    /// <summary>
+    /// Reads the PRIMARY KEY column(s) of a table directly from <c>PRAGMA table_info</c>
+    /// (column index 5 is the 1-based pk ordinal; 0 means "not part of the PK").
+    /// </summary>
+    private static List<string> GetPrimaryKeyColumns(SqliteConnection conn, string tableName)
+    {
+        var pkColumns = new List<string>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{tableName}\")";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (reader.GetInt32(5) > 0)
+                pkColumns.Add(reader.GetString(1));
+        }
+        // Deterministic ordering for the single-column key comparisons.
+        pkColumns.Sort(StringComparer.OrdinalIgnoreCase);
+        return pkColumns;
+    }
+
+    private static string GetPrimaryKeyColumn(SqliteConnection conn, string tableName)
+    {
+        var pk = GetPrimaryKeyColumns(conn, tableName);
+        Assert.Single(pk);
+        return pk[0];
+    }
+
+    /// <summary>
+    /// Upgrade path: an EXISTING file-backed database whose schema predates
+    /// <c>completion_receipts</c> gains the table ADDITIVELY through
+    /// <see cref="DatabaseMigration.EnsureSchemaUpToDate"/>, every pre-existing row survives, and a
+    /// SECOND run is idempotent — no duplicate table, no duplicate column, no data loss, and a
+    /// receipt written between the two runs is not wiped.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the <see cref="CompletionReceiptEntity"/> mapping and the generated
+    /// CREATE script no longer carries the table, so the post-reconcile
+    /// <c>Assert.Contains("completion_receipts", …)</c> fails.
+    /// </remarks>
+    [Fact]
+    public void EnsureSchema_ExistingFileBackedDb_CreatesCompletionReceiptsTableAdditively_AndIsIdempotent()
+    {
+        var dbPath = NewTempDbPath("receipt-reconcile");
+        try
+        {
+            // ── Arrange: a REAL database FILE with a legacy pipelines row but NO receipt table. ──
+            using (var seedConnection = OpenFileConnection(dbPath))
+            {
+                ExecuteDirect(seedConnection, LegacyPipelinesDdlWithoutRegistryColumn);
+                ExecuteDirect(seedConnection,
+                    """
+                    INSERT INTO pipelines (goal_id, description, goal_json, created_at)
+                    VALUES ('receipt-legacy-1', 'Legacy pipeline', '{"id":"receipt-legacy-1"}',
+                            '2025-06-01T10:00:00.0000000Z')
+                    """);
+
+                // PRECONDITION (anti-vacuous): the table genuinely does not exist yet.
+                Assert.DoesNotContain("completion_receipts", GetAllTableNames(seedConnection));
+            }
+
+            // ── Act: the FIRST reconciliation, on a fresh connection to the same file. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            // ── Assert: the table exists with the exact mapping; legacy data survived. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                Assert.Contains("completion_receipts", GetAllTableNames(connection));
+                Assert.Equal("task_id", GetPrimaryKeyColumn(connection, "completion_receipts"));
+                Assert.Equal(
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "task_id", "goal_id", "payload_json", "first_stored_at_utc",
+                    },
+                    GetTableColumns(connection, "completion_receipts"));
+
+                // The pre-existing pipeline row survived the additive migration.
+                Assert.Equal("Legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'receipt-legacy-1'"));
+
+                // A receipt written NOW must survive the second reconciliation below.
+                ExecuteDirect(connection,
+                    """
+                    INSERT INTO completion_receipts (task_id, goal_id, payload_json, first_stored_at_utc)
+                    VALUES ('task-between-runs', 'receipt-legacy-1', '{"v":1}', '2025-06-02T12:00:00.0000000Z')
+                    """);
+            }
+
+            // ── Act: the SECOND reconciliation — must be a no-op for this table. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                // Exactly ONE table of that name (never a duplicate).
+                Assert.Equal(1, CountTableOccurrences(connection, "completion_receipts"));
+
+                // Still the exact column set — the second run added no duplicate columns.
+                Assert.Equal(
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "task_id", "goal_id", "payload_json", "first_stored_at_utc",
+                    },
+                    GetTableColumns(connection, "completion_receipts"));
+
+                // No data loss: the between-runs receipt is still there, byte-exact.
+                Assert.Equal("""{"v":1}""",
+                    ScalarOn(connection, "SELECT payload_json FROM completion_receipts WHERE task_id = 'task-between-runs'"));
+
+                // And the legacy pipeline row is STILL intact after both runs.
+                Assert.Equal("Legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'receipt-legacy-1'"));
+            }
+        }
+        finally
+        {
+            DeleteDbFiles(dbPath);
+        }
+    }
+
+    /// <summary>Counts how many times a table name appears in sqlite_master (duplicate detection).</summary>
+    private static int CountTableOccurrences(SqliteConnection connection, string tableName)
+    {
+        var count = 0;
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table'";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(0), tableName, StringComparison.OrdinalIgnoreCase))
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Timestamp round-trip: an explicit entity insert then readback from a FRESH context,
+    /// covering all three <see cref="DateTimeKind"/> values on <see cref="CompletionReceiptEntity.FirstStoredAtUtc"/>.
+    /// Utc stays unchanged; Local is converted to UTC; Unspecified is treated as UTC without
+    /// changing ticks. Every fresh readback carries <see cref="DateTimeKind.Utc"/>.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: remove the <c>HasConversion(DateTimeToIsoConverter)</c> on
+    /// <c>FirstStoredAtUtc</c> and EF's default storage kicks in — the raw TEXT companion test
+    /// below no longer sees the canonical "O"-format string, and the Unspecified case stops being
+    /// normalized (its Kind would not read back as Utc).
+    /// </remarks>
+    [Theory]
+    [InlineData(DateTimeKind.Utc)]
+    [InlineData(DateTimeKind.Local)]
+    [InlineData(DateTimeKind.Unspecified)]
+    public void CompletionReceipts_FirstStoredAtUtc_RoundTripsAllKinds_AsCanonicalUtc(DateTimeKind kind)
+    {
+        var utcBase = new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc)
+            .AddMilliseconds(123).AddTicks(4); // sub-millisecond precision is preserved
+        var written = kind switch
+        {
+            DateTimeKind.Utc => utcBase,
+            DateTimeKind.Local => utcBase.ToLocalTime(),
+            _ => DateTime.SpecifyKind(utcBase, DateTimeKind.Unspecified),
+        };
+
+        // One open in-memory connection shared by BOTH contexts, so the fresh context reads
+        // the same database rather than its own empty :memory: database.
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        using (var ctx = new CopilotHiveDbContext(options))
+        {
+            ctx.Database.EnsureCreated();
+
+            ctx.CompletionReceipts.Add(new CompletionReceiptEntity
+            {
+                TaskId = $"task-kind-{(int)kind}",
+                GoalId = "goal-ts-1",
+                PayloadJson = """{"v":1}""",
+                FirstStoredAtUtc = written,
+            });
+            ctx.SaveChanges();
+        }
+
+        // A FRESH context — no shared change tracker, no shared entity instances.
+        using (var ctx = new CopilotHiveDbContext(options))
+        {
+            var read = ctx.CompletionReceipts.Single(r => r.TaskId == $"task-kind-{(int)kind}");
+
+            Assert.Equal(DateTimeKind.Utc, read.FirstStoredAtUtc.Kind);
+            Assert.Equal(utcBase, read.FirstStoredAtUtc);
+            Assert.Equal(utcBase.Ticks, read.FirstStoredAtUtc.Ticks);
+        }
+    }
+
+    /// <summary>
+    /// The raw persisted TEXT for <c>first_stored_at_utc</c> is invariant-"O" with EXACTLY seven
+    /// fractional digits and a trailing 'Z' — proven for all three <see cref="DateTimeKind"/>
+    /// writes (Utc unchanged, Local converted, Unspecified treated as UTC).
+    /// </summary>
+    [Theory]
+    [InlineData(DateTimeKind.Utc, "2025-06-15T10:30:00.1230004Z")]
+    [InlineData(DateTimeKind.Local, "2025-06-15T10:30:00.1230004Z")]
+    [InlineData(DateTimeKind.Unspecified, "2025-06-15T10:30:00.1230004Z")]
+    public void CompletionReceipts_FirstStoredAtUtc_PersistedTextIsInvariantOWithSevenFractionDigitsAndZ(
+        DateTimeKind kind, string expected)
+    {
+        var utcBase = new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc)
+            .AddMilliseconds(123).AddTicks(4);
+        var written = kind switch
+        {
+            DateTimeKind.Utc => utcBase,
+            DateTimeKind.Local => utcBase.ToLocalTime(),
+            _ => DateTime.SpecifyKind(utcBase, DateTimeKind.Unspecified),
+        };
+
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        ctx.CompletionReceipts.Add(new CompletionReceiptEntity
+        {
+            TaskId = $"task-text-{(int)kind}",
+            GoalId = "goal-ts-2",
+            PayloadJson = """{"v":1}""",
+            FirstStoredAtUtc = written,
+        });
+        ctx.SaveChanges();
+
+        var stored = (string?)ScalarOn(conn,
+            $"SELECT first_stored_at_utc FROM completion_receipts WHERE task_id = 'task-text-{(int)kind}'");
+
+        Assert.NotNull(stored);
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$", stored);
+        Assert.Equal(expected, stored);
+    }
+
+    /// <summary>
+    /// NO cascade deletion: <c>completion_receipts</c> has no FK to the pipelines or task-mappings
+    /// tables, so removing a pipeline row and/or a task-mapping row must NOT delete the receipt.
+    /// Proven behaviorally — delete each parent, then re-read the receipt from a FRESH context.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: adding an FK relationship (e.g. a cascade from pipelines or task_mappings) in
+    /// the model makes SQLite's ON DELETE CASCADE fire and the fresh-context re-read returns null.
+    /// </remarks>
+    [Fact]
+    public void CompletionReceipts_SurvivePipelineAndTaskMappingDeletions_NoCascade()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var ctx = ContextOn(connection))
+        {
+            ctx.Database.EnsureCreated();
+
+            ctx.Pipelines.Add(new PipelineEntity
+            {
+                GoalId = "goal-cascade-1",
+                Description = "cascade parent",
+                GoalJson = """{"id":"goal-cascade-1"}""",
+                Phase = "Coding",
+                MetricsJson = "{}",
+                RoleSessionsJson = "{}",
+                PhaseOutputs = "{}",
+                CreatedAt = "2025-06-15T10:00:00.0000000Z",
+                PhaseOccurrence = 1,
+            });
+            ctx.TaskMappings.Add(new TaskMappingEntity { TaskId = "task-cascade-1", GoalId = "goal-cascade-1" });
+            ctx.CompletionReceipts.Add(new CompletionReceiptEntity
+            {
+                TaskId = "task-cascade-1",
+                GoalId = "goal-cascade-1",
+                PayloadJson = """{"v":1,"task":"task-cascade-1"}""",
+                FirstStoredAtUtc = new DateTime(2025, 6, 15, 11, 0, 0, DateTimeKind.Utc),
+            });
+            ctx.SaveChanges();
+        }
+
+        // Delete the pipeline row…
+        using (var ctx = ContextOn(connection))
+        {
+            var pipeline = ctx.Pipelines.Find("goal-cascade-1");
+            Assert.NotNull(pipeline);
+            ctx.Pipelines.Remove(pipeline!);
+            ctx.SaveChanges();
+        }
+
+        // …then the task-mapping row — each independently.
+        using (var ctx = ContextOn(connection))
+        {
+            var mapping = ctx.TaskMappings.Find("task-cascade-1");
+            Assert.NotNull(mapping);
+            ctx.TaskMappings.Remove(mapping!);
+            ctx.SaveChanges();
+        }
+
+        // THE RECEIPT SURVIVES BOTH DELETIONS — re-read from a fresh context.
+        using (var ctx = ContextOn(connection))
+        {
+            var receipt = ctx.CompletionReceipts.Find("task-cascade-1");
+            Assert.NotNull(receipt);
+            Assert.Equal("goal-cascade-1", receipt!.GoalId);
+            Assert.Equal("""{"v":1,"task":"task-cascade-1"}""", receipt.PayloadJson);
+            Assert.Equal(new DateTime(2025, 6, 15, 11, 0, 0, DateTimeKind.Utc), receipt.FirstStoredAtUtc);
+
+            // And the schema really carries no FK from completion_receipts.
+            Assert.Empty(GetForeignKeys(connection, "completion_receipts"));
+        }
+    }
 }
