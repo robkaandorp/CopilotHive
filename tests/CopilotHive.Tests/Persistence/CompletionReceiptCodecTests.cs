@@ -277,6 +277,36 @@ public sealed class CompletionReceiptCodecTests
     }
 
     [Fact]
+    public void RoundTrip_EmptyOutput_PreservesItIndependentlyFromNonemptySummary()
+    {
+        const string summary = "summary-must-remain-nonempty";
+        var text = CompletionReceiptCodec.Encode(
+            Make(metrics: FullMetrics(), output: "", summary: summary));
+        var decoded = CompletionReceiptCodec.Decode(text);
+
+        Assert.Equal("", decoded.Result.Output);
+        Assert.Equal(summary, decoded.Result.Metrics!.Summary);
+        Assert.Contains("\"output\":\"\"", text, StringComparison.Ordinal);
+        Assert.Contains($"\"summary\":\"{summary}\"", text, StringComparison.Ordinal);
+        Assert.Equal(text, CompletionReceiptCodec.Encode(decoded), StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public void RoundTrip_EmptySummary_PreservesItIndependentlyFromNonemptyOutput()
+    {
+        const string output = "output-must-remain-nonempty";
+        var text = CompletionReceiptCodec.Encode(
+            Make(metrics: FullMetrics(), output: output, summary: ""));
+        var decoded = CompletionReceiptCodec.Decode(text);
+
+        Assert.Equal(output, decoded.Result.Output);
+        Assert.Equal("", decoded.Result.Metrics!.Summary);
+        Assert.Contains($"\"output\":\"{output}\"", text, StringComparison.Ordinal);
+        Assert.Contains("\"summary\":\"\"", text, StringComparison.Ordinal);
+        Assert.Equal(text, CompletionReceiptCodec.Encode(decoded), StringComparer.Ordinal);
+    }
+
+    [Fact]
     public void RoundTrip_NullVersusEmptySha_StaysDistinct()
     {
         var withNull = CompletionReceiptCodec.Decode(CompletionReceiptCodec.Encode(Make(sha: null)));
@@ -369,6 +399,84 @@ public sealed class CompletionReceiptCodecTests
         Assert.Equal(["source-a.cs", "source-b.cs", "source-mutated.cs"], source.Result.GitStatus.ChangedFiles);
         Assert.Equal(["source-i1", "source-i2"], second.Result.Metrics.Issues);
         Assert.Equal(["source-a.cs", "source-b.cs"], second.Result.GitStatus.ChangedFiles);
+    }
+
+    /// <summary>
+    /// THE ENCODE-BOUNDARY RACE PROOF for EVERY caller-owned collection the encoder reads. The
+    /// custom list hooks <see cref="ICollection{T}.CopyTo"/>: it copies the original values into the
+    /// encoder's private snapshot, signals that the detach has completed, then blocks. While Encode
+    /// is still in progress the test mutates the caller's source list (a null issue, or an unpaired
+    /// surrogate path), then releases the copy. Validation and writing must use only the already
+    /// detached values, producing the same canonical text as an independent safe candidate.
+    /// </summary>
+    [Theory]
+    [InlineData("issues")]
+    [InlineData("changedFiles")]
+    public async Task Encode_MutationAfterPrivateCollectionCopy_CannotChangeOrCorruptPayload(string collection)
+    {
+        var hooked = new CopyGateList(["safe-first", "safe-second"]);
+        var metrics = FullMetrics() with
+        {
+            Issues = collection == "issues" ? hooked : ["safe-first", "safe-second"],
+        };
+        var git = Git() with
+        {
+            ChangedFiles = collection == "changedFiles" ? hooked : ["safe-first", "safe-second"],
+        };
+        var receipt = Make(metrics: metrics, gitStatus: git, sha: "detach-sha");
+        var expected = CompletionReceiptCodec.Encode(Make(
+            metrics: FullMetrics() with { Issues = ["safe-first", "safe-second"] },
+            gitStatus: Git() with { ChangedFiles = ["safe-first", "safe-second"] },
+            sha: "detach-sha"));
+
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var encoding = Task.Run(() => CompletionReceiptCodec.Encode(receipt), cancellationToken);
+        try
+        {
+            Assert.True(hooked.CopyCompleted.Wait(TimeSpan.FromSeconds(10), cancellationToken),
+                $"Encode never copied caller-owned {collection}; detach boundary was not reached.");
+
+            // The mutation is legal caller activity and occurs AFTER the private copy completed but
+            // BEFORE Encode can validate/write. Each injected value would be refused/coerced if the
+            // caller list were read again.
+            if (collection == "issues")
+                hooked.Add(null!);
+            else
+                hooked.Add("injected-" + '\uD800');
+        }
+        finally
+        {
+            hooked.ReleaseCopy.Set();
+        }
+
+        var actual = await encoding.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+        Assert.Equal(expected, actual, StringComparer.Ordinal);
+        Assert.Equal(3, hooked.Count); // proves the caller-side mutation actually happened
+
+        var decoded = CompletionReceiptCodec.Decode(actual);
+        Assert.Equal(["safe-first", "safe-second"], decoded.Result.Metrics!.Issues);
+        Assert.Equal(["safe-first", "safe-second"], decoded.Result.GitStatus!.ChangedFiles);
+        Assert.DoesNotContain("injected", actual, StringComparison.Ordinal);
+        Assert.DoesNotContain("�", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A deterministic seam into <c>new List&lt;string&gt;(source)</c>. Re-implementing the
+    /// ICollection interface makes the List copy constructor call this hook even though the domain
+    /// property itself is typed as List&lt;string&gt;.
+    /// </summary>
+    private sealed class CopyGateList(IEnumerable<string> values) : List<string>(values), ICollection<string>
+    {
+        internal ManualResetEventSlim CopyCompleted { get; } = new(false);
+        internal ManualResetEventSlim ReleaseCopy { get; } = new(false);
+
+        void ICollection<string>.CopyTo(string[] array, int arrayIndex)
+        {
+            base.CopyTo(array, arrayIndex);
+            CopyCompleted.Set();
+            if (!ReleaseCopy.Wait(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("Test did not release the detached list copy.");
+        }
     }
 
     // ── 3. Non-finite coverage ────────────────────────────────────────────
@@ -1183,18 +1291,20 @@ public sealed class CompletionReceiptCodecTests
     public void Decode_UnpairedSurrogateEscapesInResultAndNestedEvidence_AreRefused_NotRepaired()
     {
         var canonical = Canonical();
-        foreach (var (original, malformed) in new[]
+        foreach (var (original, malformed, isolatedEscape) in new[]
                  {
-                     ("\"output\":\"out\"", "\"output\":\"\\uD800\""),
-                     ("\"summary\":\"sum\"", "\"summary\":\"\\uD800\""),
-                     ("\"issues\":[\"i1\",\"i2\"]", "\"issues\":[\"\\uD800\",\"i2\"]"),
+                     ("\"output\":\"out\"", "\"output\":\"\\uD800\"", "\\uD800"),
+                     // Independent LOW-surrogate decode vector — not satisfied by encode-side checks.
+                     ("\"output\":\"out\"", "\"output\":\"\\uDC00\"", "\\uDC00"),
+                     ("\"summary\":\"sum\"", "\"summary\":\"\\uD800\"", "\\uD800"),
+                     ("\"issues\":[\"i1\",\"i2\"]", "\"issues\":[\"\\uD800\",\"i2\"]", "\\uD800"),
                      ("\"changedFiles\":[\"a.cs\",\"b.cs\"]",
-                         "\"changedFiles\":[\"\\uD800\",\"b.cs\"]"),
+                         "\"changedFiles\":[\"\\uD800\",\"b.cs\"]", "\\uD800"),
                  })
         {
             var malformedPayload = canonical.Replace(original, malformed, StringComparison.Ordinal);
             Assert.NotEqual(canonical, malformedPayload, StringComparer.Ordinal);
-            Assert.Contains("\\uD800", malformedPayload, StringComparison.Ordinal);
+            Assert.Contains(isolatedEscape, malformedPayload, StringComparison.Ordinal);
             Assert.Throws<CompletionReceiptCodecException>(
                 () => CompletionReceiptCodec.Decode(malformedPayload));
         }

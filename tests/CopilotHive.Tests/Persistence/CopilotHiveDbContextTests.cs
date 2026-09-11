@@ -14,6 +14,7 @@ namespace CopilotHive.Tests.Persistence;
 /// Tests for <see cref="CopilotHiveDbContext"/> verifying entity mappings, value converters,
 /// enum storage format, JSON round-tripping, and schema compatibility with existing SQL stores.
 /// </summary>
+[Collection("EnvVarMutation")]
 public sealed class CopilotHiveDbContextTests
 {
     // ── Helper ────────────────────────────────────────────────────────────
@@ -595,9 +596,9 @@ public sealed class CopilotHiveDbContextTests
     private sealed record ForeignKeyInfo(string FromColumn, string ToTable, string ToColumn, string OnDelete, string OnUpdate);
 
     /// <summary>
-    /// Represents a SQLite column's nullability and default value.
+    /// Represents a SQLite column's declared type, nullability and default value.
     /// </summary>
-    private sealed record ColumnInfo(bool NotNull, string? DefaultValue);
+    private sealed record ColumnInfo(string DeclaredType, bool NotNull, string? DefaultValue);
 
     private static Dictionary<string, string> GetTableDefaults(SqliteConnection conn, string tableName)
     {
@@ -623,9 +624,10 @@ public sealed class CopilotHiveDbContextTests
         while (reader.Read())
         {
             var name = reader.GetString(1);
+            var declaredType = reader.GetString(2);
             var notNull = reader.GetInt32(3) == 1;
             var dflt = reader.IsDBNull(4) ? null : reader.GetString(4);
-            columns[name] = new ColumnInfo(notNull, dflt);
+            columns[name] = new ColumnInfo(declaredType, notNull, dflt);
         }
         return columns;
     }
@@ -1674,8 +1676,51 @@ public sealed class CopilotHiveDbContextTests
         // PRIMARY KEY is exactly task_id, single-column, from the table (not an auto-index).
         Assert.Equal("task_id", GetPrimaryKeyColumn(conn, "completion_receipts"));
 
+        // SQLite storage contract: all four values have TEXT affinity; every payload column is
+        // database-enforced NOT NULL (not merely a C# nullable annotation).
+        AssertCompletionReceiptColumnContract(conn);
+
         // NO foreign keys from completion_receipts to any other table.
         Assert.Empty(GetForeignKeys(conn, "completion_receipts"));
+    }
+
+    private static void AssertCompletionReceiptColumnContract(SqliteConnection connection)
+    {
+        var info = GetTableColumnInfo(connection, "completion_receipts");
+        Assert.Equal(4, info.Count);
+        foreach (var column in new[] { "task_id", "goal_id", "payload_json", "first_stored_at_utc" })
+            Assert.Equal("TEXT", info[column].DeclaredType.ToUpperInvariant());
+
+        Assert.True(info["goal_id"].NotNull);
+        Assert.True(info["payload_json"].NotNull);
+        Assert.True(info["first_stored_at_utc"].NotNull);
+    }
+
+    [Theory]
+    [InlineData("goal_id")]
+    [InlineData("payload_json")]
+    [InlineData("first_stored_at_utc")]
+    public void EnsureCreated_CompletionReceiptRequiredColumns_RejectRawSqlNull(string nullColumn)
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var connection = GetSqliteConnection(ctx);
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO completion_receipts (task_id, goal_id, payload_json, first_stored_at_utc)
+            VALUES ($task, $goal, $payload, $stored)
+            """;
+        command.Parameters.AddWithValue("$task", "null-contract-" + nullColumn);
+        command.Parameters.AddWithValue("$goal", nullColumn == "goal_id" ? DBNull.Value : "g1");
+        command.Parameters.AddWithValue("$payload", nullColumn == "payload_json" ? DBNull.Value : "{}");
+        command.Parameters.AddWithValue("$stored",
+            nullColumn == "first_stored_at_utc" ? DBNull.Value : "2025-01-01T00:00:00.0000000Z");
+
+        var ex = Assert.Throws<SqliteException>(() => command.ExecuteNonQuery());
+        Assert.Equal(19, ex.SqliteErrorCode); // SQLITE_CONSTRAINT
+        Assert.Contains("NOT NULL constraint failed", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0L, ScalarOn(connection, "SELECT COUNT(*) FROM completion_receipts"));
     }
 
     /// <summary>
@@ -1756,6 +1801,7 @@ public sealed class CopilotHiveDbContextTests
                         "task_id", "goal_id", "payload_json", "first_stored_at_utc",
                     },
                     GetTableColumns(connection, "completion_receipts"));
+                AssertCompletionReceiptColumnContract(connection);
 
                 // The pre-existing pipeline row survived the additive migration.
                 Assert.Equal("Legacy pipeline",
@@ -1788,6 +1834,7 @@ public sealed class CopilotHiveDbContextTests
                         "task_id", "goal_id", "payload_json", "first_stored_at_utc",
                     },
                     GetTableColumns(connection, "completion_receipts"));
+                AssertCompletionReceiptColumnContract(connection);
 
                 // No data loss: the between-runs receipt is still there, byte-exact.
                 Assert.Equal("""{"v":1}""",
@@ -1876,6 +1923,61 @@ public sealed class CopilotHiveDbContextTests
             Assert.Equal(DateTimeKind.Utc, read.FirstStoredAtUtc.Kind);
             Assert.Equal(utcBase, read.FirstStoredAtUtc);
             Assert.Equal(utcBase.Ticks, read.FirstStoredAtUtc.Ticks);
+        }
+    }
+
+    /// <summary>
+    /// Offset-sensitive proof for the Local branch. The process timezone is temporarily isolated to
+    /// UTC-07:00, making <c>ToUniversalTime</c> change ticks by seven hours. A mutant that merely
+    /// relabels Local ticks as Utc therefore persists 12:34 rather than the required 19:34.
+    /// </summary>
+    [Fact]
+    public void CompletionReceipts_FirstStoredAtUtc_LocalInputUsesOffsetConversion_NotKindRelabeling()
+    {
+        var originalTz = Environment.GetEnvironmentVariable("TZ");
+        try
+        {
+            Environment.SetEnvironmentVariable("TZ", "Etc/GMT+7");
+            TimeZoneInfo.ClearCachedData();
+
+            var local = new DateTime(2025, 1, 15, 12, 34, 56, DateTimeKind.Local).AddTicks(7);
+            Assert.Equal(TimeSpan.FromHours(-7), TimeZoneInfo.Local.GetUtcOffset(local));
+            var expectedUtc = local.ToUniversalTime();
+            Assert.Equal(new DateTime(2025, 1, 15, 19, 34, 56, DateTimeKind.Utc).AddTicks(7), expectedUtc);
+            Assert.NotEqual(local.Ticks, expectedUtc.Ticks); // anti-vacuous: conversion changes the instant's ticks
+
+            var connection = new SqliteConnection("Data Source=:memory:");
+            connection.Open();
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(connection)
+                .Options;
+
+            using (var writeContext = new CopilotHiveDbContext(options))
+            {
+                writeContext.Database.EnsureCreated();
+                writeContext.CompletionReceipts.Add(new CompletionReceiptEntity
+                {
+                    TaskId = "task-offset-local",
+                    GoalId = "goal-offset-local",
+                    PayloadJson = "{}",
+                    FirstStoredAtUtc = local,
+                });
+                writeContext.SaveChanges();
+            }
+
+            Assert.Equal("2025-01-15T19:34:56.0000007Z", ScalarOn(connection,
+                "SELECT first_stored_at_utc FROM completion_receipts WHERE task_id = 'task-offset-local'"));
+
+            using var readContext = new CopilotHiveDbContext(options);
+            var read = readContext.CompletionReceipts.Single(r => r.TaskId == "task-offset-local");
+            Assert.Equal(DateTimeKind.Utc, read.FirstStoredAtUtc.Kind);
+            Assert.Equal(expectedUtc, read.FirstStoredAtUtc);
+            Assert.Equal(expectedUtc.Ticks, read.FirstStoredAtUtc.Ticks);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TZ", originalTz);
+            TimeZoneInfo.ClearCachedData();
         }
     }
 
