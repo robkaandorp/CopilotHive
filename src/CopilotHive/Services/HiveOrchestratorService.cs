@@ -737,7 +737,19 @@ public sealed class HiveOrchestratorService(
 
     private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete)
     {
-        var completedTaskModel = taskQueue.GetActiveTask(complete.TaskId)?.Model;
+        // MODEL PROVENANCE SELECTION — performed BEFORE ApplyTaskCompletion removes the active
+        // task, because the fallback reads that entry.
+        //
+        // Field 7's explicit presence is the ONLY trustworthy signal:
+        //   * HasModel == true  → an upgraded sender reported the ORIGINAL ASSIGNED model. That
+        //     value wins unconditionally, EVEN when empty/whitespace and EVEN when the queue
+        //     disagrees. An explicit wire value is never overwritten by the volatile queue.
+        //   * HasModel == false → a legacy sender. Fall back to the queue's active task model,
+        //     which is empty when no active entry exists.
+        // Absence is never inferred from empty/whitespace content.
+        var completedTaskModel = complete.HasModel
+            ? complete.Model
+            : taskQueue.GetActiveTask(complete.TaskId)?.Model ?? "";
         logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status} (model={Model})",
             complete.TaskId, worker.Id, complete.Status,
             string.IsNullOrEmpty(completedTaskModel) ? "unknown" : completedTaskModel);
@@ -750,8 +762,9 @@ public sealed class HiveOrchestratorService(
         // pre-admission write here could clear a SUCCESSOR's live pointer and overwrite its phase
         // output on behalf of a duplicate completion that admission subsequently rejects.
 
-        // Convert to domain type at the boundary, injecting the model retrieved above
-        var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel ?? "" };
+        // Convert to domain type at the boundary, injecting the SAME selected model used for the
+        // log line above — never a second, independently derived value.
+        var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel };
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {

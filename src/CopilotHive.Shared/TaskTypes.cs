@@ -80,7 +80,19 @@ public sealed record TaskResult
     public TaskMetrics? Metrics { get; init; }
     /// <summary>Git diff statistics from the task execution.</summary>
     public GitChangeSummary? GitStatus { get; init; }
-    /// <summary>Optional model ID for the task that produced this result.</summary>
+    /// <summary>
+    /// The ORIGINAL ASSIGNED model for the task that produced this result — carried VERBATIM
+    /// from the task assignment (never the runner's provider-stripped display value, an
+    /// environment default, or the actual provider response model). It is not trimmed or
+    /// normalized, so empty/whitespace values and provider prefixes pass through unchanged.
+    /// A runtime-null assigned model is represented as the empty string, meaning
+    /// "unknown/empty assigned model".
+    /// <para>
+    /// The wire mapping always writes this value (an empty value is written with explicit
+    /// presence), so a completion is self-contained with respect to model provenance. This
+    /// does NOT enable replay or reconnect.
+    /// </para>
+    /// </summary>
     public string Model { get; init; } = "";
     /// <summary>
     /// HEAD SHA of the worker's feature-branch clone captured immediately before the coder agent ran.

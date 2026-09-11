@@ -65,7 +65,17 @@ public static class GrpcMapper
         return assignment;
     }
 
-    /// <summary>Converts a gRPC <see cref="TaskComplete"/> to a domain <see cref="TaskResult"/>.</summary>
+    /// <summary>
+    /// Converts a gRPC <see cref="TaskComplete"/> to a domain <see cref="TaskResult"/>.
+    /// <para>
+    /// The assigned <c>model</c> is copied VERBATIM. Field 7's presence bit is deliberately
+    /// NOT collapsed into the domain value here: absence and a present-but-empty value both
+    /// map to the domain empty default, and the RECEIVING transport keeps the protobuf
+    /// presence bit (<c>HasModel</c>) so it can still distinguish a legacy sender from an
+    /// upgraded sender that explicitly reports an unknown model. No nullable-domain or
+    /// presence-field migration is needed.
+    /// </para>
+    /// </summary>
     public static TaskResult ToDomain(TaskComplete complete)
     {
         return new TaskResult
@@ -81,6 +91,7 @@ public static class GrpcMapper
             Output = complete.Output,
             Metrics = complete.Metrics is not null ? ToDomain(complete.Metrics) : null,
             GitStatus = complete.GitStatus is not null ? ToDomain(complete.GitStatus) : null,
+            Model = complete.Model,
             IterationStartSha = string.IsNullOrEmpty(complete.IterationStartSha) ? null : complete.IterationStartSha,
         };
     }
@@ -179,7 +190,16 @@ public static class GrpcMapper
         };
     }
 
-    /// <summary>Converts a domain <see cref="TaskResult"/> to a gRPC <see cref="TaskComplete"/>.</summary>
+    /// <summary>
+    /// Converts a domain <see cref="TaskResult"/> to a gRPC <see cref="TaskComplete"/>.
+    /// <para>
+    /// The assigned <c>model</c> (field 7) is ALWAYS written, so every completion produced by
+    /// an upgraded worker has explicit presence. A runtime-null domain <c>Model</c> is
+    /// normalized to the empty string and still written, which means "upgraded sender,
+    /// assigned model unknown/empty" — never absence. All other completion fields keep their
+    /// existing mapping.
+    /// </para>
+    /// </summary>
     public static TaskComplete ToGrpc(TaskResult result)
     {
         var complete = new TaskComplete
@@ -193,6 +213,9 @@ public static class GrpcMapper
                 _ => throw new InvalidOperationException($"Unknown TaskOutcome: {result.Status}"),
             },
             Output = result.Output,
+            // ALWAYS set (even when empty): assigning the field sets proto3's explicit
+            // presence bit, which is what tells the receiver this is an upgraded sender.
+            Model = result.Model ?? "",
             IterationStartSha = result.IterationStartSha ?? "",
         };
         if (result.Metrics is not null)

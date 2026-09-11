@@ -965,13 +965,14 @@ public sealed class TaskExecutorTests
         }
     }
 
-    private static WorkTask BuildImproverTask(string id) => new()
+    private static WorkTask BuildImproverTask(string id, string model = "") => new()
     {
         TaskId = id,
         GoalId = $"goal-{id}",
         GoalDescription = "Improve the agents",
         Prompt = "Improve prompt",
         Role = WorkerRole.Improver,
+        Model = model,
         Repositories = [Repo("test-repo")],
     };
 
@@ -2602,7 +2603,8 @@ public sealed class TaskExecutorTests
         SeamProcessRunnerFake fake,
         MockGitOperations git,
         CancellationToken? ct = null,
-        MockAgentRunner? agentRunner = null)
+        MockAgentRunner? agentRunner = null,
+        string model = "")
     {
         var originalRunner = GitOperations.ProcessRunner;
         var originalOut = Console.Out;
@@ -2618,7 +2620,7 @@ public sealed class TaskExecutorTests
             var executor = new TaskExecutor(
                 agentRunner ?? new MockAgentRunner(), null, git, null, configRepoDir, seam);
             var result = await executor.ExecuteAsync(
-                BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
+                BuildImproverTask(taskId, model), ct ?? TestContext.Current.CancellationToken);
 
             return (result, outWriter.ToString(), errWriter.ToString());
         }
@@ -2637,7 +2639,7 @@ public sealed class TaskExecutorTests
     /// </summary>
     private static async Task<(TaskResult Result, string Stdout, string Stderr)> RunImproverLegacyAsync(
         string taskId, string configRepoDir, MockGitOperations git, CancellationToken? ct = null,
-        MockAgentRunner? agentRunner = null)
+        MockAgentRunner? agentRunner = null, string model = "")
     {
         var originalOut = Console.Out;
         var originalErr = Console.Error;
@@ -2651,7 +2653,7 @@ public sealed class TaskExecutorTests
             var executor = new TaskExecutor(
                 agentRunner ?? new MockAgentRunner(), gitOperations: git, configRepoDir: configRepoDir);
             var result = await executor.ExecuteAsync(
-                BuildImproverTask(taskId), ct ?? TestContext.Current.CancellationToken);
+                BuildImproverTask(taskId, model), ct ?? TestContext.Current.CancellationToken);
 
             return (result, outWriter.ToString(), errWriter.ToString());
         }
@@ -7716,6 +7718,99 @@ public sealed class TaskExecutorTests
     /// <summary>Counts the reset commands issued so far on the legacy mock.</summary>
     private static int CountResets(MockGitOperations git) =>
         git.GitCommands.Count(c => c.StartsWith("reset ", StringComparison.Ordinal));
+
+    /// <summary>
+    /// THE COMMON FINALIZED-RESULT RETURN BOUNDARY carries the ORIGINAL ASSIGNED model even when
+    /// the Improver finalization ADJUSTED the outcome: here a normal completion is downgraded to
+    /// Failed/FAIL by a cleanup failure, so the model must survive the composition rather than
+    /// only being stamped on a plain Completed result.
+    /// <para>
+    /// The value is asserted VERBATIM (leading/trailing whitespace and a provider prefix
+    /// included), proving the producer neither trims, normalizes, nor substitutes a display or
+    /// environment value. This reuses the existing cleanup-failure fake seam rather than
+    /// re-running the wider cleanup matrix.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ImproverCleanupAdjustedOutcome_CarriesAssignedModelVerbatim()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        const string assignedModel = "  copilot/claude-sonnet-4.6  ";
+        var resetCalls = 0;
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+            // Only the SECOND reset (the cleanup's) throws; the preparation's succeeds.
+            GitCommandThrower = args => args.StartsWith("reset --hard", StringComparison.Ordinal)
+                && ++resetCalls == 2
+                ? new InvalidOperationException("cleanup reset exploded")
+                : null,
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-model-after-cleanup", configRepoDir, git, model: assignedModel);
+
+        // The outcome really was ADJUSTED by the finalization — this is the composed path.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.Contains("[Config Repo Cleanup Failure]", result.Output, StringComparison.Ordinal);
+
+        // …and the assigned model came through the adjustment untouched.
+        Assert.Equal(assignedModel, result.Model);
+    }
+
+    /// <summary>
+    /// The model is populated at the COMMON boundary for a NON-Improver task as well — the
+    /// ordinary Completed return path — and a whitespace-only assigned model passes through
+    /// verbatim (never collapsed to empty, never trimmed).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhitespaceAssignedModel_PassesThroughVerbatim()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-blank-model", configRepoDir, git, model: "   ");
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("   ", result.Model);
+    }
+
+    /// <summary>
+    /// A runtime-NULL assigned model is represented as the domain empty string — the "unknown"
+    /// form — and never as a placeholder.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_NullAssignedModel_IsRepresentedAsEmpty()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, _) = await RunImproverLegacyAsync(
+            "improver-legacy-null-model", configRepoDir, git, model: null!);
+
+        Assert.Equal(TaskOutcome.Completed, result.Status);
+        Assert.Equal("", result.Model);
+    }
 
     /// <summary>
     /// A CLEANUP trust rejection — here a nonempty post-restore status (the protected

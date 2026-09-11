@@ -3,6 +3,8 @@ using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
+using Google.Protobuf;
+
 using Microsoft.Extensions.AI;
 
 using DomainBranchAction = CopilotHive.Services.BranchAction;
@@ -1018,5 +1020,189 @@ public sealed class GrpcMapperTests
         var restored = GrpcMapper.ToDomain(GrpcMapper.ToGrpc(original));
 
         Assert.Null(restored.ReasoningEffort);
+    }
+
+    // ── TaskComplete.model (field 7) ──────────────────────────────────────────
+    //
+    // These tests operate on ACTUAL protobuf bytes: every case serializes the produced
+    // TaskComplete and re-parses it with the generated parser, so presence (HasModel) is
+    // asserted on the decoded message rather than on the in-memory object the mapper built.
+    // A mapper that merely assigned a local property without the presence bit would fail here.
+
+    /// <summary>
+    /// The wire number is part of the cross-process contract: field 7 must not be renumbered,
+    /// and it must not collide with any of the pre-existing completion fields. Old/new
+    /// compatibility derives from additive optional protobuf semantics — not a handshake.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_UsesWireFieldNumberSevenWithoutRenumberingExistingFields()
+    {
+        Assert.Equal(7, TaskComplete.ModelFieldNumber);
+
+        int[] existing =
+        [
+            TaskComplete.TaskIdFieldNumber,
+            TaskComplete.StatusFieldNumber,
+            TaskComplete.OutputFieldNumber,
+            TaskComplete.GitStatusFieldNumber,
+            TaskComplete.MetricsFieldNumber,
+            TaskComplete.IterationStartShaFieldNumber,
+        ];
+
+        Assert.Equal([1, 2, 3, 4, 5, 6], existing);
+        Assert.DoesNotContain(TaskComplete.ModelFieldNumber, existing);
+    }
+
+    /// <summary>
+    /// The assignment's model is unchanged and stays on its own wire number — the completion's
+    /// new field must not have moved it.
+    /// </summary>
+    [Fact]
+    public void TaskAssignment_Model_WireFieldNumberIsUnchanged()
+    {
+        Assert.Equal(9, TaskAssignment.ModelFieldNumber);
+    }
+
+    /// <summary>
+    /// A NONEMPTY domain model is written, survives binary serialization, and decodes with the
+    /// value intact and presence set.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_NonemptyValue_RoundTripsWithPresence()
+    {
+        var original = BuildFullTaskResult() with { Model = "copilot/claude-sonnet-4.6" };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        Assert.True(complete.HasModel);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.True(decoded.HasModel);
+        Assert.Equal("copilot/claude-sonnet-4.6", decoded.Model);
+        Assert.Equal("copilot/claude-sonnet-4.6", GrpcMapper.ToDomain(decoded).Model);
+    }
+
+    /// <summary>
+    /// THE PRESENCE-CRITICAL CASE: an EMPTY domain model is still WRITTEN, so the serialized
+    /// bytes carry the presence bit and decode with <c>HasModel == true</c> and an empty value.
+    /// That is "upgraded sender, assigned model unknown/empty" — never absence.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_EmptyValue_IsWrittenAndDecodesWithPresence()
+    {
+        var original = BuildFullTaskResult() with { Model = "" };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        Assert.True(complete.HasModel);
+        Assert.Equal("", complete.Model);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.True(decoded.HasModel, "A present empty model must keep its explicit presence bit.");
+        Assert.Equal("", decoded.Model);
+        Assert.Equal("", GrpcMapper.ToDomain(decoded).Model);
+    }
+
+    /// <summary>
+    /// A runtime-NULL domain model is normalized to empty and STILL written, so it too has
+    /// explicit presence rather than being silently dropped from the wire.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_NullDomainValue_NormalizesToPresentEmpty()
+    {
+        var original = BuildFullTaskResult() with { Model = null! };
+        Assert.Null(original.Model);
+
+        var complete = GrpcMapper.ToGrpc(original);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.True(decoded.HasModel, "A normalized null model must still be a PRESENT (empty) value.");
+        Assert.Equal("", decoded.Model);
+        Assert.Equal("", GrpcMapper.ToDomain(decoded).Model);
+    }
+
+    /// <summary>
+    /// WHITESPACE is passed through VERBATIM — never trimmed or normalized into emptiness — and
+    /// still carries presence.
+    /// </summary>
+    [Theory]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    [InlineData("  copilot/gpt-5  ")]
+    public void TaskComplete_Model_WhitespaceValue_PassesThroughVerbatimWithPresence(string value)
+    {
+        var original = BuildFullTaskResult() with { Model = value };
+
+        var complete = GrpcMapper.ToGrpc(original);
+
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        Assert.True(decoded.HasModel);
+        Assert.Equal(value, decoded.Model);
+        Assert.Equal(value, GrpcMapper.ToDomain(decoded).Model);
+    }
+
+    /// <summary>
+    /// A LEGACY sender's message — field 7 never present, whether the bytes were produced by an
+    /// old writer that never knew the field or by an upgraded one that cleared it — decodes with
+    /// <c>HasModel == false</c> and maps to the domain empty default. Absence is a property of
+    /// the wire bytes, not of the value's content.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_LegacyAbsentField_DecodesWithoutPresence()
+    {
+        // A legacy message that never touched field 7.
+        var legacy = new TaskComplete
+        {
+            TaskId = "t",
+            Status = Shared.Grpc.TaskStatus.Completed,
+            Output = "done",
+        };
+        Assert.False(legacy.HasModel);
+
+        var decoded = TaskComplete.Parser.ParseFrom(legacy.ToByteArray());
+        Assert.False(decoded.HasModel, "Absent field 7 must stay absent after a binary round-trip.");
+        Assert.Equal("", decoded.Model);
+        Assert.Equal("", GrpcMapper.ToDomain(decoded).Model);
+
+        // And an explicitly cleared (present-then-removed) value is likewise absent.
+        var cleared = GrpcMapper.ToGrpc(BuildFullTaskResult() with { Model = "m" });
+        cleared.ClearModel();
+        var decodedCleared = TaskComplete.Parser.ParseFrom(cleared.ToByteArray());
+        Assert.False(decodedCleared.HasModel);
+    }
+
+    /// <summary>
+    /// ALL OTHER completion fields keep their existing mapping alongside the new model field, so
+    /// adding field 7 cannot have disturbed the pre-existing wire layout.
+    /// </summary>
+    [Fact]
+    public void TaskComplete_Model_DoesNotDisturbExistingFieldMapping()
+    {
+        const string sha = "abc123def456789012345678901234567890abcd";
+        var original = BuildFullTaskResult() with { Model = "model-x", IterationStartSha = sha };
+
+        var complete = GrpcMapper.ToGrpc(original);
+        var decoded = TaskComplete.Parser.ParseFrom(complete.ToByteArray());
+        var restored = GrpcMapper.ToDomain(decoded);
+
+        Assert.Equal(original.TaskId, restored.TaskId);
+        Assert.Equal(original.Status, restored.Status);
+        Assert.Equal(original.Output, restored.Output);
+        Assert.Equal(sha, restored.IterationStartSha);
+        Assert.Equal("model-x", restored.Model);
+
+        Assert.NotNull(restored.Metrics);
+        Assert.Equal(original.Metrics!.Verdict, restored.Metrics.Verdict);
+        Assert.Equal(original.Metrics.BuildSuccess, restored.Metrics.BuildSuccess);
+        Assert.Equal(original.Metrics.TotalTests, restored.Metrics.TotalTests);
+        Assert.Equal(original.Metrics.PassedTests, restored.Metrics.PassedTests);
+        Assert.Equal(original.Metrics.FailedTests, restored.Metrics.FailedTests);
+        Assert.Equal(original.Metrics.CoveragePercent, restored.Metrics.CoveragePercent);
+        Assert.Equal(original.Metrics.Issues, restored.Metrics.Issues);
+        Assert.Equal(original.Metrics.Summary, restored.Metrics.Summary);
+
+        Assert.NotNull(restored.GitStatus);
+        Assert.Equal(original.GitStatus!.FilesChanged, restored.GitStatus.FilesChanged);
+        Assert.Equal(original.GitStatus.Insertions, restored.GitStatus.Insertions);
+        Assert.Equal(original.GitStatus.Deletions, restored.GitStatus.Deletions);
+        Assert.Equal(original.GitStatus.Pushed, restored.GitStatus.Pushed);
     }
 }

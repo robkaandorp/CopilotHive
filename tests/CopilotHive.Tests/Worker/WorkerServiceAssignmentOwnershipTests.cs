@@ -929,6 +929,13 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         return new DrainEntryObservation(entered.Task, producer);
     }
 
+    /// <summary>
+    /// The ORIGINAL ASSIGNED model carried by every retention assignment. Nonempty on purpose:
+    /// the completion must be self-contained with respect to model provenance, so an executor
+    /// that still left <c>Model</c> empty (or that used any other source) is caught by name.
+    /// </summary>
+    private const string RetentionAssignedModel = "model-retention";
+
     private static OrchestratorMessage ResultAssignment(string taskId) => new()
     {
         Assignment = new TaskAssignment
@@ -938,9 +945,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             GoalDescription = "retain complete result",
             Prompt = "produce a complete result",
             Role = GrpcWorkerRole.Tester,
-            Model = "model-retention",
+            Model = RetentionAssignedModel,
         },
     };
+
+    /// <summary>
+    /// The model EXPECTED on the retained result and on the wire, read from the INPUT ASSIGNMENT
+    /// the loop is driven with — never copied from an observed output and never taken from a
+    /// mapper-only object.
+    /// </summary>
+    private static string AssignedModel(string taskId) =>
+        ResultAssignment(taskId).Assignment.Model;
 
     private static OrchestratorMessage Probe(string requestId) => new()
     {
@@ -956,8 +971,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// The EXACT terminal result the real executor chain produces for <paramref name="outcome"/>.
     /// Mirrors <c>TaskExecutor</c>'s own composition for each boundary, so the wire-payload
     /// comparison below is a byte-for-byte identity check against the pre-existing mapping.
+    /// <para>
+    /// The model comes from the INPUT ASSIGNMENT (never from an observed output), so the wire
+    /// identity check also proves the producer populated it from the assignment.
+    /// </para>
     /// </summary>
-    private static TaskResult ExpectedResult(string taskId, RetainedOutcome outcome) => outcome switch
+    private static TaskResult ExpectedResult(string taskId, RetainedOutcome outcome) =>
+        ExpectedOutcome(taskId, outcome) with { Model = AssignedModel(taskId) };
+
+    private static TaskResult ExpectedOutcome(string taskId, RetainedOutcome outcome) => outcome switch
     {
         RetainedOutcome.Completed => new TaskResult
         {
@@ -1022,7 +1044,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         Assert.Equal(expected.Status, actual.Status);
         Assert.Equal(expected.Output, actual.Output);
         Assert.Null(actual.IterationStartSha);
-        Assert.Equal(string.Empty, actual.Model);
+        // The ORIGINAL ASSIGNED model travels with the completion. The expected value is read
+        // from the input assignment, so this cannot pass by copying the observed output.
+        Assert.Equal(AssignedModel(taskId), actual.Model);
 
         var metrics = Assert.IsType<DomainTaskMetrics>(actual.Metrics);
         var expectedMetrics = expected.Metrics!;
@@ -1074,6 +1098,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var expected = GrpcMapper.ToGrpc(ExpectedResult(taskId, outcome));
         Assert.Equal(expected.ToByteArray(), actual.ToByteArray());
         Assert.Equal(ExpectedResult(taskId, outcome).Output, actual.Output);
+
+        // The ACTUAL Complete payload carries the assigned model with explicit presence, so a
+        // receiver can tell an upgraded sender from a legacy one. Expected comes from the input
+        // assignment, never from the observed message.
+        Assert.True(actual.HasModel, "The upgraded completion must carry field 7 with presence.");
+        Assert.Equal(AssignedModel(taskId), actual.Model);
 
         if (outcome == RetainedOutcome.Completed)
         {
