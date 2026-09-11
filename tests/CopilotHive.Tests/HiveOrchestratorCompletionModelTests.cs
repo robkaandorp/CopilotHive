@@ -42,7 +42,7 @@ namespace CopilotHive.Tests;
 /// sleeps and no live LLM/network dependency.
 /// </para>
 /// </summary>
-public sealed class HiveOrchestratorCompletionModelSelectionTests
+public sealed class HiveOrchestratorCompletionModelTests
 {
     /// <summary>Bound applied to every await; a hang becomes a named failure, never a stall.</summary>
     private static readonly TimeSpan BoundedWait = TimeSpan.FromSeconds(10);
