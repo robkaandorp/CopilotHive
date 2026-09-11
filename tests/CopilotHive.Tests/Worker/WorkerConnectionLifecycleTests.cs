@@ -151,15 +151,16 @@ public sealed class WorkerConnectionLifecycleTests
             // assigns its own id in the response).
             Assert.Equal(LocalWorkerId, invoker.LastRegisterWorkerId);
 
-            // ONE provisioner instance backs BOTH provisioning sites: the runner's LAZY callback is
-            // the connection's provisioner, so the eager site and the lazy site can never disagree.
-            // The identity of the callback with the connection's provisioner is what proves it — the
-            // same instance, not merely a call-count coincidence.
+            // ONE provisioner instance backs BOTH provisioning sites, through the CONNECTION's own
+            // checked entry point. The runner's LAZY callback is NOT the raw provisioner delegate —
+            // it is the connection-owned wrapper — so both sites share one provisioner instance AND
+            // one retirement contract. Call-through to that single instance is the evidence.
             Assert.Same(provisionerHarness.Provisioner, connection.Provisioner);
             Assert.NotNull(runner.ConfigProvisioner);
-            Assert.Equal(connection.Provisioner!.EnsureProvisionedAsync, runner.ConfigProvisioner);
+            Assert.NotEqual(connection.Provisioner!.EnsureProvisionedAsync, runner.ConfigProvisioner);
 
-            // The LAZY runner callback performs one fetch on this fixture's in-memory environment.
+            // The LAZY runner callback reaches that instance and performs one fetch on this
+            // fixture's in-memory environment.
             Assert.Equal(0, provisionerHarness.FetchCount);
             await runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
             Assert.Equal(1, provisionerHarness.FetchCount);
@@ -209,11 +210,19 @@ public sealed class WorkerConnectionLifecycleTests
                 () => service.SaveSessionAsync("goal:role", "{}", TestContext.Current.CancellationToken));
             Assert.Equal(WorkerConnection.DisconnectedMessage, saveFailure.Message);
 
-            // DISCONNECTED PROVISIONING ACCESS afterwards. The connection's CHECKED provisioning
-            // fetch is the production path (the TestProvisioner override above carries the test's
-            // own fetch delegate, which is deliberately not retirement-gated), so this is the entry
-            // point that proves a post-teardown provisioning attempt starts NO transport.
+            // DISCONNECTED PROVISIONING ACCESS afterwards, through the ACTUAL CAPTURED RUNNER
+            // CALLBACK with the OVERRIDE provisioner installed. The override carries its own fetch
+            // delegate, so this proves the connection-owned wrapper — not the provisioner's own
+            // plumbing — is what rejects a post-teardown attempt: the disconnected error is raised
+            // and the override provisioner is never started (its fetch count does not move).
+            var overrideFetchesBefore = provisionerHarness.FetchCount;
             var fetchCallsBefore = invoker.WorkerConfigCalls;
+            var lazyFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, lazyFailure.Message);
+            Assert.Equal(overrideFetchesBefore, provisionerHarness.FetchCount);
+
+            // The connection's checked provisioning fetch rejects likewise, starting no transport.
             var provisioningFailure = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => connection.FetchWorkerConfigAsync(
                     new GetWorkerConfigRequest { WorkerId = connection.AssignedId },
@@ -271,6 +280,251 @@ public sealed class WorkerConnectionLifecycleTests
         var sendFailure = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.ReportProgressAsync("t", "s", "d", TestContext.Current.CancellationToken));
         Assert.Equal(WorkerConnection.DisconnectedMessage, sendFailure.Message);
+    }
+
+    /// <summary>
+    /// THE CAPTURED RUNNER CALLBACK IS RETIREMENT-GATED EVEN WITH AN OVERRIDE PROVISIONER INSTALLED.
+    /// <para>
+    /// The override carries its OWN fetch delegate, which the connection knows nothing about — so if
+    /// the raw <c>EnsureProvisionedAsync</c> were handed to the runner, the cached callback would
+    /// keep provisioning after teardown. The witness is a FAILING provisioner fetch: it throws the
+    /// instant it is entered, so reaching it at all is loudly distinguishable from the disconnected
+    /// rejection, and its call count proves the underlying provisioner never started.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CapturedRunnerCallback_WithOverrideProvisioner_FailsDisconnectedAfterRetirement()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+
+        // A witness provisioner whose fetch THROWS and counts: entering it is unmistakable.
+        var entered = 0;
+        var witness = new WorkerConfigProvisioner(
+            "override-worker",
+            (_, _) =>
+            {
+                Interlocked.Increment(ref entered);
+                throw new InvalidOperationException("The underlying provisioner must not be started.");
+            },
+            _ => null,
+            (_, _) => { });
+
+        var runner = new ProvisionerCapturingRunner();
+        using var service = BuildService(runner, witness);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => { },
+            null!);
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // BARRIER: the initial Ready is written strictly after publication, so observing it is
+            // deterministic evidence that the connection is published — no polling, no sleeps.
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+
+            // The OVERRIDE is what the connection carries, for BOTH sites.
+            Assert.Same(witness, connection.Provisioner);
+            Assert.NotNull(runner.ConfigProvisioner);
+
+            // WHILE LIVE the callback really does reach the override — the witness throws its own
+            // distinct failure, which is exactly how we know the callback is not inert.
+            var live = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Contains("must not be started", live.Message, StringComparison.Ordinal);
+            Assert.Equal(1, Volatile.Read(ref entered));
+
+            // AFTER RETIREMENT the SAME captured callback must fail DISCONNECTED and must NOT start
+            // the override's transport: the entered count stays where it was.
+            connection.Retire();
+            var retired = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, retired.Message);
+            Assert.Equal(1, Volatile.Read(ref entered));
+
+            // The EAGER site's checked entry point behaves identically for the same override.
+            var eager = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, eager.Message);
+            Assert.Equal(1, Volatile.Read(ref entered));
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await ObserveForTeardownAsync(run);
+        }
+    }
+
+    /// <summary>
+    /// A THROWING POST-PUBLICATION SETUP STEP still retires and unpublishes the connection BEFORE
+    /// the stream/channel disposal callback runs.
+    /// <para>
+    /// <c>SetConfigProvisioner</c> is the fallible step used here (the interface permits an
+    /// implementation to throw). Without cleanup covering the setup interval, lexical unwinding
+    /// would dispose the transport while <c>_connection</c> stayed published and unretired — leaving
+    /// a nominally usable connection backed by a disposed stream.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ThrowingPostPublicationSetup_RetiresAndUnpublishesBeforeStreamDisposal()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+
+        var setupFailure = new InvalidOperationException("SetConfigProvisioner failed during setup.");
+
+        // Observed INSIDE the disposal callback: the state of the connection AT the moment the
+        // transport is torn down. This is the ordering the fix establishes.
+        WorkerConnection? published = null;
+        var retiredAtDisposal = false;
+        var unpublishedAtDisposal = false;
+        var disposals = 0;
+
+        WorkerService? serviceRef = null;
+
+        // The FALLIBLE post-publication setup step. It runs after publication, so it is also the
+        // deterministic point at which the published connection can be captured for the disposal
+        // assertions below — and it was still PUBLISHED and USABLE right here.
+        var publishedAtSetup = false;
+        var runner = new ThrowingSetupRunner(() =>
+        {
+            published = GetPublishedConnection(serviceRef!);
+            publishedAtSetup = published is { IsRetired: false };
+            throw setupFailure;
+        });
+
+        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+        serviceRef = service;
+
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            new RecordingRequestStream(),
+            new ChannelResponseReader(),
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ =>
+            {
+                Interlocked.Increment(ref disposals);
+                retiredAtDisposal = published?.IsRetired ?? false;
+                unpublishedAtDisposal = GetPublishedConnection(serviceRef!) is null;
+            },
+            null!);
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        // The setup step throws, so the failure propagates to the caller unchanged.
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.RunAsync(TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+        Assert.Same(setupFailure, thrown);
+
+        // The connection really was published and usable when the fallible step ran — otherwise the
+        // teardown assertions below would be vacuous.
+        Assert.NotNull(published);
+        Assert.True(publishedAtSetup, "The connection must be published and usable at the setup step.");
+
+        // ...and the cleanup that now covers the setup interval retired and unpublished it BEFORE
+        // the transport was disposed.
+        Assert.Null(GetPublishedConnection(service));
+        Assert.True(published!.IsRetired);
+        Assert.Equal(1, disposals);
+        Assert.True(retiredAtDisposal, "The connection must be retired before its stream is disposed.");
+        Assert.True(unpublishedAtDisposal, "The connection must be unpublished before its stream is disposed.");
+
+        // And the service is genuinely disconnected afterwards — no nominally usable connection.
+        var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+        Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
+    }
+
+    /// <summary>
+    /// THE EAGER PER-ASSIGNMENT SITE IS RETIREMENT-GATED TOO, for the same override provisioner.
+    /// <para>
+    /// This drives the REAL message loop through two assignments on one connection. The first runs
+    /// while the connection is live, so the eager site provably REACHES the override (the witness
+    /// fetch is entered) — that is the non-vacuity check. The connection is then retired and a
+    /// second assignment is delivered: the eager site must fail with the disconnected error and must
+    /// NOT start the override, so the witness count does not move.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task EagerProvisioningSite_WithOverrideProvisioner_IsRetirementGated()
+    {
+        // A witness provisioner whose fetch THROWS and counts: entering it is unmistakable, and it
+        // fails before any config-repo seam work, so the assignment body needs no git at all.
+        var entered = 0;
+        var witness = new WorkerConfigProvisioner(
+            "override-worker",
+            (_, _) =>
+            {
+                Interlocked.Increment(ref entered);
+                throw new InvalidOperationException("The underlying provisioner must not be started.");
+            },
+            _ => null,
+            (_, _) => { });
+
+        using var service = BuildService(new ProvisionerCapturingRunner(), witness);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => { },
+            null!);
+
+        // A connection carrying the OVERRIDE for both sites, driven through the real loop.
+        var connection = TestConnectionFactory.Attach(service, AssignedWorkerId, stream, witness);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        try
+        {
+            // LIVE: the eager site reaches the override. The body catches the witness failure and
+            // still emits its single Ready, which is the deterministic barrier.
+            responses.Push(Assignment("task-live"));
+            await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(1, Volatile.Read(ref entered));
+
+            // RETIRED: the second assignment's eager site must fail disconnected without starting
+            // the override. Its Ready cannot be written on a retired connection, so EOF plus the
+            // loop's own teardown drain is the barrier that proves the body finished.
+            connection.Retire();
+            responses.Push(Assignment("task-retired"));
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, Volatile.Read(ref entered));
+        }
+        finally
+        {
+            responses.TryComplete();
+            await ObserveForTeardownAsync(loop);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -691,6 +945,13 @@ public sealed class WorkerConnectionLifecycleTests
         typeof(WorkerService)
             .GetMethod("UnpublishConnection", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(service, [expected]);
+
+    /// <summary>Drives the REAL private message loop with an already-published connection.</summary>
+    private static Task InvokeProcessMessages(
+        WorkerService service, WorkerConnection connection, CancellationToken ct) =>
+        (Task)typeof(WorkerService)
+            .GetMethod("ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, [connection, ct])!;
 
     /// <summary>Invokes the REAL factored one-tick heartbeat sender.</summary>
     private static Task InvokeHeartbeatTickAsync(WorkerService service, WorkerConnection connection) =>
@@ -1160,6 +1421,42 @@ public sealed class WorkerConnectionLifecycleTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// An <see cref="IAgentRunner"/> whose <c>SetConfigProvisioner</c> runs a test callback — the
+    /// FALLIBLE post-publication setup step. The interface permits an implementation to throw, and
+    /// production calls it after the connection is published, so this is the seam that exercises the
+    /// setup interval's cleanup coverage.
+    /// </summary>
+    private sealed class ThrowingSetupRunner(Action onSetConfigProvisioner) : IAgentRunner
+    {
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
+            onSetConfigProvisioner();
+
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+            => Task.FromResult(string.Empty);
+
+        public TestResultReport? LastTestReport => null;
+        public WorkerReport? LastWorkerReport => null;
+        public void ClearTestReport() { }
+        public void ClearWorkerReport() { }
+        public void SetToolBridge(IToolCallBridge? bridge) { }
+        public void SetCurrentTaskId(string? taskId) { }
+        public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
+        public void SetCustomAgent(DomainWorkerRole role, string agentsMdContent) { }
+        public void SetSession(object? session) { }
+        public object? GetSession() => null;
+        public void SetMaxContextTokens(int maxTokens) { }
+        public int GetContextUsagePercent() => 0;
+        public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
+        public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     /// <summary>

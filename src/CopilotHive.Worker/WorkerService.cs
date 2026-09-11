@@ -242,22 +242,28 @@ public sealed class WorkerService(
         //    and before any assignment processing.
         PublishConnection(connection);
 
-        // The SAME instance backs both provisioning sites: the per-assignment config-repo seam and
-        // the agent runner's lazy first-client-creation callback.
-        var provisioner = connection.Provisioner;
-        _agentRunner.SetConfigProvisioner(
-            provisioner is null ? null : provisioner.EnsureProvisionedAsync);
-
-        // 5. Start heartbeat background task
-        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var heartbeatTask = RunHeartbeatAsync(connection, heartbeatCts.Token);
-
+        // From here on EVERY step is covered by cleanup. The connection is observable the moment it
+        // is published, so any fallible post-publication setup (config-provisioner installation,
+        // linked-CTS creation, heartbeat startup) must not be able to unwind lexically — disposing
+        // the stream and channel — while a nominally usable connection is still published.
+        CancellationTokenSource? heartbeatCts = null;
+        Task? heartbeatTask = null;
         try
         {
-            // 6. Send WorkerReady
+            // 5. Install the LAZY provisioning callback. It is the connection's OWN checked entry
+            //    point, so the eager per-assignment site and this lazy site share one provisioner
+            //    instance AND one retirement contract — including when a TestProvisioner replaced
+            //    the connection's provisioner.
+            _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
+
+            // 6. Start heartbeat background task
+            heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            heartbeatTask = RunHeartbeatAsync(connection, heartbeatCts.Token);
+
+            // 7. Send WorkerReady
             await SendWorkerReady(connection, ct);
 
-            // 7. Main message loop
+            // 8. Main message loop
             await ProcessMessagesAsync(connection, ct);
         }
         finally
@@ -271,8 +277,18 @@ public sealed class WorkerService(
             connection.Retire();
             UnpublishConnection(connection);
 
-            await heartbeatCts.CancelAsync();
-            try { await heartbeatTask; } catch (OperationCanceledException) { }
+            // Stop and join the heartbeat, then release the linked source. Both are null when the
+            // setup step that creates them faulted, so this cleanup is safe for EVERY point at
+            // which the body above can leave.
+            if (heartbeatCts is not null)
+                await heartbeatCts.CancelAsync();
+
+            if (heartbeatTask is not null)
+            {
+                try { await heartbeatTask; } catch (OperationCanceledException) { }
+            }
+
+            heartbeatCts?.Dispose();
         }
     }
 
@@ -528,10 +544,13 @@ public sealed class WorkerService(
                                 }
                                 else
                                 {
-                                    // STEP 2 — the ONE eager provisioning call. Everything below
-                                    // depends on the provisioner's config-repo accessors, which
-                                    // throw until the environment snapshot has been taken.
-                                    await provisioner.EnsureProvisionedAsync(taskModel, bodyCts.Token);
+                                    // STEP 2 — the ONE eager provisioning call, through the
+                                    // CONNECTION's checked entry point (the same one the lazy
+                                    // runner callback uses), so a retired connection fails
+                                    // disconnected instead of starting the provisioner. Everything
+                                    // below depends on the provisioner's config-repo accessors,
+                                    // which throw until the environment snapshot has been taken.
+                                    await connection.EnsureProvisionedAsync(taskModel, bodyCts.Token);
 
                                     // STEPS 3-4 — the askpass helper and the seam that owns it.
                                     // The seam is a per-assignment LOCAL: WorkerService owns it,

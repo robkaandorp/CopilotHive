@@ -125,6 +125,56 @@ internal sealed class WorkerConnection
         EnsureUsable().Client.GetWorkerConfigAsync(request, cancellationToken: ct).ResponseAsync;
 
     /// <summary>
+    /// THE CONNECTION-OWNED CHECKED PROVISIONING ENTRY POINT — the SINGLE way either provisioning
+    /// site reaches the installed provisioner.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Checked access is performed against THIS connection FIRST, so a provisioning attempt that
+    /// arrives after retirement fails with the EXISTING disconnected error and the underlying
+    /// provisioner is NEVER started — no snapshot is taken, no fetch delegate is invoked, no
+    /// transport begins.
+    /// </para>
+    /// <para>
+    /// WHY THE WRAPPER IS NECESSARY. The connection's PRODUCTION provisioner fetches through
+    /// <see cref="FetchWorkerConfigAsync"/>, which is itself retirement-checked. An OVERRIDE
+    /// provisioner (the <c>TestProvisioner</c> seam) carries an INDEPENDENT fetch delegate that this
+    /// connection knows nothing about, so handing its raw <c>EnsureProvisionedAsync</c> to a caller
+    /// would let a runner-cached callback keep provisioning after teardown. Routing BOTH sites
+    /// through here makes the retirement contract identical no matter which provisioner is
+    /// installed.
+    /// </para>
+    /// <para>
+    /// The installed provisioner is otherwise untouched: the SAME instance backs both sites, its
+    /// credential / operator-snapshot / cancellation implementation is unchanged, and this adds no
+    /// retry, buffering or cancellation machinery of its own.
+    /// </para>
+    /// </remarks>
+    /// <param name="taskModel">The task's model, forwarded verbatim to the provisioner.</param>
+    /// <param name="ct">Cancellation token, forwarded verbatim to the provisioner.</param>
+    /// <exception cref="InvalidOperationException">
+    /// This connection has been retired, or it carries no provisioner at all.
+    /// </exception>
+    internal Task EnsureProvisionedAsync(string? taskModel, CancellationToken ct)
+    {
+        // CHECKED FIRST: a retired connection must not start the provisioner's transport.
+        var provisioner = EnsureUsable().Provisioner
+            ?? throw new InvalidOperationException(
+                "This connection carries no provisioner — it cannot provision LLM configuration.");
+
+        return provisioner.EnsureProvisionedAsync(taskModel, ct);
+    }
+
+    /// <summary>
+    /// The provisioning callback handed to the agent runner for its LAZY first-client creation —
+    /// the SAME checked entry point <see cref="EnsureProvisionedAsync"/> the eager per-assignment
+    /// site uses, bound to THIS connection. <c>null</c> when this connection carries no provisioner,
+    /// which clears any callback a previous connection installed.
+    /// </summary>
+    internal Func<string?, CancellationToken, Task>? CreateProvisioningCallback() =>
+        Provisioner is null ? null : EnsureProvisionedAsync;
+
+    /// <summary>
     /// The production provisioner for this connection: constructed with THIS connection's assigned
     /// identity and a fetch that goes through THIS connection's checked access, so it can never be
     /// pointed at another registration's client or identity.
