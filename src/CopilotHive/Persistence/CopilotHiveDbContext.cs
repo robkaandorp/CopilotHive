@@ -47,6 +47,9 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Task-to-goal mappings table.</summary>
     public DbSet<TaskMappingEntity> TaskMappings { get; set; } = null!;
 
+    /// <summary>Completion receipts table.</summary>
+    public DbSet<CompletionReceiptEntity> CompletionReceipts { get; set; } = null!;
+
     /// <summary>Users table (single-user admin model).</summary>
     public DbSet<UserEntity> Users { get; set; } = null!;
 
@@ -90,6 +93,7 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigurePipeline(modelBuilder.Entity<PipelineEntity>());
         ConfigureConversationEntry(modelBuilder.Entity<ConversationEntryEntity>());
         ConfigureTaskMapping(modelBuilder.Entity<TaskMappingEntity>());
+        ConfigureCompletionReceipt(modelBuilder.Entity<CompletionReceiptEntity>());
         ConfigureUser(modelBuilder.Entity<UserEntity>());
         ConfigureIssue(modelBuilder.Entity<Issue>());
     }
@@ -147,6 +151,17 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.HasKey(e => e.TaskId);
         entity.Property(e => e.TaskId).HasColumnName("task_id");
         entity.Property(e => e.GoalId).HasColumnName("goal_id").IsRequired();
+    }
+
+    private static void ConfigureCompletionReceipt(EntityTypeBuilder<CompletionReceiptEntity> entity)
+    {
+        entity.ToTable("completion_receipts");
+
+        entity.HasKey(e => e.TaskId);
+        entity.Property(e => e.TaskId).HasColumnName("task_id");
+        entity.Property(e => e.GoalId).HasColumnName("goal_id").IsRequired();
+        entity.Property(e => e.PayloadJson).HasColumnName("payload_json").IsRequired();
+        entity.Property(e => e.FirstStoredAtUtc).HasColumnName("first_stored_at_utc").IsRequired().HasConversion(DateTimeToIsoConverter);
     }
 
     private static void ConfigureGoal(EntityTypeBuilder<Goal> entity)
