@@ -101,13 +101,13 @@ public sealed class SharpCoderRunnerBridgeDrainTests
         var responses = new GatedResponseStream(steps);
         var requests = new ReadyCountingRequestStream();
         using var stream = CreateDuplex(requests, responses);
-        AttachToolStream(service, stream, AssignedId);
+        var connection = AttachToolStream(service, stream, AssignedId);
 
         Task processTask = Task.CompletedTask;
         ValueTask<object?>? toolTask = null;
         try
         {
-            processTask = InvokeProcessMessages(service, stream, TestContext.Current.CancellationToken);
+            processTask = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
 
             // Deliver the assignment. The runner enters SendPromptAsync → AcquireClientLeaseAsync
             // → RunPromptTurnAsync → BuildCustomTools(ct) → CodingAgent → IChatClient streaming.
@@ -236,13 +236,13 @@ public sealed class SharpCoderRunnerBridgeDrainTests
         var responses = new GatedResponseStream(steps);
         var requests = new ReadyCountingRequestStream();
         using var stream = CreateDuplex(requests, responses);
-        AttachToolStream(service, stream, AssignedId);
+        var connection = AttachToolStream(service, stream, AssignedId);
 
         Task processTask = Task.CompletedTask;
         ValueTask<object?>? toolTask = null;
         try
         {
-            processTask = InvokeProcessMessages(service, stream, TestContext.Current.CancellationToken);
+            processTask = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
 
             // Task 1: assignment → invoke production tool → bridge pending → cancel → drain.
             await steps[0].MoveNextEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
@@ -308,25 +308,20 @@ public sealed class SharpCoderRunnerBridgeDrainTests
         field.SetValue(service, runner);
     }
 
-    private static void AttachToolStream(
+    private static WorkerConnection AttachToolStream(
         WorkerService service,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId)
-    {
-        typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, stream);
-        typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, assignedId);
-    }
+        string assignedId) =>
+        TestConnectionFactory.Attach(service, assignedId, stream, service.TestProvisioner);
 
     private static Task InvokeProcessMessages(
         WorkerService service,
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        WorkerConnection connection,
         CancellationToken ct)
     {
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        return (Task)method.Invoke(service, [stream, "worker-drain", ct])!;
+        return (Task)method.Invoke(service, [connection, ct])!;
     }
 
     private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> CreateDuplex(

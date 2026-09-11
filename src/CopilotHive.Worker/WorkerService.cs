@@ -32,9 +32,72 @@ public sealed class WorkerService(
     private volatile string? _currentTaskId;
     private volatile string? _currentRole;
 
-    // The gRPC stream reference, set during WorkStream processing
-    private AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>? _stream;
-    private string? _assignedId;
+    /// <summary>
+    /// THE SERVICE'S ONE PUBLISHED CONNECTION — an ACCEPTED registration together with its opened
+    /// duplex work stream, the gRPC client for that registration and the provisioner associated with
+    /// them. Every production operation SNAPSHOTS this one reference, once, before it awaits, so it
+    /// can never pair one registration's writer with another's identity or client.
+    /// <para>
+    /// Publication and unpublishing happen ONLY through <see cref="PublishConnection"/> and
+    /// <see cref="UnpublishConnection"/>, both by REFERENCE IDENTITY: a rejected or partially built
+    /// attempt is never published, and a teardown clears exactly the connection it owns. Concurrent
+    /// reconnect is NOT enabled, so at most one connection is ever live for this service.
+    /// </para>
+    /// </summary>
+    private WorkerConnection? _connection;
+
+    /// <summary>
+    /// TEST SEAM — builds the gRPC call invoker the orchestrator client is constructed from.
+    /// <c>null</c> selects the real <see cref="GrpcChannel"/> for <c>orchestratorUrl</c>. A test
+    /// supplies a fake invoker so the REAL <see cref="RunAsync"/> can be driven without a live
+    /// server.
+    /// </summary>
+    internal Func<CallInvoker>? CallInvokerFactory { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — opens the duplex work stream for a client. <c>null</c> selects the real
+    /// <c>client.WorkStream(cancellationToken: ct)</c>. Together with
+    /// <see cref="CallInvokerFactory"/> this lets a test hand <see cref="RunAsync"/> a fake client
+    /// and a fake duplex stream, without any live server.
+    /// </summary>
+    internal Func<
+        HiveOrchestrator.HiveOrchestratorClient,
+        CancellationToken,
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>>? WorkStreamFactory { get; set; }
+
+    /// <summary>The currently published connection, or <c>null</c> when none is published.</summary>
+    private WorkerConnection? CurrentConnection => Volatile.Read(ref _connection);
+
+    /// <summary>
+    /// PUBLISHES a FULLY CONSTRUCTED connection — registration accepted, stream open, provisioner
+    /// associated. Called from <see cref="RunAsync"/> BEFORE the initial Ready and before any
+    /// assignment processing.
+    /// </summary>
+    /// <remarks>
+    /// Also the seam the direct-loop fixtures use to install the connection they drive the real
+    /// message loop with (they construct the <see cref="WorkerConnection"/> themselves). It is
+    /// deliberately the ONLY way the published connection can change: publication stays a single,
+    /// auditable transition, and concurrent reconnect remains unsupported.
+    /// </remarks>
+    internal void PublishConnection(WorkerConnection connection) =>
+        Volatile.Write(ref _connection, connection);
+
+    /// <summary>
+    /// UNPUBLISHES exactly the expected connection, by REFERENCE IDENTITY — never by worker ID, so a
+    /// stale teardown can never drop a different registration's connection. A no-op when the
+    /// published connection is already something else (or nothing).
+    /// </summary>
+    private void UnpublishConnection(WorkerConnection expected) =>
+        Interlocked.CompareExchange(ref _connection, null, expected);
+
+    /// <summary>
+    /// CHECKED ACCESS — the published connection, or the EXISTING disconnected error when none is
+    /// published. A RETIRED connection is rejected too, so a new operation can never start transport
+    /// on a connection that teardown has already retired.
+    /// </summary>
+    private WorkerConnection RequireConnection() =>
+        (CurrentConnection ?? throw new InvalidOperationException(WorkerConnection.DisconnectedMessage))
+        .EnsureUsable();
 
     /// <summary>
     /// THE OUTBOUND SEND GATE. gRPC's <see cref="IAsyncStreamWriter{T}"/> allows at most ONE
@@ -56,23 +119,11 @@ public sealed class WorkerService(
     /// </summary>
     private readonly SemaphoreSlim _sendGate = new(1, 1);
 
-    // The gRPC client, set after successful registration — used by session RPCs
-    private HiveOrchestrator.HiveOrchestratorClient? _client;
-
     /// <summary>
-    /// The provisioner created in <see cref="RunAsync"/> after an ACCEPTED registration. It is
-    /// the SAME instance handed to the agent runner, so the config-repo seam resolves its URL
-    /// and credential from exactly the state the runner's own provisioning fetch produced.
-    /// Remains <c>null</c> until registration succeeds (and for direct message-loop tests that
-    /// never run <see cref="RunAsync"/>), which selects the LEGACY, seam-free path.
-    /// </summary>
-    private WorkerConfigProvisioner? _provisioner;
-
-    /// <summary>
-    /// TEST SEAM — overrides the <see cref="RunAsync"/>-created provisioner. When BOTH this and
-    /// <see cref="_provisioner"/> are <c>null</c> the per-assignment config-repo preparation is
-    /// SKIPPED entirely (no probe, no clone, no askpass helper, no seam) and the executor is
-    /// built with the legacy public constructor.
+    /// TEST SEAM — overrides the connection's provisioner. When the resulting connection carries
+    /// NO provisioner the per-assignment config-repo preparation is SKIPPED entirely (no probe, no
+    /// clone, no askpass helper, no seam) and the executor is built with the legacy public
+    /// constructor.
     /// </summary>
     internal WorkerConfigProvisioner? TestProvisioner { get; set; }
 
@@ -123,16 +174,29 @@ public sealed class WorkerService(
         _log.Info("Preparing SharpCoder agent engine...");
         await _agentRunner.ConnectAsync(ct);
 
-        // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network)
-        using var channel = GrpcChannel.ForAddress(orchestratorUrl, new GrpcChannelOptions
+        // Enable HTTP/2 over plaintext (required for gRPC without TLS in Docker network).
+        // A test seam may instead supply the call invoker, so the REAL lifecycle can be driven
+        // without a live server; in that case there is no channel to own.
+        GrpcChannel? channel = null;
+        CallInvoker invoker;
+        if (CallInvokerFactory is not null)
         {
-            HttpHandler = new SocketsHttpHandler
+            invoker = CallInvokerFactory();
+        }
+        else
+        {
+            channel = GrpcChannel.ForAddress(orchestratorUrl, new GrpcChannelOptions
             {
-                EnableMultipleHttp2Connections = true,
-            }
-        });
-        var client = new HiveOrchestrator.HiveOrchestratorClient(channel);
-        _client = client;
+                HttpHandler = new SocketsHttpHandler
+                {
+                    EnableMultipleHttp2Connections = true,
+                }
+            });
+            invoker = channel.CreateCallInvoker();
+        }
+
+        using var ownedChannel = channel;
+        var client = new HiveOrchestrator.HiveOrchestratorClient(invoker);
 
         // 1. Register
         var registerRequest = new RegisterRequest
@@ -145,49 +209,86 @@ public sealed class WorkerService(
 
         if (!registerResponse.Accepted)
         {
+            // REJECTED: nothing was built and nothing is published, so no partial connection can
+            // ever be observed by another operation.
             _log.Error("Registration rejected by orchestrator.");
             return;
         }
 
-        _assignedId = string.IsNullOrEmpty(registerResponse.AssignedWorkerId)
+        var assignedId = string.IsNullOrEmpty(registerResponse.AssignedWorkerId)
             ? workerId
             : registerResponse.AssignedWorkerId;
 
-        _log.Info($"Registered as {_assignedId} (orchestrator v{registerResponse.OrchestratorVersion})");
+        _log.Info($"Registered as {assignedId} (orchestrator v{registerResponse.OrchestratorVersion})");
 
-        // Registration happens BEFORE the operator may have completed OAuth sign-in, so the
-        // provisioning fetch is deliberately NOT performed here. It runs immediately before every
-        // first LLM client creation, by which time a token committed after sign-in is visible.
-        var provisioner = new WorkerConfigProvisioner(
-            _assignedId,
-            (request, token) => client.GetWorkerConfigAsync(request, cancellationToken: token).ResponseAsync);
-        _agentRunner.SetConfigProvisioner(provisioner.EnsureProvisionedAsync);
+        // 2. Open the bidirectional work stream. LEXICAL ownership stays here (the `using`), while
+        //    the connection owns CHECKED ACCESS to it — one disposal, never two.
+        using var stream = WorkStreamFactory is null
+            ? client.WorkStream(cancellationToken: ct)
+            : WorkStreamFactory(client, ct);
 
-        // The SAME instance backs the per-assignment config-repo seam, so the seam's URL and
-        // credential resolution always reflects the runner's provisioning state.
-        _provisioner = provisioner;
+        // 3. Build the connection COMPLETELY. Registration is accepted, the stream is open, and the
+        //    provisioner is associated: a supplied TestProvisioner REPLACES the production one for
+        //    BOTH provisioning sites, and otherwise the production provisioner is constructed bound
+        //    to this connection's own identity and checked fetch.
+        //
+        //    Registration happens BEFORE the operator may have completed OAuth sign-in, so the
+        //    provisioning fetch is deliberately NOT performed here. It runs immediately before every
+        //    first LLM client creation, by which time a token committed after sign-in is visible.
+        var connection = new WorkerConnection(
+            assignedId, client, stream, provisionerOverride: TestProvisioner);
 
-        // 2. Start heartbeat background task
-        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var heartbeatTask = RunHeartbeatAsync(client, _assignedId, heartbeatCts.Token);
+        // 4. PUBLISH — only now that construction has fully succeeded, and BEFORE the initial Ready
+        //    and before any assignment processing.
+        PublishConnection(connection);
 
+        // From here on EVERY step is covered by cleanup. The connection is observable the moment it
+        // is published, so any fallible post-publication setup (config-provisioner installation,
+        // linked-CTS creation, heartbeat startup) must not be able to unwind lexically — disposing
+        // the stream and channel — while a nominally usable connection is still published.
+        CancellationTokenSource? heartbeatCts = null;
+        Task? heartbeatTask = null;
         try
         {
-            // 3. Open bidirectional work stream
-            using var stream = client.WorkStream(cancellationToken: ct);
-            _stream = stream;
+            // 5. Install the LAZY provisioning callback. It is the connection's OWN checked entry
+            //    point, so the eager per-assignment site and this lazy site share one provisioner
+            //    instance AND one retirement contract — including when a TestProvisioner replaced
+            //    the connection's provisioner.
+            _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
 
-            // 4. Send WorkerReady
-            await SendWorkerReady(stream, _assignedId, ct);
+            // 6. Start heartbeat background task
+            heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            heartbeatTask = RunHeartbeatAsync(connection, heartbeatCts.Token);
 
-            // 5. Main message loop
-            await ProcessMessagesAsync(stream, _assignedId, ct);
+            // 7. Send WorkerReady
+            await SendWorkerReady(connection, ct);
+
+            // 8. Main message loop
+            await ProcessMessagesAsync(connection, ct);
         }
         finally
         {
-            _stream = null;
-            await heartbeatCts.CancelAsync();
-            try { await heartbeatTask; } catch (OperationCanceledException) { }
+            // RETIRE then UNPUBLISH the EXPECTED connection — by reference identity — BEFORE its
+            // stream and channel are disposed (both happen as this scope unwinds, after this
+            // finally). Retiring first means a NEW operation can never start transport on a
+            // connection that is being torn down, while an operation that already captured it keeps
+            // its own token and outcome. The message loop's own teardown drain has already run, so
+            // the draining body's single Ready attempt was permitted.
+            connection.Retire();
+            UnpublishConnection(connection);
+
+            // Stop and join the heartbeat, then release the linked source. Both are null when the
+            // setup step that creates them faulted, so this cleanup is safe for EVERY point at
+            // which the body above can leave.
+            if (heartbeatCts is not null)
+                await heartbeatCts.CancelAsync();
+
+            if (heartbeatTask is not null)
+            {
+                try { await heartbeatTask; } catch (OperationCanceledException) { }
+            }
+
+            heartbeatCts?.Dispose();
         }
     }
 
@@ -358,11 +459,22 @@ public sealed class WorkerService(
     /// <summary>Clears the ownership slot. Called only AFTER the drain has returned.</summary>
     private void ClearActiveAssignment() => _activeAssignment = null;
 
-    private async Task ProcessMessagesAsync(
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId,
-        CancellationToken ct)
+    /// <summary>
+    /// The message loop for ONE published connection. The connection is SNAPSHOTTED by the caller
+    /// and passed in explicitly (never re-read from the service field), so every Ready, drain and
+    /// completion this loop produces belongs to the registration it was started for.
+    /// </summary>
+    /// <remarks>
+    /// RETIREMENT ORDER. The loop's <c>finally</c> drains the retained assignment FIRST and only
+    /// THEN retires the connection, so an EOF or reader failure with a LIVE token still permits the
+    /// draining body's single Ready attempt (that Ready is written while the connection is still
+    /// usable). Retiring before the caller disposes the stream means a new operation can never start
+    /// transport on a connection whose stream is about to go away.
+    /// </remarks>
+    private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
     {
+        var stream = connection.Stream;
+
         try
         {
             await foreach (var message in ReadMessages(stream.ResponseStream, ct))
@@ -409,29 +521,36 @@ public sealed class WorkerService(
                         var terminalResult = new TerminalResultHolder();
 
                         // Run task execution concurrently so message loop can process
-                        // ToolCallResponse messages from the orchestrator during execution
+                        // ToolCallResponse messages from the orchestrator during execution.
+                        //
+                        // The body captures the EXPECTED CONNECTION OBJECT — never independently
+                        // mutable stream / client / identity values — so its provisioning, its
+                        // session RPCs and its completion write all belong to this registration.
                         var execution = Task.Run(async () =>
                         {
                             try
                             {
-                                // STEP 1 — provisioner selection. A null provisioner (no
-                                // RunAsync registration, no test override) SKIPS the whole
-                                // config-repo preparation and keeps the LEGACY executor.
-                                var provisioner = TestProvisioner ?? _provisioner;
+                                // STEP 1 — provisioner selection. A connection with NO provisioner
+                                // (a direct-loop fixture) SKIPS the whole config-repo preparation
+                                // and keeps the LEGACY executor.
+                                var provisioner = connection.Provisioner;
                                 if (provisioner is null)
                                 {
                                     var legacyExecutor = new TaskExecutor(
                                         _agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
                                     await ExecuteAndReportAsync(
-                                        legacyExecutor, domainTask, stream, assignedId,
+                                        legacyExecutor, domainTask, connection,
                                         terminalResult, bodyCts.Token, ct);
                                 }
                                 else
                                 {
-                                    // STEP 2 — the ONE eager provisioning call. Everything below
-                                    // depends on the provisioner's config-repo accessors, which
-                                    // throw until the environment snapshot has been taken.
-                                    await provisioner.EnsureProvisionedAsync(taskModel, bodyCts.Token);
+                                    // STEP 2 — the ONE eager provisioning call, through the
+                                    // CONNECTION's checked entry point (the same one the lazy
+                                    // runner callback uses), so a retired connection fails
+                                    // disconnected instead of starting the provisioner. Everything
+                                    // below depends on the provisioner's config-repo accessors,
+                                    // which throw until the environment snapshot has been taken.
+                                    await connection.EnsureProvisionedAsync(taskModel, bodyCts.Token);
 
                                     // STEPS 3-4 — the askpass helper and the seam that owns it.
                                     // The seam is a per-assignment LOCAL: WorkerService owns it,
@@ -448,7 +567,7 @@ public sealed class WorkerService(
                                         _agentRunner, this, gitOperations: null, sessionClient: this,
                                         configRepoDir: _configRepoDir, configRepoSeam: seam);
                                     await ExecuteAndReportAsync(
-                                        executor, domainTask, stream, assignedId,
+                                        executor, domainTask, connection,
                                         terminalResult, bodyCts.Token, ct);
                                 }
                             }
@@ -468,7 +587,7 @@ public sealed class WorkerService(
                             // Single-flight: only emitted if the cancel handler has not already
                             // claimed Ready for this same assignment.
                             if (readyClaim.TryClaim())
-                                await SendWorkerReady(stream, assignedId, ct);
+                                await SendWorkerReady(connection, ct);
                         }, ct);
 
                         InstallActiveAssignment(
@@ -503,7 +622,7 @@ public sealed class WorkerService(
                             // emit here if it did not (e.g. it was cancelled before reaching the
                             // claim), so a cancel never produces a second dequeue.
                             if (cancelled.Ready.TryClaim())
-                                await SendWorkerReady(stream, assignedId, ct);
+                                await SendWorkerReady(connection, ct);
                         }
                         else
                         {
@@ -511,7 +630,7 @@ public sealed class WorkerService(
                             // keeps the orchestrator's view accurate.
                             _currentTaskId = null;
                             _currentRole = null;
-                            await SendWorkerReady(stream, assignedId, ct);
+                            await SendWorkerReady(connection, ct);
                         }
                         break;
 
@@ -552,6 +671,11 @@ public sealed class WorkerService(
 
             _currentTaskId = null;
             _currentRole = null;
+
+            // RETIRE ACCESS only AFTER the drain above. A body draining behind an EOF or a reader
+            // failure with a LIVE token therefore still got its single Ready attempt; from here on,
+            // any NEW operation on this connection fails disconnected instead of starting transport.
+            connection.Retire();
         }
     }
 
@@ -618,8 +742,11 @@ public sealed class WorkerService(
     /// </remarks>
     /// <param name="executor">The executor to run — already fully constructed.</param>
     /// <param name="task">The domain task.</param>
-    /// <param name="stream">The bidirectional work stream.</param>
-    /// <param name="assignedId">This worker's orchestrator-assigned identifier.</param>
+    /// <param name="connection">
+    /// The EXPECTED connection this assignment belongs to. The completion write consumes THIS
+    /// object's stream and identity, so a completion can never be reported on a different
+    /// registration than the one the assignment arrived on.
+    /// </param>
     /// <param name="terminalResult">
     /// The assignment-local holder this execution publishes its terminal result into. Passed in by
     /// the body's closure — never discovered through the ownership slot, which may not yet hold
@@ -630,8 +757,7 @@ public sealed class WorkerService(
     private async Task ExecuteAndReportAsync(
         TaskExecutor executor,
         WorkTask task,
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId,
+        WorkerConnection connection,
         TerminalResultHolder terminalResult,
         CancellationToken bodyToken,
         CancellationToken streamToken)
@@ -642,9 +768,9 @@ public sealed class WorkerService(
         // or fail. Everything below is reporting of an already-retained result.
         terminalResult.Publish(result);
 
-        await SendAsync(stream, new WorkerMessage
+        await SendAsync(connection, new WorkerMessage
         {
-            WorkerId = assignedId,
+            WorkerId = connection.AssignedId,
             Complete = GrpcMapper.ToGrpc(result),
         }, streamToken);
 
@@ -918,21 +1044,19 @@ public sealed class WorkerService(
     /// Builds and sends ONE tool-call request through the shared send boundary.
     /// </summary>
     /// <remarks>
-    /// The stream and worker ID are captured into locals BEFORE the gate is awaited, so a send
-    /// that parks behind another writer still targets the connection it was intended for and can
-    /// never be rerouted by a concurrent mutation of <see cref="_stream"/>. The not-connected
-    /// error is unchanged and still raised before any wait.
+    /// The CONNECTION is snapshotted into a local BEFORE the gate is awaited, so a send that parks
+    /// behind another writer still targets the connection it was intended for and can never be
+    /// rerouted by a concurrent mutation of the published connection. Both the identity and the
+    /// writer come from that ONE snapshot, so they can never disagree. The not-connected error is
+    /// unchanged and still raised before any wait.
     /// </remarks>
     private async Task SendToolCallRequest(string requestId, string taskId, string toolName, string argsJson, CancellationToken ct)
     {
-        var stream = _stream;
-        var assignedId = _assignedId;
-        if (stream is null || assignedId is null)
-            throw new InvalidOperationException("Not connected to orchestrator");
+        var connection = RequireConnection();
 
-        await SendAsync(stream, new WorkerMessage
+        await SendAsync(connection, new WorkerMessage
         {
-            WorkerId = assignedId,
+            WorkerId = connection.AssignedId,
             ToolRequest = new ToolCallRequest
             {
                 RequestId = requestId,
@@ -956,12 +1080,16 @@ public sealed class WorkerService(
     /// <returns>
     /// The session JSON if found, or <c>null</c> if no session exists for the given ID.
     /// </returns>
+    /// <remarks>
+    /// The connection is snapshotted ONCE and its client used for the whole call, so the RPC can
+    /// never straddle two registrations. Checked access rejects a retired connection before the RPC
+    /// starts; an RPC already under way keeps its captured client, token and outcome.
+    /// </remarks>
     public async Task<string?> GetSessionAsync(string sessionId, CancellationToken ct)
     {
-        if (_client is null)
-            throw new InvalidOperationException("Not connected to orchestrator");
+        var client = RequireConnection().Client;
 
-        var response = await _client.GetSessionAsync(
+        var response = await client.GetSessionAsync(
             new GetSessionRequest { SessionId = sessionId },
             cancellationToken: ct);
 
@@ -975,12 +1103,12 @@ public sealed class WorkerService(
     /// <param name="sessionId">The session identifier in format "goalId:roleName".</param>
     /// <param name="sessionJson">The serialised session JSON to persist.</param>
     /// <param name="ct">Cancellation token.</param>
+    /// <remarks>Snapshot-once and checked access exactly as in <see cref="GetSessionAsync"/>.</remarks>
     public async Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct)
     {
-        if (_client is null)
-            throw new InvalidOperationException("Not connected to orchestrator");
+        var client = RequireConnection().Client;
 
-        await _client.SaveSessionAsync(
+        await client.SaveSessionAsync(
             new SaveSessionRequest { SessionId = sessionId, SessionJson = sessionJson },
             cancellationToken: ct);
     }
@@ -992,10 +1120,11 @@ public sealed class WorkerService(
     /// <c>Complete</c>, tool requests and every <c>Ready</c> — goes through here, so at most one
     /// underlying <c>RequestStream.WriteAsync</c> is outstanding at a time.
     /// </summary>
-    /// <param name="stream">
-    /// The stream captured by the CALLER before it waits. Passing it explicitly (rather than
-    /// re-reading the mutable <see cref="_stream"/> field after the wait) guarantees a waiting
-    /// send is never rerouted onto a different connection.
+    /// <param name="connection">
+    /// The connection captured by the CALLER before it waits. Passing the whole connection
+    /// explicitly (rather than re-reading the published field after the wait) guarantees a waiting
+    /// send is never rerouted onto a different connection — and that its identity and its writer
+    /// always come from the same snapshot.
     /// </param>
     /// <param name="message">The fully built message — construction happens outside the gate.</param>
     /// <param name="ct">
@@ -1011,16 +1140,21 @@ public sealed class WorkerService(
     /// retried or converted into success. The gate is NOT held across a <c>ToolCallResponse</c>
     /// await or an assignment drain, and unary RPCs (heartbeat, session, provisioning) plus the
     /// response reader stay entirely outside it.
+    /// <para>
+    /// RETIREMENT IS CHECKED AFTER THE GATE IS ACQUIRED. A send that was already queued when the
+    /// connection retired therefore cannot write on it (nor on a replacement): it fails with the
+    /// existing disconnected error instead. This is the ONLY check inside the gate — the write
+    /// itself still consumes the captured connection, so a permitted write keeps its captured
+    /// stream, token and outcome.
+    /// </para>
     /// </remarks>
-    private async Task SendAsync(
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        WorkerMessage message,
-        CancellationToken ct)
+    private async Task SendAsync(WorkerConnection connection, WorkerMessage message, CancellationToken ct)
     {
         await _sendGate.WaitAsync(ct);
         try
         {
-            await stream.RequestStream.WriteAsync(message, ct);
+            connection.EnsureUsable();
+            await connection.Stream.RequestStream.WriteAsync(message, ct);
         }
         finally
         {
@@ -1028,45 +1162,72 @@ public sealed class WorkerService(
         }
     }
 
-    private Task SendWorkerReady(
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId,
-        CancellationToken ct) =>
-        SendAsync(stream, new WorkerMessage
+    /// <summary>
+    /// Writes one <c>WorkerReady</c> on the given connection, carrying that connection's own
+    /// identity — never a separately mutable ID value.
+    /// </summary>
+    private Task SendWorkerReady(WorkerConnection connection, CancellationToken ct) =>
+        SendAsync(connection, new WorkerMessage
         {
-            WorkerId = assignedId,
+            WorkerId = connection.AssignedId,
             Ready = new WorkerReady(),
         }, ct);
 
-    private async Task RunHeartbeatAsync(
-        HiveOrchestrator.HiveOrchestratorClient client,
-        string assignedId,
-        CancellationToken ct)
+    /// <summary>
+    /// The heartbeat loop for ONE published connection. Cadence is UNCHANGED: it still waits for
+    /// <see cref="HeartbeatInterval"/> before every tick, and there is deliberately NO immediate
+    /// first heartbeat.
+    /// </summary>
+    private async Task RunHeartbeatAsync(WorkerConnection connection, CancellationToken ct)
     {
         using var timer = new PeriodicTimer(HeartbeatInterval);
 
         while (await timer.WaitForNextTickAsync(ct))
+            await SendHeartbeatAsync(connection, ct);
+    }
+
+    /// <summary>
+    /// ONE heartbeat tick on the given connection: snapshots the connection's identity and the
+    /// worker's current task state AT the tick, so the emitted request belongs to the registration
+    /// this loop was started for and reflects the state at that instant.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the loop body factored out verbatim (a TEST SEAM in shape only: the loop above is its
+    /// sole production caller), so a focused test can drive exactly one tick without waiting for a
+    /// real interval. The failure contract is UNCHANGED — a non-cancellation fault is logged in
+    /// sanitized form and the loop continues to the next tick.
+    /// </para>
+    /// <para>
+    /// CHECKED ACCESS comes FIRST, before any transport: a retired connection issues no heartbeat
+    /// RPC at all. That rejection lands on the existing sanitized log path — a heartbeat is a
+    /// periodic best-effort signal, so it keeps the existing swallow-and-retry contract rather than
+    /// propagating. A tick that already passed the check keeps its captured client, token and
+    /// outcome.
+    /// </para>
+    /// </remarks>
+    private async Task SendHeartbeatAsync(WorkerConnection connection, CancellationToken ct)
+    {
+        try
         {
-            try
+            var client = connection.EnsureUsable().Client;
+            var taskId = _currentTaskId;
+            await client.HeartbeatAsync(new HeartbeatRequest
             {
-                var taskId = _currentTaskId;
-                await client.HeartbeatAsync(new HeartbeatRequest
-                {
-                    WorkerId = assignedId,
-                    Busy = taskId is not null,
-                    CurrentTaskId = taskId ?? "",
-                    CurrentRole = _currentRole ?? "",
-                    ContextUsagePercent = taskId is not null
-                        ? _agentRunner.GetContextUsagePercent()
-                        : 0,
-                }, cancellationToken: ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
-                // echo request configuration back to the worker.
-                Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
-            }
+                WorkerId = connection.AssignedId,
+                Busy = taskId is not null,
+                CurrentTaskId = taskId ?? "",
+                CurrentRole = _currentRole ?? "",
+                ContextUsagePercent = taskId is not null
+                    ? _agentRunner.GetContextUsagePercent()
+                    : 0,
+            }, cancellationToken: ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
+            // echo request configuration back to the worker.
+            Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
         }
     }
 

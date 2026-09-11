@@ -32,13 +32,9 @@ public sealed class WorkerServiceIssueToolTests
             _ => { },
             null!);
 
-        var streamField = typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("WorkerService._stream field not found.");
-        streamField.SetValue(service, stream);
-
-        var assignedIdField = typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("WorkerService._assignedId field not found.");
-        assignedIdField.SetValue(service, "worker-1");
+        // The bridge sends through the PUBLISHED connection, so publishing it is all this test
+        // needs — the real message loop is not driven here.
+        TestConnectionFactory.Attach(service, "worker-1", stream);
 
         // Start the raise_issue call; it will block awaiting the orchestrator response.
         var raiseTask = service.RaiseIssueAsync(

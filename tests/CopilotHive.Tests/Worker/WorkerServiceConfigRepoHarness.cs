@@ -40,9 +40,6 @@ internal static class WorkerServiceConfigRepoHarness
             existing.DisposeAsync().AsTask().GetAwaiter().GetResult();
         field.SetValue(service, runner);
 
-        typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "worker-1");
-
         return service;
     }
 
@@ -50,8 +47,19 @@ internal static class WorkerServiceConfigRepoHarness
     /// Pushes ONE coder assignment through the real message loop and returns once the assignment
     /// body has emitted its Ready (i.e. the body — including the seam's disposal — has finished).
     /// </summary>
+    /// <param name="service">The service under test.</param>
+    /// <param name="taskId">The task ID to assign.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="connectionProvisioner">
+    /// The provisioner the test CONNECTION carries. <c>null</c> falls back to
+    /// <see cref="WorkerService.TestProvisioner"/>, and a connection with no provisioner at all
+    /// selects the legacy, seam-free executor path.
+    /// </param>
     internal static async Task RunOneAssignmentAsync(
-        WorkerService service, string taskId, CancellationToken ct)
+        WorkerService service,
+        string taskId,
+        CancellationToken ct,
+        WorkerConfigProvisioner? connectionProvisioner = null)
     {
         var responses = new ScriptedResponseStream();
         var requests = new ReadyGateRequestStream();
@@ -63,9 +71,14 @@ internal static class WorkerServiceConfigRepoHarness
             _ => { },
             null!);
 
+        // The connection carries the provisioner for BOTH provisioning sites; a fixture that sets
+        // neither leaves it null and keeps the legacy, seam-free executor branch.
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", stream, connectionProvisioner ?? service.TestProvisioner);
+
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var loop = (Task)method.Invoke(service, [stream, "worker-1", ct])!;
+        var loop = (Task)method.Invoke(service, [connection, ct])!;
 
         responses.Push(new OrchestratorMessage
         {
