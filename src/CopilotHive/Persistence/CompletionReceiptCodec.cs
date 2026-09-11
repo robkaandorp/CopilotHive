@@ -226,6 +226,15 @@ internal static class CompletionReceiptCodec
     /// <summary>
     /// Encodes a receipt into the canonical version-1 envelope.
     /// <para>
+    /// THE DETACH COMES FIRST, THEN THE VALIDATION, THEN THE WRITE. <see cref="Capture"/> copies the
+    /// whole receipt graph — including every caller-owned mutable collection — into a PRIVATE
+    /// snapshot before anything is inspected. <see cref="Validate"/> then examines ONLY that snapshot,
+    /// and <see cref="WriteReceipt"/> writes ONLY that snapshot. The caller's objects are read exactly
+    /// once, during the capture, and never again; a mutation the caller makes after
+    /// <see cref="Encode"/> has begun therefore cannot change the output and cannot slip a null or an
+    /// unpaired surrogate past the validation into the writer.
+    /// </para>
+    /// <para>
     /// THE RECEIPT IS VALIDATED BEFORE A SINGLE BYTE IS WRITTEN: every rule in <see cref="Validate"/>
     /// runs first, so a refused receipt produces no partial output and no stream is left half
     /// written. The result is compact JSON with the fixed member order documented on this type, and
@@ -240,16 +249,110 @@ internal static class CompletionReceiptCodec
     {
         ArgumentNullException.ThrowIfNull(receipt);
 
-        // Validate everything FIRST: a refusal must never emit partial JSON.
-        Validate(receipt);
+        // (1) THE DETACH. The caller's graph is read HERE and nowhere else.
+        var snapshot = Capture(receipt);
 
+        // (2) Validate the CAPTURED graph FIRST: a refusal must never emit partial JSON.
+        Validate(snapshot);
+
+        // (3) Write the CAPTURED graph. No caller-owned object is reachable from this point on.
         using var buffer = new MemoryStream();
         using (var writer = new Utf8JsonWriter(buffer, WriterOptions))
         {
-            WriteReceipt(writer, receipt);
+            WriteReceipt(writer, snapshot);
         }
 
         return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>
+    /// THE DETACH BOUNDARY: copies the entire receipt graph into a private
+    /// <see cref="ReceiptSnapshot"/>, so validation and writing can never observe a later caller
+    /// mutation.
+    /// <para>
+    /// EVERY caller-owned mutable collection the encoder reads is COPIED here —
+    /// <see cref="TaskMetrics.Issues"/> and <see cref="GitChangeSummary.ChangedFiles"/> — into fresh
+    /// lists this class alone holds. Every other member the envelope writes is either an immutable
+    /// <see cref="string"/> or a value type, and is copied by value into the snapshot; even the
+    /// immutable <see cref="WorkSlotPosition"/> record is flattened into scalars, so no field of the
+    /// caller's graph remains reachable from the snapshot at all. A future field that added another
+    /// caller-owned collection would have to be copied here too in order to be written.
+    /// </para>
+    /// <para>
+    /// IT VALIDATES NOTHING AND REPAIRS NOTHING. A <c>null</c> reference, a <c>null</c> list and a
+    /// <c>null</c> element are all carried into the snapshot exactly as found, so
+    /// <see cref="Validate"/> remains the single place that decides what is refused and produces the
+    /// same diagnostics it always did.
+    /// </para>
+    /// </summary>
+    /// <param name="receipt">The caller's receipt; read once, here.</param>
+    /// <returns>A snapshot that shares no mutable state with the caller.</returns>
+    private static ReceiptSnapshot Capture(CompletionReceipt receipt)
+    {
+        var slot = receipt.Slot;
+        var position = slot?.Position;
+        var result = receipt.Result;
+        var metrics = result?.Metrics;
+        var gitStatus = result?.GitStatus;
+
+        return new ReceiptSnapshot
+        {
+            GoalId = receipt.GoalId,
+            WorkerId = receipt.WorkerId,
+            Role = receipt.Role,
+            Slot = slot is null
+                ? null
+                : new SlotSnapshot
+                {
+                    TaskId = slot.TaskId,
+                    Position = position is null
+                        ? null
+                        : new PositionSnapshot
+                        {
+                            Iteration = position.Iteration,
+                            Phase = position.Phase,
+                            Occurrence = position.Occurrence,
+                        },
+                    Attempt = slot.Attempt,
+                },
+            Result = result is null
+                ? null
+                : new ResultSnapshot
+                {
+                    TaskId = result.TaskId,
+                    Status = result.Status,
+                    Output = result.Output,
+                    Model = result.Model,
+                    IterationStartSha = result.IterationStartSha,
+                    Metrics = metrics is null
+                        ? null
+                        : new MetricsSnapshot
+                        {
+                            Verdict = metrics.Verdict,
+                            BuildSuccess = metrics.BuildSuccess,
+                            TotalTests = metrics.TotalTests,
+                            PassedTests = metrics.PassedTests,
+                            FailedTests = metrics.FailedTests,
+                            CoveragePercent = metrics.CoveragePercent,
+                            // THE COPY: a fresh list, so a later Add/Clear/indexer write on the
+                            // caller's own list cannot reach the validation or the writer. A null
+                            // list stays null for Validate to refuse with its own message.
+                            Issues = metrics.Issues is null ? null : new List<string>(metrics.Issues),
+                            Summary = metrics.Summary,
+                        },
+                    GitStatus = gitStatus is null
+                        ? null
+                        : new GitSnapshot
+                        {
+                            FilesChanged = gitStatus.FilesChanged,
+                            Insertions = gitStatus.Insertions,
+                            Deletions = gitStatus.Deletions,
+                            Pushed = gitStatus.Pushed,
+                            // THE COPY, for the same reason as Issues above.
+                            ChangedFiles = gitStatus.ChangedFiles is null ? null : new List<string>(gitStatus.ChangedFiles),
+                        },
+                },
+        };
     }
 
     /// <summary>
@@ -296,15 +399,19 @@ internal static class CompletionReceiptCodec
     }
 
     /// <summary>
-    /// Builds the canonical wire object for <paramref name="receipt"/>. The caller must already have
+    /// Builds the canonical wire object from the CAPTURED snapshot. The caller must already have
     /// validated it (see <see cref="Validate"/>); the writes below therefore assume every required
     /// value is present and only re-check what would otherwise corrupt the output.
+    /// <para>
+    /// It takes a <see cref="ReceiptSnapshot"/>, never a <see cref="CompletionReceipt"/>, so the
+    /// writer physically cannot reach a caller-owned object.
+    /// </para>
     /// </summary>
-    private static void WriteReceipt(Utf8JsonWriter writer, CompletionReceipt receipt)
+    private static void WriteReceipt(Utf8JsonWriter writer, ReceiptSnapshot receipt)
     {
-        var slot = receipt.Slot;
-        var position = slot.Position;
-        var result = receipt.Result;
+        var slot = receipt.Slot!;
+        var position = slot.Position!;
+        var result = receipt.Result!;
 
         writer.WriteStartObject();
         writer.WriteNumber(VersionProperty, Version);
@@ -336,11 +443,12 @@ internal static class CompletionReceiptCodec
     }
 
     /// <summary>
-    /// Writes the <c>metrics</c> member: JSON <c>null</c> when absent, otherwise an object carrying
-    /// EVERY <see cref="TaskMetrics"/> member in the fixed order (the members are always present, so
-    /// a non-null metrics object is never abbreviated).
+    /// Writes the <c>metrics</c> member from the CAPTURED snapshot: JSON <c>null</c> when absent,
+    /// otherwise an object carrying EVERY <see cref="TaskMetrics"/> member in the fixed order (the
+    /// members are always present, so a non-null metrics object is never abbreviated). The
+    /// <c>issues</c> array is written from the snapshot's OWN list copy, never from the caller's.
     /// </summary>
-    private static void WriteMetrics(Utf8JsonWriter writer, TaskMetrics? metrics)
+    private static void WriteMetrics(Utf8JsonWriter writer, MetricsSnapshot? metrics)
     {
         if (metrics is null)
         {
@@ -357,16 +465,18 @@ internal static class CompletionReceiptCodec
         writer.WritePropertyName(CoveragePercentProperty);
         CoverageConverterInstance.Write(writer, metrics.CoveragePercent, ReadOptions);
         writer.WritePropertyName(IssuesProperty);
-        EvidenceListConverter.Write(writer, metrics.Issues, ReadOptions);
+        EvidenceListConverter.Write(writer, metrics.Issues!, ReadOptions);
         writer.WriteString(SummaryProperty, metrics.Summary);
         writer.WriteEndObject();
     }
 
     /// <summary>
-    /// Writes the <c>gitStatus</c> member: JSON <c>null</c> when absent, otherwise an object carrying
-    /// EVERY <see cref="GitChangeSummary"/> member in the fixed order.
+    /// Writes the <c>gitStatus</c> member from the CAPTURED snapshot: JSON <c>null</c> when absent,
+    /// otherwise an object carrying EVERY <see cref="GitChangeSummary"/> member in the fixed order.
+    /// The <c>changedFiles</c> array is written from the snapshot's OWN list copy, never from the
+    /// caller's.
     /// </summary>
-    private static void WriteGitStatus(Utf8JsonWriter writer, GitChangeSummary? gitStatus)
+    private static void WriteGitStatus(Utf8JsonWriter writer, GitSnapshot? gitStatus)
     {
         if (gitStatus is null)
         {
@@ -380,7 +490,7 @@ internal static class CompletionReceiptCodec
         writer.WriteNumber(DeletionsProperty, gitStatus.Deletions);
         writer.WriteBoolean(PushedProperty, gitStatus.Pushed);
         writer.WritePropertyName(ChangedFilesProperty);
-        EvidenceListConverter.Write(writer, gitStatus.ChangedFiles, ReadOptions);
+        EvidenceListConverter.Write(writer, gitStatus.ChangedFiles!, ReadOptions);
         writer.WriteEndObject();
     }
 
@@ -407,13 +517,19 @@ internal static class CompletionReceiptCodec
     /// transcode verbatim, or an unrepresentable role/phase — with
     /// <see cref="CompletionReceiptCodecException"/>. Nothing is defaulted, repaired or dropped.
     /// <para>
+    /// IT EXAMINES THE CAPTURED SNAPSHOT, NOT THE CALLER'S GRAPH. That is what closes the
+    /// validate-then-write window: the list this method walks is the very same private copy the
+    /// writer will enumerate, so an element the caller injects afterwards is neither seen here nor
+    /// written there.
+    /// </para>
+    /// <para>
     /// The role and phase checks are BELT-AND-BRACES: <see cref="CompletionReceipt"/> already
     /// guarantees a worker-backed, phase-mapped role, so on a receipt built through that constructor
     /// they can never fire. They are kept so that a future carrier change cannot silently widen what
     /// this envelope writes.
     /// </para>
     /// </summary>
-    private static void Validate(CompletionReceipt receipt)
+    private static void Validate(ReceiptSnapshot receipt)
     {
         if (receipt.GoalId is null)
             throw new CompletionReceiptCodecException("Cannot encode a receipt whose goal id is null.");
@@ -809,6 +925,141 @@ internal static class CompletionReceiptCodec
                 writer.WriteStringValue(item);
             writer.WriteEndArray();
         }
+    }
+
+    /// <summary>
+    /// THE ENCODE-SIDE DETACHED SNAPSHOT of a receipt: the private, codec-owned mirror of the
+    /// caller's graph that <see cref="Capture"/> produces, <see cref="Validate"/> inspects and
+    /// <see cref="WriteReceipt"/> writes.
+    /// <para>
+    /// It exists ONLY to close the validate-then-write window. Every member is nullable and carries
+    /// whatever the caller's graph held — including <c>null</c> — because the snapshot decides
+    /// nothing; <see cref="Validate"/> remains the single authority on what is refused, and its
+    /// messages are unchanged. It is deliberately NOT the wire shape: it has no JSON attributes and
+    /// takes no part in decoding.
+    /// </para>
+    /// </summary>
+    private sealed class ReceiptSnapshot
+    {
+        /// <summary>The captured goal identity.</summary>
+        public string? GoalId { get; init; }
+
+        /// <summary>The captured worker identity.</summary>
+        public string? WorkerId { get; init; }
+
+        /// <summary>The captured assigned role.</summary>
+        public WorkerRole Role { get; init; }
+
+        /// <summary>The captured work-slot identity, or <c>null</c> when the caller's slot was null.</summary>
+        public SlotSnapshot? Slot { get; init; }
+
+        /// <summary>The captured result, or <c>null</c> when the caller's result was null.</summary>
+        public ResultSnapshot? Result { get; init; }
+    }
+
+    /// <summary>The captured <c>slot</c>; see <see cref="ReceiptSnapshot"/>.</summary>
+    private sealed class SlotSnapshot
+    {
+        /// <summary>The captured task identity.</summary>
+        public string? TaskId { get; init; }
+
+        /// <summary>The captured position, or <c>null</c> when the caller's position was null.</summary>
+        public PositionSnapshot? Position { get; init; }
+
+        /// <summary>The captured dispatch attempt.</summary>
+        public int Attempt { get; init; }
+    }
+
+    /// <summary>
+    /// The captured <c>slot.position</c>, flattened into scalars so not even the caller's immutable
+    /// position record remains reachable; see <see cref="ReceiptSnapshot"/>.
+    /// </summary>
+    private sealed class PositionSnapshot
+    {
+        /// <summary>The captured one-based iteration.</summary>
+        public int Iteration { get; init; }
+
+        /// <summary>The captured phase.</summary>
+        public GoalPhase Phase { get; init; }
+
+        /// <summary>The captured one-based occurrence.</summary>
+        public int Occurrence { get; init; }
+    }
+
+    /// <summary>The captured <c>result</c>; see <see cref="ReceiptSnapshot"/>.</summary>
+    private sealed class ResultSnapshot
+    {
+        /// <summary>The captured task identity.</summary>
+        public string? TaskId { get; init; }
+
+        /// <summary>The captured outcome.</summary>
+        public TaskOutcome Status { get; init; }
+
+        /// <summary>The captured worker output text.</summary>
+        public string? Output { get; init; }
+
+        /// <summary>The captured model id.</summary>
+        public string? Model { get; init; }
+
+        /// <summary>The captured iteration start SHA, which may legitimately be <c>null</c>.</summary>
+        public string? IterationStartSha { get; init; }
+
+        /// <summary>The captured metrics, which may legitimately be <c>null</c>.</summary>
+        public MetricsSnapshot? Metrics { get; init; }
+
+        /// <summary>The captured git status, which may legitimately be <c>null</c>.</summary>
+        public GitSnapshot? GitStatus { get; init; }
+    }
+
+    /// <summary>The captured <c>result.metrics</c>; see <see cref="ReceiptSnapshot"/>.</summary>
+    private sealed class MetricsSnapshot
+    {
+        /// <summary>The captured verdict string.</summary>
+        public string? Verdict { get; init; }
+
+        /// <summary>The captured build-success flag.</summary>
+        public bool BuildSuccess { get; init; }
+
+        /// <summary>The captured total test count.</summary>
+        public int TotalTests { get; init; }
+
+        /// <summary>The captured passed test count.</summary>
+        public int PassedTests { get; init; }
+
+        /// <summary>The captured failed test count.</summary>
+        public int FailedTests { get; init; }
+
+        /// <summary>The captured coverage percentage.</summary>
+        public double CoveragePercent { get; init; }
+
+        /// <summary>
+        /// THE PRIVATE COPY of the caller's issue list, or <c>null</c> when the caller's list was
+        /// null. Validation walks this list and the writer emits this list, so the two can never
+        /// disagree about its contents.
+        /// </summary>
+        public List<string>? Issues { get; init; }
+
+        /// <summary>The captured summary string.</summary>
+        public string? Summary { get; init; }
+    }
+
+    /// <summary>The captured <c>result.gitStatus</c>; see <see cref="ReceiptSnapshot"/>.</summary>
+    private sealed class GitSnapshot
+    {
+        /// <summary>The captured changed-file count.</summary>
+        public int FilesChanged { get; init; }
+
+        /// <summary>The captured insertion count.</summary>
+        public int Insertions { get; init; }
+
+        /// <summary>The captured deletion count.</summary>
+        public int Deletions { get; init; }
+
+        /// <summary>The captured pushed flag.</summary>
+        public bool Pushed { get; init; }
+
+        /// <summary>THE PRIVATE COPY of the caller's changed-file list; see <see cref="MetricsSnapshot.Issues"/>.</summary>
+        public List<string>? ChangedFiles { get; init; }
     }
 
     /// <summary>
