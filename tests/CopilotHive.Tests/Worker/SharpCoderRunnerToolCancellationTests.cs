@@ -156,10 +156,9 @@ public sealed class SharpCoderRunnerToolCancellationTests
             _ => { },
             null!);
 
-        typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, stream);
-        typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "worker-tok");
+        // The bridge sends through the PUBLISHED connection, so publishing it is all this test
+        // needs — the real message loop is not driven here.
+        TestConnectionFactory.Attach(service, "worker-tok", stream);
 
         using var assignmentCts = new CancellationTokenSource();
 

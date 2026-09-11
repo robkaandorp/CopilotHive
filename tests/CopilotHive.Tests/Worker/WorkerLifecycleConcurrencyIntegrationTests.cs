@@ -111,10 +111,12 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
         var originalErr = Console.Error;
         Console.SetError(stdErr);
 
+        var connection = TestConnectionFactory.Attach(service, "worker-overlap", stream, service.TestProvisioner);
+
         Task processTask = Task.CompletedTask;
         try
         {
-            processTask = InvokeProcessMessages(service, stream, TestContext.Current.CancellationToken);
+            processTask = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
             await steps[0].MoveNextEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
             steps[0].Release.TrySetResult(true);
             var clientA = await tracker.WaitForClientAsync(0, TestContext.Current.CancellationToken);
@@ -200,12 +202,12 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
         var requests = new CapturingRequestStream();
         var responses = new GatedResponseStream(steps);
         using var stream = CreateDuplex(requests, responses);
-        AttachToolStream(service, stream, AssignedId);
+        var connection = AttachToolStream(service, stream, AssignedId);
 
         Task processTask = Task.CompletedTask;
         try
         {
-            processTask = InvokeProcessMessages(service, stream, TestContext.Current.CancellationToken);
+            processTask = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
 
             // A starts and waits inside WorkerService.RequestClarificationAsync's pending TCS.
             await steps[0].MoveNextEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
@@ -303,28 +305,21 @@ public sealed class WorkerLifecycleConcurrencyIntegrationTests
         field.SetValue(service, runner);
     }
 
-    private static void AttachToolStream(
+    private static WorkerConnection AttachToolStream(
         WorkerService service,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        string assignedId)
-    {
-        var streamField = typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("WorkerService._stream field not found.");
-        var assignedIdField = typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("WorkerService._assignedId field not found.");
-        streamField.SetValue(service, stream);
-        assignedIdField.SetValue(service, assignedId);
-    }
+        string assignedId) =>
+        TestConnectionFactory.Attach(service, assignedId, stream, service.TestProvisioner);
 
     private static Task InvokeProcessMessages(
         WorkerService service,
-        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        WorkerConnection connection,
         CancellationToken ct)
     {
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("WorkerService.ProcessMessagesAsync not found.");
-        return (Task)method.Invoke(service, [stream, "worker-overlap", ct])!;
+        return (Task)method.Invoke(service, [connection, ct])!;
     }
 
     private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> CreateDuplex(
@@ -903,8 +898,8 @@ public sealed class WorkerServiceSendSerializationTests
         // directory is the HARNESS's own temporary one, so nothing depends on a writable
         // root-level /config-repo and nothing is left behind.
         var configRepoDir = harness.ConfigRepoDir;
-        harness.Service.TestProvisioner = new ProvisionerHarness(
-            "https://github.com/org/config-repo.git", "ghp_test").Provisioner;
+        harness.UseProvisioner(new ProvisionerHarness(
+            "https://github.com/org/config-repo.git", "ghp_test").Provisioner);
         var launcher = new FakeGitLauncher(tokens =>
         {
             if (TokenMatches(tokens, "rev-parse", "--is-inside-work-tree"))
@@ -1421,11 +1416,19 @@ public sealed class WorkerServiceSendSerializationTests
             Directory.CreateDirectory(ConfigRepoDir);
 
             Service = new WorkerService("http://localhost:9999", workerId, ["coder"], ConfigRepoDir);
-            typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .SetValue(Service, CreateDuplex());
-            typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .SetValue(Service, workerId);
+            Connection = TestConnectionFactory.Attach(Service, workerId, CreateDuplex(), Service.TestProvisioner);
         }
+
+        /// <summary>The connection the fixture published for the service to drive.</summary>
+        internal WorkerConnection Connection { get; private set; }
+
+        /// <summary>
+        /// Re-publishes this harness's connection carrying <paramref name="provisioner"/>. Needed by
+        /// the provisioned-body test, which must install its provisioner AFTER the harness has
+        /// constructed the service.
+        /// </summary>
+        internal void UseProvisioner(WorkerConfigProvisioner? provisioner) =>
+            Connection = TestConnectionFactory.Attach(Service, _workerId, CreateDuplex(), provisioner);
 
         /// <summary>The production send gate instance (never mutated — read for observation only).</summary>
         private SemaphoreSlim SendGate =>
@@ -1453,9 +1456,7 @@ public sealed class WorkerServiceSendSerializationTests
             var method = typeof(WorkerService).GetMethod(
                 "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?? throw new InvalidOperationException("WorkerService.ProcessMessagesAsync not found.");
-            var stream = typeof(WorkerService).GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .GetValue(Service)!;
-            return (Task)method.Invoke(Service, [stream, _workerId, ct])!;
+            return (Task)method.Invoke(Service, [Connection, ct])!;
         }
 
         /// <summary>Replaces the default SharpCoderRunner with a test runner (disposes the default).</summary>

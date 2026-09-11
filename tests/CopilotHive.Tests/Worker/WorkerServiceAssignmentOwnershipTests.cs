@@ -1403,9 +1403,6 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             existing.DisposeAsync().AsTask().GetAwaiter().GetResult();
         field.SetValue(service, runner);
 
-        typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "worker-1");
-
         return service;
     }
 
@@ -1418,15 +1415,21 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             _ => { },
             null!);
 
+    /// <summary>
+    /// Drives the real private message loop with a connection carrying the service's
+    /// <c>TestProvisioner</c> — a <c>null</c> one keeps the legacy, seam-free executor branch, which
+    /// is what these direct-loop fixtures need.
+    /// </summary>
     private static Task InvokeProcessMessages(
         WorkerService service,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         string assignedId,
         CancellationToken ct)
     {
+        var connection = TestConnectionFactory.Attach(service, assignedId, stream, service.TestProvisioner);
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        return (Task)method.Invoke(service, [stream, assignedId, ct])!;
+        return (Task)method.Invoke(service, [connection, ct])!;
     }
 
     /// <summary>Reflects the service-owned ownership slot: 1 when occupied, 0 when empty.</summary>

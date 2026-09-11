@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Text;
 
 using CopilotHive.Worker;
@@ -138,12 +137,14 @@ public sealed class WorkerServiceConfigRepoWiringTests : IDisposable
     }
 
     /// <summary>
-    /// The production field (assigned by <c>RunAsync</c> after an ACCEPTED registration) is
-    /// consulted too — not only the test override. Deleting the <c>?? _provisioner</c> fallback
-    /// would take production back to the legacy path and fail here.
+    /// The CONNECTION's own provisioner is consulted too — not only the
+    /// <c>TestProvisioner</c> seam. The connection here is built WITHOUT touching
+    /// <c>TestProvisioner</c>, so the provisioner that selects the seam path is the one the
+    /// connection carries. Dropping the connection's provisioner would take production back to the
+    /// legacy path and fail here.
     /// </summary>
     [Fact]
-    public async Task ProductionProvisionerField_SelectsTheSeamPath()
+    public async Task ConnectionProvisioner_SelectsTheSeamPath()
     {
         Directory.CreateDirectory(ConfigRepoDir);
 
@@ -154,12 +155,9 @@ public sealed class WorkerServiceConfigRepoWiringTests : IDisposable
         using var service = WorkerServiceConfigRepoHarness.BuildService(runner, ConfigRepoDir);
 
         var harness = new ProvisionerHarness(configRepoUrl: EligibleUrl, ghToken: "ghp_test");
-        typeof(WorkerService)
-            .GetField("_provisioner", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, harness.Provisioner);
 
         await WorkerServiceConfigRepoHarness.RunOneAssignmentAsync(
-            service, "task-field", TestContext.Current.CancellationToken);
+            service, "task-field", TestContext.Current.CancellationToken, harness.Provisioner);
 
         Assert.True(launcher.Saw("rev-parse", "--is-inside-work-tree"));
         Assert.Equal(1, harness.FetchCount);

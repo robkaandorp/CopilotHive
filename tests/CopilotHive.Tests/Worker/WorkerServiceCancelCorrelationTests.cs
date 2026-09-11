@@ -172,9 +172,6 @@ public sealed class WorkerServiceCancelCorrelationTests
             existing.DisposeAsync().AsTask().GetAwaiter().GetResult();
         field.SetValue(service, runner);
 
-        typeof(WorkerService).GetField("_assignedId", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(service, "worker-1");
-
         return service;
     }
 
@@ -193,9 +190,12 @@ public sealed class WorkerServiceCancelCorrelationTests
         string assignedId,
         CancellationToken ct)
     {
+        // The fixture publishes a connection carrying the service's TestProvisioner (null here),
+        // then drives the real loop with it.
+        var connection = TestConnectionFactory.Attach(service, assignedId, stream, service.TestProvisioner);
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        return (Task)method.Invoke(service, [stream, assignedId, ct])!;
+        return (Task)method.Invoke(service, [connection, ct])!;
     }
 
     /// <summary>

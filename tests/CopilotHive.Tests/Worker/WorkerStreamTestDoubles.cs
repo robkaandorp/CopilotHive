@@ -1,12 +1,54 @@
 using CopilotHive.Shared.Grpc;
+using CopilotHive.Worker;
 
 using Grpc.Core;
+using Grpc.Net.Client;
 
 using System.Diagnostics;
 using System.Reflection;
 using System.Threading.Channels;
 
 namespace CopilotHive.Tests.Worker;
+
+/// <summary>
+/// Builds and PUBLISHES the <see cref="WorkerConnection"/> a direct-loop fixture drives the real
+/// <c>WorkerService.ProcessMessagesAsync</c> with, and returns it so the fixture can pass it to the
+/// loop.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The fixtures that drive the message loop directly have no ACCEPTED registration behind them, so
+/// they build their own connection instead of running <c>RunAsync</c>. Its gRPC client is
+/// materialised from a process-wide channel that is never used for an RPC — those fixtures exercise
+/// the DUPLEX STREAM only — and is deliberately not disposed, since it owns no connection.
+/// </para>
+/// <para>
+/// A <c>null</c> provisioner leaves the connection WITHOUT one, which is what retains the LEGACY,
+/// seam-free executor branch for these fixtures; supplying one exercises the seam path.
+/// </para>
+/// </remarks>
+internal static class TestConnectionFactory
+{
+    private static readonly GrpcChannel Channel = GrpcChannel.ForAddress("http://localhost:9999");
+
+    /// <summary>Publishes a fixture connection on <paramref name="service"/> and returns it.</summary>
+    internal static WorkerConnection Attach(
+        WorkerService service,
+        string assignedId,
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        WorkerConfigProvisioner? provisioner = null)
+    {
+        var connection = new WorkerConnection(
+            assignedId,
+            new HiveOrchestrator.HiveOrchestratorClient(Channel),
+            stream,
+            provisioner,
+            includeProductionProvisioner: false);
+
+        service.PublishConnection(connection);
+        return connection;
+    }
+}
 
 /// <summary>
 /// THE SEND-BOUNDARY ARRIVAL OBSERVER. Reads the production <c>SemaphoreSlim</c> send gate's

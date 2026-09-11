@@ -63,8 +63,12 @@ public sealed class WorkerServiceReasoningForwardingTests
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("WorkerService.ProcessMessagesAsync method not found.");
 
+        // The fixture publishes a connection carrying the service's TestProvisioner (null here),
+        // which keeps the legacy, seam-free executor branch.
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+
         // The response stream completes after the single assignment, so the loop exits on its own.
-        var task = (Task)processMessages.Invoke(service, [stream, "worker-1", ct])!;
+        var task = (Task)processMessages.Invoke(service, [connection, ct])!;
         await task;
 
         return runner.CapturedResetArgs;
