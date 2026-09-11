@@ -88,6 +88,14 @@ namespace CopilotHive.Persistence;
 /// is owned by <see cref="CoverageConverter"/>, not by a permissive global number policy.
 /// </para>
 /// <para>
+/// TEXT IS ENCODED VERBATIM OR REFUSED. Every string this envelope writes must survive the UTF-8
+/// transcode unchanged, so a string containing an UNPAIRED UTF-16 surrogate is refused at encode
+/// time rather than being silently replaced with U+FFFD. Substituting would corrupt evidence and
+/// would let two DISTINCT values collapse onto the same canonical text, producing a false duplicate
+/// in the ordinal comparison below. A well-formed surrogate pair (any non-BMP character) is accepted
+/// and preserved exactly; the decode side rejects unpaired surrogate escapes for the same reason.
+/// </para>
+/// <para>
 /// CANONICALIZATION. Decoding returns freshly allocated domain records and lists (a deep copy at the
 /// boundary — no caller alias into any encoded source), and re-encoding that result reproduces the
 /// canonical text. Therefore <c>Encode(Decode(p))</c> and <c>Encode(candidate)</c> can be compared
@@ -395,7 +403,8 @@ internal static class CompletionReceiptCodec
     /// <summary>
     /// THE ENCODE-SIDE VALIDATION, run in full before any byte is written. It refuses every value the
     /// format cannot represent faithfully — a null domain reference, a null position, a null string
-    /// where a value is required, a null list or list element, or an unrepresentable role/phase — with
+    /// where a value is required, a null list or list element, text that would not survive the UTF-8
+    /// transcode verbatim, or an unrepresentable role/phase — with
     /// <see cref="CompletionReceiptCodecException"/>. Nothing is defaulted, repaired or dropped.
     /// <para>
     /// The role and phase checks are BELT-AND-BRACES: <see cref="CompletionReceipt"/> already
@@ -435,6 +444,17 @@ internal static class CompletionReceiptCodec
         _ = PhaseLabel(slot.Position.Phase);
         _ = StatusLabel(result.Status);
 
+        // TEXT ENCODABILITY. Every string this envelope writes must survive the UTF-8 transcode
+        // verbatim; an unpaired surrogate would be silently replaced with U+FFFD by the writer.
+        RequireEncodableText(receipt.GoalId, GoalIdProperty);
+        RequireEncodableText(receipt.WorkerId, WorkerIdProperty);
+        RequireEncodableText(slot.TaskId, $"slot.{TaskIdProperty}");
+        RequireEncodableText(result.TaskId, $"result.{TaskIdProperty}");
+        RequireEncodableText(result.Output, OutputProperty);
+        RequireEncodableText(result.Model, ModelProperty);
+        if (result.IterationStartSha is { } sha)
+            RequireEncodableText(sha, IterationStartShaProperty);
+
         if (result.Metrics is { } metrics)
         {
             if (metrics.Verdict is null)
@@ -443,10 +463,14 @@ internal static class CompletionReceiptCodec
                 throw new CompletionReceiptCodecException("Cannot encode a receipt whose metrics issues list is null.");
             if (metrics.Summary is null)
                 throw new CompletionReceiptCodecException("Cannot encode a receipt whose metrics summary is null.");
+
+            RequireEncodableText(metrics.Verdict, VerdictProperty);
+            RequireEncodableText(metrics.Summary, SummaryProperty);
             foreach (var issue in metrics.Issues)
             {
                 if (issue is null)
                     throw new CompletionReceiptCodecException("Cannot encode a receipt containing a null metrics issue.");
+                RequireEncodableText(issue, $"{IssuesProperty}[]");
             }
         }
 
@@ -458,6 +482,7 @@ internal static class CompletionReceiptCodec
             {
                 if (path is null)
                     throw new CompletionReceiptCodecException("Cannot encode a receipt containing a null changed-file path.");
+                RequireEncodableText(path, $"{ChangedFilesProperty}[]");
             }
         }
     }
@@ -556,6 +581,46 @@ internal static class CompletionReceiptCodec
         if (string.IsNullOrWhiteSpace(value))
             throw new CompletionReceiptCodecException(
                 $"The completion receipt payload's '{context}' must be a non-blank string.");
+    }
+
+    /// <summary>
+    /// Refuses a string containing an UNPAIRED UTF-16 surrogate, naming the property in the failure.
+    /// <para>
+    /// WHY THIS IS A REFUSAL AND NOT A SUBSTITUTION: an unpaired surrogate has no valid UTF-8
+    /// encoding, so <see cref="Utf8JsonWriter"/> would silently replace it with U+FFFD. That is
+    /// silent data coercion — two DISTINCT domain values would collapse onto the same canonical text,
+    /// which would make the ordinal <c>Encode(Decode(p))</c> comparison report a false duplicate and
+    /// would store corrupted evidence. A well-formed surrogate PAIR (any non-BMP character) is
+    /// perfectly representable and is accepted unchanged; only the unpaired case is refused. This
+    /// matches the decode side, which rejects such escapes outright, so both directions agree.
+    /// </para>
+    /// </summary>
+    private static void RequireEncodableText(string value, string context)
+    {
+        for (var i = 0; i < value.Length; i++)
+        {
+            var c = value[i];
+            if (char.IsHighSurrogate(c))
+            {
+                // A high surrogate is valid ONLY when its low surrogate follows immediately.
+                if (i + 1 < value.Length && char.IsLowSurrogate(value[i + 1]))
+                {
+                    i++; // Consume the pair.
+                    continue;
+                }
+
+                throw new CompletionReceiptCodecException(
+                    $"The completion receipt payload's '{context}' contains an unpaired UTF-16 high " +
+                    $"surrogate (U+{(int)c:X4}) at index {i}, which cannot be encoded faithfully.");
+            }
+
+            if (char.IsLowSurrogate(c))
+            {
+                throw new CompletionReceiptCodecException(
+                    $"The completion receipt payload's '{context}' contains an unpaired UTF-16 low " +
+                    $"surrogate (U+{(int)c:X4}) at index {i}, which cannot be encoded faithfully.");
+            }
+        }
     }
 
     /// <summary>
