@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 
 using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
@@ -116,34 +117,118 @@ public sealed class CompletionReceiptCodecTests
         var text = CompletionReceiptCodec.Encode(Make());
         const string expected =
             """{"version":1,"goalId":"g1","workerId":"w1","role":"coder","slot":{"taskId":"t1","position":{"iteration":1,"phase":"coding","occurrence":1},"attempt":1},"result":{"taskId":"t1","status":"completed","output":"out","model":"m1","iterationStartSha":null,"metrics":null,"gitStatus":null}}""";
-        Assert.Equal(expected, text);
+        Assert.Equal(expected, text, StringComparer.Ordinal);
+
+        var decoded = CompletionReceiptCodec.Decode(text);
+        Assert.Null(decoded.Result.IterationStartSha);
+        Assert.Null(decoded.Result.Metrics);
+        Assert.Null(decoded.Result.GitStatus);
+        Assert.Equal(text, CompletionReceiptCodec.Encode(decoded), StringComparer.Ordinal);
     }
 
     // ── 2. Round-trip: all outcomes, all phase/role pairs ─────────────────
 
+    /// <summary>
+    /// THE COMPLETE 5×3 MATRIX. Every result field — including every nested metrics/git field — is
+    /// asserted in EVERY worker-backed phase/role × outcome cell, rather than relying on one rich
+    /// representative to stand in for the other fourteen cells.
+    /// </summary>
     [Fact]
-    public void RoundTrip_EveryOutcomeAndPhaseRolePair()
+    public void RoundTrip_EveryResultField_InEveryOutcomeAndPhaseRolePair()
     {
+        var observed = new HashSet<(GoalPhase Phase, WorkerRole Role, TaskOutcome Status)>();
         foreach (var (phase, role, roleLabel, phaseLabel) in Pairs)
         {
             foreach (var status in Enum.GetValues<TaskOutcome>())
             {
-                var receipt = Make(phase, role, status, FullMetrics(), Git(), "sha-" + roleLabel, iteration: 3, occurrence: 2, attempt: 4);
-                var text = CompletionReceiptCodec.Encode(receipt);
-                Assert.Contains($"\"role\":\"{roleLabel}\"", text);
-                Assert.Contains($"\"phase\":\"{phaseLabel}\"", text);
-                Assert.Contains($"\"status\":\"{status.ToString().ToLowerInvariant()}\"", text);
+                var cell = $"{roleLabel}-{status.ToString().ToLowerInvariant()}";
+                var issues = new List<string> { $"issue-a-{cell}", $"issue-b-{cell}" };
+                var files = new List<string> { $"src/{cell}/z.cs", $"src/{cell}/a.cs" };
+                var metrics = new TaskMetrics
+                {
+                    Verdict = $"VERDICT-{cell}",
+                    BuildSuccess = status == TaskOutcome.Completed,
+                    TotalTests = 101 + (int)status,
+                    PassedTests = 91 + (int)status,
+                    FailedTests = 10,
+                    CoveragePercent = 80.125 + (int)status,
+                    Issues = issues,
+                    Summary = $"summary-{cell}",
+                };
+                var git = new GitChangeSummary
+                {
+                    FilesChanged = 7 + (int)status,
+                    Insertions = 123 + (int)status,
+                    Deletions = 45 + (int)status,
+                    Pushed = status != TaskOutcome.Cancelled,
+                    ChangedFiles = files,
+                };
+                var receipt = Make(
+                    phase,
+                    role,
+                    status,
+                    metrics,
+                    git,
+                    sha: $"sha-{cell}",
+                    output: $"output-{cell}",
+                    summary: metrics.Summary,
+                    verdict: metrics.Verdict,
+                    model: $"model-{cell}",
+                    goalId: $"goal-{cell}",
+                    workerId: $"worker-{cell}",
+                    taskId: $"task-{cell}",
+                    iteration: 3,
+                    occurrence: 2,
+                    attempt: 4);
 
+                var text = CompletionReceiptCodec.Encode(receipt);
                 var back = CompletionReceiptCodec.Decode(text);
-                Assert.Equal(roleLabel, back.Role.ToRoleName());
+
+                Assert.True(observed.Add((phase, role, status)), $"duplicate matrix cell {cell}");
+                Assert.Contains($"\"role\":\"{roleLabel}\"", text, StringComparison.Ordinal);
+                Assert.Contains($"\"phase\":\"{phaseLabel}\"", text, StringComparison.Ordinal);
+                Assert.Contains($"\"status\":\"{status.ToString().ToLowerInvariant()}\"", text,
+                    StringComparison.Ordinal);
+
+                Assert.Equal($"goal-{cell}", back.GoalId);
+                Assert.Equal($"worker-{cell}", back.WorkerId);
+                Assert.Equal(role, back.Role);
+                Assert.Equal($"task-{cell}", back.Slot.TaskId);
                 Assert.Equal(phase, back.Slot.Position.Phase);
-                Assert.Equal(status, back.Result.Status);
                 Assert.Equal(3, back.Slot.Position.Iteration);
                 Assert.Equal(2, back.Slot.Position.Occurrence);
                 Assert.Equal(4, back.Slot.Attempt);
-                Assert.Equal(text, CompletionReceiptCodec.Encode(back));
+
+                Assert.Equal($"task-{cell}", back.Result.TaskId);
+                Assert.Equal(status, back.Result.Status);
+                Assert.Equal($"output-{cell}", back.Result.Output);
+                Assert.Equal($"model-{cell}", back.Result.Model);
+                Assert.Equal($"sha-{cell}", back.Result.IterationStartSha);
+
+                Assert.NotNull(back.Result.Metrics);
+                Assert.Equal(metrics.Verdict, back.Result.Metrics!.Verdict);
+                Assert.Equal(metrics.BuildSuccess, back.Result.Metrics.BuildSuccess);
+                Assert.Equal(metrics.TotalTests, back.Result.Metrics.TotalTests);
+                Assert.Equal(metrics.PassedTests, back.Result.Metrics.PassedTests);
+                Assert.Equal(metrics.FailedTests, back.Result.Metrics.FailedTests);
+                Assert.Equal(metrics.CoveragePercent, back.Result.Metrics.CoveragePercent);
+                Assert.Equal(issues, back.Result.Metrics.Issues);
+                Assert.Equal(metrics.Summary, back.Result.Metrics.Summary);
+
+                Assert.NotNull(back.Result.GitStatus);
+                Assert.Equal(git.FilesChanged, back.Result.GitStatus!.FilesChanged);
+                Assert.Equal(git.Insertions, back.Result.GitStatus.Insertions);
+                Assert.Equal(git.Deletions, back.Result.GitStatus.Deletions);
+                Assert.Equal(git.Pushed, back.Result.GitStatus.Pushed);
+                Assert.Equal(files, back.Result.GitStatus.ChangedFiles);
+
+                Assert.Equal(text, CompletionReceiptCodec.Encode(back), StringComparer.Ordinal);
             }
         }
+
+        Assert.Equal(5, Pairs.Length);
+        Assert.Equal(3, Enum.GetValues<TaskOutcome>().Length);
+        Assert.Equal(15, observed.Count);
     }
 
     [Fact]
@@ -234,26 +319,56 @@ public sealed class CompletionReceiptCodecTests
         Assert.Equal(["z.cs", "a.cs", "a.cs"], back.Result.GitStatus!.ChangedFiles);
     }
 
+    /// <summary>
+    /// Decoding allocates every record and list afresh. Mutating the SOURCE after decode cannot
+    /// reach either decode, and mutating one DECODE cannot reach the source or another decode.
+    /// Both directions are asserted so reference inequality cannot stand in for behavior.
+    /// </summary>
     [Fact]
-    public void Decode_ReturnsFreshLists_NoAlias()
+    public void Decode_ReturnsFreshRecordsAndLists_NoAliasesInEitherDirection()
     {
-        var metrics = FullMetrics();
-        var git = Git();
-        var text = CompletionReceiptCodec.Encode(Make(metrics: metrics, gitStatus: git));
+        var metrics = FullMetrics() with { Issues = ["source-i1", "source-i2"] };
+        var git = Git() with { ChangedFiles = ["source-a.cs", "source-b.cs"] };
+        var source = Make(metrics: metrics, gitStatus: git, sha: "source-sha");
+        var text = CompletionReceiptCodec.Encode(source);
 
         var first = CompletionReceiptCodec.Decode(text);
         var second = CompletionReceiptCodec.Decode(text);
 
-        Assert.NotSame(first.Result.Metrics!.Issues, second.Result.Metrics!.Issues);
-        Assert.NotSame(first.Result.GitStatus!.ChangedFiles, second.Result.GitStatus!.ChangedFiles);
-        Assert.NotSame(first.Result.Metrics.Issues, metrics.Issues);
+        // FRESH RECORDS, not merely fresh list wrappers.
+        Assert.NotSame(source.Slot, first.Slot);
+        Assert.NotSame(source.Slot.Position, first.Slot.Position);
+        Assert.NotSame(source.Result, first.Result);
+        Assert.NotSame(source.Result.Metrics, first.Result.Metrics);
+        Assert.NotSame(source.Result.GitStatus, first.Result.GitStatus);
+        Assert.NotSame(first.Slot, second.Slot);
+        Assert.NotSame(first.Slot.Position, second.Slot.Position);
+        Assert.NotSame(first.Result, second.Result);
+        Assert.NotSame(first.Result.Metrics, second.Result.Metrics);
+        Assert.NotSame(first.Result.GitStatus, second.Result.GitStatus);
 
-        first.Result.Metrics.Issues.Add("mutated");
-        first.Result.GitStatus.ChangedFiles.Add("mutated.cs");
+        // FRESH LISTS from the source and from every other decode.
+        Assert.NotSame(source.Result.Metrics!.Issues, first.Result.Metrics!.Issues);
+        Assert.NotSame(source.Result.GitStatus!.ChangedFiles, first.Result.GitStatus!.ChangedFiles);
+        Assert.NotSame(first.Result.Metrics.Issues, second.Result.Metrics!.Issues);
+        Assert.NotSame(first.Result.GitStatus.ChangedFiles, second.Result.GitStatus!.ChangedFiles);
 
-        Assert.Equal(["i1", "i2"], second.Result.Metrics.Issues);
-        Assert.Equal(["a.cs", "b.cs"], second.Result.GitStatus.ChangedFiles);
-        Assert.Equal(["i1", "i2"], metrics.Issues);
+        // DIRECTION 1: mutate the source AFTER decode. Both decoded values remain byte-for-byte as
+        // they were at the boundary.
+        source.Result.Metrics.Issues.Add("source-mutated");
+        source.Result.GitStatus.ChangedFiles.Add("source-mutated.cs");
+        Assert.Equal(["source-i1", "source-i2"], first.Result.Metrics.Issues);
+        Assert.Equal(["source-a.cs", "source-b.cs"], first.Result.GitStatus.ChangedFiles);
+        Assert.Equal(["source-i1", "source-i2"], second.Result.Metrics.Issues);
+        Assert.Equal(["source-a.cs", "source-b.cs"], second.Result.GitStatus.ChangedFiles);
+
+        // DIRECTION 2: mutate one decode. Neither the source nor the other decode changes.
+        first.Result.Metrics.Issues.Add("decoded-mutated");
+        first.Result.GitStatus.ChangedFiles.Add("decoded-mutated.cs");
+        Assert.Equal(["source-i1", "source-i2", "source-mutated"], source.Result.Metrics.Issues);
+        Assert.Equal(["source-a.cs", "source-b.cs", "source-mutated.cs"], source.Result.GitStatus.ChangedFiles);
+        Assert.Equal(["source-i1", "source-i2"], second.Result.Metrics.Issues);
+        Assert.Equal(["source-a.cs", "source-b.cs"], second.Result.GitStatus.ChangedFiles);
     }
 
     // ── 3. Non-finite coverage ────────────────────────────────────────────
@@ -262,24 +377,40 @@ public sealed class CompletionReceiptCodecTests
     [InlineData(double.NaN, "\"NaN\"")]
     [InlineData(double.PositiveInfinity, "\"Infinity\"")]
     [InlineData(double.NegativeInfinity, "\"-Infinity\"")]
-    public void NonFiniteCoverage_UsesExactStringTokens(double value, string token)
+    public void NonFiniteCoverage_RawEncodedTokenIsTheExactCanonicalJsonString(double value, string token)
     {
         var text = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(value)));
-        Assert.Contains($"\"coveragePercent\":{token}", text);
+        using var document = JsonDocument.Parse(text);
+        var coverage = document.RootElement.GetProperty("result").GetProperty("metrics")
+            .GetProperty("coveragePercent");
+
+        Assert.Equal(JsonValueKind.String, coverage.ValueKind);
+        Assert.Equal(token, coverage.GetRawText());
+        Assert.Contains($"\"coveragePercent\":{token}", text, StringComparison.Ordinal);
 
         var back = CompletionReceiptCodec.Decode(text);
         if (double.IsNaN(value))
             Assert.True(double.IsNaN(back.Result.Metrics!.CoveragePercent));
         else
             Assert.Equal(value, back.Result.Metrics!.CoveragePercent);
-        Assert.Equal(text, CompletionReceiptCodec.Encode(back));
+        Assert.Equal(text, CompletionReceiptCodec.Encode(back), StringComparer.Ordinal);
     }
 
-    [Fact]
-    public void FiniteCoverage_RemainsANumber()
+    [Theory]
+    [InlineData(0d, "0")]
+    [InlineData(-12.5d, "-12.5")]
+    [InlineData(87.125d, "87.125")]
+    public void FiniteCoverage_RawEncodedTokenIsAJsonNumber(double value, string exactRawToken)
     {
-        Assert.Contains("\"coveragePercent\":0", CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(0))));
-        Assert.Contains("\"coveragePercent\":-12.5", CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(-12.5))));
+        var text = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(value)));
+        using var document = JsonDocument.Parse(text);
+        var coverage = document.RootElement.GetProperty("result").GetProperty("metrics")
+            .GetProperty("coveragePercent");
+
+        Assert.Equal(JsonValueKind.Number, coverage.ValueKind);
+        Assert.Equal(exactRawToken, coverage.GetRawText());
+        Assert.DoesNotContain($"\"coveragePercent\":\"{exactRawToken}\"", text, StringComparison.Ordinal);
+        Assert.Equal(value, CompletionReceiptCodec.Decode(text).Result.Metrics!.CoveragePercent);
     }
 
     [Theory]
@@ -405,24 +536,90 @@ public sealed class CompletionReceiptCodecTests
         Assert.Equal(canonical, CompletionReceiptCodec.Encode(decoded));
     }
 
+    /// <summary>
+    /// Pins the duplicate-comparison contract exactly: normalize the STORED payload through
+    /// Encode(Decode(...)), encode the CANDIDATE independently, then compare those two strings with
+    /// ordinal semantics. Incoming whitespace/order/case and record/list reference identity are
+    /// irrelevant; a real value difference is not.
+    /// </summary>
     [Fact]
-    public void OrdinalComparisonContract_TwoEncodingsOfEqualValues_AreEqual()
+    public void OrdinalComparisonContract_NormalizedStoredPayloadEqualsIndependentCandidateByOrdinalText()
     {
-        var a = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(), gitStatus: Git(), sha: "s"));
-        var b = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(), gitStatus: Git(), sha: "s"));
-        var c = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics(), gitStatus: Git(), sha: "other"));
+        var candidateMetrics = FullMetrics() with { Issues = ["same-1", "same-2"] };
+        var candidateGit = Git() with { ChangedFiles = ["same-a.cs", "same-b.cs"] };
+        var candidate = Make(metrics: candidateMetrics, gitStatus: candidateGit, sha: "same-sha");
+        var canonicalCandidate = CompletionReceiptCodec.Encode(candidate);
 
-        Assert.Equal(a, b, StringComparer.Ordinal);
-        Assert.NotEqual(a, c, StringComparer.Ordinal);
-        Assert.Equal(a, CompletionReceiptCodec.Encode(CompletionReceiptCodec.Decode(a)), StringComparer.Ordinal);
+        // The stored text has different property order, whitespace, and permitted enum-label case.
+        var storedTree = (JsonObject)JsonNode.Parse(canonicalCandidate)!;
+        var storedVariant = new JsonObject
+        {
+            ["result"] = storedTree["result"]!.DeepClone(),
+            ["slot"] = storedTree["slot"]!.DeepClone(),
+            ["role"] = "CODER",
+            ["workerId"] = storedTree["workerId"]!.DeepClone(),
+            ["goalId"] = storedTree["goalId"]!.DeepClone(),
+            ["version"] = storedTree["version"]!.DeepClone(),
+        };
+        PositionOf(storedVariant)["phase"] = "Coding";
+        ResultOf(storedVariant)["status"] = "COMPLETED";
+        var storedPayload = JsonSerializer.Serialize(storedVariant,
+            new JsonSerializerOptions { WriteIndented = true });
+        Assert.NotEqual(canonicalCandidate, storedPayload, StringComparer.Ordinal);
+
+        var decodedStored = CompletionReceiptCodec.Decode(storedPayload);
+        var normalizedStored = CompletionReceiptCodec.Encode(decodedStored);
+
+        // Separate records and lists prove equality is not reference equality.
+        Assert.NotSame(candidate, decodedStored);
+        Assert.NotSame(candidate.Slot, decodedStored.Slot);
+        Assert.NotSame(candidate.Result, decodedStored.Result);
+        Assert.NotSame(candidate.Result.Metrics, decodedStored.Result.Metrics);
+        Assert.NotSame(candidate.Result.Metrics!.Issues, decodedStored.Result.Metrics!.Issues);
+        Assert.NotSame(candidate.Result.GitStatus, decodedStored.Result.GitStatus);
+        Assert.NotSame(candidate.Result.GitStatus!.ChangedFiles, decodedStored.Result.GitStatus!.ChangedFiles);
+
+        Assert.Equal(canonicalCandidate, normalizedStored, StringComparer.Ordinal);
+
+        // A real candidate value difference remains different after canonicalization.
+        var differentCandidate = CompletionReceiptCodec.Encode(
+            Make(metrics: FullMetrics() with { Issues = ["same-1", "DIFFERENT"] },
+                gitStatus: Git() with { ChangedFiles = ["same-a.cs", "same-b.cs"] }, sha: "same-sha"));
+        Assert.NotEqual(normalizedStored, differentCandidate, StringComparer.Ordinal);
     }
 
     [Fact]
-    public void FirstStoredTime_IsNotPartOfThePayload()
+    public void FirstStoredTime_IsOutsidePayload_AndCannotAffectOrdinalReceiptEquality()
     {
-        var text = CompletionReceiptCodec.Encode(Make(metrics: FullMetrics()));
-        Assert.DoesNotContain("firstStored", text, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("storedAt", text, StringComparison.OrdinalIgnoreCase);
+        var candidate = Make(metrics: FullMetrics(), gitStatus: Git(), sha: "sha");
+        var payload = CompletionReceiptCodec.Encode(candidate);
+        var earlier = new CompletionReceiptEntity
+        {
+            TaskId = candidate.Slot.TaskId,
+            GoalId = candidate.GoalId,
+            PayloadJson = payload,
+            FirstStoredAtUtc = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        };
+        var later = new CompletionReceiptEntity
+        {
+            TaskId = candidate.Slot.TaskId,
+            GoalId = candidate.GoalId,
+            PayloadJson = payload,
+            FirstStoredAtUtc = new DateTime(2035, 12, 31, 23, 59, 59, DateTimeKind.Utc),
+        };
+
+        Assert.NotEqual(earlier.FirstStoredAtUtc, later.FirstStoredAtUtc);
+        Assert.DoesNotContain("firstStored", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("storedAt", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(earlier.PayloadJson, later.PayloadJson, StringComparer.Ordinal);
+        Assert.Equal(
+            CompletionReceiptCodec.Encode(CompletionReceiptCodec.Decode(earlier.PayloadJson)),
+            CompletionReceiptCodec.Encode(candidate),
+            StringComparer.Ordinal);
+        Assert.Equal(
+            CompletionReceiptCodec.Encode(CompletionReceiptCodec.Decode(later.PayloadJson)),
+            CompletionReceiptCodec.Encode(candidate),
+            StringComparer.Ordinal);
     }
 
     // ── 5. Fail-closed decoding (STRUCTURAL mutations — no vacuous passes) ─
@@ -541,12 +738,12 @@ public sealed class CompletionReceiptCodecTests
     {
         foreach (var (name, token) in new (string, string)[]
                  {
+                     ("version", "\"Version\""),
                      ("goalId", "\"GoalId\""),
                      ("workerId", "\"WorkerId\""),
                      ("role", "\"Role\""),
                      ("slot", "\"Slot\""),
                      ("result", "\"Result\""),
-                     ("taskId", "\"TaskId\""),
                      ("position", "\"Position\""),
                      ("iteration", "\"Iteration\""),
                      ("phase", "\"Phase\""),
@@ -580,49 +777,90 @@ public sealed class CompletionReceiptCodecTests
     }
 
     [Fact]
-    public void Decode_RejectsMissingMemberAtEveryLevel()
+    public void Decode_RejectsCaseVariantTaskId_IndependentlyAtSlotAndResultLevels()
     {
-        foreach (var name in new[]
+        foreach (var (path, select) in new (string Path, Func<JsonObject, JsonObject> Select)[]
                  {
-                     "version", "goalId", "workerId", "role", "slot", "result",
-                     "taskId", "position", "iteration", "phase", "occurrence", "attempt",
-                     "status", "output", "model", "iterationStartSha", "metrics", "gitStatus",
-                     "verdict", "buildSuccess", "totalTests", "passedTests", "failedTests",
-                     "coveragePercent", "issues", "summary",
-                     "filesChanged", "insertions", "deletions", "pushed", "changedFiles",
+                     ("slot.taskId", SlotOf),
+                     ("result.taskId", ResultOf),
                  })
         {
             var root = Root();
-            var removed = RemoveEverywhere(root, name);
-            Assert.True(removed, $"'{name}' was not found anywhere in the payload");
-            Reject(root);
+            var owner = select(root);
+            var value = owner["taskId"]!.DeepClone();
+            Assert.True(owner.Remove("taskId"));
+            owner["TaskId"] = value;
+
+            var ex = Assert.Throws<CompletionReceiptCodecException>(
+                () => CompletionReceiptCodec.Decode(Text(root)));
+            Assert.True(ex.InnerException is JsonException,
+                $"Case variant at '{path}' must be refused by JSON property-name settings.");
         }
     }
 
-    /// <summary>Removes every occurrence of the named member from the tree; reports whether any existed.</summary>
-    private static bool RemoveEverywhere(JsonNode node, string name)
+    /// <summary>
+    /// Every required member is removed from its EXACT object level, one at a time. In particular,
+    /// <c>slot.taskId</c> and <c>result.taskId</c> are separate vectors — deleting every same-named
+    /// member at once could let one missing-member guard hide the other's absence.
+    /// </summary>
+    [Fact]
+    public void Decode_RejectsEachMissingRequiredMember_AtItsExactObjectLevel()
     {
-        var removed = false;
-        if (node is JsonObject obj)
+        var vectors = new (string Path, Action<JsonObject> Remove)[]
         {
-            if (obj.Remove(name))
-                removed = true;
-            foreach (var child in obj.Select(p => p.Value).ToList())
-            {
-                if (child is not null)
-                    removed |= RemoveEverywhere(child, name);
-            }
-        }
-        else if (node is JsonArray array)
-        {
-            foreach (var child in array)
-            {
-                if (child is not null)
-                    removed |= RemoveEverywhere(child, name);
-            }
-        }
+            ("version", r => Assert.True(r.Remove("version"))),
+            ("goalId", r => Assert.True(r.Remove("goalId"))),
+            ("workerId", r => Assert.True(r.Remove("workerId"))),
+            ("role", r => Assert.True(r.Remove("role"))),
+            ("slot", r => Assert.True(r.Remove("slot"))),
+            ("result", r => Assert.True(r.Remove("result"))),
 
-        return removed;
+            ("slot.taskId", r => Assert.True(SlotOf(r).Remove("taskId"))),
+            ("slot.position", r => Assert.True(SlotOf(r).Remove("position"))),
+            ("slot.attempt", r => Assert.True(SlotOf(r).Remove("attempt"))),
+
+            ("slot.position.iteration", r => Assert.True(PositionOf(r).Remove("iteration"))),
+            ("slot.position.phase", r => Assert.True(PositionOf(r).Remove("phase"))),
+            ("slot.position.occurrence", r => Assert.True(PositionOf(r).Remove("occurrence"))),
+
+            ("result.taskId", r => Assert.True(ResultOf(r).Remove("taskId"))),
+            ("result.status", r => Assert.True(ResultOf(r).Remove("status"))),
+            ("result.output", r => Assert.True(ResultOf(r).Remove("output"))),
+            ("result.model", r => Assert.True(ResultOf(r).Remove("model"))),
+            ("result.iterationStartSha", r => Assert.True(ResultOf(r).Remove("iterationStartSha"))),
+            ("result.metrics", r => Assert.True(ResultOf(r).Remove("metrics"))),
+            ("result.gitStatus", r => Assert.True(ResultOf(r).Remove("gitStatus"))),
+
+            ("result.metrics.verdict", r => Assert.True(MetricsOf(r).Remove("verdict"))),
+            ("result.metrics.buildSuccess", r => Assert.True(MetricsOf(r).Remove("buildSuccess"))),
+            ("result.metrics.totalTests", r => Assert.True(MetricsOf(r).Remove("totalTests"))),
+            ("result.metrics.passedTests", r => Assert.True(MetricsOf(r).Remove("passedTests"))),
+            ("result.metrics.failedTests", r => Assert.True(MetricsOf(r).Remove("failedTests"))),
+            ("result.metrics.coveragePercent", r => Assert.True(MetricsOf(r).Remove("coveragePercent"))),
+            ("result.metrics.issues", r => Assert.True(MetricsOf(r).Remove("issues"))),
+            ("result.metrics.summary", r => Assert.True(MetricsOf(r).Remove("summary"))),
+
+            ("result.gitStatus.filesChanged", r => Assert.True(GitOf(r).Remove("filesChanged"))),
+            ("result.gitStatus.insertions", r => Assert.True(GitOf(r).Remove("insertions"))),
+            ("result.gitStatus.deletions", r => Assert.True(GitOf(r).Remove("deletions"))),
+            ("result.gitStatus.pushed", r => Assert.True(GitOf(r).Remove("pushed"))),
+            ("result.gitStatus.changedFiles", r => Assert.True(GitOf(r).Remove("changedFiles"))),
+        };
+
+        Assert.Equal(32, vectors.Length);
+        foreach (var (path, remove) in vectors)
+        {
+            var root = Root();
+            remove(root);
+            var text = Text(root);
+            Assert.NotEqual(Canonical(), text, StringComparer.Ordinal);
+
+            var ex = Assert.Throws<CompletionReceiptCodecException>(
+                () => CompletionReceiptCodec.Decode(text));
+            Assert.True(ex.InnerException is JsonException,
+                $"Missing '{path}' must be rejected by required-member JSON validation, not a later guard.");
+            Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Fact]
@@ -705,6 +943,38 @@ public sealed class CompletionReceiptCodecTests
         }
     }
 
+    /// <summary>
+    /// The default strict JSON number/bool settings apply below the root too. These vectors are
+    /// otherwise valid and alter one nested scalar only, so no root/version guard can hide a lax
+    /// nested converter.
+    /// </summary>
+    [Fact]
+    public void Decode_NestedSettingsRejectNumericStringsFractionsOverflowAndWrongBooleanKinds()
+    {
+        var vectors = new (string Path, Action<JsonObject> Mutate)[]
+        {
+            ("slot.attempt numeric string", r => SlotOf(r)["attempt"] = "1"),
+            ("position.iteration fractional", r => PositionOf(r)["iteration"] = 1.5),
+            ("position.occurrence int overflow", r => PositionOf(r)["occurrence"] = 2147483648L),
+            ("metrics.totalTests numeric string", r => MetricsOf(r)["totalTests"] = "10"),
+            ("metrics.passedTests fractional", r => MetricsOf(r)["passedTests"] = 9.5),
+            ("metrics.buildSuccess string", r => MetricsOf(r)["buildSuccess"] = "true"),
+            ("git.filesChanged numeric string", r => GitOf(r)["filesChanged"] = "2"),
+            ("git.insertions fractional", r => GitOf(r)["insertions"] = 10.5),
+            ("git.pushed number", r => GitOf(r)["pushed"] = 1),
+        };
+
+        foreach (var (path, mutate) in vectors)
+        {
+            var root = Root();
+            mutate(root);
+            var ex = Assert.Throws<CompletionReceiptCodecException>(
+                () => CompletionReceiptCodec.Decode(Text(root)));
+            Assert.True(ex.InnerException is JsonException,
+                $"Nested strict-settings vector '{path}' must fail during JSON conversion.");
+        }
+    }
+
     [Fact]
     public void Decode_AcceptsPermittedEnumCaseVariants_AndNormalizesThem()
     {
@@ -780,12 +1050,23 @@ public sealed class CompletionReceiptCodecTests
     }
 
     [Fact]
-    public void Decode_BlankIdentity_NamesTheOffendingMember()
+    public void Decode_EachBlankIdentity_NamesItsExactOffendingMember()
     {
-        var root = Root();
-        SlotOf(root)["taskId"] = "  ";
-        var ex = Assert.Throws<CompletionReceiptCodecException>(() => CompletionReceiptCodec.Decode(Text(root)));
-        Assert.Contains("slot.taskId", ex.Message, StringComparison.Ordinal);
+        foreach (var (path, mutate) in new (string Path, Action<JsonObject> Mutate)[]
+                 {
+                     ("goalId", r => r["goalId"] = "  "),
+                     ("workerId", r => r["workerId"] = "  "),
+                     ("slot.taskId", r => SlotOf(r)["taskId"] = "  "),
+                     ("result.taskId", r => ResultOf(r)["taskId"] = "  "),
+                 })
+        {
+            var root = Root();
+            mutate(root);
+            var ex = Assert.Throws<CompletionReceiptCodecException>(
+                () => CompletionReceiptCodec.Decode(Text(root)));
+            Assert.Contains($"'{path}'", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("non-blank string", ex.Message, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -818,6 +1099,106 @@ public sealed class CompletionReceiptCodecTests
     }
 
     // ── 6. Encode-side validation (reachable via hand-built domain values) ─
+
+    [Theory]
+    [InlineData("goalId", "goalId")]
+    [InlineData("workerId", "workerId")]
+    [InlineData("taskId", "slot.taskId")]
+    [InlineData("output", "output")]
+    [InlineData("model", "model")]
+    [InlineData("iterationStartSha", "iterationStartSha")]
+    [InlineData("verdict", "verdict")]
+    [InlineData("summary", "summary")]
+    [InlineData("issues", "issues[]")]
+    [InlineData("changedFiles", "changedFiles[]")]
+    public void Encode_UnpairedHighSurrogateInEveryTextLocation_IsRefusedWithoutReplacement(
+        string location, string expectedContext)
+    {
+        var bad = "before-" + '\uD800' + "-after";
+        var receipt = location switch
+        {
+            "goalId" => Make(goalId: bad),
+            "workerId" => Make(workerId: bad),
+            "taskId" => Make(taskId: bad),
+            "output" => Make(output: bad),
+            "model" => Make(model: bad),
+            "iterationStartSha" => Make(sha: bad),
+            "verdict" => Make(metrics: FullMetrics(), verdict: bad),
+            "summary" => Make(metrics: FullMetrics(), summary: bad),
+            "issues" => Make(metrics: FullMetrics() with { Issues = ["valid", bad] }),
+            "changedFiles" => Make(gitStatus: Git() with { ChangedFiles = ["valid.cs", bad] }),
+            _ => throw new InvalidOperationException("Unhandled text location " + location),
+        };
+
+        var ex = Assert.Throws<CompletionReceiptCodecException>(
+            () => CompletionReceiptCodec.Encode(receipt));
+        Assert.Contains(expectedContext, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("unpaired UTF-16 high surrogate", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("�", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Encode_UnpairedLowSurrogate_IsRefused_WhileWellFormedNonBmpTextRoundTripsVerbatim()
+    {
+        var low = "before-" + '\uDC00' + "-after";
+        var lowEx = Assert.Throws<CompletionReceiptCodecException>(
+            () => CompletionReceiptCodec.Encode(Make(output: low)));
+        Assert.Contains("unpaired UTF-16 low surrogate", lowEx.Message, StringComparison.Ordinal);
+        Assert.Contains("output", lowEx.Message, StringComparison.Ordinal);
+
+        const string nonBmp = "before-😀-after";
+        var valid = Make(
+            metrics: FullMetrics() with { Issues = [nonBmp] },
+            gitStatus: Git() with { ChangedFiles = [nonBmp] },
+            sha: nonBmp,
+            output: nonBmp,
+            summary: nonBmp,
+            verdict: nonBmp,
+            model: nonBmp,
+            goalId: nonBmp,
+            workerId: nonBmp,
+            taskId: nonBmp);
+        var text = CompletionReceiptCodec.Encode(valid);
+        var decoded = CompletionReceiptCodec.Decode(text);
+
+        // Utf8JsonWriter may represent a non-BMP scalar as its valid escaped surrogate pair; the
+        // important contract is no U+FFFD substitution and exact decoded text.
+        Assert.Contains(@"before-\uD83D\uDE00-after", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("�", text, StringComparison.Ordinal);
+        Assert.DoesNotContain(@"\uFFFD", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(nonBmp, decoded.GoalId);
+        Assert.Equal(nonBmp, decoded.WorkerId);
+        Assert.Equal(nonBmp, decoded.Slot.TaskId);
+        Assert.Equal(nonBmp, decoded.Result.TaskId);
+        Assert.Equal(nonBmp, decoded.Result.Output);
+        Assert.Equal(nonBmp, decoded.Result.Model);
+        Assert.Equal(nonBmp, decoded.Result.IterationStartSha);
+        Assert.Equal(nonBmp, decoded.Result.Metrics!.Verdict);
+        Assert.Equal(nonBmp, decoded.Result.Metrics.Summary);
+        Assert.Equal([nonBmp], decoded.Result.Metrics.Issues);
+        Assert.Equal([nonBmp], decoded.Result.GitStatus!.ChangedFiles);
+    }
+
+    [Fact]
+    public void Decode_UnpairedSurrogateEscapesInResultAndNestedEvidence_AreRefused_NotRepaired()
+    {
+        var canonical = Canonical();
+        foreach (var (original, malformed) in new[]
+                 {
+                     ("\"output\":\"out\"", "\"output\":\"\\uD800\""),
+                     ("\"summary\":\"sum\"", "\"summary\":\"\\uD800\""),
+                     ("\"issues\":[\"i1\",\"i2\"]", "\"issues\":[\"\\uD800\",\"i2\"]"),
+                     ("\"changedFiles\":[\"a.cs\",\"b.cs\"]",
+                         "\"changedFiles\":[\"\\uD800\",\"b.cs\"]"),
+                 })
+        {
+            var malformedPayload = canonical.Replace(original, malformed, StringComparison.Ordinal);
+            Assert.NotEqual(canonical, malformedPayload, StringComparer.Ordinal);
+            Assert.Contains("\\uD800", malformedPayload, StringComparison.Ordinal);
+            Assert.Throws<CompletionReceiptCodecException>(
+                () => CompletionReceiptCodec.Decode(malformedPayload));
+        }
+    }
 
     [Fact]
     public void Encode_RejectsUnrepresentableDomainValues()
@@ -859,6 +1240,20 @@ public sealed class CompletionReceiptCodecTests
                 TaskId = "t1", Status = TaskOutcome.Completed, Output = "o", Model = "m",
                 Metrics = new TaskMetrics { Verdict = "v", Issues = [null!], Summary = "s" },
             }));
+
+        AssertEncodeRejected(new CompletionReceipt(
+            "g1", "w1", WorkerRole.Coder,
+            new WorkSlot("t1", new WorkSlotPosition(1, GoalPhase.Coding, 1), 1),
+            new TaskResult
+            {
+                TaskId = "t1", Status = TaskOutcome.Completed, Output = "o", Model = "m",
+                Metrics = new TaskMetrics { Verdict = "v", Issues = [], Summary = null! },
+            }));
+
+        AssertEncodeRejected(new CompletionReceipt(
+            "g1", "w1", WorkerRole.Coder,
+            new WorkSlot("t1", new WorkSlotPosition(1, GoalPhase.Coding, 1), 1),
+            new TaskResult { TaskId = "t1", Status = (TaskOutcome)999, Output = "o", Model = "m" }));
 
         AssertEncodeRejected(new CompletionReceipt(
             "g1", "w1", WorkerRole.Coder,
