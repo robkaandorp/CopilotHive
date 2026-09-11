@@ -178,6 +178,17 @@ message TaskComplete {
   GitStatus git_status = 4;
   TaskMetrics metrics = 5;
   string iteration_start_sha = 6; // HEAD SHA captured before the coder ran; used for iteration-scoped diff
+
+  // The ORIGINAL ASSIGNED model for this task, carried verbatim by an upgraded worker.
+  // proto3 `optional` gives explicit presence, which is the ONLY trustworthy signal here:
+  //   * ABSENT      → a legacy sender that does not report a model at all. The receiver
+  //                   falls back to its own volatile active-task queue.
+  //   * PRESENT     → an upgraded sender. An EMPTY value means "the assigned model is
+  //                   unknown/empty" and must NEVER be treated as absence, and must never
+  //                   be replaced by a queue value.
+  // Additive and backward compatible: an old server ignores this field and keeps its
+  // existing behavior, and no new handshake is required.
+  optional string model = 7;
 }
 
 message WorkerReady {

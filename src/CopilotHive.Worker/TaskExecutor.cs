@@ -243,7 +243,20 @@ public sealed class TaskExecutor(
 
         // ONE shared finalization path for every prepared Improver outcome, awaited BEFORE
         // this method returns. Composes cleanup diagnostics WITH the original outcome.
-        return await FinalizeImproverOutcomeAsync(task, outcome, finalization);
+        var finalized = await FinalizeImproverOutcomeAsync(task, outcome, finalization);
+
+        // THE COMMON FINALIZED-RESULT RETURN BOUNDARY. The ORIGINAL ASSIGNED model is stamped
+        // here, ONCE, AFTER finalization — so Completed/Failed/Cancelled results from every
+        // executor branch (including a cleanup-adjusted Improver outcome) carry it without
+        // duplicating an initializer on each of the many returns above. The value is the
+        // assignment's own model VERBATIM: never the runner's provider-stripped display value,
+        // never an environment default, never the actual provider response model, and never
+        // trimmed or normalized. A runtime-null assigned model becomes the empty string
+        // ("unknown/empty"), which the wire mapping still transmits with explicit presence.
+        //
+        // No result is synthesized here: when execution or finalization throws, this boundary
+        // is never reached and the exception propagates exactly as before.
+        return finalized with { Model = task.Model ?? "" };
     }
 
     /// <summary>
