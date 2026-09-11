@@ -1155,37 +1155,60 @@ public sealed class WorkerService(
         }, ct);
 
     /// <summary>
-    /// The heartbeat loop for ONE published connection: it snapshots the connection's client and
-    /// identity, so every heartbeat it emits belongs to the registration it was started for.
+    /// The heartbeat loop for ONE published connection. Cadence is UNCHANGED: it still waits for
+    /// <see cref="HeartbeatInterval"/> before every tick, and there is deliberately NO immediate
+    /// first heartbeat.
     /// </summary>
     private async Task RunHeartbeatAsync(WorkerConnection connection, CancellationToken ct)
     {
-        var client = connection.Client;
-        var assignedId = connection.AssignedId;
         using var timer = new PeriodicTimer(HeartbeatInterval);
 
         while (await timer.WaitForNextTickAsync(ct))
+            await SendHeartbeatAsync(connection, ct);
+    }
+
+    /// <summary>
+    /// ONE heartbeat tick on the given connection: snapshots the connection's identity and the
+    /// worker's current task state AT the tick, so the emitted request belongs to the registration
+    /// this loop was started for and reflects the state at that instant.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the loop body factored out verbatim (a TEST SEAM in shape only: the loop above is its
+    /// sole production caller), so a focused test can drive exactly one tick without waiting for a
+    /// real interval. The failure contract is UNCHANGED — a non-cancellation fault is logged in
+    /// sanitized form and the loop continues to the next tick.
+    /// </para>
+    /// <para>
+    /// CHECKED ACCESS comes FIRST, before any transport: a retired connection issues no heartbeat
+    /// RPC at all. That rejection lands on the existing sanitized log path — a heartbeat is a
+    /// periodic best-effort signal, so it keeps the existing swallow-and-retry contract rather than
+    /// propagating. A tick that already passed the check keeps its captured client, token and
+    /// outcome.
+    /// </para>
+    /// </remarks>
+    private async Task SendHeartbeatAsync(WorkerConnection connection, CancellationToken ct)
+    {
+        try
         {
-            try
+            var client = connection.EnsureUsable().Client;
+            var taskId = _currentTaskId;
+            await client.HeartbeatAsync(new HeartbeatRequest
             {
-                var taskId = _currentTaskId;
-                await client.HeartbeatAsync(new HeartbeatRequest
-                {
-                    WorkerId = assignedId,
-                    Busy = taskId is not null,
-                    CurrentTaskId = taskId ?? "",
-                    CurrentRole = _currentRole ?? "",
-                    ContextUsagePercent = taskId is not null
-                        ? _agentRunner.GetContextUsagePercent()
-                        : 0,
-                }, cancellationToken: ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
-                // echo request configuration back to the worker.
-                Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
-            }
+                WorkerId = connection.AssignedId,
+                Busy = taskId is not null,
+                CurrentTaskId = taskId ?? "",
+                CurrentRole = _currentRole ?? "",
+                ContextUsagePercent = taskId is not null
+                    ? _agentRunner.GetContextUsagePercent()
+                    : 0,
+            }, cancellationToken: ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
+            // echo request configuration back to the worker.
+            Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
         }
     }
 
