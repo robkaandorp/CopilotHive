@@ -642,9 +642,20 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     /// teardown reports that leak loudly instead of ignoring it.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// This is the counterpart of the vector above: together they pin BOTH halves of the contract —
     /// a cleanup failure never replaces a primary failure, and it never disappears when there is no
     /// primary failure. The bound is shortened for this vector alone so the proof stays fast.
+    /// </para>
+    /// <para>
+    /// THIS VECTOR DELIBERATELY STALLS A REAL PRODUCER, so it owns a stricter obligation than any
+    /// other: its OWN restoration must be UNCONDITIONAL. Everything after
+    /// <see cref="RecordingStreamWriter.IgnoreReleaseForLeakProof"/> runs inside a <c>try</c> whose
+    /// <c>finally</c> restores the normal bound, re-enables release and performs the REAL join — so
+    /// even a failing <c>TEARDOWN LEAK</c> expectation cannot leave the stalled
+    /// <c>WorkStream</c> alive. The join itself is then PROVEN (not merely attempted): the original
+    /// stream task must be observably completed afterwards.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Teardown_WhenTheProducerCannotBeReleased_ReportsTheLeakLoudly()
@@ -656,22 +667,65 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         // cannot terminate — the exact condition that must be reported rather than ignored.
         h.Writer.IgnoreReleaseForLeakProof();
 
-        var leak = await Assert.ThrowsAsync<TimeoutException>(
-            () => RunAsync(h, async () =>
+        ExceptionDispatchInfo? primary = null;
+        Exception? restorationFailure = null;
+        var joined = false;
+
+        try
+        {
+            var leak = await Assert.ThrowsAsync<TimeoutException>(
+                () => RunAsync(h, async () =>
+                {
+                    await h.ParkTransportPumpAsync();
+                    Assert.True(h.Writer.PumpStillParked);
+                    // THE BODY SUCCEEDS — so nothing can mask the cleanup failure.
+                }));
+
+            // THE LOUD REPORT during the ignored-release window.
+            Assert.Contains("TEARDOWN LEAK", leak.Message, StringComparison.Ordinal);
+            Assert.Contains(h.Worker.Id, leak.Message, StringComparison.Ordinal);
+            Assert.False(h.StreamJoined, "the join must be reported as failed when the producer cannot end");
+        }
+        catch (Exception ex)
+        {
+            primary = ExceptionDispatchInfo.Capture(ex);
+        }
+        finally
+        {
+            // ── THE UNCONDITIONAL RESTORATION. It runs even when an assertion above failed —
+            //    including a failing TEARDOWN LEAK expectation — so this vector can never leave the
+            //    producer it deliberately stalled alive. ──
+            h.RestoreNormalJoinBound();
+            h.Writer.StopIgnoringRelease();
+            h.Writer.ReleaseParked();
+
+            try
             {
-                await h.ParkTransportPumpAsync();
-                Assert.True(h.Writer.PumpStillParked);
-                // THE BODY SUCCEEDS — so nothing can mask the cleanup failure.
-            }));
+                // THE REAL JOIN. It FAILS LOUDLY on a bounded-wait timeout — a timeout means the
+                // producer is still live, which is exactly what this vector must never leave behind.
+                await h.AwaitStreamTerminationForLeakProofAsync();
+                joined = true;
+            }
+            catch (Exception ex)
+            {
+                restorationFailure = ex;
+            }
+        }
 
-        Assert.Contains("TEARDOWN LEAK", leak.Message, StringComparison.Ordinal);
-        Assert.Contains(h.Worker.Id, leak.Message, StringComparison.Ordinal);
-        Assert.False(h.StreamJoined, "the join must be reported as failed when the producer cannot end");
+        // THE PRIMARY FAILURE WINS, with its ORIGINAL message and stack — cleanup never masks it.
+        primary?.Throw();
 
-        // CLEAN UP FOR REAL so this proof does not itself leak the producer it deliberately stalled.
-        h.Writer.StopIgnoringRelease();
-        h.Writer.ReleaseParked();
-        await h.AwaitStreamTerminationForLeakProofAsync();
+        // No primary failure, so a genuine restoration failure must still surface.
+        if (restorationFailure is not null)
+            throw restorationFailure;
+
+        // ── THE POST-RESTORATION JOIN IS PROVEN, not merely attempted. ──
+        Assert.True(joined, "the leak-proof vector did not complete its real join");
+        Assert.True(
+            h.StreamTaskIsCompletedNow,
+            "the leak-proof vector left its deliberately stalled WorkStream producer LIVE");
+        Assert.True(h.Writer.ParkReleased, "the leak-proof vector did not re-enable the release");
+        Assert.False(h.Writer.PumpStillParked, "a pump is STILL parked after the leak-proof restoration");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -944,6 +998,12 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         }
 
         /// <summary>Pushes a real Ready and waits for the stream to end, returning its fault (or null).</summary>
+        /// <remarks>
+        /// THE SAME NARROWING AS THE LEAK PROOF: a bounded-wait timeout (or a cancellation of the
+        /// waiter) means the stream is STILL RUNNING, so it is rethrown loudly rather than returned
+        /// as if it were the stream's own terminal fault. Only an exception from a task that has
+        /// actually COMPLETED is reported as the observed termination.
+        /// </remarks>
         public async Task<Exception?> SendReadyAndAwaitStreamEndAsync()
         {
             Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
@@ -955,15 +1015,19 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
                 StreamFaulted = false;
                 return null;
             }
-            catch (TimeoutException)
-            {
-                throw new TimeoutException("the WorkStream did not drain within the bound");
-            }
-            catch (Exception ex)
+            catch (Exception ex) when (StreamTask.IsCompleted && ex is not TimeoutException)
             {
                 // The stream's own termination is the observed result for the fault vector.
                 StreamFaulted = true;
                 return ex;
+            }
+            catch (Exception ex)
+            {
+                // STILL RUNNING: a timeout (or a cancelled waiter) is a live producer, never a fault.
+                throw new TimeoutException(
+                    $"the WorkStream for worker '{Worker.Id}' did not drain within " +
+                    $"{BoundedWait.TotalSeconds:F0}s (streamCompleted={StreamTask.IsCompleted})",
+                    ex);
             }
         }
 
@@ -1022,11 +1086,24 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
                     $"{_joinBound.TotalSeconds:F0}s — a live producer/stream task remains. " +
                     $"(pumpReleased={Writer.ParkReleased}, parkedPumpStillHeld={Writer.PumpStillParked})");
             }
-            catch (Exception)
+            catch (Exception) when (StreamTask.IsCompleted)
             {
-                // The stream's OWN terminal fault is a joined termination, not a cleanup failure.
+                // The stream's OWN terminal fault of a COMPLETED task is a joined termination, not a
+                // cleanup failure. The IsCompleted guard is what keeps a STILL-RUNNING task out of
+                // this branch, so "joined" can never be claimed for a live producer.
                 StreamJoined = true;
                 StreamFaulted = true;
+            }
+            catch (Exception ex)
+            {
+                // STILL RUNNING after a non-timeout wait failure — a live producer. Report it.
+                StreamJoined = false;
+                ObserveTeardownPostconditions();
+                return new InvalidOperationException(
+                    $"TEARDOWN LEAK: the WorkStream for worker '{Worker.Id}' is still running after its " +
+                    $"join failed — a live producer/stream task remains. " +
+                    $"(pumpReleased={Writer.ParkReleased}, parkedPumpStillHeld={Writer.PumpStillParked})",
+                    ex);
             }
 
             ObserveTeardownPostconditions();
@@ -1064,9 +1141,34 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         public void UseShortJoinBoundForLeakProof() => _joinBound = TimeSpan.FromSeconds(2);
 
         /// <summary>
-        /// TEST-ONLY: awaits the real termination of the stream after the leak proof has re-enabled
+        /// TEST-ONLY: restores the NORMAL join bound. The leak proof calls this as part of its
+        /// unconditional restoration, so the REAL join that follows gets the full bound rather than
+        /// the shortened one it used to force the leak.
+        /// </summary>
+        public void RestoreNormalJoinBound() => _joinBound = BoundedWait;
+
+        /// <summary>Whether the original stream task is completed RIGHT NOW (the live-producer probe).</summary>
+        public bool StreamTaskIsCompletedNow => StreamTask.IsCompleted;
+
+        /// <summary>
+        /// TEST-ONLY: awaits the REAL termination of the stream after the leak proof has re-enabled
         /// the release, so that proof never leaves the producer it deliberately stalled behind.
         /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A BOUNDED-WAIT TIMEOUT IS NOT BENIGN AND IS NEVER SWALLOWED. The bounded
+        /// <c>WaitAsync</c> raises <see cref="TimeoutException"/> when the task is STILL RUNNING, which is precisely
+        /// the live-producer condition this helper exists to prevent — so it is rethrown loudly with
+        /// diagnostic state instead of being mistaken for a terminal fault.
+        /// </para>
+        /// <para>
+        /// THE SUPPRESSION IS NARROWED TO AN ACTUAL TERMINAL FAULT OF AN ALREADY-COMPLETED TASK: a
+        /// stream that ended faulted or cancelled IS a joined termination, so its exception is
+        /// tolerated — but only after <see cref="Task.IsCompleted"/> has been confirmed. A
+        /// still-running task can never take that path.
+        /// </para>
+        /// </remarks>
+        /// <exception cref="TimeoutException">The producer is still live after the bound.</exception>
         public async Task AwaitStreamTerminationForLeakProofAsync()
         {
             Reader.Complete();
@@ -1074,9 +1176,29 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             {
                 await StreamTask.WaitAsync(BoundedWait, CancellationToken.None);
             }
-            catch (Exception)
+            catch (Exception ex) when (StreamTask.IsCompleted && ex is not TimeoutException)
             {
-                // The stream's own terminal fault is a joined termination.
+                // AN ACTUAL TERMINAL FAULT of a COMPLETED task — a genuine joined termination.
+            }
+            catch (TimeoutException ex)
+            {
+                // STILL RUNNING: the deliberately stalled producer never ended. FAIL LOUDLY.
+                throw new TimeoutException(
+                    $"LEAK-PROOF RESTORATION FAILED: the deliberately stalled WorkStream for worker " +
+                    $"'{Worker.Id}' did not terminate within {BoundedWait.TotalSeconds:F0}s after the " +
+                    $"release was restored — a live producer remains. " +
+                    $"(pumpReleased={Writer.ParkReleased}, parkedPumpStillHeld={Writer.PumpStillParked}, " +
+                    $"streamCompleted={StreamTask.IsCompleted})",
+                    ex);
+            }
+
+            // THE JOIN IS PROVEN, not assumed: WaitAsync can only return without the task being
+            // completed if the bound elapsed, which the branch above already rejects.
+            if (!StreamTask.IsCompleted)
+            {
+                throw new InvalidOperationException(
+                    $"LEAK-PROOF RESTORATION FAILED: the WorkStream for worker '{Worker.Id}' is still " +
+                    "running after a wait that neither completed nor timed out.");
             }
         }
     }

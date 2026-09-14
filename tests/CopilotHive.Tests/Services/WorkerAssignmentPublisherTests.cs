@@ -1554,6 +1554,12 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
         public bool WorkerRemovedAfterStream { get; private set; }
 
         /// <summary>Ends the stream input and awaits its termination, capturing the terminal fault.</summary>
+        /// <remarks>
+        /// THE SAME NARROWING THE PUBLICATION HARNESS USES: a bounded-wait failure means the stream is
+        /// STILL RUNNING, so only an exception from a task that has actually COMPLETED may be recorded
+        /// as the observed terminal fault. Anything else is a live producer and is rethrown loudly —
+        /// this helper can never report "ended" for a stream that never ended.
+        /// </remarks>
         public async Task DrainAsync()
         {
             Reader.Complete();
@@ -1563,15 +1569,20 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
                 StreamEnded = true;
                 StreamFaulted = false;
             }
-            catch (TimeoutException)
+            catch (Exception ex) when (StreamTask.IsCompleted && ex is not TimeoutException)
             {
-                throw new TimeoutException("the WorkStream did not drain within the bound");
-            }
-            catch (Exception ex)
-            {
+                // AN ACTUAL TERMINAL FAULT of a COMPLETED task — a genuine joined termination.
                 StreamEnded = true;
                 StreamFaulted = true;
                 StreamTerminalException = ex;
+            }
+            catch (Exception ex)
+            {
+                // STILL RUNNING: a live producer, never a terminal fault.
+                throw new TimeoutException(
+                    $"the WorkStream did not drain within {BoundedWait.TotalSeconds:F0}s " +
+                    $"(streamCompleted={StreamTask.IsCompleted})",
+                    ex);
             }
         }
 
