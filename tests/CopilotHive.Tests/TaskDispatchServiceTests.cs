@@ -2330,10 +2330,15 @@ public sealed class TaskDispatchServiceTests
 
         var workerPool = new WorkerPool();
         var idleWorker = workerPool.RegisterWorker("worker-1", []);
-        var gateway = new GrpcWorkerGateway(workerPool);
-
         var taskQueue = new TaskQueue();
         var pipelineManager = new GoalPipelineManager();
+
+        // THE EAGER PATH IS RECORDED: the real gateway delegates its publication to the REAL
+        // publisher over a real store, so the delivered assignment must leave a recorded row — a
+        // missing publisher would merely BLOCK the send (never fall back to a raw write).
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+
         var service = CreateService(
             config: config,
             pipelineManager: pipelineManager,
@@ -2360,6 +2365,17 @@ public sealed class TaskDispatchServiceTests
 
         // The task should have been removed from the pending queue (activated)
         Assert.Null(taskQueue.TryDequeueAny());
+
+        // THE EAGER ASSIGNMENT REALLY WAS RECORDED for the DELIVERED task, and the publication
+        // happened: the row names the pinned worker and the worker's channel carries the
+        // assignment. (The channel is drained here because no transport is attached to this
+        // fixture.)
+        var deliveredTaskId = idleWorker.CurrentTaskId!;
+        var recorded = recording.Store.Load(deliveredTaskId);
+        Assert.NotNull(recorded);
+        Assert.Equal("worker-1", recorded!.Context.WorkerId);
+        Assert.True(idleWorker.MessageChannel.Reader.TryRead(out var published));
+        Assert.Equal(deliveredTaskId, published.Assignment.TaskId);
     }
 
     [Fact]

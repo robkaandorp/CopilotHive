@@ -9,7 +9,7 @@ using WorkerRole = CopilotHive.Workers.WorkerRole;
 namespace CopilotHive.Services;
 
 /// <summary>
-/// The NARROW, INJECTABLE FACE of the Ready-driven assignment recorder/publisher.
+/// The NARROW, INJECTABLE FACE of the assignment recorder/publisher.
 /// <para>
 /// It exists so a caller can depend on the capability rather than the concrete publisher — which is
 /// what lets a fixture substitute its own narrow implementation for injection. It deliberately
@@ -25,10 +25,12 @@ namespace CopilotHive.Services;
 /// the store all remain internal.
 /// </para>
 /// <para>
-/// THE CONCRETE PUBLISHER IS MANDATORY FOR READY SENDS. There is NO fallback to a raw
-/// channel write: a caller that cannot resolve a publisher must fail closed with the same explicit
-/// no-send disposition (see <see cref="WorkerAssignmentRecordingException.MissingPublisher"/>)
-/// rather than publish an unrecorded assignment.
+/// THE CONCRETE PUBLISHER IS MANDATORY FOR TASK SENDS. Both live delivery paths — the Ready-driven
+/// send and the eager send in <see cref="GrpcWorkerGateway"/> — delegate their final channel write
+/// to it. There is NO fallback to a raw channel write: a caller that cannot resolve a publisher
+/// must fail closed with the same explicit no-send disposition (see
+/// <see cref="WorkerAssignmentRecordingException.MissingPublisher"/>) rather than publish an
+/// unrecorded assignment.
 /// </para>
 /// </summary>
 public interface IWorkerAssignmentPublisher
@@ -58,8 +60,10 @@ public interface IWorkerAssignmentPublisher
 }
 
 /// <summary>
-/// THE READY-DRIVEN ASSIGNMENT PUBLISHER — the single production path that records the server's
+/// THE ASSIGNMENT PUBLISHER — the single production path that records the server's
 /// INTENDED assignment binding and only then publishes the assignment to the pinned worker.
+/// It is the recording+publication leg of BOTH live delivery paths: the Ready-driven send in
+/// <see cref="HiveOrchestratorService"/> and the eager send in <see cref="GrpcWorkerGateway"/>.
 /// <para>
 /// IT RESOLVES FROM THE DELIVERED TASK, NEVER FROM A GUESS. The pipeline is resolved with
 /// <see cref="GoalPipelineManager.GetByTaskId"/> using the DELIVERED
@@ -107,7 +111,8 @@ public interface IWorkerAssignmentPublisher
 /// <para>
 /// SCOPE, HONESTLY. This type records and publishes; it does no delivery authorization, no
 /// acknowledgement, no reconciliation and no replay, and a completed channel write is NOT proof of
-/// receipt. The eager (non-Ready) delivery path is unchanged by this slice and remains unrecorded.
+/// receipt. Both live delivery paths (Ready-driven and eager) delegate their publication here, so
+/// live assignment-recording coverage is complete.
 /// </para>
 /// </summary>
 internal sealed class WorkerAssignmentPublisher : IWorkerAssignmentPublisher
@@ -356,7 +361,7 @@ internal sealed class WorkerAssignmentPublisher : IWorkerAssignmentPublisher
 }
 
 /// <summary>
-/// The explicit reasons a Ready-driven assignment recording could NOT proceed. The set is
+/// The explicit reasons an assignment recording could NOT proceed. The set is
 /// deliberately small and flat — one reason per refusal family, no taxonomy framework.
 /// </summary>
 internal enum WorkerAssignmentRecordingFailureReason
@@ -410,8 +415,8 @@ internal enum WorkerAssignmentRecordingFailureReason
 }
 
 /// <summary>
-/// THE RECORDING-FAILURE EXCEPTION: the single explicit failure contract of the Ready-driven
-/// assignment publisher.
+/// THE RECORDING-FAILURE EXCEPTION: the single explicit failure contract of the assignment
+/// publisher.
 /// <para>
 /// THE THREE EVIDENCE MEMBERS, AND WHEN EACH IS POPULATED:
 /// </para>

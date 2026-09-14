@@ -5108,7 +5108,7 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
     /// <summary>True once <see cref="SendTaskAsync"/> has been invoked.</summary>
     public bool SendAttempted { get; private set; }
 
-    public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+    public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
     {
         SendAttempted = true;
         throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");

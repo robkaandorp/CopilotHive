@@ -1287,10 +1287,32 @@ public sealed class WorkerAssignmentPublisherDiRegistrationTests
         Assert.Same(store, PublisherField(concrete, "_store"));
     }
 
+    /// <summary>
+    /// THE EAGER PATH IS WIRED TO THE SAME RECORDER: the container's <see cref="GrpcWorkerGateway"/>
+    /// holds the SAME <see cref="IWorkerAssignmentPublisher"/> singleton, so no live delivery path
+    /// can bypass the recording.
+    /// </summary>
+    [Fact]
+    public void DiResolves_GatewayWithTheSamePublisherSingleton()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var provider = scope.ServiceProvider;
+
+        var gateway = provider.GetRequiredService<GrpcWorkerGateway>();
+        var face = provider.GetRequiredService<IWorkerAssignmentPublisher>();
+
+        Assert.Same(face, GatewayField(gateway, "_publisher"));
+    }
+
     private static object PublisherField(WorkerAssignmentPublisher publisher, string name) =>
         typeof(WorkerAssignmentPublisher)
             .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(publisher)!;
+
+    private static object? GatewayField(GrpcWorkerGateway gateway, string name) =>
+        typeof(GrpcWorkerGateway)
+            .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(gateway);
 }
 
 /// <summary>
@@ -2002,5 +2024,237 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
         protected override WriteOptions? WriteOptionsCore { get; set; }
 
         protected override AuthContext AuthContextCore => null!;
+    }
+}
+/// <summary>
+/// THE EAGER SEND BOUNDARY: <see cref="GrpcWorkerGateway.SendTaskAsync"/> delegates its whole
+/// publication to the existing publisher and REPORTS the outcome — <c>Published</c> only after the
+/// publisher's channel write completed, and <c>Blocked</c> for a
+/// <see cref="WorkerAssignmentRecordingException"/> instead of throwing it. The gateway resolves the
+/// worker exactly once and keeps a missing worker, a caller cancellation and every post-record
+/// failure as EXCEPTIONS.
+/// </summary>
+/// <remarks>
+/// The publisher is the REAL production type over a REAL file-backed SQLite store; nothing the
+/// gateway consults is stubbed. The three vectors below are the boundary's OWN contract, so they
+/// live next to the publisher's suite rather than in a second harness.
+/// </remarks>
+public sealed class GrpcWorkerGatewayEagerSendTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"copilothive-gateway-eager-{Guid.NewGuid():N}.db");
+
+    /// <summary>Creates the schema once, so the real store's operations have a table to work on.</summary>
+    public GrpcWorkerGatewayEagerSendTests()
+    {
+        using var context = CreateContext();
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var candidate in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+            catch
+            {
+                // Best-effort cleanup — a leftover temp file must never fail a test.
+            }
+        }
+    }
+
+    private string ConnectionString => $"Data Source={_dbPath};Pooling=False;Default Timeout=15";
+
+    private CopilotHiveDbContext CreateContext()
+    {
+        var connection = new SqliteConnection(ConnectionString);
+        connection.Open();
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        context.Database.EnsureCreated();
+        return context;
+    }
+
+    /// <summary>
+    /// A REAL gateway, REAL publisher and REAL store over ONE pipeline with a Pending slot at the
+    /// active-task pointer: everything the publisher validates is really registered.
+    /// </summary>
+    private (GrpcWorkerGateway Gateway, WorkerPool Pool, ConnectedWorker Worker, WorkTask Task,
+        string TaskId, WorkerAssignmentContextStore Store)
+        NewFixture(ILogger<GrpcWorkerGateway>? logger = null, bool withPublisher = true)
+    {
+        var factory = new GatewayStoreFactory(ConnectionString);
+        var store = new WorkerAssignmentContextStore(factory, NullLogger<WorkerAssignmentContextStore>.Instance);
+        var manager = new GoalPipelineManager();
+        var pool = new WorkerPool();
+        var worker = pool.RegisterWorker("worker-eager-1", []);
+
+        const string goalId = "goal-eager";
+        var pipeline = manager.CreatePipeline(new Goal { Id = goalId, Description = "eager send" });
+        const string taskId = "task-eager-coder-001-01";
+        pipeline.AllocateAttemptAndRegisterSlot(taskId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        pipeline.SetActiveTask(taskId);
+        manager.RegisterTask(taskId, goalId);
+
+        var task = new WorkTask
+        {
+            TaskId = taskId,
+            GoalId = goalId,
+            GoalDescription = "eager send",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "model-eager",
+            Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+        };
+
+        var publisher = withPublisher ? new WorkerAssignmentPublisher(manager, pool, store) : null;
+        var gateway = new GrpcWorkerGateway(pool, publisher, logger);
+
+        return (gateway, pool, worker, task, taskId, store);
+    }
+
+    /// <summary>
+    /// THE PUBLISHED OUTCOME: the publisher really recorded the delivered context AND really wrote
+    /// the assignment to the pinned worker's channel, and only then did the gateway report
+    /// <see cref="WorkerTaskSendOutcome.Published"/>.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_WithPublisher_RecordsAndPublishesAndReportsPublished()
+    {
+        var (gateway, _, worker, task, taskId, store) = NewFixture();
+
+        var outcome = await gateway.SendTaskAsync(worker.Id, task, TestContext.Current.CancellationToken);
+
+        Assert.Equal(WorkerTaskSendOutcome.Published, outcome);
+
+        // RECORDED: the row names the delivered goal, worker, role and model.
+        var recorded = store.Load(taskId);
+        Assert.NotNull(recorded);
+        Assert.Equal("goal-eager", recorded!.Context.GoalId);
+        Assert.Equal(worker.Id, recorded.Context.WorkerId);
+        Assert.Equal(WorkerRole.Coder, recorded.Context.Role);
+        Assert.Equal("model-eager", recorded.Context.Model);
+
+        // PUBLISHED to the PINNED instance's channel.
+        Assert.True(worker.MessageChannel.Reader.TryRead(out var message));
+        Assert.Equal(taskId, message.Assignment.TaskId);
+    }
+
+    /// <summary>
+    /// THE FAIL-CLOSED MISSING PUBLISHER: with no publisher the gateway reports
+    /// <see cref="WorkerTaskSendOutcome.Blocked"/> — it never falls back to a raw channel write, so
+    /// nothing reaches the worker's channel and nothing is recorded.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_WithoutPublisher_ReportsBlockedAndWritesNothing()
+    {
+        var (gateway, _, worker, task, taskId, store) = NewFixture(withPublisher: false);
+
+        var outcome = await gateway.SendTaskAsync(worker.Id, task, TestContext.Current.CancellationToken);
+
+        Assert.Equal(WorkerTaskSendOutcome.Blocked, outcome);
+        Assert.Null(store.Load(taskId));
+        Assert.False(worker.MessageChannel.Reader.TryRead(out _));
+    }
+
+    /// <summary>
+    /// THE GUARDED WARNING: a throwing logger cannot turn the handled refusal into an escaping
+    /// exception, and the warning it was asked to emit names the delivered goal and task, the
+    /// worker, the refusal reason and the blocked/retained disposition.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_RefusalWithThrowingLogger_StillReportsBlocked()
+    {
+        var logger = new CapturingThrowingGatewayLogger();
+        var (gateway, _, worker, task, _, _) = NewFixture(logger, withPublisher: false);
+
+        var outcome = await gateway.SendTaskAsync(worker.Id, task, TestContext.Current.CancellationToken);
+
+        Assert.Equal(WorkerTaskSendOutcome.Blocked, outcome);
+        Assert.True(logger.Threw);
+
+        var warning = Assert.Single(logger.Messages);
+        Assert.Contains("assignment blocked", warning, StringComparison.Ordinal);
+        Assert.Contains("no assignment published", warning, StringComparison.Ordinal);
+        Assert.Contains("task retained", warning, StringComparison.Ordinal);
+        Assert.Contains(task.GoalId, warning, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, warning, StringComparison.Ordinal);
+        Assert.Contains(worker.Id, warning, StringComparison.Ordinal);
+        Assert.Contains(
+            nameof(WorkerAssignmentRecordingFailureReason.MissingPublisher), warning, StringComparison.Ordinal);
+        Assert.DoesNotContain("pushed to worker", warning, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A MISSING WORKER STAYS AN EXCEPTION — the resolution precedes every recording decision, so a
+    /// worker the pool does not hold can never be reported as
+    /// <see cref="WorkerTaskSendOutcome.Blocked"/>.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_UnknownWorker_ThrowsAndNeverReportsBlocked()
+    {
+        var (gateway, _, _, task, _, _) = NewFixture();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gateway.SendTaskAsync("no-such-worker", task, TestContext.Current.CancellationToken));
+
+        Assert.Equal("Worker 'no-such-worker' not found.", ex.Message);
+    }
+
+    /// <summary>
+    /// A REAL CALLER CANCELLATION STAYS AN EXCEPTION: the publisher's own pre-recording observation
+    /// propagates the caller's <see cref="OperationCanceledException"/> — it is never wrapped as
+    /// <see cref="WorkerTaskSendOutcome.Blocked"/>.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_CancelledCallerToken_ThrowsOceAndRecordsNothing()
+    {
+        var (gateway, _, worker, task, taskId, store) = NewFixture();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => gateway.SendTaskAsync(worker.Id, task, cts.Token));
+
+        Assert.Null(store.Load(taskId));
+    }
+
+    /// <summary>A store factory owning one short-lived context per operation.</summary>
+    private sealed class GatewayStoreFactory(string connectionString)
+        : IDbContextFactory<CopilotHiveDbContext>
+    {
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var connection = new SqliteConnection(connectionString);
+            connection.Open();
+            return new CopilotHiveDbContext(
+                new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection).Options);
+        }
+    }
+
+    /// <summary>Captures every formatted message and then throws — the guarded-warning vector.</summary>
+    private sealed class CapturingThrowingGatewayLogger : ILogger<GrpcWorkerGateway>
+    {
+        public List<string> Messages { get; } = [];
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool Threw { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Messages.Add(formatter(state, exception));
+            Threw = true;
+            throw new InvalidOperationException("gateway-logger-sentinel");
+        }
     }
 }

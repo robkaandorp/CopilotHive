@@ -290,7 +290,13 @@ public sealed class GoalDispatcherEagerPushCurrentModelTests
         // Register an idle worker so the eager-push path fires
         var workerPool = new WorkerPool();
         var idleWorker = workerPool.RegisterWorker("worker-1", []);
-        var gateway = new GrpcWorkerGateway(workerPool);
+        var pipelineManager = new GoalPipelineManager();
+
+        // THE EAGER PUSH IS RECORDED: the real gateway delegates its publication to the REAL
+        // publisher over a real store. Without one the send would merely be BLOCKED (no fallback to
+        // a raw channel write), so a real publisher is what makes this a genuine delivery.
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
 
         // Build the dispatcher with the real gateway (which has the idle worker)
         var goal = new Goal
@@ -312,7 +318,6 @@ public sealed class GoalDispatcherEagerPushCurrentModelTests
             DefaultBranch = "develop",
         });
 
-        var pipelineManager = new GoalPipelineManager();
         var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
         pipeline.AdvanceTo(GoalPhase.Coding);
 
@@ -324,7 +329,6 @@ public sealed class GoalDispatcherEagerPushCurrentModelTests
 
         var taskId = $"task-{Guid.NewGuid():N}";
         pipelineManager.RegisterTask(taskId, goal.Id);
-
         var dispatcher = new GoalDispatcher(
             goalManager,
             pipelineManager,

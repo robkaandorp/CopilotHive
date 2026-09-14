@@ -998,10 +998,10 @@ public sealed class ResumeRestartGateTests
 
         public List<WorkTask> SentTasks { get; } = [];
 
-        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
         {
             SentTasks.Add(task);
-            return Task.CompletedTask;
+            return Task.FromResult(WorkerTaskSendOutcome.Published);
         }
 
         public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
