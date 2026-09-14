@@ -1304,6 +1304,41 @@ public sealed class WorkerAssignmentPublisherDiRegistrationTests
         Assert.Same(face, GatewayField(gateway, "_publisher"));
     }
 
+    /// <summary>
+    /// THE GATEWAY'S DI SLICE IS COMPLETE: the container's <see cref="GrpcWorkerGateway"/> is
+    /// constructed with the REQUIRED publisher AND the required
+    /// <see cref="ILogger{GrpcWorkerGateway}"/> (never a NullLogger), and the concrete/interface
+    /// singleton identity is preserved — the container holds exactly ONE gateway instance behind
+    /// both service types.
+    /// </summary>
+    [Fact]
+    public void DiResolves_GatewayWithRequiredPublisherAndLogger_AsOneSingleton()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var provider = scope.ServiceProvider;
+
+        var concrete = provider.GetRequiredService<GrpcWorkerGateway>();
+        var face = provider.GetRequiredService<IWorkerGateway>();
+
+        // THE SAME SINGLETON behind both service types.
+        Assert.Same(concrete, face);
+
+        // THE PUBLISHER IS REQUIRED: the concrete recorder singleton, never null — the gateway's
+        // constructor parameter is optional in SIGNATURE only so fixtures compile.
+        var publisher = GatewayField(concrete, "_publisher");
+        Assert.NotNull(publisher);
+        Assert.Same(
+            provider.GetRequiredService<WorkerAssignmentPublisher>(),
+            publisher);
+
+        // THE GATEWAY LOGGER IS REQUIRED: a REAL ILogger<GrpcWorkerGateway> registration — the
+        // guarded blocked-assignment diagnostic must use the gateway's own production logger,
+        // never a NullLogger default.
+        var logger = GatewayField(concrete, "_logger");
+        Assert.NotNull(logger);
+        Assert.IsNotType<NullLogger<GrpcWorkerGateway>>(logger);
+    }
+
     private static object PublisherField(WorkerAssignmentPublisher publisher, string name) =>
         typeof(WorkerAssignmentPublisher)
             .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!
