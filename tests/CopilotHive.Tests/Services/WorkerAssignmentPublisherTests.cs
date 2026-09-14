@@ -2,16 +2,22 @@ using System.Data.Common;
 using System.Reflection;
 using System.Threading.Channels;
 
+using CopilotHive.Configuration;
+using CopilotHive.Dashboard;
+using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
+using Grpc.Core;
+
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using WorkerRole = CopilotHive.Workers.WorkerRole;
@@ -1026,4 +1032,698 @@ public sealed class WorkerAssignmentPublisherDiRegistrationTests
         typeof(WorkerAssignmentPublisher)
             .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(publisher)!;
+}
+
+/// <summary>
+/// THE REAL READY PATH'S CALLER-CANCELLATION SEMANTICS, through the REAL
+/// <see cref="HiveOrchestratorService.WorkStream"/> → <c>HandleWorkerReady</c> path with the
+/// PRODUCTION <see cref="WorkerAssignmentPublisher"/> over a REAL file-backed SQLite database.
+/// </summary>
+/// <remarks>
+/// <para>
+/// THE TWO OBSERVATIONS THE CONTRACT PROMISES, proven on the live transport path:
+/// </para>
+/// <list type="bullet">
+///   <item><description>A PRE-CANCELLED caller token propagates as the caller's OWN
+///     <see cref="OperationCanceledException"/> BEFORE anything is recorded or published — never as a
+///     blocked-result wrapper — and the stream ends, removing the worker (the pre-existing teardown
+///     semantics for a real cancellation).</description></item>
+///   <item><description>A cancellation observed AT THE COMMIT INSTANT (raised by a transaction
+///     interceptor the instant the insert's transaction commits — INSIDE the recording call) is
+///     seen at the publisher's pre-publication observation: the caller's own OCE propagates, the
+///     ALREADY COMMITTED context row deliberately SURVIVES (nothing is deleted or rebound), and no
+///     assignment reaches the transport.</description></item>
+/// </list>
+/// <para>
+/// THE HARNESS mirrors the real transport: a genuine pipeline (routing + pointer + Pending slot all
+/// really registered), a real <see cref="GoalDispatcher"/>, a real queue and worker pool, and a
+/// stream reader/writer pair that signals deterministically — never a sleep.
+/// </para>
+/// </remarks>
+public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"copilothive-wap-cancel-{Guid.NewGuid():N}.db");
+
+    private readonly List<IDisposable> _fixtures = [];
+
+    /// <summary>Upper bound for every await in these vectors — never a fixed delay.</summary>
+    private static readonly TimeSpan BoundedWait = TimeSpan.FromSeconds(30);
+
+    public WorkerAssignmentReadyCancellationTests()
+    {
+        using var connection = OpenConnection();
+        using var context = ContextOn(connection);
+        context.Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        foreach (var fixture in _fixtures)
+        {
+            try
+            {
+                fixture.Dispose();
+            }
+            catch
+            {
+                // Best-effort — a leftover fixture must never fail a test.
+            }
+        }
+
+        SqliteConnection.ClearAllPools();
+        foreach (var candidate in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+            catch
+            {
+                // Best-effort cleanup — a leftover temp file must never fail a test.
+            }
+        }
+    }
+
+    // ───────────────────────────── fixture plumbing ─────────────────────────────
+
+    private string ConnectionString => $"Data Source={_dbPath};Pooling=False;Default Timeout=15";
+
+    private SqliteConnection OpenConnection()
+    {
+        var connection = new SqliteConnection(ConnectionString);
+        connection.Open();
+        return connection;
+    }
+
+    private static CopilotHiveDbContext ContextOn(SqliteConnection connection, params IInterceptor[] interceptors)
+    {
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptors.Length > 0)
+            builder.AddInterceptors(interceptors);
+        return new CopilotHiveDbContext(builder.Options);
+    }
+
+    private ReadyCancellationFactory NewFactory(params IInterceptor[] interceptors)
+    {
+        var factory = new ReadyCancellationFactory(ConnectionString, interceptors);
+        _fixtures.Add(factory);
+        return factory;
+    }
+
+    /// <summary>The recorded row's task id, read through a fresh connection; <c>null</c> when absent.</summary>
+    private string? RawAssignmentTaskId()
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT task_id FROM worker_assignment_contexts LIMIT 1";
+        return command.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// THE CANCELLATION SEMANTICS HARNESS: the real transport path with the production publisher,
+    /// exposing the caller token via a hook the fixture controls.
+    /// </summary>
+    private sealed class CancellationHarness
+    {
+        public required HiveOrchestratorService Service { get; init; }
+        public required GoalPipelineManager Manager { get; init; }
+        public required GoalPipeline Pipeline { get; init; }
+        public required WorkerPool Pool { get; init; }
+        public required TaskQueue Queue { get; init; }
+        public required ConnectedWorker Worker { get; init; }
+        public required WorkTask DeliveredTask { get; init; }
+        public required string TaskId { get; init; }
+        public required WorkerAssignmentContextStore Store { get; init; }
+        public required CapturingReadyLogger Logger { get; init; }
+        public required RecordingStreamWriter Writer { get; init; }
+        public required Func<CancellationToken> CallerToken { get; init; }
+        public required Task StreamTask { get; init; }
+        public required ReadyCancellationStreamReader Reader { get; init; }
+
+        public static async Task<CancellationHarness> CreateAsync(
+            IDbContextFactory<CopilotHiveDbContext> storeFactory,
+            CancellationTokenSource? callerCts = null)
+        {
+            var pool = new WorkerPool();
+            var queue = new TaskQueue();
+            var manager = new GoalPipelineManager();
+
+            var goal = new Goal
+            {
+                Id = $"goal-cancel-{Guid.NewGuid():N}",
+                Description = "Ready cancellation goal",
+                RepositoryNames = ["test-repo"],
+            };
+
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new ReadyCancellationGoalSource(goal));
+            await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                manager,
+                queue,
+                new GrpcWorkerGateway(pool),
+                new TaskCompletionNotifier(),
+                NullLogger<GoalDispatcher>.Instance,
+                new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
+                config: new HiveConfigFile
+                {
+                    Orchestrator = new OrchestratorConfig { WorkerTaskTimeoutMinutes = 0 },
+                },
+                dashboardNotifier: new DashboardNotifier());
+
+            var store = new WorkerAssignmentContextStore(
+                storeFactory, NullLogger<WorkerAssignmentContextStore>.Instance);
+            var realPublisher = new WorkerAssignmentPublisher(manager, pool, store);
+            var logger = new CapturingReadyLogger();
+
+            var service = new HiveOrchestratorService(
+                pool,
+                queue,
+                manager,
+                new TaskCompletionNotifier(),
+                dispatcher,
+                logger,
+                dashboardNotifier: new DashboardNotifier(),
+                assignmentPublisher: realPublisher);
+
+            // THE GENUINE OWNERSHIP: routing + pointer + Pending slot, ALL really registered.
+            var pipeline = manager.CreatePipeline(goal);
+            pipeline.AdvanceTo(GoalPhase.Coding);
+            var built = pipeline.AllocateAttemptAndRegisterSlot(
+                $"task-cancel-{Guid.NewGuid():N}", new WorkSlotPosition(1, GoalPhase.Coding, 1));
+            pipeline.SetActiveTask(built.TaskId);
+            manager.RegisterTask(built.TaskId, goal.Id);
+
+            var worker = pool.RegisterWorker($"worker-cancel-{Guid.NewGuid():N}", []);
+
+            var task = new WorkTask
+            {
+                TaskId = built.TaskId,
+                GoalId = goal.Id,
+                GoalDescription = goal.Description,
+                Prompt = "do the cancel work",
+                Role = WorkerRole.Coder,
+                Model = "copilot/claude-sonnet-4.6",
+                Repositories =
+                    [new TargetRepository { Name = "test-repo", Url = "https://example.invalid/repo" }],
+            };
+            queue.Enqueue(task);
+
+            var writer = new RecordingStreamWriter();
+            var reader = new ReadyCancellationStreamReader();
+            var streamTask = service.WorkStream(reader, writer, CancellationCallContext(callerCts));
+
+            return new CancellationHarness
+            {
+                Service = service,
+                Manager = manager,
+                Pipeline = pipeline,
+                Pool = pool,
+                Queue = queue,
+                Worker = worker,
+                DeliveredTask = task,
+                TaskId = built.TaskId,
+                Store = store,
+                Logger = logger,
+                Writer = writer,
+                CallerToken = () => callerCts?.Token ?? CancellationToken.None,
+                StreamTask = streamTask,
+                Reader = reader,
+            };
+        }
+
+        /// <summary>Pushes a real Ready without waiting for any outcome (fire, then gate separately).</summary>
+        public Task PushReadyAsync()
+        {
+            Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Pushes a real Ready and waits until the transport has FORWARDED an assignment.</summary>
+        public async Task SendReadyAndAwaitPublishedAsync()
+        {
+            Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
+            await Writer.AssignmentForwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>Pushes a real Ready and waits for the production blocked warning.</summary>
+        public async Task SendReadyAndAwaitBlockedAsync()
+        {
+            var signal = Logger.WaitForBlockedWarning();
+            Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>
+        /// Whether the stream has terminated at all — normally, faulted, or cancelled (the stream's
+        /// own <c>catch (OperationCanceledException)</c> swallows the caller OCE and returns
+        /// normally, so a cancellation can drain WITHOUT faulting).
+        /// </summary>
+        public bool StreamEnded { get; private set; }
+
+        /// <summary>Whether the stream terminated with an exception rather than draining.</summary>
+        public bool StreamFaulted { get; private set; }
+
+        /// <summary>The stream's terminal exception, captured on the drain path.</summary>
+        public Exception? StreamTerminalException { get; private set; }
+
+        /// <summary>Whether the pinned worker was removed by the stream's teardown.</summary>
+        public bool WorkerRemovedAfterStream { get; private set; }
+
+        /// <summary>Ends the stream input and awaits its termination, capturing the terminal fault.</summary>
+        public async Task DrainAsync()
+        {
+            Reader.Complete();
+            try
+            {
+                await StreamTask.WaitAsync(BoundedWait, CancellationToken.None);
+                StreamEnded = true;
+                StreamFaulted = false;
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException("the WorkStream did not drain within the bound");
+            }
+            catch (Exception ex)
+            {
+                StreamEnded = true;
+                StreamFaulted = true;
+                StreamTerminalException = ex;
+            }
+        }
+
+        /// <summary>Observes whether the stream's finally block removed the pinned worker.</summary>
+        public void ObserveWorkerTeardown()
+        {
+            // THE INSTANCE-AWARE OBSERVATION: the teardown removes via the exact pinned instance, so
+            // a same-id replacement would keep the id present while the PINNED instance is gone. The
+            // channel-completed marker is the honest "this exact instance was removed" signal — but
+            // it must be probed BEFORE the fixture's own drain completes the channel.
+            WorkerRemovedAfterStream =
+                !Worker.MessageChannel.Writer.TryWrite(new OrchestratorMessage());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (1) PRE-CANCELLED caller token: the caller's own OCE, nothing recorded or published
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A caller token ALREADY cancelled when the stream starts propagates as the caller's OWN
+    /// <see cref="OperationCanceledException"/> — swallowed by the stream's pre-existing catch — so
+    /// the stream ends before any message is read: nothing is recorded, nothing is published, no
+    /// blocked warning is emitted (a cancellation is not a refusal), and the worker is never even
+    /// pinned (the read loop observed the cancelled token before the first Ready).
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Ready_PreCancelledCallerToken_PropagatesAndRecordsNothing()
+    {
+        using var callerCts = new CancellationTokenSource();
+        var h = await CancellationHarness.CreateAsync(NewFactory(), callerCts);
+
+        try
+        {
+            // THE CANCELLATION IS ALREADY IN EFFECT before the Ready arrives.
+            await callerCts.CancelAsync();
+
+            await h.DrainAsync();
+
+            // THE CALLER'S OWN OCE reached the stream's outer handler: the stream ENDED (the
+            // production catch swallows the OCE itself and returns normally) and no
+            // recording-failure wrapper was ever created.
+            Assert.True(h.StreamEnded, "the pre-cancelled caller token must end the stream");
+
+            // NOTHING was recorded and NOTHING was published.
+            Assert.Null(RawAssignmentTaskId());
+            Assert.Empty(h.Writer.Assignments);
+            Assert.Empty(h.Writer.Messages);
+
+            // A CALLER CANCELLATION IS NOT A REFUSAL: no blocked warning was emitted.
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (!h.StreamEnded)
+                await h.DrainAsync();
+        }
+    }
+
+    /// <summary>
+    /// A caller token cancelled WHILE the stream is already pinned (the Ready is read FIRST with a
+    /// live token, and the token is cancelled during the recording's transaction commit) ends the
+    /// stream with the caller's OWN <see cref="OperationCanceledException"/> — swallowed by the
+    /// stream's pre-existing catch — so the pinned worker is removed by the finally block (the
+    /// pre-existing teardown semantics for a real cancellation), nothing is published, and no
+    /// recording refusal is logged (a cancellation is not a refusal).
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Ready_CommitTimeCancellation_TeardownRemovesPinnedWorker()
+    {
+        using var commitCts = new CancellationTokenSource();
+        var commitGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var h = await CancellationHarness.CreateAsync(
+            NewFactory(new CancelOnCommitCtsInterceptor(commitCts, commitGate)), commitCts);
+
+        try
+        {
+            // Push the Ready: the worker is pinned, the recording starts, the transaction commits
+            // (the interceptor cancels the caller token and fires the gate), and the pre-publication
+            // observation throws the caller's own OCE.
+            await h.PushReadyAsync();
+            await commitGate.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE INSTANCE-AWARE TEARDOWN OBSERVATION, taken BEFORE the fixture's own drain
+            // completes the channel: the stream's finally removed the PINNED instance (the
+            // channel-completed marker fails only when this exact instance was removed).
+            await h.DrainAsync();
+            h.ObserveWorkerTeardown();
+
+            Assert.True(h.StreamEnded, "the commit-time cancellation must end the stream");
+            Assert.True(
+                h.WorkerRemovedAfterStream,
+                "the stream's finally must remove the pinned worker on a caller cancellation");
+
+            // NOTHING was published and NO blocked warning was emitted (a cancellation is not a
+            // refusal), while no success log can exist either.
+            Assert.Empty(h.Writer.Assignments);
+            Assert.Empty(h.Writer.Messages);
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
+
+            // THE COMMITTED CONTEXT IS DELIBERATELY RETAINED — nothing was deleted or rebound.
+            Assert.Equal(h.TaskId, RawAssignmentTaskId());
+            var readback = h.Store.Load(h.TaskId);
+            Assert.NotNull(readback);
+            Assert.Equal(h.Worker.Id, readback!.Context.WorkerId);
+            Assert.Equal(WorkerRole.Coder, readback.Context.Role);
+            Assert.Equal(h.TaskId, readback.Context.Slot.TaskId);
+            Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), readback.Context.Slot.Position);
+            Assert.Equal("copilot/claude-sonnet-4.6", readback.Context.Model);
+        }
+        finally
+        {
+            if (!h.StreamEnded)
+                await h.DrainAsync();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2) COMMIT-TIME caller cancellation: the OCE propagates, the committed row SURVIVES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A caller cancellation observed AT THE COMMIT INSTANT (the token is cancelled by a transaction
+    /// interceptor the instant the insert's transaction commits — INSIDE the recording call) cancels
+    /// the SEND only: the caller's own OCE propagates out of the stream, the ALREADY COMMITTED
+    /// context row deliberately SURVIVES (a fresh readback reproduces it), and no assignment reaches
+    /// the transport.
+    /// </summary>
+    [Fact]
+    public async Task WorkStream_Ready_CommitTimeCancellation_PropagatesAndRetainsCommittedRow()
+    {
+        using var commitCts = new CancellationTokenSource();
+        var harnessStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var h = await CancellationHarness.CreateAsync(
+            NewFactory(new CancelOnCommitCtsInterceptor(commitCts, harnessStarted)), commitCts);
+
+        try
+        {
+            // Push the Ready; the interceptor cancels the caller token AT the commit instant, so
+            // the send never happens. A TCS fired by the interceptor makes the gate deterministic.
+            var ready = h.PushReadyAsync();
+
+            // The commit signal is the gate: the record's transaction has committed (and the token
+            // has been cancelled) before we proceed to the stream-end observation.
+            await harnessStarted.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            await h.DrainAsync();
+            await ready.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.True(h.StreamEnded, "the commit-time cancellation must end the stream");
+
+            // NOTHING was published and NO blocked warning was emitted (a cancellation is not a
+            // refusal), while no success log can exist either.
+            Assert.Empty(h.Writer.Assignments);
+            Assert.Empty(h.Writer.Messages);
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
+
+            // THE COMMITTED CONTEXT IS DELIBERATELY RETAINED — nothing was deleted or rebound.
+            Assert.Equal(h.TaskId, RawAssignmentTaskId());
+            var readback = h.Store.Load(h.TaskId);
+            Assert.NotNull(readback);
+            Assert.Equal(h.Worker.Id, readback!.Context.WorkerId);
+            Assert.Equal(WorkerRole.Coder, readback.Context.Role);
+            Assert.Equal(h.TaskId, readback.Context.Slot.TaskId);
+            Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), readback.Context.Slot.Position);
+            Assert.Equal("copilot/claude-sonnet-4.6", readback.Context.Model);
+        }
+        finally
+        {
+            if (!h.StreamEnded)
+                await h.DrainAsync();
+        }
+    }
+
+    // ───────────────────────────── fakes and helpers ─────────────────────────────
+
+    /// <summary>Cancels the caller CTS the instant the insert's transaction COMMITS.</summary>
+    private sealed class CancelOnCommitCtsInterceptor(CancellationTokenSource cts, TaskCompletionSource signal)
+        : DbTransactionInterceptor
+    {
+        public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData)
+        {
+            cts.Cancel();
+            signal.TrySetResult();
+        }
+    }
+
+    /// <summary>A factory handing out store-OWNED contexts on their own connections.</summary>
+    private sealed class ReadyCancellationFactory(string connectionString, IInterceptor[] interceptors)
+        : IDbContextFactory<CopilotHiveDbContext>, IDisposable
+    {
+        private readonly List<CopilotHiveDbContext> _contexts = [];
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connectionString);
+            foreach (var interceptor in interceptors)
+                builder.AddInterceptors(interceptor);
+            var context = new CopilotHiveDbContext(builder.Options);
+            lock (_contexts)
+                _contexts.Add(context);
+            return context;
+        }
+
+        public void Dispose()
+        {
+            List<CopilotHiveDbContext> contexts;
+            lock (_contexts)
+                contexts = [.. _contexts];
+            foreach (var context in contexts)
+            {
+                try
+                {
+                    context.Dispose();
+                }
+                catch
+                {
+                    // Best-effort — a leftover context must never fail a test.
+                }
+            }
+        }
+    }
+
+    /// <summary>A single-goal source for the real lifecycle service.</summary>
+    private sealed class ReadyCancellationGoalSource(Goal goal) : IGoalSource
+    {
+        public string Name => "ready-cancel-test-source";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+            Task.CompletedTask;
+    }
+
+    /// <summary>Records every logged message; signals the production blocked warning deterministically.</summary>
+    private class CapturingReadyLogger : ILogger<HiveOrchestratorService>
+    {
+        private readonly List<string> _messages = [];
+        private TaskCompletionSource? _blockedSignal;
+
+        public IReadOnlyList<string> Messages
+        {
+            get
+            {
+                lock (_messages)
+                    return [.. _messages];
+            }
+        }
+
+        public Task WaitForBlockedWarning()
+        {
+            lock (_messages)
+            {
+                _blockedSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                return _blockedSignal.Task;
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+
+            TaskCompletionSource? signal = null;
+            lock (_messages)
+            {
+                _messages.Add(message);
+                if (message.Contains("assignment blocked", StringComparison.Ordinal))
+                    signal = _blockedSignal;
+            }
+
+            signal?.TrySetResult();
+        }
+    }
+
+    /// <summary>The delivery observation at the transport boundary, with an assignment-forwarded signal.</summary>
+    private sealed class RecordingStreamWriter : IServerStreamWriter<OrchestratorMessage>
+    {
+        private readonly List<OrchestratorMessage> _messages = [];
+        private readonly TaskCompletionSource _assignmentForwarded =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public WriteOptions? WriteOptions { get; set; }
+
+        public Task AssignmentForwarded => _assignmentForwarded.Task;
+
+        public IReadOnlyList<OrchestratorMessage> Messages
+        {
+            get
+            {
+                lock (_messages)
+                    return [.. _messages];
+            }
+        }
+
+        public IReadOnlyList<TaskAssignment> Assignments =>
+            [.. Messages.Where(m => m.Assignment is not null).Select(m => m.Assignment)];
+
+        private Task RecordAsync(OrchestratorMessage message)
+        {
+            lock (_messages)
+                _messages.Add(message);
+
+            if (message.Assignment is not null)
+                _assignmentForwarded.TrySetResult();
+
+            return Task.CompletedTask;
+        }
+
+        Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(OrchestratorMessage message) =>
+            RecordAsync(message);
+
+        Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(
+            OrchestratorMessage message, CancellationToken cancellationToken) =>
+            RecordAsync(message);
+    }
+
+    private sealed class ReadyCancellationStreamReader : IAsyncStreamReader<WorkerMessage>
+    {
+        private readonly System.Threading.Channels.Channel<WorkerMessage> _channel =
+            System.Threading.Channels.Channel.CreateUnbounded<WorkerMessage>(
+                new System.Threading.Channels.UnboundedChannelOptions
+                {
+                    // THE CALLER-CANCELLATION OBSERVATION depends on the read loop seeing the
+                    // cancelled token instead of waiting for the next item: ReadAllAsync must
+                    // observe the cancelled stream token the moment it fires, not only when input
+                    // completes.
+                    SingleReader = true,
+                });
+
+        public WorkerMessage Current { get; private set; } = new();
+
+        public void Push(WorkerMessage message) => _channel.Writer.TryWrite(message);
+
+        public void Complete() => _channel.Writer.TryComplete();
+
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            while (await _channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                if (_channel.Reader.TryRead(out var message))
+                {
+                    Current = message;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static ServerCallContext CancellationCallContext(CancellationTokenSource? cts)
+    {
+        if (cts is null)
+            return new Moq.Mock<ServerCallContext>().Object;
+
+        // ServerCallContext.CancellationToken is a non-virtual property, so it cannot be mocked —
+        // a real subclass that OVERRIDES the property is the only way to hand the stream a caller
+        // token (the seam the stream's linked token source consumes).
+        return new CancellationServerCallContext(cts.Token);
+    }
+
+    /// <summary>
+    /// A <see cref="ServerCallContext"/> whose <see cref="ServerCallContext.CancellationToken"/> —
+    /// which delegates to <see cref="ServerCallContext.CancellationTokenCore"/> — is the caller's
+    /// token: the seam the stream's linked token source consumes.
+    /// </summary>
+    private sealed class CancellationServerCallContext(CancellationToken token) : ServerCallContext
+    {
+        protected override CancellationToken CancellationTokenCore => token;
+
+        protected override Task WriteResponseHeadersAsyncCore(Metadata responseHeaders) => Task.CompletedTask;
+
+        protected override ContextPropagationToken CreatePropagationTokenCore(ContextPropagationOptions? options) =>
+            throw new NotSupportedException("propagation is not used by the transport test");
+
+        protected override string MethodCore => "/test.WorkOrchestrator/WorkStream";
+
+        protected override string HostCore => "test-host";
+
+        protected override string PeerCore => "test-peer";
+
+        protected override DateTime DeadlineCore => DateTime.MaxValue;
+
+        protected override Metadata RequestHeadersCore => [];
+
+        protected override Metadata ResponseTrailersCore => [];
+
+        protected override Status StatusCore { get; set; } = Status.DefaultSuccess;
+
+        protected override WriteOptions? WriteOptionsCore { get; set; }
+
+        protected override AuthContext AuthContextCore => null!;
+    }
 }
