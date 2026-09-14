@@ -577,6 +577,112 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     }
 
     /// <summary>
+    /// THE JOIN IS A REAL AWAIT, OBSERVED SUSPENDED ON IN-FLIGHT WORK.
+    /// <para>
+    /// The two cancellation tests above never force the join to wait: one completes the handle before
+    /// the join starts, the other uses a ZERO cleanup bound that records immediately. Either way a
+    /// join that merely SAMPLED <c>handle.IsCompleted</c> once — instead of awaiting — would behave
+    /// identically, so the required join of in-flight work was not actually pinned.
+    /// </para>
+    /// <para>
+    /// This vector closes that hole end-to-end through the real <c>DrainAsync</c>:
+    /// </para>
+    /// <list type="number">
+    ///   <item><description>The ENTRY GATE fires from INSIDE the join, before its await begins, and
+    ///   reports the handle's state at that instant — test code never signals it.</description></item>
+    ///   <item><description>While parked on that signal the test proves the drain is SUSPENDED INSIDE
+    ///   THE JOIN: the original handle is still incomplete AND the drain task has not
+    ///   completed.</description></item>
+    ///   <item><description>Only then is the ORIGINAL handle completed, and THE SAME drain task is
+    ///   awaited to completion — proving the join waited for and observed that
+    ///   completion.</description></item>
+    /// </list>
+    /// <para>
+    /// A generous cleanup bound is used and never elapses, so nothing waits out a real bound on the
+    /// success path; the bounds here are pure failure bounds.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Drain_CancelledWait_JoinAwaitsInFlightHandle_ObservedSuspendedUntilItCompletes()
+    {
+        var ledger = new TeardownLedger();
+
+        // RETAINED: the handle stays in flight while the join is observed parked on it, and is
+        // settled here and awaited in the finally.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // The ENTRY GATE, signalled from INSIDE JoinAfterAbandonedWaitAsync before it awaits.
+        var joinEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var waitCts = new CancellationTokenSource();
+        var drainTask = Task.CompletedTask;
+
+        try
+        {
+            // GENUINE cancellation of the very token the drain waits on, with the handle deliberately
+            // still IN FLIGHT so the join has real work to wait for.
+            await waitCts.CancelAsync();
+
+            drainTask = ledger.DrainAsync(
+                "attempt B RunAsync",
+                handleSource.Task,
+                bound: Failsafe,
+                waitToken: waitCts.Token,
+                // GENEROUS and never reached on this path: the join returns when the handle
+                // completes, not when a bound elapses.
+                cleanupBound: CleanupFailsafe,
+                onCleanupJoinEntered: completedAtEntry => joinEntered.TrySetResult(completedAtEntry));
+
+            // BARRIER: the join has been ENTERED. Bounded, and its expiry fails the test.
+            var completedAtJoinEntry = await joinEntered.Task.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+
+            // NON-VACUITY: the join was entered while the handle was genuinely still running, so the
+            // await below has real in-flight work to observe.
+            Assert.False(
+                completedAtJoinEntry,
+                "The join must be entered while the handle is still in flight — otherwise it never has to wait.");
+
+            // THE DECISIVE OBSERVATION: the drain is SUSPENDED INSIDE THE JOIN. The handle it is
+            // joining is still incomplete, and the drain itself has not completed. A join that
+            // sampled IsCompleted once and returned would have let the drain finish here.
+            Assert.False(
+                handleSource.Task.IsCompleted,
+                "The original handle must still be in flight while the join is parked on it.");
+            Assert.False(
+                drainTask.IsCompleted,
+                "The drain must still be suspended inside the cleanup join — a one-time state sample "
+                    + "would have let it return instead of awaiting the in-flight handle.");
+
+            // RELEASE: complete the ORIGINAL handle…
+            handleSource.TrySetResult();
+
+            // …and await THE SAME drain task, which can only finish because the join observed that
+            // completion.
+            await drainTask.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(drainTask.IsCompletedSuccessfully);
+
+            // The cancellation was still recorded under its own kind…
+            var failure = Assert.Single(ledger.Failures);
+            Assert.Contains(TeardownFailureKind.TestCancelled, failure, StringComparison.Ordinal);
+            Assert.Contains("attempt B RunAsync", failure, StringComparison.Ordinal);
+            // …and the join SUCCEEDED, so neither a bound expiry nor an incomplete cleanup is present.
+            Assert.DoesNotContain(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+            Assert.DoesNotContain(TeardownFailureKind.CleanupIncomplete, failure, StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                ledger.Failures,
+                recorded => recorded.Contains(TeardownFailureKind.CleanupIncomplete, StringComparison.Ordinal));
+        }
+        finally
+        {
+            // Nothing is left outstanding: the handle is settled and both tasks are awaited.
+            handleSource.TrySetResult();
+            await handleSource.Task;
+            await ledger.DrainAsync("cleanup-join drain task", drainTask);
+        }
+    }
+
+    /// <summary>
     /// The discriminator that makes the cancellation test meaningful: a cancellation carrying the
     /// HANDLE's own token (not the wait's) is a TERMINAL outcome and is tolerated, so the two
     /// cancellation sources cannot collapse into one classification. Driven through the REAL
@@ -824,13 +930,22 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         /// <see cref="CleanupFailsafe"/> — deliberately a SEPARATE budget from <paramref name="bound"/>,
         /// since the bound that was just abandoned cannot be relied on to converge.
         /// </param>
+        /// <param name="onCleanupJoinEntered">
+        /// DETERMINISTIC ENTRY GATE for the post-cancellation join, invoked from INSIDE
+        /// <see cref="JoinAfterAbandonedWaitAsync"/> immediately BEFORE it begins awaiting the handle.
+        /// It receives the handle's <c>IsCompleted</c> state sampled AT THAT MOMENT — inside the join,
+        /// before any await — so a test can prove the join really suspends on work that is still
+        /// running instead of returning from a one-time state sample. Production drains leave it
+        /// <c>null</c>.
+        /// </param>
         internal async Task DrainAsync(
             string what,
             Task? handle,
             TimeSpan? bound = null,
             CancellationToken? waitToken = null,
             Action? onObservedBeforeClassification = null,
-            TimeSpan? cleanupBound = null)
+            TimeSpan? cleanupBound = null,
+            Action<bool>? onCleanupJoinEntered = null)
         {
             if (handle is null) return;
 
@@ -860,7 +975,10 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                 // that was just abandoned, and never the cancelled token) keeps lifecycle teardown
                 // from disposing a service while RunAsync or reader work is still active.
                 if (ReferenceEquals(kind, TeardownFailureKind.TestCancelled))
-                    await JoinAfterAbandonedWaitAsync(what, handle, cleanupBound ?? CleanupFailsafe);
+                {
+                    await JoinAfterAbandonedWaitAsync(
+                        what, handle, cleanupBound ?? CleanupFailsafe, onCleanupJoinEntered);
+                }
 
                 return;
             }
@@ -870,13 +988,25 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
 
         /// <summary>
         /// The INDEPENDENT post-cancellation cleanup join: after a caller/test cancellation was
-        /// recorded, the original handle is still awaited to a terminal state under its OWN bound and
+        /// recorded, the original handle is still AWAITED to a terminal state under its OWN bound and
         /// with <see cref="CancellationToken.None"/> — deliberately NOT the bound or the token that
         /// was just abandoned, neither of which could be relied on to converge. A handle that still
         /// fails to settle is recorded under its own kind.
         /// </summary>
-        private async Task JoinAfterAbandonedWaitAsync(string what, Task handle, TimeSpan cleanupBound)
+        /// <remarks>
+        /// The join is a genuine AWAIT, not a one-time state sample: it must suspend until the handle
+        /// it is joining actually reaches a terminal state, which is the whole point of joining
+        /// in-flight work before teardown proceeds. <paramref name="onCleanupJoinEntered"/> is
+        /// signalled from HERE, before the await, so that contract is observable end-to-end.
+        /// </remarks>
+        private async Task JoinAfterAbandonedWaitAsync(
+            string what, Task handle, TimeSpan cleanupBound, Action<bool>? onCleanupJoinEntered = null)
         {
+            // ENTRY GATE — signalled from INSIDE the join, BEFORE the await begins, carrying the
+            // handle's state as sampled at that instant. A test releases the handle only after
+            // observing this, so a join that merely samples state instead of awaiting is detectable.
+            onCleanupJoinEntered?.Invoke(handle.IsCompleted);
+
             try
             {
                 await handle.WaitAsync(cleanupBound, CancellationToken.None);
