@@ -52,6 +52,18 @@ Console.WriteLine($"[Worker] Orchestrator: {orchestratorUrl}");
 var delay = TimeSpan.FromSeconds(5);
 var maxDelay = TimeSpan.FromSeconds(60);
 
+// THE PROCESS'S ENVIRONMENT PROVENANCE, created ONCE here — OUTSIDE the attempt loop — and handed
+// to EVERY attempt's WorkerService. The provisioning snapshot is what distinguishes an ORIGINAL
+// operator override from a value the orchestrator provisioned, and that distinction belongs to the
+// PROCESS, not to one connection attempt: this loop deliberately builds a FRESH service per attempt
+// (no stale connection state leaks through retries), so if each attempt snapshotted for itself a
+// later attempt would read the PREVIOUS attempt's server-provisioned values out of the environment
+// and promote them to operator authority. Sharing this one object keeps the operator snapshot
+// authoritative for the whole process while every attempt keeps its own identity, client, stream,
+// provisioner and response provenance. It carries no locks: attempts are strictly sequential and
+// the previous one is retired and drained before the next starts.
+var provisioningEnvironment = new WorkerProvisioningEnvironment();
+
 while (!cts.IsCancellationRequested)
 {
     // Fresh instance each attempt so no stale connection state leaks through retries.
@@ -65,7 +77,8 @@ while (!cts.IsCancellationRequested)
     var service = new WorkerService(
         orchestratorUrl: orchestratorUrl,
         workerId: workerId,
-        capabilities: capabilities);
+        capabilities: capabilities,
+        provisioningEnvironment: provisioningEnvironment);
 
     var cleanExit = false;
 
