@@ -149,6 +149,19 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         return command.ExecuteScalar() as string;
     }
 
+    /// <summary>
+    /// The recorded row for ONE specific task id, read through a fresh connection; <c>null</c> when
+    /// that task has no row (a decoy row for another id therefore never satisfies this probe).
+    /// </summary>
+    private string? RawAssignmentTaskId(string taskId)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT task_id FROM worker_assignment_contexts WHERE task_id = $t";
+        command.Parameters.AddWithValue("$t", taskId);
+        return command.ExecuteScalar() as string;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // (1) THE REAL READY PATH — record THEN publish, observed in that order
     // ═══════════════════════════════════════════════════════════════════════
@@ -163,6 +176,15 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     /// the transport, so no Assignment can be available before the record. A fresh-context readback
     /// reproduces the row.
     /// </para>
+    /// <para>
+    /// THE OBSERVATION CANNOT LOSE AN ASSIGNMENT. The harness first PARKS the transport's channel
+    /// pump inside the response writer (see <see cref="ReadyHarness.ParkTransportPumpAsync"/>), so
+    /// while the record is committing the pump is provably unable to dequeue. Anything the publisher
+    /// writes therefore stays visible in the worker's channel, and the single observation point also
+    /// counts writer ENTRIES (marked before the message is recorded), which covers the
+    /// entered-but-not-yet-recorded window. The two facts are read at ONE instant through
+    /// <see cref="TransportHandoff.HasAssignmentInFlight"/> — never as two independent polls.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task WorkStream_Ready_RecordsExactContextThenPublishesMatchingAssignment()
@@ -172,31 +194,42 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
         try
         {
-            Assert.Null(await h.SendReadyAndAwaitPublishedAsync());
+            // THE PUMP IS PARKED FIRST: no dequeue can race the commit observation.
+            await h.ParkTransportPumpAsync();
+
+            await h.SendReadyAndAwaitPublisherReturnedAsync();
 
             // ── THE COMMIT-INSTANT OBSERVATION: the row was confirmed while nothing had been sent. ──
             var observed = Assert.Single(observer.Observations);
-            Assert.Equal(h.TaskId, observed.RowTaskIdAtCommit);
+            Assert.Equal(h.TaskId, observed.DeliveredTaskId);
             Assert.True(
-                observed.RowPresentAtCommit,
-                "the assignment-context row was NOT present at the commit instant — the observation " +
-                "did not land inside the record");
+                observed.DeliveredRowPresentAtCommit,
+                "the delivered task's assignment-context row was NOT present at the commit instant — " +
+                "the observation did not land inside its record");
             Assert.False(
-                observed.AssignmentAvailableAtCommit,
-                "an assignment was already on its way to the worker AT THE COMMIT INSTANT — the record " +
+                observed.AssignmentInFlightAtCommit,
+                "an assignment was already in flight to the worker AT THE COMMIT INSTANT — the record " +
                 "must be confirmed before anything is published");
+            Assert.Equal(0, observed.TransportEntriesAtCommit);
+            Assert.False(
+                observed.ChannelQueuedAtCommit,
+                "an assignment was queued on the pinned worker's channel at the commit instant");
             Assert.True(
                 CommitObservationInterceptor.HasConfirmedRowBeforeAssignment(
-                    observed.AssignmentAvailableAtCommit, observed.RowPresentAtCommit),
+                    observed.AssignmentInFlightAtCommit, observed.DeliveredRowPresentAtCommit),
                 "the row-before-publication invariant was violated at the commit instant");
 
-            // ── THE DELIVERY: exactly one assignment, naming the delivered task. ──
+            // THE PARKED PUMP REALLY WAS PARKED for the whole record — otherwise the observation
+            // above could have missed an in-flight assignment.
+            Assert.True(h.PumpWasParkedThroughoutRecord, "the transport pump was not parked across the record");
+
+            // ── RELEASE and observe THE DELIVERY: exactly one assignment, naming the delivered task. ──
+            await h.ReleaseTransportPumpAndAwaitDeliveryAsync();
             var published = Assert.Single(h.Writer.Assignments);
             Assert.Equal(h.TaskId, published.TaskId);
             Assert.Equal(h.GoalId, published.GoalId);
             Assert.Equal("copilot/claude-sonnet-4.6", published.Model);
             Assert.Equal(h.Prompt, published.Prompt);
-            Assert.Single(h.Writer.Messages);
 
             // ── NO RECORDING REFUSAL WAS LOGGED: this delivery really was recorded and sent. ──
             Assert.DoesNotContain(
@@ -224,38 +257,52 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     /// THE DELIBERATELY UNGATED CONTROL, REJECTED BY THE SAME OBSERVER — the load-bearing proof that
     /// the ordering assertion is not vacuous.
     /// <para>
-    /// The control publisher delivers an assignment and NEVER records. It really publishes (asserted
-    /// first), the observer records NO commit instant at all, and no row exists — so applying the
-    /// observer's invariant to those observed facts (<c>assignment available</c> + <c>no confirmed
-    /// row</c>) yields a REJECTION. A publisher that skipped the record therefore cannot pass this
-    /// suite. No source mutation is required.
+    /// The control publisher delivers an assignment and then COMMITS (it records a decoy row rather
+    /// than the delivered task's), so the identical observation point fires with an assignment
+    /// ALREADY IN FLIGHT and the delivered task's row ABSENT. The same invariant therefore rejects it
+    /// on a REAL post-delivery commit — not merely on the absence of any commit. The pump is parked
+    /// exactly as in the positive vector, so the in-flight assignment cannot be lost.
     /// </para>
     /// </summary>
     [Fact]
     public async Task WorkStream_Ready_UngatedControl_IsRejectedByTheRowBeforePublicationObserver()
     {
         var observer = new CommitObservationInterceptor();
-        var h = await ReadyHarness.CreateAsync(
-            NewFactory(observer), observer, publisher: new UngatedRecordingSkippingPublisher());
+        var factory = NewFactory(observer);
+
+        // THE CONTROL: publishes FIRST, then commits a decoy row through the SAME observed store.
+        var control = new UngatedPublishThenCommitPublisher(
+            new WorkerAssignmentContextStore(factory, NullLogger<WorkerAssignmentContextStore>.Instance));
+        var h = await ReadyHarness.CreateAsync(factory, observer, publisher: control);
 
         try
         {
-            Assert.Null(await h.SendReadyAndAwaitPublishedAsync());
+            await h.ParkTransportPumpAsync();
+            await h.SendReadyAndAwaitPublisherReturnedAsync();
 
-            // THE CONTROL REALLY DELIVERED — the rejection below cannot pass vacuously.
-            var published = Assert.Single(h.Writer.Assignments);
-            Assert.Equal(h.TaskId, published.TaskId);
+            // ── THE COMMIT REALLY HAPPENED AFTER THE DELIVERY, and the observer saw it. ──
+            Assert.Equal(1, control.CommitCount);
+            var observed = Assert.Single(observer.Observations);
+            Assert.Equal(h.TaskId, observed.DeliveredTaskId);
 
-            // ── THE SAME OBSERVER REJECTS IT, using the identical invariant. ──
-            Assert.Empty(observer.Observations);
-            Assert.Null(RawAssignmentTaskId());
+            // The assignment was ALREADY in flight when that commit landed…
+            Assert.True(
+                observed.AssignmentInFlightAtCommit,
+                "the ungated control's assignment was not observed in flight — the control is vacuous");
+            // …and the DELIVERED task was never recorded.
+            Assert.False(observed.DeliveredRowPresentAtCommit);
 
-            var assignmentAvailable = h.Writer.Assignments.Count > 0;
-            var rowPresent = RawAssignmentTaskId() is not null;
+            // ── THE SAME INVARIANT REJECTS IT on that post-delivery commit. ──
             Assert.False(
-                CommitObservationInterceptor.HasConfirmedRowBeforeAssignment(assignmentAvailable, rowPresent),
-                "the ungated control delivered an assignment with NO confirmed row, yet the " +
-                "row-before-publication invariant accepted it");
+                CommitObservationInterceptor.HasConfirmedRowBeforeAssignment(
+                    observed.AssignmentInFlightAtCommit, observed.DeliveredRowPresentAtCommit),
+                "the ungated control delivered an assignment before confirming the delivered task's " +
+                "row, yet the row-before-publication invariant accepted it");
+
+            // The control really delivered — asserted after releasing the parked pump.
+            await h.ReleaseTransportPumpAndAwaitDeliveryAsync();
+            Assert.Equal(h.TaskId, Assert.Single(h.Writer.Assignments).TaskId);
+            Assert.Null(RawAssignmentTaskId(h.TaskId));
         }
         finally
         {
@@ -366,8 +413,21 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
             // ── THE ROUTE IS NOW UNRESOLVABLE: a further Ready delivers NOTHING — no fabricated
             //    recovery, no wrong-goal failure, and still no success log. ──
+            //
+            // THE SECOND READY IS GATED ON ITS OWN WARNING. The helper allocates a FRESH signal per
+            // call, so this wait cannot be satisfied by the FIRST refusal's already-emitted warning —
+            // the assertions below provably run AFTER this Ready was processed. The warning COUNT is
+            // asserted to prove exactly that: one warning per processed Ready.
+            var warningsBeforeSecondReady =
+                h.Logger.Messages.Count(m => m.Contains("assignment blocked", StringComparison.Ordinal));
+            Assert.Equal(1, warningsBeforeSecondReady);
+
             h.Queue.Enqueue(h.DeliveredTask);
             await h.SendReadyAndAwaitBlockedAsync();
+
+            Assert.Equal(
+                2,
+                h.Logger.Messages.Count(m => m.Contains("assignment blocked", StringComparison.Ordinal)));
             Assert.Empty(h.Writer.Assignments);
             Assert.DoesNotContain(
                 h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
@@ -620,15 +680,19 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
             var writer = new RecordingStreamWriter();
             var reader = new ChannelStreamReader();
-            var streamTask = service.WorkStream(reader, writer, MockContext());
 
-            // The commit-instant probe consults BOTH the still-queued channel entry AND everything
-            // already forwarded, so a premature publish cannot slip past the observation.
+            // THE SINGLE HAND-OFF POINT is wired BEFORE the stream starts: the writer marks its
+            // entries into the observer's hand-off and the hand-off reads the channel's queued state,
+            // so the commit-instant observation reads both halves at one instant.
             if (observer is not null)
             {
-                observer.AssignmentProbe = () =>
-                    worker.MessageChannel.Reader.TryPeek(out _) || writer.Assignments.Count > 0;
+                observer.DeliveredTaskId = built.TaskId;
+                observer.Handoff.ChannelHasAssignment = () =>
+                    worker.MessageChannel.Reader.TryPeek(out var queued) && queued.Assignment is not null;
+                writer.Handoff = observer.Handoff;
             }
+
+            var streamTask = service.WorkStream(reader, writer, MockContext());
 
             return new ReadyHarness
             {
@@ -653,6 +717,77 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             };
         }
 
+        /// <summary>
+        /// PARKS THE TRANSPORT'S CHANNEL PUMP inside the response writer and waits until it is
+        /// provably parked. While parked the pump CANNOT dequeue the worker's channel, so anything
+        /// the publisher writes stays observable — this is what makes the commit-instant observation
+        /// unable to lose an assignment between channel dequeue and transport recording.
+        /// </summary>
+        /// <remarks>
+        /// The pump is the background loop <c>WorkStream</c> starts; it idles until the stream's FIRST
+        /// message pins the worker, then spins on the channel and forwards each message to the
+        /// response writer. Parking it INSIDE the writer means the message it holds has already been
+        /// dequeued but not yet recorded — the exact window the review called out — and the writer
+        /// marks that ENTRY before parking, so the single observation point still counts it (see
+        /// <see cref="TransportHandoff"/>).
+        /// <para>
+        /// THE PIN COMES FIRST, deterministically: a Progress message (which touches no assignment
+        /// state — <c>HandleTaskProgress</c> only logs) pins the worker so the pump begins reading.
+        /// Awaiting <see cref="RecordingStreamWriter.Parked"/> then proves BOTH that the pin was
+        /// processed and that the pump is now held inside the writer.
+        /// </para>
+        /// </remarks>
+        public async Task ParkTransportPumpAsync()
+        {
+            Writer.ParkOnNextWrite();
+
+            // (1) PIN the worker so the transport's channel pump starts reading at all.
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = Worker.Id,
+                Progress = new TaskProgress { TaskId = TaskId, Message = "pin the stream" },
+            });
+
+            // (2) Queue a NON-assignment message for the pump to carry into the writer, where it parks.
+            await Worker.MessageChannel.Writer.WriteAsync(
+                new OrchestratorMessage
+                {
+                    UpdateAgents = new UpdateAgents { AgentsMdContent = "park", Role = "coder" },
+                },
+                TestContext.Current.CancellationToken);
+
+            await Writer.Parked.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>
+        /// Releases the parked pump and waits for the assignment to be recorded by the transport —
+        /// the delivery observation, taken after the ordering proof has already been captured.
+        /// </summary>
+        public async Task ReleaseTransportPumpAndAwaitDeliveryAsync()
+        {
+            Writer.ReleaseParked();
+            await Writer.AssignmentForwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>
+        /// Whether the pump stayed parked for the WHOLE record — i.e. it did not resume (and so could
+        /// not have drained an assignment invisibly) before the commit observation was taken.
+        /// </summary>
+        public bool PumpWasParkedThroughoutRecord => Writer.ParkedThroughout;
+
+        /// <summary>
+        /// Pushes a real Ready and waits until HandleWorkerReady's publisher invocation has RETURNED
+        /// — signalled by the production success log (or, for the ungated control, by the control's
+        /// own completion signal). This never waits on the transport, so it is valid while the pump
+        /// is parked.
+        /// </summary>
+        public async Task SendReadyAndAwaitPublisherReturnedAsync()
+        {
+            var signal = Logger.WaitForPublishedLog();
+            Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
         /// <summary>Seeds a DIFFERENT context for the delivered task id — the genuine Conflict refusal.</summary>
         public void SeedConflictingRecord()
         {
@@ -674,8 +809,10 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         }
 
         /// <summary>
-        /// Pushes a real Ready and waits until the PRODUCTION WARNING has been emitted — the
-        /// deterministic signal that the handled refusal path ran (it emits exactly one warning).
+        /// Pushes a real Ready and waits until the PRODUCTION WARNING for THIS message has been
+        /// emitted. The signal is allocated FRESH for every call (see
+        /// <see cref="CapturingReadyLogger.WaitForBlockedWarning"/>), so a second Ready can never be
+        /// satisfied by the FIRST Ready's already-completed signal.
         /// </summary>
         public async Task SendReadyAndAwaitBlockedAsync()
         {
@@ -727,14 +864,54 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     // ───────────────────────────── fakes and helpers ─────────────────────────────
 
     /// <summary>
+    /// THE TRANSPORT HAND-OFF: the ONE place that answers "has an assignment left the publisher
+    /// towards this worker?", capturing BOTH halves of the hand-off at a SINGLE instant.
+    /// <para>
+    /// WHY ONE POINT AND NOT TWO POLLS. An assignment travels channel → pump dequeue → writer entry →
+    /// writer record. Sampling the channel and the recorded list as two independent reads can observe
+    /// an assignment in NEITHER, because a legal schedule dequeues it from the channel before the
+    /// writer records it. This type closes that window: the writer increments
+    /// <see cref="MarkEntered"/> BEFORE recording anything, so the moment a message leaves the channel
+    /// it is already counted here, and <see cref="HasAssignmentInFlight"/> reads the queued state and
+    /// the entry count together while the pump is parked.
+    /// </para>
+    /// </summary>
+    private sealed class TransportHandoff
+    {
+        private int _entered;
+
+        /// <summary>Reports whether the pinned worker's channel still holds a queued assignment.</summary>
+        public Func<bool>? ChannelHasAssignment { get; set; }
+
+        /// <summary>Entries the transport writer has begun — incremented BEFORE the message is recorded.</summary>
+        public int Entered => Volatile.Read(ref _entered);
+
+        /// <summary>Marks that the transport writer has ENTERED with an assignment.</summary>
+        public void MarkEntered() => Interlocked.Increment(ref _entered);
+
+        /// <summary>
+        /// The single-instant hand-off read: an assignment is in flight when it is either still
+        /// queued on the channel OR has already entered the transport writer.
+        /// </summary>
+        public bool HasAssignmentInFlight() =>
+            (ChannelHasAssignment?.Invoke() ?? false) || Entered > 0;
+    }
+
+    /// <summary>
     /// THE ROW-BEFORE-PUBLICATION OBSERVER: fired the instant a transaction COMMITS, it records
-    /// whether the assignment-context row is durable and whether an assignment has already reached
-    /// the transport AT THAT INSTANT.
+    /// whether the DELIVERED task's assignment-context row is durable and whether an assignment is
+    /// already in flight to that worker AT THAT INSTANT.
     /// <para>
     /// EF raises the committed notification only AFTER the provider's commit returned, so the fresh
     /// connection used here really does see the committed row — which is what makes this an honest
-    /// instrument rather than a guess. An observation is recorded only when the row exists, so a
-    /// publisher that skips the record produces NO observation and is rejected by the invariant.
+    /// instrument rather than a guess. The in-flight half comes from <see cref="TransportHandoff"/>,
+    /// a SINGLE observation point that cannot lose an assignment between the channel dequeue and the
+    /// transport recording.
+    /// </para>
+    /// <para>
+    /// EVERY commit is observed — including a commit that records some OTHER row — so a publisher
+    /// that delivers first and then commits a decoy is caught with <c>AssignmentInFlight == true</c>
+    /// and <c>DeliveredRowPresent == false</c>.
     /// </para>
     /// </summary>
     private sealed class CommitObservationInterceptor : IInterceptor
@@ -744,10 +921,13 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         /// <summary>The connection string of the same database the store writes to.</summary>
         public string ProbeConnectionString { get; set; } = "";
 
-        /// <summary>Reports whether anything has already been delivered to the worker.</summary>
-        public Func<bool>? AssignmentProbe { get; set; }
+        /// <summary>The task id whose row the ordering contract is about.</summary>
+        public string DeliveredTaskId { get; set; } = "";
 
-        /// <summary>The observations, in commit order; empty when no assignment row was committed.</summary>
+        /// <summary>The single-point transport hand-off observation.</summary>
+        public TransportHandoff Handoff { get; } = new();
+
+        /// <summary>The observations, in commit order.</summary>
         public IReadOnlyList<CommitObservation> Observations
         {
             get
@@ -758,44 +938,52 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         }
 
         /// <summary>
-        /// THE INVARIANT this observer exists to enforce: an assignment may be available ONLY together
-        /// with (or after) a confirmed row — "assignment available" IMPLIES "row confirmed".
+        /// THE INVARIANT this observer exists to enforce: an assignment may be in flight ONLY together
+        /// with (or after) the DELIVERED task's confirmed row — "assignment in flight" IMPLIES
+        /// "delivered row confirmed".
         /// </summary>
-        /// <param name="assignmentAvailable">Whether an assignment has reached the transport.</param>
-        /// <param name="rowPresent">Whether the assignment-context row is durable.</param>
+        /// <param name="assignmentInFlight">Whether an assignment has left the publisher.</param>
+        /// <param name="deliveredRowPresent">Whether the delivered task's row is durable.</param>
         /// <returns><c>true</c> when the facts are consistent with the ordering contract.</returns>
-        public static bool HasConfirmedRowBeforeAssignment(bool assignmentAvailable, bool rowPresent) =>
-            !assignmentAvailable || rowPresent;
+        public static bool HasConfirmedRowBeforeAssignment(bool assignmentInFlight, bool deliveredRowPresent) =>
+            !assignmentInFlight || deliveredRowPresent;
 
         /// <summary>Records one commit-instant observation; called by the forwarding interceptor.</summary>
         public void Committed()
         {
-            var rowTaskId = ProbeRowTaskId();
-            if (rowTaskId is null)
-                return;   // no assignment row was committed — nothing to observe
+            // ONE INSTANT, BOTH FACTS: the in-flight read is taken first (it is the fact the record is
+            // supposed to precede), then the durable row is confirmed.
+            var channelQueued = Handoff.ChannelHasAssignment?.Invoke() ?? false;
+            var entries = Handoff.Entered;
+            var inFlight = channelQueued || entries > 0;
+            var deliveredRowPresent = ProbeDeliveredRowPresent();
 
-            var assignmentAvailable = AssignmentProbe?.Invoke() ?? false;
             lock (_observations)
-                _observations.Add(new CommitObservation(rowTaskId, assignmentAvailable));
+            {
+                _observations.Add(new CommitObservation(
+                    DeliveredTaskId, deliveredRowPresent, inFlight, channelQueued, entries));
+            }
         }
 
-        private string? ProbeRowTaskId()
+        private bool ProbeDeliveredRowPresent()
         {
-            if (string.IsNullOrEmpty(ProbeConnectionString))
-                return null;
+            if (string.IsNullOrEmpty(ProbeConnectionString) || string.IsNullOrEmpty(DeliveredTaskId))
+                return false;
 
             try
             {
                 using var connection = new SqliteConnection(ProbeConnectionString);
                 connection.Open();
                 using var command = connection.CreateCommand();
-                command.CommandText = "SELECT task_id FROM worker_assignment_contexts LIMIT 1";
-                return command.ExecuteScalar() as string;
+                command.CommandText =
+                    "SELECT task_id FROM worker_assignment_contexts WHERE task_id = $t";
+                command.Parameters.AddWithValue("$t", DeliveredTaskId);
+                return command.ExecuteScalar() as string is not null;
             }
             catch
             {
                 // A probe failure must never mask the test's own outcome.
-                return null;
+                return false;
             }
         }
     }
@@ -811,12 +999,18 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             observer.Committed();
     }
 
-    /// <summary>One commit-instant observation: the confirmed row and the transport state.</summary>
-    private sealed record CommitObservation(string RowTaskIdAtCommit, bool AssignmentAvailableAtCommit)
-    {
-        /// <summary>Whether the assignment-context row was durable at this instant. Always <c>true</c>.</summary>
-        public bool RowPresentAtCommit => true;
-    }
+    /// <summary>One commit-instant observation: the delivered task's row and the hand-off state.</summary>
+    /// <param name="DeliveredTaskId">The task whose ordering contract is being observed.</param>
+    /// <param name="DeliveredRowPresentAtCommit">Whether THAT task's row was durable at this instant.</param>
+    /// <param name="AssignmentInFlightAtCommit">Whether an assignment had left the publisher.</param>
+    /// <param name="ChannelQueuedAtCommit">The queued half of the hand-off read.</param>
+    /// <param name="TransportEntriesAtCommit">The entered-the-writer half of the hand-off read.</param>
+    private sealed record CommitObservation(
+        string DeliveredTaskId,
+        bool DeliveredRowPresentAtCommit,
+        bool AssignmentInFlightAtCommit,
+        bool ChannelQueuedAtCommit,
+        int TransportEntriesAtCommit);
 
     /// <summary>A factory handing out store-OWNED contexts on their own connections, disposed with the fixture.</summary>
     private sealed class ReadyFactory : IDbContextFactory<CopilotHiveDbContext>, IDisposable
@@ -862,28 +1056,93 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         }
     }
 
-    /// <summary>A publisher that delivers WITHOUT recording — the deliberately UNGATED control.</summary>
-    private sealed class UngatedRecordingSkippingPublisher : IWorkerAssignmentPublisher
+    /// <summary>
+    /// THE UNGATED CONTROL: it DELIVERS FIRST and only then COMMITS — recording a DECOY context for a
+    /// different task id through the SAME observed store.
+    /// <para>
+    /// This is deliberately stronger than "never records at all": the observer fires on a REAL
+    /// post-delivery commit, so the invariant must reject it on the evidence of that commit
+    /// (assignment already in flight, delivered task's row absent) rather than merely on the absence
+    /// of any commit.
+    /// </para>
+    /// </summary>
+    private sealed class UngatedPublishThenCommitPublisher(WorkerAssignmentContextStore store)
+        : IWorkerAssignmentPublisher
     {
-        public async Task PublishAsync(ConnectedWorker worker, WorkTask task, CancellationToken cancellationToken) =>
+        private int _commitCount;
+
+        /// <summary>How many decoy commits the control performed (proves it really committed).</summary>
+        public int CommitCount => Volatile.Read(ref _commitCount);
+
+        public async Task PublishAsync(ConnectedWorker worker, WorkTask task, CancellationToken cancellationToken)
+        {
+            // (1) PUBLISH FIRST — the violation under test.
             await worker.MessageChannel.Writer.WriteAsync(
                 new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(task) }, cancellationToken);
+
+            // (2) THEN COMMIT a DECOY row, so the observer fires AFTER the delivery. The decoy uses a
+            //     different task id, so the delivered task's row stays absent.
+            var decoy = new WorkerAssignmentContext(
+                task.GoalId,
+                worker.Id,
+                WorkerRole.Coder,
+                new WorkSlot(
+                    $"decoy-{task.TaskId}", new WorkSlotPosition(1, GoalPhase.Coding, 1), 1),
+                task.Model);
+
+            var result = store.InsertOnce(decoy);
+            Assert.Equal(WorkerAssignmentWriteStatus.Recorded, result.Status);
+            Interlocked.Increment(ref _commitCount);
+        }
     }
 
     /// <summary>
     /// THE DELIVERY OBSERVATION at the transport boundary: records every message the transport
-    /// forwards, and signals deterministically the moment an assignment is forwarded.
+    /// forwards, signals deterministically the moment an assignment is forwarded, and can PARK inside
+    /// the write so the channel pump is provably unable to drain during a record.
+    /// <para>
+    /// THE ENTRY MARK IS THE KEY ORDERING DETAIL: an assignment write marks its ENTRY (via
+    /// <see cref="TransportHandoff.MarkEntered"/>) BEFORE the message is recorded and before any
+    /// parking, so the "dequeued from the channel but not yet recorded" window is counted rather than
+    /// lost.
+    /// </para>
     /// </summary>
     private sealed class RecordingStreamWriter : IServerStreamWriter<OrchestratorMessage>
     {
         private readonly List<OrchestratorMessage> _messages = [];
         private readonly TaskCompletionSource _assignmentForwarded =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _parked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private int _parkArmed;
+        private int _parkReleased;
 
         public WriteOptions? WriteOptions { get; set; }
 
+        /// <summary>The single-point hand-off this writer marks entries into.</summary>
+        public TransportHandoff? Handoff { get; set; }
+
         /// <summary>Completes when the first assignment has been forwarded to this worker.</summary>
         public Task AssignmentForwarded => _assignmentForwarded.Task;
+
+        /// <summary>Completes when the pump has entered the writer and parked.</summary>
+        public Task Parked => _parked.Task;
+
+        /// <summary>Whether the parked pump has NOT been released yet (i.e. it is still held).</summary>
+        public bool ParkedThroughout => Volatile.Read(ref _parkReleased) == 0;
+
+        /// <summary>Arms the park so the NEXT write blocks inside the writer until released.</summary>
+        public void ParkOnNextWrite() => Volatile.Write(ref _parkArmed, 1);
+
+        /// <summary>Releases a parked write. Safe when nothing is parked.</summary>
+        public void ReleaseParked()
+        {
+            Volatile.Write(ref _parkReleased, 1);
+            _release.TrySetResult();
+        }
 
         public IReadOnlyList<OrchestratorMessage> Messages
         {
@@ -898,15 +1157,24 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         public IReadOnlyList<TaskAssignment> Assignments =>
             [.. Messages.Where(m => m.Assignment is not null).Select(m => m.Assignment)];
 
-        private Task RecordAsync(OrchestratorMessage message)
+        private async Task RecordAsync(OrchestratorMessage message)
         {
+            // THE ENTRY MARK, before anything else: the message has left the channel, so the hand-off
+            // must already count it even though it is not recorded yet.
+            if (message.Assignment is not null)
+                Handoff?.MarkEntered();
+
+            if (Interlocked.Exchange(ref _parkArmed, 0) == 1)
+            {
+                _parked.TrySetResult();
+                await _release.Task;
+            }
+
             lock (_messages)
                 _messages.Add(message);
 
             if (message.Assignment is not null)
                 _assignmentForwarded.TrySetResult();
-
-            return Task.CompletedTask;
         }
 
         Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(OrchestratorMessage message) =>
@@ -917,11 +1185,18 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             RecordAsync(message);
     }
 
-    /// <summary>Records every logged message, and signals the production warning deterministically.</summary>
+    /// <summary>
+    /// Records every logged message, and signals both the production warning and the production
+    /// success log deterministically.
+    /// </summary>
     private class CapturingReadyLogger : ILogger<HiveOrchestratorService>
     {
         private readonly List<string> _messages = [];
-        private TaskCompletionSource? _blockedSignal;
+
+        // THE PENDING SIGNAL QUEUES: each waiter gets its OWN TaskCompletionSource, completed by the
+        // NEXT matching log. A previously completed signal can therefore never satisfy a later wait.
+        private readonly Queue<TaskCompletionSource> _blockedWaiters = new();
+        private readonly Queue<TaskCompletionSource> _publishedWaiters = new();
 
         public IReadOnlyList<string> Messages
         {
@@ -933,16 +1208,29 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         }
 
         /// <summary>
-        /// Returns a task that completes when the blocked disposition warning is emitted. Called
-        /// BEFORE the Ready is pushed, so the signal can never be missed.
+        /// Returns a FRESH task that completes when the NEXT blocked-disposition warning is emitted.
+        /// Called BEFORE the Ready is pushed, so the signal can never be missed — and never reused, so
+        /// a second Ready is never satisfied by the FIRST Ready's warning.
         /// </summary>
         public Task WaitForBlockedWarning()
         {
+            var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_messages)
-            {
-                _blockedSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                return _blockedSignal.Task;
-            }
+                _blockedWaiters.Enqueue(waiter);
+            return waiter.Task;
+        }
+
+        /// <summary>
+        /// Returns a FRESH task that completes when the NEXT production success log is emitted — the
+        /// signal that HandleWorkerReady's publisher invocation RETURNED. It never waits on the
+        /// transport, so it stays valid while the transport pump is parked.
+        /// </summary>
+        public Task WaitForPublishedLog()
+        {
+            var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_messages)
+                _publishedWaiters.Enqueue(waiter);
+            return waiter.Task;
         }
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
@@ -955,15 +1243,21 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         {
             var message = formatter(state, exception);
 
-            TaskCompletionSource? signal = null;
+            TaskCompletionSource? blocked = null;
+            TaskCompletionSource? published = null;
             lock (_messages)
             {
                 _messages.Add(message);
-                if (message.Contains("assignment blocked", StringComparison.Ordinal))
-                    signal = _blockedSignal;
+
+                if (message.Contains("assignment blocked", StringComparison.Ordinal) && _blockedWaiters.Count > 0)
+                    blocked = _blockedWaiters.Dequeue();
+
+                if (message.Contains("Assignment published", StringComparison.Ordinal) && _publishedWaiters.Count > 0)
+                    published = _publishedWaiters.Dequeue();
             }
 
-            signal?.TrySetResult();
+            blocked?.TrySetResult();
+            published?.TrySetResult();
         }
     }
 

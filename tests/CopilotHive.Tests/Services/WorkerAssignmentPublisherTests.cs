@@ -311,6 +311,120 @@ public sealed class WorkerAssignmentPublisherTests : IDisposable
             cts.Cancel();
     }
 
+    /// <summary>
+    /// Throws the pre-created sentinel at the assignment-context READ — the store's zero-row
+    /// duplicate readback (<c>FindRow</c>/materialization).
+    /// <para>
+    /// IT IS ARMED EXPLICITLY, so the SEED's own write (and any set-up read) completes normally and
+    /// only the publisher's readback faults. <see cref="ThrowCount"/> proves the injection really
+    /// fired, so the vector can never pass vacuously.
+    /// </para>
+    /// </summary>
+    private sealed class AssignmentReadThrowingInterceptor(Exception sentinel) : DbCommandInterceptor
+    {
+        private int _armed;
+        private int _throwCount;
+
+        /// <summary>Arms the fault so the NEXT assignment-context SELECT throws.</summary>
+        public void Arm() => Volatile.Write(ref _armed, 1);
+
+        /// <summary>How many times the sentinel was thrown.</summary>
+        public int ThrowCount => Volatile.Read(ref _throwCount);
+
+        private void ThrowIfTargeted(DbCommand command)
+        {
+            if (Volatile.Read(ref _armed) == 0)
+                return;
+
+            var trimmed = command.CommandText.TrimStart();
+            if (!trimmed.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                || !command.CommandText.Contains("worker_assignment_contexts", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref _throwCount);
+            throw sentinel;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+
+        public override InterceptionResult<object> ScalarExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// COUNTS the assignment-context commands the store actually issues, split by kind, so a caller
+    /// that invoked <c>InsertOnce</c> twice — or performed an extra post-success readback — is caught
+    /// by a COUNT rather than by a final state that an idempotent second call would reproduce.
+    /// </summary>
+    /// <remarks>
+    /// Counting happens at <c>…Executing</c> (the ATTEMPT), not at <c>…Executed</c>, so a second
+    /// attempt is counted even if it is a zero-row no-op. Only commands naming
+    /// <c>worker_assignment_contexts</c> are counted, so schema/set-up traffic cannot inflate it, and
+    /// <see cref="Reset"/> lets a fixture exclude its own seeding.
+    /// </remarks>
+    private sealed class AssignmentCommandCountingInterceptor : DbCommandInterceptor
+    {
+        private int _insertAttempts;
+        private int _readAttempts;
+
+        /// <summary>INSERT attempts against <c>worker_assignment_contexts</c>.</summary>
+        public int InsertAttempts => Volatile.Read(ref _insertAttempts);
+
+        /// <summary>SELECT attempts against <c>worker_assignment_contexts</c>.</summary>
+        public int ReadAttempts => Volatile.Read(ref _readAttempts);
+
+        /// <summary>Zeroes both counters so a fixture's own seeding is excluded from the assertion.</summary>
+        public void Reset()
+        {
+            Volatile.Write(ref _insertAttempts, 0);
+            Volatile.Write(ref _readAttempts, 0);
+        }
+
+        private void Count(DbCommand command)
+        {
+            if (!command.CommandText.Contains("worker_assignment_contexts", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var trimmed = command.CommandText.TrimStart();
+            if (trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase))
+                Interlocked.Increment(ref _insertAttempts);
+            else if (trimmed.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+                Interlocked.Increment(ref _readAttempts);
+        }
+
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            Count(command);
+            return result;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            Count(command);
+            return result;
+        }
+
+        public override InterceptionResult<object> ScalarExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+        {
+            Count(command);
+            return result;
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // (1) THE REFUSALS — no context is ever synthesized
     // ═══════════════════════════════════════════════════════════════════════
@@ -746,6 +860,151 @@ public sealed class WorkerAssignmentPublisherTests : IDisposable
         Assert.Equal(1L, AssignmentRowCount(harness.TaskId));
         var assignment = Assert.Single(harness.DrainChannel()).Assignment;
         Assert.Equal(task.TaskId, assignment.TaskId);
+    }
+
+    /// <summary>
+    /// A THROWING DUPLICATE READBACK is a <c>StoreError</c> — NOT a Conflict, not AlreadyRecorded and
+    /// not Indeterminate. A row is seeded first, so the publisher's INSERT is arbitrated to ZERO rows
+    /// and the store enters its READ path; that read is then faulted with a pre-created sentinel.
+    /// <para>
+    /// This is the publisher's OWN mapping of a read/integrity failure. A green store test is not
+    /// evidence for it: the assertion here is that the refusal the PUBLISHER raises carries
+    /// <c>StoreError</c>, a NULL store status (the store never reported an outcome) and the EXACT
+    /// thrown object, and that nothing is published.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task PublishAsync_ThrowingDuplicateReadback_StoreError_CarriesExactExceptionAndPublishesNothing()
+    {
+        var sentinel = new InvalidOperationException("the duplicate readback was sabotaged");
+        var readFault = new AssignmentReadThrowingInterceptor(sentinel);
+        var harness = NewHarness(readFault);
+        var publisher = new WorkerAssignmentPublisher(harness.Manager, harness.Pool, harness.Store);
+
+        // THE SEED runs BEFORE the fault is armed, so the row really exists and the publisher's own
+        // INSERT is arbitrated to zero rows — which is what drives the store into its READ path.
+        var seeded = harness.ExpectedContext();
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, harness.Store.InsertOnce(seeded).Status);
+        var seededTimestamp = harness.RawFirstAssigned(harness.TaskId);
+
+        // ARM: from here on, the assignment-context READ throws the sentinel.
+        readFault.Arm();
+
+        var task = harness.NewTask();
+        var refusal = await Assert.ThrowsAsync<WorkerAssignmentRecordingException>(
+            () => publisher.PublishAsync(harness.Worker, task, CancellationToken.None));
+
+        // THE INJECTION REALLY FIRED — the vector cannot pass vacuously.
+        Assert.True(readFault.ThrowCount > 0, "the duplicate readback was never faulted");
+
+        // THE PUBLISHER'S MAPPING: a thrown store read is a StoreError with the EXACT object.
+        Assert.Equal(WorkerAssignmentRecordingFailureReason.StoreError, refusal.Reason);
+        Assert.Null(refusal.StoreStatus);
+        Assert.Same(sentinel, refusal.InnerException);
+        Assert.Contains("store-error —", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains(harness.TaskId, refusal.Message);
+
+        // IT IS NOT MISREPORTED as one of the store's confirmed outcomes.
+        Assert.NotEqual(WorkerAssignmentRecordingFailureReason.Conflict, refusal.Reason);
+        Assert.NotEqual(WorkerAssignmentRecordingFailureReason.Indeterminate, refusal.Reason);
+
+        // NOTHING WAS PUBLISHED, and the seeded row is untouched.
+        Assert.Empty(harness.DrainChannel());
+        Assert.Equal(1L, AssignmentRowCount(harness.TaskId));
+        Assert.Equal(seededTimestamp, harness.RawFirstAssigned(harness.TaskId));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2b) THE ONE-CALL / NO-EXTRA-READ CONTRACT — counted, not inferred
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE FRESH <c>Recorded</c> PATH ISSUES EXACTLY ONE INSERT AND NO READ. Because a second
+    /// identical <c>InsertOnce</c> would be idempotent, final row/timestamp state cannot distinguish
+    /// one call from two — so the ATTEMPTS are COUNTED at the command boundary instead.
+    /// <para>
+    /// A single-row insert never reaches the store's zero-row read path, so the production path
+    /// performs NO readback at all: any SELECT here would be the forbidden post-success production
+    /// read.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task PublishAsync_Recorded_IssuesExactlyOneInsertAttemptAndNoProductionReadback()
+    {
+        var counter = new AssignmentCommandCountingInterceptor();
+        var harness = NewHarness(counter);
+        var publisher = new WorkerAssignmentPublisher(harness.Manager, harness.Pool, harness.Store);
+        var task = harness.NewTask();
+
+        // The count starts AFTER the arrangement, so only the publisher's own statements are counted.
+        counter.Reset();
+
+        await publisher.PublishAsync(harness.Worker, task, CancellationToken.None);
+
+        Assert.Equal(1, counter.InsertAttempts);
+        Assert.Equal(0, counter.ReadAttempts);
+
+        // The delivery itself still happened — the counts are not measuring a no-op.
+        Assert.Equal(1L, AssignmentRowCount(harness.TaskId));
+        Assert.Equal(task.TaskId, Assert.Single(harness.DrainChannel()).Assignment.TaskId);
+    }
+
+    /// <summary>
+    /// THE SEEDED <c>AlreadyRecorded</c> PATH ALSO ISSUES EXACTLY ONE INSERT ATTEMPT. The store's own
+    /// zero-row arbitration performs ONE readback to compare the stored context, and the publisher
+    /// adds NOTHING after that success: no second insert-once call and no extra production read.
+    /// </summary>
+    [Fact]
+    public async Task PublishAsync_AlreadyRecorded_IssuesExactlyOneInsertAttemptAndOnlyTheStoresOwnReadback()
+    {
+        var counter = new AssignmentCommandCountingInterceptor();
+        var harness = NewHarness(counter);
+        var publisher = new WorkerAssignmentPublisher(harness.Manager, harness.Pool, harness.Store);
+
+        var seeded = harness.ExpectedContext();
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, harness.Store.InsertOnce(seeded).Status);
+
+        // EXCLUDE the seeding: only the publisher's own statements are counted from here.
+        counter.Reset();
+
+        var task = harness.NewTask();
+        await publisher.PublishAsync(harness.Worker, task, CancellationToken.None);
+
+        // EXACTLY ONE insert attempt: a publisher that called InsertOnce twice would count two, even
+        // though the second call is idempotent and leaves the final state identical.
+        Assert.Equal(1, counter.InsertAttempts);
+
+        // EXACTLY ONE read: the store's OWN duplicate readback. A post-success production Load would
+        // make this two.
+        Assert.Equal(1, counter.ReadAttempts);
+
+        Assert.Equal(task.TaskId, Assert.Single(harness.DrainChannel()).Assignment.TaskId);
+    }
+
+    /// <summary>
+    /// A BLOCKED OUTCOME ALSO CALLS THE STORE EXACTLY ONCE: the <c>Conflict</c> refusal performs one
+    /// insert attempt and the store's one arbitration read, and the publisher adds no retry.
+    /// </summary>
+    [Fact]
+    public async Task PublishAsync_Conflict_IssuesExactlyOneInsertAttemptAndNoRetry()
+    {
+        var counter = new AssignmentCommandCountingInterceptor();
+        var harness = NewHarness(counter);
+        var publisher = new WorkerAssignmentPublisher(harness.Manager, harness.Pool, harness.Store);
+
+        Assert.Equal(
+            WorkerAssignmentWriteStatus.Recorded,
+            harness.Store.InsertOnce(harness.ExpectedContext(workerId: "worker-seeded")).Status);
+
+        counter.Reset();
+
+        var refusal = await Assert.ThrowsAsync<WorkerAssignmentRecordingException>(
+            () => publisher.PublishAsync(harness.Worker, harness.NewTask(), CancellationToken.None));
+
+        Assert.Equal(WorkerAssignmentRecordingFailureReason.Conflict, refusal.Reason);
+        Assert.Equal(1, counter.InsertAttempts);
+        Assert.Equal(1, counter.ReadAttempts);
+        Assert.Empty(harness.DrainChannel());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1565,7 +1824,11 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
     private class CapturingReadyLogger : ILogger<HiveOrchestratorService>
     {
         private readonly List<string> _messages = [];
-        private TaskCompletionSource? _blockedSignal;
+
+        // THE PENDING WAITER QUEUE: each waiter gets its OWN TaskCompletionSource, completed by the
+        // NEXT matching log. A previously completed signal can therefore never satisfy a later wait,
+        // so a second Ready is never "already done" before it has actually been processed.
+        private readonly Queue<TaskCompletionSource> _blockedWaiters = new();
 
         public IReadOnlyList<string> Messages
         {
@@ -1576,13 +1839,16 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
             }
         }
 
+        /// <summary>
+        /// Returns a FRESH task that completes when the NEXT blocked-disposition warning is emitted.
+        /// Called BEFORE the Ready is pushed, so the signal can never be missed — and never reused.
+        /// </summary>
         public Task WaitForBlockedWarning()
         {
+            var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_messages)
-            {
-                _blockedSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                return _blockedSignal.Task;
-            }
+                _blockedWaiters.Enqueue(waiter);
+            return waiter.Task;
         }
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
@@ -1599,8 +1865,8 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
             lock (_messages)
             {
                 _messages.Add(message);
-                if (message.Contains("assignment blocked", StringComparison.Ordinal))
-                    signal = _blockedSignal;
+                if (message.Contains("assignment blocked", StringComparison.Ordinal) && _blockedWaiters.Count > 0)
+                    signal = _blockedWaiters.Dequeue();
             }
 
             signal?.TrySetResult();
