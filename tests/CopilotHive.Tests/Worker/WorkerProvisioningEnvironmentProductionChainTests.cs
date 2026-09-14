@@ -83,6 +83,14 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     /// </summary>
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// The INDEPENDENT cleanup bound used only AFTER a wait was abandoned by caller/test
+    /// cancellation. It is deliberately a SEPARATE bound from <see cref="Failsafe"/>: the bound that
+    /// was just abandoned cannot be relied upon to converge, so the post-cancellation join gets its
+    /// own fresh budget (and an uncancelled token) to establish that no work is still active.
+    /// </summary>
+    private static readonly TimeSpan CleanupFailsafe = TimeSpan.FromSeconds(30);
+
     private const string OperatorOllamaUrl = "http://operator:11434";
     private const string OperatorGithubToken = "operator-original-github-token";
     private const string OperatorConfigRepoUrl = "https://github.com/operator/repo.git";
@@ -354,129 +362,241 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE REVIEWER'S EXACT RACE, pinned without any timing dependence: the bound expired
-    /// (<see cref="TimeoutException"/> was observed) AND the handle is ALREADY COMPLETED by the time
-    /// the outcome is classified.
+    /// THE REMOVAL-PROOF VECTOR FOR THE REVIEWER'S RACE, AT THE REAL <c>DrainAsync</c> CALL SITE.
     /// <para>
-    /// This is the schedule the previous implementation got wrong. It caught every exception
-    /// together, discarded the <see cref="TimeoutException"/>, then inferred expiry from a LATER
-    /// <c>handle.IsCompleted</c> sample — which reads <c>true</c> here, so nothing was recorded and
-    /// the verdict passed even though the handle had exceeded the bound. Classification must be
-    /// driven by the caught exception alone, so a completed handle CANNOT suppress the record.
+    /// The bound expires on a genuinely incomplete handle (a ZERO bound, so nothing waits), and the
+    /// deterministic seam then COMPLETES THAT SAME ORIGINAL HANDLE before classification runs. The
+    /// drain therefore classifies while <c>handle.IsCompleted</c> is <b>true</b> — exactly the legal
+    /// schedule the old inference got wrong.
     /// </para>
     /// <para>
-    /// Exercising the classification authority directly with a completed-with-timeout shape makes the
-    /// assertion independent of which of the two schedules actually occurs — no sleeping, no polling
-    /// and no reliance on losing a race.
+    /// This is the cell a classifier-only test cannot cover: reintroducing
+    /// <c>if (!handle.IsCompleted)</c> inside the <c>catch (TimeoutException)</c> clause suppresses
+    /// the record HERE and fails THIS test by name, because the guard is evaluated against a handle
+    /// that has already completed.
     /// </para>
     /// </summary>
     [Fact]
-    public void Teardown_BoundExpiredButHandleAlreadyCompleted_IsStillRecordedAsBoundExpiry()
+    public async Task Drain_BoundExpiredThenHandleCompletesBeforeClassification_IsStillRecordedAsBoundExpiry()
     {
         var ledger = new TeardownLedger();
 
-        // The decisive shape: a COMPLETED handle (IsCompleted is true — the old inference's veto)
-        // together with an OBSERVED bound expiry.
-        var completedHandle = Task.CompletedTask;
-        Assert.True(completedHandle.IsCompleted, "The handle must be completed for this race to be the one under test.");
+        // RETAINED so it is settled here and awaited in the finally — no outstanding handle is left.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completedBeforeClassification = false;
 
-        ledger.RecordObserved(
-            "attempt A RunAsync",
-            observed: new TimeoutException("The operation has timed out."),
-            handle: completedHandle,
-            bound: Failsafe,
-            waitToken: CancellationToken.None);
+        try
+        {
+            await ledger.DrainAsync(
+                "attempt A RunAsync",
+                handleSource.Task,
+                // ZERO bound: an incomplete handle expires IMMEDIATELY — a pure failure bound, never
+                // an ordering device, and nothing sleeps.
+                bound: TimeSpan.Zero,
+                onObservedBeforeClassification: () =>
+                {
+                    // THE RACE, made deterministic: the ORIGINAL handle completes AFTER the timeout
+                    // was observed and BEFORE the outcome is classified.
+                    handleSource.TrySetResult();
+                    completedBeforeClassification = handleSource.Task.IsCompleted;
+                });
 
-        // RECORDED, despite IsCompleted being true.
-        var failure = Assert.Single(ledger.Failures);
-        Assert.Contains(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
-        Assert.Contains("attempt A RunAsync", failure, StringComparison.Ordinal);
+            // Non-vacuity: the seam really did complete the handle before classification, so a
+            // resurrected IsCompleted guard would genuinely have seen true and suppressed the record.
+            Assert.True(
+                completedBeforeClassification,
+                "The original handle must be completed before classification for this race to be the one under test.");
+            Assert.True(handleSource.Task.IsCompleted);
 
-        // ...and the verdict FAILS by name rather than passing on a completed-handle technicality.
-        var verdict = Assert.ThrowsAny<Exception>(() => AssertTeardownDrained(ledger));
-        Assert.Contains(TeardownFailureKind.BoundExpired, verdict.Message, StringComparison.Ordinal);
-        Assert.Contains("not sequentially quiescent", verdict.Message, StringComparison.Ordinal);
+            // RECORDED anyway — the observed TimeoutException is the proof, not the handle's state.
+            var failure = Assert.Single(ledger.Failures);
+            Assert.Contains(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+            Assert.Contains("attempt A RunAsync", failure, StringComparison.Ordinal);
+
+            // ...and the verdict FAILS by name rather than passing on a completed-handle technicality.
+            var verdict = Assert.ThrowsAny<Exception>(() => AssertTeardownDrained(ledger));
+            Assert.Contains(TeardownFailureKind.BoundExpired, verdict.Message, StringComparison.Ordinal);
+            Assert.Contains("not sequentially quiescent", verdict.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            // Settle-and-await: the fixture leaves no outstanding handle and no undisposed owner.
+            handleSource.TrySetResult();
+            await handleSource.Task;
+        }
     }
 
     /// <summary>
-    /// The same contract through the REAL <c>DrainAsync</c> await path, with no long wait: a ZERO
-    /// bound makes an incomplete handle expire IMMEDIATELY, so the end-to-end expiry path (await →
-    /// <see cref="TimeoutException"/> → record → failing verdict) is covered deterministically.
+    /// The complement of the race above, through the SAME real <c>DrainAsync</c> path: the handle is
+    /// still incomplete AT THE MOMENT OF OBSERVATION. It is SETTLEABLE — completed and awaited in the
+    /// <c>finally</c> immediately after the assertions — so nothing is left outstanding.
     /// </summary>
     [Fact]
-    public async Task Teardown_HandleThatNeverCompletes_IsRecorded_AndVerdictFailsByName()
+    public async Task Drain_HandleIncompleteWhenBoundExpires_IsRecorded_AndVerdictFailsByName()
     {
         var ledger = new TeardownLedger();
 
-        // Never completes — and is never completed by this test, so nothing can race the record.
-        var neverCompletes = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // RETAINED: incomplete only for the observation, then settled in the finally below.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        await ledger.DrainAsync("attempt A reader waits", neverCompletes.Task, bound: TimeSpan.Zero);
+        try
+        {
+            await ledger.DrainAsync("attempt A reader waits", handleSource.Task, bound: TimeSpan.Zero);
 
-        Assert.False(neverCompletes.Task.IsCompleted, "The handle must still be running — that is the case under test.");
+            // The case under test: still running when the bound elapsed.
+            Assert.False(
+                handleSource.Task.IsCompleted,
+                "The handle must still be running at observation — that is the case under test.");
 
-        var failure = Assert.Single(ledger.Failures);
-        Assert.Contains(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
-        Assert.Contains("attempt A reader waits", failure, StringComparison.Ordinal);
+            var failure = Assert.Single(ledger.Failures);
+            Assert.Contains(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+            Assert.Contains("attempt A reader waits", failure, StringComparison.Ordinal);
 
-        var verdict = Assert.ThrowsAny<Exception>(() => AssertTeardownDrained(ledger));
-        Assert.Contains("attempt A reader waits", verdict.Message, StringComparison.Ordinal);
-        Assert.Contains(TeardownFailureKind.BoundExpired, verdict.Message, StringComparison.Ordinal);
+            var verdict = Assert.ThrowsAny<Exception>(() => AssertTeardownDrained(ledger));
+            Assert.Contains("attempt A reader waits", verdict.Message, StringComparison.Ordinal);
+            Assert.Contains(TeardownFailureKind.BoundExpired, verdict.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            // Settled immediately after the observation, per the no-outstanding-handle rule.
+            handleSource.TrySetResult();
+            await handleSource.Task;
+        }
     }
 
     /// <summary>
-    /// A CALLER/TEST cancellation must never be mislabelled as a bound expiry. It carries the token
-    /// the WAIT was performed with, so it takes its own distinct path and is recorded under its own
-    /// kind.
+    /// A GENUINELY CANCELLED WAIT, END TO END THROUGH THE REAL <c>DrainAsync</c>: the test supplies
+    /// its OWN wait token and actually cancels it, so
+    /// <see cref="Task.WaitAsync(TimeSpan, CancellationToken)"/> really throws an
+    /// <see cref="OperationCanceledException"/> carrying THAT token — no synthesized exception and no
+    /// otherwise-unreachable shape.
     /// <para>
-    /// The assertion is POSITIVE — it pins the exact kind recorded — so it cannot pass vacuously on an
-    /// empty ledger, and mislabelling this case as a bound expiry fails it by name.
+    /// The bound is generous and cannot elapse, so the recorded kind can only come from the
+    /// cancellation path. The assertion is POSITIVE on the cancellation kind AND explicitly asserts
+    /// the bound-expiry kind is ABSENT, so mislabelling fails by name.
+    /// </para>
+    /// <para>
+    /// Because the wait token is passed EXPLICITLY into the drain, a mutation that forwards a
+    /// DIFFERENT token on to the classifier makes this cancellation look like the handle's own
+    /// (terminal) and records nothing — which this test catches.
     /// </para>
     /// </summary>
     [Fact]
-    public void Teardown_CallerCancellation_IsRecordedAsItsOwnKind_NotBoundExpiry()
+    public async Task Drain_RealCancelledWait_RecordsCancellationKind_NotBoundExpiry_ThenJoinsHandle()
     {
         var ledger = new TeardownLedger();
-        var stillRunning = new TaskCompletionSource().Task;
 
-        // The shape a caller-cancelled WaitAsync produces: an OperationCanceledException carrying the
-        // token the WAIT was given (WaitAsync reports the CALLER's token, not the handle's).
+        // RETAINED: the handle outlives the abandoned wait, then settles so the INDEPENDENT cleanup
+        // join can establish that no work is still active.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
         using var waitCts = new CancellationTokenSource();
-        var waitToken = waitCts.Token;
 
-        ledger.RecordObserved(
-            "attempt B RunAsync",
-            observed: new TaskCanceledException("A task was canceled.", innerException: null, waitToken),
-            handle: stillRunning,
-            bound: Failsafe,
-            waitToken: waitToken);
+        try
+        {
+            // GENUINE cancellation of the very token the drain waits on — not a constructed exception.
+            // The handle is deliberately INCOMPLETE here: an already-completed handle would let
+            // WaitAsync short-circuit and never observe the cancellation at all.
+            await waitCts.CancelAsync();
 
-        // POSITIVE: recorded under the CANCELLATION kind…
-        var failure = Assert.Single(ledger.Failures);
-        Assert.Contains(TeardownFailureKind.TestCancelled, failure, StringComparison.Ordinal);
-        // …and NEVER as a bound expiry — the bound did not elapse here.
-        Assert.DoesNotContain(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+            await ledger.DrainAsync(
+                "attempt B RunAsync",
+                handleSource.Task,
+                // A GENEROUS bound that cannot elapse: any bound-expiry record would be a mislabel.
+                bound: Failsafe,
+                waitToken: waitCts.Token,
+                // The handle settles AFTER the cancellation is observed and BEFORE the independent
+                // cleanup join runs, so that join converges deterministically — no sleeping.
+                onObservedBeforeClassification: () => handleSource.TrySetResult());
+
+            // POSITIVE: recorded under the CANCELLATION kind…
+            var failure = Assert.Single(ledger.Failures);
+            Assert.Contains(TeardownFailureKind.TestCancelled, failure, StringComparison.Ordinal);
+            Assert.Contains("attempt B RunAsync", failure, StringComparison.Ordinal);
+            // …and NEVER as a bound expiry — the bound did not elapse here.
+            Assert.DoesNotContain(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+
+            // CLEANUP CONTINUED after recording: the original handle reached a terminal state, so no
+            // RunAsync or reader work can still be active when teardown proceeds. The cleanup join
+            // ran under its OWN bound and an uncancelled token, so it recorded nothing.
+            Assert.True(handleSource.Task.IsCompleted);
+            Assert.DoesNotContain(TeardownFailureKind.CleanupIncomplete, failure, StringComparison.Ordinal);
+        }
+        finally
+        {
+            handleSource.TrySetResult();
+            await handleSource.Task;
+        }
     }
 
     /// <summary>
-    /// The discriminator that makes the previous test meaningful: a cancellation carrying the
-    /// HANDLE's own token (not the wait's) is a TERMINAL outcome and is tolerated, so the two
-    /// cancellation sources cannot collapse into one classification.
+    /// The post-cancellation cleanup join is BOUNDED and ENFORCED, not best-effort: when the wait is
+    /// abandoned by cancellation and the handle does NOT settle, the drain records the distinct
+    /// cleanup-incomplete kind — so a service can never be disposed while its work is still active
+    /// without the fixture saying so.
     /// </summary>
     [Fact]
-    public void Teardown_HandleOwnCancellation_IsTerminal_AndRecordsNothing()
+    public async Task Drain_CancelledWaitWhoseHandleDoesNotSettle_RecordsCleanupIncomplete()
+    {
+        var ledger = new TeardownLedger();
+
+        // RETAINED: unsettled only for the observation, then settled and awaited in the finally.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var waitCts = new CancellationTokenSource();
+
+        try
+        {
+            await waitCts.CancelAsync();
+
+            await ledger.DrainAsync(
+                "attempt B reader waits",
+                handleSource.Task,
+                bound: Failsafe,
+                waitToken: waitCts.Token,
+                // A ZERO cleanup bound keeps the enforced join instantaneous: the handle has not
+                // settled, so the cleanup records rather than waiting out a real budget.
+                cleanupBound: TimeSpan.Zero);
+
+            // BOTH kinds are present: the abandoned wait AND the unfinished cleanup.
+            Assert.Contains(
+                ledger.Failures,
+                recorded => recorded.Contains(TeardownFailureKind.TestCancelled, StringComparison.Ordinal));
+            Assert.Contains(
+                ledger.Failures,
+                recorded => recorded.Contains(TeardownFailureKind.CleanupIncomplete, StringComparison.Ordinal));
+
+            var verdict = Assert.ThrowsAny<Exception>(() => AssertTeardownDrained(ledger));
+            Assert.Contains(TeardownFailureKind.CleanupIncomplete, verdict.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            handleSource.TrySetResult();
+            await handleSource.Task;
+        }
+    }
+
+    /// <summary>
+    /// The discriminator that makes the cancellation test meaningful: a cancellation carrying the
+    /// HANDLE's own token (not the wait's) is a TERMINAL outcome and is tolerated, so the two
+    /// cancellation sources cannot collapse into one classification. Driven through the REAL
+    /// <c>DrainAsync</c> with a live, DIFFERENT wait token.
+    /// </summary>
+    [Fact]
+    public async Task Drain_HandleOwnCancellation_IsTerminal_AndRecordsNothing()
     {
         var ledger = new TeardownLedger();
 
         using var handleCts = new CancellationTokenSource();
-        handleCts.Cancel();
+        await handleCts.CancelAsync();
+
+        // The WAIT's token is a different, LIVE token — so the cancellation can only be attributed to
+        // the handle itself.
         using var waitCts = new CancellationTokenSource();
 
-        // Cancelled by the HANDLE's token while the WAIT's token is a different, live one.
-        ledger.RecordObserved(
+        await ledger.DrainAsync(
             "cancelled attempt",
-            observed: new TaskCanceledException("A task was canceled.", innerException: null, handleCts.Token),
-            handle: Task.FromCanceled(handleCts.Token),
+            Task.FromCanceled(handleCts.Token),
             bound: Failsafe,
             waitToken: waitCts.Token);
 
@@ -519,22 +639,32 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     /// bound-expiry decision entirely.
     /// </summary>
     [Fact]
-    public void Teardown_WaitReturnedNormallyButHandleStillRunning_IsRecordedAsNonTerminal()
+    public async Task Teardown_WaitReturnedNormallyButHandleStillRunning_IsRecordedAsNonTerminal()
     {
         var ledger = new TeardownLedger();
-        var stillRunning = new TaskCompletionSource().Task;
 
-        ledger.RecordObserved(
-            "attempt A RunAsync",
-            observed: null,
-            handle: stillRunning,
-            bound: Failsafe,
-            waitToken: CancellationToken.None);
+        // RETAINED so the incomplete handle is settled and awaited in the finally.
+        var handleSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var failure = Assert.Single(ledger.Failures);
-        Assert.Contains(TeardownFailureKind.NotTerminal, failure, StringComparison.Ordinal);
-        // NOT a bound expiry: the bound never elapsed on this path.
-        Assert.DoesNotContain(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+        try
+        {
+            ledger.RecordObserved(
+                "attempt A RunAsync",
+                observed: null,
+                handle: handleSource.Task,
+                bound: Failsafe,
+                waitToken: CancellationToken.None);
+
+            var failure = Assert.Single(ledger.Failures);
+            Assert.Contains(TeardownFailureKind.NotTerminal, failure, StringComparison.Ordinal);
+            // NOT a bound expiry: the bound never elapsed on this path.
+            Assert.DoesNotContain(TeardownFailureKind.BoundExpired, failure, StringComparison.Ordinal);
+        }
+        finally
+        {
+            handleSource.TrySetResult();
+            await handleSource.Task;
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -622,6 +752,12 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
 
         /// <summary>The wait returned normally, yet the handle is not in a terminal state.</summary>
         internal const string NotTerminal = "DID NOT REACH A TERMINAL STATE";
+
+        /// <summary>
+        /// A wait abandoned by cancellation whose handle then failed to settle under the INDEPENDENT
+        /// cleanup bound, so work may still be active while teardown proceeds.
+        /// </summary>
+        internal const string CleanupIncomplete = "DID NOT SETTLE AFTER AN ABANDONED WAIT";
     }
 
     /// <summary>
@@ -672,32 +808,92 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         /// <see cref="TimeSpan.Zero"/>, which makes an incomplete handle expire IMMEDIATELY — so the
         /// expiry path is covered with no real waiting and no timing dependence.
         /// </param>
-        internal async Task DrainAsync(string what, Task? handle, TimeSpan? bound = null)
+        /// <param name="waitToken">
+        /// THE TOKEN THE WAIT IS PERFORMED WITH, passed EXPLICITLY on to the classifier so token
+        /// identity is a real, testable contract rather than ambient state. Defaults to the test's own
+        /// token, which is what the lifecycle drains use.
+        /// </param>
+        /// <param name="onObservedBeforeClassification">
+        /// DETERMINISTIC SEAM, invoked AFTER the wait's outcome is observed and BEFORE that outcome is
+        /// classified. It exists so a boundary test can reproduce — at the REAL call site — the legal
+        /// schedule in which the bound elapses and the ORIGINAL handle then completes before
+        /// classification runs. Production drains leave it <c>null</c>.
+        /// </param>
+        /// <param name="cleanupBound">
+        /// The INDEPENDENT bound for the post-cancellation cleanup join. Defaults to
+        /// <see cref="CleanupFailsafe"/> — deliberately a SEPARATE budget from <paramref name="bound"/>,
+        /// since the bound that was just abandoned cannot be relied on to converge.
+        /// </param>
+        internal async Task DrainAsync(
+            string what,
+            Task? handle,
+            TimeSpan? bound = null,
+            CancellationToken? waitToken = null,
+            Action? onObservedBeforeClassification = null,
+            TimeSpan? cleanupBound = null)
         {
             if (handle is null) return;
 
             var effectiveBound = bound ?? Failsafe;
-            var waitToken = TestContext.Current.CancellationToken;
+            var effectiveWaitToken = waitToken ?? TestContext.Current.CancellationToken;
 
             try
             {
-                await handle.WaitAsync(effectiveBound, waitToken);
+                await handle.WaitAsync(effectiveBound, effectiveWaitToken);
             }
             catch (TimeoutException expiry)
             {
-                // THE BOUND EXPIRED. Recorded RIGHT HERE, unconditionally, from the exception that
-                // proves it — never from a later IsCompleted sample that a racing completion could
-                // flip to true.
-                RecordObserved(what, expiry, handle, effectiveBound, waitToken);
+                // THE BOUND EXPIRED. The seam may complete the ORIGINAL handle right here, so the
+                // record below is made while IsCompleted is TRUE — proving the classification is
+                // driven by the observed exception and can never be vetoed by a racing completion.
+                onObservedBeforeClassification?.Invoke();
+                RecordObserved(what, expiry, handle, effectiveBound, effectiveWaitToken);
                 return;
             }
             catch (Exception observed)
             {
-                RecordObserved(what, observed, handle, effectiveBound, waitToken);
+                onObservedBeforeClassification?.Invoke();
+                var kind = RecordObserved(what, observed, handle, effectiveBound, effectiveWaitToken);
+
+                // CALLER/TEST CANCELLATION IS NOT THE END OF TEARDOWN. The wait was abandoned, so the
+                // handle may still be running; joining it under an INDEPENDENT bound (never the one
+                // that was just abandoned, and never the cancelled token) keeps lifecycle teardown
+                // from disposing a service while RunAsync or reader work is still active.
+                if (ReferenceEquals(kind, TeardownFailureKind.TestCancelled))
+                    await JoinAfterAbandonedWaitAsync(what, handle, cleanupBound ?? CleanupFailsafe);
+
                 return;
             }
 
-            RecordObserved(what, observed: null, handle, effectiveBound, waitToken);
+            RecordObserved(what, observed: null, handle, effectiveBound, effectiveWaitToken);
+        }
+
+        /// <summary>
+        /// The INDEPENDENT post-cancellation cleanup join: after a caller/test cancellation was
+        /// recorded, the original handle is still awaited to a terminal state under its OWN bound and
+        /// with <see cref="CancellationToken.None"/> — deliberately NOT the bound or the token that
+        /// was just abandoned, neither of which could be relied on to converge. A handle that still
+        /// fails to settle is recorded under its own kind.
+        /// </summary>
+        private async Task JoinAfterAbandonedWaitAsync(string what, Task handle, TimeSpan cleanupBound)
+        {
+            try
+            {
+                await handle.WaitAsync(cleanupBound, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                Record(
+                    $"'{what}' {TeardownFailureKind.CleanupIncomplete} of "
+                        + $"{cleanupBound.TotalSeconds:0.###}s — the wait was abandoned by "
+                        + "cancellation and the handle never reached a terminal state afterwards, so "
+                        + "work may still be active while teardown proceeds.");
+            }
+            catch (Exception)
+            {
+                // A fault or the handle's own cancellation is a TERMINAL state: the handle is no
+                // longer active, which is all this cleanup join needs to establish.
+            }
         }
 
         /// <summary>
@@ -706,8 +902,9 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         /// <remarks>
         /// Exposed so the boundary tests can drive it directly with an exact
         /// (observed-outcome, handle-state) shape — including the reviewer's race shape, a
-        /// <see cref="TimeoutException"/> alongside an ALREADY-COMPLETED handle. That makes the
-        /// coverage independent of which schedule actually occurs, with no sleeping.
+        /// <see cref="TimeoutException"/> alongside an ALREADY-COMPLETED handle. The decisive
+        /// removal-proof vector for that race lives at the REAL <see cref="DrainAsync"/> call site
+        /// (see the seam above); these direct drives are the complementary per-cell coverage.
         /// </remarks>
         /// <param name="what">The handle's name.</param>
         /// <param name="observed">The exception the wait produced, or <c>null</c> when it returned normally.</param>
@@ -719,7 +916,8 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         /// explicitly (rather than read from ambient state) so a boundary test can drive the
         /// caller-cancelled shape deterministically.
         /// </param>
-        internal void RecordObserved(
+        /// <returns>The failure kind that was recorded, or <c>null</c> when the outcome was tolerated.</returns>
+        internal string? RecordObserved(
             string what, Exception? observed, Task handle, TimeSpan bound, CancellationToken waitToken)
         {
             switch (observed)
@@ -731,7 +929,7 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                         $"'{what}' {TeardownFailureKind.BoundExpired} of {bound.TotalSeconds:0.###}s "
                             + "— it was still being awaited when the bound elapsed, so this attempt "
                             + "was never quiescent.");
-                    return;
+                    return TeardownFailureKind.BoundExpired;
 
                 // The CALLER's/TEST's own token, not the bound: a distinct kind, never a timeout
                 // failure. WaitAsync reports the token it was GIVEN when the caller cancels, whereas a
@@ -741,12 +939,12 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                     Record(
                         $"'{what}' {TeardownFailureKind.TestCancelled} — the drain could not establish "
                             + "quiescence because the test run itself was cancelled.");
-                    return;
+                    return TeardownFailureKind.TestCancelled;
 
                 // A genuine fault, or a cancellation of the HANDLE itself: a terminal outcome whose
                 // real result the test body asserts. Tolerated.
                 case not null:
-                    return;
+                    return null;
 
                 // The wait returned normally. IsCompleted is consulted HERE ONLY — to classify the
                 // terminal case — and never to decide whether the bound expired.
@@ -756,8 +954,10 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                         Record(
                             $"'{what}' {TeardownFailureKind.NotTerminal} — the wait returned but the "
                                 + "handle is STILL RUNNING, so this attempt was never quiescent.");
+                        return TeardownFailureKind.NotTerminal;
                     }
-                    return;
+
+                    return null;
             }
         }
 
