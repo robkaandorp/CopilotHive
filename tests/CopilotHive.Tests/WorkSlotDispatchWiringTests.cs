@@ -1645,7 +1645,39 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// <summary>
     /// THE HAPPY PATH, unchanged: the dequeued task is activated, the worker is marked busy with
     /// its model, the task is sent — and NO delivery-transaction record is emitted at all.
+    /// <para>
+    /// EXTENDED WITH THE ONE-ID END-TO-END CHAIN. This SINGLE fixture now also proves that ONE
+    /// exact allocated task ID — the one the PRODUCTION allocator minted for this run, never a
+    /// hand-computed or predicted string — is the ID carried by ALL SIX named surfaces of a REAL
+    /// dispatch+delivery:
+    /// </para>
+    /// <list type="number">
+    ///   <item>the registered WORK SLOT (its <c>TaskId</c> plus its structured
+    ///     <see cref="WorkSlotPosition"/> and attempt);</item>
+    ///   <item><see cref="GoalPipeline.ActiveTaskId"/> — the active pointer;</item>
+    ///   <item>the IN-MEMORY pipeline-manager mapping (task → goal);</item>
+    ///   <item>the PERSISTED <c>task_mappings</c> row, read RAW from the SQLite database;</item>
+    ///   <item>the queued <see cref="WorkTask"/>'s <c>TaskId</c>;</item>
+    ///   <item>WORKER DELIVERY — the gateway actually received a task carrying that ID.</item>
+    /// </list>
     /// </summary>
+    /// <remarks>
+    /// WHERE EACH SURFACE IS OBSERVED. All six are captured from the <c>OnSendTask</c> seam, which
+    /// runs INSIDE the gateway's real <c>SendTaskAsync</c> — stage S, the LAST step of the delivery
+    /// transaction. At that instant the admission is fully committed AND nothing has been released
+    /// yet, so the slot, the pointer, both mappings, the queue's active entry and the delivered
+    /// task are ALL simultaneously live and are read from the REAL production objects (no copies,
+    /// no synthesis, no sleep). Surface 6 is necessarily observed by the DELIVERED task handed to
+    /// the seam, which IS the delivery; the post-await assertions then re-confirm the same single
+    /// ID on every surface after the dispatch returned, which is still before any completion
+    /// handling could release the pointer.
+    /// <para>
+    /// THE MUTATIONS THIS KILLS: removing (or pre-clearing) the active-task claim fails surface 2;
+    /// dropping the in-memory claim or the persisted admission row fails surface 3 or 4; minting a
+    /// second ID anywhere along the chain fails whichever surface diverges, because every
+    /// assertion compares against the ONE ID read out of the settled slot.
+    /// </para>
+    /// </remarks>
     [Fact]
     public async Task Delivery_HappyPath_ActivatesMarksBusyAndSendsWithoutAnyDeliveryRecord()
     {
@@ -1656,7 +1688,32 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var queue = new TaskQueue();
         var logger = new TestLogger<TaskDispatchService>();
         var worker = CreateIdleWorker();
-        var gateway = new DeliveryWorkerGateway(worker);
+
+        // THE QUEUED TASK, captured from the enqueue seam — surface 5's own observation, taken on
+        // the real path rather than reconstructed afterwards (the queue is drained by the delivery).
+        WorkTask? enqueuedTask = null;
+        queue.OnEnqueue = t => enqueuedTask = t;
+
+        // ── THE DELIVERY-TIME OBSERVATIONS (stage S — see the remarks) ──────────────────
+        WorkTask? deliveredTask = null;
+        IReadOnlyList<WorkSlotView> slotsAtSend = [];
+        string? pointerAtSend = null;
+        string? memoryMappedGoalAtSend = null;
+        string? persistedMappedGoalAtSend = null;
+        WorkTask? activeQueueEntryAtSend = null;
+
+        var gateway = new DeliveryWorkerGateway(worker)
+        {
+            OnSendTask = task =>
+            {
+                deliveredTask = task;                                   // (6) worker delivery
+                slotsAtSend = pipeline.GetSlotsForTest();               // (1) the work slot
+                pointerAtSend = pipeline.ActiveTaskId;                  // (2) the active pointer
+                memoryMappedGoalAtSend = manager.GetByTaskId(task.TaskId)?.GoalId;   // (3) in-memory
+                persistedMappedGoalAtSend = ReadPersistedGoalId(task.TaskId);        // (4) persisted, RAW
+                activeQueueEntryAtSend = queue.GetActiveTask(task.TaskId);           // (5) the queue
+            },
+        };
         var service = CreateService(manager, queue, logger, workerGateway: gateway);
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
@@ -1672,6 +1729,61 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Equal("coder-model", worker.CurrentModel);
 
         Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-", StringComparison.Ordinal));
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        //  THE ONE-ID END-TO-END CHAIN — all six surfaces, the SAME single allocated ID,
+        //  observed at stage S where they are simultaneously live.
+        // ═══════════════════════════════════════════════════════════════════════════════
+
+        // THE SEAM REALLY RAN — otherwise every observation below would be vacuously null.
+        Assert.NotNull(deliveredTask);
+
+        // (1) THE WORK SLOT: the id, plus its STRUCTURED position and attempt.
+        var slotAtSend = Assert.Single(slotsAtSend);
+        Assert.Equal(taskId, slotAtSend.Slot.TaskId);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), slotAtSend.Slot.Position);
+        Assert.Equal(1, slotAtSend.Slot.Attempt);
+        Assert.Equal(WorkSlotState.Pending, slotAtSend.State);
+        // The ID is the one built from THOSE structured values plus a well-formed nonce.
+        AssertSuffixedTaskId(
+            slotAtSend.Slot.TaskId,
+            TaskIdPrefix(GoalId, WorkerRole.Coder, slotAtSend.Slot.Position.Iteration,
+                slotAtSend.Slot.Position.Occurrence, slotAtSend.Slot.Attempt));
+
+        // (2) THE ACTIVE POINTER named this exact id at delivery time…
+        Assert.Equal(taskId, pointerAtSend);
+        // …and still does after the dispatch returned (nothing has completed yet).
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+
+        // (3) THE IN-MEMORY MAPPING resolves this exact id to this goal.
+        Assert.Equal(GoalId, memoryMappedGoalAtSend);
+        Assert.Same(pipeline, manager.GetByTaskId(taskId));
+
+        // (4) THE PERSISTED MAPPING: the raw task_mappings row for this exact id.
+        Assert.Equal(GoalId, persistedMappedGoalAtSend);
+        Assert.Equal(GoalId, ReadPersistedGoalId(taskId));
+        Assert.Equal([taskId], ReadAllPersistedTaskIds());
+
+        // (5) THE QUEUED TASK — the enqueued instance and the queue's active entry are both it.
+        Assert.NotNull(enqueuedTask);
+        Assert.Equal(taskId, enqueuedTask!.TaskId);
+        Assert.NotNull(activeQueueEntryAtSend);
+        Assert.Equal(taskId, activeQueueEntryAtSend!.TaskId);
+
+        // (6) WORKER DELIVERY: the task the gateway actually received carries this exact id, and
+        // the worker it was marked busy with names it too.
+        Assert.Equal(taskId, deliveredTask!.TaskId);
+        Assert.Equal(taskId, worker.CurrentTaskId);
+        Assert.True(worker.IsBusy);
+
+        // NOTHING MINTED A SECOND ID anywhere along the chain: every surface observed at stage S
+        // carries exactly one distinct value.
+        Assert.Single(
+            new[]
+            {
+                slotAtSend.Slot.TaskId, pointerAtSend!, enqueuedTask.TaskId,
+                activeQueueEntryAtSend.TaskId, deliveredTask.TaskId, worker.CurrentTaskId!,
+            }.Distinct(StringComparer.Ordinal));
     }
 
     // ── (a) STAGE G — the throw propagates uncaught ──────────────────────────
@@ -2447,6 +2559,18 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>Number of agents-md sends attempted — the proof that stage A really ran.</summary>
         public int AgentsUpdateAttempts { get; private set; }
 
+        /// <summary>
+        /// THE DELIVERY-TIME OBSERVATION SEAM. When set, it is invoked from INSIDE
+        /// <see cref="SendTaskAsync"/> on the SUCCESS path — after the cancel/throw injections and
+        /// immediately before the send is recorded — with the very <see cref="WorkTask"/> the
+        /// gateway is delivering. Stage S is the LAST step of the delivery transaction, so at that
+        /// instant the slot, the active pointer, both mappings and the queue's active entry are ALL
+        /// simultaneously live: it is the one point where the whole identity chain can be observed
+        /// at once, on the REAL path, with no sleep and no polling. Default <c>null</c>, so every
+        /// existing vector is unaffected.
+        /// </summary>
+        public Action<WorkTask>? OnSendTask { get; init; }
+
         public ConnectedWorker? GetIdleWorker()
         {
             IdleWorkerProbes++;
@@ -2493,6 +2617,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
             if (SendTaskThrows is not null)
                 throw SendTaskThrows;
+
+            // THE DELIVERY-TIME OBSERVATION, taken INSIDE the real send — the instant at which the
+            // whole identity chain is simultaneously live (see OnSendTask).
+            OnSendTask?.Invoke(task);
 
             SentTaskIds.Add(task.TaskId);
             return Task.CompletedTask;
