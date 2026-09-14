@@ -231,6 +231,10 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             await teardown.DrainAsync("attempt A RunAsync", runA);
             await teardown.DrainAsync("attempt A reader waits", readerA.WhenAllWaitsSettledAsync());
 
+            // A's write-count barriers are bounded PROXIES; settle and observe their sources too, so
+            // a barrier whose bound expired leaves no unsettled, unobserved owner behind.
+            await writerA.SettleAndObserveOutstandingWaiters();
+
             // A's service is disposed HERE — inside A's own scope, so its disposal provably completes
             // before attempt B is constructed.
             serviceA.Dispose();
@@ -336,6 +340,9 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
 
             await teardown.DrainAsync("attempt B RunAsync", runB);
             await teardown.DrainAsync("attempt B reader waits", readerB.WhenAllWaitsSettledAsync());
+
+            // Same audit for B's write-count barriers: settled and observed, never abandoned.
+            await writerB.SettleAndObserveOutstandingWaiters();
 
             serviceB.Dispose();
             serviceBDisposed = true;
@@ -614,6 +621,13 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         // The ENTRY GATE, signalled from INSIDE JoinAfterAbandonedWaitAsync before it awaits.
         var joinEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        // Proof that the finally below SETTLED AND OBSERVED the gate's ORIGINAL task. The bounded
+        // await in the body is only a PROXY: when the gate is unreachable (join removed, or the seam
+        // bypassed) that proxy times out and the original task would otherwise be left unsettled and
+        // unobserved. This flag is asserted after the try/finally, so deleting the cleanup fails the
+        // test by name instead of silently leaking an owner.
+        var gateSettledAndObserved = false;
+
         using var waitCts = new CancellationTokenSource();
         var drainTask = Task.CompletedTask;
 
@@ -633,7 +647,9 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                 cleanupBound: CleanupFailsafe,
                 onCleanupJoinEntered: completedAtEntry => joinEntered.TrySetResult(completedAtEntry));
 
-            // BARRIER: the join has been ENTERED. Bounded, and its expiry fails the test.
+            // BARRIER: the join has been ENTERED. BOUNDED — its expiry is a pure failure bound and
+            // FAILS the test, which is exactly how an unreachable gate (join removed / seam bypassed)
+            // is caught. The original gate task is still settled and observed in the finally.
             var completedAtJoinEntry = await joinEntered.Task.WaitAsync(
                 Failsafe, TestContext.Current.CancellationToken);
 
@@ -679,7 +695,72 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             handleSource.TrySetResult();
             await handleSource.Task;
             await ledger.DrainAsync("cleanup-join drain task", drainTask);
+
+            // THE GATE ITSELF — settled and observed on EVERY path, including the failure paths this
+            // test exists to produce (unreachable gate → bounded timeout, a failed assertion, or a
+            // cancelled run). Settling first guarantees the await cannot hang even when the gate was
+            // never signalled, and the observation swallows only the GATE's own fault so the primary
+            // exception is preserved.
+            gateSettledAndObserved = await SettleAndObserveGateAsync(joinEntered, GateNeverSignalled);
         }
+
+        // Runs only when the body succeeded — which is precisely when a silently-skipped cleanup
+        // would otherwise go unnoticed. Removing the settle/observe above makes this fail by name.
+        Assert.True(
+            gateSettledAndObserved,
+            "The cleanup-join entry gate must be settled AND observed in the finally, so no TCS owner "
+                + "is left unsettled or unobserved when this test exits.");
+        Assert.True(
+            joinEntered.Task.IsCompleted,
+            "The entry gate's ORIGINAL task — not merely the bounded proxy awaited in the body — must "
+                + "be completed when this test exits.");
+    }
+
+    /// <summary>
+    /// The sentinel a gate is settled with when it was NEVER signalled by production code. It is
+    /// never asserted upon: its only job is to make the original task completable so the finally can
+    /// observe it without hanging.
+    /// </summary>
+    private const bool GateNeverSignalled = true;
+
+    /// <summary>
+    /// SETTLES AND OBSERVES a gate's ORIGINAL task, on every path, without hanging and without
+    /// masking the caller's primary exception.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A bounded <c>WaitAsync</c> proxy is NOT an observation of the underlying
+    /// <see cref="TaskCompletionSource{T}"/>: when the bound expires the proxy faults while the
+    /// original task stays pending and unobserved. This helper closes that gap — it completes the
+    /// source first (so the await is guaranteed to return even if production never signalled it), then
+    /// awaits the original task and swallows ONLY that task's own fault.
+    /// </para>
+    /// <para>
+    /// It is called from a <c>finally</c>, so it must never throw: rethrowing here would replace the
+    /// primary failure (the timeout or assertion that the test exists to report) with a teardown
+    /// artefact.
+    /// </para>
+    /// </remarks>
+    /// <param name="gate">The gate whose original task must be settled and observed.</param>
+    /// <param name="valueIfNeverSignalled">The sentinel used when production never signalled the gate.</param>
+    /// <returns><c>true</c> once the original task has been completed and observed.</returns>
+    private static async Task<bool> SettleAndObserveGateAsync<T>(
+        TaskCompletionSource<T> gate, T valueIfNeverSignalled)
+    {
+        // Idempotent: a gate production already signalled keeps its real value.
+        gate.TrySetResult(valueIfNeverSignalled);
+
+        try
+        {
+            await gate.Task;
+        }
+        catch (Exception)
+        {
+            // OBSERVED, deliberately swallowed: this is the gate's own fault/cancellation, never the
+            // test's outcome. The primary exception unwinding through the finally is preserved.
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1356,6 +1437,13 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         private readonly List<WorkerMessage> _writes = [];
         private readonly Dictionary<int, TaskCompletionSource> _countWaiters = [];
 
+        /// <summary>
+        /// EVERY waiter source ever created, retained so teardown can settle and observe each one —
+        /// including waiters whose bounded proxy expired and were therefore removed from
+        /// <see cref="_countWaiters"/> unsatisfied.
+        /// </summary>
+        private readonly List<TaskCompletionSource> _allWaiters = [];
+
         internal IReadOnlyList<WorkerMessage> Writes
         {
             get { lock (_gate) return _writes.ToList(); }
@@ -1365,6 +1453,12 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
         /// Completes once at least <paramref name="count"/> writes were recorded. The bound is a
         /// FAILURE bound: its expiry throws <see cref="TimeoutException"/> and fails the test.
         /// </summary>
+        /// <remarks>
+        /// The returned task is a bounded PROXY. When the bound expires the proxy faults while the
+        /// underlying source stays pending, so <see cref="SettleAndObserveOutstandingWaiters"/> must be
+        /// called during teardown to settle and observe every source this writer created — otherwise a
+        /// waiter that was never satisfied is left unsettled and unobserved.
+        /// </remarks>
         internal Task WaitForWriteCountAsync(int count, CancellationToken ct)
         {
             lock (_gate)
@@ -1376,9 +1470,42 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                 {
                     waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                     _countWaiters[count] = waiter;
+                    _allWaiters.Add(waiter);
                 }
 
                 return waiter.Task.WaitAsync(Failsafe, ct);
+            }
+        }
+
+        /// <summary>
+        /// TEARDOWN: settles and OBSERVES every waiter source this writer ever created, so a
+        /// write-count barrier whose bound expired (the mutant-failure paths) never leaves a
+        /// <see cref="TaskCompletionSource"/> unsettled or unobserved.
+        /// </summary>
+        /// <returns>A task that never faults — each waiter's own outcome is observed here.</returns>
+        internal async Task SettleAndObserveOutstandingWaiters()
+        {
+            List<TaskCompletionSource> snapshot;
+            lock (_gate)
+            {
+                snapshot = [.. _allWaiters];
+                _countWaiters.Clear();
+            }
+
+            foreach (var waiter in snapshot)
+            {
+                // Idempotent: a waiter the writes already satisfied keeps its existing completion.
+                waiter.TrySetResult();
+
+                try
+                {
+                    await waiter.Task;
+                }
+                catch (Exception)
+                {
+                    // OBSERVED, deliberately swallowed: a waiter's own fault is never the test's
+                    // outcome, and this runs during teardown where the primary exception must survive.
+                }
             }
         }
 
