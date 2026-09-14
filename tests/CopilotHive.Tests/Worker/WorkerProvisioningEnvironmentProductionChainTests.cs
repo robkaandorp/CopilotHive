@@ -8,7 +8,6 @@ using Grpc.Core;
 using Microsoft.Extensions.AI;
 
 using System.Reflection;
-using System.Threading.Channels;
 
 using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
 
@@ -36,6 +35,27 @@ namespace CopilotHive.Tests.Worker;
 /// provisioners and response provenance, which the identity and reference assertions below pin.
 /// </para>
 /// <para>
+/// <b>SEQUENTIAL QUIESCENCE IS PROVEN, NOT ASSUMED.</b> The production contract is for sequential
+/// QUIESCENT attempts, so attempt A is fully wound down BEFORE attempt B is constructed: A's loop
+/// token is cancelled, A's reader is completed, A's <c>RunAsync</c> handle and every wait its reader
+/// ever created are DRAINED within the failure bound, and A's service is DISPOSED — all inside A's own
+/// scope. A dedicated block of assertions then pins that state (no in-flight read, no pending waiter,
+/// a completed run handle, a disposed service, an empty teardown ledger) before B exists at all.
+/// </para>
+/// <para>
+/// <b>NO ABANDONED TASK EXISTS.</b> <see cref="ScriptedReader"/> deliberately avoids
+/// <see cref="Task.WhenAny(Task[])"/>: a losing branch there would leave a real pending task behind
+/// with nothing to await it. Instead every <c>MoveNext</c> awaits exactly ONE waiter that the fault,
+/// the EOF and the cancellation registration all settle, so the task a read creates is always the task
+/// that read observes.
+/// </para>
+/// <para>
+/// <b>TEARDOWN ENFORCES COMPLETION.</b> <see cref="TeardownLedger"/> never swallows a failure to
+/// drain: a handle still running when the bound expires is RECORDED and the recorded failures are
+/// ASSERTED, so an abandoned producer fails this test by name instead of disappearing into a
+/// catch-all. The bound is a failure bound only — it orders nothing.
+/// </para>
+/// <para>
 /// <b>Removal demonstration.</b> Building B's service with FRESH provenance over the same fake
 /// environment (the stale-operator regression) makes B's snapshot capture A's provisioned values, so
 /// the "A-owned value is CLEARED" assertion observes A's value and fails.
@@ -43,8 +63,8 @@ namespace CopilotHive.Tests.Worker;
 /// <para>
 /// No real credentials, no process-environment mutation and no network: the environment is a fake
 /// in-memory dictionary and every RPC is answered by a fake invoker. Every gate is a
-/// <see cref="TaskCompletionSource"/> or a counted write — there are NO sleep-ordered waits, and every
-/// started task is joined in a <c>finally</c>.
+/// <see cref="TaskCompletionSource"/>, a counted write, or a channel fault/EOF — there are NO sleeps
+/// and NO <c>Task.Delay</c> ordering anywhere in this fixture.
 /// </para>
 /// </summary>
 [Collection("ConsoleOutput")]
@@ -55,7 +75,12 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     private const string AssignedIdB = "worker-assigned-b";
     private const string FixtureModel = "copilot/fixture-model";
 
-    /// <summary>Generous failsafe bound; never an ordering device.</summary>
+    /// <summary>
+    /// The FAILURE BOUND for every drain and every gate. It is never an ordering device: nothing waits
+    /// for it to elapse, and its expiry always FAILS the test (either directly, through
+    /// <see cref="Task.WaitAsync(TimeSpan, CancellationToken)"/>'s <see cref="TimeoutException"/>, or
+    /// through a recorded — and asserted — <see cref="TeardownLedger"/> failure).
+    /// </summary>
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(30);
 
     private const string OperatorOllamaUrl = "http://operator:11434";
@@ -63,11 +88,16 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     private const string OperatorConfigRepoUrl = "https://github.com/operator/repo.git";
 
     /// <summary>
-    /// TWO SEQUENTIAL ATTEMPTS, ONE SHARED PROVENANCE — the whole contract in one flow.
+    /// TWO SEQUENTIAL ATTEMPTS, ONE SHARED PROVENANCE — the whole contract in one flow, with attempt A
+    /// provably quiescent and disposed before attempt B is built.
     /// </summary>
     [Fact]
     public async Task TwoSequentialAttempts_SharedProvenance_ReplaceAndClearUnderEachAttemptsIdentity()
     {
+        // Every drain in this test reports into ONE ledger, which is asserted empty at the end (and
+        // again between the two attempts), so no failure to converge can be silently swallowed.
+        var teardown = new TeardownLedger();
+
         // The FAKE process environment plus the ONE provenance object Program.cs would create
         // outside its retry loop. Nothing here touches the real process environment.
         var env = new FakeEnv(
@@ -76,7 +106,7 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             (WorkerConfigProvisioner.ConfigRepoUrlVar, OperatorConfigRepoUrl));
         var shared = new WorkerProvisioningEnvironment(env.Read, env.Write);
 
-        // ── Attempt A ─────────────────────────────────────────────────────────────
+        // ══ Attempt A ═════════════════════════════════════════════════════════════
         var invokerA = new FakeInvoker(new RegisterResponse
         {
             Accepted = true,
@@ -111,9 +141,15 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             unpublishedAtStreamDisposalA = GetPublishedConnection(attemptA!) is null;
         });
 
-        using var serviceA = attemptA;
-        using var loopCtsA = new CancellationTokenSource();
+        // Deliberately NOT `using`: A's disposal must happen inside A's own scope, BEFORE B is built —
+        // a loop-scoped `using` would defer it past the whole of attempt B.
+        var serviceA = attemptA;
+        var loopCtsA = new CancellationTokenSource();
         var runA = Task.CompletedTask;
+        var serviceADisposed = false;
+
+        // Needed by attempt B's "A started no further fetch" assertion.
+        var fetchCallsAfterRetiredCallback = 0;
 
         try
         {
@@ -173,98 +209,140 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
                 () => runnerA.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
             Assert.Equal(WorkerConnection.DisconnectedMessage, retiredCallbackFailure.Message);
             Assert.Equal(fetchCallsBeforeRetiredCallback, invokerA.WorkerConfigCalls);
-
-            // ── Attempt B: a FRESH service through the SAME attempt-construction path ──
-            var invokerB = new FakeInvoker(new RegisterResponse
-            {
-                Accepted = true,
-                AssignedWorkerId = AssignedIdB,
-            });
-            invokerB.WorkerConfigToReturn = new GetWorkerConfigResponse
-            {
-                LlmProvider = "copilot",
-            };
-
-            var runnerB = new CapturingRunner();
-            var readerB = new ScriptedReader();
-            var writerB = new RecordingWriter();
-
-            // THE SAME state object that A used: this is what Program.cs does on every retry.
-            using var serviceB = BuildAttempt(shared, runnerB, invokerB, readerB, writerB);
-            using var loopCtsB = new CancellationTokenSource();
-            var runB = Task.CompletedTask;
-
-            try
-            {
-                runB = serviceB.RunAsync(loopCtsB.Token);
-
-                await writerB.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
-                Assert.Equal(AssignedIdB, writerB.Writes[0].WorkerId);
-
-                var connectionB = Assert.IsType<WorkerConnection>(GetPublishedConnection(serviceB));
-                Assert.Null(serviceB.TestProvisioner);
-                Assert.NotNull(connectionB.Provisioner);
-
-                // Provenance is the ONLY thing shared: B has its OWN provisioner object, and neither
-                // attempt is A's.
-                Assert.NotSame(connectionA.Provisioner, connectionB.Provisioner);
-
-                Assert.NotNull(runnerB.ConfigProvisioner);
-                await runnerB.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
-
-                // B FETCHED THROUGH B: its own client and its own accepted identity.
-                Assert.Equal(1, invokerB.WorkerConfigCalls);
-                Assert.Equal(AssignedIdB, invokerB.LastWorkerConfigWorkerId);
-                Assert.Equal(fetchCallsBeforeRetiredCallback, invokerA.WorkerConfigCalls);
-
-                // REPLACED — B's value, not A's.
-                Assert.Equal("copilot", env[WorkerConfigProvisioner.LlmProviderVar]);
-                // CLEARED — values only ever PROVISIONED (by A) are removed, NOT promoted to
-                // operator overrides. With fresh provenance for B these would survive as A's values.
-                Assert.Null(env[WorkerConfigProvisioner.OllamaModelVar]);
-                Assert.Null(env[WorkerConfigProvisioner.OllamaApiKeyVar]);
-                Assert.False(env.IsSet(WorkerConfigProvisioner.OllamaModelVar));
-                Assert.False(env.IsSet(WorkerConfigProvisioner.OllamaApiKeyVar));
-
-                // The GENUINE original operator values survive both attempts untouched.
-                Assert.Equal(OperatorOllamaUrl, env[WorkerConfigProvisioner.OllamaUrlVar]);
-                Assert.Equal(OperatorGithubToken, env[WorkerConfigProvisioner.GitHubTokenVar]);
-
-                // B's RESPONSE provenance is its own: no URL or token came from A, so the chain falls
-                // through to the ORIGINAL operator environment — the intentional documented fallback.
-                Assert.Null(connectionB.Provisioner.ProvisionedConfigRepoUrl);
-                Assert.Equal(OperatorConfigRepoUrl, connectionB.Provisioner.ResolvedConfigRepoUrl);
-                Assert.Equal(OperatorGithubToken, connectionB.Provisioner.ResolveConfigRepoCredential());
-
-                // A's PROVISIONED URL never reached the environment (only the operator value lives
-                // there) and A's response provenance stays A's own.
-                Assert.Equal(OperatorConfigRepoUrl, env[WorkerConfigProvisioner.ConfigRepoUrlVar]);
-                Assert.Equal("https://github.com/org/attempt-a.git", connectionA.Provisioner.ProvisionedConfigRepoUrl);
-
-                // A's retirement is unaffected by B's attempt: it stays retired with its stale
-                // in-memory response provenance, which no later attempt may inherit.
-                Assert.True(connectionA.IsRetired);
-                Assert.Equal("ghp_attempt_a", connectionA.Provisioner.ResolveConfigRepoCredential());
-
-                // EOF ends B's loop cleanly, preserving the existing clean-return behavior.
-                readerB.Complete();
-                await runB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.True(connectionB.IsRetired);
-                Assert.Null(GetPublishedConnection(serviceB));
-            }
-            finally
-            {
-                await loopCtsB.CancelAsync();
-                readerB.Complete();
-                await ObserveForTeardownAsync(runB);
-            }
+            fetchCallsAfterRetiredCallback = invokerA.WorkerConfigCalls;
         }
         finally
         {
+            // ── A-SCOPE QUIESCENCE, BEFORE ATTEMPT B EXISTS ──────────────────────
+            // Cancel A's loop token, settle A's reader, then DRAIN both the RunAsync handle and every
+            // wait A's reader ever created. Each drain is bounded, and a handle still running at the
+            // bound is RECORDED as a teardown failure rather than abandoned.
             await loopCtsA.CancelAsync();
             readerA.Complete();
-            await ObserveForTeardownAsync(runA);
+
+            await teardown.DrainAsync("attempt A RunAsync", runA);
+            await teardown.DrainAsync("attempt A reader waits", readerA.WhenAllWaitsSettledAsync());
+
+            // A's service is disposed HERE — inside A's own scope, so its disposal provably completes
+            // before attempt B is constructed.
+            serviceA.Dispose();
+            serviceADisposed = true;
+            loopCtsA.Dispose();
         }
+
+        // ── QUIESCENCE PROOF: attempt A is fully wound down before B is built ─────
+        // Reached only when the A body succeeded (a failing body propagates out of the finally above),
+        // which is exactly when this proof must hold.
+        Assert.True(runA.IsCompleted, "Attempt A's RunAsync must be completed before attempt B starts.");
+        Assert.Equal(0, readerA.InFlightReads);
+        Assert.Equal(0, readerA.PendingWaiterCount);
+        Assert.True(readerA.WhenAllWaitsSettledAsync().IsCompleted,
+            "Every wait attempt A's reader created must be settled before attempt B starts.");
+        Assert.True(serviceADisposed, "Attempt A's service must be disposed before attempt B is constructed.");
+        AssertTeardownDrained(teardown);
+
+        // ══ Attempt B: a FRESH service through the SAME attempt-construction path ══
+        var invokerB = new FakeInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedIdB,
+        });
+        invokerB.WorkerConfigToReturn = new GetWorkerConfigResponse
+        {
+            LlmProvider = "copilot",
+        };
+
+        var runnerB = new CapturingRunner();
+        var readerB = new ScriptedReader();
+        var writerB = new RecordingWriter();
+
+        // THE SAME state object that A used: this is what Program.cs does on every retry.
+        var serviceB = BuildAttempt(shared, runnerB, invokerB, readerB, writerB);
+        var loopCtsB = new CancellationTokenSource();
+        var runB = Task.CompletedTask;
+        var serviceBDisposed = false;
+
+        try
+        {
+            runB = serviceB.RunAsync(loopCtsB.Token);
+
+            await writerB.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(AssignedIdB, writerB.Writes[0].WorkerId);
+
+            var connectionB = Assert.IsType<WorkerConnection>(GetPublishedConnection(serviceB));
+            Assert.Null(serviceB.TestProvisioner);
+            Assert.NotNull(connectionB.Provisioner);
+
+            // Provenance is the ONLY thing shared: B has its OWN provisioner object, and neither
+            // attempt is A's.
+            Assert.NotSame(connectionA!.Provisioner, connectionB.Provisioner);
+
+            Assert.NotNull(runnerB.ConfigProvisioner);
+            await runnerB.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
+
+            // B FETCHED THROUGH B: its own client and its own accepted identity.
+            Assert.Equal(1, invokerB.WorkerConfigCalls);
+            Assert.Equal(AssignedIdB, invokerB.LastWorkerConfigWorkerId);
+            Assert.Equal(fetchCallsAfterRetiredCallback, invokerA.WorkerConfigCalls);
+
+            // REPLACED — B's value, not A's.
+            Assert.Equal("copilot", env[WorkerConfigProvisioner.LlmProviderVar]);
+            // CLEARED — values only ever PROVISIONED (by A) are removed, NOT promoted to
+            // operator overrides. With fresh provenance for B these would survive as A's values.
+            Assert.Null(env[WorkerConfigProvisioner.OllamaModelVar]);
+            Assert.Null(env[WorkerConfigProvisioner.OllamaApiKeyVar]);
+            Assert.False(env.IsSet(WorkerConfigProvisioner.OllamaModelVar));
+            Assert.False(env.IsSet(WorkerConfigProvisioner.OllamaApiKeyVar));
+
+            // The GENUINE original operator values survive both attempts untouched.
+            Assert.Equal(OperatorOllamaUrl, env[WorkerConfigProvisioner.OllamaUrlVar]);
+            Assert.Equal(OperatorGithubToken, env[WorkerConfigProvisioner.GitHubTokenVar]);
+
+            // B's RESPONSE provenance is its own: no URL or token came from A, so the chain falls
+            // through to the ORIGINAL operator environment — the intentional documented fallback.
+            Assert.Null(connectionB.Provisioner.ProvisionedConfigRepoUrl);
+            Assert.Equal(OperatorConfigRepoUrl, connectionB.Provisioner.ResolvedConfigRepoUrl);
+            Assert.Equal(OperatorGithubToken, connectionB.Provisioner.ResolveConfigRepoCredential());
+
+            // A's PROVISIONED URL never reached the environment (only the operator value lives
+            // there) and A's response provenance stays A's own.
+            Assert.Equal(OperatorConfigRepoUrl, env[WorkerConfigProvisioner.ConfigRepoUrlVar]);
+            Assert.Equal("https://github.com/org/attempt-a.git", connectionA.Provisioner!.ProvisionedConfigRepoUrl);
+
+            // A's retirement is unaffected by B's attempt: it stays retired with its stale
+            // in-memory response provenance, which no later attempt may inherit.
+            Assert.True(connectionA.IsRetired);
+            Assert.Equal("ghp_attempt_a", connectionA.Provisioner.ResolveConfigRepoCredential());
+
+            // EOF ends B's loop cleanly, preserving the existing clean-return behavior.
+            readerB.Complete();
+            await runB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(connectionB.IsRetired);
+            Assert.Null(GetPublishedConnection(serviceB));
+        }
+        finally
+        {
+            // ── B-SCOPE QUIESCENCE, mirroring attempt A's ────────────────────────
+            await loopCtsB.CancelAsync();
+            readerB.Complete();
+
+            await teardown.DrainAsync("attempt B RunAsync", runB);
+            await teardown.DrainAsync("attempt B reader waits", readerB.WhenAllWaitsSettledAsync());
+
+            serviceB.Dispose();
+            serviceBDisposed = true;
+            loopCtsB.Dispose();
+        }
+
+        // ── QUIESCENCE PROOF for attempt B, and the ENFORCED teardown verdict ─────
+        Assert.True(runB.IsCompleted, "Attempt B's RunAsync must be completed at the end of the test.");
+        Assert.Equal(0, readerB.InFlightReads);
+        Assert.Equal(0, readerB.PendingWaiterCount);
+        Assert.True(serviceBDisposed, "Attempt B's service must be disposed at the end of the test.");
+
+        // THE ENFORCEMENT: any handle that failed to drain within the bound was recorded, and a
+        // recorded failure fails this test by name instead of being swallowed by a catch-all.
+        AssertTeardownDrained(teardown);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -324,19 +402,70 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(service);
 
-    /// <summary>Bounded failsafe join that never masks an assertion failure.</summary>
-    private static async Task ObserveForTeardownAsync(Task? producer)
+    /// <summary>
+    /// THE TEARDOWN VERDICT: a handle that never drained is a TEST FAILURE, reported by name.
+    /// </summary>
+    private static void AssertTeardownDrained(TeardownLedger ledger)
     {
-        if (producer is null) return;
+        var failures = ledger.Failures;
+        Assert.True(
+            failures.Count == 0,
+            "Teardown did not converge — attempts were not sequentially quiescent: "
+                + string.Join(" | ", failures));
+    }
 
-        try
+    /// <summary>
+    /// THE ENFORCING TEARDOWN DRAINER. It records — never swallows — a handle that fails to reach a
+    /// terminal state within the failure bound, and the test ASSERTS the record is empty.
+    /// </summary>
+    /// <remarks>
+    /// The distinction that matters: a handle that FAULTED or was CANCELLED is drained (an attempt's
+    /// real outcome is asserted in the test body, so rethrowing it here would mask that assertion),
+    /// whereas a handle that is STILL RUNNING after the bound was abandoned. <c>IsCompleted</c>
+    /// decides between the two unambiguously, so a bound expiry can never be mistaken for a terminal
+    /// outcome — which is exactly the failure mode a bare catch-all hides.
+    /// </remarks>
+    private sealed class TeardownLedger
+    {
+        private readonly object _gate = new();
+        private readonly List<string> _failures = [];
+
+        /// <summary>A snapshot of the recorded teardown failures.</summary>
+        internal IReadOnlyList<string> Failures
         {
-            await producer.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            get { lock (_gate) return [.. _failures]; }
         }
-        catch (Exception)
+
+        /// <summary>
+        /// Drains ONE handle within the failure bound, recording a failure when it is still running
+        /// afterwards.
+        /// </summary>
+        /// <param name="what">The handle's name, used verbatim in the recorded failure.</param>
+        /// <param name="handle">The handle to drain; <c>null</c> means there was nothing started.</param>
+        internal async Task DrainAsync(string what, Task? handle)
         {
-            // Teardown only: the attempt may fault (a transport failure, a cancelled teardown). Its
-            // real outcome was asserted in the try body; rethrowing here would mask that assertion.
+            if (handle is null) return;
+
+            try
+            {
+                await handle.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+            catch (Exception)
+            {
+                // Terminal-outcome exceptions are expected here (a transport fault, a cancelled
+                // teardown) and are asserted in the body. The IsCompleted check below is what decides
+                // whether this handle actually drained — a bound expiry leaves it incomplete.
+            }
+
+            if (!handle.IsCompleted)
+            {
+                lock (_gate)
+                {
+                    _failures.Add(
+                        $"'{what}' did not drain within {Failsafe.TotalSeconds:0}s — it is STILL RUNNING, "
+                            + "so this attempt was never quiescent.");
+                }
+            }
         }
     }
 
@@ -444,46 +573,146 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     }
 
     /// <summary>
-    /// The orchestrator-message reader for ONE attempt. It can END the loop three ways: an
-    /// availability FAULT (the transport failure under test), a clean EOF, or a scripted message —
-    /// every one of them a deterministic signal, never a delay.
+    /// The orchestrator-message reader for ONE attempt. It ends the production loop exactly two ways,
+    /// both deterministic signals and neither a delay: an availability FAULT (<see cref="Fail"/> — the
+    /// transport failure under test, rethrown VERBATIM so the production loop observes the real
+    /// <see cref="RpcException"/> category) or a clean EOF (<see cref="Complete"/>).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>NO ABANDONED TASK.</b> An earlier version raced the fault signal against the channel read
+    /// with <see cref="Task.WhenAny(Task[])"/>, which left the LOSING read pending with nothing to
+    /// await it — so the attempt could not be proven quiescent. Here each <c>MoveNext</c> creates and
+    /// awaits exactly ONE waiter, and the fault, the EOF and the cancellation registration all settle
+    /// THAT waiter. The task a read creates is therefore always the task that read observes.
+    /// </para>
+    /// <para>
+    /// <see cref="InFlightReads"/>, <see cref="PendingWaiterCount"/> and
+    /// <see cref="WhenAllWaitsSettledAsync"/> make quiescence OBSERVABLE, so the test can assert that
+    /// an attempt left nothing running instead of assuming it.
+    /// </para>
+    /// </remarks>
     private sealed class ScriptedReader : IAsyncStreamReader<OrchestratorMessage>
     {
-        private readonly Channel<OrchestratorMessage> _channel = Channel.CreateUnbounded<OrchestratorMessage>();
-        private readonly TaskCompletionSource _failSignalled =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _gate = new();
 
-        private volatile Exception? _failure;
+        /// <summary>The waiters no read has observed yet — zero once every read has unwound.</summary>
+        private readonly List<TaskCompletionSource<bool>> _pendingWaiters = [];
+
+        /// <summary>EVERY wait ever created, so teardown can prove they all settled.</summary>
+        private readonly List<Task> _allWaits = [];
+
+        private Exception? _failure;
+        private bool _completed;
+        private int _inFlightReads;
 
         public OrchestratorMessage Current { get; private set; } = null!;
 
-        /// <summary>Signals a transport fault; the next <c>MoveNext</c> throws it.</summary>
-        internal void Fail(Exception exception)
+        /// <summary>Reads that have ENTERED <c>MoveNext</c> and not yet returned.</summary>
+        internal int InFlightReads => Volatile.Read(ref _inFlightReads);
+
+        /// <summary>Waits that have not been observed by their own read yet.</summary>
+        internal int PendingWaiterCount
         {
-            _failure = exception;
-            _failSignalled.TrySetResult();
+            get { lock (_gate) return _pendingWaiters.Count; }
         }
 
-        /// <summary>Ends the stream cleanly (EOF).</summary>
-        internal void Complete() => _channel.Writer.TryComplete();
+        /// <summary>
+        /// Signals a transport fault. The waiting (or next) <c>MoveNext</c> throws it VERBATIM, so the
+        /// production loop sees the real exception type rather than a wrapper.
+        /// </summary>
+        internal void Fail(Exception exception)
+        {
+            lock (_gate)
+                _failure ??= exception;
+
+            ReleaseWaiters();
+        }
+
+        /// <summary>Ends the stream cleanly (EOF). Idempotent.</summary>
+        internal void Complete()
+        {
+            lock (_gate)
+                _completed = true;
+
+            ReleaseWaiters();
+        }
+
+        /// <summary>
+        /// A handle completing once EVERY wait this reader ever created has settled. It never throws —
+        /// each wait is observed — so teardown can bound it and record a genuine failure to drain
+        /// rather than swallowing one.
+        /// </summary>
+        internal Task WhenAllWaitsSettledAsync()
+        {
+            List<Task> snapshot;
+            lock (_gate)
+                snapshot = [.. _allWaits];
+
+            return Task.WhenAll(snapshot.Select(Observed));
+
+            static Task Observed(Task wait) =>
+                wait.ContinueWith(
+                    static completed => { _ = completed.Exception; },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+        }
 
         public async Task<bool> MoveNext(CancellationToken cancellationToken)
         {
-            var readTask = _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
-            await Task.WhenAny(readTask, _failSignalled.Task);
+            Interlocked.Increment(ref _inFlightReads);
+            try
+            {
+                while (true)
+                {
+                    TaskCompletionSource<bool> waiter;
+                    lock (_gate)
+                    {
+                        // A fault always wins, then EOF: both are terminal and checked before any wait
+                        // is created, so a signal that arrives first is never missed.
+                        if (_failure is { } failure)
+                            throw failure;
 
-            if (_failure is { } failure)
-                throw failure;
+                        if (_completed)
+                            return false;
 
-            if (!await readTask)
-                return false;
+                        waiter = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _pendingWaiters.Add(waiter);
+                        _allWaits.Add(waiter.Task);
+                    }
 
-            if (!_channel.Reader.TryRead(out var message))
-                return false;
+                    // The cancellation registration settles THE SAME waiter, so a cancelled read
+                    // unwinds with OperationCanceledException without leaving any other task pending.
+                    await using var registration = cancellationToken.Register(
+                        static state => ((TaskCompletionSource<bool>)state!).TrySetCanceled(), waiter);
 
-            Current = message;
-            return true;
+                    try
+                    {
+                        await waiter.Task;
+                    }
+                    finally
+                    {
+                        lock (_gate)
+                            _pendingWaiters.Remove(waiter);
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlightReads);
+            }
+        }
+
+        /// <summary>Settles every outstanding waiter so its own read can re-evaluate the state.</summary>
+        private void ReleaseWaiters()
+        {
+            List<TaskCompletionSource<bool>> snapshot;
+            lock (_gate)
+                snapshot = [.. _pendingWaiters];
+
+            foreach (var waiter in snapshot)
+                waiter.TrySetResult(true);
         }
     }
 
@@ -503,7 +732,10 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
             get { lock (_gate) return _writes.ToList(); }
         }
 
-        /// <summary>Completes once at least <paramref name="count"/> writes were recorded.</summary>
+        /// <summary>
+        /// Completes once at least <paramref name="count"/> writes were recorded. The bound is a
+        /// FAILURE bound: its expiry throws <see cref="TimeoutException"/> and fails the test.
+        /// </summary>
         internal Task WaitForWriteCountAsync(int count, CancellationToken ct)
         {
             lock (_gate)
