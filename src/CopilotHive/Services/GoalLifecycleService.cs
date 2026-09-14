@@ -61,48 +61,6 @@ internal sealed class GoalLifecycleService
         await FinalizeGoalAsync(pipeline, GoalStatus.Completed, failureReason: null,
             mergeCommitHash: pipeline.MergeCommitHash, ct);
 
-        // Check for regression after recording metrics
-        if (_metricsTracker is not null && _agentsManager is not null)
-        {
-            if (pipeline.Metrics.TotalTests == 0)
-                _logger.LogWarning("Test metrics not extracted (TotalTests=0); regression check will skip test comparison.");
-
-            if (_metricsTracker.HasRegressed(pipeline.Metrics))
-            {
-                _logger.LogWarning("⚠️ REGRESSION DETECTED for goal {GoalId} — rolling back AGENTS.md", pipeline.GoalId);
-
-                // Only rollback roles whose AGENTS.md version changed this iteration
-                var modifiedRoles = GetModifiedRoles(pipeline.Metrics);
-                if (modifiedRoles.Count == 0)
-                {
-                    _logger.LogInformation("No AGENTS.md files were modified this iteration — nothing to rollback");
-                }
-
-                foreach (var role in modifiedRoles)
-                {
-                    try
-                    {
-                        _agentsManager.RollbackAgentsMd(role);
-                        _logger.LogInformation("Rolled back {Role} AGENTS.md", role);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to rollback {Role} AGENTS.md", role);
-                    }
-                }
-            }
-            else
-            {
-                var comparison = _metricsTracker.CompareWithPrevious(pipeline.Metrics);
-                if (comparison is not null)
-                {
-                    _logger.LogInformation(
-                        "Metrics comparison for {GoalId}: CoverageDelta={CovDelta:+0.0;-0.0}%, PassRateDelta={PRDelta:+0.00;-0.00}",
-                        pipeline.GoalId, comparison.CoverageDelta, comparison.PassRateDelta);
-                }
-            }
-        }
-
         await TryAutoTagReleaseAsync(pipeline, ct);
     }
 
@@ -247,31 +205,6 @@ internal sealed class GoalLifecycleService
                 pipeline.Metrics.AgentsMdVersions[roleName] = $"v{history.Length:D3}";
             }
         }
-    }
-
-    internal List<WorkerRole> GetModifiedRoles(IterationMetrics current)
-    {
-        var modified = new List<WorkerRole>();
-        var history = _metricsTracker!.History;
-
-        // Need at least 2 entries: previous + current (just recorded)
-        if (history.Count < 2)
-            return modified;
-
-        var previous = history[^2];
-
-        foreach (var (roleName, currentVersion) in current.AgentsMdVersions)
-        {
-            if (!previous.AgentsMdVersions.TryGetValue(roleName, out var previousVersion)
-                || currentVersion != previousVersion)
-            {
-                var role = WorkerRoleExtensions.ParseRole(roleName);
-                if (role.HasValue)
-                    modified.Add(role.Value);
-            }
-        }
-
-        return modified;
     }
 
     internal async Task CommitMetricsToConfigRepoAsync(GoalPipeline pipeline, CancellationToken ct)
