@@ -3733,6 +3733,7 @@ public sealed class WorkSlotRegistryTests
     /// <summary>A non-blank task ID is used VERBATIM — never reformatted, never normalised.</summary>
     [Theory]
     [InlineData("add-auth-coder-002-01-001")]
+    [InlineData("add-auth-coder-002-01-001-0123456789abcdef0123456789abcdef")]
     [InlineData("Add_Auth.v2-reviewer-001-01-007")]
     [InlineData("x")]
     public void TaskBuilder_NonBlankTaskId_IsUsedVerbatim(string taskId)
@@ -5938,14 +5939,27 @@ public sealed class WorkSlotRegistryTests
 
         // An int.MaxValue high-water is LEGAL to restore…
         target.RestoreRegistry(new WorkSlotRegistrySnapshot([], [Entry(pos, int.MaxValue)]));
+        var beforeSlots = ViewsOf(target.CaptureRegistry());
+        var beforeAttempts = AttemptsOf(target.CaptureRegistry());
 
         // …but exhausted: allocator 1 refuses with InvalidOperationException, never a wrap.
         Assert.Throws<InvalidOperationException>(
             () => target.AllocateAttemptAndRegisterSlot("overflow-1", pos));
 
+        // EXACT NON-MUTATION after allocator 1: neither registry nor high-water counter changed.
+        var afterExplicitIdRefusal = target.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(afterExplicitIdRefusal));
+        Assert.Equal(beforeAttempts, AttemptsOf(afterExplicitIdRefusal));
+
         // …and so does allocator 2.
         Assert.Throws<InvalidOperationException>(
             () => target.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos));
+
+        // EXACT NON-MUTATION after allocator 2 as well: its prospective generated ID and nonce
+        // never reached a commit, and the int.MaxValue high-water remains byte-for-byte intact.
+        var afterGeneratedIdRefusal = target.CaptureRegistry();
+        Assert.Equal(beforeSlots, ViewsOf(afterGeneratedIdRefusal));
+        Assert.Equal(beforeAttempts, AttemptsOf(afterGeneratedIdRefusal));
 
         // No negative attempt ever appeared: neither refusal registered a slot.
         Assert.Empty(target.GetSlotsForTest());
