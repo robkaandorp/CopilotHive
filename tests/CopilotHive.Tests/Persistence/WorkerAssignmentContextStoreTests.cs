@@ -624,6 +624,71 @@ public sealed class WorkerAssignmentContextStoreTests : IDisposable
     }
 
     /// <summary>
+    /// THE VANISHED-ROW BRANCH: a confirmed ZERO-ROW insert whose row is then NOT there. The zero count
+    /// is produced by genuinely SUPPRESSING the provider's execution at the EF interception point, so the
+    /// statement reports zero affected rows AND no row exists — exactly the inconsistent state the
+    /// missing-row guard exists for. It is an explicit <see cref="InvalidOperationException"/> naming THE
+    /// SPECIFIC TASK, never <c>Indeterminate</c>, never <c>Recorded</c>, never <c>AlreadyRecorded</c> or
+    /// <c>Conflict</c>, and never a silent absence.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: demote the missing-row <c>throw</c> to an <c>Indeterminate</c> result (or to a
+    /// <c>Conflict</c>/<c>AlreadyRecorded</c>, or to returning <c>null</c>) and <c>Assert.Throws</c>
+    /// fails outright; weaken the message so it no longer names the task or the zero-row insert and the
+    /// message assertions fail; let the branch fall through to a successful outcome and the
+    /// "no result was produced" assertion fails. The <c>SuppressCount</c> assertion proves the injection
+    /// really fired, so the test cannot pass vacuously by never reaching the branch, and the fresh
+    /// readback proves the zero count and the absent row genuinely agree.
+    /// </remarks>
+    [Fact]
+    public void InsertOnce_ZeroRowsButRowMissing_ThrowsInvalidOperationNamingTheTask_NotIndeterminateOrRecorded()
+    {
+        const string taskId = "task-vanished";
+        var context = Context(goalId: "goal-vanished", workerId: "worker-vanished", taskId: taskId);
+
+        // PRECONDITION (anti-vacuous): the row genuinely does not exist before the attempt.
+        Assert.Equal(0L, AssignmentRowCount(taskId));
+
+        var interceptor = new AssignmentInsertSuppressingInterceptor();
+        var factory = NewFactory(interceptor);
+        var store = NewStore(factory, new AssignmentClock(FixedNow));
+
+        // NO RESULT IS PRODUCED AT ALL — the branch THROWS rather than reporting any write outcome.
+        WorkerAssignmentWriteResult? produced = null;
+        var thrown = Assert.Throws<InvalidOperationException>(() => produced = store.InsertOnce(context));
+
+        Assert.Null(produced);
+
+        // THE INJECTION REALLY FIRED: the ON CONFLICT/zero-row path was genuinely taken.
+        Assert.Equal(1, interceptor.SuppressCount);
+
+        // THE MESSAGE IS TASK-SPECIFIC and names the zero-row insert that produced the inconsistency.
+        Assert.Contains(taskId, thrown.Message, StringComparison.Ordinal);
+        Assert.Contains("is missing after a zero-row insert", thrown.Message, StringComparison.Ordinal);
+        // It is NOT the corrupt-context message and NOT an unexpected-count message: this is its own
+        // distinct integrity failure.
+        Assert.DoesNotContain("not a valid context", thrown.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("expected exactly 0 or 1", thrown.Message, StringComparison.Ordinal);
+
+        // A FRESH READBACK CONFIRMS THE ABSENCE: the zero count and the missing row really do agree, so
+        // the guard fired on a genuine inconsistency and not on a row it simply failed to see.
+        Assert.Equal(0L, AssignmentRowCount(taskId));
+        Assert.Equal(0L, (long)RawScalar("SELECT COUNT(*) FROM worker_assignment_contexts")!);
+
+        // …and a fresh factory/store (a genuine reopen) also sees nothing.
+        var readerFactory = NewFactory();
+        var reader = NewStore(readerFactory, new AssignmentClock(FixedNow));
+        Assert.Null(reader.Load(taskId));
+
+        // AN EXPLICIT RETRY, with the suppression gone, settles to Recorded — the store performed no
+        // hidden reconciliation and left nothing behind.
+        var retryFactory = NewFactory();
+        var retryStore = NewStore(retryFactory, new AssignmentClock(FixedNow));
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, retryStore.InsertOnce(context).Status);
+        Assert.Equal(1L, AssignmentRowCount(taskId));
+    }
+
+    /// <summary>
     /// A FAILING READ QUERY stays a THROW: the exact interceptor sentinel propagates out of both
     /// <c>Load</c> and the zero-row duplicate path, so a read fault is never dressed up as write
     /// uncertainty.
@@ -886,46 +951,98 @@ public sealed class WorkerAssignmentContextStoreTests : IDisposable
     /// <summary>
     /// EVERY INVALID INPUT IS REFUSED BY THE CONTEXT'S OWN CONSTRUCTOR — before any store call exists,
     /// so no factory context is ever acquired. Non-blank identities, non-null slot/position/model,
-    /// positive iteration/occurrence/attempt, worker-backed phases and the mapped role are all
-    /// enforced; the refusals name the offending member.
+    /// positive iteration/occurrence/attempt, worker-backed phases and the mapped role are all enforced;
+    /// the refusals name the offending member.
     /// </summary>
     /// <remarks>
-    /// REMOVAL-PROOF: delete any one rule from the constructor and its vector below stops throwing; the
-    /// role/phase-mapping vectors specifically prove that a mismatched pair can never become a context.
+    /// <para>
+    /// ONE GUARD PER VECTOR. Each row below carries EXACTLY ONE fault and every other value is valid, so
+    /// the refusal it observes can only have come from the guard it targets — a vector can never be
+    /// killed by an unrelated rule firing first.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOF, per guard: each vector asserts the offending parameter name AND a guard-specific
+    /// message fragment, so weakening a single rule leaves exactly that vector failing. In particular:
+    /// the WHITESPACE identity vectors kill a null-only identity check (<c>goalId is null</c> instead of
+    /// <c>IsNullOrWhiteSpace</c>), and the NEGATIVE counter vectors kill a <c>!= 0</c> check written in
+    /// place of <c>&lt;= 0</c> — in both cases the weakened guard stops throwing and
+    /// <c>Assert.Throws</c> fails. The zero vectors remain alongside them so a rule narrowed the other
+    /// way (rejecting only negatives) is caught too.
+    /// </para>
     /// </remarks>
     [Theory]
-    [InlineData("blank-goal", null, "worker", "task", "coding", "coder", 1, 1, 1, "goalId")]
-    [InlineData("null-goal", null, "worker", "task", "coding", "coder", 1, 1, 1, "goalId")]
-    [InlineData("blank-worker", "goal", "  ", "task", "coding", "coder", 1, 1, 1, "workerId")]
-    [InlineData("null-worker", "goal", null, "task", "coding", "coder", 1, 1, 1, "workerId")]
-    [InlineData("blank-task", "goal", "worker", "  ", "coding", "coder", 1, 1, 1, "slot")]
-    [InlineData("null-task", "goal", "worker", null, "coding", "coder", 1, 1, 1, "slot")]
-    [InlineData("zero-iteration", "goal", "worker", "task", "coding", "coder", 0, 1, 1, "slot")]
-    [InlineData("negative-iteration", "goal", "worker", "task", "coding", "coder", -3, 1, 1, "slot")]
-    [InlineData("zero-occurrence", "goal", "worker", "task", "coding", "coder", 1, 0, 1, "slot")]
-    [InlineData("zero-attempt", "goal", "worker", "task", "coding", "coder", 1, 1, 0, "slot")]
-    [InlineData("planning-phase", "goal", "worker", "task", "planning", "coder", 1, 1, 1, "slot")]
-    [InlineData("merging-phase", "goal", "worker", "task", "merging", "mergeworker", 1, 1, 1, "slot")]
-    [InlineData("done-phase", "goal", "worker", "task", "done", "orchestrator", 1, 1, 1, "slot")]
-    [InlineData("failed-phase", "goal", "worker", "task", "failed", "coder", 1, 1, 1, "slot")]
-    [InlineData("role-phase-mismatch", "goal", "worker", "task", "coding", "tester", 1, 1, 1, "role")]
-    [InlineData("phase-role-mismatch", "goal", "worker", "task", "testing", "coder", 1, 1, 1, "role")]
-    [InlineData("unspecified-role", "goal", "worker", "task", "coding", "unspecified", 1, 1, 1, "role")]
-    [InlineData("orchestrator-role", "goal", "worker", "task", "coding", "orchestrator", 1, 1, 1, "role")]
-    [InlineData("mergeworker-role", "goal", "worker", "task", "coding", "mergeworker", 1, 1, 1, "role")]
+    // ── identities: null AND whitespace, each in its own vector ──
+    [InlineData("null-goal", null, "worker", "task", "coding", "coder", 1, 1, 1, "goalId", "goal ID must be a non-blank string")]
+    [InlineData("whitespace-goal", "   ", "worker", "task", "coding", "coder", 1, 1, 1, "goalId", "goal ID must be a non-blank string")]
+    [InlineData("tab-goal", "\t", "worker", "task", "coding", "coder", 1, 1, 1, "goalId", "goal ID must be a non-blank string")]
+    [InlineData("empty-goal", "", "worker", "task", "coding", "coder", 1, 1, 1, "goalId", "goal ID must be a non-blank string")]
+    [InlineData("null-worker", "goal", null, "task", "coding", "coder", 1, 1, 1, "workerId", "worker ID must be a non-blank string")]
+    [InlineData("whitespace-worker", "goal", "  ", "task", "coding", "coder", 1, 1, 1, "workerId", "worker ID must be a non-blank string")]
+    [InlineData("empty-worker", "goal", "", "task", "coding", "coder", 1, 1, 1, "workerId", "worker ID must be a non-blank string")]
+    [InlineData("null-task", "goal", "worker", null, "coding", "coder", 1, 1, 1, "slot", "slot task ID must be a non-blank string")]
+    [InlineData("whitespace-task", "goal", "worker", "  ", "coding", "coder", 1, 1, 1, "slot", "slot task ID must be a non-blank string")]
+    [InlineData("empty-task", "goal", "worker", "", "coding", "coder", 1, 1, 1, "slot", "slot task ID must be a non-blank string")]
+    // ── counters: zero AND negative, each in its own vector, each naming its own field and value ──
+    [InlineData("zero-iteration", "goal", "worker", "task", "coding", "coder", 0, 1, 1, "slot", "iteration must be positive but was 0")]
+    [InlineData("negative-iteration", "goal", "worker", "task", "coding", "coder", -3, 1, 1, "slot", "iteration must be positive but was -3")]
+    [InlineData("zero-occurrence", "goal", "worker", "task", "coding", "coder", 1, 0, 1, "slot", "occurrence must be positive but was 0")]
+    [InlineData("negative-occurrence", "goal", "worker", "task", "coding", "coder", 1, -2, 1, "slot", "occurrence must be positive but was -2")]
+    [InlineData("zero-attempt", "goal", "worker", "task", "coding", "coder", 1, 1, 0, "slot", "attempt must be positive but was 0")]
+    [InlineData("negative-attempt", "goal", "worker", "task", "coding", "coder", 1, 1, -5, "slot", "attempt must be positive but was -5")]
+    // ── the non-worker phases and the role/phase mapping ──
+    [InlineData("planning-phase", "goal", "worker", "task", "planning", "coder", 1, 1, 1, "slot", "phase 'Planning' has no worker")]
+    [InlineData("merging-phase", "goal", "worker", "task", "merging", "mergeworker", 1, 1, 1, "slot", "phase 'Merging' has no worker")]
+    [InlineData("done-phase", "goal", "worker", "task", "done", "orchestrator", 1, 1, 1, "slot", "phase 'Done' has no worker")]
+    [InlineData("failed-phase", "goal", "worker", "task", "failed", "coder", 1, 1, 1, "slot", "phase 'Failed' has no worker")]
+    [InlineData("role-phase-mismatch", "goal", "worker", "task", "coding", "tester", 1, 1, 1, "role", "role 'Tester' does not match the role 'Coder'")]
+    [InlineData("phase-role-mismatch", "goal", "worker", "task", "testing", "coder", 1, 1, 1, "role", "role 'Coder' does not match the role 'Tester'")]
+    [InlineData("unspecified-role", "goal", "worker", "task", "coding", "unspecified", 1, 1, 1, "role", "role 'Unspecified' does not match the role 'Coder'")]
+    [InlineData("orchestrator-role", "goal", "worker", "task", "coding", "orchestrator", 1, 1, 1, "role", "role 'Orchestrator' does not match the role 'Coder'")]
+    [InlineData("mergeworker-role", "goal", "worker", "task", "coding", "mergeworker", 1, 1, 1, "role", "role 'MergeWorker' does not match the role 'Coder'")]
     public void InvalidInput_FailsBeforeContextAcquisition(
         string label, string? goalId, string? workerId, string? taskId, string phaseName,
-        string roleName, int iteration, int occurrence, int attempt, string expectedParamName)
+        string roleName, int iteration, int occurrence, int attempt, string expectedParamName,
+        string expectedMessageFragment)
     {
         var factory = NewFactory();
 
         var ex = Assert.Throws<ArgumentException>(() =>
             BuildContext(goalId, workerId, taskId, phaseName, roleName, iteration, occurrence, attempt));
 
+        // THE GUARD-SPECIFIC EVIDENCE: the offending parameter AND the rule that fired. A different rule
+        // firing first (or a weakened one letting the value through) cannot satisfy both.
         Assert.Equal(expectedParamName, ex.ParamName);
-        Assert.False(string.IsNullOrWhiteSpace(ex.Message));
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
 
         // NOTHING WAS ACQUIRED AND NOTHING WAS WRITTEN — and the store was never even reached.
+        Assert.True(0 == factory.CreateCount, $"vector '{label}' acquired a context before validation.");
+        Assert.True(0L == (long)RawScalar("SELECT COUNT(*) FROM worker_assignment_contexts")!,
+            $"vector '{label}' wrote a row despite being invalid.");
+    }
+
+    /// <summary>
+    /// THE SAME ISOLATED INVALID VECTORS, DRIVEN THROUGH THE STORE: a caller that hands
+    /// <see cref="WorkerAssignmentContextStore.InsertOnce"/> an invalid candidate cannot even build one,
+    /// so the refusal happens before the store acquires a context and no row is ever written. This pins
+    /// the "validation fails BEFORE any context acquisition" contract at the store boundary rather than
+    /// only at the value type.
+    /// </summary>
+    [Theory]
+    [InlineData("whitespace-goal", "   ", "worker", "task", 1, 1, 1)]
+    [InlineData("whitespace-worker", "goal", "  ", "task", 1, 1, 1)]
+    [InlineData("whitespace-task", "goal", "worker", " \t ", 1, 1, 1)]
+    [InlineData("negative-occurrence", "goal", "worker", "task", 1, -2, 1)]
+    [InlineData("negative-attempt", "goal", "worker", "task", 1, 1, -5)]
+    public void InvalidInput_ThroughStore_FailsBeforeContextAcquisition_AndPersistsNothing(
+        string label, string goalId, string workerId, string taskId, int iteration, int occurrence, int attempt)
+    {
+        var factory = NewFactory();
+        var store = NewStore(factory, new AssignmentClock(FixedNow));
+
+        // The candidate cannot be constructed at all, so InsertOnce is never reached with a bad value.
+        Assert.Throws<ArgumentException>(() => store.InsertOnce(
+            BuildContext(goalId, workerId, taskId, "coding", "coder", iteration, occurrence, attempt)));
+
         Assert.True(0 == factory.CreateCount, $"vector '{label}' acquired a context before validation.");
         Assert.True(0L == (long)RawScalar("SELECT COUNT(*) FROM worker_assignment_contexts")!,
             $"vector '{label}' wrote a row despite being invalid.");
@@ -985,6 +1102,46 @@ public sealed class WorkerAssignmentContextStoreTests : IDisposable
         Assert.Equal("context", ex.ParamName);
         Assert.Equal(0, factory.CreateCount);
         Assert.Equal(0L, (long)RawScalar("SELECT COUNT(*) FROM worker_assignment_contexts")!);
+    }
+
+    /// <summary>
+    /// THE RESULT PAIRING IS STRUCTURAL, not merely documented: the four factories are the ONLY way to
+    /// obtain a <see cref="WorkerAssignmentWriteResult"/>, and each produces the documented pairing —
+    /// evidence for <c>Indeterminate</c> alone, and no evidence for the three confirmed outcomes. A
+    /// caller cannot fabricate an inconsistent pair because no accessible constructor exists.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: re-expose the positional/public constructor (or drop the validating guard inside
+    /// it) and the "no accessible two-argument constructor" assertion fails; swap a factory's evidence
+    /// (e.g. hand <c>Recorded</c> an exception, or <c>Indeterminate</c> a null) and the pairing
+    /// assertions fail.
+    /// </remarks>
+    [Fact]
+    public void WriteResult_FactoriesAreTheOnlyConstructionPath_AndEnforceTheDocumentedPairing()
+    {
+        // THE THREE CONFIRMED OUTCOMES CARRY NO EVIDENCE.
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, WorkerAssignmentWriteResult.Recorded().Status);
+        Assert.Null(WorkerAssignmentWriteResult.Recorded().WriteException);
+        Assert.Equal(WorkerAssignmentWriteStatus.AlreadyRecorded, WorkerAssignmentWriteResult.AlreadyRecorded().Status);
+        Assert.Null(WorkerAssignmentWriteResult.AlreadyRecorded().WriteException);
+        Assert.Equal(WorkerAssignmentWriteStatus.Conflict, WorkerAssignmentWriteResult.Conflict().Status);
+        Assert.Null(WorkerAssignmentWriteResult.Conflict().WriteException);
+
+        // THE UNRESOLVED OUTCOME CARRIES THE EXACT EVIDENCE OBJECT.
+        var sentinel = new InvalidOperationException("write sentinel");
+        var indeterminate = WorkerAssignmentWriteResult.Indeterminate(sentinel);
+        Assert.Equal(WorkerAssignmentWriteStatus.Indeterminate, indeterminate.Status);
+        Assert.Same(sentinel, indeterminate.WriteException);
+
+        // NO ACCESSIBLE CONSTRUCTOR: the pairing cannot be bypassed from anywhere in the assembly, so an
+        // inconsistent result (a confirmed outcome with evidence, or Indeterminate without) is
+        // unconstructible rather than merely discouraged. The sealed record's compiler-generated copy
+        // constructor is itself private, so it is no escape hatch either.
+        var constructors = typeof(WorkerAssignmentWriteResult)
+            .GetConstructors(System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic
+                | System.Reflection.BindingFlags.Instance);
+        Assert.DoesNotContain(constructors, c => !c.IsPrivate);
     }
 
     /// <summary>
@@ -1865,6 +2022,36 @@ internal sealed class AssignmentRowCountInterceptor : DbCommandInterceptor
 
         Interlocked.Increment(ref _overrideCount);
         return _forcedCount;
+    }
+}
+
+/// <summary>
+/// SUPPRESSES the provider's execution of the assignment-context INSERT and reports a genuine zero-row
+/// result — the vanished-duplicate-row vector. Unlike a count override this really PREVENTS the write, so
+/// the zero count and the absent row AGREE, which is exactly the inconsistent state the store's
+/// missing-row guard exists for. <see cref="SuppressCount"/> proves the suppression really happened, so a
+/// test using it cannot pass vacuously by never reaching the branch.
+/// </summary>
+internal sealed class AssignmentInsertSuppressingInterceptor : DbCommandInterceptor
+{
+    private int _suppressCount;
+
+    /// <summary>How many times the INSERT execution was suppressed.</summary>
+    public int SuppressCount => Volatile.Read(ref _suppressCount);
+
+    private static bool IsAssignmentInsert(DbCommand command) =>
+        command.CommandText.TrimStart().StartsWith(
+            "INSERT INTO worker_assignment_contexts", StringComparison.OrdinalIgnoreCase);
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        if (!IsAssignmentInsert(command))
+            return result;
+
+        Interlocked.Increment(ref _suppressCount);
+        return InterceptionResult<int>.SuppressWithResult(0);
     }
 }
 

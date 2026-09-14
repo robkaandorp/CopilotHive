@@ -648,6 +648,7 @@ internal enum WorkerAssignmentWriteStatus
 /// plus, for the uncertain outcome only, the EXACT exception evidence.
 /// </summary>
 /// <remarks>
+/// <para>
 /// EXCEPTION IDENTITY, not description: <see cref="WriteException"/> carries the exact caught instance
 /// (any EF wrapper included) for a throwing write, or the <see cref="InvalidOperationException"/>
 /// describing an unexpected affected-row count. It is <c>null</c> for
@@ -655,13 +656,54 @@ internal enum WorkerAssignmentWriteStatus
 /// <see cref="WorkerAssignmentWriteStatus.AlreadyRecorded"/> and
 /// <see cref="WorkerAssignmentWriteStatus.Conflict"/> — read and integrity errors THROW instead of
 /// appearing here.
+/// </para>
+/// <para>
+/// THE PAIRING IS STRUCTURAL, NOT MERELY DOCUMENTED. The only constructor is PRIVATE and validating, so
+/// the four factories below are the sole way to obtain a result and an inconsistent pair — a confirmed
+/// outcome carrying exception evidence, or an <see cref="WorkerAssignmentWriteStatus.Indeterminate"/>
+/// with no evidence — cannot be constructed at all. This changes no outcome the store produces; it only
+/// removes the ability to fabricate one.
+/// </para>
 /// </remarks>
-/// <param name="Status">The recorded outcome.</param>
-/// <param name="WriteException">The exact write-uncertainty evidence, or <c>null</c>.</param>
-internal sealed record WorkerAssignmentWriteResult(
-    WorkerAssignmentWriteStatus Status,
-    Exception? WriteException)
+internal sealed record WorkerAssignmentWriteResult
 {
+    /// <summary>The recorded outcome.</summary>
+    internal WorkerAssignmentWriteStatus Status { get; }
+
+    /// <summary>The exact write-uncertainty evidence, or <c>null</c> for the three confirmed outcomes.</summary>
+    internal Exception? WriteException { get; }
+
+    /// <summary>
+    /// THE ONE (private) CONSTRUCTOR, which enforces the documented pairing: a defined status, evidence
+    /// for <see cref="WorkerAssignmentWriteStatus.Indeterminate"/> and no evidence for any confirmed
+    /// outcome. Every call site is one of the four factories below, so this never fires in practice — it
+    /// exists so a future one cannot quietly break the invariant.
+    /// </summary>
+    private WorkerAssignmentWriteResult(WorkerAssignmentWriteStatus status, Exception? writeException)
+    {
+        if (!Enum.IsDefined(status))
+        {
+            throw new ArgumentException(
+                $"Worker assignment write result has undefined status value {(int)status}.", nameof(status));
+        }
+
+        if (status == WorkerAssignmentWriteStatus.Indeterminate)
+        {
+            // The unresolved outcome is meaningless without its evidence.
+            ArgumentNullException.ThrowIfNull(writeException);
+        }
+        else if (writeException is not null)
+        {
+            // A CONFIRMED outcome never carries exception evidence: read and integrity errors THROW.
+            throw new ArgumentException(
+                $"Worker assignment write result '{status}' is a confirmed outcome and cannot carry write " +
+                "exception evidence.", nameof(writeException));
+        }
+
+        Status = status;
+        WriteException = writeException;
+    }
+
     /// <summary>The confirmed single-row insert — no exception evidence.</summary>
     internal static WorkerAssignmentWriteResult Recorded() =>
         new(WorkerAssignmentWriteStatus.Recorded, null);
