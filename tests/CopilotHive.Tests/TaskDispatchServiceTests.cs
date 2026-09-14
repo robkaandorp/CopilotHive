@@ -2552,11 +2552,22 @@ public sealed class TaskDispatchServiceTests
 
     /// <summary>
     /// A POST-RECORD MAPPING/CHANNEL FAILURE on the live dispatch path keeps the RECORDED context
-    /// and is NOT re-labelled as a recording failure: the completed channel makes the publisher's
-    /// post-record write throw a channel-closed fault, which the gateway does NOT
-    /// convert to <see cref="WorkerTaskSendOutcome.Blocked"/> — so stage S takes the
-    /// ambiguity-PRESERVE path and rethrows the ORIGINAL exception, and the recorded row survives.
+    /// and is NOT re-labelled as a recording failure: the completed channel makes the REAL
+    /// <see cref="WorkerAssignmentPublisher"/>'s post-record write throw, which the REAL
+    /// <see cref="GrpcWorkerGateway"/> does NOT convert to
+    /// <see cref="WorkerTaskSendOutcome.Blocked"/> — so stage S takes the ambiguity-PRESERVE path and
+    /// rethrows the ORIGINAL exception, and the recorded row survives.
     /// </summary>
+    /// <remarks>
+    /// THE WHOLE CHAIN IS REAL — real gateway, real publisher, real assignment-context store, real
+    /// in-memory SQLite and the real <c>DispatchToRole</c> stage S — so this is the F3 end-to-end
+    /// proof, and the assertion on the fault is DISCRIMINATING rather than "anything but a recording
+    /// failure": the expected original fault type is pinned EXACTLY
+    /// (<c>System.Threading.Channels.ChannelClosedException</c> — the same type the publisher's own post-record unit test
+    /// and the Ready stream test already pin, since a write to a completed channel raises it).
+    /// <c>Assert.ThrowsAsync&lt;T&gt;</c> requires EXACT type equality, so a generic wrapper, a
+    /// re-labelled recording failure or any derived substitute fails here.
+    /// </remarks>
     [Fact]
     public async Task DispatchToRole_PostRecordChannelFault_PreservesAndKeepsRecordedContext()
     {
@@ -2596,37 +2607,56 @@ public sealed class TaskDispatchServiceTests
             goal: goal,
             logger: logger);
 
-        var thrown = await Assert.ThrowsAnyAsync<Exception>(
+        var thrown = await Assert.ThrowsAsync<System.Threading.Channels.ChannelClosedException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
 
-        // NOT RE-LABELLED: the original post-record channel fault left the dispatch — never a
-        // WorkerAssignmentRecordingException and never a swallowed Blocked outcome.
+        // THE FAULT IS PINNED BY EXACT TYPE — required by ThrowsAsync<T> — and it is provably NOT a
+        // recording failure. A wrapper or a re-labelled refusal cannot satisfy this.
+        Assert.IsType<System.Threading.Channels.ChannelClosedException>(thrown);
         Assert.IsNotType<WorkerAssignmentRecordingException>(thrown);
 
-        // THE AMBIGUITY-PRESERVE RECORD: stage=send recovery=preserve — the send THREW.
-        Assert.Contains(
+        // THE AMBIGUITY-PRESERVE RECORD: EXACTLY ONE stage=send recovery=preserve record — the send
+        // THREW, and no other stage produced a failure record.
+        var preserve = Assert.Single(
             logger.LogEntries,
             e => e.LogLevel == LogLevel.Warning &&
+                 e.Message.Contains("delivery-failure", StringComparison.Ordinal) &&
                  e.Message.Contains($"task={expectedTaskId}", StringComparison.Ordinal) &&
                  e.Message.Contains("stage=send", StringComparison.Ordinal) &&
                  e.Message.Contains("recovery=preserve", StringComparison.Ordinal));
+        Assert.Contains("remains active", preserve.Message, StringComparison.Ordinal);
+
+        // NO PUBLICATION-SUCCESS RECORD, and NO recovery activity: the preserve performs none.
         Assert.DoesNotContain(
             logger.LogEntries,
             e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
 
-        // THE RECORDED CONTEXT IS RETAINED with its original values — a post-record failure never
+        // THE RECORDED CONTEXT IS RETAINED with EVERY original value — a post-record failure never
         // deletes, rebinds or relabels it.
         var row = recording.Store.Load(expectedTaskId);
         Assert.NotNull(row);
-        Assert.Equal("worker-fault", row!.Context.WorkerId);
+        Assert.Equal("goal-fault", row!.Context.GoalId);
+        Assert.Equal("worker-fault", row.Context.WorkerId);
         Assert.Equal(WorkerRole.Coder, row.Context.Role);
         Assert.Equal("coder-model", row.Context.Model);
+        Assert.Equal(expectedTaskId, row.Context.Slot.TaskId);
+        Assert.Equal(GoalPhase.Coding, row.Context.Slot.Position.Phase);
+
+        // THE TASK WAS NOT REQUEUED: still active, Pending slot/pointer/mapping intact, queue empty.
+        Assert.NotNull(taskQueue.GetActiveTask(expectedTaskId));
+        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Same(pipeline, pipelineManager.GetByTaskId(expectedTaskId));
 
         // THE DELIVERY STATE IS PRESERVED.
         Assert.True(idleWorker.IsBusy);
         Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
         Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
-        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
     }
 
     /// <summary>
@@ -2868,101 +2898,81 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
-    /// THE EXACT POST-RECORD FAULT BOUNDARY: a publisher that RECORDS the delivered
-    /// context and then throws its OWN exception type reaches stage S through the REAL gateway, and the
-    /// dispatch rethrows that EXACT instance on the ambiguity-PRESERVE path — while the recorded row
-    /// survives.
+    /// THE POST-RECORD FAULT AT THE GATEWAY BOUNDARY, over the REAL
+    /// <see cref="WorkerAssignmentPublisher"/> and the REAL store: the completed channel makes the
+    /// publisher's own post-record write throw, and the REAL
+    /// <see cref="GrpcWorkerGateway.SendTaskAsync"/> propagates that EXACT fault type instead of
+    /// reporting <see cref="WorkerTaskSendOutcome.Blocked"/> — while the row the publisher recorded
+    /// stays.
     /// </summary>
     /// <remarks>
-    /// THE EXACT-IDENTITY ASSERTION is what a wrapper (or a swallowed Blocked) cannot satisfy: the
-    /// exception observed at the dispatch IS the publisher's own pre-created instance,
-    /// <see cref="PostRecordChannelFaultException"/>, which is not a recording failure and so is never
-    /// converted to <see cref="WorkerTaskSendOutcome.Blocked"/>.
+    /// <para>
+    /// THIS IS THE BOUNDARY HALF ONLY, deliberately NOT the F3 end-to-end proof (that lives in
+    /// <c>DispatchToRole_PostRecordChannelFault_PreservesAndKeepsRecordedContext</c>, which adds the
+    /// real dispatch stage S). It drives the real gateway directly so the delegation contract —
+    /// "a post-record failure is an EXCEPTION, never a Blocked outcome" — is asserted in isolation,
+    /// with the production publisher rather than any recording substitute.
+    /// </para>
+    /// <para>
+    /// THE EXPECTED TYPE IS PINNED EXACTLY: <c>System.Threading.Channels.ChannelClosedException</c> is what a write to a
+    /// completed channel raises, and it is the same type the publisher's own post-record unit test and
+    /// the Ready stream test already pin. Because <c>Assert.ThrowsAsync&lt;T&gt;</c> demands EXACT
+    /// type equality, a wrapper or a re-labelled refusal fails here; <c>Assert.IsNotType&lt;T&gt;</c>
+    /// is kept as a SUPPORTING assertion only.
+    /// </para>
     /// </remarks>
     [Fact]
-    public async Task DispatchToRole_PostRecordFaultPublisher_RethrowsExactExceptionAndKeepsRecord()
+    public async Task SendTaskAsync_RealPublisherPostRecordChannelFault_PropagatesExactTypeAndKeepsRow()
     {
-        var config = CreateConfig();
-        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
-
         var workerPool = new WorkerPool();
-        var idleWorker = workerPool.RegisterWorker("worker-fault-pub", []);
-        var taskQueue = new TaskQueue();
+        var idleWorker = workerPool.RegisterWorker("worker-boundary-fault", []);
         var pipelineManager = new GoalPipelineManager();
 
         using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
-        var faultPublisher = new PostRecordChannelFaultPublisher(pipelineManager, recording.Store);
-        var gateway = new GrpcWorkerGateway(workerPool, faultPublisher);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
 
-        var goal = new Goal
-        {
-            Id = "goal-fault-pub",
-            Description = "post-record fault publisher fixture",
-            RepositoryNames = ["test-repo"],
-        };
-        var pipeline = pipelineManager.CreatePipeline(goal);
+        // THE REAL OWNERSHIP the publisher validates: routing, pointer and a Pending slot at the
+        // delivered task's own position.
+        const string goalId = "goal-boundary-fault";
+        var pipeline = pipelineManager.CreatePipeline(
+            new Goal { Id = goalId, Description = "boundary fault fixture" });
         pipeline.AdvanceTo(GoalPhase.Coding);
-        SetPlan(pipeline, ModelTier.Default);
-        WithControlledNonce(pipeline);
-        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
+        const string taskId = "task-boundary-fault-coder-001-01";
+        var built = pipeline.AllocateAttemptAndRegisterSlot(
+            taskId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        pipeline.SetActiveTask(built.TaskId);
+        pipelineManager.RegisterTask(built.TaskId, goalId);
 
-        var logger = new TestLogger<TaskDispatchService>();
-        var service = CreateService(
-            config: config,
-            pipelineManager: pipelineManager,
-            taskQueue: taskQueue,
-            workerGateway: gateway,
-            goal: goal,
-            logger: logger);
+        var task = new WorkTask
+        {
+            TaskId = built.TaskId,
+            GoalId = goalId,
+            GoalDescription = "boundary fault fixture",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "coder-model",
+            Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+        };
 
-        var thrown = await Assert.ThrowsAsync<PostRecordChannelFaultException>(
-            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        // THE POST-RECORD FAULT IS ARMED: the publisher records first, then its channel write fails.
+        Assert.True(idleWorker.MessageChannel.Writer.TryComplete());
 
-        // THE EXACT ORIGINAL TYPE AND INSTANCE left the dispatch — not a wrapper, not a recording
-        // failure and not a Blocked result.
-        Assert.IsType<PostRecordChannelFaultException>(thrown);
-        Assert.Same(faultPublisher.Fault, thrown);
+        var thrown = await Assert.ThrowsAsync<System.Threading.Channels.ChannelClosedException>(
+            () => gateway.SendTaskAsync(idleWorker.Id, task, TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL TYPE left the gateway — never a Blocked outcome, never a recording failure.
+        Assert.IsType<System.Threading.Channels.ChannelClosedException>(thrown);
         Assert.IsNotType<WorkerAssignmentRecordingException>(thrown);
-        Assert.Equal(1, faultPublisher.RecordCount);
 
-        // THE ONE AMBIGUITY-PRESERVE RECORD fired at stage S, and no publication-success or recovery
-        // record exists. A wrapper thrown by either gateway or dispatch would already have failed the
-        // identity assertion above.
-        var preserve = Assert.Single(
-            logger.LogEntries,
-            e => e.LogLevel == LogLevel.Warning &&
-                 e.Message.Contains($"task={expectedTaskId}", StringComparison.Ordinal) &&
-                 e.Message.Contains("stage=send", StringComparison.Ordinal) &&
-                 e.Message.Contains("recovery=preserve", StringComparison.Ordinal));
-        Assert.Contains("remains active", preserve.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            logger.LogEntries,
-            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
-        Assert.DoesNotContain(
-            logger.LogEntries,
-            e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
-
-        // THE RECORDED ROW SURVIVES with every original delivered value.
-        var row = recording.Store.Load(expectedTaskId);
+        // THE PUBLISHER'S ROW SURVIVES — the record preceded the failed send.
+        var row = recording.Store.Load(taskId);
         Assert.NotNull(row);
-        Assert.Equal("goal-fault-pub", row!.Context.GoalId);
-        Assert.Equal("worker-fault-pub", row.Context.WorkerId);
+        Assert.Equal(goalId, row!.Context.GoalId);
+        Assert.Equal(idleWorker.Id, row.Context.WorkerId);
         Assert.Equal(WorkerRole.Coder, row.Context.Role);
         Assert.Equal("coder-model", row.Context.Model);
-        Assert.Equal(expectedTaskId, row.Context.Slot.TaskId);
+        Assert.Equal(taskId, row.Context.Slot.TaskId);
         Assert.Equal(GoalPhase.Coding, row.Context.Slot.Position.Phase);
-
-        // THE TASK WAS NOT REQUEUED: it remains active, its Pending slot/pointer/mapping and worker
-        // assignment remain intact, and the pending queue is empty.
-        Assert.NotNull(taskQueue.GetActiveTask(expectedTaskId));
-        Assert.Null(taskQueue.TryDequeueAny());
-        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
-        Assert.Same(pipeline, pipelineManager.GetByTaskId(expectedTaskId));
-        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
-        Assert.True(idleWorker.IsBusy);
-        Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
-        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
-        Assert.Equal("coder-model", idleWorker.CurrentModel);
     }
 
     [Fact]
