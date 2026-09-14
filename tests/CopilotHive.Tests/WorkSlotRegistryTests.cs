@@ -2554,9 +2554,68 @@ public sealed class WorkSlotRegistryTests
     private static int ProbeAttempt(GoalPipeline pipeline, WorkSlotPosition position, string probeId = "probe") =>
         pipeline.AllocateAttemptAndRegisterSlot(probeId, position).Attempt;
 
-    /// <summary>The attempt number encoded in the LAST segment of a built task ID.</summary>
-    private static int AttemptFromTaskId(string taskId) =>
-        int.Parse(taskId[(taskId.LastIndexOf('-') + 1)..], CultureInfo.InvariantCulture);
+    // ── THE ALLOCATED-ID SHAPE: readable prefix + '-'-plus-32-lowercase-hex nonce suffix ──
+
+    /// <summary>
+    /// The FIXED width of a built task ID's trailing nonce, INCLUDING its separator: one
+    /// <c>'-'</c> plus the 32 lowercase-hex characters of <see cref="Guid.ToString(string)"/>'s
+    /// <c>"N"</c> format.
+    /// </summary>
+    private const int TaskIdSuffixLength = 33;
+
+    /// <summary>The 32 lowercase-hex characters of the controlled nonce.</summary>
+    private const string LowercaseHexPattern = "^[0-9a-f]{32}$";
+
+    /// <summary>
+    /// The ONE nonce every controlled fixture installs, so the ID a prospective allocation will
+    /// build is exactly reproducible and a seeded collision is genuine rather than hoped for.
+    /// </summary>
+    private static readonly Guid ControlledNonce = new("0123456789abcdef0123456789abcdef");
+
+    /// <summary>The controlled nonce rendered in the ID's <c>"N"</c> (32 lowercase hex) form.</summary>
+    private static string ControlledNonceSuffix => ControlledNonce.ToString("N");
+
+    /// <summary>Installs the controlled nonce on <paramref name="pipeline"/> — the deterministic seam.</summary>
+    private static GoalPipeline WithControlledNonce(GoalPipeline pipeline)
+    {
+        pipeline.TaskIdNonceForTest = () => ControlledNonce;
+        return pipeline;
+    }
+
+    /// <summary>
+    /// The READABLE PREFIX of a built task ID:
+    /// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c>.
+    /// </summary>
+    private static string TaskIdPrefix(string goalId, WorkerRole role, int iteration, int occurrence, int attempt) =>
+        $"{goalId}-{role.ToRoleName()}-{iteration:D3}-{occurrence:D2}-{attempt:D3}";
+
+    /// <summary>
+    /// Asserts the allocated-ID format: the EXACT readable prefix, then <c>'-'</c>, then exactly 32
+    /// lowercase-hex characters — total length prefix + <see cref="TaskIdSuffixLength"/>.
+    /// </summary>
+    private static void AssertSuffixedTaskId(string taskId, string expectedPrefix)
+    {
+        Assert.StartsWith(expectedPrefix + "-", taskId, StringComparison.Ordinal);
+        Assert.Equal(expectedPrefix.Length + TaskIdSuffixLength, taskId.Length);
+
+        var suffix = taskId[(expectedPrefix.Length + 1)..];
+        Assert.Matches(LowercaseHexPattern, suffix);
+    }
+
+    /// <summary>
+    /// The attempt number encoded in a built task ID's <c>{attempt:D3}</c> segment. The ID carries
+    /// a trailing <c>'-'</c>-plus-32-hex nonce, so that suffix is stripped FIRST and the attempt is
+    /// then read from the readable prefix's last dash segment.
+    /// </summary>
+    private static int AttemptFromTaskId(string taskId)
+    {
+        Assert.True(
+            taskId.Length > TaskIdSuffixLength,
+            $"Task ID '{taskId}' is too short to carry a readable prefix plus its nonce suffix.");
+
+        var prefix = taskId[..^TaskIdSuffixLength];
+        return int.Parse(prefix[(prefix.LastIndexOf('-') + 1)..], CultureInfo.InvariantCulture);
+    }
 
     #endregion
 
@@ -2715,7 +2774,7 @@ public sealed class WorkSlotRegistryTests
 
         Assert.Equal(new WorkSlotPosition(1, phase, 1), built.Position);
         Assert.Equal(1, built.Attempt);
-        Assert.Equal($"goal-1-{role.ToRoleName()}-001-01-001", built.TaskId);
+        AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("goal-1", role, 1, 1, 1));
     }
 
     /// <summary>
@@ -2806,7 +2865,7 @@ public sealed class WorkSlotRegistryTests
 
         Assert.Equal(pos, built.Position);
         Assert.Equal(1, built.Attempt);
-        Assert.Equal("goal-1-coder-001-01-001", built.TaskId);
+        AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 1, 1));
         Assert.Equal(2, pipeline.GetSlotsForTest().Count);
     }
 
@@ -2816,12 +2875,17 @@ public sealed class WorkSlotRegistryTests
     /// is free but the ID is taken. The refusal surfaces as the allocation helper's
     /// <see cref="ArgumentException"/> — a DIFFERENT exception type from the slot-integrity
     /// <see cref="WorkSlotException"/>, which is precisely what identifies the rejecting layer.
+    /// <para>
+    /// THE NONCE IS CONTROLLED so the seeded ID is the EXACT prospective one — the collision is
+    /// genuine, not hoped for. The nonce seam is the only way to make the collision deterministic
+    /// now that the ID carries a fresh GUID suffix.
+    /// </para>
     /// </summary>
     [Fact]
     public void Capture_SeededCollidingTaskIdAtDifferentPosition_ThrowsTheHelpersArgumentException()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
-        const string collidingId = "add-auth-coder-002-01-001";
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
+        var collidingId = TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix;
 
         // Parked at a DIFFERENT position (occurrence 7) and DEAD, so only the ID can collide.
         Assert.True(pipeline.SeedSlotForTest(
@@ -2842,13 +2906,18 @@ public sealed class WorkSlotRegistryTests
     /// SEEDED-COLLISION, HONEST FORM 2 — THE LIVE-POSITION REFUSAL. A live seeded slot both owns
     /// the colliding ID AND occupies the position. Only the OUTCOME is asserted (the capture is
     /// refused, nothing is registered); no claim is made about which layer rejected it.
+    /// <para>
+    /// The seeded ID is again the EXACT prospective one, via the controlled nonce, so the
+    /// duplicate-ID arbiter is genuinely armed alongside the live-position rule.
+    /// </para>
     /// </summary>
     [Fact]
     public void Capture_SeededCollidingTaskIdAtSamePosition_IsRefusedWithoutMutation()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
         var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
-        Assert.True(pipeline.SeedSlotForTest("add-auth-coder-002-01-001", pos, 1, WorkSlotState.Pending));
+        var collidingId = TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix;
+        Assert.True(pipeline.SeedSlotForTest(collidingId, pos, 1, WorkSlotState.Pending));
 
         var before = Snapshot(pipeline);
 
@@ -2863,17 +2932,22 @@ public sealed class WorkSlotRegistryTests
     #region (n) The capture — success, IDs, counters and pointer independence
 
     /// <summary>
-    /// THE LOWERCASE ID VECTOR: goal <c>add-auth</c>, iteration 2, occurrence 1, attempt 1 →
-    /// <c>add-auth-coder-002-01-001</c>, with the goal ID embedded VERBATIM.
+    /// THE LOWERCASE ID VECTOR: goal <c>add-auth</c>, iteration 2, occurrence 1, attempt 1 → the
+    /// readable prefix <c>add-auth-coder-002-01-001</c> plus a <c>'-'</c>-plus-32-lowercase-hex
+    /// nonce suffix, with the goal ID embedded VERBATIM in the prefix.
     /// </summary>
     [Fact]
     public void Capture_Success_BuildsTheExactLowercaseTaskId()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
 
         var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
 
-        Assert.Equal("add-auth-coder-002-01-001", built.TaskId);
+        // With the nonce controlled the ID is fully deterministic: prefix + the known suffix.
+        Assert.Equal(
+            TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix,
+            built.TaskId);
+        AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1));
         Assert.StartsWith("add-auth-", built.TaskId, StringComparison.Ordinal);
         Assert.Equal(new WorkSlotPosition(2, GoalPhase.Coding, 1), built.Position);
         Assert.Equal(1, built.Attempt);
@@ -2886,18 +2960,21 @@ public sealed class WorkSlotRegistryTests
     [Fact]
     public void Capture_Success_EmbedsTheGoalIdVerbatim()
     {
-        var pipeline = CaptureFixture("Add_Auth.v2", FullPlan, GoalPhase.Review);
+        var pipeline = WithControlledNonce(CaptureFixture("Add_Auth.v2", FullPlan, GoalPhase.Review));
 
         var built = pipeline.CaptureDispatchPosition(WorkerRole.Reviewer);
 
-        Assert.Equal("Add_Auth.v2-reviewer-001-01-001", built.TaskId);
+        Assert.Equal(
+            TaskIdPrefix("Add_Auth.v2", WorkerRole.Reviewer, 1, 1, 1) + "-" + ControlledNonceSuffix,
+            built.TaskId);
     }
 
     /// <summary>
     /// THE ID-ATTEMPT CONSISTENCY PROOF (the atomic derivation). The attempt parsed out of the
     /// returned task ID equals the returned <c>SlotBuildResult.Attempt</c> equals the committed
     /// counter — for BOTH the 001 vector and the 002 vector. A predicted-then-allocated
-    /// implementation could return <c>…-001</c> with Attempt 2; this pins that it cannot.
+    /// implementation could return a <c>…-001</c> prefix with Attempt 2; this pins that it cannot.
+    /// The parser strips the nonce suffix and reads the readable prefix's attempt segment.
     /// </summary>
     [Fact]
     public void Capture_IdAttemptConsistency_HoldsForBothThe001AndThe002Vector()
@@ -2907,18 +2984,20 @@ public sealed class WorkSlotRegistryTests
 
         // ── The 001 vector: a fresh position ──────────────────────────────────────────
         var first = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
-        Assert.Equal("add-auth-coder-002-01-001", first.TaskId);
+        AssertSuffixedTaskId(first.TaskId, TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1));
         Assert.Equal(1, first.Attempt);
         Assert.Equal(first.Attempt, AttemptFromTaskId(first.TaskId));
 
         // ── The 002 vector: the helper-allocated 001 → the dead transition → the capture ──
+        // The helper takes an EXPLICIT id (its contract is untouched), so the 001 seed is a plain
+        // literal — this allocator never mints, strips or reformats an imported id.
         pipeline.ClearRegistryForTest();
         var helperAllocated = pipeline.AllocateAttemptAndRegisterSlot("add-auth-coder-002-01-001", pos);
         Assert.Equal(1, helperAllocated.Attempt);
         Assert.True(pipeline.ForceSlotStateForTest(helperAllocated.TaskId, WorkSlotState.Recorded));
 
         var second = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
-        Assert.Equal("add-auth-coder-002-01-002", second.TaskId);
+        AssertSuffixedTaskId(second.TaskId, TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 2));
         Assert.Equal(2, second.Attempt);
         Assert.Equal(second.Attempt, AttemptFromTaskId(second.TaskId));
 
@@ -2942,8 +3021,147 @@ public sealed class WorkSlotRegistryTests
 
         var testing = pipeline.CaptureDispatchPosition(WorkerRole.Tester);
         Assert.Equal(1, testing.Attempt);
-        Assert.Equal("goal-1-tester-001-01-001", testing.TaskId);
+        AssertSuffixedTaskId(testing.TaskId, TaskIdPrefix("goal-1", WorkerRole.Tester, 1, 1, 1));
         Assert.Equal(new WorkSlotPosition(1, GoalPhase.Testing, 1), testing.Position);
+    }
+
+    /// <summary>
+    /// THE RESTART-IDENTITY VECTOR (the whole point of the nonce): two FRESH pipelines — each with
+    /// its own restart-reset counters — allocate the SAME goal/role/position at the SAME first
+    /// attempt. Their structured position and attempt are IDENTICAL and both IDs carry the SAME
+    /// readable prefix, yet the two IDs DIFFER: the default <see cref="Guid.NewGuid"/> nonce makes
+    /// a genuinely new attempt in a reset pipeline non-deterministically reuse an earlier ID.
+    /// <para>
+    /// This is collision RESISTANCE, honest about its limits: the suffix is identity evidence, NOT
+    /// a uniqueness guarantee, not durable assignment binding and not restart recovery.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Capture_TwoFreshPipelines_SamePositionAndAttempt_ProduceDistinctSuffixedIds()
+    {
+        var first = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+        var second = CaptureFixture(installedPlan: FullPlan, machinePhase: GoalPhase.Coding);
+
+        // NO nonce seam is installed: both use the PRODUCTION Guid.NewGuid source.
+        Assert.Null(first.TaskIdNonceForTest);
+        Assert.Null(second.TaskIdNonceForTest);
+
+        var firstBuilt = first.CaptureDispatchPosition(WorkerRole.Coder);
+        var secondBuilt = second.CaptureDispatchPosition(WorkerRole.Coder);
+
+        // IDENTICAL structured identity — the very thing a restart would reset.
+        var expectedPosition = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+        Assert.Equal(expectedPosition, firstBuilt.Position);
+        Assert.Equal(expectedPosition, secondBuilt.Position);
+        Assert.Equal(1, firstBuilt.Attempt);
+        Assert.Equal(1, secondBuilt.Attempt);
+
+        // The SAME readable prefix, in both — and a DIFFERENT allocated ID.
+        var expectedPrefix = TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 1, 1);
+        AssertSuffixedTaskId(firstBuilt.TaskId, expectedPrefix);
+        AssertSuffixedTaskId(secondBuilt.TaskId, expectedPrefix);
+        Assert.NotEqual(firstBuilt.TaskId, secondBuilt.TaskId, StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// EVERY ALLOCATION AFTER A RETIREMENT ADVANCES THE COUNTER AND MINTS A FRESH SUFFIX: with the
+    /// production source, three successive allocations at ONE position — each retired as it is
+    /// allocated — produce attempts 1, 2 and 3 with three DISTINCT suffixes and the matching
+    /// readable prefixes. The suffixes are all well-formed 32-lowercase-hex nonces.
+    /// </summary>
+    [Fact]
+    public void Capture_SuccessiveAllocationsAfterRetirement_AdvanceTheCounterAndMintFreshSuffixes()
+    {
+        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
+
+        var ids = new List<string>();
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var built = pipeline.CaptureDispatchPosition(WorkerRole.Coder);
+
+            Assert.Equal(attempt, built.Attempt);
+            Assert.Equal(pos, built.Position);
+            AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, attempt));
+            ids.Add(built.TaskId);
+
+            // Retire so the position is free for the next allocation.
+            Assert.True(pipeline.ForceSlotStateForTest(built.TaskId, WorkSlotState.Recorded));
+        }
+
+        // Three allocations, three DIFFERENT IDs — no suffix reuse across attempts.
+        Assert.Distinct(ids, StringComparer.Ordinal);
+
+        // The committed counter advanced once per allocation.
+        Assert.Equal(4, ProbeAttempt(pipeline, pos, "probe-after-successive-allocations"));
+    }
+
+    /// <summary>
+    /// A CONTROLLED NONCE CANNOT PARTIALLY COMMIT. The nonce is pinned to a value whose prospective
+    /// ID is ALREADY seeded at a different position, so the duplicate-ID refusal fires — and the
+    /// counter and the registry are EXACTLY as they were: no counter advance, no new slot, and the
+    /// seeded slot untouched. A second allocation with a DIFFERENT nonce then succeeds at the SAME
+    /// attempt number, which is the positive proof the refused call consumed nothing.
+    /// </summary>
+    [Fact]
+    public void AllocateWithId_ControlledNonceDuplicateIdRefusal_CommitsNothingAndDoesNotConsumeTheAttempt()
+    {
+        var pipeline = WithControlledNonce(NewPipeline());
+        var pos = Position(occurrence: 1);
+        var otherPos = Position(occurrence: 9);
+
+        var collidingId = TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 1, 1) + "-" + ControlledNonceSuffix;
+        Assert.True(pipeline.SeedSlotForTest(collidingId, otherPos, 1, WorkSlotState.Recorded));
+
+        var before = Snapshot(pipeline);
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => pipeline.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos));
+
+        Assert.IsNotType<WorkSlotException>(ex);
+        Assert.Contains(collidingId, ex.Message, StringComparison.Ordinal);
+
+        // NOTHING COMMITTED: the registry is byte-identical and the counter never advanced.
+        Assert.Equal(before, Snapshot(pipeline));
+
+        // THE POSITIVE PROOF: a different nonce at the SAME position still takes attempt 1 — had
+        // the refused call advanced the counter or written a slot, this would be attempt 2.
+        var otherNonce = new Guid("fedcba9876543210fedcba9876543210");
+        pipeline.TaskIdNonceForTest = () => otherNonce;
+        var built = pipeline.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos);
+
+        Assert.Equal(1, built.Attempt);
+        Assert.Equal(
+            TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 1, 1) + "-" + otherNonce.ToString("N"),
+            built.TaskId);
+    }
+
+    /// <summary>
+    /// THE NONCE IS PER-PIPELINE AND NEVER GLOBAL. Two pipelines may hold DIFFERENT controls at the
+    /// same time, and the explicit-ID overload is entirely UNTOUCHED by the seam: an imported ID —
+    /// legacy or already suffixed — is registered VERBATIM, never reformatted, never given a new
+    /// suffix.
+    /// </summary>
+    [Fact]
+    public void NonceSeam_IsPerPipeline_AndNeverAffectsTheExplicitIdOverload()
+    {
+        var pipelineA = WithControlledNonce(NewPipeline());
+        var pipelineB = WithControlledNonce(NewPipeline());
+
+        // The seam is INSTANCE state — clearing it on one leaves the other alone.
+        pipelineA.TaskIdNonceForTest = null;
+        Assert.Null(pipelineA.TaskIdNonceForTest);
+        Assert.NotNull(pipelineB.TaskIdNonceForTest);
+
+        // The explicit-ID overload takes imported IDs byte-for-byte, nonce or no nonce. Note these
+        // are deliberately DIFFERENT positions, so no double-assignment refusal intervenes.
+        const string legacy = "goal-1-coder-001-01-001";
+        var legacyResult = pipelineB.AllocateAttemptAndRegisterSlot(legacy, Position(occurrence: 1));
+        Assert.Equal(legacy, legacyResult.TaskId);
+
+        const string suffixed = "goal-1-coder-001-02-007-0123456789abcdef0123456789abcdef";
+        var suffixedResult = pipelineB.AllocateAttemptAndRegisterSlot(suffixed, Position(occurrence: 2));
+        Assert.Equal(suffixed, suffixedResult.TaskId);
     }
 
     /// <summary>
@@ -3315,7 +3533,7 @@ public sealed class WorkSlotRegistryTests
             Assert.NotNull(result);
             Assert.Equal(new WorkSlotPosition(1, GoalPhase.Testing, 1), result.Position);
             Assert.Equal(1, result.Attempt);
-            Assert.Equal("goal-1-tester-001-01-001", result.TaskId);
+            AssertSuffixedTaskId(result.TaskId, TaskIdPrefix("goal-1", WorkerRole.Tester, 1, 1, 1));
         }
     }
 
@@ -3655,9 +3873,12 @@ public sealed class WorkSlotRegistryTests
     [Fact]
     public void Capture_ConcurrentSeededLiveCollision_BothThreadsAreRefusedAndNothingChanges()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
         var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
-        Assert.True(pipeline.SeedSlotForTest("add-auth-coder-002-01-001", pos, 1, WorkSlotState.Pending));
+        // The seeded ID is the EXACT prospective one (the controlled nonce makes that possible),
+        // so the duplicate-ID arbiter is genuinely armed alongside the live-position rule.
+        var collidingId = TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix;
+        Assert.True(pipeline.SeedSlotForTest(collidingId, pos, 1, WorkSlotState.Pending));
 
         var before = Snapshot(pipeline);
 
@@ -3702,7 +3923,7 @@ public sealed class WorkSlotRegistryTests
         Assert.Single(pipeline.GetSlotsForTest());
 
         // No attempt was consumed by either refusal.
-        Assert.True(pipeline.ForceSlotStateForTest("add-auth-coder-002-01-001", WorkSlotState.Recorded));
+        Assert.True(pipeline.ForceSlotStateForTest(collidingId, WorkSlotState.Recorded));
         Assert.Equal(1, ProbeAttempt(pipeline, pos, "probe-after-collision"));
     }
 
@@ -3737,11 +3958,12 @@ public sealed class WorkSlotRegistryTests
     [Fact]
     public void Capture_LiveSlotOwningTheProspectiveId_IsRefusedByTheCaptureLevelPreCheck()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
         var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
 
-        // The occupant is LIVE at the position AND owns the exact prospective ID.
-        const string prospectiveId = "add-auth-coder-002-01-001";
+        // The occupant is LIVE at the position AND owns the exact prospective ID — the controlled
+        // nonce makes that literal, so the layer distinction genuinely arms BOTH layers.
+        var prospectiveId = TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix;
         Assert.True(pipeline.SeedSlotForTest(prospectiveId, pos, 1, WorkSlotState.Pending));
 
         var before = Snapshot(pipeline);
@@ -3763,9 +3985,9 @@ public sealed class WorkSlotRegistryTests
     [Fact]
     public void Capture_ClaimedSlotOwningTheProspectiveId_IsRefusedByTheCaptureLevelPreCheck()
     {
-        var pipeline = CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2);
+        var pipeline = WithControlledNonce(CaptureFixture("add-auth", FullPlan, GoalPhase.Coding, iteration: 2));
         var pos = new WorkSlotPosition(2, GoalPhase.Coding, 1);
-        const string prospectiveId = "add-auth-coder-002-01-001";
+        var prospectiveId = TaskIdPrefix("add-auth", WorkerRole.Coder, 2, 1, 1) + "-" + ControlledNonceSuffix;
         Assert.True(pipeline.SeedSlotForTest(prospectiveId, pos, 1, WorkSlotState.Claimed));
 
         var ex = Assert.Throws<WorkSlotException>(() => pipeline.CaptureDispatchPosition(WorkerRole.Coder));
@@ -5049,7 +5271,49 @@ public sealed class WorkSlotRegistryTests
         var built = target.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, pos);
 
         Assert.Equal(6, built.Attempt);
-        Assert.Equal("goal-1-coder-001-02-006", built.TaskId);
+        AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 2, 6));
+    }
+
+    /// <summary>
+    /// MIXED LEGACY / SUFFIXED IDS SURVIVE CAPTURE AND RESTORE EXACTLY. Two task IDs coexist in
+    /// one registry — a LEGACY unsuffixed one and an already-SUFFIXED one — and a capture/restore
+    /// round trip preserves BOTH strings byte-for-byte along with the high-water marks. Nothing
+    /// strips, normalises or re-mints a suffix, and a later allocation at the restored position
+    /// continues from the high water with a FRESH suffix at the NEXT attempt.
+    /// </summary>
+    [Fact]
+    public void Restore_MixedLegacyAndSuffixedIds_PreserveExactIdsAndHighestWater_NextAllocationTakesTheNextAttempt()
+    {
+        const string legacyId = "goal-1-coder-001-01-001";
+        var suffixedId = TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 2, 3) + "-" + ControlledNonceSuffix;
+
+        var posA = Position(occurrence: 1);
+        var posB = Position(occurrence: 2);
+
+        var source = FreshTarget();
+        source.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [View(legacyId, posA, 1, WorkSlotState.Recorded), View(suffixedId, posB, 3, WorkSlotState.Recorded)],
+            [Entry(posA, 1), Entry(posB, 3)]));
+
+        // THE ROUND TRIP: capture and restore into a fresh target.
+        var target = FreshTarget();
+        target.RestoreRegistry(source.CaptureRegistry());
+
+        var restored = ViewsOf(target.CaptureRegistry());
+        Assert.Contains(new WorkSlotView(new WorkSlot(legacyId, posA, 1), WorkSlotState.Recorded), restored);
+        Assert.Contains(new WorkSlotView(new WorkSlot(suffixedId, posB, 3), WorkSlotState.Recorded), restored);
+
+        // The high-water marks survived: the next allocation at posB is attempt 4 with a FRESH
+        // suffix, i.e. NOT the restored ID and NOT an attempt inferred from anything else.
+        var built = target.AllocateAttemptAndRegisterSlotWithId("goal-1", WorkerRole.Coder, posB);
+
+        Assert.Equal(4, built.Attempt);
+        AssertSuffixedTaskId(built.TaskId, TaskIdPrefix("goal-1", WorkerRole.Coder, 1, 2, 4));
+        Assert.NotEqual(suffixedId, built.TaskId, StringComparer.Ordinal);
+
+        // …and the restored legacy id is still present, untouched, alongside the new one.
+        Assert.Contains(legacyId, target.GetSlotsForTest().Select(v => v.Slot.TaskId));
+        Assert.Equal(3, target.GetSlotsForTest().Count);
     }
 
     // ── 5. Duplicate / invalid import rejections ──────────────────────────────────────

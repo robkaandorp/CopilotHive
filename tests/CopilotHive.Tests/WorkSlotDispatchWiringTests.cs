@@ -242,8 +242,51 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
     private readonly List<string> _tempDirectories = [];
 
-    private static string ExpectedTaskId(string goalId, WorkerRole role, int iteration = 1, int occurrence = 1, int attempt = 1) =>
+    // ── THE ALLOCATED-TASK-ID SHAPE: readable prefix + '-'-plus-32-lowercase-hex nonce ──
+
+    /// <summary>
+    /// THE CONTROLLED NONCE. A vector that must name the EXACT id a prospective dispatch will
+    /// allocate (so its seed genuinely collides) installs this on the pipeline it owns; every
+    /// other vector reads the ACTUAL id production allocated out of the settled admission. The
+    /// nonce is PER-PIPELINE instance state — no global override, no environment toggle.
+    /// </summary>
+    private static readonly Guid ControlledNonce = new("0123456789abcdef0123456789abcdef");
+
+    private static string ControlledNonceSuffix => ControlledNonce.ToString("N");
+
+    private static GoalPipeline WithControlledNonce(GoalPipeline pipeline)
+    {
+        pipeline.TaskIdNonceForTest = () => ControlledNonce;
+        return pipeline;
+    }
+
+    /// <summary>
+    /// The READABLE PREFIX of a built task ID:
+    /// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c>.
+    /// </summary>
+    private static string TaskIdPrefix(string goalId, WorkerRole role, int iteration = 1, int occurrence = 1, int attempt = 1) =>
         $"{goalId}-{role.ToRoleName()}-{iteration:D3}-{occurrence:D2}-{attempt:D3}";
+
+    /// <summary>
+    /// Asserts the allocated-ID format: the EXACT readable prefix, then <c>'-'</c>, then exactly 32
+    /// lowercase-hex characters — total length prefix + 33.
+    /// </summary>
+    private static void AssertSuffixedTaskId(string taskId, string expectedPrefix)
+    {
+        Assert.StartsWith(expectedPrefix + "-", taskId, StringComparison.Ordinal);
+        Assert.Equal(expectedPrefix.Length + 33, taskId.Length);
+        Assert.Matches("^[0-9a-f]{32}$", taskId[(expectedPrefix.Length + 1)..]);
+    }
+
+    /// <summary>
+    /// The id the dispatch ACTUALLY admitted: the single registered slot's task id. Used by every
+    /// vector whose assertions concern an admission that completed (or was rolled back with its
+    /// slot kept), so nothing is hand-computed from the old unsuffixed format.
+    /// </summary>
+    private static string SettledTaskId(GoalPipeline pipeline) => SingleSlot(pipeline).Slot.TaskId;
+
+    private static string ExpectedTaskId(string goalId, WorkerRole role, int iteration = 1, int occurrence = 1, int attempt = 1) =>
+        TaskIdPrefix(goalId, role, iteration, occurrence, attempt);
 
     private static string AbandonedRegistrationMessage(string goalId, string taskId, int iteration, GoalPhase phase, int occurrence) =>
         $"WorkSlotIntegrity: abandoned-registration goal={goalId} task={taskId} " +
@@ -304,8 +347,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var logger = new TestLogger<TaskDispatchService>();
         var service = CreateService(manager, queue, logger);
 
-        var expectedTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
-
         WorkTask? enqueued = null;
         // Observations taken AT CALLBACK ENTRY — i.e. at the instant Enqueue was entered.
         IReadOnlyList<WorkSlotView> slotsAtEntry = [];
@@ -325,7 +366,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
         Assert.NotNull(enqueued);
-        Assert.Equal(expectedTaskId, enqueued!.TaskId);
+
+        // THE ACTUAL allocated id — read from the settled admission, never hand-computed.
+        var expectedTaskId = enqueued!.TaskId;
+        AssertSuffixedTaskId(expectedTaskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // (1) THE CAPTURE had already allocated the live slot before Enqueue was entered.
         var slotAtEntry = Assert.Single(slotsAtEntry);
@@ -432,8 +476,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         WorkTask? enqueued = null;
         queue.OnEnqueue = t => enqueued = t;
 
-        // The task ID the capture WOULD have built for the first attempt at this position.
-        var wouldBeTaskId = ExpectedTaskId(GoalId, role);
+        // The READABLE PREFIX the capture would have used for the first attempt at this position.
+        // The refusal mints NO id, so absence is asserted by prefix for the registry and by the
+        // canonical prospective id for the mapping surface.
+        var wouldBePrefix = ExpectedTaskId(GoalId, role);
         // BEFORE: the registry snapshot the refusal must leave untouched.
         var slotsBefore = SlotSnapshot(pipeline);
 
@@ -443,11 +489,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Contains(logger.LogEntries, e => e.LogLevel == LogLevel.Warning && e.Message == expected);
 
         // AFTER: the registry is EXACTLY as before — no slot allocated for the refused position,
-        // and no pre-existing slot's state disturbed.
+        // and no pre-existing slot's state disturbed. No slot carries the prospective prefix.
         Assert.Equal(slotsBefore, SlotSnapshot(pipeline));
-        Assert.DoesNotContain(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == wouldBeTaskId);
+        Assert.DoesNotContain(
+            pipeline.GetSlotsForTest(),
+            s => s.Slot.TaskId.StartsWith(wouldBePrefix + "-", StringComparison.Ordinal));
 
         // No mapping was claimed — neither in the manager's memory nor in the store.
+        var wouldBeTaskId = wouldBePrefix + "-" + ControlledNonceSuffix;
         Assert.Null(manager.GetByTaskId(wouldBeTaskId));
         Assert.Null(ReadPersistedGoalId(wouldBeTaskId));
         Assert.Empty(ReadAllPersistedTaskIds());
@@ -488,7 +537,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // The ORIGINAL TaskBuilder failure, not the registration wrapper.
         Assert.Contains("No repositories configured", ex.Message, StringComparison.Ordinal);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Null(manager.GetByTaskId(taskId));
@@ -511,13 +561,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     public async Task Dispatch_RegistrationDuplicate_ThrowsExactMessageWithNullInner()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
-        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        var pipeline = WithControlledNonce(manager.CreatePipeline(CreateGoal(GoalId)));
         Arrange(pipeline, GoalPhase.Coding);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
-        // Another goal already owns the IN-MEMORY mapping the admission is about to claim, so
-        // PersistAdmission refuses with MemoryConflict — the register is memory-only now, so the
-        // persisted row is seeded separately for the untouched-competitor assertion below.
+        // THE NONCE IS CONTROLLED so the competing mapping is seeded for the EXACT id the dispatch
+        // will allocate — the duplicate/occupied-mapping refusal stays genuinely armed. The register
+        // is memory-only now, so the persisted row is seeded separately for the untouched-competitor
+        // assertion below.
+        var taskId = TaskIdPrefix(GoalId, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
         manager.CreatePipeline(CreateGoal("goal-other"));
         manager.RegisterTask(taskId, "goal-other");
         SeedPersistedMapping(taskId, "goal-other");
@@ -573,7 +624,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the slot is retained (Abandoned) after the refusal.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.Equal(
             $"Task mapping registration failed for {taskId} (goal {GoalId}) — the mapping is occupied or the persistence failed",
             ex.Message);
@@ -626,7 +679,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // Exception IDENTITY: the original instance, never a wrapper.
         Assert.Same(sentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(manager.GetByTaskId(taskId));
         Assert.Null(ReadPersistedGoalId(taskId));
@@ -673,13 +727,15 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     public async Task Dispatch_EnqueueThrows_AbandonPrecedesUnregisterPrecedesPointerClear()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
-        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        var pipeline = WithControlledNonce(manager.CreatePipeline(CreateGoal(GoalId)));
         Arrange(pipeline, GoalPhase.Coding);
 
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE NONCE IS CONTROLLED so the logger's slot probe names the EXACT id the dispatch will
+        // allocate — the a/b boundary observation stays real.
+        var taskId = TaskIdPrefix(GoalId, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
         // THE PROBES read production state live at every log event: the pipeline's own pointer and
         // the slot's state straight out of the registry seam (null until the capture allocates it).
         var logger = new RollbackProbingLogger<TaskDispatchService>(
@@ -771,7 +827,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id, read from the settled slot (never hand-computed).
+        var taskId = SettledTaskId(pipeline);
 
         // THE SETUP PROOF: OUR registration had already succeeded when the enqueue was entered.
         Assert.Equal(GoalId, mappedGoalAtEntry);
@@ -814,7 +871,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(enqueueSentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id, read from the settled slot (never hand-computed).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         Assert.Contains(logger.LogEntries, e =>
             e.LogLevel == LogLevel.Debug &&
@@ -865,11 +924,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue();
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
-        // THE SEAM: throws ONLY at the dispatch-owned unregister-result DEBUG template — the
-        // guarded site under test. The earlier abandoned-registration emission (a WARNING with a
-        // different template) must therefore SUCCEED, which is what makes its presence below a
-        // real ordering proof rather than a vacuous one.
+        // THE ACTUAL allocated id is resolved AFTER the dispatch — the slot survives the rollback
+        // (Abandoned), so the single registered slot names it. The logger's predicate below keys on
+        // the TEMPLATE, not the id, so ordering the resolution after the act is sound.
         var logger = new SelectivelyThrowingLogger<TaskDispatchService>(
             m => m.Contains("WorkSlotIntegrity: unregister goal=", StringComparison.Ordinal));
         var service = CreateService(manager, queue, logger);
@@ -892,6 +949,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // THE TWO-EXCEPTION DISTINCTION: the ORIGINAL sentinel is what left the dispatch —
         // the logger's exception is nowhere.
         Assert.Same(sentinel, thrown);
+
+        // THE ACTUAL allocated id — the rollback retained the slot (Abandoned).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // THE SWALLOW HAPPENED (the guarded site really was reached)…
         Assert.Contains(
@@ -950,7 +1011,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         // The newer pointer survives; our own slot and mapping are still released.
         Assert.Equal("newer-task", pipeline.ActiveTaskId);
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var taskId = SettledTaskId(pipeline);
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(manager.GetByTaskId(taskId));
     }
@@ -982,7 +1043,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         Arrange(pipeline, GoalPhase.Coding);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue();
         var logger = new TestLogger<TaskDispatchService>();
@@ -990,10 +1050,13 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         // OBSERVED INSIDE Enqueue: the admission has committed, so the DURABLE pointer names this
         // task at the moment the rollback is about to run. This makes the post-hoc null assertion
-        // a real state CHANGE rather than a value that was never set.
+        // a real state CHANGE rather than a value that was never set. The callback also records the
+        // ACTUAL allocated id, so the assertions below never depend on a hand-computed string.
         string? persistedPointerAtEnqueue = null;
-        queue.OnEnqueue = _ =>
+        string? taskIdAtEnqueue = null;
+        queue.OnEnqueue = t =>
         {
+            taskIdAtEnqueue = t.TaskId;
             persistedPointerAtEnqueue = ReadPersistedActiveTaskId(GoalId);
             throw sentinel;
         };
@@ -1002,8 +1065,11 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
-        // THE COMMIT REALLY HAPPENED (the E3 precondition CommittedThisInvocation was true).
-        Assert.Equal(taskId, persistedPointerAtEnqueue);
+        // THE COMMIT REALLY HAPPENED (the E3 precondition CommittedThisInvocation was true), under
+        // the id this dispatch actually allocated.
+        Assert.NotNull(taskIdAtEnqueue);
+        AssertSuffixedTaskId(taskIdAtEnqueue!, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.Equal(taskIdAtEnqueue, persistedPointerAtEnqueue);
 
         // E3'S EFFECT: the DURABLE column is NULL.
         Assert.Null(ReadPersistedActiveTaskId(GoalId));
@@ -1011,7 +1077,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // The rest of the rollback still ran, and no rollback-failure was recorded.
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
-        Assert.Null(ReadPersistedGoalId(taskId));
+        Assert.Null(ReadPersistedGoalId(taskIdAtEnqueue!));
         Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
     }
 
@@ -1027,7 +1093,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         Arrange(pipeline, GoalPhase.Coding);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue();
         var logger = new TestLogger<TaskDispatchService>();
@@ -1048,7 +1113,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // THE OWNERSHIP CHECK HELD: the competitor's durable pointer is untouched.
         Assert.Equal("newer-durable-task", ReadPersistedActiveTaskId(GoalId));
 
-        // NotMatched is the correct completion, NOT a failure — no pointer-rollback record.
+        // NotMatched is the correct completion, NOT a failure — no pointer-rollback record. The id
+        // is the ACTUAL allocated one (read from the settled slot).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.DoesNotContain(
             Warnings(logger), m => m == RollbackFailureMessage(GoalId, taskId, "pointer-rollback"));
 
@@ -1077,7 +1145,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         Arrange(pipeline, GoalPhase.Coding);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue { OnEnqueue = _ => throw enqueueSentinel };
         var logger = new TestLogger<TaskDispatchService>();
@@ -1090,6 +1157,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // never a wrapper.
         Assert.Same(enqueueSentinel, thrown);
         Assert.NotSame(updateSentinel, thrown);
+
+        // THE ACTUAL allocated id, read from the settled slot (never hand-computed).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // THE RECORD, rendered verbatim at WARNING.
         Assert.Contains(
@@ -1122,21 +1193,24 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     [Fact]
     public async Task Dispatch_EnqueueThrows_RunsE3BetweenMappingRemovalAndPointerClear()
     {
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
         var logger = new TestLogger<TaskDispatchService>();
 
         // The observation runs INSIDE E3's own statement, so whatever it sees is the state
-        // between E2 and E4 by construction.
+        // between E2 and E4 by construction. It needs the ACTUAL id, which is only knowable BEFORE
+        // the dispatch via the CONTROLLED nonce — resolved from the settled slot AFTERWARDS and
+        // compared below, so the observation is pinned to a real id rather than a guess.
         GoalPipeline? pipeline = null;
         string? mappingOwnerDuringE3 = null;
         string? memoryPointerDuringE3 = null;
+        string? taskIdDuringE3 = null;
         var e3Observed = false;
         var observer = new PipelinesPointerUpdateObserver(() =>
         {
             e3Observed = true;
-            mappingOwnerDuringE3 = ReadPersistedGoalId(taskId);
+            taskIdDuringE3 = pipeline!.ActiveTaskId;
+            mappingOwnerDuringE3 = taskIdDuringE3 is null ? null : ReadPersistedGoalId(taskIdDuringE3);
             memoryPointerDuringE3 = pipeline!.ActiveTaskId;
         });
 
@@ -1152,6 +1226,11 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         // E3 REALLY RAN (the vacuity guard: without it both observations stay null).
         Assert.True(e3Observed, "E3's persisted-pointer UPDATE must have been issued");
+
+        // THE ID THE DISPATCH ALLOCATED: observed live at E3, and equal to the settled slot's id.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.Equal(taskId, taskIdDuringE3);
 
         // E2 PRECEDED E3: the mapping row was already gone when E3's UPDATE ran.
         Assert.Null(mappingOwnerDuringE3);
@@ -1179,7 +1258,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
         Arrange(pipeline, GoalPhase.Coding);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
         var sentinel = new InvalidOperationException("enqueue-sentinel");
         var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
         var logger = new TestLogger<TaskDispatchService>();
@@ -1188,6 +1266,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
+
+        // THE ACTUAL allocated id, read from the settled slot (never hand-computed).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // NO pointer-rollback record: the step was skipped, not attempted and failed.
         Assert.DoesNotContain(
@@ -1224,7 +1306,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id (the admission stands, so the live slot names it).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         // The admission stands: slot live, mapping ours, pointer set.
         Assert.Equal(WorkSlotState.Pending, SingleSlot(pipeline).State);
         Assert.Same(pipeline, manager.GetByTaskId(taskId));
@@ -1258,7 +1342,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         var dispatched = queue.TryDequeueAny();
         Assert.NotNull(dispatched);
         if (taskStillActive)
@@ -1296,7 +1381,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var firstTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder, attempt: 1);
+        var firstTaskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(firstTaskId, TaskIdPrefix(GoalId, WorkerRole.Coder, attempt: 1));
         var dispatched = queue.TryDequeueAny();
         Assert.NotNull(dispatched);
         queue.Activate(dispatched!, "worker-dead");
@@ -1314,7 +1400,11 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var logger = new TestLogger<TaskDispatchService>();
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it again", TestContext.Current.CancellationToken);
 
-        var secondTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder, attempt: 2);
+        // THE ACTUAL second id: the replacement's slot is the LIVE (Pending) one, and its id is the
+        // id the fresh capture allocated — attempt 2 with its OWN fresh suffix.
+        var secondTaskId = Assert.Single(pipeline.GetSlotsForTest(), s => s.State == WorkSlotState.Pending).Slot.TaskId;
+        AssertSuffixedTaskId(secondTaskId, TaskIdPrefix(GoalId, WorkerRole.Coder, attempt: 2));
+        Assert.NotEqual(firstTaskId, secondTaskId, StringComparer.Ordinal);
         Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == secondTaskId).State);
         Assert.Equal(WorkSlotState.Abandoned, Assert.Single(pipeline.GetSlotsForTest(), s => s.Slot.TaskId == firstTaskId).State);
         Assert.Same(pipeline, manager.GetByTaskId(secondTaskId));
@@ -1340,7 +1430,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         var dispatched = queue.TryDequeueAny();
         Assert.NotNull(dispatched);
         queue.Activate(dispatched!, "worker-dead");
@@ -1386,7 +1477,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var firstTaskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL first id — the dispatch admitted it, so the live slot names it.
+        var firstTaskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(firstTaskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         var dispatched = queue.TryDequeueAny();
         Assert.NotNull(dispatched);
         queue.Activate(dispatched!, "worker-dead");
@@ -1418,7 +1511,20 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // THE REPLACEMENT flows: a fresh dispatch in the restarted round claims its mapping IN
         // MEMORY (the register is memory-only since the admission-atomic-switch; persistence
         // belongs to the admission path), and the replacement's completion resolves the pipeline.
-        const string replacementTaskId = "goal-wiring-coder-001-01-002";
+        // The replacement id is a REAL allocated id from the allocator itself — never a
+        // hand-computed string. NOTE the RESTART-IDENTITY shape this pins: the restored pipeline's
+        // counters restarted, so the replacement's attempt is 1 AGAIN, over the SAME readable
+        // prefix — and its id is nevertheless DISTINCT from the first task's, because a genuinely
+        // new allocation mints its own nonce suffix. That is collision RESISTANCE, not restart
+        // recovery: no ID is replayed and no assignment is durably bound.
+        var restoredPipeline = restartedManager.GetByGoalId(GoalId);
+        Assert.NotNull(restoredPipeline);
+        var replacement = restoredPipeline!.AllocateAttemptAndRegisterSlotWithId(
+            GoalId, WorkerRole.Coder, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        Assert.Equal(1, replacement.Attempt);
+        AssertSuffixedTaskId(replacement.TaskId, TaskIdPrefix(GoalId, WorkerRole.Coder, attempt: 1));
+        var replacementTaskId = replacement.TaskId;
+        Assert.NotEqual(firstTaskId, replacementTaskId, StringComparer.Ordinal);
         restartedManager.RegisterTask(replacementTaskId, GoalId);
         await restartedCompletion.HandleTaskCompletionAsync(
             new TaskResult
@@ -1555,7 +1661,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id (the admission stands, so the live slot names it).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.Equal([taskId], gateway.SentTaskIds);
         Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
         Assert.NotNull(queue.GetActiveTask(taskId));
@@ -1603,7 +1711,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id (the admission stands, so the live slot names it).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         // The agents-md send WAS attempted and DID throw — the stage really ran.
         Assert.Equal(1, gateway.AgentsUpdateAttempts);
         Assert.Equal([taskId], gateway.SentTaskIds);
@@ -1650,7 +1760,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // (i) THE THROW DOES NOT ESCAPE the dispatch.
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id (the admission stands, so the live slot names it).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         // The indirect path really was exercised — otherwise this test proves nothing.
         Assert.Equal(1, gateway.AgentsUpdateAttempts);
         Assert.True(logger.ThrewAtLeastOnce, "the maintenance path's logger must actually have thrown");
@@ -1711,7 +1823,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // not before the admission.
         Assert.Equal(1, gateway.IdleWorkerProbes);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id: the admission stands (the requeue does not retire the slot), so
+        // the live slot names it.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         var guardLine = DeliveryRecoveryMessage(GoalId, taskId);
         var failureLine = DeliveryFailureMessage(
             GoalId, taskId, worker.Id, "cancel-check", "requeue", RequeueOutcome);
@@ -1790,7 +1905,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         Assert.Equal(1, gateway.IdleWorkerProbes);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the rollback retained the slot (Abandoned), so the single
+        // registered slot names it.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // THE RULE: no guard line, because the Enqueue call did NOT return normally.
         Assert.DoesNotContain(
@@ -1862,7 +1980,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         // The competitor's value SURVIVES: the restore refused to write over it.
         Assert.Equal(WorkerRole.Reviewer, worker.Role);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the rollback retained the slot (Abandoned).
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         // The rest of the recovery still ran exactly as usual.
         Assert.Contains(logger.LogEntries, e => e.Message == DeliveryRecoveryMessage(GoalId, taskId));
         Assert.Contains(logger.LogEntries, e =>
@@ -1904,7 +2024,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the PRESERVE left the slot live, so it names the id.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // THE PRESERVE: still active, never sent, and NOT put back on the pending queue.
         Assert.NotNull(queue.GetActiveTask(taskId));
@@ -1947,7 +2069,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the admission stands, so the live slot names it.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
         Assert.True(logger.ThrewAtLeastOnce, "the throwing diagnostic must actually have been reached");
         // The dequeued task reached the worker — it was never stranded by the diagnostic failure.
         Assert.Equal([taskId], gateway.SentTaskIds);
@@ -2044,7 +2168,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         DeliveryWorkerGateway gateway,
         ConnectedWorker worker)
     {
-        var taskId = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL allocated id — the send PRESERVE left the slot live, so it names the id.
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
 
         // THE PRESERVE: active, busy, model set, Role left on the delivered task's role.
         Assert.NotNull(queue.GetActiveTask(taskId));
@@ -2089,7 +2215,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var serviceA = CreateService(manager, queue, loggerA, goal: CreateGoal("goal-a"));
         await serviceA.DispatchToRole(pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
 
-        var taskA = ExpectedTaskId("goal-a", WorkerRole.Coder);
+        // THE ACTUAL first id: the admitted slot names it.
+        var taskA = SettledTaskId(pipelineA);
+        AssertSuffixedTaskId(taskA, TaskIdPrefix("goal-a", WorkerRole.Coder));
 
         // Pipeline B now dispatches WITH an idle worker — and the FIFO hands it A's task.
         var pipelineB = manager.CreatePipeline(CreateGoal(GoalId));
@@ -2105,7 +2233,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             () => serviceB.DispatchToRole(pipelineB, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken));
         Assert.Same(sentinel, thrown);
 
-        var taskB = ExpectedTaskId(GoalId, WorkerRole.Coder);
+        // THE ACTUAL second id: B's admission stands (its slot is live), so it names the id.
+        var taskB = SettledTaskId(pipelineB);
+        AssertSuffixedTaskId(taskB, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.NotEqual(taskA, taskB, StringComparer.Ordinal);
 
         // THE MISMATCH RECORD: the DELIVERED goal, plus BOTH task IDs.
         Assert.Contains(loggerB.LogEntries, e =>

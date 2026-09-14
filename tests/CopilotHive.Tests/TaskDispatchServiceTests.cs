@@ -372,6 +372,20 @@ namespace CopilotHive.Tests;
 /// </summary>
 public sealed class TaskDispatchServiceTests
 {
+    // ── The allocated-task-ID shape (shared with the credential suite below) ──
+
+    private static string ControlledNonceSuffix => AllocatedTaskId.ControlledNonceSuffix;
+
+    private static GoalPipeline WithControlledNonce(GoalPipeline pipeline) =>
+        AllocatedTaskId.WithControlledNonce(pipeline);
+
+    private static string TaskIdPrefix(string goalId, WorkerRole role,
+        int iteration = 1, int occurrence = 1, int attempt = 1) =>
+        AllocatedTaskId.Prefix(goalId, role, iteration, occurrence, attempt);
+
+    private static void AssertSuffixedTaskId(string taskId, string expectedPrefix) =>
+        AllocatedTaskId.AssertSuffixed(taskId, expectedPrefix);
+
     // ── ResolveRepositories ───────────────────────────────────────────────
 
     [Fact]
@@ -1377,7 +1391,7 @@ public sealed class TaskDispatchServiceTests
         report += "TRAILING-EVIDENCE-AT-END: all 636 tests green.";
 
         // The tester task must be admitted so the completion path accepts the result.
-        var testerTaskId = $"{pipeline.GoalId}-tester-001-01-001";
+        var testerTaskIdPrefix = $"{pipeline.GoalId}-tester-001-01-001";
         pipeline.CoderBranch = "feature/test-branch"; // seed so the tester task has BranchInfo
 
         var dispatched = new List<WorkTask>();
@@ -1385,7 +1399,7 @@ public sealed class TaskDispatchServiceTests
 
         await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
         var dispatchedTesterId = Assert.Single(dispatched).TaskId;
-        Assert.Equal(testerTaskId, dispatchedTesterId);
+        AssertSuffixedTaskId(dispatchedTesterId, testerTaskIdPrefix);
 
         // The current Testing phase entry (created by the real dispatch path, or seeded here when
         // the fixture dispatched manually): DriveNextPhaseAsync writes the WorkerOutput onto the
@@ -1416,8 +1430,10 @@ public sealed class TaskDispatchServiceTests
         var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
         Assert.Equal(report, testingEntry.WorkerOutput);
 
-        // The reviewer task dispatched by the driver carries the same FULL report verbatim.
-        var reviewerTask = dispatched.Single(t => t.TaskId.EndsWith("reviewer-001-01-001"));
+        // The reviewer task dispatched by the driver carries the same FULL report verbatim. The
+        // SELECTOR matches the reader-visible prefix (the ID itself now carries a nonce suffix).
+        var reviewerTask = dispatched.Single(t => t.TaskId.StartsWith(
+            $"{pipeline.GoalId}-reviewer-001-01-001-", StringComparison.Ordinal));
         Assert.Equal(WorkerRole.Reviewer, reviewerTask.Role);
         Assert.True(reviewerTask.Metadata.ContainsKey("tester_report"));
         Assert.Equal(report, reviewerTask.Metadata["tester_report"]);
@@ -1472,7 +1488,8 @@ public sealed class TaskDispatchServiceTests
         var testingEntry = Assert.Single(pipeline.PhaseLog, e => e.Name == GoalPhase.Testing);
         Assert.Equal(report, testingEntry.WorkerOutput);
 
-        var reviewerTask = dispatched.FirstOrDefault(t => t.TaskId.EndsWith("reviewer-001-01-001"));
+        var reviewerTask = dispatched.FirstOrDefault(t => t.TaskId.StartsWith(
+            $"{pipeline.GoalId}-reviewer-001-01-001-", StringComparison.Ordinal));
         if (reviewerTask is not null)
             Assert.Equal(report, reviewerTask.Metadata["tester_report"]);
     }
@@ -1679,7 +1696,7 @@ public sealed class TaskDispatchServiceTests
         // ── HOP 1: the REAL dispatch admits the tester task ──────────────
         await service.DispatchToRole(pipeline, WorkerRole.Tester, "Test it", TestContext.Current.CancellationToken);
         var testerTaskId = Assert.Single(dispatched).TaskId;
-        Assert.Equal($"{pipeline.GoalId}-tester-001-01-001", testerTaskId);
+        AssertSuffixedTaskId(testerTaskId, $"{pipeline.GoalId}-tester-001-01-001");
 
         // The CURRENT Testing phase entry the driver writes its WorkerOutput onto.
         pipeline.PhaseLog.Add(new PhaseResult
@@ -1891,7 +1908,11 @@ public sealed class TaskDispatchServiceTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
 
-        var refusedTaskId = $"{pipeline.GoalId}-coder-001-01-001";
+        // THE ACTUAL captured id — the refusal rolls the slot back to Abandoned but keeps it
+        // registered, so the single slot IS the id the dispatch allocated (never a hand-computed
+        // unsuffixed string, which would no longer match the nonce-suffixed id).
+        var refusedTaskId = Assert.Single(pipeline.GetSlotsForTest()).Slot.TaskId;
+        AssertSuffixedTaskId(refusedTaskId, TaskIdPrefix(pipeline.GoalId, WorkerRole.Coder));
         Assert.Equal(
             $"Task mapping registration failed for {refusedTaskId} (goal {pipeline.GoalId}) — " +
             "the pipeline already has an active task (an overlapping dispatch refused)",
@@ -1950,13 +1971,16 @@ public sealed class TaskDispatchServiceTests
         var pipeline = pipelineManager.CreatePipeline(goal);
         pipeline.AdvanceTo(GoalPhase.Coding);
         SetPlan(pipeline, ModelTier.Default);
+        // THE NONCE IS CONTROLLED so the foreign mapping is seeded for the EXACT id this dispatch
+        // will allocate — the ownership-checked rollback assertion below is genuinely armed.
+        WithControlledNonce(pipeline);
 
         // A CAPTURING logger so the abandoned-registration emission is assertable — the escape
         // flow must produce the same slot-release record as the R1–R5 flow.
         var logger = new TestLogger<TaskDispatchService>();
         var service = CreateService(config, pipelineManager, taskQueue, logger);
 
-        var expectedTaskId = $"{pipeline.GoalId}-coder-001-01-001";
+        var expectedTaskId = TaskIdPrefix(pipeline.GoalId, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
 
         // AN INDEPENDENTLY OWNED MAPPING for the very task id this dispatch will use. The
         // rollback's unregister is OWNERSHIP-CHECKED, so it must leave this foreign claim intact.
@@ -2033,11 +2057,13 @@ public sealed class TaskDispatchServiceTests
         var (service, pipeline, taskQueue, pipelineManager) = CreateServiceWithPipelineAndManager(
             GoalPhase.Coding, config, ModelTier.Default);
 
-        var expectedTaskId = $"{pipeline.GoalId}-coder-001-01-001";
+        var expectedTaskId = TaskIdPrefix(pipeline.GoalId, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
         Assert.Null(pipeline.CoderBranch);
 
         // A FOREIGN in-memory mapping for this task id makes PersistAdmission refuse with
-        // MemoryConflict AFTER the claim has already assigned CoderBranch.
+        // MemoryConflict AFTER the claim has already assigned CoderBranch. The nonce is controlled
+        // so the foreign mapping is seeded for the EXACT id the dispatch will allocate.
+        WithControlledNonce(pipeline);
         pipelineManager.CreatePipeline(new Goal
         {
             Id = "goal-conflict-owner",
@@ -2225,9 +2251,10 @@ public sealed class TaskDispatchServiceTests
 
         await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
 
-        // Task was enqueued with the attempt-stamped ID the capture allocated.
+        // Task was enqueued with the attempt-stamped ID the capture allocated: the readable prefix
+        // plus a fresh nonce suffix.
         Assert.NotNull(enqueuedTask);
-        Assert.Equal($"{goal.Id}-coder-001-01-001", enqueuedTask!.TaskId);
+        AssertSuffixedTaskId(enqueuedTask!.TaskId, TaskIdPrefix(goal.Id, WorkerRole.Coder));
 
         // Task was registered in pipeline manager (taskId → goalId mapping)
         var lookupPipeline = pipelineManager.GetByTaskId(enqueuedTask.TaskId);
@@ -2266,8 +2293,11 @@ public sealed class TaskDispatchServiceTests
         var pipeline = pipelineManager.CreatePipeline(goal);
         pipeline.AdvanceTo(GoalPhase.Coding);
         SetPlan(pipeline, ModelTier.Default);
+        // THE NONCE IS CONTROLLED so the competing mapping is seeded for the EXACT id this dispatch
+        // will allocate, keeping the occupied-mapping refusal genuinely armed.
+        WithControlledNonce(pipeline);
 
-        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
         var otherGoal = new Goal { Id = $"goal-other-{Guid.NewGuid():N}", Description = "Other" };
         pipelineManager.CreatePipeline(otherGoal);
         pipelineManager.RegisterTask(expectedTaskId, otherGoal.Id);
@@ -3100,8 +3130,11 @@ public sealed class TaskDispatchServiceTests
         var pipeline = pipelineManager.CreatePipeline(goal);
         pipeline.AdvanceTo(GoalPhase.Coding);
         SetPlan(pipeline, ModelTier.Default);
+        // THE NONCE IS CONTROLLED so the competing mapping is seeded for the EXACT id this dispatch
+        // will allocate, keeping the occupied-mapping refusal genuinely armed.
+        WithControlledNonce(pipeline);
 
-        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
         var otherGoal = new Goal { Id = $"goal-other-{Guid.NewGuid():N}", Description = "Other" };
         pipelineManager.CreatePipeline(otherGoal);
         pipelineManager.RegisterTask(expectedTaskId, otherGoal.Id);
@@ -3189,8 +3222,10 @@ public sealed class TaskDispatchServiceTests
         Assert.Same(enqueueSentinel, thrown);
 
         // THE EXISTING BRANCH REALLY FIRED: the store's delete was forced to fail, so the
-        // unregister returned (true, false) — the DEBUG record shows it…
-        var expectedTaskId = $"{goal.Id}-coder-001-01-001";
+        // unregister returned (true, false) — the DEBUG record shows it… The id is the ACTUAL one
+        // the dispatch allocated (read from the settled slot, never a hand-computed string).
+        var expectedTaskId = Assert.Single(pipeline.GetSlotsForTest()).Slot.TaskId;
+        AssertSuffixedTaskId(expectedTaskId, TaskIdPrefix(goal.Id, WorkerRole.Coder));
         Assert.Contains(
             logger.SeenMessages,
             m => m == $"WorkSlotIntegrity: unregister goal={goal.Id} task={expectedTaskId} memoryRemoved=True persistenceRemoved=False");
@@ -3318,6 +3353,48 @@ public sealed class TaskDispatchServiceTests
         public Task UpdateGoalStatusAsync(
             string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
             Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// THE ALLOCATED-TASK-ID FORMAT used by both dispatch suites: the readable prefix
+/// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c>, then <c>'-'</c>, then
+/// exactly 32 lowercase-hex characters minted from the pipeline's per-instance nonce.
+/// <para>
+/// The CONTROLLED nonce is what lets a vector know the EXACT prospective id BEFORE dispatching —
+/// only that makes an advanced foreign-mapping seed a genuine collision. It is installed on the
+/// pipeline under test; there is no global/static override and no environment toggle.
+/// </para>
+/// </summary>
+internal static class AllocatedTaskId
+{
+    /// <summary>The one controlled nonce every deterministic fixture installs.</summary>
+    internal static readonly Guid ControlledNonce = new("0123456789abcdef0123456789abcdef");
+
+    /// <summary>The controlled nonce in the id's 32-lowercase-hex (<c>"N"</c>) form.</summary>
+    internal static string ControlledNonceSuffix => ControlledNonce.ToString("N");
+
+    /// <summary>Installs the controlled nonce on <paramref name="pipeline"/> and returns it.</summary>
+    internal static GoalPipeline WithControlledNonce(GoalPipeline pipeline)
+    {
+        pipeline.TaskIdNonceForTest = () => ControlledNonce;
+        return pipeline;
+    }
+
+    /// <summary>The READABLE PREFIX of a built task id.</summary>
+    internal static string Prefix(string goalId, WorkerRole role,
+        int iteration = 1, int occurrence = 1, int attempt = 1) =>
+        $"{goalId}-{role.ToRoleName()}-{iteration:D3}-{occurrence:D2}-{attempt:D3}";
+
+    /// <summary>
+    /// Asserts the allocated-id FORMAT: the exact readable prefix, then <c>'-'</c>, then exactly 32
+    /// lowercase-hex characters (total length = prefix + 33).
+    /// </summary>
+    internal static void AssertSuffixed(string taskId, string expectedPrefix)
+    {
+        Assert.StartsWith(expectedPrefix + "-", taskId, StringComparison.Ordinal);
+        Assert.Equal(expectedPrefix.Length + 33, taskId.Length);
+        Assert.Matches("^[0-9a-f]{32}$", taskId[(expectedPrefix.Length + 1)..]);
     }
 }
 
@@ -3785,12 +3862,18 @@ public sealed class TaskDispatchCredentialTests
     private static void AssertNoAdmission(
         GoalPipeline pipeline, TaskQueue queue, GoalPipelineManager manager, List<WorkTask> enqueued)
     {
+        // NO SLOT means the capture never ran, so no task id was ever minted and the dispatch could
+        // not have claimed ANY mapping. The manager's API resolves by an exact id, so the probe uses
+        // BOTH canonical forms of the prospective id — the nonce-suffixed one the allocator would
+        // produce and the legacy unsuffixed one — and both must resolve to nothing.
         Assert.Empty(pipeline.GetSlotsForTest());
         Assert.Null(pipeline.ActiveTaskId);
         Assert.Empty(enqueued);
         Assert.Null(queue.TryDequeueAny());
-        var expectedTaskId = $"{pipeline.GoalId}-coder-001-01-001";
-        Assert.Null(manager.GetByTaskId(expectedTaskId));
+
+        var prefix = AllocatedTaskId.Prefix(pipeline.GoalId, WorkerRole.Coder);
+        Assert.Null(manager.GetByTaskId(prefix + "-" + AllocatedTaskId.ControlledNonceSuffix));
+        Assert.Null(manager.GetByTaskId(prefix));
     }
 
     // ── (7) THE POST-LOOKUP RECHECK — the cancellation the lookup never reports ──
