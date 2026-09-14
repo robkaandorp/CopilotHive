@@ -299,9 +299,9 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
 
     /// <summary>
     /// Bug-1 regression (iteration 2): the env-revert step (<c>RevertProvisionedToOperatorSnapshot</c>)
-    /// calls <c>_writeEnv</c>, which CAN throw. The iteration-1 code cleared
-    /// <c>_provisionedConfigRepoUrl</c> AFTER that fallible revert, so a mid-revert write failure
-    /// left a STALE URL in place. The fix clears the URL BEFORE the fallible revert.
+    /// writes through the environment provenance's writer, which CAN throw. The iteration-1 code
+    /// cleared <c>_provisionedConfigRepoUrl</c> AFTER that fallible revert, so a mid-revert write
+    /// failure left a STALE URL in place. The fix clears the URL BEFORE the fallible revert.
     /// <para>
     /// This test provisions a URL, then drives an RPC failure whose env-revert throws mid-way
     /// (the first provisioned variable's write throws). The exception propagates (the revert is
@@ -323,8 +323,8 @@ public sealed class WorkerConfigProvisionerConfigRepoUrlTests
         var fetch = new FetchController();
         var prov = CreateThrowing(env, fetch);
 
-        // 1. A successful provision: LLM_PROVIDER is provisioned (so it is in _provisionedVars
-        //    and will be reverted), and a config-repo URL is captured.
+        // 1. A successful provision: LLM_PROVIDER is provisioned (so the shared provenance tracks
+        //    it as owned and will revert it), and a config-repo URL is captured.
         var successResponse = new GetWorkerConfigResponse
         {
             ConfigRepoUrl = "https://github.com/org/stale-url.git",

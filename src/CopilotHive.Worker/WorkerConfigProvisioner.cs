@@ -27,6 +27,17 @@ namespace CopilotHive.Worker;
 /// previously-provisioned value for an operator override.
 /// </para>
 /// <para>
+/// <b>Provenance is OWNED BY THE PROCESS, not by one attempt.</b> The snapshot and the
+/// provisioned-variable tracking live in a <see cref="WorkerProvisioningEnvironment"/>, which the
+/// worker process creates ONCE and shares across its SEQUENTIAL connection attempts (see
+/// <c>Program.cs</c>). A worker runs a fresh attempt after a transport failure, so if each attempt
+/// snapshotted for itself the second attempt would read the FIRST attempt's server-provisioned
+/// values out of the environment and promote them to operator authority. Sharing the provenance
+/// keeps ORIGINAL operator values authoritative for the whole process while everything else
+/// remains per-attempt: each provisioner still owns its own response provenance
+/// (<see cref="ProvisionedConfigRepoUrl"/> and the in-memory provisioned token) and its own fetch.
+/// </para>
+/// <para>
 /// <b>Whitespace is absence</b> for every provisioned variable, both in the snapshot and in the
 /// provisioning response.
 /// </para>
@@ -87,20 +98,32 @@ public sealed class WorkerConfigProvisioner
         LlmProviderVar, OllamaUrlVar, OllamaApiKeyVar, OllamaModelVar, GitHubModelVar,
     ];
 
+    /// <summary>
+    /// Every variable the operator snapshot tracks: both token aliases, the config-repo URL and
+    /// every setting variable. The snapshot is taken through
+    /// <see cref="WorkerProvisioningEnvironment.EnsureSnapshot"/>, which consults this list only
+    /// for the FIRST caller of the process.
+    /// </summary>
+    private static readonly string[] SnapshotVars =
+    [
+        GhTokenVar, GitHubTokenVar, ConfigRepoUrlVar,
+        .. SettingVars,
+    ];
+
     private readonly Func<GetWorkerConfigRequest, CancellationToken, Task<GetWorkerConfigResponse>> _fetch;
-    private readonly Func<string, string?> _readEnv;
-    private readonly Action<string, string?> _writeEnv;
     private readonly string _workerId;
     private readonly WorkerLogger _log = new("Provisioning");
 
     /// <summary>
-    /// The worker environment as it looked BEFORE the first provisioning call. Populated exactly
-    /// once by <see cref="EnsureSnapshot"/>; <c>null</c> until then.
+    /// THE ENVIRONMENT PROVENANCE this provisioner works through: the ONE operator snapshot, the
+    /// set of variables currently owned by a provisioner, and the read/write delegates they are
+    /// expressed in terms of. It is the WORKER PROCESS's object — created once and shared across
+    /// sequential connection attempts by <c>Program.cs</c> — so an attempt that applied
+    /// server-provisioned values can never be re-read by a later attempt as if the operator had
+    /// supplied them. A provisioner that constructed its own isolated state (the PUBLIC
+    /// constructor) keeps the previous per-instance behavior.
     /// </summary>
-    private Dictionary<string, string?>? _operatorSnapshot;
-
-    /// <summary>Variables currently holding a value written by this provisioner.</summary>
-    private readonly HashSet<string> _provisionedVars = new(StringComparer.Ordinal);
+    private readonly WorkerProvisioningEnvironment _environment;
 
     /// <summary>
     /// The most recently provisioned non-whitespace <c>config_repo_url</c> from the response, or
@@ -131,7 +154,10 @@ public sealed class WorkerConfigProvisioner
     private string? _provisionedGithubToken;
 
     /// <summary>
-    /// Creates a provisioner.
+    /// Creates a provisioner backed by its OWN isolated <see cref="WorkerProvisioningEnvironment"/>:
+    /// the operator snapshot and provisioned-variable tracking are private to this instance, and
+    /// nothing is shared. This is the PUBLIC constructor, unchanged in shape for callers that want
+    /// the per-instance behavior (and the <c>readEnv</c>/<c>writeEnv</c> seams they always had).
     /// </summary>
     /// <param name="workerId">The worker's identifier, sent with the request for orchestrator-side logging.</param>
     /// <param name="fetch">Performs the <c>GetWorkerConfig</c> unary RPC.</param>
@@ -142,11 +168,28 @@ public sealed class WorkerConfigProvisioner
         Func<GetWorkerConfigRequest, CancellationToken, Task<GetWorkerConfigResponse>> fetch,
         Func<string, string?>? readEnv = null,
         Action<string, string?>? writeEnv = null)
+        : this(workerId, fetch, new WorkerProvisioningEnvironment(readEnv, writeEnv))
+    {
+    }
+
+    /// <summary>
+    /// THE SHARED-PROVENANCE constructor: creates a provisioner over the WORKER PROCESS's
+    /// environment provenance, so ORIGINAL operator values stay authoritative across the
+    /// SEQUENTIAL connection attempts the process makes. The state object is taken AS IS — there
+    /// are deliberately no competing delegate overrides here and no mutable public setters, so
+    /// this path cannot be pointed at a second reader/writer for the same process.
+    /// </summary>
+    /// <param name="workerId">The worker's identifier, sent with the request for orchestrator-side logging.</param>
+    /// <param name="fetch">Performs the <c>GetWorkerConfig</c> unary RPC.</param>
+    /// <param name="environment">The worker process's shared environment provenance.</param>
+    internal WorkerConfigProvisioner(
+        string workerId,
+        Func<GetWorkerConfigRequest, CancellationToken, Task<GetWorkerConfigResponse>> fetch,
+        WorkerProvisioningEnvironment environment)
     {
         _workerId = workerId;
         _fetch = fetch ?? throw new ArgumentNullException(nameof(fetch));
-        _readEnv = readEnv ?? Environment.GetEnvironmentVariable;
-        _writeEnv = writeEnv ?? ((name, value) => Environment.SetEnvironmentVariable(name, value));
+        _environment = environment ?? throw new ArgumentNullException(nameof(environment));
     }
 
     /// <summary>
@@ -182,8 +225,7 @@ public sealed class WorkerConfigProvisioner
         get
         {
             EnsureSnapshotTaken();
-            var operatorUrl = _operatorSnapshot!.TryGetValue(ConfigRepoUrlVar, out var op) ? op : null;
-            return operatorUrl ?? _provisionedConfigRepoUrl;
+            return _environment.OperatorValue(ConfigRepoUrlVar) ?? _provisionedConfigRepoUrl;
         }
     }
 
@@ -225,8 +267,8 @@ public sealed class WorkerConfigProvisioner
         // and returns the selected candidate unchanged.
         return GitCredentialResolver.Resolve(
             _provisionedGithubToken,
-            _readEnv(GhTokenVar),
-            _readEnv(GitHubTokenVar));
+            _environment.Read(GhTokenVar),
+            _environment.Read(GitHubTokenVar));
     }
 
     /// <summary>
@@ -369,25 +411,19 @@ public sealed class WorkerConfigProvisioner
     /// <summary>
     /// Restores every currently-provisioned variable to the value captured in the pre-first-fetch
     /// operator snapshot, removing it entirely when the operator had not set it. A variable that
-    /// was operator-provided in the snapshot is never in <see cref="_provisionedVars"/> to begin
-    /// with, so an initial operator value can never be touched here.
+    /// was operator-provided in the snapshot is never in the provisioned set to begin with, so an
+    /// initial operator value can never be touched here.
     /// </summary>
     /// <returns>The NAMES of the variables that were reverted, for logging.</returns>
     private List<string> RevertProvisionedToOperatorSnapshot()
     {
         var reverted = new List<string>();
 
-        // Copy first: the loop mutates the set.
-        foreach (var name in _provisionedVars.ToArray())
+        foreach (var name in _environment.ProvisionedNames)
         {
             // Null restores the operator value when one existed, else removes the variable.
-            var operatorValue = _operatorSnapshot is not null
-                && _operatorSnapshot.TryGetValue(name, out var snapshot)
-                ? snapshot
-                : null;
-
-            _writeEnv(name, operatorValue);
-            _provisionedVars.Remove(name);
+            _environment.Write(name, _environment.OperatorValue(name));
+            _environment.UnmarkProvisioned(name);
             reverted.Add(name);
         }
 
@@ -440,24 +476,13 @@ public sealed class WorkerConfigProvisioner
 
     /// <summary>
     /// Captures the operator-provided environment exactly once, BEFORE the first provisioning
-    /// call, so no retry can mistake a previously-provisioned value for an operator override.
+    /// call, so no later provisioning — in THIS attempt or in a LATER ONE sharing the same
+    /// provenance — can mistake a previously-provisioned value for an operator override.
     /// <c>CONFIG_REPO_URL</c> is registered as a tracked variable so operator-vs-provisioned
     /// tracking works for the config repo URL; a provisioned <c>CONFIG_REPO_URL</c> is NEVER
     /// written back to the environment (the env only ever carries the operator value).
     /// </summary>
-    private void EnsureSnapshot()
-    {
-        if (_operatorSnapshot is not null) return;
-
-        _operatorSnapshot = new Dictionary<string, string?>(StringComparer.Ordinal)
-        {
-            [GhTokenVar] = Normalize(_readEnv(GhTokenVar)),
-            [GitHubTokenVar] = Normalize(_readEnv(GitHubTokenVar)),
-            [ConfigRepoUrlVar] = Normalize(_readEnv(ConfigRepoUrlVar)),
-        };
-        foreach (var name in SettingVars)
-            _operatorSnapshot[name] = Normalize(_readEnv(name));
-    }
+    private void EnsureSnapshot() => _environment.EnsureSnapshot(SnapshotVars);
 
     /// <summary>
     /// Guards the config-repo accessors: the operator snapshot must exist before any accessor
@@ -466,7 +491,7 @@ public sealed class WorkerConfigProvisioner
     /// </summary>
     private void EnsureSnapshotTaken()
     {
-        if (_operatorSnapshot is null)
+        if (!_environment.HasSnapshot)
             throw new InvalidOperationException(
                 "The environment snapshot has not been taken yet — call EnsureProvisionedAsync before using the config-repo accessors.");
     }
@@ -474,10 +499,7 @@ public sealed class WorkerConfigProvisioner
     /// <summary>
     /// Whether the operator supplied this variable before any provisioning happened.
     /// </summary>
-    private bool IsOperatorProvided(string name) =>
-        _operatorSnapshot is not null
-        && _operatorSnapshot.TryGetValue(name, out var value)
-        && value is not null;
+    private bool IsOperatorProvided(string name) => _environment.IsOperatorProvided(name);
 
     /// <summary>
     /// Applies the token under alias precedence: an operator value in EITHER alias suppresses
@@ -505,16 +527,16 @@ public sealed class WorkerConfigProvisioner
 
         if (provisioned is not null)
         {
-            _writeEnv(name, provisioned);
-            _provisionedVars.Add(name);
+            _environment.Write(name, provisioned);
+            _environment.MarkProvisioned(name);
             applied.Add(name);
             return;
         }
 
-        // No longer provisioned: clear the value this provisioner previously wrote.
-        if (_provisionedVars.Remove(name))
+        // No longer provisioned: clear the value a provisioner previously wrote.
+        if (_environment.UnmarkProvisioned(name))
         {
-            _writeEnv(name, null);
+            _environment.Write(name, null);
             cleared.Add(name);
         }
     }
@@ -526,8 +548,9 @@ public sealed class WorkerConfigProvisioner
     {
         CredentialRequirement.None => true,
         CredentialRequirement.GitHubTokenAlias =>
-            Normalize(_readEnv(GhTokenVar)) is not null || Normalize(_readEnv(GitHubTokenVar)) is not null,
-        CredentialRequirement.OllamaApiKey => Normalize(_readEnv(OllamaApiKeyVar)) is not null,
+            Normalize(_environment.Read(GhTokenVar)) is not null
+            || Normalize(_environment.Read(GitHubTokenVar)) is not null,
+        CredentialRequirement.OllamaApiKey => Normalize(_environment.Read(OllamaApiKeyVar)) is not null,
         _ => throw new InvalidOperationException($"Unhandled credential requirement '{requirement}'."),
     };
 

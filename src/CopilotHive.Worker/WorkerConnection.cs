@@ -54,12 +54,21 @@ internal sealed class WorkerConnection
     /// connection with NO provisioner at all, which selects the legacy, seam-free executor path for
     /// direct-loop tests. Production always leaves this <c>true</c>.
     /// </param>
+    /// <param name="provisioningEnvironment">
+    /// The WORKER PROCESS's shared environment provenance, threaded from the attempt-construction
+    /// path into the production provisioner. <c>null</c> gives this connection its OWN isolated
+    /// provenance, which is the previous per-connection behavior (and what the focused fixtures
+    /// that build a connection themselves keep). Only the environment snapshot and the
+    /// provisioned-variable tracking are shared: this connection's identity, client, stream and
+    /// provisioner all stay its own.
+    /// </param>
     internal WorkerConnection(
         string assignedId,
         HiveOrchestrator.HiveOrchestratorClient client,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         WorkerConfigProvisioner? provisionerOverride = null,
-        bool includeProductionProvisioner = true)
+        bool includeProductionProvisioner = true,
+        WorkerProvisioningEnvironment? provisioningEnvironment = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(assignedId);
         ArgumentNullException.ThrowIfNull(client);
@@ -69,7 +78,9 @@ internal sealed class WorkerConnection
         Client = client;
         Stream = stream;
         Provisioner = provisionerOverride
-            ?? (includeProductionProvisioner ? CreateProductionProvisioner() : null);
+            ?? (includeProductionProvisioner
+                ? CreateProductionProvisioner(provisioningEnvironment)
+                : null);
     }
 
     /// <summary>
@@ -177,13 +188,22 @@ internal sealed class WorkerConnection
     /// <summary>
     /// The production provisioner for this connection: constructed with THIS connection's assigned
     /// identity and a fetch that goes through THIS connection's checked access, so it can never be
-    /// pointed at another registration's client or identity.
+    /// pointed at another registration's client or identity. The ENVIRONMENT PROVENANCE it works
+    /// through is shared from the attempt-construction path when one was supplied, and is otherwise
+    /// a fresh ISOLATED one belonging to this connection alone.
     /// </summary>
     /// <remarks>
     /// Called ONLY from the constructor. The fetch delegate captures <c>this</c>, and the only way
     /// to reach the delegate is through this object — which the service does not publish until
     /// construction has completed, so no partially built connection is ever observable.
     /// </remarks>
-    private WorkerConfigProvisioner CreateProductionProvisioner() =>
-        new(AssignedId, (request, token) => FetchWorkerConfigAsync(request, token));
+    /// <param name="provisioningEnvironment">
+    /// The shared worker-process provenance, taken AS IS; <c>null</c> builds an isolated one.
+    /// </param>
+    private WorkerConfigProvisioner CreateProductionProvisioner(
+        WorkerProvisioningEnvironment? provisioningEnvironment) =>
+        new(
+            AssignedId,
+            (request, token) => FetchWorkerConfigAsync(request, token),
+            provisioningEnvironment ?? new WorkerProvisioningEnvironment());
 }

@@ -25,6 +25,50 @@ public sealed class WorkerService(
     private readonly string _configRepoDir = configRepoDir;
     private readonly WorkerLogger _log = new("Worker");
 
+    /// <summary>
+    /// THE WORKER PROCESS'S ENVIRONMENT PROVENANCE. The <c>Program.cs</c> attempt loop creates ONE
+    /// of these OUTSIDE the loop and passes that EXACT object to EVERY service it constructs, so the
+    /// operator snapshot and the provisioned-variable tracking survive across the process's
+    /// SEQUENTIAL connection attempts: an attempt that applied server-provisioned values can never
+    /// be re-read by a later attempt as if the operator had supplied them.
+    /// <para>
+    /// The OTHER public constructor leaves this as a FRESH, ISOLATED object, which is the previous
+    /// per-service behavior and keeps every existing caller (and focused fixture) unchanged. Only
+    /// provenance is shared; identity, client, stream, provisioner and response provenance all stay
+    /// per-connection.
+    /// </para>
+    /// </summary>
+    private readonly WorkerProvisioningEnvironment _provisioningEnvironment = new();
+
+    /// <summary>
+    /// THE ATTEMPT-CONSTRUCTION PATH. <c>Program.cs</c> creates ONE
+    /// <see cref="WorkerProvisioningEnvironment"/> OUTSIDE its retry loop and builds EVERY attempt's
+    /// service through here, passing that exact object — so the operator snapshot and the
+    /// provisioned-variable tracking are the PROCESS's, shared by all of its SEQUENTIAL attempts,
+    /// while everything else (runner, send gate, heartbeat, connection) stays per-attempt.
+    /// <para>
+    /// The state object is taken AS IS: no delegate override is accepted here, so this path cannot
+    /// be pointed at a second reader/writer for the same process.
+    /// </para>
+    /// </summary>
+    /// <param name="orchestratorUrl">The orchestrator's gRPC endpoint.</param>
+    /// <param name="workerId">The locally configured worker id.</param>
+    /// <param name="capabilities">The worker's advertised capabilities.</param>
+    /// <param name="provisioningEnvironment">The worker process's shared environment provenance.</param>
+    /// <param name="configRepoDir">The config repository directory for this attempt.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="provisioningEnvironment"/> is <c>null</c>.</exception>
+    internal WorkerService(
+        string orchestratorUrl,
+        string workerId,
+        string[] capabilities,
+        WorkerProvisioningEnvironment provisioningEnvironment,
+        string configRepoDir = "/config-repo")
+        : this(orchestratorUrl, workerId, capabilities, configRepoDir)
+    {
+        _provisioningEnvironment = provisioningEnvironment
+            ?? throw new ArgumentNullException(nameof(provisioningEnvironment));
+    }
+
     // Pending tool calls awaiting orchestrator responses, keyed by request_id
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
 
@@ -235,8 +279,14 @@ public sealed class WorkerService(
         //    Registration happens BEFORE the operator may have completed OAuth sign-in, so the
         //    provisioning fetch is deliberately NOT performed here. It runs immediately before every
         //    first LLM client creation, by which time a token committed after sign-in is visible.
+        //
+        //    The connection also receives THIS SERVICE's environment provenance — the process-lifetime
+        //    object the attempt-construction path supplied — so the production provisioner's operator
+        //    snapshot is the PROCESS's, not this attempt's. Nothing else is shared: the connection
+        //    still owns its identity, client, stream and provisioner.
         var connection = new WorkerConnection(
-            assignedId, client, stream, provisionerOverride: TestProvisioner);
+            assignedId, client, stream, provisionerOverride: TestProvisioner,
+            provisioningEnvironment: _provisioningEnvironment);
 
         // 4. PUBLISH — only now that construction has fully succeeded, and BEFORE the initial Ready
         //    and before any assignment processing.
