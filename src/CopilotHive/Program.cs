@@ -277,6 +277,31 @@ public sealed class Program
             builder.Services.AddDbContextFactory<CopilotHiveDbContext>(options =>
                 options.UseSqlite($"Data Source={dbPath}"));
 
+            // Assignment recording: the INSERT-ONCE worker-assignment-context store and the
+            // Ready-driven publisher that records a delivered assignment and only then publishes it.
+            //
+            // The store is FACTORY-ONLY: it owns one short-lived context per operation, created
+            // through the IDbContextFactory registration immediately above (there is deliberately no
+            // borrowed-context mode), so it must be constructed from the factory rather than bound to
+            // a context instance.
+            //
+            // The publisher is registered BOTH as the concrete type and as its narrow interface,
+            // resolved to the SAME singleton instance (the existing WorkerPool/IWorkerPool pattern).
+            // The concrete registration is the mandatory production recorder — the interface is only
+            // the injection seam, never a replacement for it, and there is no fallback to a raw
+            // channel write when no publisher is available.
+            builder.Services.AddSingleton(sp =>
+                new WorkerAssignmentContextStore(
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<WorkerAssignmentContextStore>>()));
+            builder.Services.AddSingleton(sp =>
+                new WorkerAssignmentPublisher(
+                    sp.GetRequiredService<GoalPipelineManager>(),
+                    sp.GetRequiredService<WorkerPool>(),
+                    sp.GetRequiredService<WorkerAssignmentContextStore>()));
+            builder.Services.AddSingleton<IWorkerAssignmentPublisher>(sp =>
+                sp.GetRequiredService<WorkerAssignmentPublisher>());
+
             // Backup service: creates tar.gz archives of runtime state
             builder.Services.AddSingleton(sp =>
                 new BackupService(stateDir,
