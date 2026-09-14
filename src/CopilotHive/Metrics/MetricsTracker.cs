@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging;
 namespace CopilotHive.Metrics;
 
 /// <summary>
-/// Loads, records, and compares per-iteration metrics, persisting each entry as a JSON file.
+/// Loads and records per-iteration metrics, persisting each entry as a JSON file.
 /// </summary>
 public sealed class MetricsTracker
 {
@@ -54,49 +54,6 @@ public sealed class MetricsTracker
             metrics.Iteration, metrics.PassedTests, metrics.TotalTests, metrics.CoveragePercent);
     }
 
-    /// <summary>
-    /// Compares the given metrics with the previous iteration, if one exists.
-    /// </summary>
-    /// <param name="current">The current iteration's metrics.</param>
-    /// <returns>A <see cref="MetricsComparison"/>, or <c>null</c> when fewer than two iterations have been recorded.</returns>
-    public MetricsComparison? CompareWithPrevious(IterationMetrics current)
-    {
-        if (_history.Count < 2)
-            return null;
-
-        var previous = _history[^2];
-        return new MetricsComparison
-        {
-            Previous = previous,
-            Current = current,
-            CoverageDelta = current.CoveragePercent - previous.CoveragePercent,
-            TestCountDelta = current.TotalTests - previous.TotalTests,
-            PassRateDelta = current.PassRate - previous.PassRate,
-        };
-    }
-
-    /// <summary>
-    /// Returns <c>true</c> when coverage or pass-rate has regressed relative to the previous iteration.
-    /// </summary>
-    /// <param name="current">The current iteration's metrics to evaluate.</param>
-    /// <returns><c>true</c> if regression is detected; otherwise <c>false</c>.</returns>
-    public bool HasRegressed(IterationMetrics current)
-    {
-        var comparison = CompareWithPrevious(current);
-        if (comparison is null)
-            return false;
-
-        // If current extraction produced no test data, skip the test regression check entirely
-        if (current.TotalTests == 0)
-        {
-            _logger?.LogWarning("Test metrics not extracted (TotalTests=0); skipping test regression check");
-            return comparison.CoverageDelta < -1.0;
-        }
-
-        // Regression: coverage dropped OR pass rate dropped
-        return comparison.CoverageDelta < -1.0 || comparison.PassRateDelta < -0.05;
-    }
-
     private void LoadHistory()
     {
         if (!Directory.Exists(_metricsPath))
@@ -113,25 +70,4 @@ public sealed class MetricsTracker
                 _history.Add(metrics);
         }
     }
-}
-
-/// <summary>
-/// Holds the result of comparing two consecutive iteration metrics.
-/// </summary>
-public sealed class MetricsComparison
-{
-    /// <summary>Metrics from the previous iteration.</summary>
-    public required IterationMetrics Previous { get; init; }
-    /// <summary>Metrics from the current iteration.</summary>
-    public required IterationMetrics Current { get; init; }
-    /// <summary>Change in coverage percentage (positive = improved).</summary>
-    public double CoverageDelta { get; init; }
-    /// <summary>Change in the total test count (positive = more tests).</summary>
-    public int TestCountDelta { get; init; }
-    /// <summary>Change in pass rate (positive = improved).</summary>
-    public double PassRateDelta { get; init; }
-
-    /// <summary>Returns a human-readable summary of coverage, test count, and pass-rate deltas.</summary>
-    public override string ToString() =>
-        $"Coverage: {CoverageDelta:+0.0;-0.0}%, Tests: {TestCountDelta:+0;-0}, PassRate: {PassRateDelta:+0.00;-0.00}";
 }

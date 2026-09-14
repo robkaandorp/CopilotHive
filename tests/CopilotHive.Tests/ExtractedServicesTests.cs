@@ -520,118 +520,6 @@ public sealed class GoalLifecycleServiceTests
         Assert.Empty(pipeline.Metrics.AgentsMdVersions);
     }
 
-    // ── GetModifiedRoles ─────────────────────────────────────────────────────
-
-    [Fact]
-    public void GetModifiedRoles_NewVersion_ReturnsModifiedRole()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"metrics-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var metricsTracker = new MetricsTracker(tempDir, NullLogger<MetricsTracker>.Instance);
-            metricsTracker.RecordIteration(new IterationMetrics
-            {
-                Iteration = 1,
-                AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v001" },
-            });
-            metricsTracker.RecordIteration(new IterationMetrics
-            {
-                Iteration = 2,
-                AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v002" },
-            });
-
-            var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
-            var pipeline = new GoalPipeline(goal);
-            pipeline.Metrics.AgentsMdVersions["coder"] = "v002";
-
-            var service = new GoalLifecycleService(
-                goalManager: new GoalManager(),
-                logger: NullLogger<GoalLifecycleService>.Instance,
-                metricsTracker: metricsTracker);
-
-            var modified = service.GetModifiedRoles(pipeline.Metrics);
-
-            Assert.Contains(WorkerRole.Coder, modified);
-        }
-        finally
-        {
-            TestHelpers.ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    [Fact]
-    public void GetModifiedRoles_NoChange_ReturnsEmpty()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"metrics-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            var metricsTracker = new MetricsTracker(tempDir, NullLogger<MetricsTracker>.Instance);
-            metricsTracker.RecordIteration(new IterationMetrics
-            {
-                Iteration = 1,
-                AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v001" },
-            });
-            metricsTracker.RecordIteration(new IterationMetrics
-            {
-                Iteration = 2,
-                AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v001" },
-            });
-
-            var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
-            var pipeline = new GoalPipeline(goal);
-            pipeline.Metrics.AgentsMdVersions["coder"] = "v001";
-
-            var service = new GoalLifecycleService(
-                goalManager: new GoalManager(),
-                logger: NullLogger<GoalLifecycleService>.Instance,
-                metricsTracker: metricsTracker);
-
-            var modified = service.GetModifiedRoles(pipeline.Metrics);
-
-            Assert.Empty(modified);
-        }
-        finally
-        {
-            TestHelpers.ForceDeleteDirectory(tempDir);
-        }
-    }
-
-    [Fact]
-    public void GetModifiedRoles_InsufficientHistory_ReturnsEmpty()
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), $"metrics-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(tempDir);
-        try
-        {
-            // Only 1 entry in history — need at least 2 for comparison
-            var metricsTracker = new MetricsTracker(tempDir, NullLogger<MetricsTracker>.Instance);
-            metricsTracker.RecordIteration(new IterationMetrics
-            {
-                Iteration = 1,
-                AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v001" },
-            });
-
-            var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
-            var pipeline = new GoalPipeline(goal);
-            pipeline.Metrics.AgentsMdVersions["coder"] = "v002";
-
-            var service = new GoalLifecycleService(
-                goalManager: new GoalManager(),
-                logger: NullLogger<GoalLifecycleService>.Instance,
-                metricsTracker: metricsTracker);
-
-            var modified = service.GetModifiedRoles(pipeline.Metrics);
-
-            Assert.Empty(modified);
-        }
-        finally
-        {
-            TestHelpers.ForceDeleteDirectory(tempDir);
-        }
-    }
-
     // ── MarkGoalFailedAsync ──────────────────────────────────────────────────
 
     [Fact]
@@ -764,6 +652,269 @@ public sealed class GoalLifecycleServiceTests
         await service.MarkGoalCompletedAsync(pipeline, TestContext.Current.CancellationToken);
 
         Assert.Equal(0, notificationCount);
+    }
+
+    // ── MarkGoalCompletedAsync end-to-end (no automatic AGENTS rollback) ────
+    //
+    // The metrics-triggered automatic AGENTS.md rollback on goal completion was
+    // deliberately retired. These tests exercise the real MarkGoalCompletedAsync with
+    // real AgentsManager and MetricsTracker instances in a setup that WOULD have
+    // triggered the old rollback path (nonempty archive history, different
+    // previous/current AGENTS version counts, non-null managers, pipeline not yet
+    // Done) and assert that completion now leaves every AGENTS.md file byte-identical,
+    // emits no regression/rollback/comparison announcement, and still records metrics.
+
+    [Fact]
+    public async Task MarkGoalCompletedAsync_CoverageDropVersusPrevious_DoesNotRollBackAgentsMd()
+    {
+        var agentsDir = Path.Combine(Path.GetTempPath(), $"agents-e2e-{Guid.NewGuid():N}");
+        var metricsDir = Path.Combine(Path.GetTempPath(), $"metrics-e2e-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(agentsDir);
+        try
+        {
+            // Scenario 1: prior measured coverage 80 vs current unmeasured/default 0,
+            // with all tests passing — old code: CoverageDelta=-80 → regression → rollback.
+            var fx = await CreateCompletionFixtureAsync(
+                agentsDir, metricsDir,
+                previousTotalTests: 10, previousPassedTests: 10, previousCoveragePercent: 80.0,
+                currentTotalTests: 10, currentPassedTests: 10, currentCoveragePercent: 0.0);
+
+            await ActAndAssertNoRollbackAsync(fx);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(agentsDir);
+            TestHelpers.ForceDeleteDirectory(metricsDir);
+        }
+    }
+
+    [Fact]
+    public async Task MarkGoalCompletedAsync_PassRateDropAtEqualCoverage_DoesNotRollBackAgentsMd()
+    {
+        var agentsDir = Path.Combine(Path.GetTempPath(), $"agents-e2e-{Guid.NewGuid():N}");
+        var metricsDir = Path.Combine(Path.GetTempPath(), $"metrics-e2e-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(agentsDir);
+        try
+        {
+            // Scenario 2: pass-rate drop far larger than five percentage points at equal
+            // coverage — old code: PassRateDelta=-0.5 → regression → rollback.
+            var fx = await CreateCompletionFixtureAsync(
+                agentsDir, metricsDir,
+                previousTotalTests: 10, previousPassedTests: 10, previousCoveragePercent: 80.0,
+                currentTotalTests: 10, currentPassedTests: 5, currentCoveragePercent: 80.0);
+
+            await ActAndAssertNoRollbackAsync(fx);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(agentsDir);
+            TestHelpers.ForceDeleteDirectory(metricsDir);
+        }
+    }
+
+    [Fact]
+    public async Task MarkGoalCompletedAsync_ZeroCurrentTestsAndDefaultCoverage_DoesNotRollBackAgentsMd()
+    {
+        var agentsDir = Path.Combine(Path.GetTempPath(), $"agents-e2e-{Guid.NewGuid():N}");
+        var metricsDir = Path.Combine(Path.GetTempPath(), $"metrics-e2e-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(agentsDir);
+        try
+        {
+            // Scenario 3: zero current tests / default coverage — old code: TotalTests=0
+            // skipped the test check but CoverageDelta=-80 still triggered rollback.
+            var fx = await CreateCompletionFixtureAsync(
+                agentsDir, metricsDir,
+                previousTotalTests: 10, previousPassedTests: 10, previousCoveragePercent: 80.0,
+                currentTotalTests: 0, currentPassedTests: 0, currentCoveragePercent: 0.0);
+
+            await ActAndAssertNoRollbackAsync(fx);
+        }
+        finally
+        {
+            TestHelpers.ForceDeleteDirectory(agentsDir);
+            TestHelpers.ForceDeleteDirectory(metricsDir);
+        }
+    }
+
+    /// <summary>
+    /// Runs the real <see cref="GoalLifecycleService.MarkGoalCompletedAsync"/> end-to-end and
+    /// asserts the retired rollback path stays retired: every AGENTS.md file (current bytes
+    /// AND archived versions) is byte-identical, no regression/rollback/comparison
+    /// announcement is logged, the pipeline reaches Done, the registered goal becomes
+    /// Completed, current metrics are recorded and reloadable from disk, and the normal
+    /// completion notification fires exactly once.
+    /// </summary>
+    private static async Task ActAndAssertNoRollbackAsync(CompletionFixture fx)
+    {
+        // Fixture capability check: this setup must genuinely be capable of triggering
+        // the OLD rollback path — otherwise the preservation assertions prove nothing.
+        var coderHistory = fx.AgentsManager.GetHistory(WorkerRole.Coder);
+        Assert.NotEmpty(coderHistory);                          // rollback has a version to restore
+        Assert.NotEqual(GoalPhase.Done, fx.Pipeline.Phase);     // completion is not a guarded no-op
+        Assert.NotEqual("v001", fx.MetricsTracker.History[^1].AgentsMdVersions["coder"]); // v000 ≠ v001
+        Assert.NotNull(fx.MetricsTracker);
+        Assert.NotNull(fx.AgentsManager);
+
+        var agentsBefore = SnapshotDirectory(fx.AgentsDir);
+        var capturingLogger = new TestLogger<GoalLifecycleService>();
+        var notifier = new DashboardNotifier();
+        var notificationCount = 0;
+        notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
+
+        var service = new GoalLifecycleService(
+            goalManager: fx.GoalManager,
+            logger: capturingLogger,
+            metricsTracker: fx.MetricsTracker,
+            agentsManager: fx.AgentsManager,
+            dashboardNotifier: notifier);
+
+        await service.MarkGoalCompletedAsync(fx.Pipeline, TestContext.Current.CancellationToken);
+
+        // Pipeline and registered goal both reach their terminal completed state.
+        Assert.Equal(GoalPhase.Done, fx.Pipeline.Phase);
+        Assert.Equal(GoalStatus.Completed, fx.Source.LastStatus);
+
+        // The normal completion notification still occurs exactly once.
+        Assert.Equal(1, notificationCount);
+
+        // Current metrics were actually recorded and can be loaded back from disk.
+        Assert.NotNull(fx.MetricsTracker.Latest);
+        Assert.Equal(fx.CurrentTotalTests, fx.MetricsTracker.Latest!.TotalTests);
+        Assert.Equal(fx.CurrentPassedTests, fx.MetricsTracker.Latest.PassedTests);
+        Assert.Equal(fx.CurrentCoveragePercent, fx.MetricsTracker.Latest.CoveragePercent);
+        Assert.Equal("v001", fx.MetricsTracker.Latest.AgentsMdVersions["coder"]);
+        Assert.True(File.Exists(Path.Combine(fx.MetricsDir, "iteration-001.json")),
+            "Expected the current iteration's metrics file on disk");
+
+        var reloaded = new MetricsTracker(fx.MetricsDir, NullLogger<MetricsTracker>.Instance);
+        Assert.Equal(2, reloaded.History.Count);
+        Assert.Equal(fx.CurrentTotalTests, reloaded.History[^1].TotalTests);
+        Assert.Equal("v001", reloaded.History[^1].AgentsMdVersions["coder"]);
+
+        // Exact current instruction bytes AND archive filenames/bytes remain unchanged.
+        Assert.Equal(agentsBefore, SnapshotDirectory(fx.AgentsDir));
+
+        // No regression/rollback/comparison announcement is emitted (old-code wording).
+        // The zero-test warning is listed as its EXACT retired service message (and precise
+        // fragments) so reintroducing ONLY that warning — without any of the other
+        // announcements — still fails this shared assertion for every scenario.
+        string[] forbiddenFragments =
+        [
+            "REGRESSION DETECTED",
+            "rolling back AGENTS.md",
+            "Rolled back",
+            "nothing to rollback",
+            "Metrics comparison",
+            "Test metrics not extracted (TotalTests=0); regression check will skip test comparison.",
+            "Test metrics not extracted",
+            "regression check",
+            "test comparison",
+        ];
+        Assert.DoesNotContain(capturingLogger.LogEntries, e =>
+            forbiddenFragments.Any(f => e.Message.Contains(f, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>
+    /// Builds the shared end-to-end completion fixture: a real <see cref="AgentsManager"/>
+    /// with a genuine archived Coder instruction history, a real <see cref="MetricsTracker"/>
+    /// holding an older iteration that recorded the Coder at v000 (unequal to the current
+    /// v001 produced from the real archive), and a registered goal behind a not-yet-Done
+    /// pipeline carrying the scenario's current metrics.
+    /// </summary>
+    private static async Task<CompletionFixture> CreateCompletionFixtureAsync(
+        string agentsDir,
+        string metricsDir,
+        int previousTotalTests,
+        int previousPassedTests,
+        double previousCoveragePercent,
+        int currentTotalTests,
+        int currentPassedTests,
+        double currentCoveragePercent)
+    {
+        Directory.CreateDirectory(metricsDir);
+
+        // Real AgentsManager with a genuine archive: the second update archives the first
+        // content as history/coder/v001.agents.md and installs the current instructions.
+        var agentsManager = new AgentsManager(agentsDir, NullLogger<AgentsManager>.Instance);
+        agentsManager.UpdateAgentsMd(WorkerRole.Coder, "prior coder guidance — archived version");
+        agentsManager.UpdateAgentsMd(WorkerRole.Coder, "current coder guidance — live version");
+
+        // Previous iteration's metrics: coder recorded at v000 (unequal to the current v001).
+        var metricsTracker = new MetricsTracker(metricsDir, NullLogger<MetricsTracker>.Instance);
+        metricsTracker.RecordIteration(new IterationMetrics
+        {
+            Iteration = 0,
+            TotalTests = previousTotalTests,
+            PassedTests = previousPassedTests,
+            FailedTests = Math.Max(0, previousTotalTests - previousPassedTests),
+            CoveragePercent = previousCoveragePercent,
+            AgentsMdVersions = new Dictionary<string, string> { ["coder"] = "v000" },
+        });
+
+        var goal = new Goal { Id = $"goal-{Guid.NewGuid():N}", Description = "Test goal" };
+        var pipeline = new GoalPipeline(goal);
+        pipeline.StateMachine.StartIteration([GoalPhase.Coding, GoalPhase.Testing, GoalPhase.Review, GoalPhase.Merging]);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+
+        var source = new RecordingGoalSource(goal);
+        var goalManager = new GoalManager();
+        goalManager.AddSource(source);
+        // Must call GetNextGoalAsync to register the goal in the manager
+        await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+
+        pipeline.Metrics.TotalTests = currentTotalTests;
+        pipeline.Metrics.PassedTests = currentPassedTests;
+        pipeline.Metrics.FailedTests = Math.Max(0, currentTotalTests - currentPassedTests);
+        pipeline.Metrics.CoveragePercent = currentCoveragePercent;
+
+        return new CompletionFixture(
+            pipeline, source, goalManager, agentsManager, metricsTracker,
+            agentsDir, metricsDir, currentTotalTests, currentPassedTests, currentCoveragePercent);
+    }
+
+    /// <summary>Byte-exact snapshot of every file under a directory, keyed by relative path.</summary>
+    private static Dictionary<string, byte[]> SnapshotDirectory(string root)
+    {
+        var snapshot = new Dictionary<string, byte[]>();
+        foreach (var file in Directory.GetFiles(root, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(root, file).Replace('\\', '/');
+            snapshot[relative] = File.ReadAllBytes(file);
+        }
+        return snapshot;
+    }
+
+    private sealed record CompletionFixture(
+        GoalPipeline Pipeline,
+        RecordingGoalSource Source,
+        GoalManager GoalManager,
+        AgentsManager AgentsManager,
+        MetricsTracker MetricsTracker,
+        string AgentsDir,
+        string MetricsDir,
+        int CurrentTotalTests,
+        int CurrentPassedTests,
+        double CurrentCoveragePercent);
+
+    /// <summary>
+    /// Goal source that records the last status update so tests can assert the registered
+    /// goal reached <see cref="GoalStatus.Completed"/>.
+    /// </summary>
+    private sealed class RecordingGoalSource(Goal goal) : IGoalSource
+    {
+        public GoalStatus? LastStatus { get; private set; }
+
+        public string Name => "recording-goal-source";
+
+        public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+        public Task UpdateGoalStatusAsync(
+            string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default)
+        {
+            LastStatus = status;
+            return Task.CompletedTask;
+        }
     }
 
     // ── CommitMetricsToConfigRepoAsync ───────────────────────────────────────
