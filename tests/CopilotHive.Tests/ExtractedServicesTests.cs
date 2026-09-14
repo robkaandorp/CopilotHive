@@ -795,6 +795,9 @@ public sealed class GoalLifecycleServiceTests
         Assert.Equal(agentsBefore, SnapshotDirectory(fx.AgentsDir));
 
         // No regression/rollback/comparison announcement is emitted (old-code wording).
+        // The zero-test warning is listed as its EXACT retired service message (and precise
+        // fragments) so reintroducing ONLY that warning — without any of the other
+        // announcements — still fails this shared assertion for every scenario.
         string[] forbiddenFragments =
         [
             "REGRESSION DETECTED",
@@ -802,6 +805,10 @@ public sealed class GoalLifecycleServiceTests
             "Rolled back",
             "nothing to rollback",
             "Metrics comparison",
+            "Test metrics not extracted (TotalTests=0); regression check will skip test comparison.",
+            "Test metrics not extracted",
+            "regression check",
+            "test comparison",
         ];
         Assert.DoesNotContain(capturingLogger.LogEntries, e =>
             forbiddenFragments.Any(f => e.Message.Contains(f, StringComparison.OrdinalIgnoreCase)));
