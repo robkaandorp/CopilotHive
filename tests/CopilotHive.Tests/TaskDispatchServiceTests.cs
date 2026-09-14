@@ -2733,6 +2733,140 @@ public sealed class TaskDispatchServiceTests
         Assert.Same(pipelineB, pipelineManager.GetByTaskId(taskB));
     }
 
+    // ── DispatchToRole: the delegate-to-publisher boundary and the post-record fault ──
+
+    /// <summary>
+    /// SMOKE CHECK FOR THE PUBLISHER SPY: the REAL <see cref="GrpcWorkerGateway"/> forwards the EXACT
+    /// pinned <see cref="ConnectedWorker"/> instance, the EXACT delivered <see cref="WorkTask"/>
+    /// instance and the caller's token to <see cref="IWorkerAssignmentPublisher.PublishAsync"/> — once
+    /// — and its own task stays INCOMPLETE until that call returns.
+    /// </summary>
+    /// <remarks>
+    /// THE BOUNDARY IS DRIVEN DIRECTLY, so the assertions are about the gateway's delegation contract
+    /// alone (a dispatch-level vector would observe the same values through extra layers). The spy's
+    /// entry signal is awaited with a BOUNDED wait; the completion is granted by the fixture.
+    /// </remarks>
+    [Fact]
+    public async Task SendTaskAsync_RealGateway_ForwardsExactWorkerTaskAndTokenOnceAndAwaitsCompletion()
+    {
+        var workerPool = new WorkerPool();
+        var worker = workerPool.RegisterWorker("worker-spy", []);
+        var spy = new GatewayPublishSpy();
+        var gateway = new GrpcWorkerGateway(workerPool, spy);
+
+        var task = new WorkTask
+        {
+            TaskId = "task-spy-coder-001-01",
+            GoalId = "goal-spy",
+            GoalDescription = "spy fixture",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "model-spy",
+            Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+        };
+
+        using var cts = new CancellationTokenSource();
+        var send = gateway.SendTaskAsync(worker.Id, task, cts.Token);
+
+        // THE SPY WAS REACHED: the exact references and the exact token were forwarded.
+        await spy.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.Same(worker, spy.ReceivedWorker);
+        Assert.Same(task, spy.ReceivedTask);
+        Assert.Equal(cts.Token, spy.ReceivedCancellationToken);
+        Assert.Equal(1, spy.InvocationCount);
+
+        // THE CALLER'S TASK IS STILL INCOMPLETE — the completion is the publisher's to grant.
+        Assert.False(send.IsCompleted, "SendTaskAsync must stay incomplete until PublishAsync returns");
+
+        // RELEASE THE PUBLISHER: the caller now completes with the Published outcome, and the spy was
+        // invoked exactly ONCE (no duplicate delegation).
+        spy.Release();
+        Assert.Equal(
+            WorkerTaskSendOutcome.Published,
+            await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+        Assert.Equal(1, spy.InvocationCount);
+
+        // NO SPURIOUS CHANNEL WRITE: the spy's default behavior publishes nothing.
+        Assert.False(worker.MessageChannel.Reader.TryRead(out _));
+    }
+
+    /// <summary>
+    /// SMOKE CHECK FOR THE FIXTURE-MINTED POST-RECORD FAULT: a publisher that RECORDS the delivered
+    /// context and then throws its OWN exception type reaches stage S through the REAL gateway, and the
+    /// dispatch rethrows that EXACT instance on the ambiguity-PRESERVE path — while the recorded row
+    /// survives.
+    /// </summary>
+    /// <remarks>
+    /// THE EXACT-IDENTITY ASSERTION is what a wrapper (or a swallowed Blocked) cannot satisfy: the
+    /// exception observed at the dispatch IS the publisher's own pre-created instance,
+    /// <see cref="PostRecordChannelFaultException"/>, which is not a recording failure and so is never
+    /// converted to <see cref="WorkerTaskSendOutcome.Blocked"/>.
+    /// </remarks>
+    [Fact]
+    public async Task DispatchToRole_PostRecordFaultPublisher_RethrowsExactExceptionAndKeepsRecord()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-fault-pub", []);
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var faultPublisher = new PostRecordChannelFaultPublisher(pipelineManager, recording.Store);
+        var gateway = new GrpcWorkerGateway(workerPool, faultPublisher);
+
+        var goal = new Goal
+        {
+            Id = "goal-fault-pub",
+            Description = "post-record fault publisher fixture",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+        WithControlledNonce(pipeline);
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
+
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goal,
+            logger: logger);
+
+        var thrown = await Assert.ThrowsAsync<PostRecordChannelFaultException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE EXACT ORIGINAL INSTANCE left the dispatch — not a wrapper, not a recording failure.
+        Assert.Same(faultPublisher.Fault, thrown);
+        Assert.Equal(1, faultPublisher.RecordCount);
+
+        // THE AMBIGUITY-PRESERVE RECORD fired, and no publication-success record exists.
+        Assert.Contains(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning &&
+                 e.Message.Contains($"task={expectedTaskId}", StringComparison.Ordinal) &&
+                 e.Message.Contains("stage=send", StringComparison.Ordinal) &&
+                 e.Message.Contains("recovery=preserve", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+
+        // THE RECORDED ROW SURVIVES with the DELIVERED ownership, and the delivery state is preserved.
+        var row = recording.Store.Load(expectedTaskId);
+        Assert.NotNull(row);
+        Assert.Equal("goal-fault-pub", row!.Context.GoalId);
+        Assert.Equal("worker-fault-pub", row.Context.WorkerId);
+        Assert.Equal(WorkerRole.Coder, row.Context.Role);
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+        Assert.Null(taskQueue.TryDequeueAny());
+    }
+
     [Fact]
     public async Task DispatchToRole_WhenNoIdleWorker_EnqueuesButDoesNotDispatch()
     {
