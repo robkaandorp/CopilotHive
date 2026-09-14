@@ -4,7 +4,6 @@ using CopilotHive.Worker;
 
 using Grpc.Core;
 
-using System.Reflection;
 using System.Text.Json;
 using System.Threading.Channels;
 
@@ -33,8 +32,9 @@ public sealed class WorkerServiceIssueToolTests
             null!);
 
         // The bridge sends through the PUBLISHED connection, so publishing it is all this test
-        // needs — the real message loop is not driven here.
-        TestConnectionFactory.Attach(service, "worker-1", stream);
+        // needs — the real message loop is not driven here. The pending response is owned by THAT
+        // connection, so it is resolved through it (never through a service-global map).
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream);
 
         // Start the raise_issue call; it will block awaiting the orchestrator response.
         var raiseTask = service.RaiseIssueAsync(
@@ -54,17 +54,17 @@ public sealed class WorkerServiceIssueToolTests
         Assert.Equal("It crashes on empty input", args.RootElement.GetProperty("description").GetString());
         Assert.Equal("high", args.RootElement.GetProperty("severity").GetString());
 
-        // Resolve the pending TCS so the RaiseIssueAsync task completes.
-        var pendingField = typeof(WorkerService).GetField("_pendingToolCalls", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("WorkerService._pendingToolCalls field not found.");
-        var pending = (System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>>)pendingField.GetValue(service)!;
-        Assert.True(pending.TryGetValue(message.ToolRequest.RequestId, out var tcs));
-        tcs!.TrySetResult(new ToolCallResponse
+        // The wait belongs to the connection the request was written on.
+        Assert.Equal(1, connection.PendingToolResponseCount);
+        Assert.False(raiseTask.IsCompleted);
+
+        // Resolve the pending wait with a genuine server response so RaiseIssueAsync completes.
+        Assert.True(connection.TryCompleteToolResponse(new ToolCallResponse
         {
             RequestId = message.ToolRequest.RequestId,
             ResultJson = "{\"acknowledged\":true,\"issue_id\":\"parser-crashes\"}",
             Success = true,
-        });
+        }));
 
         var result = await raiseTask;
         Assert.Contains("\"acknowledged\":true", result);

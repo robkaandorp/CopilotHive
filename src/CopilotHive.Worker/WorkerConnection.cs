@@ -40,6 +40,28 @@ internal sealed class WorkerConnection
     private int _retired;
 
     /// <summary>
+    /// THE ONE PER-CONNECTION TOOL-RESPONSE LOCK. It makes registration, response completion,
+    /// removal and the one-way <see cref="EndToolResponses"/> a single atomic lifetime: a
+    /// registration either lands inside the still-open lifetime or is rejected with the EXISTING
+    /// disconnected error, and no caller ever observes a half-updated registry.
+    /// </summary>
+    private readonly object _toolResponsesLock = new();
+
+    /// <summary>
+    /// The pending response-bearing tool calls THIS connection owns, keyed by the request ID the
+    /// request write carried. Entries are removed as soon as they settle (completion, removal or
+    /// <see cref="EndToolResponses"/>), so this holds only genuinely outstanding waits and never
+    /// accumulates history.
+    /// </summary>
+    private readonly Dictionary<string, TaskCompletionSource<ToolCallResponse>> _toolResponses = [];
+
+    /// <summary>
+    /// Whether the response lifetime has been ended. ONE-WAY: once <see cref="EndToolResponses"/>
+    /// has run, registration is closed for the rest of this connection's life.
+    /// </summary>
+    private bool _toolResponsesClosed;
+
+    /// <summary>
     /// Creates a connection.
     /// </summary>
     /// <param name="assignedId">The fixed orchestrator-assigned worker identity.</param>
@@ -109,7 +131,20 @@ internal sealed class WorkerConnection
     internal bool IsRetired => Volatile.Read(ref _retired) != 0;
 
     /// <summary>Retires this connection. Idempotent.</summary>
-    internal void Retire() => Interlocked.Exchange(ref _retired, 1);
+    /// <remarks>
+    /// RETIREMENT ALSO ENDS THIS CONNECTION'S TOOL-RESPONSE LIFETIME, as an IDEMPOTENT fallback:
+    /// a connection torn down from a path that never entered the message loop (a fallible
+    /// post-publication setup step, for example) must not leave a bridge call parked on a response
+    /// that can never arrive. The message loop still ends responses EXPLICITLY and FIRST, before its
+    /// assignment drain — see <c>WorkerService.ProcessMessagesAsync</c>.
+    /// </remarks>
+    internal void Retire()
+    {
+        // RETIRED FIRST: a wait released by the response closure below then observes a connection
+        // that is already unusable, so its continuation can never re-enter this connection.
+        Interlocked.Exchange(ref _retired, 1);
+        EndToolResponses();
+    }
 
     /// <summary>
     /// CHECKED ACCESS — returns this connection, or fails with the EXISTING disconnected error when
@@ -123,6 +158,162 @@ internal sealed class WorkerConnection
             throw new InvalidOperationException(DisconnectedMessage);
 
         return this;
+    }
+
+    // ── Tool-response lifetime (per connection) ────────────────────────────────
+    //
+    // A response-bearing bridge call's pending wait belongs to the connection its REQUEST was
+    // written on, not to the service. The lifetime is therefore:
+    //
+    //   REGISTER   — one entry per request ID, on the OPEN lifetime, or the EXISTING disconnected
+    //                error when the lifetime has already ended.
+    //   SETTLE     — a matching response, the caller's cancellation, or a failed send removes the
+    //                entry; settled entries never accumulate.
+    //   END        — one-way: closes registration, clears every entry and faults the unresolved
+    //                response tasks with the EXISTING disconnected category/message. Never a
+    //                fabricated negative response.
+    //
+    // All of it is coordinated by the ONE lock above, so a registration can never land in a
+    // lifetime that has already ended and no reader ever observes a partially updated registry.
+
+    /// <summary>
+    /// The number of response-bearing waits currently owned by this connection (observation seam
+    /// for tests; entries are removed as they settle, so this is never a history length).
+    /// </summary>
+    internal int PendingToolResponseCount
+    {
+        get { lock (_toolResponsesLock) return _toolResponses.Count; }
+    }
+
+    /// <summary>
+    /// REGISTERS a response-bearing wait on THIS connection and returns the task the caller awaits.
+    /// </summary>
+    /// <remarks>
+    /// Registration and the lifetime state are decided under the ONE lock, so the wait either
+    /// belongs to the still-open lifetime or is rejected BEFORE anything is written with the
+    /// EXISTING disconnected error category — the same failure a caller would see if it had
+    /// snapshotted a retired connection.
+    /// </remarks>
+    /// <param name="requestId">The request ID the request write will carry.</param>
+    /// <exception cref="InvalidOperationException">
+    /// This connection's response lifetime has ended, or this connection has been retired.
+    /// </exception>
+    internal Task<ToolCallResponse> RegisterToolResponse(string requestId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(requestId);
+
+        lock (_toolResponsesLock)
+        {
+            if (_toolResponsesClosed || IsRetired)
+                throw new InvalidOperationException(DisconnectedMessage);
+
+            var pending = new TaskCompletionSource<ToolCallResponse>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _toolResponses[requestId] = pending;
+            return pending.Task;
+        }
+    }
+
+    /// <summary>
+    /// COMPLETES a pending wait from an incoming tool response. Unknown and late responses are
+    /// IGNORED (the entry is already gone). The completed entry is REMOVED, so settled calls never
+    /// accumulate.
+    /// </summary>
+    /// <param name="response">The genuine server response, used exactly as received.</param>
+    /// <returns><c>true</c> when a pending wait was matched and completed.</returns>
+    internal bool TryCompleteToolResponse(ToolCallResponse response)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+
+        TaskCompletionSource<ToolCallResponse>? pending;
+        lock (_toolResponsesLock)
+        {
+            if (!_toolResponses.Remove(response.RequestId, out pending))
+                return false;
+        }
+
+        pending.TrySetResult(response);
+        return true;
+    }
+
+    /// <summary>
+    /// SETTLES a pending wait as cancelled by its CALLER's token and removes the entry. A no-op
+    /// when the entry has already settled (first-terminal-winner).
+    /// </summary>
+    /// <param name="requestId">The request ID whose wait is being cancelled.</param>
+    /// <param name="ct">The caller's token, which the cancelled wait reports.</param>
+    internal void CancelToolResponse(string requestId, CancellationToken ct)
+    {
+        TaskCompletionSource<ToolCallResponse>? pending;
+        lock (_toolResponsesLock)
+        {
+            if (!_toolResponses.Remove(requestId, out pending))
+                return;
+        }
+
+        pending.TrySetCanceled(ct);
+    }
+
+    /// <summary>
+    /// REMOVES an entry without settling it — used by the bridge's own cleanup. The wait's outcome
+    /// was already decided by whichever terminal path won. A no-op when it is already gone.
+    /// </summary>
+    /// <param name="requestId">The request ID to drop.</param>
+    internal void RemoveToolResponse(string requestId)
+    {
+        lock (_toolResponsesLock)
+            _toolResponses.Remove(requestId);
+    }
+
+    /// <summary>
+    /// CHECKED ACCESS — fails with the EXISTING disconnected error when this connection's
+    /// tool-response lifetime has ENDED. Response-bearing sends take this check AFTER acquiring the
+    /// send gate and BEFORE starting the underlying write, so a request queued behind the gate can
+    /// never begin a write whose response could no longer be delivered to it.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The response lifetime has ended.</exception>
+    internal void EnsureToolResponsesOpen()
+    {
+        lock (_toolResponsesLock)
+        {
+            if (_toolResponsesClosed)
+                throw new InvalidOperationException(DisconnectedMessage);
+        }
+    }
+
+    /// <summary>
+    /// ENDS this connection's tool-response lifetime. ONE-WAY and IDEMPOTENT: registration is
+    /// closed, every entry is cleared, and each unresolved response task is FAULTED with the
+    /// EXISTING disconnected category/message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY FAULT AND NOT A SYNTHESIZED RESPONSE. A response that will never arrive says nothing
+    /// about the remote outcome: a fabricated negative <see cref="ToolCallResponse"/> would claim
+    /// the orchestrator refused or did not perform the request, which this worker cannot know. The
+    /// wait therefore ends with the SAME disconnect error every other no-usable-connection path
+    /// raises, leaving the caller to treat the remote effect as UNKNOWN.
+    /// </para>
+    /// <para>
+    /// The decision (close + drain the registry) happens under the ONE lock; the faulting happens
+    /// after it, so no continuation runs while the lock is held.
+    /// </para>
+    /// </remarks>
+    internal void EndToolResponses()
+    {
+        List<TaskCompletionSource<ToolCallResponse>> unresolved = [];
+        lock (_toolResponsesLock)
+        {
+            if (_toolResponsesClosed)
+                return;
+
+            _toolResponsesClosed = true;
+            unresolved.AddRange(_toolResponses.Values);
+            _toolResponses.Clear();
+        }
+
+        foreach (var pending in unresolved)
+            pending.TrySetException(new InvalidOperationException(DisconnectedMessage));
     }
 
     /// <summary>

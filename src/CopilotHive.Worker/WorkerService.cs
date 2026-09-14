@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text;
 using Grpc.Core;
 using Grpc.Net.Client;
@@ -69,8 +68,10 @@ public sealed class WorkerService(
             ?? throw new ArgumentNullException(nameof(provisioningEnvironment));
     }
 
-    // Pending tool calls awaiting orchestrator responses, keyed by request_id
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<ToolCallResponse>> _pendingToolCalls = new();
+    // Pending tool calls awaiting orchestrator responses are owned by the CONNECTION their request
+    // was written on (WorkerConnection's per-connection response registry), never by this service:
+    // the lifetime of such a wait is the lifetime of the connection that can still deliver its
+    // response.
 
     // Current task state — read by heartbeat, written by message loop
     private volatile string? _currentTaskId;
@@ -515,11 +516,15 @@ public sealed class WorkerService(
     /// completion this loop produces belongs to the registration it was started for.
     /// </summary>
     /// <remarks>
-    /// RETIREMENT ORDER. The loop's <c>finally</c> drains the retained assignment FIRST and only
-    /// THEN retires the connection, so an EOF or reader failure with a LIVE token still permits the
-    /// draining body's single Ready attempt (that Ready is written while the connection is still
-    /// usable). Retiring before the caller disposes the stream means a new operation can never start
-    /// transport on a connection whose stream is about to go away.
+    /// RETIREMENT ORDER. The loop's <c>finally</c> ends this connection's tool-response waits FIRST,
+    /// then drains the retained assignment, and only THEN retires the connection. Ending responses
+    /// before the drain matters: a bridge call parked on a response whose loop has ended can never
+    /// be released by a response, so a wait bound to an independent live token would otherwise hold
+    /// the drain — and retirement — off forever. Draining before retiring means an EOF or reader
+    /// failure with a LIVE token still permits the draining body's single Ready attempt (that Ready
+    /// is written while the connection is still usable). Retiring before the caller disposes the
+    /// stream means a new operation can never start transport on a connection whose stream is about
+    /// to go away.
     /// </remarks>
     private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
     {
@@ -694,15 +699,12 @@ public sealed class WorkerService(
 
                     case OrchestratorMessage.PayloadOneofCase.ToolResponse:
                         var response = message.ToolResponse;
-                        if (_pendingToolCalls.TryRemove(response.RequestId, out var tcs))
-                        {
-                            tcs.TrySetResult(response);
-                        }
-                        else
-                        {
-                            // Expected for fire-and-forget tools like report_progress
+                        // Dispatched through the CONNECTION this loop was started for — the SAME
+                        // object the request was written on — never a service-global map. A response
+                        // whose wait belongs to another (or no) connection is simply untracked here,
+                        // which is expected for fire-and-forget tools like report_progress.
+                        if (!connection.TryCompleteToolResponse(response))
                             _log.Debug($"Received ToolCallResponse for untracked request: {response.RequestId}");
-                        }
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.None:
@@ -712,6 +714,14 @@ public sealed class WorkerService(
         }
         finally
         {
+            // END RESPONSE WAITS FIRST — BEFORE the assignment cancellation/drain below. A tool call
+            // parked on a response whose loop has ended can never be released by a response, and a
+            // wait bound to an INDEPENDENT live token (not the assignment's) would otherwise hold the
+            // drain's await forever. Ending the response lifetime here faults every unresolved wait
+            // with the EXISTING disconnected error, so such a caller unwinds and retirement is
+            // always reached. A wait that already terminated is unaffected (first-terminal-winner).
+            connection.EndToolResponses();
+
             // Stream shutdown must not leave a task running: Program disposes the runner right
             // after this returns, and a still-running turn holds the client lifecycle lease.
             // Cancel then drain so the runner is quiescent before disposal. The ownership
@@ -1006,105 +1016,155 @@ public sealed class WorkerService(
     #region IToolCallBridge
 
     /// <inheritdoc/>
-    public async Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct)
-    {
-        var requestId = Guid.NewGuid().ToString("N");
-        var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingToolCalls[requestId] = tcs;
-
-        using var reg = ct.Register(() => tcs.TrySetCanceled());
-
-        try
-        {
-            await SendToolCallRequest(requestId, taskId, "request_clarification",
-                System.Text.Json.JsonSerializer.Serialize(new { question }), ct);
-
-            var response = await tcs.Task;
-            return response.Success ? response.ResultJson : $"Error: {response.Error}";
-        }
-        finally
-        {
-            _pendingToolCalls.TryRemove(requestId, out _);
-        }
-    }
+    public Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            taskId, "request_clarification",
+            System.Text.Json.JsonSerializer.Serialize(new { question }), ct);
 
     /// <inheritdoc/>
     public async Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct)
     {
-        var requestId = Guid.NewGuid().ToString("N");
-        await SendToolCallRequest(requestId, taskId, "report_progress",
+        // FIRE-AND-FORGET: no response is awaited, so this takes NO response-lifetime check and
+        // registers nothing. It still snapshots ONE connection and writes on it.
+        var connection = RequireConnection();
+        await SendToolCallRequest(
+            connection, NewRequestId(), taskId, "report_progress",
             System.Text.Json.JsonSerializer.Serialize(new { status, details }), ct);
     }
 
     /// <inheritdoc/>
     public async Task ReportNarrativeAsync(string taskId, string narrative, CancellationToken ct)
     {
-        var requestId = Guid.NewGuid().ToString("N");
-        await SendToolCallRequest(requestId, taskId, "report_narrative",
+        // FIRE-AND-FORGET: see ReportProgressAsync.
+        var connection = RequireConnection();
+        await SendToolCallRequest(
+            connection, NewRequestId(), taskId, "report_narrative",
             System.Text.Json.JsonSerializer.Serialize(new { narrative }), ct);
     }
 
     /// <inheritdoc/>
-    public async Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct)
-    {
-        var requestId = Guid.NewGuid().ToString("N");
-        var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingToolCalls[requestId] = tcs;
-
-        using var reg = ct.Register(() => tcs.TrySetCanceled());
-
-        try
-        {
-            await SendToolCallRequest(requestId, taskId, "get_goal",
-                System.Text.Json.JsonSerializer.Serialize(new { goal_id = goalId }), ct);
-
-            var response = await tcs.Task;
-            return response.Success ? response.ResultJson : $"Error: {response.Error}";
-        }
-        finally
-        {
-            _pendingToolCalls.TryRemove(requestId, out _);
-        }
-    }
+    public Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            taskId, "get_goal",
+            System.Text.Json.JsonSerializer.Serialize(new { goal_id = goalId }), ct);
 
     /// <inheritdoc/>
-    public async Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct)
-    {
-        var requestId = Guid.NewGuid().ToString("N");
-        var tcs = new TaskCompletionSource<ToolCallResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingToolCalls[requestId] = tcs;
+    public Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            taskId, "raise_issue",
+            System.Text.Json.JsonSerializer.Serialize(new { type, title, description, severity }), ct);
 
-        using var reg = ct.Register(() => tcs.TrySetCanceled());
+    /// <summary>A fresh request ID for one tool call.</summary>
+    private static string NewRequestId() => Guid.NewGuid().ToString("N");
+
+    /// <summary>
+    /// THE ONE RESPONSE-BEARING BRIDGE HELPER: snapshots ONE connection, REGISTERS the pending
+    /// response ON THAT SAME connection, sends the request on it, awaits the genuine server
+    /// response and converts it to the bridge's string result.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// SNAPSHOT ONCE, BEFORE REGISTRATION. The connection is captured before the pending entry
+    /// exists, and every later step — registration, the request write, the removal — uses that SAME
+    /// object, so registration and sending can never re-read a different
+    /// <c>CurrentConnection</c>. Both the identity and the writer come from that one snapshot, so
+    /// they cannot disagree.
+    /// </para>
+    /// <para>
+    /// The not-connected error is unchanged and still raised before any wait. Registration itself is
+    /// checked against the connection's response lifetime, so a call whose response could no longer
+    /// be delivered fails with the EXISTING disconnected error BEFORE anything is written.
+    /// </para>
+    /// <para>
+    /// TERMINATION IS FIRST-TERMINAL-WINNER. A genuine response, the caller's own cancellation and
+    /// the connection's response closure all race to settle the ONE pending task; the first to
+    /// settle wins and later attempts are no-ops. There is no universal precedence claim between
+    /// them. No automatic resend is ever performed: if a response is lost, the REMOTE OUTCOME IS
+    /// UNKNOWN, and re-sending could duplicate a remote effect.
+    /// </para>
+    /// </remarks>
+    /// <param name="taskId">The task this tool call belongs to.</param>
+    /// <param name="toolName">The wire tool name.</param>
+    /// <param name="argsJson">The serialized tool arguments.</param>
+    /// <param name="ct">The CALLER's token, which cancels this request.</param>
+    private async Task<string> SendResponseBearingToolCallAsync(
+        string taskId, string toolName, string argsJson, CancellationToken ct)
+    {
+        var connection = RequireConnection();
+        var requestId = NewRequestId();
+
+        // REGISTER FIRST, on the SAME snapshot. A closed response lifetime (or a retired connection)
+        // throws the EXISTING disconnected error here, before any transport is attempted.
+        var responseTask = connection.RegisterToolResponse(requestId);
+
+        // CALLER CANCELLATION still cancels THIS request, using THIS caller's token, and removes the
+        // entry so a cancelled wait never lingers.
+        using var reg = ct.Register(() => connection.CancelToolResponse(requestId, ct));
 
         try
         {
-            await SendToolCallRequest(requestId, taskId, "raise_issue",
-                System.Text.Json.JsonSerializer.Serialize(new { type, title, description, severity }), ct);
+            await SendToolCallRequest(
+                connection, requestId, taskId, toolName, argsJson, ct, responseBearing: true);
 
-            var response = await tcs.Task;
+            var response = await responseTask;
             return response.Success ? response.ResultJson : $"Error: {response.Error}";
+        }
+        catch
+        {
+            // A losing send can leave the pending task faulted or cancelled. Observe it — a faulted
+            // task must never go unobserved — WITHOUT masking this send's ORIGINAL error, which is
+            // what propagates.
+            ObserveAbandonedResponse(responseTask);
+            throw;
         }
         finally
         {
-            _pendingToolCalls.TryRemove(requestId, out _);
+            // Settled entries are removed rather than accumulated. A no-op when a terminal path has
+            // already dropped it.
+            connection.RemoveToolResponse(requestId);
         }
     }
 
     /// <summary>
-    /// Builds and sends ONE tool-call request through the shared send boundary.
+    /// Observes a response task abandoned by a failing send so its exception (from a racing
+    /// connection teardown) is never unobserved. Deliberately does NOT await, rethrow or otherwise
+    /// wait: the send's own ORIGINAL exception is the authoritative outcome and must not be masked.
     /// </summary>
     /// <remarks>
-    /// The CONNECTION is snapshotted into a local BEFORE the gate is awaited, so a send that parks
-    /// behind another writer still targets the connection it was intended for and can never be
-    /// rerouted by a concurrent mutation of the published connection. Both the identity and the
-    /// writer come from that ONE snapshot, so they can never disagree. The not-connected error is
-    /// unchanged and still raised before any wait.
+    /// The continuation is UNCONDITIONAL rather than fault-only: the fault can arrive at any moment
+    /// (or never, if no teardown races the send), and reading <see cref="Task.Exception"/> is safe on
+    /// every terminal state — it is <c>null</c> for a successful or cancelled task. Nothing here
+    /// extends the call's lifetime or delays it.
     /// </remarks>
-    private async Task SendToolCallRequest(string requestId, string taskId, string toolName, string argsJson, CancellationToken ct)
-    {
-        var connection = RequireConnection();
+    private static void ObserveAbandonedResponse(Task responseTask) =>
+        _ = responseTask.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
-        await SendAsync(connection, new WorkerMessage
+    /// <summary>
+    /// Builds and sends ONE tool-call request ON THE GIVEN CONNECTION through the shared send
+    /// boundary.
+    /// </summary>
+    /// <remarks>
+    /// The connection is passed in EXPLICITLY — the caller snapshots it before it waits, so a send
+    /// that parks behind another writer still targets the connection it was intended for, and
+    /// registration and sending can never re-read a different <c>CurrentConnection</c>. When
+    /// <paramref name="responseBearing"/> is set, the connection's response-lifetime openness is
+    /// checked after the send gate is acquired (see <see cref="SendAsync"/>) — restricted to
+    /// response-bearing sends, so Complete, Ready, progress/narrative and unary paths are unaffected.
+    /// </remarks>
+    private Task SendToolCallRequest(
+        WorkerConnection connection,
+        string requestId,
+        string taskId,
+        string toolName,
+        string argsJson,
+        CancellationToken ct,
+        bool responseBearing = false)
+    {
+        var message = new WorkerMessage
         {
             WorkerId = connection.AssignedId,
             ToolRequest = new ToolCallRequest
@@ -1114,7 +1174,9 @@ public sealed class WorkerService(
                 ToolName = toolName,
                 ArgumentsJson = argsJson,
             },
-        }, ct);
+        };
+
+        return SendAsync(connection, message, ct, responseBearing);
     }
 
     #endregion
@@ -1182,6 +1244,14 @@ public sealed class WorkerService(
     /// or cancelled-while-waiting call writes nothing, cancels no other sender, and releases no
     /// permit it never acquired.
     /// </param>
+    /// <param name="responseBearing">
+    /// <c>true</c> ONLY for a send whose caller is waiting on this connection for a response (the
+    /// <c>request_clarification</c> / <c>get_goal</c> / <c>raise_issue</c> bridge calls). Such a send
+    /// additionally checks the connection's response lifetime AFTER acquiring the gate and BEFORE
+    /// starting the underlying write, so a request that was queued while the lifetime was open can
+    /// never begin a write whose response could no longer be delivered to it. Complete, Ready,
+    /// progress/narrative sends and unary sessions pass <c>false</c> and are entirely unaffected.
+    /// </param>
     /// <remarks>
     /// The permit is released in <c>finally</c> AFTER a successful acquisition only — including
     /// when the underlying write fails synchronously or asynchronously, or is cancelled — so the
@@ -1191,19 +1261,29 @@ public sealed class WorkerService(
     /// await or an assignment drain, and unary RPCs (heartbeat, session, provisioning) plus the
     /// response reader stay entirely outside it.
     /// <para>
-    /// RETIREMENT IS CHECKED AFTER THE GATE IS ACQUIRED. A send that was already queued when the
-    /// connection retired therefore cannot write on it (nor on a replacement): it fails with the
-    /// existing disconnected error instead. This is the ONLY check inside the gate — the write
-    /// itself still consumes the captured connection, so a permitted write keeps its captured
-    /// stream, token and outcome.
+    /// RETIREMENT IS CHECKED AFTER THE GATE IS ACQUIRED, and for a response-bearing send the
+    /// RESPONSE LIFETIME is checked immediately after it. A send that was already queued when the
+    /// connection retired (or when its response lifetime ended) therefore cannot write on it (nor
+    /// on a replacement): it fails with the existing disconnected error instead. These checks are
+    /// the ONLY additional work inside the gate — the write itself still consumes the captured
+    /// connection, so a permitted write keeps its captured stream, token and outcome, and an
+    /// in-flight write task is never abandoned.
     /// </para>
     /// </remarks>
-    private async Task SendAsync(WorkerConnection connection, WorkerMessage message, CancellationToken ct)
+    private async Task SendAsync(
+        WorkerConnection connection, WorkerMessage message, CancellationToken ct, bool responseBearing = false)
     {
         await _sendGate.WaitAsync(ct);
         try
         {
             connection.EnsureUsable();
+
+            // RESPONSE-BEARING ONLY: a request whose response lifetime has already ended must not
+            // begin its queued write. The shared send gate is still taken and released normally, and
+            // a write that already started keeps its existing awaited behavior.
+            if (responseBearing)
+                connection.EnsureToolResponsesOpen();
+
             await connection.Stream.RequestStream.WriteAsync(message, ct);
         }
         finally
