@@ -2630,11 +2630,11 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
-    /// THE SAME-ROLE FIFO DELIVERS THE ACTUAL DEQUEUED TASK, AND THE RECORDING NAMES IT: goal A
-    /// (coder) is dispatched first with NO idle worker, so its task sits in the pending queue; goal
-    /// B (also coder) is then dispatched WITH an idle worker. The role-aware dequeue yields A's
-    /// EARLIER queued task, and the real recorded row and the channel assignment carry A's
-    /// delivered task — never B's newly admitted task and never B's enclosing pipeline.
+    /// THE ROLE-AGNOSTIC FALLBACK DELIVERS THE ACTUAL DEQUEUED TASK, AND THE RECORDING NAMES IT:
+    /// goal A's Coder task is queued first; goal B then requests Tester while the Tester queue is
+    /// deterministically empty. Therefore <c>TryDequeue(Tester)</c> cannot select A and the following
+    /// <c>TryDequeueAny()</c> is the only path that can deliver it. The real recorded row, channel
+    /// assignment and publication-success log all name A — never B's newly admitted task or pipeline.
     /// </summary>
     [Fact]
     public async Task DispatchToRole_RoleAgnosticFallbackDeliversEarlierTask_RecordsTheDeliveredContext()
@@ -2650,93 +2650,146 @@ public sealed class TaskDispatchServiceTests
         using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
         var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
 
-        // THE ENQUEUE SEAM IS INSTALLED FIRST so both admissions' ids are captured from the real
-        // path (the queue is FIFO-drained by the delivery, so post-hoc reconstruction is impossible).
-        var enqueuedTasks = new List<string>();
-        taskQueue.OnEnqueue = t => enqueuedTasks.Add(t.TaskId);
+        WorkTask? admittedA = null;
+        WorkTask? admittedB = null;
+        WorkTask? temporarilyClaimedB = null;
+        var requestRoleQueueWasEmpty = false;
+
+        // THE DETERMINISTIC COMPETING-CONSUMER SCHEDULE. A production consumer may claim B between
+        // B's enqueue and this eager push. The synchronous enqueue seam models exactly that legal
+        // schedule: claim B's Tester task, prove no Tester task remains, then let stage D run. B is
+        // restored in finally so the fixture never leaks its test-owned claim.
+        taskQueue.OnEnqueue = task =>
+        {
+            if (task.GoalId == "goal-fallback-a")
+            {
+                admittedA = task;
+                return;
+            }
+
+            if (task.GoalId == "goal-fallback-b")
+            {
+                admittedB = task;
+                temporarilyClaimedB = taskQueue.TryDequeue(WorkerRole.Tester);
+                requestRoleQueueWasEmpty = taskQueue.TryDequeue(WorkerRole.Tester) is null;
+            }
+        };
 
         var goalA = new Goal
         {
-            Id = "goal-fifo-a",
-            Description = "fifo goal A",
+            Id = "goal-fallback-a",
+            Description = "fallback goal A",
             RepositoryNames = ["test-repo"],
         };
         var pipelineA = pipelineManager.CreatePipeline(goalA);
         pipelineA.AdvanceTo(GoalPhase.Coding);
         SetPlan(pipelineA, ModelTier.Default);
 
-        // NO IDLE WORKER YET: pipeline A's dispatch only ENQUEUES its coder task.
+        // NO IDLE WORKER YET: A's Coder task remains pending.
         var serviceA = CreateService(
             config: config,
             pipelineManager: pipelineManager,
             taskQueue: taskQueue,
             workerGateway: gateway,
             goal: goalA);
-        await serviceA.DispatchToRole(pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
+        await serviceA.DispatchToRole(
+            pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
 
-        // THE IDLE WORKER APPEARS — pipeline B's tester dispatch will FIFO-deliver A's coder task.
-        var idleWorker = workerPool.RegisterWorker("worker-fifo", []);
-
+        var idleWorker = workerPool.RegisterWorker("worker-fallback", []);
         var goalB = new Goal
         {
-            Id = "goal-fifo-b",
-            Description = "fifo goal B",
+            Id = "goal-fallback-b",
+            Description = "fallback goal B",
             RepositoryNames = ["test-repo"],
         };
         var pipelineB = pipelineManager.CreatePipeline(goalB);
-        pipelineB.AdvanceTo(GoalPhase.Coding);
+        pipelineB.AdvanceTo(GoalPhase.Testing);
         SetPlan(pipelineB, ModelTier.Default);
-
+        var loggerB = new TestLogger<TaskDispatchService>();
         var serviceB = CreateService(
             config: config,
             pipelineManager: pipelineManager,
             taskQueue: taskQueue,
             workerGateway: gateway,
-            goal: goalB);
-        await serviceB.DispatchToRole(pipelineB, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken);
+            goal: goalB,
+            logger: loggerB);
 
-        // BOTH admissions minted their own ids; B's coder task went back to the pending queue
-        // while A's EARLIER coder task was DELIVERED by the role-aware FIFO.
-        var taskA = Assert.Single(enqueuedTasks, id => id.StartsWith("goal-fifo-a", StringComparison.Ordinal));
-        var taskB = Assert.Single(enqueuedTasks, id => id.StartsWith("goal-fifo-b", StringComparison.Ordinal));
+        try
+        {
+            // B REQUESTS TESTER. Its own Tester task has been claimed by the deterministic schedule,
+            // while the only queued task is A's Coder task. Stage D must therefore use fallback.
+            await serviceB.DispatchToRole(
+                pipelineB, WorkerRole.Tester, "Test B", TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            taskQueue.OnEnqueue = null;
+            if (temporarilyClaimedB is not null
+                && taskQueue.GetActiveTask(temporarilyClaimedB.TaskId) is null)
+            {
+                taskQueue.Enqueue(temporarilyClaimedB);
+            }
+        }
 
-        // THE DELIVERED TASK IS A's: the worker is busy with it, on A's coder model and role.
+        Assert.NotNull(admittedA);
+        Assert.NotNull(admittedB);
+        Assert.Same(admittedB, temporarilyClaimedB);
+        Assert.Equal(WorkerRole.Tester, admittedB!.Role);
+        Assert.Equal(WorkerRole.Coder, admittedA!.Role);
+        Assert.NotEqual(admittedB.Role, admittedA.Role);
+        Assert.True(requestRoleQueueWasEmpty,
+            "the requested Tester queue must be empty before stage D so only TryDequeueAny can return A");
+
+        var taskA = admittedA.TaskId;
+        var taskB = admittedB.TaskId;
+
+        // THE DELIVERED TASK IS A's, although B requested a DIFFERENT role.
         Assert.True(idleWorker.IsBusy);
         Assert.Equal(taskA, idleWorker.CurrentTaskId);
         Assert.Equal("coder-model", idleWorker.CurrentModel);
         Assert.Equal(WorkerRole.Coder, idleWorker.Role);
 
-        // THE RECORDED CONTEXT NAMES THE DELIVERED TASK'S GOAL, SLOT AND MODEL — not B's enclosing
-        // pipeline and not B's admitted tester task.
+        // THE RECORDED CONTEXT REPRODUCES THE ACTUAL DEQUEUED TASK, not B's admitted Tester task.
         var recorded = recording.Store.Load(taskA);
         Assert.NotNull(recorded);
-        Assert.Equal("goal-fifo-a", recorded!.Context.GoalId);
-        Assert.Equal("worker-fifo", recorded.Context.WorkerId);
+        Assert.Equal(goalA.Id, recorded!.Context.GoalId);
+        Assert.Equal(idleWorker.Id, recorded.Context.WorkerId);
         Assert.Equal(WorkerRole.Coder, recorded.Context.Role);
         Assert.Equal("coder-model", recorded.Context.Model);
+        Assert.Equal(taskA, recorded.Context.Slot.TaskId);
         Assert.Equal(GoalPhase.Coding, recorded.Context.Slot.Position.Phase);
-
-        // NOTHING WAS RECORDED FOR B's ADMITTED TASK: it was only enqueued, never delivered.
         Assert.Null(recording.Store.Load(taskB));
 
-        // THE ASSIGNMENT MESSAGE NAMES THE DELIVERED task, and B's tester task remains pending.
+        // THE CHANNEL AND FINAL PUBLICATION-SUCCESS LOG BOTH NAME A. A final log naming B would prove
+        // the enclosing dispatch leaked into delivery identity.
         Assert.True(idleWorker.MessageChannel.Reader.TryRead(out var published));
         Assert.Equal(taskA, published.Assignment.TaskId);
-        taskQueue.OnEnqueue = null;
-        Assert.Equal([taskB], new[] { taskQueue.TryDequeueAny()!.TaskId });
-        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Contains(
+            loggerB.LogEntries,
+            entry => entry.LogLevel == LogLevel.Information
+                     && entry.Message == $"Task {taskA} pushed to worker {idleWorker.Id}");
+        Assert.DoesNotContain(
+            loggerB.LogEntries,
+            entry => entry.LogLevel == LogLevel.Information
+                     && entry.Message == $"Task {taskB} pushed to worker {idleWorker.Id}");
 
-        // THE SUCCESS LOG names the DELIVERED task and the pinned worker.
+        // B'S OWN ADMISSION IS UNTOUCHED and restored to the pending queue after the competing claim.
         Assert.Equal(taskA, pipelineA.ActiveTaskId);
         Assert.Equal(taskB, pipelineB.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineA.GetSlotsForTest()).State);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineB.GetSlotsForTest()).State);
         Assert.Same(pipelineA, pipelineManager.GetByTaskId(taskA));
         Assert.Same(pipelineB, pipelineManager.GetByTaskId(taskB));
+        Assert.NotNull(taskQueue.GetActiveTask(taskA));
+        Assert.Null(taskQueue.GetActiveTask(taskB));
+        Assert.Equal(taskB, taskQueue.TryDequeue(WorkerRole.Tester)!.TaskId);
+        Assert.Null(taskQueue.TryDequeueAny());
     }
 
     // ── DispatchToRole: the delegate-to-publisher boundary and the post-record fault ──
 
     /// <summary>
-    /// SMOKE CHECK FOR THE PUBLISHER SPY: the REAL <see cref="GrpcWorkerGateway"/> forwards the EXACT
+    /// THE EXACT DELEGATION/COMPLETION BOUNDARY: the REAL <see cref="GrpcWorkerGateway"/> forwards the EXACT
     /// pinned <see cref="ConnectedWorker"/> instance, the EXACT delivered <see cref="WorkTask"/>
     /// instance and the caller's token to <see cref="IWorkerAssignmentPublisher.PublishAsync"/> — once
     /// — and its own task stays INCOMPLETE until that call returns.
@@ -2768,30 +2821,54 @@ public sealed class TaskDispatchServiceTests
         using var cts = new CancellationTokenSource();
         var send = gateway.SendTaskAsync(worker.Id, task, cts.Token);
 
-        // THE SPY WAS REACHED: the exact references and the exact token were forwarded.
-        await spy.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
-        Assert.Same(worker, spy.ReceivedWorker);
-        Assert.Same(task, spy.ReceivedTask);
-        Assert.Equal(cts.Token, spy.ReceivedCancellationToken);
-        Assert.Equal(1, spy.InvocationCount);
+        try
+        {
+            // THE SPY WAS REACHED: the exact POOL-HELD worker reference, task reference and caller
+            // token were forwarded exactly once.
+            await spy.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            Assert.Same(workerPool.GetWorker(worker.Id), spy.ReceivedWorker);
+            Assert.Same(worker, spy.ReceivedWorker);
+            Assert.Same(task, spy.ReceivedTask);
+            Assert.Equal(cts.Token, spy.ReceivedCancellationToken);
+            Assert.Equal(1, spy.InvocationCount);
 
-        // THE CALLER'S TASK IS STILL INCOMPLETE — the completion is the publisher's to grant.
-        Assert.False(send.IsCompleted, "SendTaskAsync must stay incomplete until PublishAsync returns");
+            // THE CALLER'S TASK IS STILL INCOMPLETE — the completion is the publisher's to grant.
+            // This immediate observation occurs only after entry, while the pre-created release TCS
+            // is demonstrably still pending; a fire-and-forget gateway therefore fails deterministically.
+            Assert.False(spy.ReleaseToken.IsCompleted);
+            Assert.False(send.IsCompleted, "SendTaskAsync must stay incomplete until PublishAsync returns");
 
-        // RELEASE THE PUBLISHER: the caller now completes with the Published outcome, and the spy was
-        // invoked exactly ONCE (no duplicate delegation).
-        spy.Release();
-        Assert.Equal(
-            WorkerTaskSendOutcome.Published,
-            await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
-        Assert.Equal(1, spy.InvocationCount);
+            // RELEASE THE PUBLISHER: the caller now completes with Published, and only after the
+            // publisher's own task has completed. No duplicate delegation is permitted by this call.
+            spy.Release();
+            Assert.Equal(
+                WorkerTaskSendOutcome.Published,
+                await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            Assert.True(spy.ReleaseToken.IsCompleted);
+            Assert.Equal(1, spy.InvocationCount);
 
-        // NO SPURIOUS CHANNEL WRITE: the spy's default behavior publishes nothing.
-        Assert.False(worker.MessageChannel.Reader.TryRead(out _));
+            // NO SPURIOUS CHANNEL WRITE: the spy's default behavior publishes nothing.
+            Assert.False(worker.MessageChannel.Reader.TryRead(out _));
+        }
+        finally
+        {
+            // SETTLE AND JOIN THE TEST-OWNED TASK on every exit. A failed assertion must not leave the
+            // publisher parked on its release gate; cleanup faults are observed without masking the
+            // primary assertion failure.
+            spy.Release();
+            try
+            {
+                await send.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
+            }
+            catch
+            {
+                // The main assertion path owns any gateway failure; cleanup only guarantees no live task.
+            }
+        }
     }
 
     /// <summary>
-    /// SMOKE CHECK FOR THE FIXTURE-MINTED POST-RECORD FAULT: a publisher that RECORDS the delivered
+    /// THE EXACT POST-RECORD FAULT BOUNDARY: a publisher that RECORDS the delivered
     /// context and then throws its OWN exception type reaches stage S through the REAL gateway, and the
     /// dispatch rethrows that EXACT instance on the ambiguity-PRESERVE path — while the recorded row
     /// survives.
@@ -2841,30 +2918,51 @@ public sealed class TaskDispatchServiceTests
         var thrown = await Assert.ThrowsAsync<PostRecordChannelFaultException>(
             () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
 
-        // THE EXACT ORIGINAL INSTANCE left the dispatch — not a wrapper, not a recording failure.
+        // THE EXACT ORIGINAL TYPE AND INSTANCE left the dispatch — not a wrapper, not a recording
+        // failure and not a Blocked result.
+        Assert.IsType<PostRecordChannelFaultException>(thrown);
         Assert.Same(faultPublisher.Fault, thrown);
+        Assert.IsNotType<WorkerAssignmentRecordingException>(thrown);
         Assert.Equal(1, faultPublisher.RecordCount);
 
-        // THE AMBIGUITY-PRESERVE RECORD fired, and no publication-success record exists.
-        Assert.Contains(
+        // THE ONE AMBIGUITY-PRESERVE RECORD fired at stage S, and no publication-success or recovery
+        // record exists. A wrapper thrown by either gateway or dispatch would already have failed the
+        // identity assertion above.
+        var preserve = Assert.Single(
             logger.LogEntries,
             e => e.LogLevel == LogLevel.Warning &&
                  e.Message.Contains($"task={expectedTaskId}", StringComparison.Ordinal) &&
                  e.Message.Contains("stage=send", StringComparison.Ordinal) &&
                  e.Message.Contains("recovery=preserve", StringComparison.Ordinal));
+        Assert.Contains("remains active", preserve.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(
             logger.LogEntries,
             e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
 
-        // THE RECORDED ROW SURVIVES with the DELIVERED ownership, and the delivery state is preserved.
+        // THE RECORDED ROW SURVIVES with every original delivered value.
         var row = recording.Store.Load(expectedTaskId);
         Assert.NotNull(row);
         Assert.Equal("goal-fault-pub", row!.Context.GoalId);
         Assert.Equal("worker-fault-pub", row.Context.WorkerId);
         Assert.Equal(WorkerRole.Coder, row.Context.Role);
-        Assert.True(idleWorker.IsBusy);
-        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+        Assert.Equal("coder-model", row.Context.Model);
+        Assert.Equal(expectedTaskId, row.Context.Slot.TaskId);
+        Assert.Equal(GoalPhase.Coding, row.Context.Slot.Position.Phase);
+
+        // THE TASK WAS NOT REQUEUED: it remains active, its Pending slot/pointer/mapping and worker
+        // assignment remain intact, and the pending queue is empty.
+        Assert.NotNull(taskQueue.GetActiveTask(expectedTaskId));
         Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Same(pipeline, pipelineManager.GetByTaskId(expectedTaskId));
+        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
     }
 
     [Fact]
