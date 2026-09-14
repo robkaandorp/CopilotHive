@@ -18,13 +18,20 @@ namespace CopilotHive.Services;
 /// <see cref="WorkTask"/>, and its own <see cref="CancellationToken"/>.
 /// </para>
 /// <para>
+/// PUBLIC BY NECESSITY, NARROW BY DESIGN: <see cref="HiveOrchestratorService"/> is a PUBLIC type, so
+/// an appended constructor parameter cannot be an internal type (C# forbids the inconsistent
+/// accessibility). This interface is the widest thing that parameter may name, and it exposes
+/// nothing but the single publish operation — the concrete publisher, the recording-failure type and
+/// the store all remain internal.
+/// </para>
+/// <para>
 /// THE CONCRETE PUBLISHER IS MANDATORY FOR READY SENDS. There is NO fallback to a raw
 /// channel write: a caller that cannot resolve a publisher must fail closed with the same explicit
 /// no-send disposition (see <see cref="WorkerAssignmentRecordingException.MissingPublisher"/>)
 /// rather than publish an unrecorded assignment.
 /// </para>
 /// </summary>
-internal interface IWorkerAssignmentPublisher
+public interface IWorkerAssignmentPublisher
 {
     /// <summary>
     /// Records the delivered task's assignment context EXACTLY ONCE and, only when that record is

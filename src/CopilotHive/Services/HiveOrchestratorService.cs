@@ -26,13 +26,23 @@ public sealed class HiveOrchestratorService(
     IIssueStore? issueStore = null,
     IEventBus? eventBus = null,
     UserService? userService = null,
-    ConfigRepoManager? configRepoManager = null) : HiveOrchestrator.HiveOrchestratorBase
+    ConfigRepoManager? configRepoManager = null,
+    IWorkerAssignmentPublisher? assignmentPublisher = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
     private readonly IEventBus? _eventBus = eventBus;
     private readonly UserService? _userService = userService;
     private readonly ConfigRepoManager? _configRepoManager = configRepoManager;
+
+    /// <summary>
+    /// THE MANDATORY READY-SEND RECORDER. Optional in the constructor signature only so unrelated
+    /// fixtures that never exercise a Ready send keep compiling; the production container always
+    /// supplies it. It is never a fall-back-to-raw-write switch: when it is absent the Ready send
+    /// FAILS CLOSED (see <see cref="LogAssignmentBlocked"/>), because publishing an unrecorded
+    /// assignment is exactly what this slice exists to prevent.
+    /// </summary>
+    private readonly IWorkerAssignmentPublisher? _assignmentPublisher = assignmentPublisher;
 
     /// <summary>
     /// Reads an orchestrator process environment variable. Overridable for tests so
@@ -451,13 +461,105 @@ public sealed class HiveOrchestratorService(
             ApplyTaskAssignment(worker, task);
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
-            await worker.MessageChannel.Writer.WriteAsync(
-                new OrchestratorMessage { Assignment = GrpcMapper.ToGrpc(task) },
-                cancellationToken);
+            // THE READY-DRIVEN RECORDED PUBLICATION. The dequeue, the agents.md update and the
+            // activation/busy-marking above keep their existing order; ONLY the final raw channel
+            // write is replaced. The publisher records the delivered assignment's context exactly
+            // once and PUBLISHES it only once that record is confirmed, so an unrecorded assignment
+            // is never delivered.
+            //
+            // ONLY the recording failure is handled here; everything else — a real stream/caller
+            // cancellation and any post-record send fault — keeps its existing teardown semantics and
+            // propagates out of this method unchanged.
+            try
+            {
+                if (_assignmentPublisher is null)
+                {
+                    // FAIL CLOSED. There is deliberately NO fallback to the old raw write: a missing
+                    // recorder means the assignment was not recorded, which is exactly the reason it
+                    // must not be delivered either.
+                    throw WorkerAssignmentRecordingException.MissingPublisher();
+                }
+
+                await _assignmentPublisher.PublishAsync(worker, task, cancellationToken);
+
+                // A COMPLETED CHANNEL WRITE IS NOT PROOF OF RECEIPT — the worker may never consume
+                // it — so this line deliberately records intent, not delivery.
+                logger.LogInformation(
+                    "Assignment published to worker {WorkerId} for task {TaskId}", worker.Id, task.TaskId);
+            }
+            catch (WorkerAssignmentRecordingException ex)
+            {
+                LogAssignmentBlocked(worker, task, ex);
+
+                // RETURN NORMALLY: the pinned worker, the active task and the busy state are
+                // deliberately retained. This stream is NOT unwound and the worker is NOT removed —
+                // the assignment stays held until the existing explicit goal cancellation or the
+                // enabled task-timeout policy releases it. No requeue, no fabricated completion, no
+                // wrong-goal failure, no new timer/retry/reconciliation.
+            }
         }
         else
         {
             _dashboardNotifier?.NotifyStateChanged();
+        }
+    }
+
+    /// <summary>
+    /// THE ONE ACTIONABLE WARNING for a refused Ready assignment recording, carrying the goal
+    /// contract's exact disposition wording.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE WARNING IS GUARDED. The whole diagnostic — the failure-reason formatting, the
+    /// <see cref="Exception.Message"/> read and the logger call INCLUDED — sits inside its own
+    /// no-throw guard, so a logger (or a message getter) that itself throws cannot escape and mask
+    /// the handled disposition. The recording refusal is the authoritative outcome here; the
+    /// diagnostic must never replace it.
+    /// </para>
+    /// <para>
+    /// WHY THERE IS NO SUCCESS LOG ON THIS PATH: the assignment was NOT published. Emitting an
+    /// assignment/ success line would misreport the delivery, and no recovery activity was performed
+    /// either — the task is left held for the operator's explicit cancellation or the enabled
+    /// task-timeout policy.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The pinned worker whose assignment was refused.</param>
+    /// <param name="task">The delivered task that was retained.</param>
+    /// <param name="failure">The recording failure; its exact message is included as evidence.</param>
+    private void LogAssignmentBlocked(ConnectedWorker worker, WorkTask task, WorkerAssignmentRecordingException failure)
+    {
+        try
+        {
+            // THE EXACT DISPOSITION WORDING, plus the refusal's own reason/category text as
+            // actionable detail. No success wording appears anywhere in this message.
+            logger.LogWarning(
+                "Worker {WorkerId} task {TaskId}: assignment blocked; no assignment published; " +
+                "task retained; cancel the goal or use configured recovery (reason={Reason}) — {Detail}",
+                worker.Id,
+                task.TaskId,
+                failure.Reason,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// Reads <see cref="Exception.Message"/> inside its own no-throw guard: an exception whose
+    /// <c>Message</c> getter throws yields a static placeholder, so the guarded warning above
+    /// degrades while its never-masked guarantee does not.
+    /// </summary>
+    private static string MessageOrPlaceholder(Exception exception)
+    {
+        try
+        {
+            return exception.Message;
+        }
+        catch (Exception messageException)
+        {
+            return $"<message getter threw: {messageException.GetType().Name}>";
         }
     }
 
