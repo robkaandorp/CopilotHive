@@ -2,6 +2,8 @@ using System.Data.Common;
 using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Persistence.Entities;
+using CopilotHive.Services;
+using CopilotHive.Workers;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -2092,6 +2094,422 @@ public sealed class CopilotHiveDbContextTests
 
             // And the schema really carries no FK from completion_receipts.
             Assert.Empty(GetForeignKeys(connection, "completion_receipts"));
+        }
+    }
+
+    // ── 14. worker_assignment_contexts (fresh schema, upgrade path, no cascades) ──
+
+    /// <summary>
+    /// Fresh database: <c>EnsureCreated</c> must produce <c>worker_assignment_contexts</c> with EXACTLY
+    /// the ten declared columns, <c>task_id</c> as the single-column PRIMARY KEY, TEXT affinity for the
+    /// six text columns, INTEGER affinity for the three counters and database-enforced NOT NULL on every
+    /// non-key column — no extra column, no surrogate key, and no FK to the pipelines/task-mapping rows.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the <see cref="WorkerAssignmentContextEntity"/> mapping (the
+    /// <c>ConfigureWorkerAssignmentContext</c> call), rename any column mapping, drop a member, change
+    /// <c>HasKey</c> to a different/composite key, or make a counter nullable, and one of the assertions
+    /// below fails.
+    /// </remarks>
+    [Fact]
+    public void EnsureCreated_WorkerAssignmentContextsTable_HasExactColumnsTypesAndTaskIdPrimaryKey()
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var conn = GetSqliteConnection(ctx);
+
+        Assert.Contains("worker_assignment_contexts", GetAllTableNames(conn));
+
+        // EXACT column set — the ten declared columns and nothing else.
+        Assert.Equal(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "task_id", "goal_id", "worker_id", "role", "phase", "model",
+                "iteration", "occurrence", "attempt", "first_assigned_at_utc",
+            },
+            GetTableColumns(conn, "worker_assignment_contexts"));
+
+        // PRIMARY KEY is exactly task_id, single-column, taken from the table (not an auto-index).
+        Assert.Equal("task_id", GetPrimaryKeyColumn(conn, "worker_assignment_contexts"));
+
+        // THE DECLARED TYPES: the text columns are TEXT and the three counters are INTEGER.
+        var info = GetTableColumnInfo(conn, "worker_assignment_contexts");
+        Assert.Equal(10, info.Count);
+        foreach (var column in new[] { "task_id", "goal_id", "worker_id", "role", "phase", "model", "first_assigned_at_utc" })
+            Assert.Equal("TEXT", info[column].DeclaredType.ToUpperInvariant());
+        foreach (var column in new[] { "iteration", "occurrence", "attempt" })
+            Assert.Equal("INTEGER", info[column].DeclaredType.ToUpperInvariant());
+
+        // EVERY NON-KEY COLUMN IS DATABASE-ENFORCED NOT NULL (not merely a C# nullable annotation).
+        foreach (var column in new[] { "goal_id", "worker_id", "role", "phase", "model", "iteration", "occurrence", "attempt", "first_assigned_at_utc" })
+            Assert.True(info[column].NotNull, $"column {column} must be NOT NULL");
+
+        // NO foreign keys from worker_assignment_contexts to any other table.
+        Assert.Empty(GetForeignKeys(conn, "worker_assignment_contexts"));
+    }
+
+    /// <summary>
+    /// A required column really rejects a raw SQL NULL (SQLITE_CONSTRAINT), proving NOT NULL is enforced
+    /// by the database and not only by the model.
+    /// </summary>
+    [Theory]
+    [InlineData("goal_id")]
+    [InlineData("worker_id")]
+    [InlineData("role")]
+    [InlineData("phase")]
+    [InlineData("model")]
+    [InlineData("iteration")]
+    [InlineData("occurrence")]
+    [InlineData("attempt")]
+    [InlineData("first_assigned_at_utc")]
+    public void EnsureCreated_WorkerAssignmentContextRequiredColumns_RejectRawSqlNull(string nullColumn)
+    {
+        using var ctx = CopilotHiveDbContext.CreateInMemory();
+        var connection = GetSqliteConnection(ctx);
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO worker_assignment_contexts
+                (task_id, goal_id, worker_id, role, phase, model, iteration, occurrence, attempt, first_assigned_at_utc)
+            VALUES
+                (@task, @goal, @worker, @role, @phase, @model, @iteration, @occurrence, @attempt, @assigned)
+            """;
+        command.Parameters.AddWithValue("@task", "null-contract-" + nullColumn);
+        command.Parameters.AddWithValue("@goal", nullColumn == "goal_id" ? DBNull.Value : "g1");
+        command.Parameters.AddWithValue("@worker", nullColumn == "worker_id" ? DBNull.Value : "w1");
+        command.Parameters.AddWithValue("@role", nullColumn == "role" ? DBNull.Value : "coder");
+        command.Parameters.AddWithValue("@phase", nullColumn == "phase" ? DBNull.Value : "coding");
+        command.Parameters.AddWithValue("@model", nullColumn == "model" ? DBNull.Value : "m1");
+        command.Parameters.AddWithValue("@iteration", nullColumn == "iteration" ? DBNull.Value : 1);
+        command.Parameters.AddWithValue("@occurrence", nullColumn == "occurrence" ? DBNull.Value : 1);
+        command.Parameters.AddWithValue("@attempt", nullColumn == "attempt" ? DBNull.Value : 1);
+        command.Parameters.AddWithValue("@assigned",
+            nullColumn == "first_assigned_at_utc" ? DBNull.Value : "2025-01-01T00:00:00.0000000Z");
+
+        var ex = Assert.Throws<SqliteException>(() => command.ExecuteNonQuery());
+        Assert.Equal(19, ex.SqliteErrorCode); // SQLITE_CONSTRAINT
+        Assert.Contains("NOT NULL constraint failed", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0L, ScalarOn(connection, "SELECT COUNT(*) FROM worker_assignment_contexts"));
+    }
+
+    /// <summary>
+    /// Fresh database, FILE-BACKED, reached through the migration path rather than <c>EnsureCreated</c>:
+    /// reconciling an empty database file creates <c>worker_assignment_contexts</c> with the full
+    /// mapping, and a row written through the EF model round-trips — including the lowercase enum
+    /// conversion and the canonical UTC "O" timestamp text.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the mapping and the fresh-database reconciliation no longer creates the
+    /// table; remove either value converter and the raw text assertions below fail.
+    /// </remarks>
+    [Fact]
+    public void EnsureSchema_FreshFileBackedDb_CreatesWorkerAssignmentContextsTable_AndValuesRoundTrip()
+    {
+        var dbPath = NewTempDbPath("wac-fresh");
+        try
+        {
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                // PRECONDITION (anti-vacuous): the database file is genuinely empty.
+                Assert.Empty(GetAllTableNames(connection));
+
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+
+                Assert.Contains("worker_assignment_contexts", GetAllTableNames(connection));
+                Assert.Equal(
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "task_id", "goal_id", "worker_id", "role", "phase", "model",
+                        "iteration", "occurrence", "attempt", "first_assigned_at_utc",
+                    },
+                    GetTableColumns(connection, "worker_assignment_contexts"));
+                Assert.Empty(GetForeignKeys(connection, "worker_assignment_contexts"));
+
+                var assignedAt = new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc).AddMilliseconds(123).AddTicks(4);
+                ctx.WorkerAssignmentContexts.Add(new WorkerAssignmentContextEntity
+                {
+                    TaskId = "wac-fresh-1",
+                    GoalId = "goal-fresh-1",
+                    WorkerId = "worker-fresh-1",
+                    Role = WorkerRole.DocWriter,
+                    Phase = GoalPhase.DocWriting,
+                    Model = "copilot/claude-sonnet-4.6",
+                    Iteration = 2,
+                    Occurrence = 3,
+                    Attempt = 4,
+                    FirstAssignedAtUtc = assignedAt,
+                });
+                ctx.SaveChanges();
+
+                // THE SHARED CONVENTIONS, PROVEN FROM THE RAW COLUMN TEXTS.
+                Assert.Equal("docwriter", ScalarOn(connection,
+                    "SELECT role FROM worker_assignment_contexts WHERE task_id = 'wac-fresh-1'"));
+                Assert.Equal("docwriting", ScalarOn(connection,
+                    "SELECT phase FROM worker_assignment_contexts WHERE task_id = 'wac-fresh-1'"));
+                Assert.Equal("2025-06-15T10:30:00.1230004Z", ScalarOn(connection,
+                    "SELECT first_assigned_at_utc FROM worker_assignment_contexts WHERE task_id = 'wac-fresh-1'"));
+            }
+
+            // A FRESH context over the same file reads the row back, enum values and instant intact.
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                var row = ctx.WorkerAssignmentContexts.Find("wac-fresh-1");
+
+                Assert.NotNull(row);
+                Assert.Equal("goal-fresh-1", row!.GoalId);
+                Assert.Equal("worker-fresh-1", row.WorkerId);
+                Assert.Equal(WorkerRole.DocWriter, row.Role);
+                Assert.Equal(GoalPhase.DocWriting, row.Phase);
+                Assert.Equal("copilot/claude-sonnet-4.6", row.Model);
+                Assert.Equal(2, row.Iteration);
+                Assert.Equal(3, row.Occurrence);
+                Assert.Equal(4, row.Attempt);
+                Assert.Equal(DateTimeKind.Utc, row.FirstAssignedAtUtc.Kind);
+                Assert.Equal(new DateTime(2025, 6, 15, 10, 30, 0, DateTimeKind.Utc).AddMilliseconds(123).AddTicks(4),
+                    row.FirstAssignedAtUtc);
+            }
+        }
+        finally
+        {
+            DeleteDbFiles(dbPath);
+        }
+    }
+
+    /// <summary>
+    /// THE ADDITIVE-RECONCILIATION PROOF for the new table on a REAL, on-disk SQLite database (not an
+    /// in-memory-only handle): a POPULATED legacy schema that predates the table gains it through the
+    /// existing <see cref="DatabaseMigration.EnsureSchemaUpToDate"/> additive path, EVERY seeded
+    /// pipeline, task-mapping and completion-receipt row survives byte-identically, and a SECOND
+    /// reconciliation is idempotent — no duplicate table, no duplicate column, no data loss, and an
+    /// assignment context written between the two runs is NOT wiped.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: delete the <see cref="WorkerAssignmentContextEntity"/> mapping and the generated
+    /// CREATE script no longer carries the table, so the post-reconcile
+    /// <c>Assert.Contains("worker_assignment_contexts", …)</c> fails; drop the CREATE TABLE detection and
+    /// the pre-existing seeded data assertions fail too.
+    /// </remarks>
+    [Fact]
+    public void EnsureSchema_ExistingFileBackedDb_CreatesWorkerAssignmentContextsTableAdditively_AndIsIdempotent()
+    {
+        var dbPath = NewTempDbPath("wac-reconcile");
+        try
+        {
+            // ── Arrange: a REAL database FILE with a legacy schema and SEEDED rows in three tables. ──
+            using (var seedConnection = OpenFileConnection(dbPath))
+            {
+                ExecuteDirect(seedConnection, LegacyPipelinesDdlWithoutRegistryColumn);
+                ExecuteDirect(seedConnection,
+                    """
+                    INSERT INTO pipelines (goal_id, description, goal_json, phase, iteration, active_task_id,
+                                           coder_branch, created_at, phase_occurrence, machine_phase)
+                    VALUES ('wac-legacy-goal', 'Legacy pipeline', '{"id":"wac-legacy-goal"}', 'Coding', 3,
+                            'task-legacy', 'coder/wac-legacy-goal', '2025-06-01T10:00:00.0000000Z', 2, 'Coding')
+                    """);
+                ExecuteDirect(seedConnection,
+                    "CREATE TABLE task_mappings (task_id TEXT NOT NULL PRIMARY KEY, goal_id TEXT NOT NULL)");
+                ExecuteDirect(seedConnection,
+                    "INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-legacy', 'wac-legacy-goal')");
+                ExecuteDirect(seedConnection,
+                    """
+                    CREATE TABLE completion_receipts (
+                        task_id TEXT NOT NULL PRIMARY KEY,
+                        goal_id TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        first_stored_at_utc TEXT NOT NULL
+                    )
+                    """);
+                ExecuteDirect(seedConnection,
+                    """
+                    INSERT INTO completion_receipts (task_id, goal_id, payload_json, first_stored_at_utc)
+                    VALUES ('task-legacy', 'wac-legacy-goal', '{"version":1}', '2025-06-02T12:00:00.0000000Z')
+                    """);
+
+                // PRECONDITION (anti-vacuous): the new table genuinely does not exist yet.
+                Assert.DoesNotContain("worker_assignment_contexts", GetAllTableNames(seedConnection));
+                Assert.Equal(1L, ScalarOn(seedConnection, "SELECT COUNT(*) FROM pipelines"));
+                Assert.Equal(1L, ScalarOn(seedConnection, "SELECT COUNT(*) FROM task_mappings"));
+                Assert.Equal(1L, ScalarOn(seedConnection, "SELECT COUNT(*) FROM completion_receipts"));
+            }
+
+            // ── Act: the FIRST reconciliation, on a fresh connection to the same file. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            // ── Assert: the table exists with the exact mapping; EVERY seeded row survived. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                Assert.Contains("worker_assignment_contexts", GetAllTableNames(connection));
+                Assert.Equal("task_id", GetPrimaryKeyColumn(connection, "worker_assignment_contexts"));
+                Assert.Equal(
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "task_id", "goal_id", "worker_id", "role", "phase", "model",
+                        "iteration", "occurrence", "attempt", "first_assigned_at_utc",
+                    },
+                    GetTableColumns(connection, "worker_assignment_contexts"));
+                Assert.Empty(GetForeignKeys(connection, "worker_assignment_contexts"));
+
+                // THE SEEDED PIPELINE, MAPPING AND RECEIPT ROWS ARE BYTE-IDENTICAL.
+                Assert.Equal("Legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'wac-legacy-goal'"));
+                Assert.Equal("Coding",
+                    ScalarOn(connection, "SELECT phase FROM pipelines WHERE goal_id = 'wac-legacy-goal'"));
+                Assert.Equal(3L,
+                    ScalarOn(connection, "SELECT iteration FROM pipelines WHERE goal_id = 'wac-legacy-goal'"));
+                Assert.Equal("task-legacy",
+                    ScalarOn(connection, "SELECT active_task_id FROM pipelines WHERE goal_id = 'wac-legacy-goal'"));
+                Assert.Equal("wac-legacy-goal",
+                    ScalarOn(connection, "SELECT goal_id FROM task_mappings WHERE task_id = 'task-legacy'"));
+                Assert.Equal("""{"version":1}""",
+                    ScalarOn(connection, "SELECT payload_json FROM completion_receipts WHERE task_id = 'task-legacy'"));
+
+                // A context written NOW must survive the second reconciliation below.
+                ExecuteDirect(connection,
+                    """
+                    INSERT INTO worker_assignment_contexts
+                        (task_id, goal_id, worker_id, role, phase, model, iteration, occurrence, attempt, first_assigned_at_utc)
+                    VALUES
+                        ('task-between-runs', 'wac-legacy-goal', 'worker-1', 'coder', 'coding', 'model-1',
+                         1, 1, 1, '2025-06-03T12:00:00.0000000Z')
+                    """);
+            }
+
+            // ── Act: the SECOND reconciliation — must be a no-op for this table. ──
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                using var ctx = ContextOn(connection);
+                DatabaseMigration.EnsureSchemaUpToDate(ctx, NullLogger.Instance);
+            }
+
+            using (var connection = OpenFileConnection(dbPath))
+            {
+                // IDEMPOTENT: exactly ONE table of that name and ONE column of each name.
+                Assert.Equal(1, CountTableOccurrences(connection, "worker_assignment_contexts"));
+                Assert.Equal(1, CountColumnOccurrences(connection, "worker_assignment_contexts", "task_id"));
+                Assert.Equal(1, CountColumnOccurrences(connection, "worker_assignment_contexts", "first_assigned_at_utc"));
+                Assert.Equal(
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "task_id", "goal_id", "worker_id", "role", "phase", "model",
+                        "iteration", "occurrence", "attempt", "first_assigned_at_utc",
+                    },
+                    GetTableColumns(connection, "worker_assignment_contexts"));
+
+                // No data loss anywhere: the between-runs context is still there byte-exact…
+                Assert.Equal("worker-1",
+                    ScalarOn(connection, "SELECT worker_id FROM worker_assignment_contexts WHERE task_id = 'task-between-runs'"));
+                Assert.Equal("2025-06-03T12:00:00.0000000Z",
+                    ScalarOn(connection, "SELECT first_assigned_at_utc FROM worker_assignment_contexts WHERE task_id = 'task-between-runs'"));
+
+                // …and the seeded rows in all three pre-existing tables are STILL intact.
+                Assert.Equal(1L, ScalarOn(connection, "SELECT COUNT(*) FROM pipelines"));
+                Assert.Equal(1L, ScalarOn(connection, "SELECT COUNT(*) FROM task_mappings"));
+                Assert.Equal(1L, ScalarOn(connection, "SELECT COUNT(*) FROM completion_receipts"));
+                Assert.Equal("Legacy pipeline",
+                    ScalarOn(connection, "SELECT description FROM pipelines WHERE goal_id = 'wac-legacy-goal'"));
+                Assert.Equal("""{"version":1}""",
+                    ScalarOn(connection, "SELECT payload_json FROM completion_receipts WHERE task_id = 'task-legacy'"));
+            }
+        }
+        finally
+        {
+            DeleteDbFiles(dbPath);
+        }
+    }
+
+    /// <summary>
+    /// NO cascade deletion: <c>worker_assignment_contexts</c> has NO FK to the pipelines or task-mappings
+    /// tables, so removing a transient pipeline row and/or a task-mapping row must NOT delete the recorded
+    /// assignment context. Proven behaviorally — delete each parent, then re-read the context from a FRESH
+    /// context.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: adding an FK relationship (e.g. a cascade from pipelines or task_mappings) in the
+    /// model makes SQLite's ON DELETE CASCADE fire and the fresh-context re-read returns null.
+    /// </remarks>
+    [Fact]
+    public void WorkerAssignmentContexts_SurvivePipelineAndTaskMappingDeletions_NoCascade()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var ctx = ContextOn(connection))
+        {
+            ctx.Database.EnsureCreated();
+
+            ctx.Pipelines.Add(new PipelineEntity
+            {
+                GoalId = "goal-wac-cascade",
+                Description = "cascade parent",
+                GoalJson = """{"id":"goal-wac-cascade"}""",
+                Phase = "Coding",
+                MetricsJson = "{}",
+                RoleSessionsJson = "{}",
+                PhaseOutputs = "{}",
+                CreatedAt = "2025-06-15T10:00:00.0000000Z",
+                PhaseOccurrence = 1,
+            });
+            ctx.TaskMappings.Add(new TaskMappingEntity { TaskId = "task-wac-cascade", GoalId = "goal-wac-cascade" });
+            ctx.WorkerAssignmentContexts.Add(new WorkerAssignmentContextEntity
+            {
+                TaskId = "task-wac-cascade",
+                GoalId = "goal-wac-cascade",
+                WorkerId = "worker-wac-cascade",
+                Role = WorkerRole.Reviewer,
+                Phase = GoalPhase.Review,
+                Model = "model-wac-cascade",
+                Iteration = 5,
+                Occurrence = 2,
+                Attempt = 7,
+                FirstAssignedAtUtc = new DateTime(2025, 6, 15, 11, 0, 0, DateTimeKind.Utc),
+            });
+            ctx.SaveChanges();
+        }
+
+        // Delete the pipeline row…
+        using (var ctx = ContextOn(connection))
+        {
+            var pipeline = ctx.Pipelines.Find("goal-wac-cascade");
+            Assert.NotNull(pipeline);
+            ctx.Pipelines.Remove(pipeline!);
+            ctx.SaveChanges();
+        }
+
+        // …then the task-mapping row — each independently.
+        using (var ctx = ContextOn(connection))
+        {
+            var mapping = ctx.TaskMappings.Find("task-wac-cascade");
+            Assert.NotNull(mapping);
+            ctx.TaskMappings.Remove(mapping!);
+            ctx.SaveChanges();
+        }
+
+        // THE RECORDED CONTEXT SURVIVES BOTH DELETIONS — re-read from a fresh context.
+        using (var ctx = ContextOn(connection))
+        {
+            var row = ctx.WorkerAssignmentContexts.Find("task-wac-cascade");
+            Assert.NotNull(row);
+            Assert.Equal("goal-wac-cascade", row!.GoalId);
+            Assert.Equal("worker-wac-cascade", row.WorkerId);
+            Assert.Equal(WorkerRole.Reviewer, row.Role);
+            Assert.Equal(GoalPhase.Review, row.Phase);
+            Assert.Equal("model-wac-cascade", row.Model);
+            Assert.Equal(5, row.Iteration);
+            Assert.Equal(2, row.Occurrence);
+            Assert.Equal(7, row.Attempt);
+            Assert.Equal(new DateTime(2025, 6, 15, 11, 0, 0, DateTimeKind.Utc), row.FirstAssignedAtUtc);
+
+            // And the schema really carries no FK from worker_assignment_contexts.
+            Assert.Empty(GetForeignKeys(connection, "worker_assignment_contexts"));
+
+            // The parents really are gone, so the survival above is not vacuous.
+            Assert.Null(ctx.Pipelines.Find("goal-wac-cascade"));
+            Assert.Null(ctx.TaskMappings.Find("task-wac-cascade"));
         }
     }
 }
