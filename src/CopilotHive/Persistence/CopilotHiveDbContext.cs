@@ -3,6 +3,8 @@ using System.Text.Json;
 
 using CopilotHive.Goals;
 using CopilotHive.Persistence.Entities;
+using CopilotHive.Services;
+using CopilotHive.Workers;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -50,6 +52,9 @@ public sealed class CopilotHiveDbContext : DbContext
     /// <summary>Completion receipts table.</summary>
     public DbSet<CompletionReceiptEntity> CompletionReceipts { get; set; } = null!;
 
+    /// <summary>Worker assignment contexts table.</summary>
+    public DbSet<WorkerAssignmentContextEntity> WorkerAssignmentContexts { get; set; } = null!;
+
     /// <summary>Users table (single-user admin model).</summary>
     public DbSet<UserEntity> Users { get; set; } = null!;
 
@@ -94,6 +99,7 @@ public sealed class CopilotHiveDbContext : DbContext
         ConfigureConversationEntry(modelBuilder.Entity<ConversationEntryEntity>());
         ConfigureTaskMapping(modelBuilder.Entity<TaskMappingEntity>());
         ConfigureCompletionReceipt(modelBuilder.Entity<CompletionReceiptEntity>());
+        ConfigureWorkerAssignmentContext(modelBuilder.Entity<WorkerAssignmentContextEntity>());
         ConfigureUser(modelBuilder.Entity<UserEntity>());
         ConfigureIssue(modelBuilder.Entity<Issue>());
     }
@@ -162,6 +168,34 @@ public sealed class CopilotHiveDbContext : DbContext
         entity.Property(e => e.GoalId).HasColumnName("goal_id").IsRequired();
         entity.Property(e => e.PayloadJson).HasColumnName("payload_json").IsRequired();
         entity.Property(e => e.FirstStoredAtUtc).HasColumnName("first_stored_at_utc").IsRequired().HasConversion(DateTimeToIsoConverter);
+    }
+
+    /// <summary>
+    /// Maps <see cref="WorkerAssignmentContextEntity"/> to the <c>worker_assignment_contexts</c> table:
+    /// the durable, INSERT-ONCE typed-column record of the server's intended binding for one dispatched
+    /// task.
+    /// <para>
+    /// The role and phase use the SHARED lowercase enum converter and the timestamp uses the SHARED UTC
+    /// <c>"O"</c>-format converter — no new convention is invented. There is deliberately NO foreign key
+    /// and NO cascade relationship to <c>pipelines</c> or <c>task_mappings</c>: deleting a transient
+    /// pipeline or routing row must not erase the recorded assignment context.
+    /// </para>
+    /// </summary>
+    private static void ConfigureWorkerAssignmentContext(EntityTypeBuilder<WorkerAssignmentContextEntity> entity)
+    {
+        entity.ToTable("worker_assignment_contexts");
+
+        entity.HasKey(e => e.TaskId);
+        entity.Property(e => e.TaskId).HasColumnName("task_id");
+        entity.Property(e => e.GoalId).HasColumnName("goal_id").IsRequired();
+        entity.Property(e => e.WorkerId).HasColumnName("worker_id").IsRequired();
+        entity.Property(e => e.Role).HasColumnName("role").IsRequired().HasConversion(LowercaseEnumConverter<WorkerRole>());
+        entity.Property(e => e.Phase).HasColumnName("phase").IsRequired().HasConversion(LowercaseEnumConverter<GoalPhase>());
+        entity.Property(e => e.Model).HasColumnName("model").IsRequired();
+        entity.Property(e => e.Iteration).HasColumnName("iteration").IsRequired();
+        entity.Property(e => e.Occurrence).HasColumnName("occurrence").IsRequired();
+        entity.Property(e => e.Attempt).HasColumnName("attempt").IsRequired();
+        entity.Property(e => e.FirstAssignedAtUtc).HasColumnName("first_assigned_at_utc").IsRequired().HasConversion(DateTimeToIsoConverter);
     }
 
     private static void ConfigureGoal(EntityTypeBuilder<Goal> entity)
