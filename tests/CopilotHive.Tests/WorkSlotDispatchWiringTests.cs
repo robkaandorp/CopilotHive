@@ -1730,6 +1730,13 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-", StringComparison.Ordinal));
 
+        // THE PUBLICATION-SUCCESS RECORD fires for the PUBLISHED outcome — and the reported-refusal
+        // vector above pins that it does NOT fire for a Blocked one.
+        Assert.Contains(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Task {taskId} pushed to worker {worker.Id}");
+
         // ═══════════════════════════════════════════════════════════════════════════════
         //  THE ONE-ID END-TO-END CHAIN — all six surfaces, the SAME single allocated ID,
         //  observed at stage S where they are simultaneously live.
@@ -2220,6 +2227,339 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         AssertSendPreserve(manager, pipeline, queue, logger, gateway, worker);
     }
 
+    // ── (h2) STAGE S — THE REPORTED REFUSAL (Blocked) ────────────────────────
+
+    /// <summary>
+    /// A <see cref="WorkerTaskSendOutcome.Blocked"/> report is NOT a failure: the dispatch returns
+    /// NORMALLY with NO <c>delivery-failure</c> record, and the WHOLE delivery state is retained —
+    /// the active queue entry, the pointer, the Pending slot, the mapping and the worker's
+    /// busy/role/model state.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_SendReportsBlocked_ReturnsNormallyAndRetainsEverything()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker) { SendTaskBlocks = true };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        // THE NORMAL RETURN — nothing escapes the dispatch for a reported refusal.
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
+
+        // THE EAGER ADMISSION AND DELIVERY STATE ARE ALL RETAINED.
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
+        Assert.True(worker.IsBusy);
+        Assert.Equal(WorkerRole.Coder, worker.Role);
+        Assert.Equal("coder-model", worker.CurrentModel);
+        Assert.Empty(DrainPending(queue));
+        Assert.Equal(WorkSlotState.Pending, SingleSlot(pipeline).State);
+        Assert.Same(pipeline, manager.GetByTaskId(taskId));
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+
+        // NO FAILURE RECORD AND NO RECOVERY: a refusal is not an ambiguity-preserve.
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-failure", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
+        // NO PUBLICATION-SUCCESS RECORD EITHER: it reports channel publication, which a refusal
+        // deliberately did NOT perform.
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Task {taskId} pushed to worker {worker.Id}");
+        Assert.Contains(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Dispatched Coder task {taskId} for goal {GoalId} " +
+                              $"(branch=copilothive/{GoalId})");
+    }
+
+    /// <summary>
+    /// TWO-GOAL FIFO ISOLATION FOR THE REFUSAL: pipeline B's push delivers pipeline A's EARLIER
+    /// queued task, which is BLOCKED. B's own admission — its slot, its mapping, its pointer — is
+    /// completely untouched, and A's delivered task is preserved rather than thrown into B's
+    /// dispatch.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_BlockedEarlierTaskOfAnotherGoal_LeavesBothAdmissionsIntact()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+
+        // Pipeline A dispatched first; its coder task sits in the pending queue with no idle worker.
+        var pipelineA = manager.CreatePipeline(CreateGoal("goal-a"));
+        Arrange(pipelineA, GoalPhase.Coding);
+        var queue = new TaskQueue();
+        var serviceA = CreateService(
+            manager, queue, new TestLogger<TaskDispatchService>(), goal: CreateGoal("goal-a"));
+        await serviceA.DispatchToRole(pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
+
+        var taskA = SettledTaskId(pipelineA);
+        AssertSuffixedTaskId(taskA, TaskIdPrefix("goal-a", WorkerRole.Coder));
+
+        // Pipeline B dispatches WITH an idle worker — and the FIFO hands it A's task.
+        var pipelineB = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipelineB, GoalPhase.Coding);
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var loggerB = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker) { SendTaskBlocks = true };
+        var serviceB = CreateService(manager, queue, loggerB, workerGateway: gateway);
+
+        // THE NORMAL RETURN: the refusal for A must not surface as B's failure.
+        await serviceB.DispatchToRole(pipelineB, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken);
+
+        var taskB = SettledTaskId(pipelineB);
+        AssertSuffixedTaskId(taskB, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.NotEqual(taskA, taskB, StringComparer.Ordinal);
+
+        // THE MISMATCH RECORD names the DELIVERED goal and BOTH task IDs.
+        Assert.Contains(loggerB.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug && e.Message == DeliveryMismatchMessage("goal-a", taskB, taskA));
+        // NO failure record names the DELIVERED task: the refusal is not a preserve.
+        Assert.DoesNotContain(loggerB.LogEntries, e => e.Message.Contains("delivery-failure", StringComparison.Ordinal));
+
+        // THE DELIVERED task is the one retained by the delivery.
+        Assert.NotNull(queue.GetActiveTask(taskA));
+        Assert.Equal([taskA], gateway.MarkedBusyTaskIds);
+
+        // B's ADMISSION is untouched, and A's admission stands too.
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineB.GetSlotsForTest()).State);
+        Assert.Same(pipelineB, manager.GetByTaskId(taskB));
+        Assert.Equal(taskB, pipelineB.ActiveTaskId);
+        Assert.Equal([taskB], DrainPending(queue));
+        Assert.Same(pipelineA, manager.GetByTaskId(taskA));
+        Assert.Equal(taskA, pipelineA.ActiveTaskId);
+    }
+
+    // ── (h3) THE REAL-GATEWAY OBSERVATION FIXTURES ───────────────────────────
+
+    /// <summary>
+    /// THE COMPLETE TWO-GOAL CONFLICT/REFUSAL CHAIN: the REAL
+    /// <see cref="GrpcWorkerGateway"/> — with the REAL publisher and the fixture-minted
+    /// <see cref="CapturingGatewayLogger"/> — is reached by a real two-goal FIFO delivery, and its
+    /// single guarded warning NAMES the DELIVERED goal and task, the worker and the refusal reason.
+    /// </summary>
+    /// <remarks>
+    /// THE GENUINE REFUSAL: a DIFFERENT context is seeded for A's delivered task id, so the real
+    /// publisher's insert-once arbitration reports <c>Conflict</c>. The warning therefore comes from
+    /// the real gateway's own guarded diagnostic, and A's delivered task is never published while B's
+    /// admission — its slot, its mapping, its pointer — is untouched.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_RealGatewayBlockedWarning_NamesDeliveredGoalTaskWorkerAndReason()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+
+        // Pipeline A first, with NO idle worker: its coder task is only ENQUEUED.
+        var pipelineA = manager.CreatePipeline(CreateGoal("goal-warn-a"));
+        Arrange(pipelineA, GoalPhase.Coding);
+        var queue = new TaskQueue();
+        var serviceA = CreateService(
+            manager, queue, new TestLogger<TaskDispatchService>(), goal: CreateGoal("goal-warn-a"));
+        await serviceA.DispatchToRole(pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
+
+        var taskA = SettledTaskId(pipelineA);
+        AssertSuffixedTaskId(taskA, TaskIdPrefix("goal-warn-a", WorkerRole.Coder));
+
+        // THE REAL GATEWAY, the REAL publisher and the CAPTURING gateway logger — all three sharing
+        // ONE worker pool, so the publisher's pinned-instance check really holds.
+        var pool = new WorkerPool();
+        var registered = pool.RegisterWorker("worker-warn", []);
+        registered.Role = WorkerRole.Tester;
+        var gatewayLogger = new CapturingGatewayLogger();
+
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var conflictingSlot = new WorkSlot(taskA, new WorkSlotPosition(4, GoalPhase.Testing, 2), 5);
+        var seeded = recording.Store.InsertOnce(new WorkerAssignmentContext(
+            "goal-warn-a", "worker-elsewhere", WorkerRole.Tester, conflictingSlot, "conflicting-model"));
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, seeded.Status);
+        var seededRowBeforeDelivery = recording.Store.Load(taskA);
+        Assert.NotNull(seededRowBeforeDelivery);
+
+        var gateway = new GrpcWorkerGateway(pool, recording.Publisher, gatewayLogger);
+
+        // Pipeline B's dispatch FIFO-delivers A's EARLIER coder task through the real gateway.
+        var pipelineB = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipelineB, GoalPhase.Coding);
+        var loggerB = new TestLogger<TaskDispatchService>();
+        var serviceB = CreateService(manager, queue, loggerB, workerGateway: gateway);
+
+        await serviceB.DispatchToRole(pipelineB, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken);
+
+        var taskB = SettledTaskId(pipelineB);
+        AssertSuffixedTaskId(taskB, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.NotEqual(taskA, taskB, StringComparer.Ordinal);
+
+        // THE SINGLE GUARDED WARNING, with its structured fields: worker, DELIVERED task, DELIVERED
+        // goal, the refusal reason and the blocked/retained disposition. It must never accidentally
+        // identify B, whose dispatch merely triggered delivery of A.
+        var warning = Assert.Single(
+            gatewayLogger.Emitted, entry => entry.Level == LogLevel.Warning);
+        Assert.Contains("assignment blocked", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("no assignment published", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("task retained", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(taskA, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("goal-warn-a", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(registered.Id, warning.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            nameof(WorkerAssignmentRecordingFailureReason.Conflict),
+            warning.Message,
+            StringComparison.Ordinal);
+
+        // THE STRUCTURED ARGUMENTS carry the same four fields verbatim.
+        Assert.Contains(registered.Id, warning.Arguments);
+        Assert.Contains(taskA, warning.Arguments);
+        Assert.Contains("goal-warn-a", warning.Arguments);
+        Assert.Contains(WorkerAssignmentRecordingFailureReason.Conflict, warning.Arguments);
+        Assert.DoesNotContain(taskB, warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(taskB, warning.Arguments);
+
+        // THE THROWING ARM: a logger asked to fail at WARNING (and one asked to fail at ANY level)
+        // really throws through the REAL gateway — which is the capability the guarded warning's
+        // resilience vector needs.
+        foreach (var throwingLogger in new[]
+                 {
+                     new CapturingGatewayLogger { ThrowOnLevel = LogLevel.Warning },
+                     new CapturingGatewayLogger { ThrowOnAnyWrite = true },
+                 })
+        {
+            var throwingGateway = new GrpcWorkerGateway(pool, recording.Publisher, throwingLogger);
+            var outcome = await throwingGateway.SendTaskAsync(
+                registered.Id,
+                new WorkTask
+                {
+                    TaskId = taskA,
+                    GoalId = "goal-warn-a",
+                    GoalDescription = "warning fixture",
+                    Prompt = "do the work",
+                    Role = WorkerRole.Coder,
+                    Model = "model-warn",
+                    Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+                },
+                TestContext.Current.CancellationToken);
+
+            // THE THROW WAS REAL AND THE HANDLED DISPOSITION SURVIVED IT.
+            Assert.Equal(WorkerTaskSendOutcome.Blocked, outcome);
+            Assert.Equal(1, throwingLogger.ThrowCount);
+            Assert.Single(throwingLogger.Emitted);
+        }
+
+        // NOTHING WAS PUBLISHED and the FINAL publication-success record for A does not exist.
+        Assert.False(registered.MessageChannel.Reader.TryRead(out _));
+        Assert.DoesNotContain(
+            loggerB.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            loggerB.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Task {taskA} pushed to worker {registered.Id}");
+
+        // THE EARLIER ADMISSION/ENQUEUE RECORD FOR B REMAINS. This is intentionally NOT blanket log
+        // silence: suppressing all post-admission information would fail this positive assertion.
+        Assert.Contains(
+            loggerB.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Dispatched Coder task {taskB} for goal {GoalId} " +
+                              $"(branch=copilothive/{GoalId})");
+
+        // THE CONFLICTING ASSIGNMENT ROW FOR A IS BYTE-FOR-BYTE SEMANTICALLY UNCHANGED, including its
+        // first-assigned instant; B was never delivered and therefore acquired no assignment row.
+        var seededRowAfterDelivery = recording.Store.Load(taskA);
+        Assert.NotNull(seededRowAfterDelivery);
+        Assert.Equal(seededRowBeforeDelivery!.Context, seededRowAfterDelivery!.Context);
+        Assert.Equal(seededRowBeforeDelivery.FirstAssignedAtUtc, seededRowAfterDelivery.FirstAssignedAtUtc);
+        Assert.Null(recording.Store.Load(taskB));
+
+        // BOTH ADMISSIONS REMAIN INTACT. A is the active queue entry retained by the blocked
+        // delivery; B remains pending. Both pointers, Pending slots, in-memory mappings and durable
+        // task-mapping rows still identify their original pipelines.
+        Assert.NotNull(queue.GetActiveTask(taskA));
+        Assert.Null(queue.GetActiveTask(taskB));
+        Assert.Equal(taskA, pipelineA.ActiveTaskId);
+        Assert.Equal(taskB, pipelineB.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineA.GetSlotsForTest()).State);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineB.GetSlotsForTest()).State);
+        Assert.Same(pipelineA, manager.GetByTaskId(taskA));
+        Assert.Same(pipelineB, manager.GetByTaskId(taskB));
+        Assert.Equal("goal-warn-a", ReadPersistedGoalId(taskA));
+        Assert.Equal(GoalId, ReadPersistedGoalId(taskB));
+        Assert.Equal([taskB], DrainPending(queue));
+
+        // THE PINNED WORKER RETAINS A'S actual delivered identity; no B state unwound it.
+        Assert.Equal(taskA, registered.CurrentTaskId);
+        Assert.True(registered.IsBusy);
+        Assert.Equal(WorkerRole.Coder, registered.Role);
+        Assert.Equal("coder-model", registered.CurrentModel);
+    }
+
+    /// <summary>
+    /// THE UNDEFINED-OUTCOME BOUNDARY: a gateway double returning an UNDEFINED
+    /// <see cref="WorkerTaskSendOutcome"/> makes the dispatch's explicit <c>default</c> branch throw,
+    /// and the publication-success record is NEVER emitted for it.
+    /// </summary>
+    [Fact]
+    public async Task Delivery_SendReportsUndefinedOutcome_ThrowsAndEmitsNoSuccessRecord()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new DeliveryWorkerGateway(worker)
+        {
+            SendTaskOutcomeOverride = (WorkerTaskSendOutcome)999,
+        };
+        var service = CreateService(manager, queue, logger, workerGateway: gateway);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE UNDEFINED VALUE IS REPORTED AS SUCH — never mistaken for a publication.
+        Assert.Equal("Unhandled WorkerTaskSendOutcome: 999", thrown.Message);
+
+        var taskId = SettledTaskId(pipeline);
+
+        // NO FINAL SUCCESS RECORD FOR THE ACTUAL TASK. The explicit default throw occurs before that
+        // log site, and no delivery-failure record is invented (the undefined return is a contract
+        // violation, not an exception thrown by the send ambiguity point). Retain the pre-existing
+        // broad assertion and add the exact-task assertion; neither existing coverage nor precision
+        // is traded away.
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Task {taskId} pushed to worker {worker.Id}");
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("delivery-failure", StringComparison.Ordinal));
+
+        // THE THROW DOES NOT SECRETLY ROLLBACK OR REQUEUE: stage S had already activated and marked
+        // the worker before it inspected the undefined result.
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+        Assert.Equal([taskId], gateway.MarkedBusyTaskIds);
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+        Assert.True(worker.IsBusy);
+
+        // The adjacent Delivery_SendReportsBlocked_ReturnsNormallyAndRetainsEverything vector pins
+        // the other pre-success branch: Blocked returns normally and likewise emits no final success
+        // record. Together the two vectors prove only Published can reach that log.
+    }
+
     /// <summary>
     /// A CALLER CANCELLATION AT STAGE S takes THE SAME PRESERVE PATH, and the cancellation is
     /// genuinely driven by the CALLER'S TOKEN — not a fabricated tokenless
@@ -2460,7 +2800,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         public ConnectedWorker? GetIdleWorker() => throw _sentinel;
         public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [];
         public void MarkBusy(string workerId, string taskId) { }
-        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default) =>
+            Task.FromResult(WorkerTaskSendOutcome.Published);
         public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) => Task.CompletedTask;
         public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default) => Task.CompletedTask;
     }
@@ -2515,6 +2856,28 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         /// <summary>When set, <see cref="SendTaskAsync"/> throws it (stage S).</summary>
         public Exception? SendTaskThrows { get; init; }
+
+        /// <summary>
+        /// When set, <see cref="SendTaskAsync"/> reports the RECORDING REFUSAL
+        /// (<see cref="WorkerTaskSendOutcome.Blocked"/>) instead of publishing — the eager
+        /// gateway's blocked disposition, WITHOUT any thrown failure. The cancel/throw injections
+        /// above still take precedence, so a vector can combine an injected throw with this flag
+        /// only deliberately.
+        /// </summary>
+        public bool SendTaskBlocks { get; init; }
+
+        /// <summary>
+        /// THE UNDEFINED-OUTCOME ARM: when set, <see cref="SendTaskAsync"/> returns THIS value
+        /// verbatim instead of the two defined outcomes — e.g. <c>(WorkerTaskSendOutcome)999</c>.
+        /// A vector uses it to prove the dispatch's explicit <c>default</c> branch throws (and
+        /// therefore can never be mistaken for a successful publication).
+        /// </summary>
+        /// <remarks>
+        /// IT IS DELIBERATELY PLACED BESIDE <see cref="SendTaskBlocks"/> AND APPLIED THE SAME WAY:
+        /// the cancel/throw injections above still take precedence, so an armed throw is still an
+        /// armed throw.
+        /// </remarks>
+        public WorkerTaskSendOutcome? SendTaskOutcomeOverride { get; init; }
 
         /// <summary>
         /// When set, <see cref="SendTaskAsync"/> CANCELS this source and then throws by observing
@@ -2592,7 +2955,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             _worker.CurrentTaskId = taskId;
         }
 
-        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+        public async Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
         {
             TokenAtSend = ct;
 
@@ -2618,12 +2981,18 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             if (SendTaskThrows is not null)
                 throw SendTaskThrows;
 
+            if (SendTaskOutcomeOverride is WorkerTaskSendOutcome overridden)
+                return overridden;
+
+            if (SendTaskBlocks)
+                return WorkerTaskSendOutcome.Blocked;
+
             // THE DELIVERY-TIME OBSERVATION, taken INSIDE the real send — the instant at which the
             // whole identity chain is simultaneously live (see OnSendTask).
             OnSendTask?.Invoke(task);
 
             SentTaskIds.Add(task.TaskId);
-            return Task.CompletedTask;
+            return WorkerTaskSendOutcome.Published;
         }
 
         public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>

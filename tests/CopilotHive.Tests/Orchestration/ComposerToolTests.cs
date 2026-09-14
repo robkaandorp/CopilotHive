@@ -2642,8 +2642,8 @@ public sealed class ComposerToolTests : IDisposable
             Capabilities = [],
         };
 
-        public Task SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default) =>
+            Task.FromResult(WorkerTaskSendOutcome.Published);
 
         public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
             Task.CompletedTask;

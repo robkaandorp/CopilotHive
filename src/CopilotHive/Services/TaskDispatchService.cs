@@ -543,7 +543,9 @@ internal sealed class TaskDispatchService
         //                      the ONE provably-safe recovery point, hence THE REQUEUE.
         //    P1 (activate)     NON-THROWING BY CONTRACT (see the two-mutation comment below).
         //    P2 (mark-busy)    RUNTIME-REACHABLE (the interface throw) → THE AMBIGUITY-PRESERVE.
-        //    S  (send)         THE AMBIGUITY POINT → THE PRESERVE.
+        //    S  (send)         THE AMBIGUITY POINT → THE PRESERVE when the send THROWS; a REPORTED
+        //                      refusal (WorkerTaskSendOutcome.Blocked) is NOT a failure and returns
+        //                      normally, retaining everything and emitting no success record.
         //
         //  THE PROPAGATION RULE: every caught DELIVERY-OPERATION exception is RETHROWN UNCHANGED
         //  after its recovery. Every POST-DEQUEUE logger failure is swallowed by the logging
@@ -721,13 +723,22 @@ internal sealed class TaskDispatchService
             throw;
         }
 
-        // STAGE S — THE PRESERVE. The send's outcome is the ambiguity this whole transaction is
-        // honest about: the worker may or may not have received the assignment. Undoing anything
-        // here could deliver the same task twice, so the record fires and the ORIGINAL rethrows —
-        // a caller cancellation at S takes exactly the same path.
+        // STAGE S — THE PRESERVE, OR THE PUBLICATION. The send's FAILURE outcome is the ambiguity
+        // this whole transaction is honest about: the worker may or may not have received the
+        // assignment. Undoing anything here could deliver the same task twice, so the record fires
+        // and the ORIGINAL rethrows — a caller cancellation at S takes exactly the same path.
+        //
+        // THE PUBLISHER'S REFUSAL IS NOT A FAILURE. When the gateway reports
+        // WorkerTaskSendOutcome.Blocked the assignment was deliberately NOT published (the
+        // recording contract refused it, or no publisher was configured). The pinned worker, the
+        // active queue entry, the pointer, the Pending slot, the mapping, the worker's busy/role/
+        // model state and the stored row are ALL deliberately retained, and this method returns
+        // NORMALLY — no rollback, no requeue, no goal failure, and no completion-side effect. The
+        // disposition record for that refusal is emitted by the gateway itself.
+        WorkerTaskSendOutcome sendOutcome;
         try
         {
-            await _workerGateway.SendTaskAsync(deliveryWorkerId, queuedTask, ct);
+            sendOutcome = await _workerGateway.SendTaskAsync(deliveryWorkerId, queuedTask, ct);
         }
         catch (Exception)
         {
@@ -737,6 +748,24 @@ internal sealed class TaskDispatchService
             throw;
         }
 
+        switch (sendOutcome)
+        {
+            case WorkerTaskSendOutcome.Blocked:
+                // RETURN NORMALLY, retaining everything and emitting NO publication-success record.
+                return;
+
+            case WorkerTaskSendOutcome.Published:
+                break;
+
+            default:
+                // NO SILENT FALLBACK: an undefined outcome is a contract violation, and it must
+                // never be mistaken for a successful publication.
+                throw new InvalidOperationException($"Unhandled WorkerTaskSendOutcome: {sendOutcome}");
+        }
+
+        // THE PUBLICATION-SUCCESS RECORD — reached ONLY for WorkerTaskSendOutcome.Published. It
+        // reports CHANNEL PUBLICATION, never confirmed receipt: the worker may never consume the
+        // message.
         LogSafely(() => _logger.LogInformation(
             "Task {TaskId} pushed to worker {WorkerId}", deliveredTaskId, deliveryWorkerId));
     }
@@ -750,7 +779,11 @@ internal sealed class TaskDispatchService
         /// <summary>The MarkBusy/CurrentModel stage (P2).</summary>
         Prepare,
 
-        /// <summary>The SendTaskAsync stage (S).</summary>
+        /// <summary>
+        /// The SendTaskAsync stage (S). Its THROW is the ambiguity-preserve; a returned
+        /// <see cref="WorkerTaskSendOutcome.Blocked"/> is a reported refusal that retains
+        /// everything and emits no <c>pushed to worker</c> record.
+        /// </summary>
         Send,
     }
 

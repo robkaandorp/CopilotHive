@@ -346,6 +346,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
 using System.Collections.Concurrent;
+using System.Reflection;
 using CopilotHive.Configuration;
 using CopilotHive.Git;
 using CopilotHive.Goals;
@@ -2330,10 +2331,15 @@ public sealed class TaskDispatchServiceTests
 
         var workerPool = new WorkerPool();
         var idleWorker = workerPool.RegisterWorker("worker-1", []);
-        var gateway = new GrpcWorkerGateway(workerPool);
-
         var taskQueue = new TaskQueue();
         var pipelineManager = new GoalPipelineManager();
+
+        // THE EAGER PATH IS RECORDED: the real gateway delegates its publication to the REAL
+        // publisher over a real store, so the delivered assignment must leave a recorded row — a
+        // missing publisher would merely BLOCK the send (never fall back to a raw write).
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+
         var service = CreateService(
             config: config,
             pipelineManager: pipelineManager,
@@ -2360,6 +2366,613 @@ public sealed class TaskDispatchServiceTests
 
         // The task should have been removed from the pending queue (activated)
         Assert.Null(taskQueue.TryDequeueAny());
+
+        // THE EAGER ASSIGNMENT REALLY WAS RECORDED for the DELIVERED task, and the publication
+        // happened: the row names the pinned worker and the worker's channel carries the
+        // assignment. (The channel is drained here because no transport is attached to this
+        // fixture.)
+        var deliveredTaskId = idleWorker.CurrentTaskId!;
+        var recorded = recording.Store.Load(deliveredTaskId);
+        Assert.NotNull(recorded);
+        Assert.Equal("worker-1", recorded!.Context.WorkerId);
+        Assert.True(idleWorker.MessageChannel.Reader.TryRead(out var published));
+        Assert.Equal(deliveredTaskId, published.Assignment.TaskId);
+
+        // The recorded row's goal and model are the DELIVERED task's, and its slot phase matches
+        // the delivered dispatch's Coding slot.
+        Assert.Equal(pipeline.GoalId, recorded.Context.GoalId);
+        Assert.Equal("coder-model", recorded.Context.Model);
+        Assert.Equal(WorkerRole.Coder, recorded.Context.Role);
+        Assert.Equal(GoalPhase.Coding, recorded.Context.Slot.Position.Phase);
+        // The publication-success log is pinned by the wiring suite's happy-path vector, which
+        // captures the service logger; this fixture uses the shared NullLogger wiring.
+    }
+
+    // ── DispatchToRole: the recorded eager delivery — conflict, fail-closed, recovery ──
+
+    /// <summary>
+    /// A REAL CONFLICTING ROW for the delivered task id BLOCKS the whole eager delivery: the real
+    /// gateway delegates to the real publisher, whose InsertOnce reads a DIFFERENT stored context
+    /// and refuses with Conflict, and the gateway reports <see cref="WorkerTaskSendOutcome.Blocked"/>,
+    /// which stage S treats as a NORMAL return — before the publication-success log.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS: the seeded row is the ONLY state this test's outcome depends on, and the
+    /// assertion set pins (i) the Blocked outcome's absence of a channel message, (ii) the absence
+    /// of the FINAL <c>pushed to worker</c> log, (iii) the RETENTION of the earlier
+    /// <c>Dispatched … (branch=…)</c> admission line and of every retained delivery state, and
+    /// (iv) the UNCHANGED pre-existing row. A recording bypass (missing publisher, or a publisher
+    /// that was never invoked) yields the same Blocked outcome, so (ii)/(iv) plus the strengthened
+    /// happy-path test above (which REQUIRES a recorded row AND the success log) are what kill it.
+    /// </remarks>
+    [Fact]
+    public async Task DispatchToRole_ConflictingRowForDeliveredTask_BlocksPublishesNothingAndKeepsState()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-conflict", []);
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+
+        var goal = new Goal
+        {
+            Id = "goal-conflict",
+            Description = "conflict fixture",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+        // THE NONCE IS CONTROLLED so the conflicting row is seeded for the EXACT id this dispatch
+        // will allocate and deliver.
+        WithControlledNonce(pipeline);
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
+
+        // THE REAL CONFLICTING ROW: a DIFFERENT stored context (worker, role, model, slot) for the
+        // delivered task id, inserted through the REAL store before the dispatch runs.
+        var conflictingSlot = new WorkSlot(expectedTaskId, new WorkSlotPosition(7, GoalPhase.Testing, 3), 9);
+        var conflictingContext = new WorkerAssignmentContext(
+            "goal-conflict", "worker-elsewhere", WorkerRole.Tester, conflictingSlot, "conflicting-model");
+        var seeded = recording.Store.InsertOnce(conflictingContext);
+        Assert.Equal(WorkerAssignmentWriteStatus.Recorded, seeded.Status);
+
+        var logger = new TestLogger<TaskDispatchService>();
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goal,
+            logger: logger);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        // THE OUTCOME IS BLOCKED — but delivered as a NORMAL return: no exception escaped, and the
+        // admission/enqueue logs (including the Dispatched line) are still present.
+        Assert.Contains(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Dispatched Coder task {expectedTaskId} for goal {goal.Id} (branch=copilothive/{goal.Id})");
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Task {expectedTaskId} pushed to worker worker-conflict");
+
+        // NO Assignment REACHED THE CHANNEL, and NOTHING WAS RE-RECORDED over the seeded row.
+        Assert.False(idleWorker.MessageChannel.Reader.TryRead(out _));
+
+        // THE DELIVERY STATE IS FULLY RETAINED (no rollback, no requeue, no goal failure).
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+        Assert.Same(pipeline, pipelineManager.GetByTaskId(expectedTaskId));
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+
+        // THE PRE-EXISTING ROW IS UNCHANGED — never overwritten or rebound.
+        var row = recording.Store.Load(expectedTaskId);
+        Assert.NotNull(row);
+        Assert.Equal("worker-elsewhere", row!.Context.WorkerId);
+        Assert.Equal(WorkerRole.Tester, row.Context.Role);
+        Assert.Equal("conflicting-model", row.Context.Model);
+        Assert.Equal(new WorkSlot(expectedTaskId, new WorkSlotPosition(7, GoalPhase.Testing, 3), 9), row.Context.Slot);
+    }
+
+    /// <summary>
+    /// THE FAIL-CLOSED MISSING PUBLISHER ON THE LIVE DISPATCH PATH: with a publisher-less gateway
+    /// the eager send reports <see cref="WorkerTaskSendOutcome.Blocked"/>, NOTHING is published to
+    /// the channel, NOTHING is recorded, and the dispatch still returns normally with every
+    /// delivery state retained — an unrecorded assignment is never delivered by a raw write.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_MissingPublisherBlocked_PublishesNothingAndRetainsState()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-nopub", []);
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        // THE PUBLISHER-LESS GATEWAY: the eager send must fail CLOSED, never falling back to a raw
+        // channel write.
+        var gateway = new GrpcWorkerGateway(workerPool);
+
+        var goal = new Goal
+        {
+            Id = "goal-nopub",
+            Description = "missing publisher fixture",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+        WithControlledNonce(pipeline);
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
+
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goal,
+            logger: logger);
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        // THE NORMAL RETURN with the admission logs retained and NO publication-success record.
+        Assert.Contains(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Information &&
+                 e.Message == $"Dispatched Coder task {expectedTaskId} for goal {goal.Id} (branch=copilothive/{goal.Id})");
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+
+        // FAIL CLOSED: nothing on the channel, nothing recorded.
+        Assert.False(idleWorker.MessageChannel.Reader.TryRead(out _));
+
+        // THE DELIVERY STATE IS RETAINED.
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A POST-RECORD MAPPING/CHANNEL FAILURE on the live dispatch path keeps the RECORDED context
+    /// and is NOT re-labelled as a recording failure: the completed channel makes the REAL
+    /// <see cref="WorkerAssignmentPublisher"/>'s post-record write throw, which the REAL
+    /// <see cref="GrpcWorkerGateway"/> does NOT convert to
+    /// <see cref="WorkerTaskSendOutcome.Blocked"/> — so stage S takes the ambiguity-PRESERVE path and
+    /// rethrows the ORIGINAL exception, and the recorded row survives.
+    /// </summary>
+    /// <remarks>
+    /// THE WHOLE CHAIN IS REAL — real gateway, real publisher, real assignment-context store, real
+    /// in-memory SQLite and the real <c>DispatchToRole</c> stage S — so this is the F3 end-to-end
+    /// proof, and the assertion on the fault is DISCRIMINATING rather than "anything but a recording
+    /// failure": the expected original fault type is pinned EXACTLY
+    /// (<c>System.Threading.Channels.ChannelClosedException</c> — the same type the publisher's own post-record unit test
+    /// and the Ready stream test already pin, since a write to a completed channel raises it).
+    /// <c>Assert.ThrowsAsync&lt;T&gt;</c> requires EXACT type equality, so a generic wrapper, a
+    /// re-labelled recording failure or any derived substitute fails here.
+    /// </remarks>
+    [Fact]
+    public async Task DispatchToRole_PostRecordChannelFault_PreservesAndKeepsRecordedContext()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-fault", []);
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+
+        var goal = new Goal
+        {
+            Id = "goal-fault",
+            Description = "post-record fault fixture",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipeline = pipelineManager.CreatePipeline(goal);
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipeline, ModelTier.Default);
+        WithControlledNonce(pipeline);
+        var expectedTaskId = TaskIdPrefix(goal.Id, WorkerRole.Coder) + "-" + ControlledNonceSuffix;
+
+        // THE CHANNEL IS CLOSED AFTER RECORDING WILL HAVE HAPPENED: the publisher records the
+        // context, then its post-record channel write throws.
+        idleWorker.MessageChannel.Writer.TryComplete();
+
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goal,
+            logger: logger);
+
+        var thrown = await Assert.ThrowsAsync<System.Threading.Channels.ChannelClosedException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE FAULT IS PINNED BY EXACT TYPE — required by ThrowsAsync<T> — and it is provably NOT a
+        // recording failure. A wrapper or a re-labelled refusal cannot satisfy this.
+        Assert.IsType<System.Threading.Channels.ChannelClosedException>(thrown);
+        Assert.IsNotType<WorkerAssignmentRecordingException>(thrown);
+
+        // THE AMBIGUITY-PRESERVE RECORD: EXACTLY ONE stage=send recovery=preserve record — the send
+        // THREW, and no other stage produced a failure record.
+        var preserve = Assert.Single(
+            logger.LogEntries,
+            e => e.LogLevel == LogLevel.Warning &&
+                 e.Message.Contains("delivery-failure", StringComparison.Ordinal) &&
+                 e.Message.Contains($"task={expectedTaskId}", StringComparison.Ordinal) &&
+                 e.Message.Contains("stage=send", StringComparison.Ordinal) &&
+                 e.Message.Contains("recovery=preserve", StringComparison.Ordinal));
+        Assert.Contains("remains active", preserve.Message, StringComparison.Ordinal);
+
+        // NO PUBLICATION-SUCCESS RECORD, and NO recovery activity: the preserve performs none.
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries,
+            e => e.Message.Contains("delivery-recovery", StringComparison.Ordinal));
+
+        // THE RECORDED CONTEXT IS RETAINED with EVERY original value — a post-record failure never
+        // deletes, rebinds or relabels it.
+        var row = recording.Store.Load(expectedTaskId);
+        Assert.NotNull(row);
+        Assert.Equal("goal-fault", row!.Context.GoalId);
+        Assert.Equal("worker-fault", row.Context.WorkerId);
+        Assert.Equal(WorkerRole.Coder, row.Context.Role);
+        Assert.Equal("coder-model", row.Context.Model);
+        Assert.Equal(expectedTaskId, row.Context.Slot.TaskId);
+        Assert.Equal(GoalPhase.Coding, row.Context.Slot.Position.Phase);
+
+        // THE TASK WAS NOT REQUEUED: still active, Pending slot/pointer/mapping intact, queue empty.
+        Assert.NotNull(taskQueue.GetActiveTask(expectedTaskId));
+        Assert.Null(taskQueue.TryDequeueAny());
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Same(pipeline, pipelineManager.GetByTaskId(expectedTaskId));
+
+        // THE DELIVERY STATE IS PRESERVED.
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(expectedTaskId, idleWorker.CurrentTaskId);
+        Assert.Equal(expectedTaskId, pipeline.ActiveTaskId);
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
+    }
+
+    /// <summary>
+    /// THE ROLE-AGNOSTIC FALLBACK DELIVERS THE ACTUAL DEQUEUED TASK, AND THE RECORDING NAMES IT:
+    /// goal A's Coder task is queued first; goal B then requests Tester while the Tester queue is
+    /// deterministically empty. Therefore <c>TryDequeue(Tester)</c> cannot select A and the following
+    /// <c>TryDequeueAny()</c> is the only path that can deliver it. The real recorded row, channel
+    /// assignment and publication-success log all name A — never B's newly admitted task or pipeline.
+    /// </summary>
+    [Fact]
+    public async Task DispatchToRole_RoleAgnosticFallbackDeliversEarlierTask_RecordsTheDeliveredContext()
+    {
+        var config = CreateConfig();
+        config.Workers["coder"] = new WorkerConfig { Model = "coder-model" };
+        config.Workers["tester"] = new WorkerConfig { Model = "tester-model" };
+
+        var workerPool = new WorkerPool();
+        var taskQueue = new TaskQueue();
+        var pipelineManager = new GoalPipelineManager();
+
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+
+        WorkTask? admittedA = null;
+        WorkTask? admittedB = null;
+        WorkTask? temporarilyClaimedB = null;
+        var requestRoleQueueWasEmpty = false;
+
+        // THE DETERMINISTIC COMPETING-CONSUMER SCHEDULE. A production consumer may claim B between
+        // B's enqueue and this eager push. The synchronous enqueue seam models exactly that legal
+        // schedule: claim B's Tester task, prove no Tester task remains, then let stage D run. B is
+        // restored in finally so the fixture never leaks its test-owned claim.
+        taskQueue.OnEnqueue = task =>
+        {
+            if (task.GoalId == "goal-fallback-a")
+            {
+                admittedA = task;
+                return;
+            }
+
+            if (task.GoalId == "goal-fallback-b")
+            {
+                admittedB = task;
+                temporarilyClaimedB = taskQueue.TryDequeue(WorkerRole.Tester);
+                requestRoleQueueWasEmpty = taskQueue.TryDequeue(WorkerRole.Tester) is null;
+            }
+        };
+
+        var goalA = new Goal
+        {
+            Id = "goal-fallback-a",
+            Description = "fallback goal A",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipelineA = pipelineManager.CreatePipeline(goalA);
+        pipelineA.AdvanceTo(GoalPhase.Coding);
+        SetPlan(pipelineA, ModelTier.Default);
+
+        // NO IDLE WORKER YET: A's Coder task remains pending.
+        var serviceA = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goalA);
+        await serviceA.DispatchToRole(
+            pipelineA, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken);
+
+        var idleWorker = workerPool.RegisterWorker("worker-fallback", []);
+        var goalB = new Goal
+        {
+            Id = "goal-fallback-b",
+            Description = "fallback goal B",
+            RepositoryNames = ["test-repo"],
+        };
+        var pipelineB = pipelineManager.CreatePipeline(goalB);
+        pipelineB.AdvanceTo(GoalPhase.Testing);
+        SetPlan(pipelineB, ModelTier.Default);
+        var loggerB = new TestLogger<TaskDispatchService>();
+        var serviceB = CreateService(
+            config: config,
+            pipelineManager: pipelineManager,
+            taskQueue: taskQueue,
+            workerGateway: gateway,
+            goal: goalB,
+            logger: loggerB);
+
+        try
+        {
+            // B REQUESTS TESTER. Its own Tester task has been claimed by the deterministic schedule,
+            // while the only queued task is A's Coder task. Stage D must therefore use fallback.
+            await serviceB.DispatchToRole(
+                pipelineB, WorkerRole.Tester, "Test B", TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            taskQueue.OnEnqueue = null;
+            if (temporarilyClaimedB is not null
+                && taskQueue.GetActiveTask(temporarilyClaimedB.TaskId) is null)
+            {
+                taskQueue.Enqueue(temporarilyClaimedB);
+            }
+        }
+
+        Assert.NotNull(admittedA);
+        Assert.NotNull(admittedB);
+        Assert.Same(admittedB, temporarilyClaimedB);
+        Assert.Equal(WorkerRole.Tester, admittedB!.Role);
+        Assert.Equal(WorkerRole.Coder, admittedA!.Role);
+        Assert.NotEqual(admittedB.Role, admittedA.Role);
+        Assert.True(requestRoleQueueWasEmpty,
+            "the requested Tester queue must be empty before stage D so only TryDequeueAny can return A");
+
+        var taskA = admittedA.TaskId;
+        var taskB = admittedB.TaskId;
+
+        // THE DELIVERED TASK IS A's, although B requested a DIFFERENT role.
+        Assert.True(idleWorker.IsBusy);
+        Assert.Equal(taskA, idleWorker.CurrentTaskId);
+        Assert.Equal("coder-model", idleWorker.CurrentModel);
+        Assert.Equal(WorkerRole.Coder, idleWorker.Role);
+
+        // THE RECORDED CONTEXT REPRODUCES THE ACTUAL DEQUEUED TASK, not B's admitted Tester task.
+        var recorded = recording.Store.Load(taskA);
+        Assert.NotNull(recorded);
+        Assert.Equal(goalA.Id, recorded!.Context.GoalId);
+        Assert.Equal(idleWorker.Id, recorded.Context.WorkerId);
+        Assert.Equal(WorkerRole.Coder, recorded.Context.Role);
+        Assert.Equal("coder-model", recorded.Context.Model);
+        Assert.Equal(taskA, recorded.Context.Slot.TaskId);
+        Assert.Equal(GoalPhase.Coding, recorded.Context.Slot.Position.Phase);
+        Assert.Null(recording.Store.Load(taskB));
+
+        // THE CHANNEL AND FINAL PUBLICATION-SUCCESS LOG BOTH NAME A. A final log naming B would prove
+        // the enclosing dispatch leaked into delivery identity.
+        Assert.True(idleWorker.MessageChannel.Reader.TryRead(out var published));
+        Assert.Equal(taskA, published.Assignment.TaskId);
+        Assert.Contains(
+            loggerB.LogEntries,
+            entry => entry.LogLevel == LogLevel.Information
+                     && entry.Message == $"Task {taskA} pushed to worker {idleWorker.Id}");
+        Assert.DoesNotContain(
+            loggerB.LogEntries,
+            entry => entry.LogLevel == LogLevel.Information
+                     && entry.Message == $"Task {taskB} pushed to worker {idleWorker.Id}");
+
+        // B'S OWN ADMISSION IS UNTOUCHED and restored to the pending queue after the competing claim.
+        Assert.Equal(taskA, pipelineA.ActiveTaskId);
+        Assert.Equal(taskB, pipelineB.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineA.GetSlotsForTest()).State);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipelineB.GetSlotsForTest()).State);
+        Assert.Same(pipelineA, pipelineManager.GetByTaskId(taskA));
+        Assert.Same(pipelineB, pipelineManager.GetByTaskId(taskB));
+        Assert.NotNull(taskQueue.GetActiveTask(taskA));
+        Assert.Null(taskQueue.GetActiveTask(taskB));
+        Assert.Equal(taskB, taskQueue.TryDequeue(WorkerRole.Tester)!.TaskId);
+        Assert.Null(taskQueue.TryDequeueAny());
+    }
+
+    // ── DispatchToRole: the delegate-to-publisher boundary and the post-record fault ──
+
+    /// <summary>
+    /// THE EXACT DELEGATION/COMPLETION BOUNDARY: the REAL <see cref="GrpcWorkerGateway"/> forwards the EXACT
+    /// pinned <see cref="ConnectedWorker"/> instance, the EXACT delivered <see cref="WorkTask"/>
+    /// instance and the caller's token to <see cref="IWorkerAssignmentPublisher.PublishAsync"/> — once
+    /// — and its own task stays INCOMPLETE until that call returns.
+    /// </summary>
+    /// <remarks>
+    /// THE BOUNDARY IS DRIVEN DIRECTLY, so the assertions are about the gateway's delegation contract
+    /// alone (a dispatch-level vector would observe the same values through extra layers). The spy's
+    /// entry signal is awaited with a BOUNDED wait; the completion is granted by the fixture.
+    /// </remarks>
+    [Fact]
+    public async Task SendTaskAsync_RealGateway_ForwardsExactWorkerTaskAndTokenOnceAndAwaitsCompletion()
+    {
+        var workerPool = new WorkerPool();
+        var worker = workerPool.RegisterWorker("worker-spy", []);
+        var spy = new GatewayPublishSpy();
+        var gateway = new GrpcWorkerGateway(workerPool, spy);
+
+        var task = new WorkTask
+        {
+            TaskId = "task-spy-coder-001-01",
+            GoalId = "goal-spy",
+            GoalDescription = "spy fixture",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "model-spy",
+            Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+        };
+
+        using var cts = new CancellationTokenSource();
+        var send = gateway.SendTaskAsync(worker.Id, task, cts.Token);
+
+        try
+        {
+            // THE SPY WAS REACHED: the exact POOL-HELD worker reference, task reference and caller
+            // token were forwarded exactly once.
+            await spy.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            Assert.Same(workerPool.GetWorker(worker.Id), spy.ReceivedWorker);
+            Assert.Same(worker, spy.ReceivedWorker);
+            Assert.Same(task, spy.ReceivedTask);
+            Assert.Equal(cts.Token, spy.ReceivedCancellationToken);
+            Assert.Equal(1, spy.InvocationCount);
+
+            // THE CALLER'S TASK IS STILL INCOMPLETE — the completion is the publisher's to grant.
+            // This immediate observation occurs only after entry, while the pre-created release TCS
+            // is demonstrably still pending; a fire-and-forget gateway therefore fails deterministically.
+            Assert.False(spy.ReleaseToken.IsCompleted);
+            Assert.False(send.IsCompleted, "SendTaskAsync must stay incomplete until PublishAsync returns");
+
+            // RELEASE THE PUBLISHER: the caller now completes with Published, and only after the
+            // publisher's own task has completed. No duplicate delegation is permitted by this call.
+            spy.Release();
+            Assert.Equal(
+                WorkerTaskSendOutcome.Published,
+                await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            Assert.True(spy.ReleaseToken.IsCompleted);
+            Assert.Equal(1, spy.InvocationCount);
+
+            // NO SPURIOUS CHANNEL WRITE: the spy's default behavior publishes nothing.
+            Assert.False(worker.MessageChannel.Reader.TryRead(out _));
+        }
+        finally
+        {
+            // SETTLE AND JOIN THE TEST-OWNED TASK on every exit. A failed assertion must not leave the
+            // publisher parked on its release gate; cleanup faults are observed without masking the
+            // primary assertion failure.
+            spy.Release();
+            try
+            {
+                await send.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
+            }
+            catch
+            {
+                // The main assertion path owns any gateway failure; cleanup only guarantees no live task.
+            }
+        }
+    }
+
+    /// <summary>
+    /// THE POST-RECORD FAULT AT THE GATEWAY BOUNDARY, over the REAL
+    /// <see cref="WorkerAssignmentPublisher"/> and the REAL store: the completed channel makes the
+    /// publisher's own post-record write throw, and the REAL
+    /// <see cref="GrpcWorkerGateway.SendTaskAsync"/> propagates that EXACT fault type instead of
+    /// reporting <see cref="WorkerTaskSendOutcome.Blocked"/> — while the row the publisher recorded
+    /// stays.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS THE BOUNDARY HALF ONLY, deliberately NOT the F3 end-to-end proof (that lives in
+    /// <c>DispatchToRole_PostRecordChannelFault_PreservesAndKeepsRecordedContext</c>, which adds the
+    /// real dispatch stage S). It drives the real gateway directly so the delegation contract —
+    /// "a post-record failure is an EXCEPTION, never a Blocked outcome" — is asserted in isolation,
+    /// with the production publisher rather than any recording substitute.
+    /// </para>
+    /// <para>
+    /// THE EXPECTED TYPE IS PINNED EXACTLY: <c>System.Threading.Channels.ChannelClosedException</c> is what a write to a
+    /// completed channel raises, and it is the same type the publisher's own post-record unit test and
+    /// the Ready stream test already pin. Because <c>Assert.ThrowsAsync&lt;T&gt;</c> demands EXACT
+    /// type equality, a wrapper or a re-labelled refusal fails here; <c>Assert.IsNotType&lt;T&gt;</c>
+    /// is kept as a SUPPORTING assertion only.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task SendTaskAsync_RealPublisherPostRecordChannelFault_PropagatesExactTypeAndKeepsRow()
+    {
+        var workerPool = new WorkerPool();
+        var idleWorker = workerPool.RegisterWorker("worker-boundary-fault", []);
+        var pipelineManager = new GoalPipelineManager();
+
+        using var recording = EagerAssignmentRecording.Start(pipelineManager, workerPool);
+        var gateway = new GrpcWorkerGateway(workerPool, recording.Publisher);
+
+        // THE REAL OWNERSHIP the publisher validates: routing, pointer and a Pending slot at the
+        // delivered task's own position.
+        const string goalId = "goal-boundary-fault";
+        var pipeline = pipelineManager.CreatePipeline(
+            new Goal { Id = goalId, Description = "boundary fault fixture" });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        const string taskId = "task-boundary-fault-coder-001-01";
+        var built = pipeline.AllocateAttemptAndRegisterSlot(
+            taskId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        pipeline.SetActiveTask(built.TaskId);
+        pipelineManager.RegisterTask(built.TaskId, goalId);
+
+        var task = new WorkTask
+        {
+            TaskId = built.TaskId,
+            GoalId = goalId,
+            GoalDescription = "boundary fault fixture",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "coder-model",
+            Repositories = [new TargetRepository { Name = "repo", Url = "https://example.invalid/repo" }],
+        };
+
+        // THE POST-RECORD FAULT IS ARMED: the publisher records first, then its channel write fails.
+        Assert.True(idleWorker.MessageChannel.Writer.TryComplete());
+
+        var thrown = await Assert.ThrowsAsync<System.Threading.Channels.ChannelClosedException>(
+            () => gateway.SendTaskAsync(idleWorker.Id, task, TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL TYPE left the gateway — never a Blocked outcome, never a recording failure.
+        Assert.IsType<System.Threading.Channels.ChannelClosedException>(thrown);
+        Assert.IsNotType<WorkerAssignmentRecordingException>(thrown);
+
+        // THE PUBLISHER'S ROW SURVIVES — the record preceded the failed send.
+        var row = recording.Store.Load(taskId);
+        Assert.NotNull(row);
+        Assert.Equal(goalId, row!.Context.GoalId);
+        Assert.Equal(idleWorker.Id, row.Context.WorkerId);
+        Assert.Equal(WorkerRole.Coder, row.Context.Role);
+        Assert.Equal("coder-model", row.Context.Model);
+        Assert.Equal(taskId, row.Context.Slot.TaskId);
+        Assert.Equal(GoalPhase.Coding, row.Context.Slot.Position.Phase);
     }
 
     [Fact]
@@ -2802,7 +3415,8 @@ public sealed class TaskDispatchServiceTests
         TaskQueue? taskQueue = null,
         IWorkerGateway? workerGateway = null,
         Goal? goal = null,
-        bool useNullConfig = false)
+        bool useNullConfig = false,
+        ILogger<TaskDispatchService>? logger = null)
     {
         // useNullConfig models the "hive-config.yaml was never loaded" case, where the service
         // receives a genuinely null config rather than a defaulted one.
@@ -2818,7 +3432,12 @@ public sealed class TaskDispatchServiceTests
             goal ?? new Goal { Id = "setup-goal", Description = "Setup" }));
         goalManager.GetNextGoalAsync().GetAwaiter().GetResult();
 
-        var logger = NullLogger<TaskDispatchService>.Instance;
+        // THE OBSERVATION SEAM: a capturing TestLogger when the caller supplies one, otherwise the
+        // same NullLogger wiring production-equivalent fixtures use.
+        if (logger is null)
+        {
+            logger = NullLogger<TaskDispatchService>.Instance;
+        }
 
         // GoalLifecycleService — constructed the same way as GoalDispatcher
         var lifecycleService = new GoalLifecycleService(
@@ -2844,7 +3463,7 @@ public sealed class TaskDispatchServiceTests
 
     /// <summary>
     /// THE SUPPORTING-HELPER OVERLOAD (β-PREP-2): identical to the default
-    /// <see cref="CreateService(HiveConfigFile?, GoalPipelineManager?, TaskQueue?, IWorkerGateway?, Goal?, bool)"/>
+    /// <see cref="CreateService(HiveConfigFile?, GoalPipelineManager?, TaskQueue?, IWorkerGateway?, Goal?, bool, ILogger{TaskDispatchService}?)"/>
     /// wiring, but installs a CALLER-SUPPLIED <see cref="ILogger{TaskDispatchService}"/> — the
     /// seam the guarded-logging vectors need (a throwing logger whose predicate targets one
     /// guarded emission). Added per the supporting-helper exception; no existing test's

@@ -247,7 +247,10 @@ public sealed class Program
             builder.Services.AddGrpc();
             builder.Services.AddSingleton<WorkerPool>();
             builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<WorkerPool>());
-            builder.Services.AddSingleton<GrpcWorkerGateway>();
+            builder.Services.AddSingleton(sp => new GrpcWorkerGateway(
+                sp.GetRequiredService<WorkerPool>(),
+                sp.GetRequiredService<IWorkerAssignmentPublisher>(),
+                sp.GetRequiredService<ILogger<GrpcWorkerGateway>>()));
             builder.Services.AddSingleton<IWorkerGateway>(sp => sp.GetRequiredService<GrpcWorkerGateway>());
             builder.Services.AddSingleton<TaskQueue>();
             builder.Services.AddSingleton<TaskCompletionNotifier>();
@@ -278,7 +281,9 @@ public sealed class Program
                 options.UseSqlite($"Data Source={dbPath}"));
 
             // Assignment recording: the INSERT-ONCE worker-assignment-context store and the
-            // Ready-driven publisher that records a delivered assignment and only then publishes it.
+            // assignment publisher that records a delivered assignment and only then publishes it.
+            // The publisher is used by BOTH live delivery paths: the Ready-driven send in
+            // HiveOrchestratorService and the eager send in GrpcWorkerGateway.
             //
             // The store is FACTORY-ONLY: it owns one short-lived context per operation, created
             // through the IDbContextFactory registration immediately above (there is deliberately no
@@ -289,7 +294,8 @@ public sealed class Program
             // resolved to the SAME singleton instance (the existing WorkerPool/IWorkerPool pattern).
             // The concrete registration is the mandatory production recorder — the interface is only
             // the injection seam, never a replacement for it, and there is no fallback to a raw
-            // channel write when no publisher is available.
+            // channel write when no publisher is available. The gateway registration above resolves
+            // this same singleton, so no delivery path can bypass the recording.
             builder.Services.AddSingleton(sp =>
                 new WorkerAssignmentContextStore(
                     sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
