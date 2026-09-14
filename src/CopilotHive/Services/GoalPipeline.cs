@@ -38,6 +38,21 @@ public sealed class GoalPipeline
     /// </summary>
     private List<GoalPhase>? _installedPhases;
 
+    /// <summary>
+    /// THE ID-BUILDER NONCE SEAM — a PER-PIPELINE, test-only override of the GUID minted into
+    /// <see cref="AllocateAttemptAndRegisterSlotWithId"/>'s task-ID suffix.
+    /// <para>
+    /// <c>null</c> (the production default) means <see cref="Guid.NewGuid"/>, so production always
+    /// mints a fresh nonce. A test may install a controlled nonce to build the EXACT task ID a
+    /// prospective allocation would produce, which is what keeps the duplicate-ID refusal
+    /// fixtures non-vacuous. It is used ONLY for deterministic duplicate/refusal fixtures: there
+    /// is deliberately NO global/static override, no environment toggle and no operator-facing
+    /// configuration. The value is read inside the allocation's <c>_lock</c> span and nowhere
+    /// else, and it can never change the ID of an already-allocated slot.
+    /// </para>
+    /// </summary>
+    internal Func<Guid>? TaskIdNonceForTest { get; set; }
+
     /// <summary>Unique identifier of the goal this pipeline is tracking.</summary>
     public string GoalId { get; }
     /// <summary>Human-readable description of the goal.</summary>
@@ -517,7 +532,11 @@ public sealed class GoalPipeline
     ///   <item>the ATOMIC allocation via
     ///     <see cref="AllocateAttemptAndRegisterSlotWithId"/> — the task ID is built from the
     ///     attempt allocated inside that one lock span, so the ID's attempt, the returned
-    ///     <see cref="SlotBuildResult.Attempt"/>, and the committed counter can never diverge.</item>
+    ///     <see cref="SlotBuildResult.Attempt"/>, and the committed counter can never diverge.
+    ///     Its format is the human-readable
+    ///     <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c> PREFIX plus a
+    ///     <c>-{32 lowercase hex}</c> SUFFIX minted per prospective new allocation; the capture
+    ///     carries whichever ONE ID the allocator returned, verbatim.</item>
     /// </list>
     /// <para>
     /// HONEST ATOMICITY. The phase+occurrence PAIR is atomic at the snapshot instant (the machine
@@ -632,13 +651,27 @@ public sealed class GoalPipeline
     /// attempt: the attempt embedded in the task ID, the returned
     /// <see cref="SlotBuildResult.Attempt"/>, and the committed counter are the SAME value, born
     /// in the same lock span. The ID format is
-    /// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}</c> (e.g.
-    /// <c>add-auth-coder-002-01-001</c>) with the goal ID used verbatim and the role name from
-    /// <see cref="WorkerRoleExtensions.ToRoleName"/>.
+    /// <c>{goalId}-{roleName}-{iteration:D3}-{occurrence:D2}-{attempt:D3}-{32 lowercase hex}</c>
+    /// (e.g. <c>add-auth-coder-002-01-001-9f1c…</c>) with the goal ID used verbatim and the role
+    /// name from <see cref="WorkerRoleExtensions.ToRoleName"/>. The human-readable prefix is
+    /// exactly the pre-existing format; the appended 32-character lowercase-hex
+    /// <see cref="Guid"/> (<c>"N"</c> format) is minted per PROSPECTIVE new allocation, so a
+    /// genuinely NEW attempt allocated in a fresh/reset pipeline whose counters restart still
+    /// receives an ID distinct from any earlier attempt's. The suffix is IDENTITY EVIDENCE OF
+    /// COLLISION RESISTANCE — <em>not</em> a mathematical uniqueness guarantee, not an
+    /// authorization token, and not durable assignment binding.
+    /// </para>
+    /// <para>
+    /// THE COUNTER IS COMMITTED ONLY ON SUCCESS. The prospective attempt is read but not written
+    /// until every refusal has been cleared, so an exhausted counter, a duplicate task ID or a
+    /// live position at <paramref name="position"/> all leave <c>_dispatchAttempts</c> and
+    /// <c>_slots</c> exactly as they were — no partial commit, no counter advance.
     /// </para>
     /// <para>
     /// This is an ADDITIVE overload: <see cref="AllocateAttemptAndRegisterSlot(string, WorkSlotPosition)"/>
-    /// is untouched and keeps its own contract.
+    /// is untouched and keeps its own contract. Imported IDs — legacy or already suffixed — keep
+    /// flowing through that explicit-ID overload byte-for-byte unchanged; this builder never
+    /// re-formats or strips a suffix, and nothing else in production mints a replacement ID.
     /// </para>
     /// </summary>
     /// <param name="goalId">The goal ID, embedded verbatim in the task ID; must be non-blank.</param>
@@ -681,7 +714,14 @@ public sealed class GoalPipeline
                     $"Dispatch attempt counter for position {position} has reached int.MaxValue and cannot advance.");
             }
 
-            var taskId = $"{goalId}-{roleName}-{position.Iteration:D3}-{position.Occurrence:D2}-{attempt:D3}";
+            // The READABLE PREFIX is the pre-existing human-readable format, kept EXACTLY; the
+            // NONCE suffix (32 lowercase hex characters — Guid "N") is minted per prospective new
+            // allocation so a NEW attempt in a fresh/reset pipeline cannot deterministically reuse
+            // an earlier attempt's ID. The suffix is identity evidence of collision resistance,
+            // never a uniqueness guarantee or an authorization token.
+            var nonceSource = TaskIdNonceForTest;
+            var nonce = (nonceSource is null ? Guid.NewGuid() : nonceSource()).ToString("N");
+            var taskId = $"{goalId}-{roleName}-{position.Iteration:D3}-{position.Occurrence:D2}-{attempt:D3}-{nonce}";
 
             if (_slots.ContainsKey(taskId))
                 throw new ArgumentException($"A work slot is already registered for task '{taskId}'.", nameof(goalId));

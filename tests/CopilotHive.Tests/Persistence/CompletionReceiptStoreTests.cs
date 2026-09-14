@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
+using CopilotHive.Goals;
 using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Workers;
@@ -526,6 +527,86 @@ public sealed class CompletionReceiptStoreTests : IDisposable
         var loaded = store.Load(taskId);
         Assert.NotNull(loaded);
         Assert.Equal(storedCanonical, CompletionReceiptCodec.Encode(loaded!.Receipt));
+    }
+
+    /// <summary>
+    /// THE CROSS-RESET KEY REGRESSION. Two receipts come from two FRESH pipelines whose counters
+    /// restarted: both allocate the SAME goal/role/position and the SAME first attempt, so their
+    /// readable ID prefixes are identical — but the allocated task IDs DIFFER (each minted its own
+    /// nonce suffix). Both inserts therefore <c>Stored</c>, each <c>Load</c> returns its OWN
+    /// original result, neither row overwrites the other, and no duplicate confusion arises.
+    /// <para>
+    /// REMOVAL PROOF: drop the nonce suffix from the ID builder and the two IDs collapse to one
+    /// string — the second insert becomes <c>AlreadyStored</c> (or, with a differing payload,
+    /// <c>Conflict</c>) and this test fails on both the status and the load assertions.
+    /// </para>
+    /// <para>
+    /// This is IDENTITY EVIDENCE OF COLLISION RESISTANCE ONLY: the suffix makes deterministic reuse
+    /// improbable, not impossible, and it is not durable assignment binding, not replay safety and
+    /// not restart recovery.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void InsertOnce_TwoFreshPipelinesSameSemanticsDistinctAllocatedIds_BothStoredAndEachLoadsItsOwn()
+    {
+        const string goalId = "goal-reset";
+        var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+
+        // TWO FRESH pipelines — each with its own restart-reset counters — allocate the same
+        // position's first attempt through the PRODUCTION id builder (no nonce seam installed).
+        var firstPipeline = new GoalPipeline(new Goal { Id = goalId, Description = "reset goal" });
+        var secondPipeline = new GoalPipeline(new Goal { Id = goalId, Description = "reset goal" });
+        Assert.Null(firstPipeline.TaskIdNonceForTest);
+        Assert.Null(secondPipeline.TaskIdNonceForTest);
+
+        var firstAllocation = firstPipeline.AllocateAttemptAndRegisterSlotWithId(goalId, WorkerRole.Coder, position);
+        var secondAllocation = secondPipeline.AllocateAttemptAndRegisterSlotWithId(goalId, WorkerRole.Coder, position);
+
+        // IDENTICAL structured semantics — same goal, role, position and attempt…
+        Assert.Equal(1, firstAllocation.Attempt);
+        Assert.Equal(1, secondAllocation.Attempt);
+        Assert.Equal(position, firstAllocation.Position);
+        Assert.Equal(position, secondAllocation.Position);
+        Assert.StartsWith($"{goalId}-coder-001-01-001-", firstAllocation.TaskId, StringComparison.Ordinal);
+        Assert.StartsWith($"{goalId}-coder-001-01-001-", secondAllocation.TaskId, StringComparison.Ordinal);
+
+        // …but DISTINCT allocated ids (this is the entire point of the nonce).
+        Assert.NotEqual(firstAllocation.TaskId, secondAllocation.TaskId, StringComparer.Ordinal);
+
+        var firstReceipt = Receipt(
+            goalId: goalId, taskId: firstAllocation.TaskId, output: "out-first",
+            attempt: firstAllocation.Attempt, metrics: Metrics(), gitStatus: Git());
+        var secondReceipt = Receipt(
+            goalId: goalId, taskId: secondAllocation.TaskId, output: "out-second",
+            attempt: secondAllocation.Attempt, metrics: Metrics(), gitStatus: Git());
+
+        var factory = NewFactory();
+        var store = NewStore(factory, new FixedTimeProvider(FixedNow));
+
+        // BOTH INSERTS STORE: neither is a duplicate of the other.
+        Assert.Equal(CompletionReceiptWriteStatus.Stored, store.InsertOnce(firstReceipt).Status);
+        Assert.Equal(CompletionReceiptWriteStatus.Stored, store.InsertOnce(secondReceipt).Status);
+
+        // ONE ROW EACH — no overwrite, no phantom row.
+        Assert.Equal(1L, ReceiptRowCount(firstAllocation.TaskId));
+        Assert.Equal(1L, ReceiptRowCount(secondAllocation.TaskId));
+        Assert.Equal(2L, (long)RawScalar("SELECT COUNT(*) FROM completion_receipts")!);
+
+        // EACH LOAD RETURNS ITS OWN ORIGINAL RESULT — keyed by the DISTINCT allocated ids.
+        var firstLoaded = store.Load(firstAllocation.TaskId);
+        var secondLoaded = store.Load(secondAllocation.TaskId);
+        Assert.NotNull(firstLoaded);
+        Assert.NotNull(secondLoaded);
+        Assert.Equal("out-first", firstLoaded!.Receipt.Result.Output);
+        Assert.Equal("out-second", secondLoaded!.Receipt.Result.Output);
+        Assert.Equal(firstAllocation.TaskId, firstLoaded.Receipt.Slot.TaskId);
+        Assert.Equal(secondAllocation.TaskId, secondLoaded.Receipt.Slot.TaskId);
+        Assert.Equal(CompletionReceiptCodec.Encode(firstReceipt), CompletionReceiptCodec.Encode(firstLoaded.Receipt));
+        Assert.Equal(CompletionReceiptCodec.Encode(secondReceipt), CompletionReceiptCodec.Encode(secondLoaded.Receipt));
+
+        // The raw payloads are the two DIFFERENT canonical texts, each under its own key.
+        Assert.Equal(CompletionReceiptCodec.Encode(firstReceipt), RawPayload(firstAllocation.TaskId));
+        Assert.Equal(CompletionReceiptCodec.Encode(secondReceipt), RawPayload(secondAllocation.TaskId));
     }
 
     private static CompletionReceipt ConflictingCandidate(string kind, string taskId) => kind switch
