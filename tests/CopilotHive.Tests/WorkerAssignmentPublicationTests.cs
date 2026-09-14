@@ -1,5 +1,6 @@
 using System.Data.Common;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 
 using CopilotHive.Configuration;
 using CopilotHive.Dashboard;
@@ -162,6 +163,60 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         return command.ExecuteScalar() as string;
     }
 
+    /// <summary>
+    /// THE ONE LIFECYCLE every vector in this fixture runs through: the body, then the harness's
+    /// SHARED teardown, on EVERY path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THIS EXISTS RATHER THAN A PER-TEST <c>finally</c>: a per-test release call is only reached
+    /// on the SUCCESS path, so a failing load-bearing assertion (or an intentional mutant) would leave
+    /// the transport pump parked and the <c>WorkStream</c> producer LIVE and UNJOINED. Routing every
+    /// vector through one helper means a future test cannot forget the release — the teardown owns it.
+    /// </para>
+    /// <para>
+    /// THE PRIMARY FAILURE STAYS AUTHORITATIVE. The body's exception is captured and RETHROWN
+    /// UNCHANGED (via <see cref="ExceptionDispatchInfo"/>, so its original message and stack survive),
+    /// and the teardown's own outcome is only surfaced when the body SUCCEEDED. A genuine cleanup
+    /// failure is therefore never silently swallowed, and it can never replace the assertion message
+    /// the reviewer needs to see.
+    /// </para>
+    /// </remarks>
+    /// <param name="harness">The harness whose shared teardown must run.</param>
+    /// <param name="body">The vector's assertions.</param>
+    private static async Task RunAsync(ReadyHarness harness, Func<Task> body)
+    {
+        ExceptionDispatchInfo? primary = null;
+        try
+        {
+            await body();
+        }
+        catch (Exception ex)
+        {
+            primary = ExceptionDispatchInfo.Capture(ex);
+        }
+
+        // THE TEARDOWN RUNS ON EVERY PATH and never throws — it reports instead.
+        var cleanupFailure = await harness.StopAsync();
+
+        // THE PRIMARY FAILURE WINS: rethrown with its ORIGINAL message and stack.
+        primary?.Throw();
+
+        // No primary failure, so a genuine cleanup failure must still surface.
+        if (cleanupFailure is not null)
+            throw cleanupFailure;
+
+        // THE PRODUCER CLEANUP POST-CONDITIONS, asserted for every green vector: nothing is left live.
+        Assert.True(harness.PumpReleasedAfterTeardown, "the transport pump was not released by the teardown");
+        Assert.True(harness.StreamJoined, "the stream task was not joined by the teardown");
+        Assert.True(
+            harness.StreamTaskCompletedAfterTeardown,
+            "the WorkStream producer task is still live after teardown");
+        Assert.True(
+            harness.WorkerRemovedAfterTeardown,
+            "the stream's finally did not run its pinned-worker cleanup");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // (1) THE REAL READY PATH — record THEN publish, observed in that order
     // ═══════════════════════════════════════════════════════════════════════
@@ -192,7 +247,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         var observer = new CommitObservationInterceptor();
         var h = await ReadyHarness.CreateAsync(NewFactory(observer), observer);
 
-        try
+        await RunAsync(h, async () =>
         {
             // THE PUMP IS PARKED FIRST: no dequeue can race the commit observation.
             await h.ParkTransportPumpAsync();
@@ -246,11 +301,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), readback.Context.Slot.Position);
             Assert.Equal(1, readback.Context.Slot.Attempt);
             Assert.Equal("copilot/claude-sonnet-4.6", readback.Context.Model);
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
     }
 
     /// <summary>
@@ -275,7 +326,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             new WorkerAssignmentContextStore(factory, NullLogger<WorkerAssignmentContextStore>.Instance));
         var h = await ReadyHarness.CreateAsync(factory, observer, publisher: control);
 
-        try
+        await RunAsync(h, async () =>
         {
             await h.ParkTransportPumpAsync();
             await h.SendReadyAndAwaitPublisherReturnedAsync();
@@ -303,11 +354,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             await h.ReleaseTransportPumpAndAwaitDeliveryAsync();
             Assert.Equal(h.TaskId, Assert.Single(h.Writer.Assignments).TaskId);
             Assert.Null(RawAssignmentTaskId(h.TaskId));
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -328,7 +375,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     {
         var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null);
 
-        try
+        await RunAsync(h, async () =>
         {
             // THE GENUINE REFUSAL: a DIFFERENT worker already owns this task id's recorded context.
             h.SeedConflictingRecord();
@@ -369,11 +416,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
             // ── NO REQUEUE: the blocked task was not put back for another worker. ──
             Assert.Null(h.Queue.TryDequeueAny());
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
     }
 
     /// <summary>
@@ -390,7 +433,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     {
         var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null);
 
-        try
+        await RunAsync(h, async () =>
         {
             // ── THE TIMEOUT POLICY IS DISABLED: 0 minutes, so no automatic reclaim exists. ──
             Assert.Equal(0, h.Config.Orchestrator.WorkerTaskTimeoutMinutes);
@@ -431,11 +474,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             Assert.Empty(h.Writer.Assignments);
             Assert.DoesNotContain(
                 h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
     }
 
     /// <summary>
@@ -448,7 +487,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     {
         var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null, withPublisher: false);
 
-        try
+        await RunAsync(h, async () =>
         {
             await h.SendReadyAndAwaitBlockedAsync();
 
@@ -467,11 +506,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             // The delivery is still held, not released.
             Assert.Equal(h.TaskId, h.Pipeline.ActiveTaskId);
             Assert.True(h.Worker.IsBusy);
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -489,7 +524,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         var throwingLogger = new ThrowingOnWarningReadyLogger();
         var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null, logger: throwingLogger);
 
-        try
+        await RunAsync(h, async () =>
         {
             h.SeedConflictingRecord();
 
@@ -500,11 +535,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             Assert.Empty(h.Writer.Assignments);
             Assert.True(h.Worker.IsBusy);
             Assert.Equal(h.TaskId, h.Pipeline.ActiveTaskId);
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
 
         // THE EXACT WORDING, asserted against the message the throwing logger actually received.
         var warning = Assert.Single(
@@ -531,7 +562,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     {
         var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null);
 
-        try
+        await RunAsync(h, async () =>
         {
             // Complete the channel so the POST-RECORD write fails.
             Assert.True(h.Worker.MessageChannel.Writer.TryComplete());
@@ -548,11 +579,99 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             Assert.Equal(h.TaskId, RawAssignmentTaskId());
             Assert.DoesNotContain(
                 h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
-        }
-        finally
-        {
-            await h.StopAsync();
-        }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (5) THE FAILURE-PATH PRODUCER CLEANUP CONTRACT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE TEARDOWN CONTRACT ON THE FAILURE PATH — the guarantee every vector above depends on.
+    /// <para>
+    /// A load-bearing assertion is made to FAIL while the transport pump is PARKED, which is exactly
+    /// the state the ordering vectors (and the publish-before-record mutant) leave behind: the test
+    /// never reaches its own release call. The shared teardown must still release the pump
+    /// unconditionally, join the ORIGINAL stream task within a finite bound, and let the PRIMARY
+    /// assertion exception through UNCHANGED.
+    /// </para>
+    /// <para>
+    /// WITHOUT the unconditional release this test HANGS for the full bound and then reports a
+    /// teardown leak — so it fails loudly instead of leaving a live <c>WorkStream</c> behind.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Teardown_WhenABodyAssertionFailsWithThePumpParked_ReleasesJoinsAndPreservesTheOriginalFailure()
+    {
+        var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null);
+        const string primaryMessage = "PRIMARY-ASSERTION-SENTINEL: the load-bearing check failed";
+
+        // THE FAILURE PATH, driven explicitly: the pump is parked and then the body throws, so the
+        // body's own release call is never reached.
+        var primary = await Assert.ThrowsAnyAsync<Xunit.Sdk.XunitException>(
+            () => RunAsync(h, async () =>
+            {
+                await h.ParkTransportPumpAsync();
+
+                // The pump really is parked INSIDE the writer at this point.
+                Assert.True(h.Writer.PumpStillParked, "the pump was not parked — the vector is vacuous");
+
+                Assert.Fail(primaryMessage);
+            }));
+
+        // ── (1) THE PRIMARY FAILURE SURVIVED, with its ORIGINAL message — not a cleanup exception. ──
+        Assert.Contains(primaryMessage, primary.Message, StringComparison.Ordinal);
+        Assert.IsNotType<TimeoutException>(primary);
+        Assert.DoesNotContain("TEARDOWN LEAK", primary.Message, StringComparison.Ordinal);
+
+        // ── (2) THE PRODUCER CLEANUP RAN ANYWAY, on the failure path. ──
+        Assert.True(h.PumpReleasedAfterTeardown, "the teardown did not release the parked pump");
+        Assert.False(h.Writer.PumpStillParked, "a pump is STILL parked inside the transport writer");
+
+        // ── (3) THE ORIGINAL STREAM TASK WAS JOINED — no live producer remains. ──
+        Assert.True(h.StreamJoined, "the teardown did not join the stream task");
+        Assert.True(h.StreamTaskCompletedAfterTeardown, "the WorkStream producer task is still live");
+
+        // ── (4) THE PINNED WORKER'S OWN CLEANUP RAN (the stream's finally removed it). ──
+        Assert.True(h.WorkerRemovedAfterTeardown, "the stream's finally did not remove the pinned worker");
+    }
+
+    /// <summary>
+    /// A GENUINE CLEANUP FAILURE IS NOT SWALLOWED when the body SUCCEEDED: a pump that can never be
+    /// released (its release gate is neutralised) makes the bounded join exceed its bound, and the
+    /// teardown reports that leak loudly instead of ignoring it.
+    /// </summary>
+    /// <remarks>
+    /// This is the counterpart of the vector above: together they pin BOTH halves of the contract —
+    /// a cleanup failure never replaces a primary failure, and it never disappears when there is no
+    /// primary failure. The bound is shortened for this vector alone so the proof stays fast.
+    /// </remarks>
+    [Fact]
+    public async Task Teardown_WhenTheProducerCannotBeReleased_ReportsTheLeakLoudly()
+    {
+        var h = await ReadyHarness.CreateAsync(NewFactory(), observer: null);
+        h.UseShortJoinBoundForLeakProof();
+
+        // THE UNRELEASABLE PUMP: the writer ignores the teardown's release, so the producer really
+        // cannot terminate — the exact condition that must be reported rather than ignored.
+        h.Writer.IgnoreReleaseForLeakProof();
+
+        var leak = await Assert.ThrowsAsync<TimeoutException>(
+            () => RunAsync(h, async () =>
+            {
+                await h.ParkTransportPumpAsync();
+                Assert.True(h.Writer.PumpStillParked);
+                // THE BODY SUCCEEDS — so nothing can mask the cleanup failure.
+            }));
+
+        Assert.Contains("TEARDOWN LEAK", leak.Message, StringComparison.Ordinal);
+        Assert.Contains(h.Worker.Id, leak.Message, StringComparison.Ordinal);
+        Assert.False(h.StreamJoined, "the join must be reported as failed when the producer cannot end");
+
+        // CLEAN UP FOR REAL so this proof does not itself leak the producer it deliberately stalled.
+        h.Writer.StopIgnoringRelease();
+        h.Writer.ReleaseParked();
+        await h.AwaitStreamTerminationForLeakProofAsync();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -592,6 +711,9 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
         /// <summary>Whether the stream terminated with an exception rather than draining.</summary>
         public bool StreamFaulted { get; private set; }
+
+        /// <summary>The finite bound the shared teardown joins the stream task with.</summary>
+        private TimeSpan _joinBound = BoundedWait;
 
         /// <summary>
         /// Builds the harness. Every collaborator is REAL except the publisher seam, which is
@@ -845,10 +967,108 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             }
         }
 
-        public async Task StopAsync()
+        /// <summary>
+        /// THE SHARED TEARDOWN — the ONE place every vector's producer cleanup happens, so no
+        /// ordering/control/mutant path can leave the transport pump parked.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THE ORDER IS THE CONTRACT, and every step is UNCONDITIONAL:
+        /// </para>
+        /// <list type="number">
+        ///   <item><description>RELEASE THE PARK FIRST. The pump may be blocked inside
+        ///     <see cref="RecordingStreamWriter.RecordAsync"/> awaiting its release gate — which is
+        ///     exactly the state a FAILING load-bearing assertion leaves behind, because the test
+        ///     never reached its own release call. Completing the request input first would not help:
+        ///     <c>WorkStream</c> awaits its channel task, so a parked pump keeps the whole stream
+        ///     alive. Releasing first is what makes the join below possible at all.</description></item>
+        ///   <item><description>COMPLETE THE REQUEST INPUT so the read loop can finish.</description></item>
+        ///   <item><description>JOIN THE ORIGINAL STREAM TASK with a FINITE bound. Exceeding the
+        ///     bound is a REAL LEAK (a live producer), so it is reported as a cleanup failure rather
+        ///     than silently ignored.</description></item>
+        /// </list>
+        /// <para>
+        /// IT NEVER THROWS: the outcome is RETURNED so the caller
+        /// (<see cref="WorkerAssignmentPublicationTests.RunAsync"/>) can keep a PRIMARY assertion
+        /// failure authoritative and surface a cleanup failure only when there is no primary one.
+        /// A stream that terminated with its own fault (the post-record channel-fault vector) is a
+        /// normal, JOINED termination — not a cleanup failure.
+        /// </para>
+        /// </remarks>
+        /// <returns><c>null</c> when teardown completed cleanly; otherwise the cleanup failure.</returns>
+        public async Task<Exception?> StopAsync()
         {
-            // End the stream, then observe (never rethrow) its termination so a failing assertion is
-            // never replaced by a teardown fault.
+            // (1) THE UNCONDITIONAL RELEASE. Idempotent: safe when nothing is parked and safe when a
+            // test already released it on its own success path.
+            Writer.ReleaseParked();
+
+            // (2) END THE REQUEST INPUT.
+            Reader.Complete();
+
+            // (3) THE BOUNDED JOIN of the ORIGINAL stream task.
+            try
+            {
+                await StreamTask.WaitAsync(_joinBound, CancellationToken.None);
+                StreamJoined = true;
+                StreamFaulted = false;
+            }
+            catch (TimeoutException)
+            {
+                // THE LEAK: the producer is still live. Report it loudly.
+                StreamJoined = false;
+                ObserveTeardownPostconditions();
+                return new TimeoutException(
+                    $"TEARDOWN LEAK: the WorkStream for worker '{Worker.Id}' did not terminate within " +
+                    $"{_joinBound.TotalSeconds:F0}s — a live producer/stream task remains. " +
+                    $"(pumpReleased={Writer.ParkReleased}, parkedPumpStillHeld={Writer.PumpStillParked})");
+            }
+            catch (Exception)
+            {
+                // The stream's OWN terminal fault is a joined termination, not a cleanup failure.
+                StreamJoined = true;
+                StreamFaulted = true;
+            }
+
+            ObserveTeardownPostconditions();
+            return null;
+        }
+
+        /// <summary>
+        /// Captures the post-teardown facts the leak proof asserts: the pump was released, the stream
+        /// task really completed, and the stream's own <c>finally</c> ran its pinned-worker cleanup.
+        /// </summary>
+        private void ObserveTeardownPostconditions()
+        {
+            PumpReleasedAfterTeardown = Writer.ParkReleased;
+            StreamTaskCompletedAfterTeardown = StreamTask.IsCompleted;
+            WorkerRemovedAfterTeardown = !ReferenceEquals(Pool.GetWorker(Worker.Id), Worker);
+        }
+
+        /// <summary>Whether the bounded join actually joined the stream task.</summary>
+        public bool StreamJoined { get; private set; }
+
+        /// <summary>Post-teardown: the transport pump's release gate was signalled.</summary>
+        public bool PumpReleasedAfterTeardown { get; private set; }
+
+        /// <summary>Post-teardown: the original stream task has completed (no live producer).</summary>
+        public bool StreamTaskCompletedAfterTeardown { get; private set; }
+
+        /// <summary>Post-teardown: the stream's finally removed the pinned worker from the pool.</summary>
+        public bool WorkerRemovedAfterTeardown { get; private set; }
+
+        /// <summary>
+        /// TEST-ONLY: shortens the join bound so the leak-reporting proof stays fast. Used ONLY by
+        /// <c>Teardown_WhenTheProducerCannotBeReleased_ReportsTheLeakLoudly</c>; every other vector
+        /// keeps the full bound.
+        /// </summary>
+        public void UseShortJoinBoundForLeakProof() => _joinBound = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// TEST-ONLY: awaits the real termination of the stream after the leak proof has re-enabled
+        /// the release, so that proof never leaves the producer it deliberately stalled behind.
+        /// </summary>
+        public async Task AwaitStreamTerminationForLeakProofAsync()
+        {
             Reader.Complete();
             try
             {
@@ -856,7 +1076,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             }
             catch (Exception)
             {
-                StreamFaulted = true;
+                // The stream's own terminal fault is a joined termination.
             }
         }
     }
@@ -1119,6 +1339,8 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
         private int _parkArmed;
         private int _parkReleased;
+        private int _parkedNow;
+        private int _ignoreRelease;
 
         public WriteOptions? WriteOptions { get; set; }
 
@@ -1134,15 +1356,34 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         /// <summary>Whether the parked pump has NOT been released yet (i.e. it is still held).</summary>
         public bool ParkedThroughout => Volatile.Read(ref _parkReleased) == 0;
 
+        /// <summary>Whether the release gate has been signalled — the teardown's release evidence.</summary>
+        public bool ParkReleased => Volatile.Read(ref _parkReleased) == 1;
+
+        /// <summary>Whether a pump is CURRENTLY blocked inside this writer (the leak indicator).</summary>
+        public bool PumpStillParked => Volatile.Read(ref _parkedNow) == 1;
+
         /// <summary>Arms the park so the NEXT write blocks inside the writer until released.</summary>
         public void ParkOnNextWrite() => Volatile.Write(ref _parkArmed, 1);
 
-        /// <summary>Releases a parked write. Safe when nothing is parked.</summary>
+        /// <summary>
+        /// Releases a parked write. IDEMPOTENT and safe when nothing is parked — the shared teardown
+        /// calls it unconditionally on every path, including after a test already released it.
+        /// </summary>
         public void ReleaseParked()
         {
             Volatile.Write(ref _parkReleased, 1);
-            _release.TrySetResult();
+            if (Volatile.Read(ref _ignoreRelease) == 0)
+                _release.TrySetResult();
         }
+
+        /// <summary>
+        /// TEST-ONLY: makes <see cref="ReleaseParked"/> a NO-OP so a parked pump genuinely cannot
+        /// terminate — the unreleasable-producer condition the leak-reporting proof needs.
+        /// </summary>
+        public void IgnoreReleaseForLeakProof() => Volatile.Write(ref _ignoreRelease, 1);
+
+        /// <summary>TEST-ONLY: restores normal release behaviour so the leak proof can clean up.</summary>
+        public void StopIgnoringRelease() => Volatile.Write(ref _ignoreRelease, 0);
 
         public IReadOnlyList<OrchestratorMessage> Messages
         {
@@ -1166,8 +1407,18 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
             if (Interlocked.Exchange(ref _parkArmed, 0) == 1)
             {
+                // THE PARKED WINDOW is observable, so the teardown can report a still-held pump as a
+                // leak rather than hanging silently.
+                Volatile.Write(ref _parkedNow, 1);
                 _parked.TrySetResult();
-                await _release.Task;
+                try
+                {
+                    await _release.Task;
+                }
+                finally
+                {
+                    Volatile.Write(ref _parkedNow, 0);
+                }
             }
 
             lock (_messages)
