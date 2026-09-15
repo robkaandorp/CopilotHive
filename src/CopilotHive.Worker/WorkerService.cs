@@ -378,22 +378,53 @@ public sealed class WorkerService(
                 ? null
                 : await CaptureCancellationFailureAsync(heartbeatCts);
 
-            if (heartbeatTask is not null)
-            {
-                try { await heartbeatTask; } catch (OperationCanceledException) { }
-            }
+            // THE JOIN OUTCOME IS CAPTURED TOO. Awaiting the ORIGINAL heartbeat task can itself
+            // fault with a non-cancellation error (the heartbeat loop's own diagnostic is guarded,
+            // but the seam-supplied task is arbitrary). Letting that fault unwind this `finally`
+            // would skip the disposal below AND silently replace both a RunAsync primary and the
+            // captured cancellation-callback failure, so it is captured instead. Ordinary
+            // cancellation stays tolerated exactly as before.
+            var joinFailure = heartbeatTask is null
+                ? null
+                : await CaptureJoinFailureAsync(heartbeatTask);
 
             heartbeatCts?.Dispose();
 
-            // ERROR PRECEDENCE. With a message-loop primary failure already recorded, that primary
-            // is what propagates and the secondary cancellation-cleanup failure is reported through
-            // guarded sanitized logging ONLY. Without a primary, the deferred cancellation failure
-            // propagates now — AFTER the join and the resource cleanup have completed — so a
-            // throwing callback can never be turned into a fabricated successful teardown.
-            PropagateOrReport(
-                cancellationFailure, primaryFailure, "Heartbeat cancellation cleanup failed");
+            // ERROR PRECEDENCE — ONE authoritative outcome; every other failure is merely REPORTED
+            // through guarded sanitized logging (a logger failure can never replace a real one):
+            //   1. a RunAsync/message-loop PRIMARY already in flight wins, and BOTH cleanup
+            //      failures are reported beside it;
+            //   2. otherwise the deferred cancellation-callback failure wins — the heartbeat-join
+            //      failure may never replace or discard it, so it is reported instead;
+            //   3. otherwise the heartbeat-join failure propagates.
+            // Nothing is raised until the join above and the disposal above have completed, so a
+            // throwing callback (or a faulting heartbeat) can never be turned into a fabricated
+            // successful teardown and can never skip releasing the source.
+            if (primaryFailure is not null)
+            {
+                ReportIfPresent(cancellationFailure, HeartbeatCancellationFailedMessage);
+                ReportIfPresent(joinFailure, HeartbeatJoinFailedMessage);
+            }
+            else if (cancellationFailure is not null)
+            {
+                ReportIfPresent(joinFailure, HeartbeatJoinFailedMessage);
+                RethrowDeferred(cancellationFailure);
+            }
+            else
+            {
+                RethrowDeferred(joinFailure);
+            }
         }
     }
+
+    /// <summary>The sanitized report message for a failed heartbeat cancellation request.</summary>
+    private const string HeartbeatCancellationFailedMessage = "Heartbeat cancellation cleanup failed";
+
+    /// <summary>The sanitized report message for a failed heartbeat JOIN.</summary>
+    private const string HeartbeatJoinFailedMessage = "Heartbeat join failed";
+
+    /// <summary>The sanitized report message for a failed assignment cancellation request.</summary>
+    private const string TaskCancellationFailedMessage = "Task cancellation cleanup failed";
 
     /// <summary>
     /// Requests cancellation on <paramref name="source"/> and CAPTURES a failure raised by a
@@ -431,6 +462,54 @@ public sealed class WorkerService(
         {
             return ex;
         }
+    }
+
+    /// <summary>
+    /// JOINS <paramref name="task"/> to termination and CAPTURES a non-cancellation failure instead
+    /// of letting it unwind the caller's cleanup.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The task is awaited WITHOUT a caller token, so the join can never be made vacuous and the
+    /// work is never abandoned. Ordinary cancellation is tolerated exactly as before (a cancelled
+    /// heartbeat is the normal teardown outcome and returns <c>null</c>); anything else is returned
+    /// VERBATIM — never unwrapped or normalized into a single invented type — so the caller can
+    /// release its resources first and then apply its precedence policy to the actual evidence.
+    /// </para>
+    /// <para>
+    /// A successful join also returns <c>null</c>: no failure is ever manufactured.
+    /// </para>
+    /// </remarks>
+    /// <param name="task">The ORIGINAL task to join.</param>
+    /// <returns>The captured join failure, or <c>null</c> for success or ordinary cancellation.</returns>
+    private static async Task<Exception?> CaptureJoinFailureAsync(Task task)
+    {
+        try
+        {
+            await task;
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: this is how a cancelled background task unwinds.
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// Reports a non-authoritative failure through the guarded sanitized log. A no-op when there is
+    /// nothing to report.
+    /// </summary>
+    /// <param name="failure">The failure to report, or <c>null</c>.</param>
+    /// <param name="message">The static, secret-free message describing the cleanup stage.</param>
+    private void ReportIfPresent(Exception? failure, string message)
+    {
+        if (failure is not null)
+            TryLogSanitized(message, failure);
     }
 
     /// <summary>
@@ -869,13 +948,33 @@ public sealed class WorkerService(
                             // Single-flight: the drained body normally claims Ready itself. Only
                             // emit here if it did not (e.g. it was cancelled before reaching the
                             // claim), so a cancel never produces a second dequeue.
+                            //
+                            // THE WRITE'S OUTCOME IS CAPTURED, not allowed to jump past the
+                            // deferred failure below: a Ready write that fails or is cancelled
+                            // would otherwise unwind straight to the loop's catch and SILENTLY
+                            // DISCARD the captured cancellation-callback evidence.
+                            Exception? readyFailure = null;
                             if (cancelled.Ready.TryClaim())
-                                await SendWorkerReady(connection, ct);
+                            {
+                                try
+                                {
+                                    await SendWorkerReady(connection, ct);
+                                }
+                                catch (Exception ex)
+                                {
+                                    readyFailure = ex;
+                                }
+                            }
 
-                            // ERROR PRECEDENCE. A deferred cancellation-cleanup failure surfaces
-                            // ONLY after the ownership clear, the heartbeat-state cleanup and this
-                            // cancel handler's single Ready have all completed.
-                            RethrowDeferred(cancelDrainFailure);
+                            // ERROR PRECEDENCE. The ownership clear, the heartbeat-state cleanup and
+                            // this cancel handler's single Ready have all completed by now.
+                            // A FAILED Ready write is a genuine PRIOR PRIMARY (real transport or
+                            // caller cancellation), so it keeps its own identity and propagates,
+                            // while the deferred cancellation-callback failure is reported through
+                            // the guarded sanitized log rather than being discarded. With a
+                            // successful (or unclaimed) Ready the deferred failure propagates.
+                            PropagateOrReport(cancelDrainFailure, readyFailure, TaskCancellationFailedMessage);
+                            RethrowDeferred(readyFailure);
                         }
                         else
                         {
@@ -954,7 +1053,7 @@ public sealed class WorkerService(
             // logger failure can never replace the real failure. Without a primary, the deferred
             // failure propagates now, AFTER the clear, the retirement and the join above.
             PropagateOrReport(
-                teardownDrainFailure, primaryFailure, "Task cancellation cleanup failed");
+                teardownDrainFailure, primaryFailure, TaskCancellationFailedMessage);
         }
     }
 
@@ -1596,7 +1695,18 @@ public sealed class WorkerService(
         {
             // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
             // echo request configuration back to the worker.
-            Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
+            //
+            // GUARDED: a heartbeat fault is a best-effort diagnostic, so a degraded stderr (a
+            // redirected/closed writer, a throwing test seam) must not be able to fault the
+            // heartbeat loop and turn a swallow-and-retry tick into a teardown-time join failure.
+            try
+            {
+                Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
+            }
+            catch
+            {
+                // The tick's swallow-and-retry contract is what matters, not the diagnostic.
+            }
         }
     }
 

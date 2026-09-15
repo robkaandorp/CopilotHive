@@ -1155,6 +1155,146 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
+    /// DEFECT B — A MATCHING CANCEL WHOSE SINGLE READY WRITE FAILS MUST STILL SURFACE THE
+    /// CANCELLATION-CALLBACK EVIDENCE.
+    /// <para>
+    /// The cancel handler only writes Ready when the drained body did NOT claim it. That state is
+    /// produced here exactly as production can: the body's provisioning fails, and the sanitized
+    /// diagnostic in its generic catch is written to a DEGRADED <c>Console.Error</c> that throws for
+    /// that line — so the delegate unwinds through its <c>finally</c> WITHOUT reaching its Ready
+    /// claim. The claim is therefore unconsumed (proved by a zero Ready count), and the handler owns
+    /// the single Ready attempt.
+    /// </para>
+    /// <para>
+    /// The matching cancel then hits BOTH failures: the assignment's cancellation callback throws,
+    /// and the handler's own Ready write fails. The Ready failure is a genuine prior primary, so it
+    /// propagates with its ORIGINAL identity — but the deferred callback evidence must NOT be
+    /// silently discarded: it is reported through the existing guarded sanitized log.
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF. With the deferred failure rethrown only AFTER an unguarded Ready write, the
+    /// write's exception jumps straight to the loop's catch and the captured callback evidence is
+    /// lost entirely — the sanitized report never appears, so the named assertion on it fails.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task MatchingCancelWithThrowingCallbackAndFailingReadyWrite_SurfacesReadyFailureAndReportsCallback()
+    {
+        var runner = new GatedPromptRunner();
+        using var service = BuildService(runner);
+
+        // A provisioning failure inside the body, BEFORE any executor exists: the body reaches its
+        // generic sanitized catch, which is where the degraded diagnostic sink strikes.
+        service.TestProvisioner = new WorkerConfigProvisioner(
+            "worker-1",
+            (_, _) => Task.FromException<GetWorkerConfigResponse>(
+                new InvalidOperationException("injected provisioning failure")),
+            _ => null,
+            (_, _) => { });
+
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var stream = BuildStream(requests, responses);
+
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        ArmedCancellationCallback? armed = null;
+        try
+        {
+            // The sink throws ONLY for the body's own failure line, so every other sanitized report
+            // in this test is still captured and assertable.
+            Console.SetError(new MarkerThrowingErrorWriter("Task execution failed", stdErr));
+
+            responses.Push(ResultAssignment("task-A"));
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Join the body: it faulted on its own diagnostic, so it never reached its Ready claim.
+            var execution = GetActiveExecution(service);
+            await ObserveLoopForTeardownAsync(execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // NON-VACUITY: the claim really is unconsumed, so the cancel handler will own the single
+            // Ready attempt below. (If the body had claimed it, this count would be 1.)
+            Assert.True(execution.IsCompleted, "The body must have finished before the cancel is delivered.");
+            Assert.Equal(0, requests.ReadyCount);
+
+            // Arm BOTH failures: the assignment's cancellation callback throws, and the handler's
+            // own Ready write fails.
+            armed = ArmThrowingCancellationCallback(service);
+            var ownerCts = armed.Source;
+            var readyWriteFailure = new InvalidOperationException("injected Ready write failure");
+            requests.FailNextReadyWrite = readyWriteFailure;
+
+            responses.Push(MatchingCancel("task-A"));
+
+            // The Ready-write failure is the authoritative outcome, with its ORIGINAL identity.
+            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(readyWriteFailure, propagated);
+
+            // The handler really did own and attempt the single Ready write.
+            Assert.Equal(1, requests.ReadyCount);
+
+            // Cleanup completed regardless: ownership cleared, heartbeat state cleaned, the
+            // assignment's source cancelled and disposed, and the callback ran exactly once.
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+            Assert.True(ownerCts.IsCancellationRequested);
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.Equal(1, armed.InvocationCount);
+
+            // THE EVIDENCE SURVIVES: the deferred callback failure was reported in sanitized form
+            // (type classification only, never the message) rather than being silently discarded.
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Task cancellation cleanup failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(armed.CallbackFailure.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await ObserveLoopForTeardownAsync(loop);
+            armed?.DisposeRegistration();
+        }
+    }
+
+    /// <summary>
+    /// A diagnostic sink that throws for lines containing a MARKER and forwards everything else to
+    /// an inner writer. It models a partially degraded <c>Console.Error</c>: the one failure line
+    /// this test needs to break is broken, while the sanitized reports under assertion remain
+    /// observable.
+    /// </summary>
+    private sealed class MarkerThrowingErrorWriter(string marker, System.IO.TextWriter inner)
+        : System.IO.TextWriter
+    {
+        public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        public override void WriteLine(string? value)
+        {
+            if (value is not null && value.Contains(marker, StringComparison.Ordinal))
+                throw new InvalidOperationException("injected diagnostic failure");
+
+            inner.WriteLine(value);
+        }
+
+        public override void Write(string? value)
+        {
+            if (value is not null && value.Contains(marker, StringComparison.Ordinal))
+                throw new InvalidOperationException("injected diagnostic failure");
+
+            inner.Write(value);
+        }
+
+        public override void Write(char value) => inner.Write(value);
+    }
+
+    /// <summary>
     /// A diagnostic sink that throws on EVERY write — modelling a broken or closed
     /// <c>Console.Error</c>. Used to prove the guarded sanitized report cannot skip cleanup or
     /// replace the primary failure: without the production guard the throw from this writer
@@ -2089,6 +2229,13 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             get { lock (_gate) return _readyCount; }
         }
 
+        /// <summary>
+        /// ONE-SHOT injected failure for the next <c>WorkerReady</c> write, applied AFTER the
+        /// message was recorded (so the attempt still counts). It models the single Ready write
+        /// failing on the cancel handler's own attempt. Consumed on use.
+        /// </summary>
+        public Exception? FailNextReadyWrite { get; set; }
+
         /// <summary>Completes once at least <paramref name="count"/> Ready messages were written.</summary>
         public Task WaitForReadyCountAsync(int count)
         {
@@ -2127,7 +2274,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 foreach (var threshold in satisfied) _waiters.Remove(threshold);
             }
             foreach (var tcs in ready) tcs.TrySetResult();
-            return Task.CompletedTask;
+
+            // The ATTEMPT is recorded above before the injected failure applies, so a test can prove
+            // the write really was issued by the producer under test.
+            if (FailNextReadyWrite is not { } readyFailure)
+                return Task.CompletedTask;
+
+            FailNextReadyWrite = null;
+            return Task.FromException(readyFailure);
         }
 
         Task IAsyncStreamWriter<WorkerMessage>.WriteAsync(WorkerMessage message, CancellationToken cancellationToken)
