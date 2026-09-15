@@ -266,19 +266,68 @@ internal sealed class WorkerConnection
     }
 
     /// <summary>
-    /// CHECKED ACCESS — fails with the EXISTING disconnected error when this connection's
-    /// tool-response lifetime has ENDED. Response-bearing sends take this check AFTER acquiring the
-    /// send gate and BEFORE starting the underlying write, so a request queued behind the gate can
-    /// never begin a write whose response could no longer be delivered to it.
+    /// TEST SEAM — invoked INSIDE the response-write linearization boundary (with
+    /// <c>_toolResponsesLock</c> held) IMMEDIATELY BEFORE the response-bearing write is initiated,
+    /// and only after the lifetime has been observed OPEN. <c>null</c> in production, where the
+    /// boundary therefore contains nothing but the check and the synchronous write initiation.
     /// </summary>
-    /// <exception cref="InvalidOperationException">The response lifetime has ended.</exception>
-    internal void EnsureToolResponsesOpen()
+    /// <remarks>
+    /// <para>
+    /// It exists so a test can observe and control THAT EXACT INSTANT: a hook that blocks here holds
+    /// the boundary, so a concurrent <see cref="EndToolResponses"/> provably cannot complete between
+    /// the openness decision and the write initiation. Nothing in production sets it, so it is
+    /// unreachable in normal operation.
+    /// </para>
+    /// <para>
+    /// The hook runs WITH THE LOCK HELD: it must not call back into this connection's response
+    /// registry (that would self-deadlock) and must not await.
+    /// </para>
+    /// </remarks>
+    internal Action? OnResponseBearingWriteInitiating { get; set; }
+
+    /// <summary>
+    /// THE RESPONSE-BEARING WRITE BOUNDARY — the SINGLE linearization point that decides the
+    /// response lifetime is OPEN and INITIATES the underlying write, both under the ONE
+    /// <c>_toolResponsesLock</c>, so <see cref="EndToolResponses"/> can never complete between the
+    /// two. A queued request whose lifetime closed before this boundary therefore never begins
+    /// transport at all, and only an ALREADY-STARTED write retains its existing awaited
+    /// transport/caller-cancellation behavior.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ONLY THE SYNCHRONOUS INITIATION IS LOCKED. <c>WriteAsync</c> is invoked inside the lock purely
+    /// to obtain its Task; that Task is AWAITED OUTSIDE the lock, so nothing ever awaits while
+    /// holding it and no registry call is made from within it. A write that has been initiated is
+    /// never abandoned — the caller awaits exactly the Task produced here.
+    /// </para>
+    /// <para>
+    /// This is used ONLY by response-bearing sends. Complete, Ready, progress/narrative sends and the
+    /// unary RPCs do not go through it and are entirely unaffected.
+    /// </para>
+    /// </remarks>
+    /// <param name="message">The fully built message — construction happens outside the boundary.</param>
+    /// <param name="ct">Forwarded verbatim to the underlying write, exactly as before.</param>
+    /// <exception cref="InvalidOperationException">
+    /// This connection's response lifetime has ENDED — the write is NOT initiated.
+    /// </exception>
+    internal Task WriteResponseBearingAsync(WorkerMessage message, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(message);
+
+        Task write;
         lock (_toolResponsesLock)
         {
             if (_toolResponsesClosed)
                 throw new InvalidOperationException(DisconnectedMessage);
+
+            // The test seam's instant: the lifetime is decided OPEN and the write has not started.
+            OnResponseBearingWriteInitiating?.Invoke();
+
+            // INITIATION ONLY — the returned Task is awaited by the caller, outside this lock.
+            write = Stream.RequestStream.WriteAsync(message, ct);
         }
+
+        return write;
     }
 
     /// <summary>

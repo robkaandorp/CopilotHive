@@ -1151,9 +1151,11 @@ public sealed class WorkerService(
     /// The connection is passed in EXPLICITLY — the caller snapshots it before it waits, so a send
     /// that parks behind another writer still targets the connection it was intended for, and
     /// registration and sending can never re-read a different <c>CurrentConnection</c>. When
-    /// <paramref name="responseBearing"/> is set, the connection's response-lifetime openness is
-    /// checked after the send gate is acquired (see <see cref="SendAsync"/>) — restricted to
-    /// response-bearing sends, so Complete, Ready, progress/narrative and unary paths are unaffected.
+    /// <paramref name="responseBearing"/> is set, the send goes through the connection's
+    /// RESPONSE-BEARING WRITE BOUNDARY once the send gate has been acquired (see
+    /// <see cref="SendAsync"/>), which decides openness and initiates the write indivisibly —
+    /// restricted to response-bearing sends, so Complete, Ready, progress/narrative and unary paths
+    /// are unaffected.
     /// </remarks>
     private Task SendToolCallRequest(
         WorkerConnection connection,
@@ -1247,10 +1249,11 @@ public sealed class WorkerService(
     /// <param name="responseBearing">
     /// <c>true</c> ONLY for a send whose caller is waiting on this connection for a response (the
     /// <c>request_clarification</c> / <c>get_goal</c> / <c>raise_issue</c> bridge calls). Such a send
-    /// additionally checks the connection's response lifetime AFTER acquiring the gate and BEFORE
-    /// starting the underlying write, so a request that was queued while the lifetime was open can
-    /// never begin a write whose response could no longer be delivered to it. Complete, Ready,
-    /// progress/narrative sends and unary sessions pass <c>false</c> and are entirely unaffected.
+    /// goes through the connection's RESPONSE-BEARING WRITE BOUNDARY, which decides the response
+    /// lifetime is open and INITIATES the write under one lock, so a request that was queued while
+    /// the lifetime was open can never begin a write whose response could no longer be delivered to
+    /// it. Complete, Ready, progress/narrative sends and unary sessions pass <c>false</c> and are
+    /// entirely unaffected.
     /// </param>
     /// <remarks>
     /// The permit is released in <c>finally</c> AFTER a successful acquisition only — including
@@ -1261,11 +1264,12 @@ public sealed class WorkerService(
     /// await or an assignment drain, and unary RPCs (heartbeat, session, provisioning) plus the
     /// response reader stay entirely outside it.
     /// <para>
-    /// RETIREMENT IS CHECKED AFTER THE GATE IS ACQUIRED, and for a response-bearing send the
-    /// RESPONSE LIFETIME is checked immediately after it. A send that was already queued when the
-    /// connection retired (or when its response lifetime ended) therefore cannot write on it (nor
-    /// on a replacement): it fails with the existing disconnected error instead. These checks are
-    /// the ONLY additional work inside the gate — the write itself still consumes the captured
+    /// RETIREMENT IS CHECKED AFTER THE GATE IS ACQUIRED. A send that was already queued when the
+    /// connection retired therefore cannot write on it (nor on a replacement): it fails with the
+    /// existing disconnected error instead. A RESPONSE-BEARING send then performs its openness
+    /// decision and its write INITIATION as one indivisible step inside the connection's boundary,
+    /// so the lifetime cannot close in between; the resulting write is still AWAITED here, inside
+    /// this gate, exactly as every other write is. The write itself still consumes the captured
     /// connection, so a permitted write keeps its captured stream, token and outcome, and an
     /// in-flight write task is never abandoned.
     /// </para>
@@ -1278,13 +1282,13 @@ public sealed class WorkerService(
         {
             connection.EnsureUsable();
 
-            // RESPONSE-BEARING ONLY: a request whose response lifetime has already ended must not
-            // begin its queued write. The shared send gate is still taken and released normally, and
-            // a write that already started keeps its existing awaited behavior.
-            if (responseBearing)
-                connection.EnsureToolResponsesOpen();
-
-            await connection.Stream.RequestStream.WriteAsync(message, ct);
+            // RESPONSE-BEARING ONLY: the openness decision and the write INITIATION happen together
+            // inside the connection's boundary, so a closed response lifetime can never let a queued
+            // request begin transport. The returned in-flight write is awaited here — inside the
+            // shared gate, never inside the connection's lock — so it is never abandoned.
+            await (responseBearing
+                ? connection.WriteResponseBearingAsync(message, ct)
+                : connection.Stream.RequestStream.WriteAsync(message, ct));
         }
         finally
         {
