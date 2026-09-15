@@ -59,6 +59,40 @@ public sealed class HiveOrchestratorService(
     /// <summary>Maximum number of tracked heartbeat entries before the oldest is evicted.</summary>
     internal int MaxHeartbeatEntries { get; set; } = 200;
 
+    /// <summary>
+    /// THE DISTINCT REFUSAL REASONS of the bounded completion/idle-release guard. Each names ONE
+    /// guard, so a diagnostic (and a test synchronizing on it) identifies exactly which
+    /// observation refused the delivery rather than merely that something did.
+    /// </summary>
+    internal static class OwnershipRefusalReasons
+    {
+        /// <summary>The pinned instance is no longer the one registered under its ID (ABA).</summary>
+        public const string PinnedInstanceReplaced =
+            "the pinned worker is no longer the instance registered under its ID";
+
+        /// <summary>The pool does not hold this worker busy with the completing task.</summary>
+        public const string WorkerNotBusyWithTask = "the worker is not busy with that task";
+
+        /// <summary>The queue holds no active entry for the completing task.</summary>
+        public const string NoActiveQueueEntry = "the task has no active queue entry";
+
+        /// <summary>The active queue entry names a different assigned worker.</summary>
+        public const string ForeignAssignedWorker =
+            "the active queue entry is assigned to a different worker";
+
+        /// <summary>The checked release was refused at the mutation point.</summary>
+        public const string CheckedReleaseRefused =
+            "the checked release was refused — the worker's ownership changed after validation";
+
+        /// <summary>A Ready arrived while the observed task still has an active queue entry.</summary>
+        public const string ReadyTaskStillActive =
+            "the worker's task is still active in the queue; no completion released it";
+
+        /// <summary>The checked idle was refused at the mutation point.</summary>
+        public const string ReadyCheckedIdleRefused =
+            "the worker's ownership changed or is inconsistent; the checked idle was refused";
+    }
+
 
     /// <summary>
     /// Registers a worker with the orchestrator and assigns it an ID.
@@ -424,17 +458,29 @@ public sealed class HiveOrchestratorService(
     }
 
     /// <summary>
-    /// Applies task completion to a worker: marks the task complete in the queue, marks the
-    /// worker idle, and clears <see cref="ConnectedWorker.CurrentModel"/> to <c>null</c>.
+    /// Applies task completion to a worker through the pool's CHECKED release: the captured
+    /// instance is only marked idle (and its <see cref="ConnectedWorker.CurrentModel"/> cleared,
+    /// INSIDE that release) when it is still the registered instance, still busy, and still
+    /// executing <paramref name="taskId"/>. ONLY a successful release removes that exact task id
+    /// from the active queue.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
+    /// <remarks>
+    /// A REFUSAL MUTATES NOTHING: no idle reset, no model write and no queue removal. That is what
+    /// keeps a late completion from releasing a SUCCESSOR's assignment — including a successor that
+    /// is already busy with a DIFFERENT task id, whose active queue entry must survive untouched.
+    /// </remarks>
     /// <param name="worker">The worker that completed the task.</param>
     /// <param name="taskId">The identifier of the completed task.</param>
-    internal void ApplyTaskCompletion(ConnectedWorker worker, string taskId)
+    /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
+    internal bool ApplyTaskCompletion(ConnectedWorker worker, string taskId)
     {
+        if (!workerPool.TryReleaseCompletedTask(worker, taskId))
+            return false;
+
+        // ONLY after an accepted release: remove the EXACT task id that was released.
         taskQueue.MarkComplete(taskId);
-        workerPool.MarkIdle(worker.Id);
-        worker.CurrentModel = null;
+        return true;
     }
 
     private async Task HandleWorkerReady(
@@ -442,7 +488,43 @@ public sealed class HiveOrchestratorService(
         IServerStreamWriter<OrchestratorMessage> responseStream,
         CancellationToken cancellationToken)
     {
-        workerPool.MarkIdle(worker.Id);
+        // ── THE SYNCHRONIZED OWNERSHIP OBSERVATION ───────────────────────────────────────────
+        // One lock-consistent read of the instance, its busy flag and its current task. Reading
+        // those three facts separately could mix a successor's busy flag with a predecessor's task
+        // id and release an assignment that is still being worked on.
+        if (!workerPool.TryGetWorkerSnapshot(worker.Id, out var observed)
+            || !ReferenceEquals(observed.Worker, worker))
+        {
+            // GONE OR REPLACED (ABA): this stream no longer owns the registered worker, so it must
+            // not idle, dequeue or assign anything on its behalf.
+            LogReadyIgnored(worker.Id, null, OwnershipRefusalReasons.PinnedInstanceReplaced);
+            return;
+        }
+
+        // ── THE STILL-OWNED TASK GATE ────────────────────────────────────────────────────────
+        // A Ready that arrives while the observed task STILL has an active queue entry is a Ready
+        // for work nobody has released. Idling here would silently abandon a held assignment (and
+        // hand the worker a second task), so the handler returns BEFORE any idle or dequeue.
+        if (observed.CurrentTaskId is not null
+            && taskQueue.GetActiveTask(observed.CurrentTaskId) is not null)
+        {
+            LogReadyIgnored(
+                worker.Id, observed.CurrentTaskId, OwnershipRefusalReasons.ReadyTaskStillActive);
+            return;
+        }
+
+        // ── THE CHECKED IDLE ─────────────────────────────────────────────────────────────────
+        // Re-validated against the SAME observation under the pool's activity lock: a changed
+        // instance, a changed task id, or an inconsistent busy/task shape is refused and nothing
+        // is mutated. CurrentModel is deliberately untouched here — the Ready path's existing
+        // model behaviour is preserved.
+        if (!workerPool.TryMarkIdleForReady(observed, queueEntryAbsent: true))
+        {
+            LogReadyIgnored(
+                worker.Id, observed.CurrentTaskId, OwnershipRefusalReasons.ReadyCheckedIdleRefused);
+            return;
+        }
+
         logger.LogInformation("Worker {WorkerId} is ready", worker.Id);
 
         // Dequeue a task for this worker
@@ -492,10 +574,15 @@ public sealed class HiveOrchestratorService(
                 LogAssignmentBlocked(worker, task, ex);
 
                 // RETURN NORMALLY: the pinned worker, the active task and the busy state are
-                // deliberately retained. This stream is NOT unwound and the worker is NOT removed —
-                // the assignment stays held until the existing explicit goal cancellation or the
-                // enabled task-timeout policy releases it. No requeue, no fabricated completion, no
-                // wrong-goal failure, no new timer/retry/reconciliation.
+                // deliberately retained. This stream is NOT unwound and the worker is NOT removed.
+                //
+                // WHAT DOES *NOT* RELEASE THIS HOLD: explicit goal cancellation.
+                // GoalDispatcher.CancelGoalAsync is LOGICAL cancellation ONLY — it fails the goal
+                // and removes the pipeline, but it does NOT stop the worker and does NOT release
+                // transport ownership: the worker's busy flag, its CurrentTaskId and the task's
+                // active TaskQueue entry all survive it. Only the enabled task-timeout policy (or
+                // worker recovery) actually reclaims the hold. No requeue, no fabricated completion,
+                // no wrong-goal failure, no new timer/retry/reconciliation happens here.
             }
         }
         else
@@ -519,8 +606,11 @@ public sealed class HiveOrchestratorService(
     /// <para>
     /// WHY THERE IS NO SUCCESS LOG ON THIS PATH: the assignment was NOT published. Emitting an
     /// assignment/ success line would misreport the delivery, and no recovery activity was performed
-    /// either — the task is left held for the operator's explicit cancellation or the enabled
-    /// task-timeout policy.
+    /// either — the task is left HELD. It is deliberately NOT released by explicit goal
+    /// cancellation: <see cref="GoalDispatcher.CancelGoalAsync"/> is LOGICAL cancellation only (it
+    /// removes the pipeline but leaves the worker running and leaves the busy flag, the current
+    /// task id and the active queue entry in place), which is exactly why this warning tells the
+    /// operator that worker recovery may be required.
     /// </para>
     /// </remarks>
     /// <param name="worker">The pinned worker whose assignment was refused.</param>
@@ -534,11 +624,65 @@ public sealed class HiveOrchestratorService(
             // actionable detail. No success wording appears anywhere in this message.
             logger.LogWarning(
                 "Worker {WorkerId} task {TaskId}: assignment blocked; no assignment published; " +
-                "task retained; cancel the goal or use configured recovery (reason={Reason}) — {Detail}",
+                "task retained; logical cancellation alone does not release transport ownership; " +
+                "worker recovery may be required (reason={Reason}) — {Detail}",
                 worker.Id,
                 task.TaskId,
                 failure.Reason,
                 MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED READY-REFUSAL DIAGNOSTIC: a Ready that was ignored because the worker's
+    /// observed ownership was missing, foreign or still held by the queue.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED like every other diagnostic on a refusal path: the whole log call sits inside its
+    /// own no-throw guard, so a throwing logger can never turn an ignored Ready into an escaping
+    /// exception that would unwind the worker's stream.
+    /// </remarks>
+    /// <param name="workerId">The worker whose Ready was ignored.</param>
+    /// <param name="observedTaskId">The task observed on that worker, or <c>null</c> when idle.</param>
+    /// <param name="reason">Why the Ready was ignored.</param>
+    private void LogReadyIgnored(string workerId, string? observedTaskId, string reason)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} ready ignored (task={TaskId}): {Reason}; no task was dequeued or " +
+                "assigned and no ownership was released",
+                workerId,
+                observedTaskId ?? "(none)",
+                reason);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED COMPLETION-REFUSAL DIAGNOSTIC: a completion that was ignored because the
+    /// worker's or the queue's observed ownership did not match the completing task.
+    /// </summary>
+    /// <param name="workerId">The worker that delivered the completion.</param>
+    /// <param name="taskId">The task the completion claimed.</param>
+    /// <param name="reason">Why the completion was ignored.</param>
+    private void LogCompletionIgnored(string workerId, string taskId, string reason)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} completion for task {TaskId} ignored: {Reason}; nothing was " +
+                "released, removed or notified",
+                workerId,
+                taskId,
+                reason);
         }
         catch
         {
@@ -839,24 +983,95 @@ public sealed class HiveOrchestratorService(
 
     private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete)
     {
-        // MODEL PROVENANCE SELECTION — performed BEFORE ApplyTaskCompletion removes the active
-        // task, because the fallback reads that entry.
+        // ══ THE OWNERSHIP VALIDATION, BEFORE ANY CLEANUP OR NOTIFICATION ═════════════════════
+        // A completion is only acted on when BOTH authorities still agree that THIS stream's
+        // worker owns THIS task:
+        //   (1) the pool: a lock-consistent snapshot whose instance is the pinned one, that is
+        //       still busy, and whose CurrentTaskId is the completing task; and
+        //   (2) the queue: an ACTIVE entry for that exact task id whose assigned_worker is this
+        //       worker.
+        // Anything else — a missing entry, a foreign owner, a stale/duplicate delivery — returns
+        // here, so no successor's assignment is ever released on its behalf.
+        if (!workerPool.TryGetWorkerSnapshot(worker.Id, out var observed)
+            || !ReferenceEquals(observed.Worker, worker))
+        {
+            LogCompletionIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.PinnedInstanceReplaced);
+            return;
+        }
+
+        if (!observed.IsBusy
+            || !string.Equals(observed.CurrentTaskId, complete.TaskId, StringComparison.Ordinal))
+        {
+            LogCompletionIgnored(
+                worker.Id,
+                complete.TaskId,
+                $"{OwnershipRefusalReasons.WorkerNotBusyWithTask} (busy={observed.IsBusy}, " +
+                $"currentTask={observed.CurrentTaskId ?? "(none)"})");
+            return;
+        }
+
+        var activeTask = taskQueue.GetActiveTask(complete.TaskId);
+        if (activeTask is null)
+        {
+            LogCompletionIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.NoActiveQueueEntry);
+            return;
+        }
+
+        if (!activeTask.Metadata.TryGetValue("assigned_worker", out var assignedWorker)
+            || !string.Equals(assignedWorker, worker.Id, StringComparison.Ordinal))
+        {
+            LogCompletionIgnored(
+                worker.Id,
+                complete.TaskId,
+                $"{OwnershipRefusalReasons.ForeignAssignedWorker} " +
+                $"(assignedWorker={assignedWorker ?? "(none)"})");
+            return;
+        }
+
+        // MODEL PROVENANCE SELECTION — performed BEFORE the release removes the active task,
+        // because the fallback reads that entry (the VALIDATED one resolved above).
         //
         // Field 7's explicit presence is the ONLY trustworthy signal:
         //   * HasModel == true  → an upgraded sender reported the ORIGINAL ASSIGNED model. That
         //     value wins unconditionally, EVEN when empty/whitespace and EVEN when the queue
         //     disagrees. An explicit wire value is never overwritten by the volatile queue.
-        //   * HasModel == false → a legacy sender. Fall back to the queue's active task model,
-        //     which is empty when no active entry exists.
+        //   * HasModel == false → a legacy sender. Fall back to the queue's active task model.
         // Absence is never inferred from empty/whitespace content.
-        var completedTaskModel = complete.HasModel
-            ? complete.Model
-            : taskQueue.GetActiveTask(complete.TaskId)?.Model ?? "";
+        var completedTaskModel = complete.HasModel ? complete.Model : activeTask.Model;
         logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status} (model={Model})",
             complete.TaskId, worker.Id, complete.Status,
             string.IsNullOrEmpty(completedTaskModel) ? "unknown" : completedTaskModel);
 
-        ApplyTaskCompletion(worker, complete.TaskId);
+        // THE BOUNDARY MAPPING HAPPENS BEFORE THE CLEANUP. A mapping failure (e.g. an unknown
+        // wire status) must not leave the worker released and the queue entry removed with no
+        // result to notify — it returns locally instead, keeping the held task and this stream.
+        TaskResult result;
+        try
+        {
+            // Convert to domain type at the boundary, injecting the SAME selected model used for
+            // the log line above — never a second, independently derived value.
+            result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel };
+        }
+        catch (Exception ex)
+        {
+            LogCompletionMappingFailed(worker.Id, complete.TaskId, ex);
+
+            // RETURN NORMALLY: the assignment, the active entry and this stream are retained. No
+            // fabricated failure result is notified on the worker's behalf.
+            return;
+        }
+
+        // ══ THE CHECKED RELEASE ══════════════════════════════════════════════════════════════
+        // Re-validated at the mutation point: a refusal releases nothing, removes nothing and
+        // notifies nothing.
+        if (!ApplyTaskCompletion(worker, complete.TaskId))
+        {
+            LogCompletionIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.CheckedReleaseRefused);
+            return;
+        }
 
         // MUTATION OWNERSHIP: transport does NOT touch the pipeline. The active-task pointer and
         // the phase entry's worker output are owned exclusively by the ADMITTED completion path
@@ -864,9 +1079,6 @@ public sealed class HiveOrchestratorService(
         // pre-admission write here could clear a SUCCESSOR's live pointer and overwrite its phase
         // output on behalf of a duplicate completion that admission subsequently rejects.
 
-        // Convert to domain type at the boundary, injecting the SAME selected model used for the
-        // log line above — never a second, independently derived value.
-        var result = GrpcMapper.ToDomain(complete) with { Model = completedTaskModel };
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {
@@ -879,6 +1091,30 @@ public sealed class HiveOrchestratorService(
                 logger.LogError(ex, "Error in task completion handler for {TaskId}", complete.TaskId);
             }
         });
+    }
+
+    /// <summary>
+    /// THE GUARDED MAPPING-FAILURE DIAGNOSTIC: the completion could not be mapped to its domain
+    /// result, so nothing was released and nothing was notified.
+    /// </summary>
+    /// <param name="workerId">The worker that delivered the completion.</param>
+    /// <param name="taskId">The task the completion claimed.</param>
+    /// <param name="failure">The mapping failure; its message is included as evidence.</param>
+    private void LogCompletionMappingFailed(string workerId, string taskId, Exception failure)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} completion for task {TaskId} could not be mapped; the task and " +
+                "the stream are retained and no completion was notified — {Detail}",
+                workerId,
+                taskId,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
     }
 
 }

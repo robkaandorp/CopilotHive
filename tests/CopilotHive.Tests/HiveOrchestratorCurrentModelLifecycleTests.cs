@@ -132,8 +132,9 @@ public sealed class HiveOrchestratorCurrentModelLifecycleTests
     #region ApplyTaskCompletion_ClearsCurrentModel
 
     /// <summary>
-    /// Calling <see cref="HiveOrchestratorService.ApplyTaskCompletion"/> clears
-    /// <see cref="ConnectedWorker.CurrentModel"/> to <c>null</c>.
+    /// Calling <see cref="HiveOrchestratorService.ApplyTaskCompletion"/> for the worker's OWN
+    /// current task reports success and clears <see cref="ConnectedWorker.CurrentModel"/> to
+    /// <c>null</c> INSIDE the checked release.
     /// If this null-assignment is removed from production code, this test will fail.
     /// </summary>
     [Fact]
@@ -162,11 +163,89 @@ public sealed class HiveOrchestratorCurrentModelLifecycleTests
         Assert.True(worker.IsBusy);
 
         // Act — call the real service completion method
-        service.ApplyTaskCompletion(worker, dequeued.TaskId);
+        Assert.True(service.ApplyTaskCompletion(worker, dequeued.TaskId));
 
-        // Assert: model is cleared and worker is idle
+        // Assert: model is cleared, worker is idle and the active entry is gone
         Assert.Null(worker.CurrentModel);
         Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Null(taskQueue.GetActiveTask(dequeued.TaskId));
+    }
+
+    #endregion
+
+    #region ApplyTaskCompletion — checked release refusals
+
+    /// <summary>
+    /// A completion for a DIFFERENT task id than the one the worker is executing is REFUSED: the
+    /// busy state, the current task, the model and the successor's active queue entry all survive.
+    /// </summary>
+    [Fact]
+    public void ApplyTaskCompletion_ForeignTaskId_IsRefusedAndMutatesNothing()
+    {
+        var (service, pool, taskQueue) = CreateService();
+        var worker = pool.RegisterWorker("w-complete-foreign", []);
+
+        var successor = new WorkTask
+        {
+            TaskId = "task-successor",
+            GoalId = "goal-foreign",
+            GoalDescription = "Successor",
+            Prompt = "Work",
+            Role = WorkerRole.Coder,
+            Model = "successor-model",
+            Repositories = [],
+        };
+        taskQueue.Enqueue(successor);
+        var dequeued = taskQueue.TryDequeue(WorkerRole.Unspecified)!;
+        service.ApplyTaskAssignment(worker, dequeued);
+
+        // A LATE predecessor completion arrives for a task this worker no longer owns.
+        Assert.False(service.ApplyTaskCompletion(worker, "task-predecessor"));
+
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-successor", worker.CurrentTaskId);
+        Assert.Equal("successor-model", worker.CurrentModel);
+        Assert.NotNull(taskQueue.GetActiveTask("task-successor"));
+    }
+
+    /// <summary>
+    /// A completion delivered against an ALREADY-REPLACED worker instance (ABA) is REFUSED, and
+    /// the replacement registered under the same ID keeps its own assignment untouched.
+    /// </summary>
+    [Fact]
+    public void ApplyTaskCompletion_ReplacedWorkerInstance_IsRefused()
+    {
+        var (service, pool, taskQueue) = CreateService();
+        var stale = pool.RegisterWorker("w-aba", []);
+
+        var task = new WorkTask
+        {
+            TaskId = "task-aba",
+            GoalId = "goal-aba",
+            GoalDescription = "ABA",
+            Prompt = "Work",
+            Role = WorkerRole.Coder,
+            Model = "stale-model",
+            Repositories = [],
+        };
+        taskQueue.Enqueue(task);
+        var dequeued = taskQueue.TryDequeue(WorkerRole.Unspecified)!;
+        service.ApplyTaskAssignment(stale, dequeued);
+
+        // The stale instance is replaced under the SAME id.
+        Assert.True(pool.RemoveWorker(stale));
+        var replacement = pool.RegisterWorker("w-aba", []);
+        pool.MarkBusy("w-aba", "task-aba");
+        replacement.CurrentModel = "replacement-model";
+
+        Assert.False(service.ApplyTaskCompletion(stale, "task-aba"));
+
+        // The replacement was never released, and the active entry was never removed.
+        Assert.True(replacement.IsBusy);
+        Assert.Equal("task-aba", replacement.CurrentTaskId);
+        Assert.Equal("replacement-model", replacement.CurrentModel);
+        Assert.NotNull(taskQueue.GetActiveTask("task-aba"));
     }
 
     #endregion
@@ -204,7 +283,7 @@ public sealed class HiveOrchestratorCurrentModelLifecycleTests
         Assert.True(worker.IsBusy);
 
         // Phase 2 — complete task via real service
-        service.ApplyTaskCompletion(worker, dequeued.TaskId);
+        Assert.True(service.ApplyTaskCompletion(worker, dequeued.TaskId));
         Assert.Null(worker.CurrentModel);
         Assert.False(worker.IsBusy);
     }

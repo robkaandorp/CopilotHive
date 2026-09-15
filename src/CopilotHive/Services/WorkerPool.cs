@@ -18,6 +18,27 @@ public sealed record WorkerPoolStats
 }
 
 /// <summary>
+/// A point-in-time, lock-consistent view of ONE worker's assignment ownership, taken under the
+/// pool's activity lock so the three facts it carries can never be torn against each other.
+/// </summary>
+/// <remarks>
+/// It is a pure OBSERVATION: the referenced instance stays live and its state may change before
+/// the observer acts. That is exactly why the checked idle/release operations re-validate the
+/// captured instance and task id under the same lock instead of trusting the snapshot.
+/// </remarks>
+internal readonly record struct WorkerOwnershipSnapshot
+{
+    /// <summary>The exact instance registered under the requested ID at the snapshot instant.</summary>
+    public required ConnectedWorker Worker { get; init; }
+
+    /// <summary>Whether that instance was executing a task at the snapshot instant.</summary>
+    public required bool IsBusy { get; init; }
+
+    /// <summary>The task the instance was executing, or <c>null</c> when it was idle.</summary>
+    public required string? CurrentTaskId { get; init; }
+}
+
+/// <summary>
 /// Thread-safe registry of currently connected workers. Supports registration,
 /// lookup, heartbeat tracking, and busy/idle state management.
 /// </summary>
@@ -226,11 +247,185 @@ public sealed class WorkerPool : IWorkerPool
             if (!_workers.TryGetValue(id, out var worker))
                 return;
 
-            worker.IsBusy = false;
-            worker.CurrentTaskId = null;
-            worker.CurrentTaskStartedAt = null;
-            worker.Role = WorkerRole.Unspecified;
+            ResetToIdleNoLock(worker);
         }
+    }
+
+    /// <summary>
+    /// THE ONE IDLE-RESET FIELD SET, shared by <see cref="MarkIdle"/> and by the checked
+    /// idle/release operations, so a checked release can never drift from the ID-based reset.
+    /// Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    /// <param name="worker">The captured worker instance to reset — never re-resolved by ID.</param>
+    private static void ResetToIdleNoLock(ConnectedWorker worker)
+    {
+        worker.IsBusy = false;
+        worker.CurrentTaskId = null;
+        worker.CurrentTaskStartedAt = null;
+        worker.Role = WorkerRole.Unspecified;
+    }
+
+    /// <summary>
+    /// Takes a lock-consistent snapshot of the ownership state of the worker currently registered
+    /// under <paramref name="workerId"/>: the instance itself, its <see cref="ConnectedWorker.IsBusy"/>
+    /// flag and its <see cref="ConnectedWorker.CurrentTaskId"/>, all read under <c>_activityLock</c>
+    /// so the three facts belong to the SAME instant.
+    /// </summary>
+    /// <remarks>
+    /// This is an OBSERVATION ONLY — it mutates nothing and it establishes no ownership. The
+    /// returned instance stays live, so every acting caller must re-validate it through
+    /// <see cref="TryReleaseCompletedTask"/> or <see cref="TryMarkIdleForReady"/>, which re-check
+    /// the captured instance and task id under the same lock.
+    /// </remarks>
+    /// <param name="workerId">Identifier of the worker to observe.</param>
+    /// <param name="snapshot">The snapshot, when a worker is registered under that ID.</param>
+    /// <returns><c>true</c> when a worker was registered and observed; <c>false</c> otherwise.</returns>
+    internal bool TryGetWorkerSnapshot(string workerId, out WorkerOwnershipSnapshot snapshot)
+    {
+        lock (_activityLock)
+        {
+            if (!_workers.TryGetValue(workerId, out var worker))
+            {
+                snapshot = default;
+                return false;
+            }
+
+            snapshot = new WorkerOwnershipSnapshot
+            {
+                Worker = worker,
+                IsBusy = worker.IsBusy,
+                CurrentTaskId = worker.CurrentTaskId,
+            };
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// THE CHECKED COMPLETION RELEASE. Marks <paramref name="expected"/> idle and clears its
+    /// <see cref="ConnectedWorker.CurrentModel"/> — but ONLY when, at the mutation point and under
+    /// <c>_activityLock</c>, that exact instance is still the one registered under its ID, it is
+    /// still busy, and it is still executing <paramref name="expectedTaskId"/> (compared
+    /// ORDINALLY).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT THIS PROTECTS: a completion that arrives late must never release a SUCCESSOR's
+    /// assignment. A replacement instance registered under the same ID (ABA), a worker that has
+    /// moved on to a different task id, and a worker that is no longer busy are all REFUSED
+    /// without touching a single assignment field.
+    /// </para>
+    /// <para>
+    /// WHAT THIS DOES NOT PROTECT (deliberately out of scope): a concurrent reactivation of the
+    /// SAME task id between an observation and this call. The reference/task checks here guard
+    /// only this mutation; queue membership is a separate concurrent operation.
+    /// </para>
+    /// </remarks>
+    /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
+    /// <param name="expectedTaskId">The task the caller observed that instance executing.</param>
+    /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
+    internal bool TryReleaseCompletedTask(ConnectedWorker expected, string expectedTaskId)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(expectedTaskId);
+
+        lock (_activityLock)
+        {
+            if (!IsStillOwnedNoLock(expected, expectedTaskId))
+                return false;
+
+            // A completion release only ever applies to a BUSY owner: an idle worker has nothing
+            // of this task left to release.
+            if (!expected.IsBusy)
+                return false;
+
+            ResetToIdleNoLock(expected);
+
+            // THE MODEL IS CLEARED INSIDE THE CHECKED RELEASE, never afterwards: a later write
+            // would land outside the ownership check and could clear a successor's model.
+            expected.CurrentModel = null;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// THE CHECKED READY IDLE. Applies the idle reset to the instance the caller observed, under
+    /// <c>_activityLock</c>, and only when the observation is still consistent at the mutation
+    /// point. <see cref="ConnectedWorker.CurrentModel"/> is deliberately NOT touched — the Ready
+    /// path's existing model behaviour is preserved.
+    /// </summary>
+    /// <remarks>
+    /// <para>THE THREE ACCEPTED SHAPES:</para>
+    /// <list type="bullet">
+    ///   <item><description>AN IDLE/INITIAL READY — the observed <c>CurrentTaskId</c> is
+    ///     <c>null</c> and the worker is NOT busy, at both the observation and the mutation
+    ///     point. This is the first Ready of a stream and the Ready that follows an accepted
+    ///     completion.</description></item>
+    ///   <item><description>A RELEASING READY — the observed <c>CurrentTaskId</c> is non-null,
+    ///     the worker was busy at the observation AND is still busy at the mutation point, the
+    ///     caller observed that the task has NO active queue entry any more
+    ///     (<paramref name="queueEntryAbsent"/>), and the registered instance and task id still
+    ///     match the observation.</description></item>
+    ///   <item><description>EVERYTHING ELSE IS REFUSED — including the inconsistent
+    ///     "non-null task id but not busy" shape, which is refused WITHOUT releasing anything and
+    ///     without writing a single assignment field.</description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="observed">The caller's snapshot: the captured instance, its busy flag and its task.</param>
+    /// <param name="queueEntryAbsent">
+    /// Whether the caller observed that the snapshot's task has no active queue entry. Ignored for
+    /// the null-task shape; required for the non-null one. Queue inspection stays a SEPARATE
+    /// concurrent operation — this is an observation the caller passes in, not a lock-held fact.
+    /// </param>
+    /// <returns><c>true</c> when the idle reset was applied; <c>false</c> when it was refused.</returns>
+    internal bool TryMarkIdleForReady(WorkerOwnershipSnapshot observed, bool queueEntryAbsent)
+    {
+        var expected = observed.Worker;
+        ArgumentNullException.ThrowIfNull(expected);
+
+        lock (_activityLock)
+        {
+            if (!IsStillOwnedNoLock(expected, observed.CurrentTaskId))
+                return false;
+
+            if (observed.CurrentTaskId is null)
+            {
+                // THE IDLE/INITIAL READY: nothing may be released, so the worker must be idle
+                // both when it was observed and now.
+                return !observed.IsBusy && !expected.IsBusy && Applied(expected);
+            }
+
+            // THE RELEASING READY: the ownership must have been busy when observed, must still be
+            // busy now, and the task must no longer be owned by the queue.
+            if (!observed.IsBusy || !expected.IsBusy || !queueEntryAbsent)
+                return false;
+
+            return Applied(expected);
+        }
+
+        static bool Applied(ConnectedWorker worker)
+        {
+            // Only the CAPTURED instance is mutated — never a replacement resolved by ID.
+            ResetToIdleNoLock(worker);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expected"/> is STILL the instance registered under its ID and is
+    /// still executing <paramref name="expectedTaskId"/> (ordinal comparison, <c>null</c> meaning
+    /// "no task"). Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    private bool IsStillOwnedNoLock(ConnectedWorker expected, string? expectedTaskId)
+    {
+        if (!_workers.TryGetValue(expected.Id, out var registered))
+            return false;
+
+        // ABA: a replacement instance under the same ID is never mutated on the strength of the
+        // old instance's observation.
+        if (!ReferenceEquals(registered, expected))
+            return false;
+
+        return string.Equals(expected.CurrentTaskId, expectedTaskId, StringComparison.Ordinal);
     }
 
     /// <summary>

@@ -114,7 +114,8 @@ public sealed class GrpcWorkerGateway : IWorkerGateway
         {
             _logger.LogWarning(
                 "Worker {WorkerId} task {TaskId}: assignment blocked; no assignment published; " +
-                "task retained; cancel the goal or use configured recovery " +
+                "task retained; logical cancellation alone does not release transport ownership; " +
+                "worker recovery may be required " +
                 "(goal={GoalId}, reason={Reason}) — {Detail}",
                 workerId,
                 task.TaskId,
