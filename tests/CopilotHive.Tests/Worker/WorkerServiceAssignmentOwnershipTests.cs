@@ -54,6 +54,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// Bound on teardown's drain-to-fixpoint loop. Each pass joins every newly admitted assignment
+    /// execution; a fixture can only create a handful, so exceeding this means the runner kept
+    /// admitting new work after the recording was sealed, which is reported as a named failure
+    /// rather than looped on forever.
+    /// </summary>
+    private const int MaxTeardownDrainPasses = 8;
+
+    /// <summary>
     /// Token cancellation held at the unwind: after prompt entry the loop's token is
     /// cancelled, the body OBSERVES the cancellation, and the loop CANNOT finish — its
     /// teardown is draining the retained body, which the fake holds inside its unwind gate.
@@ -681,14 +689,22 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// the owner, B has neither started nor been installed, and once A is released B receives a
     /// fresh empty holder that never observes A's result.
     /// <para>
-    /// ORDERING PROOF — the removal-proof part. A message merely being consumed is normally not
-    /// evidence that its handler ran, so this fixture uses <see cref="InlineDispatchResponseReader"/>
-    /// and first proves the loop has a pending read. Completing that read with B resumes production
-    /// inline: <c>Push</c> cannot return until B's real handler reaches its first incomplete await —
-    /// A's replacement drain in the correct code, or the gated reset in a drain-less/not-awaited
-    /// mutant. The pre-release assertions are therefore made only after dispatch. The reset and
-    /// prompt-entry captures additionally record whether A's ORIGINAL execution was already complete
-    /// at those exact production boundaries. No polling, sleeps, or Task-internal inspection is used.
+    /// ORDERING PROOF — the removal-proof part. A message merely being consumed is not evidence
+    /// that its handler ran, so this fixture layers three independent, production-visible
+    /// discriminators and never claims a happens-before edge the doubles do not provide (see
+    /// <see cref="InlineDispatchResponseReader"/> for exactly what the dispatch rendezvous does and
+    /// does not guarantee across the async-iterator boundary):
+    /// <list type="number">
+    ///   <item><description>PRE-RELEASE, while A is still parked: B's session-reset gate must NOT
+    ///   have been signalled. The test neither pre-releases that gate nor releases A beforehand, so
+    ///   correct code cannot have reached it — it is parked in the drain awaiting A.</description></item>
+    ///   <item><description>AT THE RESET AND PROMPT BOUNDARIES: each captures whether A's ORIGINAL
+    ///   execution was already complete at that exact production instant.</description></item>
+    ///   <item><description>POST-RELEASE CONSEQUENCE: once A is terminal, a detached drain resumes
+    ///   and clears the slot it finds — which is B's — so the slot still holding B, with B's body
+    ///   alive, is what correct code alone produces.</description></item>
+    /// </list>
+    /// No polling, sleeps, or Task-internal inspection is used.
     /// </para>
     /// </summary>
     [Fact]
@@ -763,9 +779,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // The loop is now parked in its next MoveNext. This fixture completes that pending read
-            // with inline continuations, so Push(B) cannot return until B's real handler reaches its
-            // first incomplete await: the replacement drain (correct) or the reset gate (mutant).
+            // The loop is now parked in its next MoveNext. Completing that pending read is this
+            // fixture's DISPATCH RENDEZVOUS — see InlineDispatchResponseReader for the exact
+            // happens-before edge it does, and does not, provide.
             await responses.WaitForParkedReadCountAsync(3)
                 .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
@@ -788,19 +804,21 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             CapturePreRelease(() => Assert.Same(resultA, GetRetainedResult(service)));
             CapturePreRelease(() => Assert.Equal(1, runner.ResetCount));
 
-            // Pre-release B's reset gate. Correct production has not reached it yet because it is
-            // awaiting A. A removed/not-awaited drain has reached the reset; completing this
-            // synchronous gate drives that handler through body creation and owner installation
-            // while A remains parked, which sets up the detached drain's observable consequence.
-            bResetRelease.TrySetResult();
-            if (GetActiveAssignment(service) is not null
-                && string.Equals(GetActiveTaskId(service), taskB, StringComparison.Ordinal))
-            {
-                executionB = GetActiveExecution(service);
-            }
+            // THE POSITIVE PRE-RELEASE DISCRIMINATOR. B's session reset is the FIRST production step
+            // after the replacement drain. The test does NOT pre-release the reset gate and does NOT
+            // release A before this check, so correct code cannot have reached the reset: it is
+            // parked in the drain awaiting A's still-held ORIGINAL execution. A handler that
+            // removed, detached, or failed to await that drain runs straight on to the reset, where
+            // OnResetEntered signals this gate while A is still parked. Nothing in the test can
+            // complete this signal, so it firing here is evidence production skipped the drain.
+            CapturePreRelease(() => Assert.False(
+                bResetReached.Task.IsCompleted,
+                "B's session reset was reached while A's original execution was still parked — the "
+                + "replacement drain did not run, was detached, or was not awaited."));
 
-            // Release A's Ready write: only now can A's ORIGINAL execution terminate, the awaited
-            // drain join in correct code, or the detached drain's later ownership clear.
+            // RELEASE A ONLY NOW — after every pre-release observation above has been taken. From
+            // here A's ORIGINAL execution can terminate, which is what lets a correct drain join and
+            // proceed, and what lets a DETACHED drain resume and expose its consequence below.
             requests.ReleaseReady(0);
 
             // THE DETERMINISTIC RENDEZVOUS. BOTH a correct handler and a drain-less one reach B's
@@ -823,9 +841,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 executionA.IsCompleted,
                 "A's original execution must be terminal once its Ready write was released.");
 
-            // B's reset gate was pre-released above. Await positive evidence that the real handler
-            // attempted B and its body entered.
+            // Let B's handler continue past the reset, then await positive evidence that the real
+            // handler attempted B and its body entered.
+            bResetRelease.TrySetResult();
             await runner.PromptStarted(taskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            if (GetActiveAssignment(service) is not null
+                && string.Equals(GetActiveTaskId(service), taskB, StringComparison.Ordinal))
+            {
+                executionB = GetActiveExecution(service);
+            }
 
             // The same ordering holds at B's own prompt entry. Record any failure so the test can
             // still reach and inspect the detached drain's production-visible consequence.
@@ -2279,12 +2303,36 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         /// entry completes when that invocation returns or throws.
         /// </summary>
         /// <remarks>
-        /// A dictionary of gates cannot answer "is anything still parked?" for an invocation that
-        /// began AFTER a teardown sweep, and the ownership slot only ever exposes the CURRENT body.
-        /// This list is therefore the durable teardown input: joining every entry proves no prompt —
-        /// early, replaced, or late-started — is still running when the service is disposed.
+        /// This tracks PROMPT invocations only. It is NOT the assignment's enclosing execution —
+        /// see <see cref="AssignmentExecutions"/>, which is what teardown must join.
         /// </remarks>
         private readonly List<Task> _startedBodies = [];
+
+        /// <summary>
+        /// APPEND-ONLY record of the REAL enclosing assignment executions
+        /// (<c>ActiveAssignment.Execution</c>, i.e. the <c>Task.Run</c> body), discovered through
+        /// <see cref="ExecutionProbe"/> at every production boundary this double already observes.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A prompt-return surrogate is NOT a substitute: the enclosing execution continues past
+        /// <c>SendPromptAsync</c> through result creation and the Complete/Ready reporting, so a
+        /// surrogate can be terminal while the real execution is still live. Teardown joins THESE.
+        /// </para>
+        /// <para>
+        /// THE CLOSURE HANDSHAKE. <see cref="SealRecording"/> latches this record. After sealing,
+        /// work admitted CONCURRENTLY is still recorded (every production boundary keeps probing),
+        /// and <see cref="RecordedSinceSeal"/> reports whether anything was admitted after the
+        /// latch — so a caller can re-drain to a fixpoint instead of assuming the set is closed.
+        /// </para>
+        /// </remarks>
+        private readonly List<Task> _assignmentExecutions = [];
+
+        /// <summary>Set once <see cref="SealRecording"/> has run.</summary>
+        private bool _sealed;
+
+        /// <summary>Set whenever an execution is admitted AFTER the seal.</summary>
+        private bool _recordedSinceSeal;
 
         /// <summary>
         /// TEARDOWN LATCH. Once set it stays set for the rest of the fixture, and every release gate
@@ -2305,6 +2353,85 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         internal IReadOnlyList<Task> StartedBodies
         {
             get { lock (_gate) return [.. _startedBodies]; }
+        }
+
+        /// <summary>
+        /// Snapshot of every REAL enclosing assignment execution this double ever observed. This is
+        /// the authoritative teardown join set.
+        /// </summary>
+        internal IReadOnlyList<Task> AssignmentExecutions
+        {
+            get { lock (_gate) return [.. _assignmentExecutions]; }
+        }
+
+        /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the
+        /// ownership slot is empty. Installed by the fixture so this double can record the REAL
+        /// execution at each production boundary it already observes (reset entry, prompt entry) —
+        /// the moments the enclosing body exists and is reachable.
+        /// </summary>
+        internal Func<Task?>? ExecutionProbe { get; set; }
+
+        /// <summary>
+        /// Whether an execution was admitted AFTER <see cref="SealRecording"/>. Teardown re-drains
+        /// while this keeps flipping, so a body admitted concurrently with the seal is joined
+        /// rather than missed.
+        /// </summary>
+        internal bool RecordedSinceSeal
+        {
+            get { lock (_gate) return _recordedSinceSeal; }
+        }
+
+        /// <summary>
+        /// CLOSURE HANDSHAKE — latches the recording set. Recording itself does NOT stop (that
+        /// would hide late work); instead every later admission is flagged through
+        /// <see cref="RecordedSinceSeal"/> so teardown can re-drain to a fixpoint. Returns the
+        /// snapshot taken at the instant of sealing.
+        /// </summary>
+        internal IReadOnlyList<Task> SealRecording()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>
+        /// Clears the post-seal flag so a caller can detect a NEW admission during its next drain
+        /// pass. Returns the current snapshot for that pass.
+        /// </summary>
+        internal IReadOnlyList<Task> TakeRecordedSinceSeal()
+        {
+            lock (_gate)
+            {
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>
+        /// Records the REAL enclosing execution currently installed, if any. Idempotent by
+        /// reference: an execution observed at several boundaries is stored once.
+        /// </summary>
+        private void RecordCurrentExecution()
+        {
+            if (ExecutionProbe?.Invoke() is not { } execution)
+                return;
+
+            lock (_gate)
+            {
+                foreach (var recorded in _assignmentExecutions)
+                {
+                    if (ReferenceEquals(recorded, execution))
+                        return;
+                }
+
+                _assignmentExecutions.Add(execution);
+                if (_sealed)
+                    _recordedSinceSeal = true;
+            }
         }
 
         internal Task PromptStarted(string taskId)
@@ -2393,11 +2520,20 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             {
                 // The ordering capture runs at ENTRY, before this body can park or be released.
                 OnPromptEntered?.Invoke(taskId);
+
+                // RECORD THE REAL ENCLOSING EXECUTION. At prompt entry the assignment's Task.Run
+                // body exists; if the owner is already installed this captures the actual
+                // ActiveAssignment.Execution rather than this prompt-return surrogate.
+                RecordCurrentExecution();
+
                 await release.WaitAsync(ct);
                 return output(taskId);
             }
             finally
             {
+                // Probe again on the way out: an execution installed while this prompt was parked
+                // (the handler installs the owner only after Task.Run returns) is admitted here.
+                RecordCurrentExecution();
                 lock (_gate) _completed.Add(taskId);
                 completion.TrySetResult();
             }
@@ -2441,6 +2577,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             // The ordering capture runs at the handler's FIRST post-drain step...
             OnResetEntered?.Invoke(model);
+
+            // RECORD THE REAL ENCLOSING EXECUTION of whatever assignment is installed right now.
+            // The reset for assignment N+1 runs while assignment N's execution may still be the
+            // installed owner, so this boundary admits an execution the ownership snapshots could
+            // otherwise miss once a later clear happens.
+            RecordCurrentExecution();
 
             // ...and then the reset PARKS if a gate was installed, so the capture above is taken at
             // a fixed point the test controls rather than racing the test's own observations. The
@@ -2502,7 +2644,36 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             existing.DisposeAsync().AsTask().GetAwaiter().GetResult();
         field.SetValue(service, runner);
 
+        // INSTALL THE REAL-EXECUTION PROBE. The double calls it at the production boundaries it
+        // already observes, so it records the enclosing ActiveAssignment.Execution (the Task.Run
+        // body) rather than a prompt-return surrogate. Teardown joins those recorded executions,
+        // which is what makes an orphaned-but-live body impossible to miss after a detached drain
+        // clears the ownership slot.
+        switch (runner)
+        {
+            case RetentionRunner retention:
+                retention.ExecutionProbe = () => TryGetActiveExecution(service);
+                break;
+            case GatedPromptRunner gated:
+                gated.ExecutionProbe = () => TryGetActiveExecution(service);
+                break;
+            default:
+                break;
+        }
+
         return service;
+    }
+
+    /// <summary>
+    /// The service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the ownership
+    /// slot is empty. Observation only — it never mutates production state.
+    /// </summary>
+    private static Task? TryGetActiveExecution(WorkerService service)
+    {
+        var active = GetActiveAssignment(service);
+        return active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
     }
 
     private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> BuildStream(
@@ -2574,26 +2745,30 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     {
         List<Exception> failures = [];
 
-        // EVERY BODY THAT EVER STARTED, from the runner's own append-only record. A gate dictionary
-        // cannot answer "is a late-started invocation still parked?", and the ownership slot only
-        // exposes the CURRENT body — so this is the authoritative teardown input. The runner's
-        // teardown latch has already released (or pre-released) every gate by the time the caller
-        // reaches here, so each of these is expected to be terminal.
+        // EVERY REAL ASSIGNMENT EXECUTION the runner ever observed. These are the enclosing
+        // Task.Run bodies (ActiveAssignment.Execution) — NOT prompt-return surrogates, which go
+        // terminal while the real execution is still creating its result and writing Complete/Ready.
+        // A gate dictionary cannot answer "is a late-started body still live?", and the ownership
+        // slot only ever exposes the CURRENT owner, so a detached drain that clears the slot would
+        // otherwise hide an orphaned-but-live execution from teardown entirely.
         var runnerField = typeof(WorkerService)
             .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        IReadOnlyList<Task> startedBodies = runnerField.GetValue(service) switch
+        var runnerInstance = runnerField.GetValue(service);
+
+        // Prompt surrogates are still joined (they are real work the double owns), but they are
+        // additive evidence only; the assignment executions below are the authoritative set.
+        IReadOnlyList<Task> startedBodies = runnerInstance switch
         {
             RetentionRunner retention => retention.StartedBodies,
             GatedPromptRunner gated => gated.StartedBodies,
             _ => [],
         };
 
-        for (var index = 0; index < startedBodies.Count; index++)
-        {
-            var body = startedBodies[index];
-            if (!producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
-                producers = [.. producers, ($"started prompt body #{index}", body)];
-        }
+        foreach (var body in startedBodies)
+            AddProducer("started prompt body", body);
+
+        foreach (var execution in RecordedExecutions())
+            AddProducer("recorded assignment execution", execution);
 
         // Capture any assignment body that started before the test reached its explicit local
         // assignment. This closes assertion-failure windows without relying on the loop to be the
@@ -2602,11 +2777,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var activeExecution = active is null
             ? null
             : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
-        if (activeExecution is not null
-            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, activeExecution)))
-        {
-            producers = [.. producers, ("active assignment body", activeExecution)];
-        }
+        if (activeExecution is not null)
+            AddProducer("active assignment body", activeExecution);
 
         foreach (var (name, producer) in producers)
         {
@@ -2622,16 +2794,46 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             ? null
             : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
         if (lateActiveExecution is not null
-            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, lateActiveExecution)))
+            && AddProducer("late active assignment body", lateActiveExecution))
         {
-            producers = [.. producers, ("late active assignment body", lateActiveExecution)];
             await JoinOneAsync("late active assignment body", lateActiveExecution);
         }
 
-        // FINAL SWEEP of the runner's record: a body may have started while the joins above ran (a
-        // buffered assignment the loop only reached during teardown). The latch guarantees its gate
-        // was already released, so this join is expected to complete promptly.
-        startedBodies = runnerField.GetValue(service) switch
+        // THE CLOSURE HANDSHAKE. Seal the runner's recording, then drain to a FIXPOINT: join
+        // everything recorded, and if the runner admitted a new execution concurrently with (or
+        // after) the seal, take the new snapshot and join again. The loop is bounded by the number
+        // of distinct executions a fixture can create, and each individual join keeps its own
+        // bounded wait, so a body that starts during teardown is joined rather than missed.
+        SealRunnerRecording();
+        var drainPasses = 0;
+        while (true)
+        {
+            var admittedNew = false;
+            foreach (var execution in RecordedExecutions())
+            {
+                if (!AddProducer($"sealed assignment execution #{drainPasses}", execution))
+                    continue;
+
+                admittedNew = true;
+                await JoinOneAsync($"sealed assignment execution #{drainPasses}", execution);
+            }
+
+            if (!admittedNew && !RunnerRecordedSinceSeal())
+                break;
+
+            if (++drainPasses > MaxTeardownDrainPasses)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    "Teardown could not reach a closed join set: the runner kept admitting new "
+                    + "assignment executions after the recording was sealed."));
+                break;
+            }
+
+            TakeRunnerRecordedSinceSeal();
+        }
+
+        // FINAL SWEEP of the prompt record: a prompt may have started while the joins above ran.
+        startedBodies = runnerInstance switch
         {
             RetentionRunner retention => retention.StartedBodies,
             GatedPromptRunner gated => gated.StartedBodies,
@@ -2641,10 +2843,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         for (var index = 0; index < startedBodies.Count; index++)
         {
             var body = startedBodies[index];
-            if (producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+            if (!AddProducer($"late-started prompt body #{index}", body))
                 continue;
 
-            producers = [.. producers, ($"late-started prompt body #{index}", body)];
             await JoinOneAsync($"late-started prompt body #{index}", body);
         }
 
@@ -2689,6 +2890,67 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 failures.Add(ex);
             }
         }
+
+        // Adds a producer to the join set unless it is already present (by reference). Returns
+        // whether it was newly admitted, so a caller can join only what it just added.
+        bool AddProducer(string name, Task? producer)
+        {
+            if (producer is null)
+                return false;
+
+            foreach (var candidate in producers)
+            {
+                if (ReferenceEquals(candidate.Producer, producer))
+                    return false;
+            }
+
+            producers = [.. producers, (name, producer)];
+            return true;
+        }
+
+        IReadOnlyList<Task> RecordedExecutions() => runnerInstance switch
+        {
+            RetentionRunner retention => retention.AssignmentExecutions,
+            GatedPromptRunner gated => gated.AssignmentExecutions,
+            _ => [],
+        };
+
+        void SealRunnerRecording()
+        {
+            switch (runnerInstance)
+            {
+                case RetentionRunner retention:
+                    retention.SealRecording();
+                    break;
+                case GatedPromptRunner gated:
+                    gated.SealRecording();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        bool RunnerRecordedSinceSeal() => runnerInstance switch
+        {
+            RetentionRunner retention => retention.RecordedSinceSeal,
+            GatedPromptRunner gated => gated.RecordedSinceSeal,
+            _ => false,
+        };
+
+        void TakeRunnerRecordedSinceSeal()
+        {
+            switch (runnerInstance)
+            {
+                case RetentionRunner retention:
+                    retention.TakeRecordedSinceSeal();
+                    break;
+                case GatedPromptRunner gated:
+                    gated.TakeRecordedSinceSeal();
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     /// <summary>
@@ -2708,11 +2970,25 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         /// <summary>
         /// APPEND-ONLY record of every prompt invocation that ever STARTED, in start order. Each
-        /// entry completes when that invocation returns or throws, so teardown can join every body —
-        /// including one that started AFTER the teardown sweep, which no gate dictionary and no
-        /// ownership-slot snapshot can surface.
+        /// entry completes when that invocation returns or throws. This tracks PROMPT invocations
+        /// only — see <see cref="AssignmentExecutions"/> for the enclosing executions teardown joins.
         /// </summary>
         private readonly List<Task> _startedBodies = [];
+
+        /// <summary>
+        /// APPEND-ONLY record of the REAL enclosing assignment executions
+        /// (<c>ActiveAssignment.Execution</c>), discovered through <see cref="ExecutionProbe"/> at
+        /// the production boundaries this double already observes. A prompt-return surrogate is not
+        /// a substitute: the enclosing execution continues past the prompt through result creation
+        /// and the Complete/Ready reporting.
+        /// </summary>
+        private readonly List<Task> _assignmentExecutions = [];
+
+        /// <summary>Set once <see cref="SealRecording"/> has run.</summary>
+        private bool _sealed;
+
+        /// <summary>Set whenever an execution is admitted AFTER the seal.</summary>
+        private bool _recordedSinceSeal;
 
         private readonly TaskCompletionSource _unwindGate =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2730,6 +3006,75 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         internal IReadOnlyList<Task> StartedBodies
         {
             get { lock (_gate) return [.. _startedBodies]; }
+        }
+
+        /// <summary>
+        /// Snapshot of every REAL enclosing assignment execution this double ever observed. This is
+        /// the authoritative teardown join set.
+        /// </summary>
+        internal IReadOnlyList<Task> AssignmentExecutions
+        {
+            get { lock (_gate) return [.. _assignmentExecutions]; }
+        }
+
+        /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the
+        /// slot is empty. Installed by a fixture so this double records the REAL execution at the
+        /// production boundaries it already observes.
+        /// </summary>
+        internal Func<Task?>? ExecutionProbe { get; set; }
+
+        /// <summary>Whether an execution was admitted AFTER <see cref="SealRecording"/>.</summary>
+        internal bool RecordedSinceSeal
+        {
+            get { lock (_gate) return _recordedSinceSeal; }
+        }
+
+        /// <summary>
+        /// CLOSURE HANDSHAKE — latches the recording set. Recording continues (that is what keeps
+        /// late work visible); every later admission is flagged so teardown can re-drain to a
+        /// fixpoint instead of assuming the set is closed.
+        /// </summary>
+        internal IReadOnlyList<Task> SealRecording()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>Clears the post-seal flag and returns the snapshot for the next drain pass.</summary>
+        internal IReadOnlyList<Task> TakeRecordedSinceSeal()
+        {
+            lock (_gate)
+            {
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>
+        /// Records the REAL enclosing execution currently installed, if any. Idempotent by reference.
+        /// </summary>
+        private void RecordCurrentExecution()
+        {
+            if (ExecutionProbe?.Invoke() is not { } execution)
+                return;
+
+            lock (_gate)
+            {
+                foreach (var recorded in _assignmentExecutions)
+                {
+                    if (ReferenceEquals(recorded, execution))
+                        return;
+                }
+
+                _assignmentExecutions.Add(execution);
+                if (_sealed)
+                    _recordedSinceSeal = true;
+            }
         }
 
         /// <summary>
@@ -2792,6 +3137,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Slot(_started, id).TrySetResult();
             try
             {
+                // RECORD THE REAL ENCLOSING EXECUTION: at prompt entry the assignment's Task.Run
+                // body exists, so this captures the actual ActiveAssignment.Execution rather than
+                // this prompt-return surrogate.
+                RecordCurrentExecution();
+
                 await Slot(_release, id).Task.WaitAsync(ct);
                 return "done";
             }
@@ -2805,6 +3155,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             }
             finally
             {
+                // Probe again on the way out: an execution installed while this prompt was parked
+                // (the handler installs the owner only after Task.Run returns) is admitted here.
+                RecordCurrentExecution();
                 Slot(_finished, id).TrySetResult();
                 completion.TrySetResult();
             }
@@ -2831,6 +3184,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         public async Task ResetSessionAsync(
             string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
         {
+            // Record whatever execution is installed at this boundary: the reset for assignment
+            // N+1 runs while assignment N may still be the installed owner.
+            RecordCurrentExecution();
             _resetAttempted.TrySetResult();
             if (resetFails)
                 throw new InvalidOperationException("reset failed");
@@ -2927,12 +3283,42 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// A deterministic reader whose pending <c>MoveNext</c> continuation runs inline when
-    /// <see cref="Push"/> supplies a message. The replacement-ordering fixture first proves the
-    /// loop has a pending read, then pushes B; that call cannot return until B's real handler reaches
-    /// its first incomplete await. This gives a handler-dispatch boundary without polling, sleeps,
-    /// or inspecting Task internals.
+    /// A deterministic reader whose pending <c>MoveNext</c> continuation is completed SYNCHRONOUSLY
+    /// (its <see cref="TaskCompletionSource{TResult}"/> is created WITHOUT
+    /// <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/>), so
+    /// <see cref="Push"/> hands the message to a loop that is already parked on that read.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT THIS DOUBLE GUARANTEES. (1) <see cref="WaitForParkedReadCountAsync"/> gives positive
+    /// evidence that the loop is parked inside <c>MoveNext</c> — the message is handed to a waiting
+    /// reader, never merely enqueued. (2) <see cref="Consumed"/> fires only after the message was
+    /// actually dequeued by the loop's read, so it is real read progress, not a test-side counter.
+    /// (3) The pending read's completion is synchronous, so the loop's resumption is scheduled at
+    /// the moment of <see cref="Push"/> rather than at some later, test-invisible time.
+    /// </para>
+    /// <para>
+    /// WHAT THIS DOUBLE DOES **NOT** GUARANTEE — stated plainly, because the fixture must not claim
+    /// an edge it does not have. Production iterates with <c>await foreach</c> over an async
+    /// iterator (<c>ReadMessages</c>). Completing the reader's <c>MoveNext</c> task resumes the
+    /// ITERATOR, but the runtime is NOT required to traverse the iterator's own
+    /// <c>MoveNextAsync</c>/outer <c>await foreach</c> boundary synchronously on the pushing thread.
+    /// Therefore <c>Push</c> RETURNING does not by itself prove the message's HANDLER has been
+    /// entered: on a legal queued-continuation schedule the handler may start slightly later.
+    /// Closing that last gap would require a production-visible signal at the drain/clear boundary,
+    /// i.e. a new production seam, which is explicitly out of scope.
+    /// </para>
+    /// <para>
+    /// HOW THE FIXTURE COMPENSATES. The replacement-ordering test never relies on "Push returned"
+    /// as handler-entry evidence. Its discriminators are production-visible signals raised from
+    /// INSIDE the handler (the session-reset entry gate and the prompt-entry capture) plus the
+    /// ownership consequence observed after A is released, and it holds A parked until every
+    /// pre-release observation has been taken. A mutant that skips the drain reaches the reset while
+    /// A is still parked and is caught whenever it does so; the residual is a schedule in which the
+    /// mutant's handler has not started by the time the pre-release checks run, which the
+    /// post-release consequence assertions are designed to catch instead.
+    /// </para>
+    /// </remarks>
     private sealed class InlineDispatchResponseReader : IAsyncStreamReader<OrchestratorMessage>
     {
         private readonly object _gate = new();

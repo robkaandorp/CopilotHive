@@ -50,6 +50,13 @@ public sealed class WorkerConnectionLifecycleTests
     /// <summary>Generous failsafe bound; never an ordering device.</summary>
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Bound on teardown's drain-to-fixpoint loop. Each pass joins every newly admitted assignment
+    /// execution; exceeding this means the runner kept admitting new work after the recording was
+    /// sealed, which is reported as a named failure rather than looped on forever.
+    /// </summary>
+    private const int MaxTeardownDrainPasses = 8;
+
     // ══════════════════════════════════════════════════════════════════════════
     // (1) The REAL RunAsync flow.
     // ══════════════════════════════════════════════════════════════════════════
@@ -1817,8 +1824,27 @@ public sealed class WorkerConnectionLifecycleTests
         return service;
     }
 
+    /// <summary>
+    /// The service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the ownership
+    /// slot is empty. Observation only — it never mutates production state.
+    /// </summary>
+    private static Task? TryGetActiveExecution(WorkerService service)
+    {
+        var active = typeof(WorkerService)
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service);
+        return active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+    }
+
     private static void ReplaceRunner(WorkerService service, IAgentRunner runner)
     {
+        // INSTALL THE REAL-EXECUTION PROBE so the double records the enclosing
+        // ActiveAssignment.Execution rather than a completed placeholder.
+        if (runner is ProvisionerCapturingRunner capturing)
+            capturing.ExecutionProbe = () => TryGetActiveExecution(service);
+
         var field = typeof(WorkerService).GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("WorkerService._agentRunner field not found.");
         if (field.GetValue(service) is IAgentRunner existing)
@@ -1975,15 +2001,14 @@ public sealed class WorkerConnectionLifecycleTests
         // exposes the CURRENT body — so this is the authoritative teardown input.
         var runnerField = typeof(WorkerService)
             .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var startedBodies = runnerField.GetValue(service) is ProvisionerCapturingRunner capturing
-            ? capturing.StartedBodies
-            : [];
+        var recordedRunner = runnerField.GetValue(service) as ProvisionerCapturingRunner;
+        var startedBodies = recordedRunner?.AssignmentExecutions ?? [];
 
         for (var index = 0; index < startedBodies.Count; index++)
         {
             var body = startedBodies[index];
             if (!producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
-                producers = [.. producers, ($"started prompt body #{index}", body)];
+                producers = [.. producers, ($"recorded assignment execution #{index}", body)];
         }
 
         // A body can start before an assertion captures it in a local. Discover the service's active
@@ -2024,18 +2049,37 @@ public sealed class WorkerConnectionLifecycleTests
 
         // FINAL SWEEP of the runner's record: a body may have started while the joins above ran (a
         // buffered assignment the loop only reached during teardown).
-        startedBodies = runnerField.GetValue(service) is ProvisionerCapturingRunner lateCapturing
-            ? lateCapturing.StartedBodies
-            : [];
-
-        for (var index = 0; index < startedBodies.Count; index++)
+        // THE CLOSURE HANDSHAKE. Seal the recording, then drain to a FIXPOINT: join everything
+        // recorded, and if an execution was admitted concurrently with (or after) the seal, take
+        // the new snapshot and join again. Each join keeps its own bounded wait, so a body that
+        // starts during teardown is joined rather than missed.
+        recordedRunner?.SealRecording();
+        var drainPasses = 0;
+        while (recordedRunner is not null)
         {
-            var body = startedBodies[index];
-            if (producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
-                continue;
+            var admittedNew = false;
+            foreach (var execution in recordedRunner.AssignmentExecutions)
+            {
+                if (producers.Any(candidate => ReferenceEquals(candidate.Producer, execution)))
+                    continue;
 
-            producers = [.. producers, ($"late-started prompt body #{index}", body)];
-            await JoinOneAsync($"late-started prompt body #{index}", body);
+                admittedNew = true;
+                producers = [.. producers, ($"sealed assignment execution #{drainPasses}", execution)];
+                await JoinOneAsync($"sealed assignment execution #{drainPasses}", execution);
+            }
+
+            if (!admittedNew && !recordedRunner.RecordedSinceSeal)
+                break;
+
+            if (++drainPasses > MaxTeardownDrainPasses)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    "Teardown could not reach a closed join set: the runner kept admitting new "
+                    + "assignment executions after the recording was sealed."));
+                break;
+            }
+
+            recordedRunner.TakeRecordedSinceSeal();
         }
 
         // Do not let lexical disposal race a timed-out original task. These tests own service
@@ -2545,33 +2589,111 @@ public sealed class WorkerConnectionLifecycleTests
         private readonly object _gate = new();
 
         /// <summary>
-        /// APPEND-ONLY record of every prompt invocation that ever STARTED, in start order. Each
-        /// entry completes when that invocation returns or throws, so teardown can join every body —
-        /// including one the loop only started AFTER the teardown sweep, which neither a gate
-        /// dictionary nor an ownership-slot snapshot can surface.
+        /// APPEND-ONLY record of the REAL enclosing assignment executions
+        /// (<c>ActiveAssignment.Execution</c>) this double observed, discovered through
+        /// <see cref="ExecutionProbe"/> at the production boundaries it already sees.
         /// </summary>
-        private readonly List<Task> _startedBodies = [];
+        /// <remarks>
+        /// A completed placeholder per prompt is NOT recorded here: it would assert that the
+        /// assignment work is terminal while the enclosing <c>Task.Run</c> body is still creating
+        /// its result and writing Complete/Ready, which is exactly the surrogate hazard teardown
+        /// must avoid. Only the real execution is admitted.
+        /// </remarks>
+        private readonly List<Task> _assignmentExecutions = [];
+
+        /// <summary>Set once <see cref="SealRecording"/> has run.</summary>
+        private bool _sealed;
+
+        /// <summary>Set whenever an execution is admitted AFTER the seal.</summary>
+        private bool _recordedSinceSeal;
 
         internal Func<string?, CancellationToken, Task>? ConfigProvisioner { get; private set; }
 
-        /// <summary>Snapshot of every prompt invocation that ever started, in start order.</summary>
-        internal IReadOnlyList<Task> StartedBodies
+        /// <summary>
+        /// Snapshot of every REAL enclosing assignment execution this double ever observed. This is
+        /// the authoritative teardown join set.
+        /// </summary>
+        internal IReadOnlyList<Task> AssignmentExecutions
         {
-            get { lock (_gate) return [.. _startedBodies]; }
+            get { lock (_gate) return [.. _assignmentExecutions]; }
+        }
+
+        /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the
+        /// ownership slot is empty. Installed by the fixture so this double records the real
+        /// execution instead of a surrogate.
+        /// </summary>
+        internal Func<Task?>? ExecutionProbe { get; set; }
+
+        /// <summary>Whether an execution was admitted AFTER <see cref="SealRecording"/>.</summary>
+        internal bool RecordedSinceSeal
+        {
+            get { lock (_gate) return _recordedSinceSeal; }
+        }
+
+        /// <summary>
+        /// CLOSURE HANDSHAKE — latches the recording set. Recording continues so late work stays
+        /// visible; every later admission is flagged so teardown can re-drain to a fixpoint.
+        /// </summary>
+        internal IReadOnlyList<Task> SealRecording()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>Clears the post-seal flag and returns the snapshot for the next drain pass.</summary>
+        internal IReadOnlyList<Task> TakeRecordedSinceSeal()
+        {
+            lock (_gate)
+            {
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>
+        /// Records the REAL enclosing execution currently installed, if any. Idempotent by reference.
+        /// </summary>
+        private void RecordCurrentExecution()
+        {
+            if (ExecutionProbe?.Invoke() is not { } execution)
+                return;
+
+            lock (_gate)
+            {
+                foreach (var recorded in _assignmentExecutions)
+                {
+                    if (ReferenceEquals(recorded, execution))
+                        return;
+                }
+
+                _assignmentExecutions.Add(execution);
+                if (_sealed)
+                    _recordedSinceSeal = true;
+            }
         }
 
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
             ConfigProvisioner = provisioner;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
-            => Task.CompletedTask;
+        {
+            // The reset for assignment N+1 runs while assignment N may still be installed.
+            RecordCurrentExecution();
+            return Task.CompletedTask;
+        }
 
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
-            // This runner never parks, but the invocation is still recorded durably so teardown's
-            // join set is the set of bodies that actually started rather than a slot snapshot.
-            lock (_gate) _startedBodies.Add(Task.CompletedTask);
+            // Record the REAL enclosing execution — never a completed placeholder standing in for
+            // assignment work that is still running.
+            RecordCurrentExecution();
             return Task.FromResult(string.Empty);
         }
 
