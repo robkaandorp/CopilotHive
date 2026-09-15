@@ -1,14 +1,20 @@
 using CopilotHive.Dashboard;
-using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Git;
+using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
 using Grpc.Core;
 
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+
+using System.Threading.Channels;
 
 using Moq;
 
@@ -386,6 +392,127 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // (4) THE PUBLISHED → CANCELLED → LATE-COMPLETION → READY SEQUENCE
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE PUBLISHED/CANCELLED/LATE-COMPLETION SEQUENCE: a GENUINELY PUBLISHED assignment, a
+    /// subsequent LOGICAL goal cancellation, then the worker's LATE REAL incoming completion, and
+    /// finally a Ready.
+    /// <para>
+    /// THE SEQUENCE: (1) a REAL Ready is pushed on the real stream; the handler dequeues the
+    /// queued task, applies the assignment and publishes it through the REAL
+    /// <see cref="WorkerAssignmentPublisher"/> over a REAL SQLite store — the worker genuinely owns
+    /// the task. (2) <see cref="GoalDispatcher.CancelGoalAsync"/> — logical cancellation —
+    /// SUCCEEDS: the pipeline is marked Failed and removed, but the worker keeps the task. (3) The
+    /// worker's LATE REAL completion then arrives on the real stream: the TRANSPORT guard accepts
+    /// it (both authorities still agree), so the worker's OWN transport ownership clears — but the
+    /// domain completion handling (the real <see cref="GoalDispatcher.HandleTaskCompletionAsync"/>
+    /// path) drops it through its no-pipeline/terminal guards, so the CANCELLED goal cannot
+    /// advance. (4) The following Ready is then ACCEPTED: the released worker is idle with no task.
+    /// </para>
+    /// <para>
+    /// NOT CLAIMED HERE: no recovery, no fabricated completion for never-delivered work, and no
+    /// protection against post-Ready queue insertion or subsequent-assignment races — those are
+    /// excluded by the goal's bounded contract.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task PublishedAssignment_LogicalCancellation_LateCompletion_ReadiesAgain()
+    {
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-ownership-seq-{Guid.NewGuid():N}.db");
+
+        try
+        {
+            await using var h = Harness.CreateWithPublishedAssignmentSupport(dbPath);
+
+            const string goalId = "goal-owned-seq";
+            const string taskId = "task-owned-seq";
+
+            // ── THE DISPATCHABLE SETUP: a real pipeline with a Pending slot at the active-task
+            //    pointer, the task→goal mapping registered, and the task QUEUED so the real Ready
+            //    path can dequeue it. ──
+            var goal = new Goal { Id = goalId, Description = "owned transport sequence" };
+            h.Manager.CreatePipeline(goal, maxRetries: 3);
+            h.GoalSource.Register(goal);
+            var pipeline = h.Manager.GetByGoalId(goalId);
+            Assert.NotNull(pipeline);
+
+            var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+            var slotBuild = pipeline!.AllocateAttemptAndRegisterSlot(taskId, position);
+            pipeline.SetActiveTask(taskId);
+            h.Manager.RegisterTask(taskId, goalId);
+
+            h.Queue.Enqueue(h.BuildTask(taskId, "seq-model") with { GoalId = goalId });
+
+            // ── (1) THE GENUINELY PUBLISHED ASSIGNMENT, through the REAL Ready path ──
+            await h.ReadyAndAwaitAssignmentPublishedAsync();
+
+            // The published assignment left the worker genuinely busy, with its model set and the
+            // queue entry active — exactly the state the completion guard will validate later.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal(taskId, h.Worker.CurrentTaskId);
+            Assert.Equal("seq-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask(taskId));
+            Assert.Equal(1, h.AssignmentsPublished); // the real channel write happened
+
+            // ── (2) THE LOGICAL CANCELLATION — the real GoalDispatcher path ─────────
+            var cancelledPipeline = h.Manager.GetByGoalId(goalId);
+            Assert.NotNull(cancelledPipeline);
+            var dispatcher = h.Dispatcher!;
+            Assert.True(await dispatcher.CancelGoalAsync(goalId, TestContext.Current.CancellationToken));
+
+            // Cancellation is LOGICAL ONLY: the pipeline is failed AND REMOVED (so the goal can
+            // never advance), but the worker's transport ownership SURVIVES.
+            Assert.Equal(GoalPhase.Failed, cancelledPipeline.Phase);
+            Assert.Null(h.Manager.GetByGoalId(goalId));
+            Assert.Null(h.Manager.GetByTaskId(taskId));
+            Assert.True(h.Worker.IsBusy, "logical cancellation must not release the worker");
+            Assert.Equal(taskId, h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask(taskId));
+
+            // ── (3) THE LATE REAL INCOMING COMPLETION on the real stream ────────────
+            // The transport guard accepts it (pool and queue still agree) and clears THIS task's
+            // transport ownership; the domain notification is genuinely delivered to the real
+            // dispatcher, whose TaskCompletionService drops it (no pipeline → warning) so the
+            // cancelled goal cannot advance.
+            var result = await h.CompleteAndAwaitNotificationAsync(taskId);
+
+            Assert.Equal(taskId, result.TaskId);
+            Assert.False(h.Worker.IsBusy, "the late completion clears its own transport ownership");
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Null(h.Worker.CurrentModel);
+            Assert.Null(h.Queue.GetActiveTask(taskId));
+
+            // THE GOAL CANNOT ADVANCE: the pipeline was removed by the cancellation, so the
+            // domain handling found no pipeline for the late result. The stream is alive.
+            Assert.False(h.StreamEnded);
+
+            // ── (4) THE FOLLOWING READY IS ACCEPTED ────────────────────────────────
+            await h.ReadyAndAwaitAcceptedAsync();
+
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+        }
+        finally
+        {
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  harness
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -413,12 +540,60 @@ public sealed class CompletionTransportOwnershipTests
         /// <summary>Whether the real stream task has terminated.</summary>
         public bool StreamEnded => StreamTask.IsCompleted;
 
-        public static Harness Create()
+        /// <summary>
+        /// The REAL dispatcher, so the sequence vector's late completion flows into the REAL
+        /// <see cref="GoalDispatcher.HandleTaskCompletionAsync"/> domain path. Null in the plain
+        /// vectors, which never reach the domain layer.
+        /// </summary>
+        public GoalDispatcher? Dispatcher { get; private init; }
+
+        /// <summary>
+        /// The pipeline registry shared by the service, dispatcher and sequence vector.
+        /// </summary>
+        public GoalPipelineManager Manager { get; private init; } = null!;
+
+        /// <summary>
+        /// The REAL assignment publisher used by the sequence vector's Ready path; null otherwise.
+        /// </summary>
+        public WorkerAssignmentPublisher? ServiceAssignmentPublisher { get; private init; }
+
+        /// <summary>The in-memory goal source backing the sequence vector's real cancellation.</summary>
+        public SequenceGoalSource GoalSource { get; private init; } = null!;
+
+        /// <summary>How many assignment messages the REAL publisher wrote to the pinned channel.</summary>
+        public int AssignmentsPublished => Volatile.Read(ref _assignmentsPublished);
+
+        private int _assignmentsPublished;
+
+        public static Harness Create() => CreateCore(withPublishedAssignmentSupport: false, dbPath: null);
+
+        /// <summary>
+        /// Creates a harness WITH the published-assignment support the sequence vector needs: a
+        /// REAL <see cref="WorkerAssignmentPublisher"/> over a REAL file-backed SQLite store
+        /// supplied to the service, and the REAL dispatcher's notifier subscription replaced by a
+        /// counting one so publication to the pinned channel is observable without a second
+        /// notification path.
+        /// </summary>
+        public static Harness CreateWithPublishedAssignmentSupport(string dbPath) =>
+            CreateCore(withPublishedAssignmentSupport: true, dbPath);
+
+        private static Harness CreateCore(bool withPublishedAssignmentSupport, string? dbPath)
         {
             var pool = new WorkerPool();
             var queue = new TaskQueue();
             var pipelineManager = new GoalPipelineManager();
             var dashboard = new DashboardNotifier();
+
+            var goalManager = new GoalManager();
+            var goalSource = new SequenceGoalSource();
+            if (withPublishedAssignmentSupport)
+            {
+                // The REAL dispatcher's cancellation persists the goal's status through its
+                // GoalManager, so the sequence vector registers a minimal test goal source
+                // (mirroring the GoalDispatcherCancelTests pattern) BEFORE the dispatcher
+                // subscribes — it is TEST-only persistence, not state the transport consults.
+                goalManager.AddSource(goalSource);
+            }
 
             // TWO notifiers: the dispatcher subscribes to its own, so the transport notifier
             // carries exactly ONE subscriber — the harness's own handler.
@@ -426,13 +601,29 @@ public sealed class CompletionTransportOwnershipTests
             var dispatcherNotifier = new TaskCompletionNotifier();
 
             var dispatcher = new GoalDispatcher(
-                new GoalManager(),
+                goalManager,
                 pipelineManager,
                 queue,
                 new GrpcWorkerGateway(pool),
                 dispatcherNotifier,
                 NullLogger<GoalDispatcher>.Instance,
                 new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+
+            IWorkerAssignmentPublisher? assignmentPublisher = null;
+            if (withPublishedAssignmentSupport)
+            {
+                // THE REAL STORE over a REAL file-backed SQLite database — the same shape the
+                // production container wires. The publisher consults ONLY real state.
+                var factory = new SequenceDbContextFactory(dbPath!);
+                using (var bootstrapContext = factory.CreateDbContext())
+                    bootstrapContext.Database.EnsureCreated();
+
+                assignmentPublisher = new WorkerAssignmentPublisher(
+                    pipelineManager,
+                    pool,
+                    new WorkerAssignmentContextStore(
+                        factory, NullLogger<WorkerAssignmentContextStore>.Instance));
+            }
 
             var logger = new SignallingLogger();
             var service = new HiveOrchestratorService(
@@ -442,7 +633,8 @@ public sealed class CompletionTransportOwnershipTests
                 transportNotifier,
                 dispatcher,
                 logger,
-                dashboardNotifier: dashboard);
+                dashboardNotifier: dashboard,
+                assignmentPublisher: assignmentPublisher);
 
             var worker = pool.RegisterWorker(WorkerId, []);
             var reader = new ChannelStreamReader();
@@ -458,6 +650,10 @@ public sealed class CompletionTransportOwnershipTests
                 Notifier = transportNotifier,
                 Reader = reader,
                 StreamTask = streamTask,
+                Dispatcher = dispatcher,
+                Manager = pipelineManager,
+                ServiceAssignmentPublisher = assignmentPublisher as WorkerAssignmentPublisher,
+                GoalSource = goalSource,
             };
 
             transportNotifier.OnTaskCompleted += result =>
@@ -474,7 +670,152 @@ public sealed class CompletionTransportOwnershipTests
                 return Task.CompletedTask;
             };
 
+            // THE PUBLICATION OBSERVER: the real publisher's channel write is drained on another
+            // task, so this counting subscription is the deterministic signal that a publication
+            // genuinely reached the pinned worker's channel. The drained message is dropped.
+            if (withPublishedAssignmentSupport)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await foreach (var _ in worker.MessageChannel.Reader.ReadAllAsync(
+                            CancellationToken.None))
+                        {
+                            Interlocked.Increment(ref harness._assignmentsPublished);
+                            TaskCompletionSource? signal = null;
+                            lock (harness._publicationSignals)
+                            {
+                                if (harness._publicationSignals.Count > 0)
+                                    signal = harness._publicationSignals.Dequeue();
+                            }
+
+                            signal?.TrySetResult();
+                        }
+                    }
+                    catch (ChannelClosedException)
+                    {
+                        // The pinned channel closes with the worker's teardown — expected.
+                    }
+                });
+            }
+
             return harness;
+        }
+
+        /// <summary>
+        /// An <see cref="IDbContextFactory{CopilotHiveDbContext}"/> handing out contexts on the
+        /// sequence vector's own file-backed SQLite database. TEST INFRASTRUCTURE ONLY — it does
+        /// not touch any state the production paths consult.
+        /// </summary>
+        private sealed class SequenceDbContextFactory(string dbPath)
+            : IDbContextFactory<CopilotHiveDbContext>
+        {
+            public CopilotHiveDbContext CreateDbContext() =>
+                new(new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                    .UseSqlite($"Data Source={dbPath};Pooling=False")
+                    .Options);
+        }
+
+        /// <summary>
+        /// A minimal in-memory <see cref="IGoalStore"/> for the sequence vector: goals register
+        /// themselves on demand and status updates are recorded, so the REAL
+        /// <see cref="GoalDispatcher.CancelGoalAsync"/> path completes without a real store.
+        /// </summary>
+        public sealed class SequenceGoalSource : IGoalStore
+        {
+            private readonly Dictionary<string, Goal> _goals = [];
+
+            public string Name => "sequence-test-source";
+
+            /// <summary>Registers a goal so the source can resolve and update it.</summary>
+            public void Register(Goal goal) { lock (_goals) _goals[goal.Id] = goal; }
+
+            public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<Goal>>([]);
+
+            public Task UpdateGoalStatusAsync(
+                string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null,
+                CancellationToken ct = default)
+            {
+                lock (_goals)
+                {
+                    if (_goals.TryGetValue(goalId, out var goal))
+                    {
+                        goal.Status = status;
+                        goal.FailureReason = metadata?.FailureReason;
+                    }
+                }
+
+                return Task.CompletedTask;
+            }
+
+            public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default)
+            {
+                lock (_goals) return Task.FromResult<IReadOnlyList<Goal>>([.. _goals.Values]);
+            }
+
+            public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default)
+            {
+                lock (_goals) return Task.FromResult(
+                    _goals.TryGetValue(goalId, out var goal) ? goal : null);
+            }
+
+            public Task<Goal> CreateGoalAsync(Goal goal, CancellationToken ct = default)
+            {
+                lock (_goals) _goals[goal.Id] = goal;
+                return Task.FromResult(goal);
+            }
+
+            public Task UpdateGoalAsync(Goal goal, CancellationToken ct = default) => Task.CompletedTask;
+
+            public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default)
+            {
+                lock (_goals) return Task.FromResult(_goals.Remove(goalId));
+            }
+
+            public Task<IReadOnlyList<Goal>> SearchGoalsAsync(
+                string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<Goal>>([]);
+
+            public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(
+                GoalStatus status, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<Goal>>([]);
+
+            public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) =>
+                Task.CompletedTask;
+
+            public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+
+            public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) =>
+                Task.FromResult(release);
+
+            public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) =>
+                Task.FromResult<Release?>(null);
+
+            public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<Release>>([]);
+
+            public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+
+            public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) =>
+                Task.CompletedTask;
+
+            public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) =>
+                Task.FromResult(false);
+
+            public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<Goal>>([]);
+
+            public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+
+            public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+
+            public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(
+                int? limit = null, CancellationToken ct = default) =>
+                Task.FromResult<IReadOnlyList<(string, PersistedClarification)>>([]);
         }
 
         /// <summary>Builds a task carrying this harness's shape.</summary>
@@ -664,6 +1005,27 @@ public sealed class CompletionTransportOwnershipTests
                     },
                 ]);
         }
+
+        /// <summary>
+        /// Pushes a Ready and awaits the production READY-ACCEPTED line AND the real publisher's
+        /// channel write, so a returned call proves the Ready was accepted AND the assignment was
+        /// genuinely published to the pinned worker's channel.
+        /// </summary>
+        public async Task ReadyAndAwaitAssignmentPublishedAsync()
+        {
+            var published = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var publishedBefore = AssignmentsPublished;
+            lock (_publicationSignals)
+                _publicationSignals.Enqueue(published);
+
+            await ReadyAndAwaitAcceptedAsync();
+
+            await published.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(publishedBefore + 1, AssignmentsPublished);
+        }
+
+        private readonly Queue<TaskCompletionSource> _publicationSignals = new();
 
         /// <summary>Ends the stream and joins it, bounded, on every path.</summary>
         public async ValueTask DisposeAsync()
