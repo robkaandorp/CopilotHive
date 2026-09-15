@@ -676,20 +676,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// Replacement is forced while A is still blocked in its Ready write.  The loop has consumed B
-    /// but cannot reset or install it until A's body drains, so A and its result remain the owner.
-    /// Once released, B receives a fresh empty holder; it never observes A's retained result.
-    /// <para>
-    /// ORDERING PROOF.  A message merely being CONSUMED is not evidence that the assignment
-    /// handler ran: <c>ChannelResponseReader.MoveNext</c> signals <c>Consumed</c> before
-    /// <c>ProcessMessagesAsync</c> dispatches on the payload, so asserting on A right after
-    /// <c>Consumed(3)</c> could observe A simply because replacement had not started yet — and a
-    /// clear-before-drain implementation would survive.  This test therefore awaits a POSITIVE
-    /// drain-entry signal (<see cref="ObserveOwnerDrainEntry"/>): the replacement handler has
-    /// provably entered <c>DrainAssignmentAsync</c> and is parked awaiting A's still-blocked body.
-    /// Only THEN are A's ownership and retained result asserted, so a clear performed before that
-    /// drain leaves an empty slot and fails the test by name.
-    /// </para>
+    /// Replacement drainage is invoked directly while A is still blocked in its Ready write. The
+    /// returned production operation is the deterministic drain-entry signal: it is incomplete while
+    /// A is held, and A and its result remain the owner. Once released and joined, the drain clears
+    /// A; a subsequently delivered B receives a fresh empty holder and never observes A's result.
+    /// This proves drain-before-clear without polling or inspecting Task internals.
     /// </summary>
     [Fact]
     public async Task Replacement_DrainsPriorOwnerThenInstallsFreshEmptyResultHolder()
@@ -706,9 +697,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var stream = BuildStream(requests, responses);
         var loop = InvokeProcessMessages(service, stream, "worker-1", TestContext.Current.CancellationToken);
-        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken);
-        DrainEntryObservation? drainObservation = null;
+        var replacementDrain = Task.CompletedTask;
         try
         {
             responses.Push(ResultAssignment(taskA));
@@ -727,31 +716,23 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // Arm the positive observer BEFORE B is delivered. Its stable TCS is signalled only
-            // after A's task acquires a continuation, which is the direct effect of the replacement
-            // handler entering `await assignment.Execution`. The producer is retained for finally.
-            drainObservation = ObserveOwnerDrainEntry(executionA, drainObserverCts.Token);
-
-            // B is delivered while A's execution cannot finish: A's body is parked inside its
-            // Ready write, so A's task can only complete once the test releases that gate.
-            responses.Push(ResultAssignment(taskB));
-
-            // POSITIVE DRAIN-ENTRY SYNCHRONIZATION.  Await the pre-created TCS until the replacement
-            // handler has actually entered the drain and is awaiting A's body — not merely until
-            // B's message was pulled off the channel. A clear-before-drain implementation has
-            // already emptied the slot by the time this gate opens.
-            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            // The drain is in progress and A's body is provably still running, so a correct
-            // implementation MUST still own A and its retained result here.
+            // Invoke the production replacement drain directly. Because A's execution is held in
+            // its Ready write, the returned operation is necessarily parked on A's ORIGINAL task.
+            replacementDrain = InvokeReplacementDrain(service);
+            Assert.False(replacementDrain.IsCompleted);
             Assert.False(executionA.IsCompleted, "A's body must still be unwinding while its drain is parked.");
             Assert.Same(ownerA, GetActiveAssignment(service));
             Assert.Equal(taskA, GetActiveTaskId(service));
             Assert.Same(resultA, GetRetainedResult(service));
             Assert.Equal(1, runner.ResetCount);
-            Assert.False(runner.HasPromptStarted(taskB));
 
             requests.ReleaseReady(0);
+            await replacementDrain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetActiveAssignment(service));
+
+            // Deliver B only after the production drain completed. Its handler must install a fresh
+            // owner/result holder; no task-internal continuation inspection is needed.
+            responses.Push(ResultAssignment(taskB));
             await runner.PromptStarted(taskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // A has now drained and B is executing, but B has not produced a result.  A following
@@ -786,13 +767,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
         finally
         {
-            await drainObserverCts.CancelAsync();
             runner.ReleaseAll();
             requests.ReleaseAll();
+            await ObserveLoopForTeardownAsync(replacementDrain);
             responses.TryComplete();
             await ObserveLoopForTeardownAsync(loop);
-            if (drainObservation is not null)
-                await ObserveLoopForTeardownAsync(drainObservation.Producer);
             TryDelete(root);
         }
     }
@@ -800,21 +779,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     // ── Throwing cancellation callback at the assignment teardown ─────────────
 
     /// <summary>
-    /// A THROWING CANCELLATION CALLBACK DURING MATCHING-CANCEL CLEANUP cannot skip the join.
+    /// A THROWING CANCELLATION CALLBACK DURING THE MATCHING-CANCEL DRAIN cannot skip the join.
+    /// This test invokes the production matching-cancel ownership transition directly while the
+    /// real message loop remains alive and idle. That isolation is intentional: the loop's outer
+    /// teardown cannot rescue a broken matching drain, so every observed join, disposal and clear
+    /// belongs to <c>DrainRetainedForMatchingCancelAsync</c> itself.
     /// <para>
-    /// The assignment's own CTS carries a callback that throws. The body is parked behind the
-    /// runner's unwind gate, so the drain's <c>await assignment.Execution</c> cannot finish. A
-    /// teardown that let the callback failure escape the cancellation request would skip that
-    /// await entirely — the ownership slot would already be empty and the source already disposed
-    /// while the ORIGINAL body was still running. A POSITIVE drain-entry observation (the body
-    /// task acquiring a continuation) is awaited first, so these assertions cannot pass merely
-    /// because the cancel was not processed yet.
-    /// </para>
-    /// <para>
-    /// After the unwind is released the drain completes, the source is disposed, ownership and the
-    /// heartbeat state are cleared, and the cancellation-error evidence surfaces on the loop task —
-    /// with the ORIGINAL <see cref="AggregateException"/> wrapper intact, never as a fabricated
-    /// successful cancellation.
+    /// With the body held behind its unwind gate, the matching drain cannot complete, ownership
+    /// remains installed and the source remains undisposed. After release, the ORIGINAL body joins,
+    /// the source is disposed, ownership clears, and the exact cancellation-callback evidence is
+    /// returned by the matching drain. The connection is still live at that point, proving outer
+    /// loop teardown did not perform a second rescue drain.
     /// </para>
     /// </summary>
     [Fact]
@@ -829,13 +804,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
-        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken);
         ArmedCancellationCallback? armed = null;
-        DrainEntryObservation? drainObservation = null;
+        MatchingDrainOperation? matchingDrain = null;
         try
         {
-            // Assign A and park its body inside the prompt: a RETAINED, running assignment.
             responses.Push(Assignment("task-A"));
             await runner.PromptStarted("task-A");
             responses.Push(Probe("installed"));
@@ -843,62 +815,50 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             var ownerBeforeCancel = GetActiveAssignment(service);
             var execution = GetActiveExecution(service);
-
-            // Arm the THROWING callback on A's OWN assignment-scoped CTS.
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
-            Assert.False(ownerCts.IsCancellationRequested);
 
-            // Arm the POSITIVE observer BEFORE the cancel is delivered: it completes only once the
-            // cancel handler has entered the drain and registered a continuation on A's body.
-            drainObservation = ObserveOwnerDrainEntry(execution, drainObserverCts.Token);
+            // Invoke the ACTUAL production transition used by the matching-cancel handler. The
+            // message loop remains parked on its reader, so its outer finally cannot rescue this
+            // operation if the cancellation exception escapes before the join.
+            matchingDrain = InvokeMatchingCancelDrain(service);
+            await runner.CancelObserved("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            responses.Push(MatchingCancel("task-A"));
-            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            // The callback threw, yet the drain is parked awaiting the ORIGINAL body: the body is
-            // provably still running, so a correct implementation MUST still own A, MUST still hold
-            // its undisposed source and MUST NOT have finished the handler.
-            Assert.True(armed.CallbackInvoked, "The armed callback must have been invoked by the drain's cancellation request.");
-            Assert.False(execution.IsCompleted, "A's body must still be running while its drain is parked.");
+            Assert.True(armed.CallbackInvoked);
+            Assert.True(ownerCts.IsCancellationRequested);
+            Assert.False(execution.IsCompleted, "The original body is held behind its unwind gate.");
             Assert.Same(ownerBeforeCancel, GetActiveAssignment(service));
             Assert.Same(ownerCts, GetOwnerCts(service));
-            Assert.Equal("task-A", GetHeartbeatTaskId(service));
             Assert.Null(Record.Exception(() => _ = ownerCts.Token));
-            Assert.False(loop.IsCompleted, "The loop must not finish while the retained body is still unwinding.");
+            Assert.False(connection.IsRetired, "Outer loop teardown must not be involved in this drain.");
 
-            // The cancellation request itself DID take effect (the callback throw is reported
-            // on top of a genuinely cancelled source), so nothing fabricates a partial cancel.
-            Assert.True(ownerCts.IsCancellationRequested, "The cancellation request must still have taken effect.");
-
-            // Release the ORIGINAL body: only now can the drain join and the handler finish.
             runner.ReleaseUnwind();
 
-            // The deferred cancellation failure surfaces AFTER cleanup, keeping the runtime's own
-            // AggregateException wrapper and the callback's original exception as evidence.
-            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
-                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.IsType<AggregateException>(surfaced);
+            // A pre-fix matching drain faults here and leaves ownership/source intact. The repaired
+            // transition completes normally with the deferred evidence only AFTER joining,
+            // disposing and clearing.
+            await matchingDrain.Completion.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var surfaced = Assert.IsType<AggregateException>(matchingDrain.DeferredFailure());
             Assert.Contains(armed.CallbackFailure, Flatten(surfaced));
 
-            // Ownership cleared exactly once, heartbeat state cleaned, source disposed, and the
-            // cancellation callback ran EXACTLY ONCE — so the source really was cancelled by the
-            // matching cancel and DISPOSED (a bypassed capture would leave it live and re-cancelled).
+            Assert.True(execution.IsCompleted);
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Null(GetHeartbeatTaskId(service));
-            Assert.True(ownerCts.IsCancellationRequested);
             Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
             Assert.Equal(1, armed.InvocationCount);
             Assert.Equal(1, requests.ReadyCount);
+            Assert.False(connection.IsRetired, "The matching transition, not outer teardown, performed cleanup.");
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
         }
         finally
         {
-            await drainObserverCts.CancelAsync();
             runner.ReleaseAll();
+            if (matchingDrain is not null)
+                await ObserveLoopForTeardownAsync(matchingDrain.Completion);
             responses.TryComplete();
             await ObserveLoopForTeardownAsync(loop);
-            if (drainObservation is not null)
-                await ObserveLoopForTeardownAsync(drainObservation.Producer);
             armed?.DisposeRegistration();
         }
     }
@@ -921,10 +881,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
-        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken);
         ArmedCancellationCallback? armed = null;
-        DrainEntryObservation? drainObservation = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -936,11 +893,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
-            drainObservation = ObserveOwnerDrainEntry(execution, drainObserverCts.Token);
-
-            // EOF while the body is still running: the loop's finally drains the retained assignment.
+            // EOF while the body is still running: the loop's finally cancels the retained
+            // assignment. The body's own cancellation-observed signal is the deterministic
+            // boundary; no Task internals or polling are used.
             responses.TryComplete();
-            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await runner.CancelObserved("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // Parked in the drain on the ORIGINAL body: nothing cleared, nothing disposed, and the
             // connection's access is still open (retirement follows the drain).
@@ -972,12 +929,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
         finally
         {
-            await drainObserverCts.CancelAsync();
             runner.ReleaseAll();
             responses.TryComplete();
             await ObserveLoopForTeardownAsync(loop);
-            if (drainObservation is not null)
-                await ObserveLoopForTeardownAsync(drainObservation.Producer);
             armed?.DisposeRegistration();
         }
     }
@@ -994,20 +948,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var runner = new GatedPromptRunner();
         using var service = BuildService(runner);
 
-        var originalFault = new InvalidOperationException("reader fault");
+        var originalFault = new ReaderPrimaryFailureException("reader fault");
         var responses = new FaultingResponseReader();
         var requests = new RecordingRequestStream();
         var stream = BuildStream(requests, responses);
 
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
-        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken);
 
         var originalErr = Console.Error;
         var stdErr = new StringWriter();
         ArmedCancellationCallback? armed = null;
-        DrainEntryObservation? drainObservation = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -1022,11 +973,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // The diagnostics run from here on through the EXISTING logger seam.
             Console.SetError(stdErr);
 
-            drainObservation = ObserveOwnerDrainEntry(execution, drainObserverCts.Token);
-
-            // The reader faults while the body is still running: a REAL loop primary.
+            // The reader faults while the body is still running: a REAL loop primary. The body's
+            // cancellation-observed signal confirms teardown cancelled this exact assignment.
             responses.ArmFault(originalFault);
-            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await runner.CancelObserved("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.True(armed.CallbackInvoked, "The armed callback must have been invoked by the teardown's cancellation request.");
             Assert.False(execution.IsCompleted, "A's body must still be running while its drain is parked.");
@@ -1034,7 +984,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseUnwind();
 
             // The PRIMARY — the reader's own exception instance — is what surfaces.
-            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+            var propagated = await Assert.ThrowsAsync<ReaderPrimaryFailureException>(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Same(originalFault, propagated);
 
@@ -1049,18 +999,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             var diagnostics = stdErr.ToString();
             Assert.Contains("Task cancellation cleanup failed", diagnostics, StringComparison.Ordinal);
             Assert.Contains(
-                nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+                nameof(AssignmentCancellationCallbackException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(nameof(ReaderPrimaryFailureException), diagnostics, StringComparison.Ordinal);
             Assert.DoesNotContain(armed.CallbackFailure.Message, diagnostics, StringComparison.Ordinal);
         }
         finally
         {
             Console.SetError(originalErr);
-            await drainObserverCts.CancelAsync();
             runner.ReleaseAll();
             responses.TryComplete();
             await ObserveLoopForTeardownAsync(loop);
-            if (drainObservation is not null)
-                await ObserveLoopForTeardownAsync(drainObservation.Producer);
             armed?.DisposeRegistration();
         }
     }
@@ -1086,19 +1034,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var runner = new GatedPromptRunner();
         using var service = BuildService(runner);
 
-        var originalFault = new InvalidOperationException("reader fault");
+        var originalFault = new ReaderPrimaryFailureException("reader fault");
         var responses = new FaultingResponseReader();
         var requests = new RecordingRequestStream();
         var stream = BuildStream(requests, responses);
 
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
-        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
-            TestContext.Current.CancellationToken);
 
         var originalErr = Console.Error;
         ArmedCancellationCallback? armed = null;
-        DrainEntryObservation? drainObservation = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -1111,14 +1056,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             var ownerCts = armed.Source;
 
             // From here on the diagnostics sink itself is BROKEN: every write throws.
-            Console.SetError(new ThrowingErrorWriter());
-
-            drainObservation = ObserveOwnerDrainEntry(execution, drainObserverCts.Token);
+            var throwingWriter = new ThrowingErrorWriter();
+            Console.SetError(throwingWriter);
 
             // The reader faults while the body is still running: a REAL loop primary, and the
-            // teardown's cancellation request raises the armed callback failure.
+            // teardown's cancellation request raises the armed callback failure. The body's own
+            // cancellation-observed gate confirms this exact assignment entered its unwind path.
             responses.ArmFault(originalFault);
-            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await runner.CancelObserved("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.True(armed.CallbackInvoked, "The armed callback must have been invoked by the teardown's cancellation request.");
             Assert.False(execution.IsCompleted, "A's body must still be running while its drain is parked.");
@@ -1128,7 +1073,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             // The PRIMARY — the reader's own exception instance — is what surfaces, even though
             // the secondary report's sink threw: a failing diagnostic is not an error channel.
-            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+            var propagated = await Assert.ThrowsAsync<ReaderPrimaryFailureException>(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Same(originalFault, propagated);
 
@@ -1140,17 +1085,81 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.True(ownerCts.IsCancellationRequested);
             Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
             Assert.Equal(1, armed.InvocationCount);
+            Assert.True(throwingWriter.WriteAttempts > 0, "The guarded cleanup diagnostic must be attempted.");
         }
         finally
         {
             Console.SetError(originalErr);
-            await drainObserverCts.CancelAsync();
             runner.ReleaseAll();
             responses.TryComplete();
             await ObserveLoopForTeardownAsync(loop);
-            if (drainObservation is not null)
-                await ObserveLoopForTeardownAsync(drainObservation.Producer);
             armed?.DisposeRegistration();
+        }
+    }
+
+    /// <summary>
+    /// The non-cancellation body-fault diagnostic inside <c>DrainAssignmentAsync</c> is guarded.
+    /// The assignment body faults on its Ready write, then a matching cancel drains that already
+    /// faulted ORIGINAL execution while <c>Console.Error</c> throws specifically for the drain
+    /// diagnostic. The source must still be disposed and ownership must still clear; a following
+    /// probe is consumed by the still-live loop, proving the matching handler completed.
+    /// </summary>
+    [Fact]
+    public async Task MatchingCancel_BodyFaultDiagnosticThrows_StillDisposesSourceAndClearsOwnership()
+    {
+        var runner = new GatedPromptRunner();
+        using var service = BuildService(runner);
+
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var bodyFault = new BodyReadyWriteFailureException("injected body Ready failure");
+        requests.FailNextReadyWrite = bodyFault;
+        var stream = BuildStream(requests, responses);
+
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+        var originalErr = Console.Error;
+        var drainDiagnosticFailure = new BodyDiagnosticFailureException("injected drain diagnostic failure");
+        var throwingWriter = new MarkerThrowingErrorWriter(
+            "Task drain observed a fault", new StringWriter(), drainDiagnosticFailure);
+        try
+        {
+            responses.Push(Assignment("task-A"));
+            await runner.PromptStarted("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var ownerCts = GetOwnerCts(service);
+            var execution = GetActiveExecution(service);
+            runner.Release("task-A");
+
+            var propagatedBodyFault = await Assert.ThrowsAsync<BodyReadyWriteFailureException>(
+                () => execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(bodyFault, propagatedBodyFault);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Null(Record.Exception(() => _ = ownerCts.Token));
+
+            // Only the DrainAssignmentAsync diagnostic is degraded from this point onward.
+            Console.SetError(throwingWriter);
+            responses.Push(MatchingCancel("task-A"));
+            responses.Push(Probe("after-drain"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(throwingWriter.WriteAttempts > 0, "The guarded drain diagnostic must be attempted.");
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.False(connection.IsRetired, "A guarded diagnostic failure must not terminate the loop.");
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await ObserveLoopForTeardownAsync(loop);
         }
     }
 
@@ -1177,8 +1186,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// lost entirely — the sanitized report never appears, so the named assertion on it fails.
     /// </para>
     /// </summary>
-    [Fact]
-    public async Task MatchingCancelWithThrowingCallbackAndFailingReadyWrite_SurfacesReadyFailureAndReportsCallback()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MatchingCancelWithThrowingCallbackAndFailingReadyWrite_SurfacesReadyFailureAndReportsCallback(
+        bool cancelReadyWrite)
     {
         var runner = new GatedPromptRunner();
         using var service = BuildService(runner);
@@ -1201,41 +1213,50 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var originalErr = Console.Error;
         var stdErr = new StringWriter();
+        var bodyDiagnosticFailure = new BodyDiagnosticFailureException("injected body diagnostic failure");
         ArmedCancellationCallback? armed = null;
         try
         {
             // The sink throws ONLY for the body's own failure line, so every other sanitized report
             // in this test is still captured and assertable.
-            Console.SetError(new MarkerThrowingErrorWriter("Task execution failed", stdErr));
+            Console.SetError(new MarkerThrowingErrorWriter(
+                "Task execution failed", stdErr, bodyDiagnosticFailure));
 
             responses.Push(ResultAssignment("task-A"));
             responses.Push(Probe("installed"));
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // Join the body: it faulted on its own diagnostic, so it never reached its Ready claim.
+            // Join the ORIGINAL body and pin its exact failure: it faulted on its own diagnostic,
+            // so it never reached its Ready claim.
             var execution = GetActiveExecution(service);
-            await ObserveLoopForTeardownAsync(execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            var bodyFault = await Assert.ThrowsAsync<BodyDiagnosticFailureException>(
+                () => execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(bodyDiagnosticFailure, bodyFault);
 
-            // NON-VACUITY: the claim really is unconsumed, so the cancel handler will own the single
-            // Ready attempt below. (If the body had claimed it, this count would be 1.)
-            Assert.True(execution.IsCompleted, "The body must have finished before the cancel is delivered.");
+            // NON-VACUITY: inspect the owner's actual Ready claim, not merely the writer count.
+            // The body left it untouched, so the matching-cancel handler owns the one attempt below.
+            var readyClaim = GetOwnerReadyClaim(service);
+            Assert.Equal(0, GetReadyClaimState(readyClaim));
             Assert.Equal(0, requests.ReadyCount);
 
             // Arm BOTH failures: the assignment's cancellation callback throws, and the handler's
             // own Ready write fails.
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
-            var readyWriteFailure = new InvalidOperationException("injected Ready write failure");
+            Exception readyWriteFailure = cancelReadyWrite
+                ? new OperationCanceledException("injected Ready write cancellation")
+                : new ReadyWritePrimaryException("injected Ready write failure");
             requests.FailNextReadyWrite = readyWriteFailure;
 
             responses.Push(MatchingCancel("task-A"));
 
             // The Ready-write failure is the authoritative outcome, with its ORIGINAL identity.
-            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+            var propagated = await Record.ExceptionAsync(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Same(readyWriteFailure, propagated);
 
-            // The handler really did own and attempt the single Ready write.
+            // The handler really did consume the claim and attempt the single Ready write.
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
             Assert.Equal(1, requests.ReadyCount);
 
             // Cleanup completed regardless: ownership cleared, heartbeat state cleaned, the
@@ -1251,7 +1272,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // (type classification only, never the message) rather than being silently discarded.
             var diagnostics = stdErr.ToString();
             Assert.Contains("Task cancellation cleanup failed", diagnostics, StringComparison.Ordinal);
-            Assert.Contains(nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+            Assert.Contains(
+                nameof(AssignmentCancellationCallbackException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(readyWriteFailure.GetType().Name, diagnostics, StringComparison.Ordinal);
             Assert.DoesNotContain(armed.CallbackFailure.Message, diagnostics, StringComparison.Ordinal);
         }
         finally
@@ -1270,15 +1293,25 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// this test needs to break is broken, while the sanitized reports under assertion remain
     /// observable.
     /// </summary>
-    private sealed class MarkerThrowingErrorWriter(string marker, System.IO.TextWriter inner)
+    private sealed class MarkerThrowingErrorWriter(
+        string marker,
+        System.IO.TextWriter inner,
+        Exception failure)
         : System.IO.TextWriter
     {
+        private int _writeAttempts;
+
         public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        internal int WriteAttempts => Volatile.Read(ref _writeAttempts);
 
         public override void WriteLine(string? value)
         {
             if (value is not null && value.Contains(marker, StringComparison.Ordinal))
-                throw new InvalidOperationException("injected diagnostic failure");
+            {
+                Interlocked.Increment(ref _writeAttempts);
+                throw failure;
+            }
 
             inner.WriteLine(value);
         }
@@ -1286,7 +1319,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         public override void Write(string? value)
         {
             if (value is not null && value.Contains(marker, StringComparison.Ordinal))
-                throw new InvalidOperationException("injected diagnostic failure");
+            {
+                Interlocked.Increment(ref _writeAttempts);
+                throw failure;
+            }
 
             inner.Write(value);
         }
@@ -1302,13 +1338,29 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// </summary>
     private sealed class ThrowingErrorWriter : System.IO.TextWriter
     {
+        private int _writeAttempts;
+
         public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
 
-        public override void Write(char value) => throw new InvalidOperationException("injected diagnostic failure");
+        internal int WriteAttempts => Volatile.Read(ref _writeAttempts);
 
-        public override void Write(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+        public override void Write(char value)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            throw new InvalidOperationException("injected diagnostic failure");
+        }
 
-        public override void WriteLine(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+        public override void Write(string? value)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            throw new InvalidOperationException("injected diagnostic failure");
+        }
+
+        public override void WriteLine(string? value)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            throw new InvalidOperationException("injected diagnostic failure");
+        }
     }
 
     // ── Retention assertions and harness ──────────────────────────────────────
@@ -1374,73 +1426,6 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             ?? throw new Xunit.Sdk.XunitException("Expected an active assignment owner to cancel.");
         var cts = (CancellationTokenSource)active.GetType().GetProperty("Cts")!.GetValue(active)!;
         await cts.CancelAsync();
-    }
-
-    /// <summary>Stable positive signal plus the observer producer that owns that signal.</summary>
-    private sealed record DrainEntryObservation(Task Entered, Task Producer);
-
-    /// <summary>
-    /// Arms a POSITIVE TCS DRAIN-ENTRY GATE for the replacement-ordering proof.
-    /// <para>
-    /// The production drain is <c>await assignment.Execution</c>. Entering that await REGISTERS a
-    /// continuation on the still-incomplete body task, so the body's continuation slot flipping
-    /// from empty to non-empty is direct evidence that the replacement handler reached the drain
-    /// and parked there — evidence a message-consumed signal cannot give, because the reader
-    /// signals before handler dispatch. The observer is armed while that slot is still empty and
-    /// completes <see cref="DrainEntryObservation.Entered"/> only after the transition.
-    /// </para>
-    /// <para>
-    /// There are no timing sleeps: the observer yields cooperatively until direct state evidence
-    /// appears. Its producer has a stable identity returned to the caller, is cancellation-aware,
-    /// and is always joined by the test's <c>finally</c>. The gate's bounded WaitAsync remains only
-    /// a hang failsafe.
-    /// </para>
-    /// </summary>
-    private static DrainEntryObservation ObserveOwnerDrainEntry(Task execution, CancellationToken ct)
-    {
-        var field = typeof(Task).GetField("m_continuationObject", BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException(
-                "Task.m_continuationObject was not found: drain entry cannot be observed on this "
-                + "runtime, so replacement ordering cannot be proven.");
-
-        if (field.GetValue(execution) is not null)
-            throw new Xunit.Sdk.XunitException(
-                "A's continuation slot was already occupied before replacement was delivered; "
-                + "the drain-entry gate would be vacuous.");
-
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var producer = Task.Run(async () =>
-        {
-            try
-            {
-                while (field.GetValue(execution) is null)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    if (execution.IsCompleted)
-                    {
-                        throw new Xunit.Sdk.XunitException(
-                            "A's body completed before replacement drain entry was observed; "
-                            + "the blocking precondition was lost.");
-                    }
-
-                    await Task.Yield();
-                }
-
-                entered.TrySetResult();
-            }
-            catch (OperationCanceledException)
-            {
-                entered.TrySetCanceled(ct);
-                throw;
-            }
-            catch (Exception ex)
-            {
-                entered.TrySetException(ex);
-                throw;
-            }
-        }, CancellationToken.None);
-
-        return new DrainEntryObservation(entered.Task, producer);
     }
 
     /// <summary>
@@ -1633,6 +1618,35 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
     }
 
+    /// <summary>
+    /// Invokes the production matching-cancel ownership transition without delivering a message to
+    /// the loop, keeping outer loop teardown out of the observation. The returned accessor is read
+    /// only after <see cref="MatchingDrainOperation.Completion"/> terminates.
+    /// </summary>
+    private static Task InvokeReplacementDrain(WorkerService service) =>
+        (Task)typeof(WorkerService).GetMethod(
+                "DrainRetainedForReplacementAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, null)!;
+
+    private static MatchingDrainOperation InvokeMatchingCancelDrain(WorkerService service)
+    {
+        var operation = typeof(WorkerService).GetMethod(
+                "DrainRetainedForMatchingCancelAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, null)!;
+        var completion = Assert.IsAssignableFrom<Task>(operation);
+
+        return new MatchingDrainOperation(
+            completion,
+            () =>
+            {
+                Assert.True(completion.IsCompletedSuccessfully);
+                var result = operation.GetType().GetProperty("Result")!.GetValue(operation)!;
+                return (Exception?)result.GetType().GetField("Item2")!.GetValue(result);
+            });
+    }
+
+    private sealed record MatchingDrainOperation(Task Completion, Func<Exception?> DeferredFailure);
+
     private static object? GetActiveAssignment(WorkerService service) =>
         typeof(WorkerService).GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(service);
@@ -1668,6 +1682,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         return (CancellationTokenSource)active.GetType().GetProperty("Cts")!.GetValue(active)!;
     }
 
+    private static object GetOwnerReadyClaim(WorkerService service)
+    {
+        var active = GetActiveAssignment(service)
+            ?? throw new Xunit.Sdk.XunitException("Expected an active assignment owner.");
+        return active.GetType().GetProperty("Ready")!.GetValue(active)!;
+    }
+
+    private static int GetReadyClaimState(object readyClaim) =>
+        (int)readyClaim.GetType().GetField("_claimed", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(readyClaim)!;
+
     /// <summary>
     /// Flattens an exception (including <see cref="AggregateException"/> wrappers) so an assertion
     /// can locate the ORIGINAL callback evidence inside the runtime's own wrapper without the test
@@ -1677,6 +1702,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         exception is AggregateException aggregate
             ? [.. aggregate.Flatten().InnerExceptions]
             : [exception];
+
+    private sealed class AssignmentCancellationCallbackException(string message) : Exception(message);
+
+    private sealed class ReaderPrimaryFailureException(string message) : Exception(message);
+
+    private sealed class ReadyWritePrimaryException(string message) : Exception(message);
+
+    private sealed class BodyReadyWriteFailureException(string message) : Exception(message);
+
+    private sealed class BodyDiagnosticFailureException(string message) : Exception(message);
 
     /// <summary>
     /// An armed throwing cancellation callback: the ACTUAL assignment-scoped source it was
@@ -1726,10 +1761,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// (rather than observing a vacuous, never-invoked registration).
     /// </para>
     /// </summary>
-    private static ArmedCancellationCallback ArmThrowingCancellationCallback(WorkerService service)
+    private static ArmedCancellationCallback ArmThrowingCancellationCallback(
+        WorkerService service,
+        Exception? failure = null)
     {
         var source = GetOwnerCts(service);
-        var failure = new InvalidOperationException("throwing cancellation callback");
+        failure ??= new AssignmentCancellationCallbackException("throwing cancellation callback");
         ArmedCancellationCallback? armed = null;
         var registration = source.Token.Register(() =>
         {
@@ -2091,12 +2128,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     {
         try
         {
-            await loop;
+            await loop.WaitAsync(Failsafe, CancellationToken.None);
         }
-        catch
+        catch (TimeoutException)
         {
-            // Expected on a failure path: the loop faults with OCE (cancelled teardown) or
-            // the scenario's reader fault. Swallowed HERE ONLY, never on the assert path.
+            throw new Xunit.Sdk.XunitException(
+                "Teardown failed to join the original loop within the bounded failsafe; live work remains.");
+        }
+        catch (Exception) when (loop.IsCompleted)
+        {
+            // A terminal loop fault is expected on several assertion-failure cleanup paths. Only a
+            // still-live original task is a teardown failure; timeout is handled distinctly above.
         }
     }
 
@@ -2222,6 +2264,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         private readonly object _gate = new();
         private readonly Dictionary<int, TaskCompletionSource> _waiters = [];
         private int _readyCount;
+        private Exception? _failNextReadyWrite;
 
         /// <summary>Snapshot of how many Ready messages were written so far.</summary>
         public int ReadyCount
@@ -2234,7 +2277,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         /// message was recorded (so the attempt still counts). It models the single Ready write
         /// failing on the cancel handler's own attempt. Consumed on use.
         /// </summary>
-        public Exception? FailNextReadyWrite { get; set; }
+        public Exception? FailNextReadyWrite
+        {
+            get { lock (_gate) return _failNextReadyWrite; }
+            set { lock (_gate) _failNextReadyWrite = value; }
+        }
 
         /// <summary>Completes once at least <paramref name="count"/> Ready messages were written.</summary>
         public Task WaitForReadyCountAsync(int count)
@@ -2260,9 +2307,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             List<TaskCompletionSource> ready = [];
             List<int> satisfied = [];
+            Exception? readyFailure;
             lock (_gate)
             {
                 _readyCount++;
+                readyFailure = _failNextReadyWrite;
+                _failNextReadyWrite = null;
                 foreach (var (threshold, tcs) in _waiters)
                 {
                     if (_readyCount >= threshold)
@@ -2277,11 +2327,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             // The ATTEMPT is recorded above before the injected failure applies, so a test can prove
             // the write really was issued by the producer under test.
-            if (FailNextReadyWrite is not { } readyFailure)
-                return Task.CompletedTask;
-
-            FailNextReadyWrite = null;
-            return Task.FromException(readyFailure);
+            return readyFailure is null ? Task.CompletedTask : Task.FromException(readyFailure);
         }
 
         Task IAsyncStreamWriter<WorkerMessage>.WriteAsync(WorkerMessage message, CancellationToken cancellationToken)
