@@ -331,6 +331,60 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     /// <summary>
+    /// A registration RPC FAILURE is an escaping exception, never
+    /// <see cref="WorkerRunOutcome.RegistrationRejected"/>: the run faults with the ORIGINAL fault
+    /// identity (the same precedence as before the outcome distinction existed), and the failure
+    /// happens where the rejected path's normal return would have been — proving a returned outcome
+    /// really does mean "no failure left <see cref="WorkerService.RunAsync"/>".
+    /// <para>
+    /// REMOVAL PROOF. If the rejection branch ever swallowed the RPC fault (or returned
+    /// <see cref="WorkerRunOutcome.RegistrationRejected"/> instead of propagating), the
+    /// <see cref="Assert.ThrowsAsync{T}(Func{Task})"/> below fails: no exception escapes the run.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_RegistrationRpcFails_FaultsInsteadOfReturningOutcome()
+    {
+        // The registration RPC itself faults: the run must propagate this fault, NOT report any
+        // WorkerRunOutcome — in particular never RegistrationRejected.
+        var registerFailure = new InvalidOperationException("Registration RPC failed.");
+        var invoker = new FaultingRegisterInvoker(registerFailure);
+        var runner = new ProvisionerCapturingRunner();
+        var streamOpened = 0;
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The service is disposed by the teardown helper, never by a `using` declaration.
+        try
+        {
+            service.CallInvokerFactory = () => invoker;
+            service.WorkStreamFactory = (_, _) =>
+            {
+                Interlocked.Increment(ref streamOpened);
+                throw new InvalidOperationException("No stream may be opened after a failed registration RPC.");
+            };
+
+            // THE REAL RUN HANDLE: the awaited result is the production method's own outcome — here
+            // it is a fault, with its ORIGINAL identity, not a returned WorkerRunOutcome value.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken)
+                    .WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(registerFailure, thrown);
+
+            // The failure happened at the registration boundary, so NOTHING was built afterwards:
+            // no stream was opened, no connection was published, and the runner never received a
+            // provisioner callback — the exact opposite of the accepted path's evidence.
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(0, streamOpened);
+            Assert.Null(runner.ConfigProvisioner);
+            Assert.Equal(1, invoker.RegisterCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
+    }
+
+    /// <summary>
     /// THE CAPTURED RUNNER CALLBACK IS RETIREMENT-GATED EVEN WITH AN OVERRIDE PROVISIONER INSTALLED.
     /// <para>
     /// The override carries its OWN fetch delegate, which the connection knows nothing about — so if
@@ -2247,6 +2301,69 @@ public sealed class WorkerConnectionLifecycleTests
             : [exception];
 
     // ── Fakes ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A <see cref="CallInvoker"/> whose <c>Register</c> RPC always FAULTS, so a test can prove the
+    /// registration failure escapes <see cref="WorkerService.RunAsync"/> as an exception rather than
+    /// being converted into a returned <see cref="WorkerRunOutcome"/>. Every other unary call is a
+    /// fixture bug and throws loudly, and the register call is counted exactly like
+    /// <see cref="FakeOrchestratorInvoker"/> counts its calls.
+    /// </summary>
+    private sealed class FaultingRegisterInvoker(Exception registerFailure) : CallInvoker
+    {
+        private int _registerCalls;
+
+        internal int RegisterCalls => Volatile.Read(ref _registerCalls);
+
+        public override TResponse BlockingUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected blocking call {method.FullName}.");
+
+        public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
+        {
+            var payload = method.FullName switch
+            {
+                // The register RPC faults; the call still completes as a faulted unary call so the
+                // production `await client.RegisterAsync(...)` propagates the ORIGINAL exception.
+                "/copilothive.HiveOrchestrator/Register" => FailRegister(),
+                "/copilothive.HiveOrchestrator/GetWorkerConfig" => FailUnexpected(),
+                "/copilothive.HiveOrchestrator/GetSession" => FailUnexpected(),
+                "/copilothive.HiveOrchestrator/SaveSession" => FailUnexpected(),
+                "/copilothive.HiveOrchestrator/Heartbeat" => FailUnexpected(),
+                _ => FailUnexpected(method.FullName),
+            };
+
+            return new AsyncUnaryCall<TResponse>(
+                payload,
+                Task.FromResult(new Metadata()),
+                () => new Status(StatusCode.OK, string.Empty),
+                () => new Metadata(),
+                () => { });
+
+            Task<TResponse> FailRegister()
+            {
+                Interlocked.Increment(ref _registerCalls);
+                return Task.FromException<TResponse>(registerFailure);
+            }
+
+            Task<TResponse> FailUnexpected(string? fullName = null) =>
+                Task.FromException<TResponse>(
+                    new NotSupportedException($"Unexpected unary call {fullName ?? method.FullName}."));
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected server-streaming call {method.FullName}.");
+
+        public override AsyncClientStreamingCall<TRequest, TResponse> AsyncClientStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected client-streaming call {method.FullName}.");
+
+        public override AsyncDuplexStreamingCall<TRequest, TResponse> AsyncDuplexStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected duplex-streaming call {method.FullName}.");
+    }
 
     /// <summary>
     /// A <see cref="CallInvoker"/> answering the unary RPCs the connection boundary reaches —
