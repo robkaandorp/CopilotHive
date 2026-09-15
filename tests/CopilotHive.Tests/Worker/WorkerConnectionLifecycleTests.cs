@@ -1970,6 +1970,22 @@ public sealed class WorkerConnectionLifecycleTests
     {
         List<Exception> failures = priorFailure is null ? [] : [priorFailure];
 
+        // EVERY BODY THAT EVER STARTED, from the runner's own append-only record. A gate dictionary
+        // cannot answer "is a late-started invocation still parked?", and the ownership slot only
+        // exposes the CURRENT body — so this is the authoritative teardown input.
+        var runnerField = typeof(WorkerService)
+            .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var startedBodies = runnerField.GetValue(service) is ProvisionerCapturingRunner capturing
+            ? capturing.StartedBodies
+            : [];
+
+        for (var index = 0; index < startedBodies.Count; index++)
+        {
+            var body = startedBodies[index];
+            if (!producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+                producers = [.. producers, ($"started prompt body #{index}", body)];
+        }
+
         // A body can start before an assertion captures it in a local. Discover the service's active
         // original execution after gates/readers were settled and join it independently from its
         // parent loop.
@@ -2004,6 +2020,22 @@ public sealed class WorkerConnectionLifecycleTests
         {
             producers = [.. producers, ("late active assignment body", lateActiveExecution)];
             await JoinOneAsync("late active assignment body", lateActiveExecution);
+        }
+
+        // FINAL SWEEP of the runner's record: a body may have started while the joins above ran (a
+        // buffered assignment the loop only reached during teardown).
+        startedBodies = runnerField.GetValue(service) is ProvisionerCapturingRunner lateCapturing
+            ? lateCapturing.StartedBodies
+            : [];
+
+        for (var index = 0; index < startedBodies.Count; index++)
+        {
+            var body = startedBodies[index];
+            if (producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+                continue;
+
+            producers = [.. producers, ($"late-started prompt body #{index}", body)];
+            await JoinOneAsync($"late-started prompt body #{index}", body);
         }
 
         // Do not let lexical disposal race a timed-out original task. These tests own service
@@ -2510,7 +2542,23 @@ public sealed class WorkerConnectionLifecycleTests
     /// </summary>
     private sealed class ProvisionerCapturingRunner : IAgentRunner
     {
+        private readonly object _gate = new();
+
+        /// <summary>
+        /// APPEND-ONLY record of every prompt invocation that ever STARTED, in start order. Each
+        /// entry completes when that invocation returns or throws, so teardown can join every body —
+        /// including one the loop only started AFTER the teardown sweep, which neither a gate
+        /// dictionary nor an ownership-slot snapshot can surface.
+        /// </summary>
+        private readonly List<Task> _startedBodies = [];
+
         internal Func<string?, CancellationToken, Task>? ConfigProvisioner { get; private set; }
+
+        /// <summary>Snapshot of every prompt invocation that ever started, in start order.</summary>
+        internal IReadOnlyList<Task> StartedBodies
+        {
+            get { lock (_gate) return [.. _startedBodies]; }
+        }
 
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
             ConfigProvisioner = provisioner;
@@ -2518,8 +2566,14 @@ public sealed class WorkerConnectionLifecycleTests
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
             => Task.CompletedTask;
+
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
-            => Task.FromResult(string.Empty);
+        {
+            // This runner never parks, but the invocation is still recorded durably so teardown's
+            // join set is the set of bodies that actually started rather than a slot snapshot.
+            lock (_gate) _startedBodies.Add(Task.CompletedTask);
+            return Task.FromResult(string.Empty);
+        }
 
         public TestResultReport? LastTestReport => null;
         public WorkerReport? LastWorkerReport => null;

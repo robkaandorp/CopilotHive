@@ -800,8 +800,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 + "drain did not run or was not awaited.");
 
             // A's ORIGINAL execution is now genuinely terminal, which is the precondition for the
-            // stray-drain check further below.
+            // detached-drain checks below.
             await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                executionA.IsCompleted,
+                "A's original execution must be terminal once its Ready write was released.");
 
             // Let B's handler continue past the reset.
             bResetRelease.TrySetResult();
@@ -812,6 +815,21 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 await aJoinedAtBPromptEntry.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
                 "B's body started before A's original execution was joined — the replacement drain "
                 + "did not run or was not awaited.");
+
+            // THE DETACHED-DRAIN CONSEQUENCE, observed directly. B's handler has now provably been
+            // ENTERED (its reset ran and its prompt started) and A's ORIGINAL execution is terminal,
+            // so a replacement drain that was started but NOT awaited has everything it needs to
+            // resume — and when it does it clears whatever the ownership slot holds, which by then
+            // is B's owner. A correct implementation awaited that drain BEFORE installing B, so
+            // nothing can clear B here. Both facts are asserted: the slot still holds B, and B's
+            // body is still alive.
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.Equal(
+                taskB,
+                GetActiveTaskId(service));
+            Assert.False(
+                runner.PromptCompleted(taskB),
+                "B's body must still be running while the test holds its prompt gate.");
 
             // A has now drained and B is executing, but B has not produced a result.  A following
             // message boundary proves B's owner was installed before inspecting its fresh holder.
@@ -2219,6 +2237,28 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         private readonly Dictionary<string, TaskCompletionSource> _started = [];
         private readonly Dictionary<string, TaskCompletionSource> _release = [];
         private readonly HashSet<string> _startedIds = [];
+
+        /// <summary>Task ids whose prompt invocation has RETURNED (normally or by throwing).</summary>
+        private readonly HashSet<string> _completed = [];
+
+        /// <summary>
+        /// APPEND-ONLY record of every prompt invocation that ever STARTED, in start order. Each
+        /// entry completes when that invocation returns or throws.
+        /// </summary>
+        /// <remarks>
+        /// A dictionary of gates cannot answer "is anything still parked?" for an invocation that
+        /// began AFTER a teardown sweep, and the ownership slot only ever exposes the CURRENT body.
+        /// This list is therefore the durable teardown input: joining every entry proves no prompt —
+        /// early, replaced, or late-started — is still running when the service is disposed.
+        /// </remarks>
+        private readonly List<Task> _startedBodies = [];
+
+        /// <summary>
+        /// TEARDOWN LATCH. Once set it stays set for the rest of the fixture, and every release gate
+        /// created from then on is completed AT CREATION, so an invocation that starts after the
+        /// sweep can never park on a gate nobody will ever release.
+        /// </summary>
+        private bool _teardown;
         private string? _taskId;
         private int _promptCount;
         private int _executionEntryCount;
@@ -2227,6 +2267,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         internal int PromptCount => Volatile.Read(ref _promptCount);
         internal int ExecutionEntryCount => Volatile.Read(ref _executionEntryCount);
         internal int ResetCount => Volatile.Read(ref _resetCount);
+
+        /// <summary>Snapshot of every prompt invocation that ever started, in start order.</summary>
+        internal IReadOnlyList<Task> StartedBodies
+        {
+            get { lock (_gate) return [.. _startedBodies]; }
+        }
 
         internal Task PromptStarted(string taskId)
         {
@@ -2262,15 +2308,32 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             lock (_gate) return _startedIds.Contains(taskId);
         }
 
+        /// <summary>
+        /// Whether the prompt invocation for <paramref name="taskId"/> has RETURNED. It is the
+        /// positive "that body is still alive" observation a teardown-ordering assertion needs:
+        /// <c>false</c> while the invocation is parked on its gate.
+        /// </summary>
+        internal bool PromptCompleted(string taskId)
+        {
+            lock (_gate)
+                return _completed.Contains(taskId);
+        }
+
         internal void Release(string taskId)
         {
             lock (_gate) Slot(_release, taskId).TrySetResult();
         }
 
+        /// <summary>
+        /// Enters TEARDOWN MODE and releases everything currently parked. The latch persists, so any
+        /// gate created afterwards (a late-started body's prompt gate, or a reset gate) is completed
+        /// at creation — closing the window where a body that starts after the sweep parks forever.
+        /// </summary>
         internal void ReleaseAll()
         {
             lock (_gate)
             {
+                _teardown = true;
                 foreach (var source in _release.Values) source.TrySetResult();
             }
         }
@@ -2283,15 +2346,28 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // The ordering capture runs at ENTRY, before this body can park or be released.
             OnPromptEntered?.Invoke(taskId);
 
+            // RECORD THIS INVOCATION DURABLY, at entry, so teardown can join it even if it started
+            // after the sweep and even if the ownership slot never exposes it.
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task release;
             lock (_gate)
             {
+                _startedBodies.Add(completion.Task);
                 _startedIds.Add(taskId);
                 Slot(_started, taskId).TrySetResult();
+                release = Slot(_release, taskId).Task;
             }
-            Task release;
-            lock (_gate) release = Slot(_release, taskId).Task;
-            await release.WaitAsync(ct);
-            return output(taskId);
+
+            try
+            {
+                await release.WaitAsync(ct);
+                return output(taskId);
+            }
+            finally
+            {
+                lock (_gate) _completed.Add(taskId);
+                completion.TrySetResult();
+            }
         }
 
         public TestResultReport? LastTestReport { get; } = new()
@@ -2334,19 +2410,31 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             OnResetEntered?.Invoke(model);
 
             // ...and then the reset PARKS if a gate was installed, so the capture above is taken at
-            // a fixed point the test controls rather than racing the test's own observations.
-            if (ResetGate is { } gate)
+            // a fixed point the test controls rather than racing the test's own observations. The
+            // TEARDOWN LATCH suppresses the park entirely, so a reset that is reached after the
+            // sweep cannot hold a late-started assignment open.
+            bool teardown;
+            lock (_gate) teardown = _teardown;
+
+            if (!teardown && ResetGate is { } gate)
                 await gate.WaitAsync(ct);
         }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
-        private static TaskCompletionSource Slot(
+        /// <summary>
+        /// Returns the gate for <paramref name="taskId"/>, creating it on first use. A gate created
+        /// while the TEARDOWN LATCH is set is completed AT CREATION, so a body that starts after the
+        /// teardown sweep never parks on a gate nobody will release. Callers hold <c>_gate</c>.
+        /// </summary>
+        private TaskCompletionSource Slot(
             Dictionary<string, TaskCompletionSource> slots,
             string taskId)
         {
             if (!slots.TryGetValue(taskId, out var source))
             {
                 source = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (_teardown)
+                    source.TrySetResult();
                 slots[taskId] = source;
             }
             return source;
@@ -2448,6 +2536,27 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     {
         List<Exception> failures = [];
 
+        // EVERY BODY THAT EVER STARTED, from the runner's own append-only record. A gate dictionary
+        // cannot answer "is a late-started invocation still parked?", and the ownership slot only
+        // exposes the CURRENT body — so this is the authoritative teardown input. The runner's
+        // teardown latch has already released (or pre-released) every gate by the time the caller
+        // reaches here, so each of these is expected to be terminal.
+        var runnerField = typeof(WorkerService)
+            .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        IReadOnlyList<Task> startedBodies = runnerField.GetValue(service) switch
+        {
+            RetentionRunner retention => retention.StartedBodies,
+            GatedPromptRunner gated => gated.StartedBodies,
+            _ => [],
+        };
+
+        for (var index = 0; index < startedBodies.Count; index++)
+        {
+            var body = startedBodies[index];
+            if (!producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+                producers = [.. producers, ($"started prompt body #{index}", body)];
+        }
+
         // Capture any assignment body that started before the test reached its explicit local
         // assignment. This closes assertion-failure windows without relying on the loop to be the
         // body's only join owner.
@@ -2479,6 +2588,26 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             producers = [.. producers, ("late active assignment body", lateActiveExecution)];
             await JoinOneAsync("late active assignment body", lateActiveExecution);
+        }
+
+        // FINAL SWEEP of the runner's record: a body may have started while the joins above ran (a
+        // buffered assignment the loop only reached during teardown). The latch guarantees its gate
+        // was already released, so this join is expected to complete promptly.
+        startedBodies = runnerField.GetValue(service) switch
+        {
+            RetentionRunner retention => retention.StartedBodies,
+            GatedPromptRunner gated => gated.StartedBodies,
+            _ => [],
+        };
+
+        for (var index = 0; index < startedBodies.Count; index++)
+        {
+            var body = startedBodies[index];
+            if (producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+                continue;
+
+            producers = [.. producers, ($"late-started prompt body #{index}", body)];
+            await JoinOneAsync($"late-started prompt body #{index}", body);
         }
 
         // A using declaration would dispose the service while a timed-out original task is still
@@ -2538,12 +2667,37 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         private readonly Dictionary<string, TaskCompletionSource> _finished = [];
         private readonly Dictionary<string, TaskCompletionSource> _release = [];
         private readonly Dictionary<string, TaskCompletionSource> _cancelObserved = [];
+
+        /// <summary>
+        /// APPEND-ONLY record of every prompt invocation that ever STARTED, in start order. Each
+        /// entry completes when that invocation returns or throws, so teardown can join every body —
+        /// including one that started AFTER the teardown sweep, which no gate dictionary and no
+        /// ownership-slot snapshot can surface.
+        /// </summary>
+        private readonly List<Task> _startedBodies = [];
+
         private readonly TaskCompletionSource _unwindGate =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _resetAttempted =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// TEARDOWN LATCH. Once set it stays set, and every release gate created from then on is
+        /// completed AT CREATION, so a body that starts after the sweep cannot park forever.
+        /// </summary>
+        private bool _teardown;
         private string? _taskId;
 
+        /// <summary>Snapshot of every prompt invocation that ever started, in start order.</summary>
+        internal IReadOnlyList<Task> StartedBodies
+        {
+            get { lock (_gate) return [.. _startedBodies]; }
+        }
+
+        /// <summary>
+        /// Returns the gate for <paramref name="key"/>, creating it on first use. A gate created
+        /// while the TEARDOWN LATCH is set is completed AT CREATION.
+        /// </summary>
         private TaskCompletionSource Slot(Dictionary<string, TaskCompletionSource> map, string key)
         {
             lock (_gate)
@@ -2551,6 +2705,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 if (!map.TryGetValue(key, out var tcs))
                 {
                     tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    if (_teardown)
+                        tcs.TrySetResult();
                     map[key] = tcs;
                 }
                 return tcs;
@@ -2567,12 +2723,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         /// <summary>Releases the held unwind so a cancelled body can finish draining.</summary>
         public void ReleaseUnwind() => _unwindGate.TrySetResult();
 
-        /// <summary>Teardown failsafe: releases every gate a parked producer could hold.</summary>
+        /// <summary>
+        /// Teardown failsafe: enters TEARDOWN MODE and releases every gate a parked producer could
+        /// hold. The latch persists, so gates created after this sweep are released on creation.
+        /// </summary>
         public void ReleaseAll()
         {
             ReleaseUnwind();
             lock (_gate)
             {
+                _teardown = true;
                 foreach (var tcs in _release.Values) tcs.TrySetResult();
             }
             _resetAttempted.TrySetResult();
@@ -2585,6 +2745,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
             var id = _taskId ?? "(unknown)";
+
+            // RECORD THIS INVOCATION DURABLY, at entry, so teardown joins it even when it started
+            // after the sweep and the ownership slot never exposes it.
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_gate) _startedBodies.Add(completion.Task);
+
             Slot(_started, id).TrySetResult();
             try
             {
@@ -2602,6 +2768,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             finally
             {
                 Slot(_finished, id).TrySetResult();
+                completion.TrySetResult();
             }
         }
 
