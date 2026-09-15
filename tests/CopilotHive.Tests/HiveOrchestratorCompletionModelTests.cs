@@ -134,35 +134,51 @@ public sealed class HiveOrchestratorCompletionModelTests
     }
 
     /// <summary>
-    /// A PRESENT model survives with NO active queue entry at all — the completion is
-    /// self-contained with respect to model provenance.
+    /// A PRESENT model with NO active queue entry is NOT a completion this transport owns: the
+    /// bounded ownership guard refuses it, so nothing is notified and nothing is released.
     /// </summary>
     [Fact]
-    public async Task HandleTaskComplete_PresentModelWithMissingQueueEntry_Survives()
+    public async Task HandleTaskComplete_PresentModelWithMissingQueueEntry_IsIgnored()
     {
-        var result = await RunAsync(
+        var observed = await RunIgnoredAsync(
             taskId: "task-no-queue-present",
-            queueModel: null,
             completeModel: "wire-model-z",
             present: true);
 
-        Assert.Equal("wire-model-z", result.Model);
+        AssertRefusedAndRetained(observed, "task-no-queue-present");
     }
 
     /// <summary>
-    /// ABSENT field with NO active queue entry yields empty — the legacy sender's unknown
-    /// model, never a fabricated default.
+    /// An ABSENT field with NO active queue entry is likewise refused — no fabricated empty-model
+    /// completion is emitted for work this transport cannot prove it owns.
     /// </summary>
     [Fact]
-    public async Task HandleTaskComplete_AbsentModelWithMissingQueueEntry_YieldsEmpty()
+    public async Task HandleTaskComplete_AbsentModelWithMissingQueueEntry_IsIgnored()
     {
-        var result = await RunAsync(
+        var observed = await RunIgnoredAsync(
             taskId: "task-no-queue-absent",
-            queueModel: null,
             completeModel: null,
             present: false);
 
-        Assert.Equal("", result.Model);
+        AssertRefusedAndRetained(observed, "task-no-queue-absent");
+    }
+
+    /// <summary>
+    /// THE REFUSAL POST-CONDITIONS: no domain notification, no completion dashboard notification
+    /// (only the stream teardown's own), and the worker's assignment fields all RETAINED.
+    /// </summary>
+    private static void AssertRefusedAndRetained(IgnoredObservation observed, string taskId)
+    {
+        Assert.Equal(0, observed.NotificationCount);
+
+        // ONLY the teardown's worker-removal notification: an accepted completion would have
+        // added a second, synchronous one.
+        Assert.Equal(1, observed.TotalDashboardNotifications);
+
+        // NOTHING WAS RELEASED: busy, task and model are exactly as the assignment left them.
+        Assert.True(observed.Worker.IsBusy);
+        Assert.Equal(taskId, observed.Worker.CurrentTaskId);
+        Assert.Equal("assigned-model", observed.Worker.CurrentModel);
     }
 
     /// <summary>
@@ -215,20 +231,35 @@ public sealed class HiveOrchestratorCompletionModelTests
     }
 
     /// <summary>
-    /// Drives ONE completion through the REAL <c>WorkStream</c> loop and returns the domain
-    /// result the production handler emitted on the real notifier.
+    /// What an IGNORED completion left behind: no notification, no completion dashboard
+    /// notification, and the worker's own ownership state.
     /// </summary>
-    /// <param name="taskId">The completing task's identifier.</param>
-    /// <param name="queueModel">The model on the ACTIVE-TASK QUEUE entry, or null for none.</param>
-    /// <param name="completeModel">The wire model value (ignored when <paramref name="present"/> is false).</param>
-    /// <param name="present">Whether field 7 is PRESENT on the wire message.</param>
-    /// <param name="fullPayload">Whether to also populate metrics/git status and assert them.</param>
-    private static async Task<Observation> RunAsync(
-        string taskId,
-        string? queueModel,
-        string? completeModel,
-        bool present,
-        bool fullPayload = false)
+    /// <param name="Worker">The pinned worker instance.</param>
+    /// <param name="ActiveTaskAfterCompletion">The queue's active entry for the task afterwards.</param>
+    /// <param name="NotificationCount">Domain completion notifications observed.</param>
+    /// <param name="TotalDashboardNotifications">
+    /// EVERY dashboard notification observed for the whole run. The stream's teardown contributes
+    /// exactly ONE (the pinned worker's removal); an ACCEPTED completion would contribute a second,
+    /// issued synchronously by the handler before its <c>Task.Run</c>.
+    /// </param>
+    private sealed record IgnoredObservation(
+        ConnectedWorker Worker,
+        WorkTask? ActiveTaskAfterCompletion,
+        int NotificationCount,
+        int TotalDashboardNotifications);
+
+    /// <summary>
+    /// The live collaborators one vector runs against, built exactly as production wires them.
+    /// </summary>
+    private sealed record Fixture(
+        HiveOrchestratorService Service,
+        WorkerPool Pool,
+        TaskQueue Queue,
+        DashboardNotifier Dashboard,
+        TaskCompletionNotifier TransportNotifier,
+        ConnectedWorker Worker);
+
+    private static Fixture CreateFixture()
     {
         var pool = new WorkerPool();
         var taskQueue = new TaskQueue();
@@ -259,34 +290,16 @@ public sealed class HiveOrchestratorCompletionModelTests
             dashboardNotifier: dashboard);
 
         var worker = pool.RegisterWorker(WorkerId, []);
+        return new Fixture(service, pool, taskQueue, dashboard, transportNotifier, worker);
+    }
 
-        // Seed the ACTIVE-TASK QUEUE through the production assignment path when a queue model
-        // is requested; otherwise leave the queue without an entry for this task.
-        if (queueModel is not null)
-        {
-            var queued = QueuedTask(taskId) with { Model = queueModel };
-            taskQueue.Enqueue(queued);
-            var dequeued = taskQueue.TryDequeue(DomainWorkerRole.Unspecified);
-            Assert.NotNull(dequeued);
-            Assert.Same(queued, dequeued);
-            service.ApplyTaskAssignment(worker, dequeued!);
-        }
-
-        var captured = new TaskCompletionSource<TaskResult>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        var notificationCount = 0;
-        Func<TaskResult, Task> handler = result =>
-        {
-            Interlocked.Increment(ref notificationCount);
-            captured.TrySetResult(result);
-            return Task.CompletedTask;
-        };
-        transportNotifier.OnTaskCompleted += handler;
-
-        var dashboardNotifications = 0;
-        Action dashboardHandler = () => Interlocked.Increment(ref dashboardNotifications);
-        dashboard.OnStateChanged += dashboardHandler;
-
+    /// <summary>
+    /// Builds the wire <c>TaskComplete</c> for one cell, round-tripped through the wire so the
+    /// presence bit each cell asserts on is the WIRE's, not a local artifact.
+    /// </summary>
+    private static GrpcTaskComplete BuildWireComplete(
+        string taskId, string? completeModel, bool present, bool fullPayload)
+    {
         var complete = new GrpcTaskComplete
         {
             TaskId = taskId,
@@ -313,10 +326,62 @@ public sealed class HiveOrchestratorCompletionModelTests
             Assert.False(complete.HasModel, "A legacy cell must build a message WITHOUT field 7.");
         }
 
-        // Push the message exactly as a worker's bytes would decode on the server: serialize and
-        // re-parse, so the presence bit each cell asserts on is the WIRE's, not a local artifact.
         var wireComplete = GrpcTaskComplete.Parser.ParseFrom(complete.ToByteArray());
         Assert.Equal(present, wireComplete.HasModel);
+        return wireComplete;
+    }
+
+    /// <summary>
+    /// Drives ONE completion through the REAL <c>WorkStream</c> loop and returns the domain
+    /// result the production handler emitted on the real notifier.
+    /// </summary>
+    /// <remarks>
+    /// THE OWNERSHIP IS GENUINE: the task is really activated on the queue for THIS worker through
+    /// the production assignment path, so the handler's validated-ownership gate is satisfied by
+    /// real state rather than by a fixture shortcut.
+    /// </remarks>
+    /// <param name="taskId">The completing task's identifier.</param>
+    /// <param name="queueModel">The model on the ACTIVE-TASK QUEUE entry.</param>
+    /// <param name="completeModel">The wire model value (ignored when <paramref name="present"/> is false).</param>
+    /// <param name="present">Whether field 7 is PRESENT on the wire message.</param>
+    /// <param name="fullPayload">Whether to also populate metrics/git status and assert them.</param>
+    private static async Task<Observation> RunAsync(
+        string taskId,
+        string queueModel,
+        string? completeModel,
+        bool present,
+        bool fullPayload = false)
+    {
+        var fixture = CreateFixture();
+        var (service, _, taskQueue, dashboard, transportNotifier, worker) = fixture;
+
+        // Seed the ACTIVE-TASK QUEUE through the production assignment path: this is what makes
+        // the worker's busy/task state and the queue's assigned_worker agree.
+        var queued = QueuedTask(taskId) with { Model = queueModel };
+        taskQueue.Enqueue(queued);
+        var dequeued = taskQueue.TryDequeue(DomainWorkerRole.Unspecified);
+        Assert.NotNull(dequeued);
+        Assert.Same(queued, dequeued);
+        service.ApplyTaskAssignment(worker, dequeued!);
+        Assert.True(worker.IsBusy);
+        Assert.Equal(taskId, worker.CurrentTaskId);
+
+        var captured = new TaskCompletionSource<TaskResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var notificationCount = 0;
+        Func<TaskResult, Task> handler = result =>
+        {
+            Interlocked.Increment(ref notificationCount);
+            captured.TrySetResult(result);
+            return Task.CompletedTask;
+        };
+        transportNotifier.OnTaskCompleted += handler;
+
+        var dashboardNotifications = 0;
+        Action dashboardHandler = () => Interlocked.Increment(ref dashboardNotifications);
+        dashboard.OnStateChanged += dashboardHandler;
+
+        var wireComplete = BuildWireComplete(taskId, completeModel, present, fullPayload);
 
         var reader = new ChannelStreamReader();
         var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
@@ -347,6 +412,73 @@ public sealed class HiveOrchestratorCompletionModelTests
                 taskQueue.GetActiveTask(taskId),
                 Volatile.Read(ref notificationCount),
                 dashboardAtCompletion);
+        }
+        finally
+        {
+            transportNotifier.OnTaskCompleted -= handler;
+            dashboard.OnStateChanged -= dashboardHandler;
+            reader.Complete();
+            await ObserveStreamForTeardownAsync(streamTask);
+        }
+    }
+
+    /// <summary>
+    /// Drives ONE completion for a task that has NO active queue entry — the unowned delivery —
+    /// and returns what it left behind.
+    /// </summary>
+    /// <remarks>
+    /// THE OBSERVATION IS NOT A RACE. <c>HandleTaskComplete</c> runs synchronously inside the
+    /// stream's read loop, so once the stream has drained and terminated the handler has provably
+    /// returned. An accepted completion would already have raised the dashboard notification (it
+    /// is issued synchronously, before the <c>Task.Run</c>), so a zero count here is a real
+    /// refusal rather than an unobserved schedule.
+    /// </remarks>
+    private static async Task<IgnoredObservation> RunIgnoredAsync(
+        string taskId,
+        string? completeModel,
+        bool present)
+    {
+        var fixture = CreateFixture();
+        var (service, pool, taskQueue, dashboard, transportNotifier, worker) = fixture;
+
+        // THE WORKER REALLY OWNS THE TASK, but the QUEUE does not: this isolates the
+        // missing-active-entry refusal rather than merely failing the busy check.
+        pool.MarkBusy(WorkerId, taskId);
+        worker.CurrentModel = "assigned-model";
+        Assert.True(worker.IsBusy);
+        Assert.Equal(taskId, worker.CurrentTaskId);
+        Assert.Null(taskQueue.GetActiveTask(taskId));
+
+        var notificationCount = 0;
+        Func<TaskResult, Task> handler = _ =>
+        {
+            Interlocked.Increment(ref notificationCount);
+            return Task.CompletedTask;
+        };
+        transportNotifier.OnTaskCompleted += handler;
+
+        var dashboardNotifications = 0;
+        Action dashboardHandler = () => Interlocked.Increment(ref dashboardNotifications);
+        dashboard.OnStateChanged += dashboardHandler;
+
+        var wireComplete = BuildWireComplete(taskId, completeModel, present, fullPayload: false);
+
+        var reader = new ChannelStreamReader();
+        var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
+
+        try
+        {
+            Interlocked.Exchange(ref dashboardNotifications, 0);
+
+            reader.Push(new WorkerMessage { WorkerId = WorkerId, Complete = wireComplete });
+            reader.Complete();
+            await streamTask.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            return new IgnoredObservation(
+                worker,
+                taskQueue.GetActiveTask(taskId),
+                Volatile.Read(ref notificationCount),
+                Volatile.Read(ref dashboardNotifications));
         }
         finally
         {

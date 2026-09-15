@@ -420,12 +420,15 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
     }
 
     /// <summary>
-    /// THE EXISTING EXPLICIT CANCELLATION PATH STILL RELEASES A BLOCKED ASSIGNMENT, with the task
-    /// timeout policy DISABLED — no fabricated completion, no automatic recovery.
+    /// LOGICAL GOAL CANCELLATION STILL SUCCEEDS over a blocked assignment — and is HONEST about
+    /// what it does not do. With the task timeout policy DISABLED, cancellation fails the goal and
+    /// deregisters its pipeline, but it deliberately does NOT stop the worker and does NOT remove
+    /// the task's ACTIVE QUEUE OWNERSHIP.
     /// <para>
-    /// This is the operator's real escape hatch: <c>GoalDispatcher.CancelGoalAsync</c> fails the goal
-    /// and removes its pipeline. The test proves the blocked delivery is genuinely still HELD first,
-    /// then that cancellation works, then that the route is gone so a further Ready delivers nothing.
+    /// So the subsequent Ready is IGNORED by the bounded completion/idle-release guard: the worker's
+    /// observed task is still active in the queue, so the handler returns BEFORE idling or
+    /// dequeuing — no fabricated completion, no release of never-delivered work, and nothing
+    /// published.
     /// </para>
     /// </summary>
     [Fact]
@@ -454,26 +457,39 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             Assert.Null(h.Manager.GetByTaskId(h.TaskId));
             Assert.Null(h.Manager.GetByGoalId(h.GoalId));
 
-            // ── THE ROUTE IS NOW UNRESOLVABLE: a further Ready delivers NOTHING — no fabricated
-            //    recovery, no wrong-goal failure, and still no success log. ──
+            // ── CANCELLATION IS LOGICAL ONLY: the transport ownership survives it. ──
+            Assert.NotNull(h.Queue.GetActiveTask(h.TaskId));
+            Assert.True(h.Worker.IsBusy, "logical cancellation must not stop or release the worker");
+            Assert.Equal(h.TaskId, h.Worker.CurrentTaskId);
+
+            // ── A FURTHER READY IS IGNORED, not re-assigned: the observed task still has an
+            //    ACTIVE QUEUE ENTRY, so the guard returns before any idle or dequeue. ──
             //
             // THE SECOND READY IS GATED ON ITS OWN WARNING. The helper allocates a FRESH signal per
-            // call, so this wait cannot be satisfied by the FIRST refusal's already-emitted warning —
-            // the assertions below provably run AFTER this Ready was processed. The warning COUNT is
-            // asserted to prove exactly that: one warning per processed Ready.
-            var warningsBeforeSecondReady =
+            // call, so this wait cannot be satisfied by the FIRST refusal's already-emitted warning
+            // — the assertions below provably run AFTER this Ready was processed.
+            var blockedWarningsBeforeSecondReady =
                 h.Logger.Messages.Count(m => m.Contains("assignment blocked", StringComparison.Ordinal));
-            Assert.Equal(1, warningsBeforeSecondReady);
+            Assert.Equal(1, blockedWarningsBeforeSecondReady);
 
+            // A pending task is available — so an unguarded Ready WOULD dequeue and publish it.
             h.Queue.Enqueue(h.DeliveredTask);
-            await h.SendReadyAndAwaitBlockedAsync();
+            await h.SendReadyAndAwaitIgnoredAsync();
 
+            // NO SECOND ASSIGNMENT ATTEMPT AT ALL: neither a publication nor a blocked refusal.
             Assert.Equal(
-                2,
+                blockedWarningsBeforeSecondReady,
                 h.Logger.Messages.Count(m => m.Contains("assignment blocked", StringComparison.Ordinal)));
             Assert.Empty(h.Writer.Assignments);
             Assert.DoesNotContain(
                 h.Logger.Messages, m => m.Contains("Assignment published", StringComparison.Ordinal));
+
+            // THE HELD OWNERSHIP IS UNCHANGED: no release, no requeue of the held task, and the
+            // freshly enqueued task was never dequeued.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal(h.TaskId, h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask(h.TaskId));
+            Assert.Same(h.DeliveredTask, h.Queue.TryDequeueAny());
         });
     }
 
@@ -541,8 +557,8 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         var warning = Assert.Single(
             throwingLogger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
         Assert.Contains(
-            "assignment blocked; no assignment published; task retained; cancel the goal or use " +
-            "configured recovery",
+            "assignment blocked; no assignment published; task retained; logical cancellation " +
+            "alone does not release transport ownership; worker recovery may be required",
             warning,
             StringComparison.Ordinal);
         Assert.DoesNotContain("Assignment published", warning, StringComparison.Ordinal);
@@ -995,6 +1011,26 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             var signal = Logger.WaitForBlockedWarning();
             Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        }
+
+        /// <summary>
+        /// Pushes a real Ready and waits until the PRODUCTION READY-IGNORED WARNING for THIS
+        /// message has been emitted — the deterministic signal that the guard refused the Ready
+        /// BEFORE idling or dequeuing. The signal is allocated FRESH per call.
+        /// </summary>
+        public async Task SendReadyAndAwaitIgnoredAsync()
+        {
+            var signal = Logger.WaitForReadyIgnoredWarning();
+            Reader.Push(new WorkerMessage { WorkerId = Worker.Id, Ready = new WorkerReady() });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE REFUSING GUARD IS NAMED: the still-active queue entry, never a generic refusal.
+            Assert.Contains(
+                Logger.Messages,
+                m => m.Contains("ready ignored", StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.ReadyTaskStillActive,
+                         StringComparison.Ordinal));
         }
 
         /// <summary>Pushes a real Ready and waits for the stream to end, returning its fault (or null).</summary>
@@ -1570,6 +1606,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
         // NEXT matching log. A previously completed signal can therefore never satisfy a later wait.
         private readonly Queue<TaskCompletionSource> _blockedWaiters = new();
         private readonly Queue<TaskCompletionSource> _publishedWaiters = new();
+        private readonly Queue<TaskCompletionSource> _readyIgnoredWaiters = new();
 
         public IReadOnlyList<string> Messages
         {
@@ -1606,6 +1643,18 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
             return waiter.Task;
         }
 
+        /// <summary>
+        /// Returns a FRESH task that completes when the NEXT production READY-IGNORED warning is
+        /// emitted — the signal that the bounded guard refused a Ready before idling or dequeuing.
+        /// </summary>
+        public Task WaitForReadyIgnoredWarning()
+        {
+            var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_messages)
+                _readyIgnoredWaiters.Enqueue(waiter);
+            return waiter.Task;
+        }
+
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -1618,6 +1667,7 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
             TaskCompletionSource? blocked = null;
             TaskCompletionSource? published = null;
+            TaskCompletionSource? readyIgnored = null;
             lock (_messages)
             {
                 _messages.Add(message);
@@ -1627,10 +1677,14 @@ public sealed class WorkerAssignmentPublicationTests : IDisposable
 
                 if (message.Contains("Assignment published", StringComparison.Ordinal) && _publishedWaiters.Count > 0)
                     published = _publishedWaiters.Dequeue();
+
+                if (message.Contains("ready ignored", StringComparison.Ordinal) && _readyIgnoredWaiters.Count > 0)
+                    readyIgnored = _readyIgnoredWaiters.Dequeue();
             }
 
             blocked?.TrySetResult();
             published?.TrySetResult();
+            readyIgnored?.TrySetResult();
         }
     }
 

@@ -1151,6 +1151,11 @@ public sealed class DashboardNotifierWorkerWiringTests
 
             var craftCallsBefore = harness.Brain.CraftPromptCalls;
 
+            // The transport's bounded completion guard only forwards a completion whose ownership
+            // it can still see. A's first completion released it, so it is re-established here —
+            // transport state ONLY, so the DOMAIN duplicate protection is the thing under test.
+            harness.ReestablishTransportOwnership(taskA);
+
             // ── THE DUPLICATE: same task id, DIFFERENT output ────────────────────────────
             await harness.DeliverCompletionAsync(
                 taskA, output: "DUPLICATE-RAW-OUTPUT", summary: "DUPLICATE-SUMMARY");
@@ -1174,6 +1179,9 @@ public sealed class DashboardNotifierWorkerWiringTests
 
             // ── The real sequential handoff still works: B completes and C is dispatched ──
             // B carries NO summary, so this delivery also pins the driver's OUTPUT FALLBACK.
+            // The duplicate above consumed the transport ownership it was given, so B's own
+            // transport ownership is re-established before its delivery (transport state only).
+            harness.ReestablishTransportOwnership(taskB);
             await harness.DeliverCompletionAsync(taskB, output: "B-RAW-OUTPUT", summary: "");
 
             Assert.Equal("B-RAW-OUTPUT", successorEntry.WorkerOutput);
@@ -1251,6 +1259,12 @@ public sealed class DashboardNotifierWorkerWiringTests
 
             var dispatchedBefore = harness.Dispatched.Count;
             var craftCallsBefore = harness.Brain.CraftPromptCalls;
+
+            // The transport's bounded completion guard only forwards a completion whose ownership
+            // it can still see; A's first completion released it. Re-establishing TRANSPORT state
+            // only keeps the subject of this vector the DOMAIN's registered-slot duplicate
+            // protection — the Claimed slot and the null pointer asserted above are untouched.
+            harness.ReestablishTransportOwnership(taskA);
 
             // ── THE DUPLICATE, delivered inside the window and awaited to REJECTION ───────
             await harness.DeliverCompletionAsync(
@@ -1350,8 +1364,13 @@ public sealed class DashboardNotifierWorkerWiringTests
         public required GoalPipeline Pipeline { get; init; }
         public required GatedTransportBrain Brain { get; init; }
         public required List<string> Dispatched { get; init; }
+
+        /// <summary>Every dispatched task, by id — the source for re-establishing ownership.</summary>
+        public required ConcurrentDictionary<string, WorkTask> DispatchedTasks { get; init; }
         public required string WorkerId { get; init; }
         public required ConnectedWorker Worker { get; init; }
+        public required WorkerPool Pool { get; init; }
+        public required TaskQueue Queue { get; init; }
         public required ChannelStreamReader Reader { get; init; }
         public required Task StreamTask { get; init; }
 
@@ -1422,7 +1441,12 @@ public sealed class DashboardNotifierWorkerWiringTests
             pipeline.AdvanceTo(GoalPhase.Coding);
 
             var dispatched = new List<string>();
-            taskQueue.OnEnqueue = t => dispatched.Add(t.TaskId);
+            var dispatchedTasks = new ConcurrentDictionary<string, WorkTask>();
+            taskQueue.OnEnqueue = t =>
+            {
+                dispatched.Add(t.TaskId);
+                dispatchedTasks[t.TaskId] = t;
+            };
 
             const string workerId = "transport-worker";
             var worker = pool.RegisterWorker(workerId, []);
@@ -1438,8 +1462,11 @@ public sealed class DashboardNotifierWorkerWiringTests
                 Pipeline = pipeline,
                 Brain = brain,
                 Dispatched = dispatched,
+                DispatchedTasks = dispatchedTasks,
                 WorkerId = workerId,
                 Worker = worker,
+                Pool = pool,
+                Queue = taskQueue,
                 Reader = reader,
                 StreamTask = streamTask,
             };
@@ -1517,6 +1544,35 @@ public sealed class DashboardNotifierWorkerWiringTests
         public Task DeliverCompletionAsync(string taskId, string output, string summary) =>
             BeginCompletionDelivery(taskId, output, summary)
                 .WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+        /// <summary>
+        /// Re-establishes the TRANSPORT-LEVEL ownership the bounded completion guard requires for
+        /// <paramref name="taskId"/>: the queue holds an ACTIVE entry assigned to this worker, and
+        /// the pool holds this worker busy with that task.
+        /// </summary>
+        /// <remarks>
+        /// THIS IS DELIBERATELY TRANSPORT-ONLY SETUP, not a domain shortcut. These vectors are
+        /// about the DOMAIN duplicate protection (admission and the registered-slot guards), which
+        /// only ever runs on a completion that the transport accepted. A first completion already
+        /// released both authorities, so without this the duplicate would be refused at the
+        /// transport boundary and the domain guard under test would never be reached. Nothing
+        /// about the PIPELINE's state (pointer, slot, phase entry) is touched here.
+        /// </remarks>
+        public void ReestablishTransportOwnership(string taskId)
+        {
+            Assert.True(
+                DispatchedTasks.TryGetValue(taskId, out var task),
+                $"task '{taskId}' was never dispatched through the queue");
+
+            Queue.Activate(task!, WorkerId);
+            Pool.MarkBusy(WorkerId, taskId);
+
+            // The transport's two ownership authorities now agree, exactly as they do for a real
+            // in-flight assignment.
+            Assert.NotNull(Queue.GetActiveTask(taskId));
+            Assert.True(Worker.IsBusy);
+            Assert.Equal(taskId, Worker.CurrentTaskId);
+        }
 
         /// <summary>
         /// THE TEARDOWN, and it must drain MORE than the stream. <c>HandleTaskComplete</c>
