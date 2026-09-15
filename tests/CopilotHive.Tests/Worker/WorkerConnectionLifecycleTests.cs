@@ -240,7 +240,7 @@ public sealed class WorkerConnectionLifecycleTests
         {
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(("RunAsync", run));
             TryDelete(configRepoDir);
         }
     }
@@ -370,7 +370,7 @@ public sealed class WorkerConnectionLifecycleTests
         {
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(("RunAsync", run));
         }
     }
 
@@ -523,7 +523,7 @@ public sealed class WorkerConnectionLifecycleTests
         finally
         {
             responses.TryComplete();
-            await ObserveForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("message loop", loop));
         }
     }
 
@@ -680,8 +680,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -814,8 +814,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -941,8 +941,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -1038,8 +1038,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -1160,8 +1160,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -1339,8 +1339,8 @@ public sealed class WorkerConnectionLifecycleTests
             heartbeatGate.TrySetResult();
             await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(controlledHeartbeatTask);
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
         }
     }
 
@@ -1637,8 +1637,7 @@ public sealed class WorkerConnectionLifecycleTests
         {
             gated.EnterTeardownMode();
             gated.ReleaseAllParkedWrites();
-            await JoinForTeardownAsync(holder);
-            await JoinForTeardownAsync(queued);
+            await JoinAllForTeardownAsync(("holder send", holder), ("queued send", queued));
         }
     }
 
@@ -1728,8 +1727,7 @@ public sealed class WorkerConnectionLifecycleTests
             // Guaranteed release + join: nothing outlives this finally, even after a failure.
             gatedA.EnterTeardownMode();
             gatedA.ReleaseAllParkedWrites();
-            await JoinForTeardownAsync(holder);
-            await JoinForTeardownAsync(contender);
+            await JoinAllForTeardownAsync(("holder send", holder), ("contender send", contender));
         }
     }
 
@@ -1922,29 +1920,63 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     /// <summary>
-    /// Bounded teardown join of the ORIGINAL task. Terminal task faults are expected on cleanup
-    /// paths and are swallowed only after the original task is known complete; a timeout means live
-    /// work remains and is reported loudly rather than being mistaken for a successful join.
+    /// JOINS EVERY ORIGINAL TASK a test started, each under its OWN bounded wait, and only then
+    /// reports whatever went wrong.
     /// </summary>
-    private static async Task ObserveForTeardownAsync(Task? producer)
+    /// <remarks>
+    /// <para>
+    /// A test's <c>finally</c> must first release every gate, cancel, and complete/fault every
+    /// reader, and then call this ONCE with every started task. Because each join is attempted
+    /// independently and failures are accumulated, one still-live producer can never skip the joins
+    /// that follow it — which is what previously let a <c>WorkerService</c> be disposed while other
+    /// original work was still running.
+    /// </para>
+    /// <para>
+    /// A STILL-LIVE task is a LOUD, distinct failure (never a silent return): it is reported as a
+    /// named teardown failure identifying the producer. A task that terminated with a fault or a
+    /// cancellation is quiescent, which is all teardown requires, so its outcome is swallowed HERE
+    /// ONLY — the real outcome is asserted on the test's normal path.
+    /// </para>
+    /// </remarks>
+    /// <param name="producers">
+    /// The started tasks, in the order they should be joined. <c>null</c> entries (a producer a
+    /// test never started) are skipped.
+    /// </param>
+    private static async Task JoinAllForTeardownAsync(params (string Name, Task? Producer)[] producers)
     {
-        if (producer is null) return;
-        try
-        {
-            await producer.WaitAsync(Failsafe, CancellationToken.None);
-        }
-        catch (TimeoutException)
-        {
-            throw new Xunit.Sdk.XunitException(
-                "Teardown failed to join the original task within the bounded failsafe; live work remains.");
-        }
-        catch (Exception) when (producer.IsCompleted)
-        {
-            // Expected terminal fault/cancellation on teardown. The original task is quiescent.
-        }
-    }
+        List<Exception> failures = [];
 
-    private static Task JoinForTeardownAsync(Task? producer) => ObserveForTeardownAsync(producer);
+        foreach (var (name, producer) in producers)
+        {
+            if (producer is null)
+                continue;
+
+            try
+            {
+                await producer.WaitAsync(Failsafe, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    $"Teardown failed to join '{name}' within the bounded failsafe; live work remains."));
+            }
+            catch (Exception) when (producer.IsCompleted)
+            {
+                // Terminal fault/cancellation: the original task is quiescent, which is all the
+                // teardown contract requires.
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
+
+        if (failures.Count == 1)
+            throw failures[0];
+
+        if (failures.Count > 1)
+            throw new AggregateException("Teardown could not join every original task.", failures);
+    }
 
     /// <summary>
     /// Flattens an exception (and any <see cref="AggregateException"/> wrapper the runtime produced)

@@ -100,11 +100,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
         finally
         {
-            // Teardown even after an assertion failure: release gates, let the reader end, and
-            // OBSERVE the loop before the service's using-disposal runs.
+            // Teardown even after an assertion failure: RELEASE every gate and end the reader
+            // FIRST, then join every original task, so the service is never disposed with live work.
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -157,7 +157,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -213,7 +213,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -275,7 +275,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // using-disposal runs — even after an assertion failure.
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -356,8 +356,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             firstResponses.TryComplete();
             secondResponses.TryComplete();
-            await ObserveLoopForTeardownAsync(firstLoop);
-            await ObserveLoopForTeardownAsync(secondLoop);
+            await JoinAllForTeardownAsync(("first loop", firstLoop), ("second loop", secondLoop));
         }
     }
 
@@ -399,7 +398,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // has already been awaited in the try, so this join is instantaneous.
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -500,7 +499,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
             TryDelete(root);
         }
     }
@@ -605,7 +604,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
             TryDelete(root);
         }
     }
@@ -670,17 +669,31 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
             TryDelete(root);
         }
     }
 
     /// <summary>
-    /// Replacement drainage is invoked directly while A is still blocked in its Ready write. The
-    /// returned production operation is the deterministic drain-entry signal: it is incomplete while
-    /// A is held, and A and its result remain the owner. Once released and joined, the drain clears
-    /// A; a subsequently delivered B receives a fresh empty holder and never observes A's result.
-    /// This proves drain-before-clear without polling or inspecting Task internals.
+    /// Replacement is forced through the REAL assignment handler while A is still blocked in its
+    /// Ready write. The loop consumes B, but the handler cannot reset the runner, start B's body or
+    /// install B's owner until A's ORIGINAL execution has been joined — so A and its result remain
+    /// the owner, B has neither started nor been installed, and once A is released B receives a
+    /// fresh empty holder that never observes A's result.
+    /// <para>
+    /// ORDERING PROOF — the removal-proof part. A message merely being CONSUMED is not evidence
+    /// that the handler ran to a particular point: <c>ChannelResponseReader.MoveNext</c> signals
+    /// <c>Consumed</c> BEFORE <c>ProcessMessagesAsync</c> dispatches on the payload, so the
+    /// pre-release assertions below could in principle be evaluated before a drain-less mutant had
+    /// started B. The airtight evidence is therefore captured INSIDE B's own prompt entry: the
+    /// runner records whether A's ORIGINAL execution task had ALREADY completed at the instant B's
+    /// prompt started. A correct handler awaits A's execution first, so that capture is
+    /// necessarily <c>true</c>; a handler that removed — or failed to await — the replacement drain
+    /// starts B while A is still parked in its Ready write (the test releases that gate only later),
+    /// so the capture is necessarily <c>false</c> and this test fails by name. No polling, no
+    /// sleeps, and no inspection of Task internals: the capture reads the public completion state
+    /// of a task the test itself holds.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Replacement_DrainsPriorOwnerThenInstallsFreshEmptyResultHolder()
@@ -697,7 +710,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var stream = BuildStream(requests, responses);
         var loop = InvokeProcessMessages(service, stream, "worker-1", TestContext.Current.CancellationToken);
-        var replacementDrain = Task.CompletedTask;
+
+        // Hoisted so the finally can join EVERY original task it started, even after a failure, and
+        // can release the reset gate that a parked handler may still be waiting on.
+        Task? executionA = null;
+        Task? executionB = null;
+        var bResetRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
             responses.Push(ResultAssignment(taskA));
@@ -708,41 +726,112 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             var resultA = AssertFullRetainedResult(service, taskA, RetainedOutcome.Completed);
 
-            // Capture A's own owner and body BEFORE replacement begins.  The drain-entry probe
-            // below watches THIS task, so it can never be satisfied by some later assignment.
+            // Capture A's own owner and ORIGINAL body BEFORE replacement begins, so every ordering
+            // observation below is about THIS assignment and can never be satisfied by a later one.
             var ownerA = GetActiveAssignment(service);
-            var executionA = GetActiveExecution(service);
+            executionA = GetActiveExecution(service);
 
+            // ARM THE ORDERING CAPTURES before B can possibly be handled. Each records, at a
+            // production-visible instant on B's path, whether A's ORIGINAL execution had already
+            // completed. `_resetCount` distinguishes B's reset from A's. The values are what
+            // discriminate — no polling, no sleeps, no Task-internals inspection.
+            //
+            // The reset ALSO parks on a gate the test owns, so the capture is taken at a fixed
+            // point and the pre-release observations below cannot race a drain-less handler that
+            // rushes ahead: such a handler necessarily reaches the reset (recording `false`) and
+            // then waits there, where the test can observe it deterministically.
+            var capturedExecutionA = executionA;
+            var bResetReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var aJoinedAtBReset = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var aJoinedAtBPromptEntry = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            runner.ResetGate = bResetRelease.Task;
+            runner.OnResetEntered = _ =>
+            {
+                if (runner.ResetCount >= 2)
+                {
+                    aJoinedAtBReset.TrySetResult(capturedExecutionA.IsCompleted);
+                    bResetReached.TrySetResult();
+                }
+            };
+            runner.OnPromptEntered = enteredTaskId =>
+            {
+                if (string.Equals(enteredTaskId, taskB, StringComparison.Ordinal))
+                    aJoinedAtBPromptEntry.TrySetResult(capturedExecutionA.IsCompleted);
+            };
+
+            // A's body is now parked inside its Ready write: its ORIGINAL execution cannot finish
+            // until the test releases that gate.
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // Invoke the production replacement drain directly. Because A's execution is held in
-            // its Ready write, the returned operation is necessarily parked on A's ORIGINAL task.
-            replacementDrain = InvokeReplacementDrain(service);
-            Assert.False(replacementDrain.IsCompleted);
+            // Deliver B through the REAL loop while A is still unfinished, followed by a probe the
+            // sequential loop can only consume once it has finished handling B.
+            responses.Push(ResultAssignment(taskB));
+            responses.Push(Probe("B-blocked-probe"));
+            await responses.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // A's ORIGINAL body is provably still running, so the handler must still own A: it may
+            // not reset the runner, start B, or install B's owner yet.
             Assert.False(executionA.IsCompleted, "A's body must still be unwinding while its drain is parked.");
+            Assert.False(runner.HasPromptStarted(taskB), "B must not start while A's original body is still running.");
+            Assert.False(responses.Consumed(4).IsCompleted, "The loop must still be parked inside B's handler.");
             Assert.Same(ownerA, GetActiveAssignment(service));
             Assert.Equal(taskA, GetActiveTaskId(service));
             Assert.Same(resultA, GetRetainedResult(service));
             Assert.Equal(1, runner.ResetCount);
 
+            // Release A's Ready write: only now can A's ORIGINAL execution terminate, the drain
+            // join, and the handler proceed to B's session reset — where it parks on the gate.
             requests.ReleaseReady(0);
-            await replacementDrain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            Assert.Null(GetActiveAssignment(service));
 
-            // Deliver B only after the production drain completed. Its handler must install a fresh
-            // owner/result holder; no task-internal continuation inspection is needed.
-            responses.Push(ResultAssignment(taskB));
+            // THE DETERMINISTIC RENDEZVOUS. BOTH a correct handler and a drain-less one reach B's
+            // session reset and park there, so this wait always completes; what DISCRIMINATES them
+            // is the value each captured at that instant. A handler that REMOVED the replacement
+            // drain reaches the reset while A is still parked in its Ready write and records
+            // `false`.
+            await bResetReached.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                await aJoinedAtBReset.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
+                "B's session reset ran before A's original execution was joined — the replacement "
+                + "drain did not run or was not awaited.");
+
+            // A's ORIGINAL execution is now genuinely terminal, which is the precondition for the
+            // stray-drain check further below.
+            await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Let B's handler continue past the reset.
+            bResetRelease.TrySetResult();
             await runner.PromptStarted(taskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The same ordering holds at B's own prompt entry.
+            Assert.True(
+                await aJoinedAtBPromptEntry.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
+                "B's body started before A's original execution was joined — the replacement drain "
+                + "did not run or was not awaited.");
 
             // A has now drained and B is executing, but B has not produced a result.  A following
             // message boundary proves B's owner was installed before inspecting its fresh holder.
             responses.Push(Probe("B-installed"));
-            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await responses.Consumed(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(taskB, GetActiveTaskId(service));
             Assert.NotSame(ownerA, GetActiveAssignment(service));
             Assert.Null(GetRetainedResult(service));
             Assert.Equal(2, runner.ResetCount);
+            Assert.True(executionA.IsCompleted, "A's original execution must be joined before B is installed.");
+
+            // NO STRAY DRAIN MAY STILL BE IN FLIGHT. A's execution is terminal by now, so a
+            // replacement drain that was started but NOT awaited would have resumed and cleared the
+            // ownership slot — the slot it finds is B's, which it would wrongly empty. The boundary
+            // below is the loop's own consumption of another probe: after it, the slot must STILL
+            // hold B. This is what makes a fire-and-forget drain observable without polling.
+            responses.Push(Probe("no-stray-drain"));
+            await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(
+                taskB,
+                GetActiveTaskId(service));
+            Assert.Equal(1, GetSlotOccupancy(service));
 
             runner.Release(taskB);
             await requests.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -750,14 +839,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.NotSame(resultA, resultB);
             requests.ReleaseComplete(1);
             await requests.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            var executionB = GetActiveExecution(service);
+            executionB = GetActiveExecution(service);
             requests.ReleaseReady(1);
             await executionB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Same(resultB, GetRetainedResult(service));
 
             responses.Push(MatchingCancel(taskB));
             responses.Push(Probe("B-cleared"));
-            await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await responses.Consumed(8).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Null(GetActiveAssignment(service));
             Assert.Equal(2, runner.ExecutionEntryCount);
             Assert.Equal(2, runner.PromptCount);
@@ -767,11 +856,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
         finally
         {
+            // RELEASE EVERYTHING FIRST — gates and the reader — so no join below can be blocked
+            // by work this cleanup itself still has to unblock. Only then join every original task,
+            // each under its own bound, so one live producer cannot skip the remaining joins.
             runner.ReleaseAll();
             requests.ReleaseAll();
-            await ObserveLoopForTeardownAsync(replacementDrain);
+            bResetRelease.TrySetResult();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(
+                ("assignment body A", executionA),
+                ("assignment body B", executionB),
+                ("loop", loop));
             TryDelete(root);
         }
     }
@@ -806,6 +901,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
         ArmedCancellationCallback? armed = null;
         MatchingDrainOperation? matchingDrain = null;
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? bodyExecution = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -815,6 +913,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             var ownerBeforeCancel = GetActiveAssignment(service);
             var execution = GetActiveExecution(service);
+            bodyExecution = execution;
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
@@ -855,10 +954,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         finally
         {
             runner.ReleaseAll();
-            if (matchingDrain is not null)
-                await ObserveLoopForTeardownAsync(matchingDrain.Completion);
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(
+                ("matching-cancel drain", matchingDrain?.Completion),
+                ("assignment body", bodyExecution),
+                ("loop", loop));
             armed?.DisposeRegistration();
         }
     }
@@ -882,6 +982,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
         ArmedCancellationCallback? armed = null;
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? bodyExecution = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -890,6 +993,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             var execution = GetActiveExecution(service);
+            bodyExecution = execution;
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
@@ -931,7 +1035,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
         }
     }
@@ -959,6 +1063,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var originalErr = Console.Error;
         var stdErr = new StringWriter();
         ArmedCancellationCallback? armed = null;
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? bodyExecution = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -967,6 +1074,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             var execution = GetActiveExecution(service);
+            bodyExecution = execution;
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
@@ -1008,7 +1116,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
         }
     }
@@ -1044,6 +1152,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         var originalErr = Console.Error;
         ArmedCancellationCallback? armed = null;
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? bodyExecution = null;
         try
         {
             responses.Push(Assignment("task-A"));
@@ -1052,6 +1163,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             var execution = GetActiveExecution(service);
+            bodyExecution = execution;
             armed = ArmThrowingCancellationCallback(service);
             var ownerCts = armed.Source;
 
@@ -1092,7 +1204,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
         }
     }
@@ -1159,7 +1271,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("loop", loop));
         }
     }
 
@@ -1215,6 +1327,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var stdErr = new StringWriter();
         var bodyDiagnosticFailure = new BodyDiagnosticFailureException("injected body diagnostic failure");
         ArmedCancellationCallback? armed = null;
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? bodyExecution = null;
         try
         {
             // The sink throws ONLY for the body's own failure line, so every other sanitized report
@@ -1229,6 +1344,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // Join the ORIGINAL body and pin its exact failure: it faulted on its own diagnostic,
             // so it never reached its Ready claim.
             var execution = GetActiveExecution(service);
+            bodyExecution = execution;
             var bodyFault = await Assert.ThrowsAsync<BodyDiagnosticFailureException>(
                 () => execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Same(bodyDiagnosticFailure, bodyFault);
@@ -1282,9 +1398,161 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await ObserveLoopForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
         }
+    }
+
+    /// <summary>
+    /// The MATCHING-CANCEL HANDLER'S NO-PRIOR-PRIMARY BRANCH: when the single Ready write SUCCEEDS
+    /// (or was already claimed by the body), a throwing cancellation callback must still be
+    /// SURFACED by the REAL handler — never silently swallowed.
+    /// <para>
+    /// Both reachable shapes of that branch are covered:
+    /// <list type="bullet">
+    ///   <item><description><see cref="ReadyBranch.HandlerWritesSuccessfully"/> — the body never
+    ///   reaches its Ready claim (its provisioning fails and the sanitized diagnostic for that
+    ///   failure hits a degraded sink), so the handler owns the one Ready attempt and that write
+    ///   SUCCEEDS.</description></item>
+    ///   <item><description><see cref="ReadyBranch.AlreadyClaimedByBody"/> — the body completed
+    ///   normally and already consumed the claim, so the handler writes NO Ready at
+    ///   all.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF. A handler that propagates/reports the deferred drain failure ONLY when the
+    /// Ready write itself failed — and silently returns otherwise — leaves the loop healthy: the
+    /// subsequent probe is consumed and EOF ends the loop successfully. Both cells therefore fail
+    /// by name on the "must fault" assertion, and neither can be satisfied by the opposite
+    /// (failed-Ready) branch, which is covered separately.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(ReadyBranch.HandlerWritesSuccessfully)]
+    [InlineData(ReadyBranch.AlreadyClaimedByBody)]
+    public async Task MatchingCancelWithThrowingCallback_ReadySucceedsOrIsClaimed_StillSurfacesCallbackFailure(
+        ReadyBranch branch)
+    {
+        var runner = new GatedPromptRunner();
+        using var service = BuildService(runner);
+
+        if (branch == ReadyBranch.HandlerWritesSuccessfully)
+        {
+            // A provisioning failure inside the body, BEFORE any executor exists: the body reaches
+            // its generic sanitized catch, whose diagnostic the degraded sink below breaks — so the
+            // delegate unwinds WITHOUT reaching its Ready claim and the handler owns the one write.
+            service.TestProvisioner = new WorkerConfigProvisioner(
+                "worker-1",
+                (_, _) => Task.FromException<GetWorkerConfigResponse>(
+                    new InvalidOperationException("injected provisioning failure")),
+                _ => null,
+                (_, _) => { });
+        }
+
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var stream = BuildStream(requests, responses);
+
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        var bodyDiagnosticFailure = new BodyDiagnosticFailureException("injected body diagnostic failure");
+        ArmedCancellationCallback? armed = null;
+        Task? bodyExecution = null;
+        try
+        {
+            // The sink breaks ONLY the body's own failure line; every sanitized report asserted
+            // below stays observable.
+            Console.SetError(new MarkerThrowingErrorWriter(
+                "Task execution failed", stdErr, bodyDiagnosticFailure));
+
+            responses.Push(ResultAssignment("task-A"));
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            bodyExecution = GetActiveExecution(service);
+            var readyClaim = GetOwnerReadyClaim(service);
+
+            if (branch == ReadyBranch.HandlerWritesSuccessfully)
+            {
+                // The body faults on its own diagnostic before the claim.
+                var bodyFault = await Assert.ThrowsAsync<BodyDiagnosticFailureException>(
+                    () => bodyExecution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+                Assert.Same(bodyDiagnosticFailure, bodyFault);
+
+                // NON-VACUITY: the claim is genuinely unconsumed, so the handler owns the one write.
+                Assert.Equal(0, GetReadyClaimState(readyClaim));
+                Assert.Equal(0, requests.ReadyCount);
+            }
+            else
+            {
+                // The body completes normally and CONSUMES the claim with its own Ready write.
+                runner.Release("task-A");
+                await bodyExecution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1);
+
+                // NON-VACUITY: the claim is genuinely consumed, so the handler writes no Ready.
+                Assert.Equal(1, GetReadyClaimState(readyClaim));
+                Assert.Equal(1, requests.ReadyCount);
+            }
+
+            var readyCountBeforeCancel = requests.ReadyCount;
+
+            // Arm ONLY the cancellation-callback failure: the Ready write is left to SUCCEED.
+            armed = ArmThrowingCancellationCallback(service);
+            var ownerCts = armed.Source;
+            Assert.Null(requests.FailNextReadyWrite);
+
+            responses.Push(MatchingCancel("task-A"));
+
+            // THE DISCRIMINATOR: with no prior primary the handler must surface the deferred
+            // callback failure out of the loop. A silently-returning handler leaves the loop healthy
+            // and this assertion fails by name.
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Contains(armed.CallbackFailure, Flatten(surfaced));
+
+            // The single-Ready contract is intact for this branch.
+            var expectedReadyCount = branch == ReadyBranch.HandlerWritesSuccessfully
+                ? readyCountBeforeCancel + 1
+                : readyCountBeforeCancel;
+            Assert.Equal(expectedReadyCount, requests.ReadyCount);
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
+
+            // Cleanup still completed before the failure surfaced.
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+            Assert.True(ownerCts.IsCancellationRequested);
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.Equal(1, armed.InvocationCount);
+
+            // With NO prior primary the evidence PROPAGATES; it is not downgraded to a report.
+            Assert.DoesNotContain(
+                "Task cancellation cleanup failed", stdErr.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
+            armed?.DisposeRegistration();
+        }
+    }
+
+    /// <summary>
+    /// Which reachable shape of the matching-cancel handler's single-Ready step a cell exercises.
+    /// </summary>
+    public enum ReadyBranch
+    {
+        /// <summary>The body never claimed Ready, so the handler writes it — successfully.</summary>
+        HandlerWritesSuccessfully,
+
+        /// <summary>The body already claimed and wrote Ready, so the handler writes none.</summary>
+        AlreadyClaimedByBody,
     }
 
     /// <summary>
@@ -1623,11 +1891,6 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// the loop, keeping outer loop teardown out of the observation. The returned accessor is read
     /// only after <see cref="MatchingDrainOperation.Completion"/> terminates.
     /// </summary>
-    private static Task InvokeReplacementDrain(WorkerService service) =>
-        (Task)typeof(WorkerService).GetMethod(
-                "DrainRetainedForReplacementAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .Invoke(service, null)!;
-
     private static MatchingDrainOperation InvokeMatchingCancelDrain(WorkerService service)
     {
         var operation = typeof(WorkerService).GetMethod(
@@ -1967,6 +2230,30 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             lock (_gate) return Slot(_started, taskId).Task;
         }
 
+        /// <summary>
+        /// Invoked AT prompt entry with the entering task's id, BEFORE the prompt parks. It is the
+        /// observation point for ordering evidence that must be captured at the exact instant a
+        /// body starts — for example whether a previous assignment's ORIGINAL execution had already
+        /// been joined by then.
+        /// </summary>
+        internal Action<string>? OnPromptEntered { get; set; }
+
+        /// <summary>
+        /// Invoked AT session-reset entry with the assignment's model. The assignment handler calls
+        /// <c>ResetSessionAsync</c> as its FIRST step after the replacement drain and BEFORE the
+        /// body is started or the owner installed, so this is the earliest production-visible point
+        /// at which "the drain has returned" can be observed.
+        /// </summary>
+        internal Action<string?>? OnResetEntered { get; set; }
+
+        /// <summary>
+        /// A gate the session reset PARKS on after <see cref="OnResetEntered"/> has run. Setting it
+        /// makes the capture at reset entry ORDER-INDEPENDENT: whichever moment the handler reaches
+        /// the reset, it records the state AT THAT INSTANT and then waits, so a test can take its
+        /// observations and release the gate afterwards without the two racing.
+        /// </summary>
+        internal Task? ResetGate { get; set; }
+
         internal bool HasPromptStarted(string taskId)
         {
             lock (_gate) return _startedIds.Contains(taskId);
@@ -1989,6 +2276,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             var taskId = _taskId ?? throw new InvalidOperationException("Task ID was not set.");
             Interlocked.Increment(ref _promptCount);
+
+            // The ordering capture runs at ENTRY, before this body can park or be released.
+            OnPromptEntered?.Invoke(taskId);
+
             lock (_gate)
             {
                 _startedIds.Add(taskId);
@@ -2029,13 +2320,20 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task ResetSessionAsync(
+        public async Task ResetSessionAsync(
             string? model,
             ReasoningEffort? reasoningEffort,
             CancellationToken ct = default)
         {
             Interlocked.Increment(ref _resetCount);
-            return Task.CompletedTask;
+
+            // The ordering capture runs at the handler's FIRST post-drain step...
+            OnResetEntered?.Invoke(model);
+
+            // ...and then the reset PARKS if a gate was installed, so the capture above is taken at
+            // a fixed point the test controls rather than racing the test's own observations.
+            if (ResetGate is { } gate)
+                await gate.WaitAsync(ct);
         }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -2118,28 +2416,62 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             "_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(service);
 
     /// <summary>
-    /// Teardown-only observation of a started loop: settles it WITHOUT propagating its
-    /// outcome, so a faulting loop (cancelled teardown, reader fault, reset failure) can
-    /// never mask the assertion that failed inside the test body. The loop's actual outcome
-    /// is always asserted in the try body on the normal path; this join exists purely to
-    /// guarantee every producer is quiescent before the service's using-disposal runs.
+    /// JOINS EVERY ORIGINAL TASK a test started, each under its OWN bounded wait, and only then
+    /// reports whatever went wrong.
     /// </summary>
-    private static async Task ObserveLoopForTeardownAsync(Task loop)
+    /// <remarks>
+    /// <para>
+    /// A test's <c>finally</c> must first release every gate and complete/fault every reader, and
+    /// then call this ONCE with every started task. Because each join is attempted independently
+    /// and failures are accumulated, one still-live producer can never skip the joins that follow
+    /// it — which is what previously let a <c>WorkerService</c> be disposed while other original
+    /// work was still running.
+    /// </para>
+    /// <para>
+    /// A STILL-LIVE task is a LOUD, distinct failure (never a silent return): it is reported as a
+    /// named teardown failure that identifies the producer. A task that terminated with a fault or
+    /// a cancellation is quiescent, which is all teardown requires, so its outcome is swallowed
+    /// HERE ONLY — the real outcome is asserted on the test's normal path.
+    /// </para>
+    /// </remarks>
+    /// <param name="producers">
+    /// The started tasks, in the order they should be joined. <c>null</c> entries (a producer a
+    /// test never started) are skipped.
+    /// </param>
+    private static async Task JoinAllForTeardownAsync(params (string Name, Task? Producer)[] producers)
     {
-        try
+        List<Exception> failures = [];
+
+        foreach (var (name, producer) in producers)
         {
-            await loop.WaitAsync(Failsafe, CancellationToken.None);
+            if (producer is null)
+                continue;
+
+            try
+            {
+                await producer.WaitAsync(Failsafe, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    $"Teardown failed to join '{name}' within the bounded failsafe; live work remains."));
+            }
+            catch (Exception) when (producer.IsCompleted)
+            {
+                // Terminal fault/cancellation: the original task is quiescent, which is all the
+                // teardown contract requires.
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
         }
-        catch (TimeoutException)
-        {
-            throw new Xunit.Sdk.XunitException(
-                "Teardown failed to join the original loop within the bounded failsafe; live work remains.");
-        }
-        catch (Exception) when (loop.IsCompleted)
-        {
-            // A terminal loop fault is expected on several assertion-failure cleanup paths. Only a
-            // still-live original task is a teardown failure; timeout is handled distinctly above.
-        }
+
+        if (failures.Count == 1)
+            throw failures[0];
+
+        if (failures.Count > 1)
+            throw new AggregateException("Teardown could not join every original task.", failures);
     }
 
     /// <summary>
