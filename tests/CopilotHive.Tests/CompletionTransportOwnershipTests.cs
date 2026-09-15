@@ -354,11 +354,26 @@ public sealed class CompletionTransportOwnershipTests
     /// naming that guard — not by the later checked release.
     /// </summary>
     /// <remarks>
-    /// WHY THIS IS INVOKED DIRECTLY RATHER THAN THROUGH THE STREAM: <c>WorkStream</c> already ends
-    /// a stream whose pinned instance no longer matches the registered one, so a real stream can
-    /// never deliver this case to the handler. The check inside the handler is deliberate
-    /// defence-in-depth, and this is the honest way to pin it: the narrower runtime contract is
-    /// asserted here, while the reachable ownership vectors above all run through the real stream.
+    /// <para>
+    /// WHAT THIS VECTOR IS, STATED HONESTLY: it SIMULATES the narrow TIME-OF-CHECK-TO-TIME-OF-USE
+    /// window that the real stream leaves open, by invoking the handler directly with the stale
+    /// instance. It is NOT a claim that the case is unreachable through a real stream, and it is
+    /// NOT a reproduction of the concurrent interleaving either.
+    /// </para>
+    /// <para>
+    /// WHY THE WINDOW IS REAL. <c>WorkStream</c>'s per-message pinned-instance check
+    /// (<c>HiveOrchestratorService</c>, the <c>ReferenceEquals(current, pinnedWorker)</c> guard in
+    /// the read loop) runs BEFORE the payload switch dispatches to <c>HandleTaskComplete</c>. A
+    /// replacement that re-registers under the same ID in between passes that check and still
+    /// reaches the handler with a stale pinned instance. The handler's own pinned-instance check is
+    /// what closes that window — which is exactly what this vector pins.
+    /// </para>
+    /// <para>
+    /// WHY IT IS NOT DRIVEN CONCURRENTLY HERE: hitting that window through a live stream would
+    /// need a production seam between the loop's check and the handler call, and this round adds no
+    /// new production seams. Every REACHABLE-without-a-race ownership vector above does run through
+    /// the real stream; only this TOCTOU simulation calls the handler directly.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Completion_ForReplacedWorkerInstance_IsRefusedByThePinnedInstanceGuard()
@@ -368,7 +383,9 @@ public sealed class CompletionTransportOwnershipTests
         var stale = h.Worker;
 
         // The pinned instance is replaced under the SAME id, and the replacement takes over the
-        // very same task — so ONLY the pinned-instance check can refuse this delivery.
+        // very same task — so ONLY the pinned-instance check can refuse this delivery. This is the
+        // state the TOCTOU window leaves behind: the stream's own check already passed against the
+        // pre-replacement instance, and the handler is reached with the now-stale pin.
         Assert.True(h.Pool.RemoveWorker(stale));
         var replacement = h.Pool.RegisterWorker(WorkerId, []);
         h.Pool.MarkBusy(WorkerId, "task-aba");
@@ -982,9 +999,11 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
-        /// Invokes the PRODUCTION <c>HandleTaskComplete</c> directly for an instance the real
-        /// stream loop would already have rejected — the only way to exercise the handler's own
-        /// defence-in-depth pinned-instance check.
+        /// Invokes the PRODUCTION <c>HandleTaskComplete</c> directly with a stale pinned instance,
+        /// SIMULATING the TOCTOU window between <c>WorkStream</c>'s per-message pinned-instance
+        /// check and its dispatch to this handler — a window a replacement re-registering under the
+        /// same ID really can land in. Direct invocation is how that interleaving is reproduced
+        /// deterministically without adding a production seam.
         /// </summary>
         public void InvokeHandleTaskCompleteDirectly(ConnectedWorker pinned, string taskId)
         {

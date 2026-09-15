@@ -574,10 +574,15 @@ public sealed class HiveOrchestratorService(
                 LogAssignmentBlocked(worker, task, ex);
 
                 // RETURN NORMALLY: the pinned worker, the active task and the busy state are
-                // deliberately retained. This stream is NOT unwound and the worker is NOT removed —
-                // the assignment stays held until the existing explicit goal cancellation or the
-                // enabled task-timeout policy releases it. No requeue, no fabricated completion, no
-                // wrong-goal failure, no new timer/retry/reconciliation.
+                // deliberately retained. This stream is NOT unwound and the worker is NOT removed.
+                //
+                // WHAT DOES *NOT* RELEASE THIS HOLD: explicit goal cancellation.
+                // GoalDispatcher.CancelGoalAsync is LOGICAL cancellation ONLY — it fails the goal
+                // and removes the pipeline, but it does NOT stop the worker and does NOT release
+                // transport ownership: the worker's busy flag, its CurrentTaskId and the task's
+                // active TaskQueue entry all survive it. Only the enabled task-timeout policy (or
+                // worker recovery) actually reclaims the hold. No requeue, no fabricated completion,
+                // no wrong-goal failure, no new timer/retry/reconciliation happens here.
             }
         }
         else
@@ -601,8 +606,11 @@ public sealed class HiveOrchestratorService(
     /// <para>
     /// WHY THERE IS NO SUCCESS LOG ON THIS PATH: the assignment was NOT published. Emitting an
     /// assignment/ success line would misreport the delivery, and no recovery activity was performed
-    /// either — the task is left held for the operator's explicit cancellation or the enabled
-    /// task-timeout policy.
+    /// either — the task is left HELD. It is deliberately NOT released by explicit goal
+    /// cancellation: <see cref="GoalDispatcher.CancelGoalAsync"/> is LOGICAL cancellation only (it
+    /// removes the pipeline but leaves the worker running and leaves the busy flag, the current
+    /// task id and the active queue entry in place), which is exactly why this warning tells the
+    /// operator that worker recovery may be required.
     /// </para>
     /// </remarks>
     /// <param name="worker">The pinned worker whose assignment was refused.</param>

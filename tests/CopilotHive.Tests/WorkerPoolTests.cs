@@ -1602,6 +1602,13 @@ public sealed class WorkerPoolTests
     /// A null-task observation of a BUSY worker is the inconsistent shape and is refused: a busy
     /// worker's assignment may never be dropped by a null-task Ready.
     /// </summary>
+    /// <remarks>
+    /// THE ISOLATED SIDE: the MUTATION-TIME half of the null-task predicate. The observation saw
+    /// <c>IsBusy=false</c>, so only the current-value check can refuse this call — dropping it
+    /// makes this vector go green while the observation-time half stays satisfied. The
+    /// observation-time half is isolated by
+    /// <see cref="TryMarkIdleForReady_NullTask_BusyAtObservationIdleAtMutation_IsRefused"/>.
+    /// </remarks>
     [Fact]
     public void TryMarkIdleForReady_NullTaskButBusy_IsRefused()
     {
@@ -1609,11 +1616,57 @@ public sealed class WorkerPoolTests
         var worker = pool.RegisterWorker("w-ready-busynull", []);
         Assert.True(pool.TryGetWorkerSnapshot("w-ready-busynull", out var snapshot));
 
+        // THE OBSERVATION SAW AN IDLE WORKER — so the mutation-time check is the only one that
+        // can refuse what follows.
+        Assert.False(snapshot.IsBusy);
+        Assert.Null(snapshot.CurrentTaskId);
+
         // The worker becomes busy (with no task id) AFTER the observation.
         worker.IsBusy = true;
 
         Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
         Assert.True(worker.IsBusy);
+    }
+
+    /// <summary>
+    /// THE NULL-TASK OBSERVATION-TIME HALF, ISOLATED. The observation saw a BUSY worker (with no
+    /// task id — the inconsistent shape), and by the time the checked idle runs the worker is idle
+    /// again. The CURRENT value would therefore satisfy the mutation-time half on its own, so only
+    /// the OBSERVATION-time half can refuse this call: dropping <c>!observed.IsBusy</c> turns this
+    /// vector green.
+    /// </summary>
+    /// <remarks>
+    /// A stale observation must never authorize a release. Every assignment field is asserted at
+    /// its EXACT pre-call value, so an applied idle reset (which would clear the role and the task
+    /// start timestamp) is detected rather than merely "not obviously changed".
+    /// </remarks>
+    [Fact]
+    public void TryMarkIdleForReady_NullTask_BusyAtObservationIdleAtMutation_IsRefused()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-ready-null-stale-busy", []);
+
+        // THE OBSERVED STATE: busy, but carrying NO task id.
+        worker.IsBusy = true;
+        worker.Role = CopilotHive.Workers.WorkerRole.Reviewer;
+        worker.CurrentModel = "carried-model";
+        worker.CurrentTaskStartedAt = new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-null-stale-busy", out var snapshot));
+        Assert.True(snapshot.IsBusy, "the observation must see a BUSY worker for this vector to isolate its side");
+        Assert.Null(snapshot.CurrentTaskId);
+
+        // THE MUTATION-TIME STATE: idle again — so the current-value half alone would accept.
+        worker.IsBusy = false;
+
+        Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+
+        // EVERY assignment field is EXACTLY as it was before the refused call.
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Reviewer, worker.Role);
+        Assert.Equal("carried-model", worker.CurrentModel);
+        Assert.Equal(new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc), worker.CurrentTaskStartedAt);
     }
 
     /// <summary>
@@ -1657,6 +1710,12 @@ public sealed class WorkerPoolTests
     /// A NON-NULL observed task with <c>IsBusy == false</c> is the inconsistent shape: refused
     /// WITHOUT releasing and without clearing any assignment field.
     /// </summary>
+    /// <remarks>
+    /// THIS VECTOR PINS THE COMBINED SHAPE (not busy at EITHER point). The two temporal halves are
+    /// isolated separately by
+    /// <see cref="TryMarkIdleForReady_NonNullTask_BusyAtObservationIdleAtMutation_IsRefused"/> and
+    /// <see cref="TryMarkIdleForReady_NonNullTask_IdleAtObservationBusyAtMutation_IsRefused"/>.
+    /// </remarks>
     [Fact]
     public void TryMarkIdleForReady_NonNullTaskButNotBusy_IsRefusedAndMutatesNothing()
     {
@@ -1674,6 +1733,88 @@ public sealed class WorkerPoolTests
         Assert.Equal("task-inconsistent", worker.CurrentTaskId);
         Assert.NotNull(worker.CurrentTaskStartedAt);
         Assert.Equal(CopilotHive.Workers.WorkerRole.Coder, worker.Role);
+    }
+
+    /// <summary>
+    /// THE NON-NULL MUTATION-TIME HALF, ISOLATED. The observation saw a BUSY worker owning the
+    /// task, and by the time the checked idle runs the SAME task id is still present but the
+    /// worker is no longer busy. The OBSERVATION-time half is therefore satisfied, so only the
+    /// MUTATION-time half (<c>!expected.IsBusy</c>) can refuse this call: dropping it turns this
+    /// vector green.
+    /// </summary>
+    /// <remarks>
+    /// The refusal contract is pinned by EXACT pre-call values for every assignment field, so an
+    /// applied idle reset — which would null the task id and the start timestamp and reset the
+    /// role — is detected rather than merely "not obviously changed".
+    /// </remarks>
+    [Fact]
+    public void TryMarkIdleForReady_NonNullTask_BusyAtObservationIdleAtMutation_IsRefused()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-ready-nonnull-stale-busy", []);
+        pool.MarkBusy("w-ready-nonnull-stale-busy", "task-stale-busy");
+        worker.Role = CopilotHive.Workers.WorkerRole.Tester;
+        worker.CurrentModel = "carried-model";
+        var startedAt = worker.CurrentTaskStartedAt;
+        Assert.NotNull(startedAt);
+
+        // THE OBSERVATION: busy, owning the task.
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-nonnull-stale-busy", out var snapshot));
+        Assert.True(snapshot.IsBusy, "the observation must see a BUSY worker for this vector to isolate its side");
+        Assert.Equal("task-stale-busy", snapshot.CurrentTaskId);
+
+        // THE MUTATION-TIME STATE: the SAME task id, but no longer busy.
+        worker.IsBusy = false;
+
+        Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+
+        // EVERY assignment field is EXACTLY as it was before the refused call.
+        Assert.False(worker.IsBusy);
+        Assert.Equal("task-stale-busy", worker.CurrentTaskId);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Tester, worker.Role);
+        Assert.Equal("carried-model", worker.CurrentModel);
+        Assert.Equal(startedAt, worker.CurrentTaskStartedAt);
+    }
+
+    /// <summary>
+    /// THE NON-NULL OBSERVATION-TIME HALF, ISOLATED. The observation saw the task id with
+    /// <c>IsBusy=false</c> (the inconsistent shape), and by the time the checked idle runs the
+    /// worker is busy with that SAME task. The MUTATION-time half is therefore satisfied, so only
+    /// the OBSERVATION-time half (<c>!observed.IsBusy</c>) can refuse this call: dropping it turns
+    /// this vector green.
+    /// </summary>
+    /// <remarks>
+    /// A stale, internally inconsistent observation must never authorize a release of ownership
+    /// that is live right now. Every assignment field is asserted at its EXACT pre-call value.
+    /// </remarks>
+    [Fact]
+    public void TryMarkIdleForReady_NonNullTask_IdleAtObservationBusyAtMutation_IsRefused()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-ready-nonnull-stale-idle", []);
+        pool.MarkBusy("w-ready-nonnull-stale-idle", "task-stale-idle");
+        worker.Role = CopilotHive.Workers.WorkerRole.DocWriter;
+        worker.CurrentModel = "carried-model";
+        var startedAt = worker.CurrentTaskStartedAt;
+        Assert.NotNull(startedAt);
+
+        // THE OBSERVATION: the task id is present but the worker reads as NOT busy.
+        worker.IsBusy = false;
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-nonnull-stale-idle", out var snapshot));
+        Assert.False(snapshot.IsBusy, "the observation must see a NON-BUSY worker for this vector to isolate its side");
+        Assert.Equal("task-stale-idle", snapshot.CurrentTaskId);
+
+        // THE MUTATION-TIME STATE: busy with the SAME task — the current-value half alone accepts.
+        worker.IsBusy = true;
+
+        Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+
+        // EVERY assignment field is EXACTLY as it was before the refused call.
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-stale-idle", worker.CurrentTaskId);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.DocWriter, worker.Role);
+        Assert.Equal("carried-model", worker.CurrentModel);
+        Assert.Equal(startedAt, worker.CurrentTaskStartedAt);
     }
 
     /// <summary>
