@@ -411,6 +411,371 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // (5) The bridge parameterized over ALL THREE response-bearing methods: EOF.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// WHICH bridge method is exercised by the EOF theory. All three go through the ONE
+    /// response-bearing helper, but each is a distinct public entry point, so each is driven
+    /// separately against the real message loop.
+    /// </summary>
+    public enum BridgeToolCase
+    {
+        Clarification,
+        GetGoal,
+        RaiseIssue,
+    }
+
+    /// <summary>
+    /// PARAMETERIZED OVER THE THREE REAL BRIDGE METHODS: the request write succeeds with a
+    /// STILL-LIVE caller token (one write, one registration), then the response loop's EOF ends
+    /// the wait with the EXISTING disconnected error and there is NO resend — the remote outcome
+    /// of the lost response stays unknown.
+    /// <para>
+    /// REMOVAL-PROOFNESS: with a service-global registry (or a wait bound to the loop token) the
+    /// EOF would leave the call parked forever and the bounded join fails by name; with an
+    /// automatic resend a second write would appear and the write-count assertion fails by name.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(BridgeToolCase.Clarification)]
+    [InlineData(BridgeToolCase.GetGoal)]
+    [InlineData(BridgeToolCase.RaiseIssue)]
+    public async Task BridgeCall_EofAfterSuccessfulRequest_FailsDisconnected_WithNoResend(
+        BridgeToolCase toolCase)
+    {
+        using var service = NewService();
+        var requests = new RecordingToolRequestStream();
+        var responses = new ChannelResponseReader();
+        var connection = Publish(service, requests, responses);
+
+        var loop = InvokeLoop(service, connection, TestContext.Current.CancellationToken);
+        try
+        {
+            using var callerCts = new CancellationTokenSource();
+            var call = StartBridgeCall(service, toolCase, callerCts.Token);
+
+            var written = await requests.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerId, written.WorkerId);
+            Assert.False(
+                callerCts.IsCancellationRequested,
+                "The caller token must still be live when the request write succeeds.");
+            Assert.Equal(1, connection.PendingToolResponseCount);
+            Assert.False(call.IsCompleted);
+
+            // EOF: no response can ever arrive. The loop's teardown ends the wait owned by THIS
+            // connection, independently of the caller's still-live token.
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => call.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+
+            // NO resend: exactly one request write ever happened, and the settled entry is gone.
+            Assert.Equal(1, requests.WriteCount);
+            Assert.Equal(0, connection.PendingToolResponseCount);
+            Assert.True(connection.IsRetired);
+        }
+        finally
+        {
+            responses.TryComplete();
+            await ObserveAsync(loop);
+        }
+    }
+
+    /// <summary>
+    /// READER-FAULT VARIANT: the loop's ORIGINAL reader exception is preserved (surfaced from the
+    /// loop join by identity), while the parked bridge wait still ends with the EXISTING
+    /// disconnected error — never the reader fault — and there is no resend.
+    /// </summary>
+    [Fact]
+    public async Task ReaderFault_BridgeWaitFailsDisconnected_AndLoopPreservesTheOriginalReaderException()
+    {
+        var original = new InvalidOperationException("reader fault");
+        using var service = NewService();
+        var requests = new RecordingToolRequestStream();
+        var responses = new FaultingResponseReader();
+        var connection = Publish(service, requests, responses);
+
+        var loop = InvokeLoop(service, connection, TestContext.Current.CancellationToken);
+        try
+        {
+            var call = service.GetGoalAsync("task-rf", "goal-rf", TestContext.Current.CancellationToken);
+            await requests.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            Assert.Equal(1, connection.PendingToolResponseCount);
+
+            // The reader faults on its next MoveNext: the loop unwinds, ends the response waits,
+            // and propagates the ORIGINAL exception.
+            responses.ArmFault(original);
+
+            // The bridge wait ends with the EXISTING disconnected error — the reader fault is the
+            // LOOP's outcome, not the caller's.
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => call.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+
+            // The loop's ORIGINAL reader exception is preserved by IDENTITY.
+            var propagated = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(original, propagated);
+
+            Assert.Equal(1, requests.WriteCount); // no resend
+            Assert.Equal(0, connection.PendingToolResponseCount);
+            Assert.True(connection.IsRetired);
+        }
+        finally
+        {
+            responses.TryComplete();
+            await ObserveAsync(loop);
+        }
+    }
+
+    /// <summary>
+    /// The REAL <see cref="WorkerService.RunAsync"/> production teardown seams (fake invoker +
+    /// fake work stream): a bridge wait parked on the published connection is ended by the
+    /// response loop's EOF through the FULL lifecycle — registration, EOF, loop finally,
+    /// retirement, unpublish — with no resend and the existing disconnected error.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_EofDuringBridgeWait_BridgeFailsDisconnected_ThroughProductionTeardown()
+    {
+        var runner = new BridgeWaitingRunner();
+        using var service = NewService(runner);
+        runner.Service = service;
+
+        var requests = new RecordingToolRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = Stream(requests, responses);
+
+        service.CallInvokerFactory = () => new RegisterAcceptedInvoker();
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var run = service.RunAsync(TestContext.Current.CancellationToken);
+        try
+        {
+            // BARRIER: the initial Ready proves publication through the real lifecycle.
+            await requests.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.False(connection.IsRetired);
+
+            var call = service.GetGoalAsync("task-run", "goal-run", TestContext.Current.CancellationToken);
+            var written = await requests.WaitForWriteAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(connection.AssignedId, written.WorkerId);
+            Assert.Equal(1, connection.PendingToolResponseCount);
+
+            // EOF ends the loop; the lifecycle's finally retires and unpublishes.
+            responses.TryComplete();
+            await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => call.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+
+            // Full teardown happened, and the lost response was NOT retried: the request write
+            // count never moved past the initial Ready + one tool request.
+            Assert.Equal(2, requests.WriteCount);
+            Assert.Equal(0, connection.PendingToolResponseCount);
+            Assert.True(connection.IsRetired);
+            Assert.Null(GetPublishedConnection(service));
+        }
+        finally
+        {
+            responses.TryComplete();
+            await ObserveAsync(run);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (6) End-first is final, and ownership is per connection (same worker ID).
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// END-FIRST: once <c>EndToolResponses</c> has run, the bridge wait is already failed — a
+    /// response arriving late for the SAME request ID cannot resurrect it, no resend happens, and
+    /// registration stays closed for the rest of this connection's life.
+    /// </summary>
+    [Fact]
+    public async Task EndFirst_BridgeWaitCannotBeResurrectedByALateResponse()
+    {
+        using var service = NewService();
+        var requests = new RecordingToolRequestStream();
+        var connection = Publish(service, requests);
+
+        var call = service.RequestClarificationAsync("task-end", "why?", CancellationToken.None);
+        var requestId = (await requests.WaitForWriteAsync(0, TestContext.Current.CancellationToken))
+            .ToolRequest.RequestId;
+        Assert.Equal(1, connection.PendingToolResponseCount);
+
+        // END FIRST: the response lifetime closes and the wait fails disconnected.
+        connection.EndToolResponses();
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => call.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+        Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+
+        // A late response for the SAME request ID has nothing left to settle — it cannot
+        // resurrect the failed wait, and it is not held as history either.
+        Assert.False(connection.TryCompleteToolResponse(
+            new ToolCallResponse { RequestId = requestId, Success = true, ResultJson = "{}" }));
+        Assert.Equal(0, connection.PendingToolResponseCount);
+        Assert.Equal(1, requests.WriteCount); // no resend
+
+        // Registration stays CLOSED on this connection after the end.
+        var rejected = Assert.Throws<InvalidOperationException>(
+            () => { _ = connection.RegisterToolResponse("req-late"); });
+        Assert.Equal(WorkerConnection.DisconnectedMessage, rejected.Message);
+    }
+
+    /// <summary>
+    /// CONTROLLED A/B CONNECTION OWNERSHIP with the SAME worker ID on both sides: a response
+    /// dispatched to A and A's <c>EndToolResponses</c> can neither settle nor remove B's pending
+    /// request, and B's lifetime stays open while A's is closed. This is OWNERSHIP testing — the
+    /// connections are never driven concurrently through a reconnect, and no concurrent-reconnect
+    /// support is claimed.
+    /// <para>
+    /// REMOVAL-PROOFNESS: with a service-global or worker-ID-keyed registry, A's completion/end
+    /// would find and settle B's entry, so the "still pending" assertions fail by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AbConnections_SameWorkerId_AResponseAndEndCannotSettleOrRemoveBsRequest()
+    {
+        using var service = NewService();
+        var requestsA = new RecordingToolRequestStream();
+        var connectionA = Publish(service, requestsA);
+
+        var requestsB = new RecordingToolRequestStream();
+        var connectionB = BuildConnection(requestsB, null);
+
+        // The SAME worker ID on both sides is exactly what a worker-ID-keyed registry would
+        // confuse; only per-connection ownership can keep the two lifetimes apart.
+        Assert.Equal(connectionA.AssignedId, connectionB.AssignedId);
+
+        // A owns a REAL bridge wait; B owns its own registration for a different request.
+        var callA = service.GetGoalAsync("task-ab", "goal-ab", TestContext.Current.CancellationToken);
+        var idA = (await requestsA.WaitForWriteAsync(0, TestContext.Current.CancellationToken))
+            .ToolRequest.RequestId;
+        Assert.Equal(1, connectionA.PendingToolResponseCount);
+
+        var waitB = connectionB.RegisterToolResponse("req-B");
+        Assert.Equal(1, connectionB.PendingToolResponseCount);
+
+        // A's connection cannot settle B's wait, even for B's own request ID.
+        Assert.False(connectionA.TryCompleteToolResponse(
+            new ToolCallResponse { RequestId = "req-B", Success = true, ResultJson = "{}" }));
+        Assert.Equal(1, connectionB.PendingToolResponseCount);
+        Assert.False(waitB.IsCompleted);
+        Assert.False(callA.IsCompleted);
+
+        // A's END cannot close B's lifetime, clear its entries, or remove its wait.
+        connectionA.EndToolResponses();
+        var failureA = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => callA.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+        Assert.Equal(WorkerConnection.DisconnectedMessage, failureA.Message);
+        Assert.Equal(0, connectionA.PendingToolResponseCount);
+
+        // B's wait is untouched, and B's registration is STILL OPEN.
+        Assert.Equal(1, connectionB.PendingToolResponseCount);
+        _ = connectionB.RegisterToolResponse("req-B2");
+        Assert.Equal(2, connectionB.PendingToolResponseCount);
+
+        // B's own response settles its own wait through B alone — with exactly the payload B
+        // received — while B's other registration stays pending.
+        var payloadB = new ToolCallResponse
+        {
+            RequestId = "req-B",
+            Success = true,
+            ResultJson = "{\"from\":\"B\"}",
+        };
+        Assert.True(connectionB.TryCompleteToolResponse(payloadB));
+        Assert.Same(payloadB, await waitB);
+        Assert.Equal(1, connectionB.PendingToolResponseCount);
+
+        // B's stream never saw a write: nothing about A's traffic reached it.
+        Assert.Equal(0, requestsB.WriteCount);
+        Assert.Equal(1, requestsA.WriteCount); // A's single request, no resend
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (7) A real assignment on the real bridge with CancellationToken.None.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A REAL ASSIGNMENT's body waits on the REAL bridge with <see cref="CancellationToken.None"/>
+    /// — no assignment token bound to the wait — and EOF releases that wait INDEPENDENTLY, while
+    /// the runner's unwind gate proves the loop STILL waits for the assignment body (the ownership
+    /// slot stays occupied and the connection is not retired) before clearing it and retiring.
+    /// Single-final-Ready is preserved: the drained body's own claim emits exactly one Ready,
+    /// written while the connection was still usable.
+    /// <para>
+    /// REMOVAL-PROOFNESS: without ending the response waits BEFORE the drain, the None-bound wait
+    /// is unreachable by both the response reader (EOF) and any token, so the drain never finishes
+    /// and the bounded loop join fails by name; without drain-before-retire, the retired
+    /// connection rejects the body's Ready and the Ready-count assertion fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AssignmentBridgeWait_OnIndependentToken_IsReleasedByEof_WhileUnwindGateHoldsTheDrain()
+    {
+        var runner = new BridgeThenUnwindRunner();
+        using var service = NewService(runner);
+        runner.Service = service;
+
+        var requests = new RecordingToolRequestStream();
+        var responses = new ChannelResponseReader();
+        var connection = Publish(service, requests, responses);
+
+        var loop = InvokeLoop(service, connection, TestContext.Current.CancellationToken);
+        try
+        {
+            responses.Push(Assignment("task-unwind"));
+            await runner.PromptStarted("task-unwind");
+            await requests.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+
+            // The bridge wait is parked on the connection, bound to CancellationToken.None —
+            // only the connection's response closure can end it.
+            Assert.Equal(1, connection.PendingToolResponseCount);
+            Assert.False(loop.IsCompleted);
+
+            // EOF: no response can ever arrive.
+            responses.TryComplete();
+
+            // The wait was released INDEPENDENTLY of the assignment token, by the loop's teardown
+            // ending the response waits FIRST.
+            await runner.BridgeFailed("task-unwind");
+            Assert.Equal(WorkerConnection.DisconnectedMessage, runner.ObservedBridgeFailure!.Message);
+            Assert.Equal(0, connection.PendingToolResponseCount);
+
+            // The body observed the assignment cancellation and is now HELD in its unwind gate:
+            // the loop's drain must still wait for the body before clearing the slot or retiring.
+            await runner.CancelObserved("task-unwind");
+            Assert.False(loop.IsCompleted, "The loop must not finish while the body is still unwinding.");
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.False(connection.IsRetired);
+
+            // Release the unwind: the drain completes, the slot clears, the connection retires.
+            runner.ReleaseUnwind();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+
+            // SINGLE FINAL READY: exactly the drained body's own claim — no duplicate from the
+            // teardown, and it really was written (the connection was still usable at that point).
+            Assert.Equal(1, requests.ReadyCount);
+            // NO resend of the tool request: exactly one request write ever happened.
+            Assert.Equal(1, requests.ToolRequestCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await ObserveAsync(loop);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -533,6 +898,12 @@ public sealed class WorkerConnectionToolCallLifetimeTests
 
         internal int WriteCount { get { lock (_gate) return _writes.Count; } }
 
+        /// <summary>How many of the recorded writes were <c>WorkerReady</c> messages.</summary>
+        internal int ReadyCount { get { lock (_gate) return _writes.Count(w => w.PayloadCase == WorkerMessage.PayloadOneofCase.Ready); } }
+
+        /// <summary>How many of the recorded writes were tool-call requests.</summary>
+        internal int ToolRequestCount { get { lock (_gate) return _writes.Count(w => w.PayloadCase == WorkerMessage.PayloadOneofCase.ToolRequest); } }
+
         public override Task WriteAsync(WorkerMessage message)
         {
             Record(message);
@@ -626,6 +997,314 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
             => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Starts the given bridge method with the given token — the THREE response-bearing public
+    /// entry points, each driven by name so the theory covers every one of them.
+    /// </summary>
+    private static Task<string> StartBridgeCall(WorkerService service, BridgeToolCase toolCase, CancellationToken ct) =>
+        toolCase switch
+        {
+            BridgeToolCase.Clarification =>
+                service.RequestClarificationAsync($"task-{toolCase}", "why?", ct),
+            BridgeToolCase.GetGoal =>
+                service.GetGoalAsync($"task-{toolCase}", "goal-1", ct),
+            BridgeToolCase.RaiseIssue =>
+                service.RaiseIssueAsync($"task-{toolCase}", "bug", "title", "desc", "low", ct),
+            _ => throw new ArgumentOutOfRangeException(nameof(toolCase), toolCase, "Unknown bridge case."),
+        };
+
+    /// <summary>A minimal <see cref="CallInvoker"/> that accepts every registration.</summary>
+    private sealed class RegisterAcceptedInvoker : CallInvoker
+    {
+        public override TResponse BlockingUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected blocking call {method.FullName}.");
+
+        public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
+        {
+            if (method.FullName != "/copilothive.HiveOrchestrator/Register")
+                throw new NotSupportedException($"Unexpected unary call {method.FullName}.");
+
+            return new AsyncUnaryCall<TResponse>(
+                Task.FromResult((TResponse)(object)new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = WorkerId,
+                    OrchestratorVersion = "test",
+                }),
+                Task.FromResult(new Metadata()),
+                () => new Status(StatusCode.OK, string.Empty),
+                () => new Metadata(),
+                () => { });
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected server-streaming call {method.FullName}.");
+
+        public override AsyncClientStreamingCall<TRequest, TResponse> AsyncClientStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected client-streaming call {method.FullName}.");
+
+        public override AsyncDuplexStreamingCall<TRequest, TResponse> AsyncDuplexStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException(
+                $"Unexpected duplex call {method.FullName} — the fixture supplies the stream explicitly.");
+    }
+
+    /// <summary>Reflects the real published-connection field (observation only).</summary>
+    private static WorkerConnection? GetPublishedConnection(WorkerService service) =>
+        (WorkerConnection?)typeof(WorkerService)
+            .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service);
+
+    /// <summary>Reflects the service-owned ownership slot: 1 when occupied, 0 when empty.</summary>
+    private static int GetSlotOccupancy(WorkerService service)
+    {
+        var slot = typeof(WorkerService).GetField(
+            "_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(service);
+        return slot is null ? 0 : 1;
+    }
+
+    /// <summary>Reflects the heartbeat busy state: the current task ID, or null.</summary>
+    private static string? GetHeartbeatTaskId(WorkerService service)
+        => (string?)typeof(WorkerService).GetField(
+            "_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(service);
+
+    /// <summary>
+    /// A channel-backed reader that behaves like <see cref="ChannelResponseReader"/> until
+    /// <see cref="FaultingResponseReader.ArmFault"/> is called, then throws the ORIGINAL exception
+    /// from the next <c>MoveNext</c> — modelling a reader fault whose identity the loop must
+    /// propagate. Local to these tests so the frozen shared doubles stay byte-for-byte unchanged.
+    /// </summary>
+    private sealed class FaultingResponseReader : IAsyncStreamReader<OrchestratorMessage>
+    {
+        private readonly System.Threading.Channels.Channel<OrchestratorMessage> _channel =
+            System.Threading.Channels.Channel.CreateUnbounded<OrchestratorMessage>();
+
+        private readonly object _gate = new();
+        private readonly Dictionary<int, TaskCompletionSource> _consumedWaiters = [];
+        private int _consumed;
+        private Exception? _fault;
+
+        public OrchestratorMessage Current { get; private set; } = null!;
+
+        public void Push(OrchestratorMessage message) => _channel.Writer.TryWrite(message);
+
+        public void TryComplete() => _channel.Writer.TryComplete();
+
+        /// <summary>
+        /// One-shot: the next <c>MoveNext</c> outcome surfaces <paramref name="fault"/>. Also
+        /// completes the channel, so a loop ALREADY parked inside <c>WaitToReadAsync</c> wakes
+        /// deterministically (no further message is required) and reaches the fault check.
+        /// </summary>
+        public void ArmFault(Exception fault)
+        {
+            lock (_gate) _fault = fault;
+            _channel.Writer.TryComplete();
+        }
+
+        public Task Consumed(int count)
+        {
+            lock (_gate)
+            {
+                if (_consumed >= count) return Task.CompletedTask;
+                if (!_consumedWaiters.TryGetValue(count, out var waiter))
+                {
+                    waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _consumedWaiters[count] = waiter;
+                }
+                return waiter.Task;
+            }
+        }
+
+        /// <summary>Consumes and throws the armed fault, if any. One-shot.</summary>
+        private Exception? TakeFault()
+        {
+            lock (_gate)
+            {
+                var fault = _fault;
+                _fault = null;
+                return fault;
+            }
+        }
+
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            // Pre-check: covers a fault armed while the loop was BETWEEN MoveNext calls.
+            if (TakeFault() is { } preFault)
+                throw preFault;
+
+            if (!await _channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                // Post-check: covers a fault armed while THIS call was parked inside
+                // WaitToReadAsync — TryComplete woke the park, and the fault must fire
+                // instead of a plain EOF.
+                if (TakeFault() is { } postFault)
+                    throw postFault;
+
+                return false;
+            }
+
+            if (!_channel.Reader.TryRead(out var message))
+            {
+                if (TakeFault() is { } emptyFault)
+                    throw emptyFault;
+
+                return false;
+            }
+
+            Current = message;
+            List<TaskCompletionSource> ready = [];
+            lock (_gate)
+            {
+                _consumed++;
+                foreach (var (threshold, waiter) in _consumedWaiters)
+                {
+                    if (_consumed >= threshold)
+                        ready.Add(waiter);
+                }
+            }
+            foreach (var waiter in ready)
+                waiter.TrySetResult();
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="IAgentRunner"/> whose prompt body first parks on the REAL bridge with
+    /// <see cref="CancellationToken.None"/> (an independent token — only the connection's response
+    /// closure can end that wait), records the bridge failure, then — after OBSERVING the
+    /// assignment cancellation — holds its unwind in a dedicated gate until released. This is the
+    /// assignment-ownership unwind pattern, applied to a bridge-parked body.
+    /// </summary>
+    private sealed class BridgeThenUnwindRunner : IAgentRunner
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, TaskCompletionSource> _started = [];
+        private readonly Dictionary<string, TaskCompletionSource> _release = [];
+        private readonly Dictionary<string, TaskCompletionSource> _finished = [];
+        private readonly Dictionary<string, TaskCompletionSource> _bridgeFailed = [];
+        private readonly Dictionary<string, TaskCompletionSource> _cancelObserved = [];
+        private readonly TaskCompletionSource _unwindGate =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private string? _taskId;
+
+        internal WorkerService? Service { get; set; }
+
+        /// <summary>The failure the parked bridge wait ended with, once it has ended.</summary>
+        internal InvalidOperationException? ObservedBridgeFailure { get; private set; }
+
+        private TaskCompletionSource Slot(Dictionary<string, TaskCompletionSource> map, string key)
+        {
+            lock (_gate)
+            {
+                if (!map.TryGetValue(key, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    map[key] = tcs;
+                }
+                return tcs;
+            }
+        }
+
+        public Task PromptStarted(string taskId) => Slot(_started, taskId).Task;
+
+        /// <summary>Completes when the bridge wait for this task has FAILED (any outcome).</summary>
+        public Task BridgeFailed(string taskId) => Slot(_bridgeFailed, taskId).Task;
+
+        /// <summary>Releases the parked body gate for this task (teardown failsafe).</summary>
+        public void Release(string taskId) => Slot(_release, taskId).TrySetResult();
+
+        /// <summary>Completes when the body has OBSERVED its assignment token as cancelled.</summary>
+        public Task CancelObserved(string taskId) => Slot(_cancelObserved, taskId).Task;
+
+        /// <summary>Releases the held unwind so the drained body can finish.</summary>
+        public void ReleaseUnwind() => _unwindGate.TrySetResult();
+
+        /// <summary>Teardown failsafe: releases every gate a parked producer could hold.</summary>
+        public void ReleaseAll()
+        {
+            ReleaseUnwind();
+            lock (_gate)
+            {
+                foreach (var tcs in _started.Values) tcs.TrySetResult();
+                foreach (var tcs in _release.Values) tcs.TrySetResult();
+                foreach (var tcs in _bridgeFailed.Values) tcs.TrySetResult();
+                foreach (var tcs in _cancelObserved.Values) tcs.TrySetResult();
+            }
+        }
+
+        public void SetCurrentTaskId(string? taskId) => _taskId = taskId;
+
+        public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+        {
+            var id = _taskId ?? "(unknown)";
+            Slot(_started, id).TrySetResult();
+
+            var bridge = (IToolCallBridge)(Service
+                ?? throw new InvalidOperationException("The runner was not given the service under test."));
+
+            // An INDEPENDENT live token: the assignment's cancellation must not end this wait
+            // directly — only the connection's response closure can.
+            var pending = bridge.GetGoalAsync(id, "goal-unwind", CancellationToken.None);
+            try
+            {
+                _ = await pending;
+            }
+            catch (Exception ex)
+            {
+                ObservedBridgeFailure = ex as InvalidOperationException
+                    ?? new InvalidOperationException("Unexpected bridge failure type.", ex);
+                Slot(_bridgeFailed, id).TrySetResult();
+            }
+
+            // The bridge wait has ended (by the teardown's response closure). The body now parks
+            // on its ASSIGNMENT-bound release gate, so the EOF teardown must CANCEL it — and the
+            // unwind is then HELD until the test releases it, proving the drain waits for the
+            // body before clearing the slot and retiring the connection.
+            try
+            {
+                await Slot(_release, id).Task.WaitAsync(ct);
+                return "unreachable";
+            }
+            catch (OperationCanceledException)
+            {
+                Slot(_cancelObserved, id).TrySetResult();
+                await _unwindGate.Task;
+                throw;
+            }
+            finally
+            {
+                Slot(_finished, id).TrySetResult();
+            }
+        }
+
+        public TestResultReport? LastTestReport => null;
+        public WorkerReport? LastWorkerReport => null;
+        public void ClearTestReport() { }
+        public void ClearWorkerReport() { }
+        public void SetToolBridge(IToolCallBridge? bridge) { }
+        public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
+        public void SetCustomAgent(DomainWorkerRole role, string agentsMdContent) { }
+        public void SetSession(object? session) { }
+        public object? GetSession() => null;
+        public void SetMaxContextTokens(int maxTokens) { }
+        public int GetContextUsagePercent() => 0;
+        public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
+        public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public async Task ResetSessionAsync(
+            string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
+            => await Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
