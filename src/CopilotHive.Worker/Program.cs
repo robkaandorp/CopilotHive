@@ -80,14 +80,19 @@ while (!cts.IsCancellationRequested)
         capabilities: capabilities,
         provisioningEnvironment: provisioningEnvironment);
 
-    var cleanExit = false;
+    // The run's OBSERVED outcome, assigned only from the awaited RunAsync result. It is declared
+    // here (outside the try) so the loop decision below sees exactly what the real call returned:
+    // no reconstructed or defaulted value can stand in for it.
+    WorkerRunOutcome outcome;
 
     try
     {
         try
         {
-            await service.RunAsync(cts.Token);
-            cleanExit = true;
+            // The returned outcome is the REAL result of the run — a rejected registration or an
+            // accepted work stream that ended with the whole lifecycle teardown completing. Either
+            // way this attempt is over and the loop stops; a returned outcome never reconnects.
+            outcome = await service.RunAsync(cts.Token);
         }
         finally
         {
@@ -96,8 +101,24 @@ while (!cts.IsCancellationRequested)
             service.Dispose();
         }
 
-        if (cleanExit)
-            break; // clean exit
+        if (outcome == WorkerRunOutcome.WorkStreamEnded)
+        {
+            // Static and secret-free: the accepted work stream ended and this process is exiting.
+            // Deliberately NOT a reconnect trigger — a returned outcome still exits.
+            Console.WriteLine("[Worker] Work stream ended; the worker is exiting.");
+        }
+        else if (outcome != WorkerRunOutcome.RegistrationRejected)
+        {
+            // An UNKNOWN/unexpected enum value must never silently trigger a retry nor be treated
+            // as a clean outcome. This is an ordinary fatal failure under the existing sanitized
+            // catch below.
+            throw new InvalidOperationException(
+                $"Unexpected worker run outcome: {(int)outcome}.");
+        }
+
+        // The registration-rejection diagnostic is emitted by the service itself. BOTH known
+        // outcomes stop this loop with the same exit code as before: the attempt is over.
+        break;
     }
     catch (OperationCanceledException)
     {
