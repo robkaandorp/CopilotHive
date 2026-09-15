@@ -263,30 +263,41 @@ public sealed class WorkerConnectionLifecycleTests
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
         var runner = new ProvisionerCapturingRunner();
         var streamOpened = 0;
-        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
-        service.CallInvokerFactory = () => invoker;
-        service.WorkStreamFactory = (_, _) =>
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
         {
-            Interlocked.Increment(ref streamOpened);
-            throw new InvalidOperationException("No stream may be opened for a rejected registration.");
-        };
+            service.CallInvokerFactory = () => invoker;
+            service.WorkStreamFactory = (_, _) =>
+            {
+                Interlocked.Increment(ref streamOpened);
+                throw new InvalidOperationException("No stream may be opened for a rejected registration.");
+            };
 
-        await service.RunAsync(TestContext.Current.CancellationToken);
+            await service.RunAsync(TestContext.Current.CancellationToken);
 
-        Assert.Null(GetPublishedConnection(service));
-        Assert.Equal(0, streamOpened);
-        Assert.Null(runner.ConfigProvisioner);
-        Assert.Equal(1, invoker.RegisterCalls);
-        Assert.Equal(0, invoker.WorkerConfigCalls);
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(0, streamOpened);
+            Assert.Null(runner.ConfigProvisioner);
+            Assert.Equal(1, invoker.RegisterCalls);
+            Assert.Equal(0, invoker.WorkerConfigCalls);
 
-        // Nothing usable was published, so access fails with the EXISTING error category.
-        var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
+            // Nothing usable was published, so access fails with the EXISTING error category.
+            var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
 
-        var sendFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.ReportProgressAsync("t", "s", "d", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, sendFailure.Message);
+            var sendFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ReportProgressAsync("t", "s", "d", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, sendFailure.Message);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -1448,26 +1459,37 @@ public sealed class WorkerConnectionLifecycleTests
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
         invoker.SessionToReturn = new GetSessionResponse { Found = true, SessionJson = "{\"turn\":7}" };
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        var loaded = await service.GetSessionAsync("goal-1:coder", TestContext.Current.CancellationToken);
-        Assert.Equal("{\"turn\":7}", loaded);
-        Assert.Equal(1, invoker.GetSessionCalls);
-        Assert.Equal("goal-1:coder", invoker.LastGetSessionId);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker);
 
-        await service.SaveSessionAsync("goal-1:coder", "{\"turn\":8}", TestContext.Current.CancellationToken);
-        Assert.Equal(1, invoker.SaveSessionCalls);
-        Assert.Equal("goal-1:coder", invoker.LastSaveSessionId);
-        Assert.Equal("{\"turn\":8}", invoker.LastSaveSessionJson);
+            var loaded = await service.GetSessionAsync("goal-1:coder", TestContext.Current.CancellationToken);
+            Assert.Equal("{\"turn\":7}", loaded);
+            Assert.Equal(1, invoker.GetSessionCalls);
+            Assert.Equal("goal-1:coder", invoker.LastGetSessionId);
 
-        // A not-found response loads as null — absence is not an error.
-        invoker.SessionToReturn = new GetSessionResponse { Found = false };
-        Assert.Null(await service.GetSessionAsync("missing:role", TestContext.Current.CancellationToken));
+            await service.SaveSessionAsync("goal-1:coder", "{\"turn\":8}", TestContext.Current.CancellationToken);
+            Assert.Equal(1, invoker.SaveSessionCalls);
+            Assert.Equal("goal-1:coder", invoker.LastSaveSessionId);
+            Assert.Equal("{\"turn\":8}", invoker.LastSaveSessionJson);
 
-        // Both RPCs went through THIS connection's client (one client per connection).
-        Assert.NotNull(connection.Client);
-        Assert.Equal(2, invoker.GetSessionCalls);
+            // A not-found response loads as null — absence is not an error.
+            invoker.SessionToReturn = new GetSessionResponse { Found = false };
+            Assert.Null(await service.GetSessionAsync("missing:role", TestContext.Current.CancellationToken));
+
+            // Both RPCs went through THIS connection's client (one client per connection).
+            Assert.NotNull(connection.Client);
+            Assert.Equal(2, invoker.GetSessionCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -1486,19 +1508,30 @@ public sealed class WorkerConnectionLifecycleTests
             LlmProvider = "copilot",
         };
 
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(
-            service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // A NULL provisioner override, so the connection built the PRODUCTION provisioner.
-        Assert.NotNull(connection.Provisioner);
-        await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(
+                service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
 
-        Assert.Equal(1, invoker.WorkerConfigCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+            // A NULL provisioner override, so the connection built the PRODUCTION provisioner.
+            Assert.NotNull(connection.Provisioner);
+            await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
 
-        // The provisioned token is forwarded out of the response.
-        Assert.Equal("ghp_provisioned_by_orchestrator", connection.Provisioner.ResolveConfigRepoCredential());
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+
+            // The provisioned token is forwarded out of the response.
+            Assert.Equal("ghp_provisioned_by_orchestrator", connection.Provisioner.ResolveConfigRepoCredential());
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -1510,21 +1543,32 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task ProductionProvisioningPath_FailsDisconnectedAfterRetirement_WithoutTransport()
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(
-            service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // A live fetch reaches the fake client once and carries the ASSIGNED identity.
-        await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
-        Assert.Equal(1, invoker.WorkerConfigCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(
+                service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
 
-        // A NEW fetch after retirement fails disconnected BEFORE starting transport.
-        connection.Retire();
-        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
-        Assert.Equal(1, invoker.WorkerConfigCalls);
+            // A live fetch reaches the fake client once and carries the ASSIGNED identity.
+            await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+
+            // A NEW fetch after retirement fails disconnected BEFORE starting transport.
+            connection.Retire();
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -1537,36 +1581,47 @@ public sealed class WorkerConnectionLifecycleTests
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
         var requests = new RecordingRequestStream();
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker, writer: requests);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        connection.Retire();
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker, writer: requests);
 
-        var ensure = Assert.Throws<InvalidOperationException>(() => connection.EnsureUsable());
-        Assert.Equal(WorkerConnection.DisconnectedMessage, ensure.Message);
+            connection.Retire();
 
-        var fetch = await Assert.ThrowsAsync<InvalidOperationException>(() => connection.FetchWorkerConfigAsync(
-            new GetWorkerConfigRequest { WorkerId = connection.AssignedId },
-            TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, fetch.Message);
+            var ensure = Assert.Throws<InvalidOperationException>(() => connection.EnsureUsable());
+            Assert.Equal(WorkerConnection.DisconnectedMessage, ensure.Message);
 
-        var load = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, load.Message);
+            var fetch = await Assert.ThrowsAsync<InvalidOperationException>(() => connection.FetchWorkerConfigAsync(
+                new GetWorkerConfigRequest { WorkerId = connection.AssignedId },
+                TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, fetch.Message);
 
-        var save = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.SaveSessionAsync("goal:role", "{}", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, save.Message);
+            var load = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, load.Message);
 
-        var send = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.ReportNarrativeAsync("t", "n", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, send.Message);
+            var save = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.SaveSessionAsync("goal:role", "{}", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, save.Message);
 
-        // NO transport was ever started for the retired connection.
-        Assert.Equal(0, invoker.GetSessionCalls);
-        Assert.Equal(0, invoker.SaveSessionCalls);
-        Assert.Equal(0, invoker.WorkerConfigCalls);
-        Assert.Empty(requests.Writes);
+            var send = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ReportNarrativeAsync("t", "n", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, send.Message);
+
+            // NO transport was ever started for the retired connection.
+            Assert.Equal(0, invoker.GetSessionCalls);
+            Assert.Equal(0, invoker.SaveSessionCalls);
+            Assert.Equal(0, invoker.WorkerConfigCalls);
+            Assert.Empty(requests.Writes);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -1578,31 +1633,42 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task HeartbeatTick_ForwardsConnectionIdentityAndTaskState_AndSkipsWhenRetired()
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker, assignedId: AssignedWorkerId);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // Idle: no current task, so Busy is false and the state fields are empty.
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(1, invoker.HeartbeatCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
-        Assert.False(invoker.LastHeartbeatBusy);
-        Assert.Equal(string.Empty, invoker.LastHeartbeatTaskId);
-        Assert.Equal(string.Empty, invoker.LastHeartbeatRole);
-        Assert.Equal(0, invoker.LastHeartbeatContextUsage);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker, assignedId: AssignedWorkerId);
 
-        // Busy: the tick reflects the task state AT the tick.
-        SetCurrentTaskState(service, taskId: "task-hb", role: "coder");
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(2, invoker.HeartbeatCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
-        Assert.True(invoker.LastHeartbeatBusy);
-        Assert.Equal("task-hb", invoker.LastHeartbeatTaskId);
-        Assert.Equal("coder", invoker.LastHeartbeatRole);
+            // Idle: no current task, so Busy is false and the state fields are empty.
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(1, invoker.HeartbeatCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
+            Assert.False(invoker.LastHeartbeatBusy);
+            Assert.Equal(string.Empty, invoker.LastHeartbeatTaskId);
+            Assert.Equal(string.Empty, invoker.LastHeartbeatRole);
+            Assert.Equal(0, invoker.LastHeartbeatContextUsage);
 
-        // RETIRED: checked access comes first, so no heartbeat RPC is issued at all.
-        connection.Retire();
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(2, invoker.HeartbeatCalls);
+            // Busy: the tick reflects the task state AT the tick.
+            SetCurrentTaskState(service, taskId: "task-hb", role: "coder");
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(2, invoker.HeartbeatCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
+            Assert.True(invoker.LastHeartbeatBusy);
+            Assert.Equal("task-hb", invoker.LastHeartbeatTaskId);
+            Assert.Equal("coder", invoker.LastHeartbeatRole);
+
+            // RETIRED: checked access comes first, so no heartbeat RPC is issued at all.
+            connection.Retire();
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(2, invoker.HeartbeatCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>

@@ -706,6 +706,30 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// </list>
     /// No polling, sleeps, or Task-internal inspection is used.
     /// </para>
+    /// <para>
+    /// RESIDUAL — stated plainly rather than claimed away. The pre-release discriminators fire only
+    /// if the mutant's handler has REACHED B's session reset by the time they run. Because the
+    /// dispatch rendezvous cannot force the async-iterator boundary to be traversed synchronously
+    /// (see <see cref="InlineDispatchResponseReader"/>), a legal queued-continuation schedule exists
+    /// in which a fire-and-forget (`_ = DrainRetainedForReplacementAsync()`) mutant has not yet
+    /// entered B's handler at that instant. On that schedule the pre-release checks are vacuously
+    /// satisfied and only the post-release consequence assertions remain as evidence.
+    /// </para>
+    /// <para>
+    /// WHAT THAT MUTANT CAN STILL VIOLATE. A detached drain genuinely breaks a stated production
+    /// contract — "ownership is cleared only AFTER the original execution joined" — because its
+    /// continuation can clear the slot after B was installed. The post-release assertions below
+    /// (slot occupancy, owner task id after a further consumed probe) target exactly that
+    /// consequence, and in practice they catch it. What cannot be offered here is a
+    /// SCHEDULE-INDEPENDENT proof: the continuation may also resume at a moment when clearing is
+    /// unobservable to this fixture.
+    /// </para>
+    /// <para>
+    /// THE SINGLE BINDING CONSTRAINT is the no-new-production-seam rule for this goal. A
+    /// production-visible signal at the drain/clear boundary would make the ordering directly
+    /// observable and close the residual; sleeps, polling and reflection are likewise forbidden and
+    /// are deliberately NOT used to approximate one.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Replacement_DrainsPriorOwnerThenInstallsFreshEmptyResultHolder()
@@ -803,6 +827,18 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             CapturePreRelease(() => Assert.Equal(taskA, GetActiveTaskId(service)));
             CapturePreRelease(() => Assert.Same(resultA, GetRetainedResult(service)));
             CapturePreRelease(() => Assert.Equal(1, runner.ResetCount));
+
+            // B IS NOT INSTALLED — asserted directly, not merely implied by A still owning the slot.
+            // The slot holds exactly one owner and that owner is NOT B, so the handler cannot have
+            // reached InstallActiveAssignment for B while A's ORIGINAL execution is still running.
+            CapturePreRelease(() => Assert.Equal(1, GetSlotOccupancy(service)));
+            CapturePreRelease(() => Assert.NotEqual(taskB, GetActiveTaskId(service)));
+
+            // NOR HAS B'S EXECUTION BODY BEGUN ANY WORK. The executor's first act is to take the
+            // tool bridge (ExecutionEntryCount) and the prompt is what PromptCount counts, so both
+            // staying at A's single entry proves no part of B's body ran ahead of the drain.
+            CapturePreRelease(() => Assert.Equal(1, runner.ExecutionEntryCount));
+            CapturePreRelease(() => Assert.Equal(1, runner.PromptCount));
 
             // THE POSITIVE PRE-RELEASE DISCRIMINATOR. B's session reset is the FIRST production step
             // after the replacement drain. The test does NOT pre-release the reset gate and does NOT
