@@ -711,7 +711,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         // can release the reset gate that a parked handler may still be waiting on.
         Task? executionA = null;
         Task? executionB = null;
-        var bResetRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bResetRelease = new TaskCompletionSource();
+        List<Exception> preReleaseFailures = [];
         try
         {
             responses.Push(ResultAssignment(taskA));
@@ -742,7 +743,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 TaskCreationOptions.RunContinuationsAsynchronously);
             var aJoinedAtBPromptEntry = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            runner.ResetGate = bResetRelease.Task;
+            runner.ResetGate = bResetRelease;
             runner.OnResetEntered = _ =>
             {
                 if (runner.ResetCount >= 2)
@@ -776,16 +777,30 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             // A's ORIGINAL body is provably still running, so the handler must still own A: it may
             // not reset the runner, start B, or install B's owner yet.
-            Assert.False(executionA.IsCompleted, "A's body must still be unwinding while its drain is parked.");
-            Assert.False(runner.HasPromptStarted(taskB), "B must not start while A's original body is still running.");
-            Assert.False(responses.Consumed(4).IsCompleted, "The loop must still be parked inside B's handler.");
-            Assert.Same(ownerA, GetActiveAssignment(service));
-            Assert.Equal(taskA, GetActiveTaskId(service));
-            Assert.Same(resultA, GetRetainedResult(service));
-            Assert.Equal(1, runner.ResetCount);
+            CapturePreRelease(() =>
+                Assert.False(executionA.IsCompleted, "A's body must still be unwinding while its drain is parked."));
+            CapturePreRelease(() =>
+                Assert.False(runner.HasPromptStarted(taskB), "B must not start while A's original body is still running."));
+            CapturePreRelease(() =>
+                Assert.False(responses.Consumed(4).IsCompleted, "The loop must still be parked inside B's handler."));
+            CapturePreRelease(() => Assert.Same(ownerA, GetActiveAssignment(service)));
+            CapturePreRelease(() => Assert.Equal(taskA, GetActiveTaskId(service)));
+            CapturePreRelease(() => Assert.Same(resultA, GetRetainedResult(service)));
+            CapturePreRelease(() => Assert.Equal(1, runner.ResetCount));
 
-            // Release A's Ready write: only now can A's ORIGINAL execution terminate, the drain
-            // join, and the handler proceed to B's session reset — where it parks on the gate.
+            // Pre-release B's reset gate. Correct production has not reached it yet because it is
+            // awaiting A. A removed/not-awaited drain has reached the reset; completing this
+            // synchronous gate drives that handler through body creation and owner installation
+            // while A remains parked, which sets up the detached drain's observable consequence.
+            bResetRelease.TrySetResult();
+            if (GetActiveAssignment(service) is not null
+                && string.Equals(GetActiveTaskId(service), taskB, StringComparison.Ordinal))
+            {
+                executionB = GetActiveExecution(service);
+            }
+
+            // Release A's Ready write: only now can A's ORIGINAL execution terminate, the awaited
+            // drain join in correct code, or the detached drain's later ownership clear.
             requests.ReleaseReady(0);
 
             // THE DETERMINISTIC RENDEZVOUS. BOTH a correct handler and a drain-less one reach B's
@@ -794,10 +809,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // drain reaches the reset while A is still parked in its Ready write and records
             // `false`.
             await bResetReached.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            Assert.True(
-                await aJoinedAtBReset.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
+            var joinedAtReset = await aJoinedAtBReset.Task.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+            CapturePreRelease(() => Assert.True(
+                joinedAtReset,
                 "B's session reset ran before A's original execution was joined — the replacement "
-                + "drain did not run or was not awaited.");
+                + "drain did not run or was not awaited."));
 
             // A's ORIGINAL execution is now genuinely terminal, which is the precondition for the
             // detached-drain checks below.
@@ -806,36 +823,35 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 executionA.IsCompleted,
                 "A's original execution must be terminal once its Ready write was released.");
 
-            // Let B's handler continue past the reset.
-            bResetRelease.TrySetResult();
+            // B's reset gate was pre-released above. Await positive evidence that the real handler
+            // attempted B and its body entered.
             await runner.PromptStarted(taskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // The same ordering holds at B's own prompt entry.
-            Assert.True(
-                await aJoinedAtBPromptEntry.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
+            // The same ordering holds at B's own prompt entry. Record any failure so the test can
+            // still reach and inspect the detached drain's production-visible consequence.
+            var joinedAtPrompt = await aJoinedAtBPromptEntry.Task.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+            CapturePreRelease(() => Assert.True(
+                joinedAtPrompt,
                 "B's body started before A's original execution was joined — the replacement drain "
-                + "did not run or was not awaited.");
+                + "did not run or was not awaited."));
+
+            // A following message boundary proves B's real handler completed owner installation.
+            responses.Push(Probe("B-installed"));
+            await responses.Consumed(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // THE DETACHED-DRAIN CONSEQUENCE, observed directly. B's handler has now provably been
-            // ENTERED (its reset ran and its prompt started) and A's ORIGINAL execution is terminal,
-            // so a replacement drain that was started but NOT awaited has everything it needs to
-            // resume — and when it does it clears whatever the ownership slot holds, which by then
-            // is B's owner. A correct implementation awaited that drain BEFORE installing B, so
-            // nothing can clear B here. Both facts are asserted: the slot still holds B, and B's
-            // body is still alive.
+            // attempted, B is installed, and A's ORIGINAL execution is terminal. A detached drain
+            // that resumes after A therefore clears B's ownership. Correct production has no such
+            // detached continuation: the slot still holds B and B's body is alive.
             Assert.Equal(1, GetSlotOccupancy(service));
-            Assert.Equal(
-                taskB,
-                GetActiveTaskId(service));
+            Assert.Equal(taskB, GetActiveTaskId(service));
             Assert.False(
                 runner.PromptCompleted(taskB),
                 "B's body must still be running while the test holds its prompt gate.");
 
-            // A has now drained and B is executing, but B has not produced a result.  A following
-            // message boundary proves B's owner was installed before inspecting its fresh holder.
-            responses.Push(Probe("B-installed"));
-            await responses.Consumed(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(taskB, GetActiveTaskId(service));
+            executionB ??= GetActiveExecution(service);
             Assert.NotSame(ownerA, GetActiveAssignment(service));
             Assert.Null(GetRetainedResult(service));
             Assert.Equal(2, runner.ResetCount);
@@ -871,6 +887,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.Equal(2, runner.ExecutionEntryCount);
             Assert.Equal(2, runner.PromptCount);
 
+            if (preReleaseFailures.Count == 1)
+                throw preReleaseFailures[0];
+            if (preReleaseFailures.Count > 1)
+                throw new AggregateException("Replacement ordering failed before A was released.", preReleaseFailures);
+
             responses.TryComplete();
             await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
         }
@@ -888,6 +909,18 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 ("assignment body B", executionB),
                 ("loop", loop));
             TryDelete(root);
+        }
+
+        void CapturePreRelease(Action assertion)
+        {
+            try
+            {
+                assertion();
+            }
+            catch (Exception ex)
+            {
+                preReleaseFailures.Add(ex);
+            }
         }
     }
 
@@ -2301,7 +2334,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         /// the reset, it records the state AT THAT INSTANT and then waits, so a test can take its
         /// observations and release the gate afterwards without the two racing.
         /// </summary>
-        internal Task? ResetGate { get; set; }
+        internal TaskCompletionSource? ResetGate { get; set; }
 
         internal bool HasPromptStarted(string taskId)
         {
@@ -2334,6 +2367,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             lock (_gate)
             {
                 _teardown = true;
+                ResetGate?.TrySetResult();
                 foreach (var source in _release.Values) source.TrySetResult();
             }
         }
@@ -2343,11 +2377,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             var taskId = _taskId ?? throw new InvalidOperationException("Task ID was not set.");
             Interlocked.Increment(ref _promptCount);
 
-            // The ordering capture runs at ENTRY, before this body can park or be released.
-            OnPromptEntered?.Invoke(taskId);
-
-            // RECORD THIS INVOCATION DURABLY, at entry, so teardown can join it even if it started
-            // after the sweep and even if the ownership slot never exposes it.
+            // RECORD THIS INVOCATION DURABLY before any observer can throw, so every invocation
+            // that entered the runner remains visible to teardown.
             var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Task release;
             lock (_gate)
@@ -2360,6 +2391,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             try
             {
+                // The ordering capture runs at ENTRY, before this body can park or be released.
+                OnPromptEntered?.Invoke(taskId);
                 await release.WaitAsync(ct);
                 return output(taskId);
             }
@@ -2413,10 +2446,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // a fixed point the test controls rather than racing the test's own observations. The
             // TEARDOWN LATCH suppresses the park entirely, so a reset that is reached after the
             // sweep cannot hold a late-started assignment open.
-            bool teardown;
-            lock (_gate) teardown = _teardown;
+            Task? gate;
+            lock (_gate)
+            {
+                if (_teardown)
+                    ResetGate?.TrySetResult();
+                gate = ResetGate?.Task;
+            }
 
-            if (!teardown && ResetGate is { } gate)
+            if (gate is not null)
                 await gate.WaitAsync(ct);
         }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
