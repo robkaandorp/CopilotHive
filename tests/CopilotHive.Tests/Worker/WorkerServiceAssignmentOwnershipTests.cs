@@ -700,9 +700,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     ///   correct code cannot have reached it — it is parked in the drain awaiting A.</description></item>
     ///   <item><description>AT THE RESET AND PROMPT BOUNDARIES: each captures whether A's ORIGINAL
     ///   execution was already complete at that exact production instant.</description></item>
-    ///   <item><description>POST-RELEASE CONSEQUENCE: once A is terminal, a detached drain resumes
-    ///   and clears the slot it finds — which is B's — so the slot still holding B, with B's body
-    ///   alive, is what correct code alone produces.</description></item>
+    ///   <item><description>POST-RELEASE CONSEQUENCE: if a detached drain resumes after B is
+    ///   installed, it clears B's slot. The fixture therefore asserts that the slot still holds B
+    ///   while B's body is alive; as documented below, this targets but cannot force that schedule.</description></item>
     /// </list>
     /// No polling, sleeps, or Task-internal inspection is used.
     /// </para>
@@ -727,8 +727,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// <para>
     /// THE SINGLE BINDING CONSTRAINT is the no-new-production-seam rule for this goal. A
     /// production-visible signal at the drain/clear boundary would make the ordering directly
-    /// observable and close the residual; sleeps, polling and reflection are likewise forbidden and
-    /// are deliberately NOT used to approximate one.
+    /// observable and close the residual; sleeps, polling, and async-state-machine/continuation-field
+    /// reflection are likewise forbidden and are deliberately NOT used to approximate one.
     /// </para>
     /// </summary>
     [Fact]
@@ -900,10 +900,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             responses.Push(Probe("B-installed"));
             await responses.Consumed(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE DETACHED-DRAIN CONSEQUENCE, observed directly. B's handler has now provably been
-            // attempted, B is installed, and A's ORIGINAL execution is terminal. A detached drain
-            // that resumes after A therefore clears B's ownership. Correct production has no such
-            // detached continuation: the slot still holds B and B's body is alive.
+            // THE DETACHED-DRAIN CONSEQUENCE TARGET. B's handler has now provably been attempted,
+            // B is installed, and A's ORIGINAL execution is terminal. If a detached drain resumes
+            // during this window it clears B's ownership; the assertions below reject that outcome.
+            // They do not force the detached continuation to run in this window (the documented
+            // no-seam residual), while correct production has no detached continuation at all.
             Assert.Equal(1, GetSlotOccupancy(service));
             Assert.Equal(taskB, GetActiveTaskId(service));
             Assert.False(
@@ -917,11 +918,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.Equal(2, runner.ResetCount);
             Assert.True(executionA.IsCompleted, "A's original execution must be joined before B is installed.");
 
-            // NO STRAY DRAIN MAY STILL BE IN FLIGHT. A's execution is terminal by now, so a
-            // replacement drain that was started but NOT awaited would have resumed and cleared the
-            // ownership slot — the slot it finds is B's, which it would wrongly empty. The boundary
-            // below is the loop's own consumption of another probe: after it, the slot must STILL
-            // hold B. This is what makes a fire-and-forget drain observable without polling.
+            // NO OBSERVED STRAY DRAIN MAY CLEAR B. A's execution is terminal by now, so any detached
+            // replacement drain that resumes after B's install wrongly empties B's slot. The loop's
+            // consumption of another probe is a real message-loop boundary; after it, B must STILL
+            // own the slot. This strengthens the consequence check without claiming the probe is a
+            // rendezvous with an independently scheduled detached continuation.
             responses.Push(Probe("no-stray-drain"));
             await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(
@@ -3392,8 +3393,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             foreach (var waiter in consumedReady)
                 waiter.TrySetResult();
 
-            // Deliberately NOT RunContinuationsAsynchronously: this is the fixture's dispatch
-            // rendezvous. Production resumes inline and runs until its next incomplete await.
+            // Deliberately NOT RunContinuationsAsynchronously: this synchronously completes the
+            // underlying reader wait. The ReadMessages async iterator may resume inline, but the
+            // runtime need not traverse its MoveNextAsync/outer await-foreach boundary before this
+            // call returns; the remarks above state that residual explicitly.
             pending.SetResult(true);
         }
 
