@@ -10,11 +10,10 @@ using CopilotHive.Workers;
 using Grpc.Core;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-using System.Threading.Channels;
+using System.Runtime.ExceptionServices;
 
 using Moq;
 
@@ -39,8 +38,31 @@ namespace CopilotHive.Tests;
 /// </para>
 /// </summary>
 /// <remarks>
-/// Every vector uses a real <c>WorkStream</c>, deterministic signals (the production log lines and
-/// the notifier itself) and BOUNDED waits — no sleeps and no live dependencies.
+/// <para>
+/// THE THREE TOPOLOGY RULES EVERY VECTOR HERE OBEYS, because the evidence is worthless without
+/// them:
+/// </para>
+/// <list type="number">
+///   <item><description>ONE NOTIFIER, REAL DOWNSTREAM. The transport and the real
+///     <see cref="GoalDispatcher"/> share a SINGLE <see cref="TaskCompletionNotifier"/>, and the
+///     dispatcher is the LAST subscriber — so production's own <c>NotifyAsync</c> AWAITS the real
+///     <see cref="GoalDispatcher.HandleTaskCompletionAsync"/> chain. Downstream evidence is read
+///     from the REAL <c>TaskCompletionService</c> log lines, never from a test-owned
+///     counter.</description></item>
+///   <item><description>PUBLICATION IS OBSERVED AT THE gRPC WRITER. The real <c>WorkStream</c>
+///     pump is the ONLY consumer of the worker's message channel; a publication is observed where
+///     the pump forwards it — at the <see cref="IServerStreamWriter{T}"/> — so no test reader ever
+///     races the production pump.</description></item>
+///   <item><description>EVERY REFUSAL IS BARRIERED AND THE STREAM IS STRICTLY JOINED. A refusal is
+///     only asserted after a POST-HANDLER BARRIER proves the handler RETURNED (see
+///     <see cref="Harness.BarrierAsync"/>), and the shared teardown joins the producer with a
+///     bound where a timeout or a terminal fault is a TEST FAILURE. Deleting an early return
+///     therefore cannot hide behind a swallowed fault.</description></item>
+/// </list>
+/// <para>
+/// No sleeps, no live dependencies, no fire-and-forget producers: every started task is retained
+/// and joined.
+/// </para>
 /// </remarks>
 public sealed class CompletionTransportOwnershipTests
 {
@@ -49,30 +71,72 @@ public sealed class CompletionTransportOwnershipTests
 
     private const string WorkerId = "ownership-worker";
 
+    /// <summary>
+    /// THE ONE LIFECYCLE every vector runs through: the body, then the harness's SHARED STRICT
+    /// teardown, on EVERY path.
+    /// </summary>
+    /// <remarks>
+    /// THE PRIMARY FAILURE STAYS AUTHORITATIVE: the body's exception is rethrown UNCHANGED (via
+    /// <see cref="ExceptionDispatchInfo"/>, so its message and stack survive), and the teardown's
+    /// own outcome is surfaced only when the body SUCCEEDED. A cleanup failure is therefore never
+    /// swallowed and never replaces the assertion the reviewer needs to see.
+    /// </remarks>
+    /// <param name="harness">The harness whose strict teardown must run.</param>
+    /// <param name="body">The vector's assertions.</param>
+    private static async Task RunAsync(Harness harness, Func<Task> body)
+    {
+        ExceptionDispatchInfo? primary = null;
+        try
+        {
+            await body();
+        }
+        catch (Exception ex)
+        {
+            primary = ExceptionDispatchInfo.Capture(ex);
+        }
+
+        // THE STRICT TEARDOWN RUNS ON EVERY PATH and never throws — it reports instead.
+        var cleanupFailure = await harness.StopAsync();
+
+        primary?.Throw();
+
+        if (cleanupFailure is not null)
+            throw cleanupFailure;
+
+        // THE PRODUCER POST-CONDITION, asserted for every green vector: nothing is left live.
+        Assert.True(harness.StreamEnded, "the WorkStream producer is still live after teardown");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // (1) THE ACCEPTED COMPLETION — the positive control
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// VALID ACTIVE OWNERSHIP IS ACCEPTED: the worker is released, its model cleared, that exact
-    /// active entry removed, and exactly one completion notified.
+    /// active entry removed, and the completion genuinely reaches the REAL downstream dispatcher.
     /// </summary>
     [Fact]
     public async Task Completion_WithValidActiveOwnership_ReleasesAndNotifies()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-valid", model: "assigned-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-valid", model: "assigned-model");
 
-        var result = await h.CompleteAndAwaitNotificationAsync("task-valid");
+            var result = await h.CompleteAndAwaitDownstreamAsync("task-valid");
 
-        Assert.Equal("task-valid", result.TaskId);
-        Assert.Equal("assigned-model", result.Model);
+            Assert.Equal("task-valid", result.TaskId);
+            Assert.Equal("assigned-model", result.Model);
 
-        Assert.False(h.Worker.IsBusy);
-        Assert.Null(h.Worker.CurrentTaskId);
-        Assert.Null(h.Worker.CurrentModel);
-        Assert.Null(h.Queue.GetActiveTask("task-valid"));
-        Assert.Equal(1, h.NotificationCount);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Null(h.Worker.CurrentModel);
+            Assert.Null(h.Queue.GetActiveTask("task-valid"));
+
+            // THE REAL DOWNSTREAM CHAIN RAN — evidence from the production TaskCompletionService
+            // log line, not from a test counter.
+            Assert.Equal(1, h.DownstreamHandledCount("task-valid"));
+        });
     }
 
     /// <summary>
@@ -82,13 +146,16 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_ExplicitEmptyModel_BeatsQueueFallback()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-explicit-empty", model: "queue-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-explicit-empty", model: "queue-model");
 
-        var result = await h.CompleteAndAwaitNotificationAsync(
-            "task-explicit-empty", model: "", modelPresent: true);
+            var result = await h.CompleteAndAwaitDownstreamAsync(
+                "task-explicit-empty", model: "", modelPresent: true);
 
-        Assert.Equal("", result.Model);
+            Assert.Equal("", result.Model);
+        });
     }
 
     /// <summary>
@@ -98,12 +165,15 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_AbsentModel_UsesValidatedQueueEntryModel()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-absent-model", model: "queue-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-absent-model", model: "queue-model");
 
-        var result = await h.CompleteAndAwaitNotificationAsync("task-absent-model");
+            var result = await h.CompleteAndAwaitDownstreamAsync("task-absent-model");
 
-        Assert.Equal("queue-model", result.Model);
+            Assert.Equal("queue-model", result.Model);
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -112,24 +182,27 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// A MISSING ACTIVE ENTRY is refused: the worker really owns the task, but the queue does not,
-    /// so nothing is released and nothing is notified.
+    /// so nothing is released, nothing is notified and the handler RETURNS cleanly.
     /// </summary>
     [Fact]
     public async Task Completion_WithoutActiveQueueEntry_IsIgnored()
     {
-        await using var h = Harness.Create();
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            // Pool ownership WITHOUT queue activation.
+            h.Pool.MarkBusy(WorkerId, "task-unqueued");
+            h.Worker.CurrentModel = "assigned-model";
 
-        // Pool ownership WITHOUT queue activation.
-        h.Pool.MarkBusy(WorkerId, "task-unqueued");
-        h.Worker.CurrentModel = "assigned-model";
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-unqueued", HiveOrchestratorService.OwnershipRefusalReasons.NoActiveQueueEntry);
 
-        await h.CompleteAndAwaitIgnoredAsync(
-            "task-unqueued", HiveOrchestratorService.OwnershipRefusalReasons.NoActiveQueueEntry);
-
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-unqueued", h.Worker.CurrentTaskId);
-        Assert.Equal("assigned-model", h.Worker.CurrentModel);
-        Assert.Equal(0, h.NotificationCount);
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-unqueued", h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-unqueued"));
+        });
     }
 
     /// <summary>
@@ -139,20 +212,24 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_WithForeignAssignedWorker_IsIgnored()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-foreign", model: "assigned-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-foreign", model: "assigned-model");
 
-        // The queue's ownership moves to somebody else while the pool still names this worker.
-        h.Queue.MarkActive("task-foreign", "another-worker");
+            // The queue's ownership moves to somebody else while the pool still names this worker.
+            h.Queue.MarkActive("task-foreign", "another-worker");
 
-        await h.CompleteAndAwaitIgnoredAsync(
-            "task-foreign", HiveOrchestratorService.OwnershipRefusalReasons.ForeignAssignedWorker);
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-foreign", HiveOrchestratorService.OwnershipRefusalReasons.ForeignAssignedWorker);
 
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-foreign", h.Worker.CurrentTaskId);
-        Assert.Equal("assigned-model", h.Worker.CurrentModel);
-        Assert.NotNull(h.Queue.GetActiveTask("task-foreign"));
-        Assert.Equal(0, h.NotificationCount);
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-foreign", h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-foreign"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-foreign"));
+        });
     }
 
     /// <summary>
@@ -168,29 +245,32 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_StaleTaskWhileSuccessorHoldsDistinctTask_IsIgnoredAndSuccessorSurvives()
     {
-        await using var h = Harness.Create();
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            // The successor the worker is now executing.
+            h.Assign("task-successor", model: "successor-model");
 
-        // The successor the worker is now executing.
-        h.Assign("task-successor", model: "successor-model");
+            // The predecessor's own active entry — assigned to THIS SAME worker, so the queue-side
+            // checks all pass and only the pool's ownership can refuse the delivery.
+            var predecessor = h.BuildTask("task-predecessor", "predecessor-model");
+            h.Queue.Activate(predecessor, WorkerId);
+            Assert.Equal(
+                WorkerId, h.Queue.GetActiveTask("task-predecessor")!.Metadata["assigned_worker"]);
 
-        // The predecessor's own active entry — assigned to THIS SAME worker, so the queue-side
-        // checks all pass and only the pool's ownership can refuse the delivery.
-        var predecessor = h.BuildTask("task-predecessor", "predecessor-model");
-        h.Queue.Activate(predecessor, WorkerId);
-        Assert.Equal(
-            WorkerId, h.Queue.GetActiveTask("task-predecessor")!.Metadata["assigned_worker"]);
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-predecessor",
+                HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
 
-        await h.CompleteAndAwaitIgnoredAsync(
-            "task-predecessor",
-            HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
-
-        // The successor's ownership is untouched, and the predecessor's entry survives too.
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-successor", h.Worker.CurrentTaskId);
-        Assert.Equal("successor-model", h.Worker.CurrentModel);
-        Assert.NotNull(h.Queue.GetActiveTask("task-successor"));
-        Assert.NotNull(h.Queue.GetActiveTask("task-predecessor"));
-        Assert.Equal(0, h.NotificationCount);
+            // The successor's ownership is untouched, and the predecessor's entry survives too.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-successor", h.Worker.CurrentTaskId);
+            Assert.Equal("successor-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-successor"));
+            Assert.NotNull(h.Queue.GetActiveTask("task-predecessor"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-predecessor"));
+        });
     }
 
     /// <summary>
@@ -201,19 +281,23 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_FromWorkerThatIsNoLongerBusy_IsIgnored()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-released", model: "assigned-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-released", model: "assigned-model");
 
-        // The pool-side ownership is released while the queue entry survives.
-        h.Pool.MarkIdle(WorkerId);
-        Assert.False(h.Worker.IsBusy);
-        Assert.NotNull(h.Queue.GetActiveTask("task-released"));
+            // The pool-side ownership is released while the queue entry survives.
+            h.Pool.MarkIdle(WorkerId);
+            Assert.False(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-released"));
 
-        await h.CompleteAndAwaitIgnoredAsync(
-            "task-released", HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-released", HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
 
-        Assert.NotNull(h.Queue.GetActiveTask("task-released"));
-        Assert.Equal(0, h.NotificationCount);
+            Assert.NotNull(h.Queue.GetActiveTask("task-released"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-released"));
+        });
     }
 
     /// <summary>
@@ -224,33 +308,39 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_MappingFailure_RetainsOwnershipAndThenReadyIsIgnored()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-unmappable", model: "assigned-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-unmappable", model: "assigned-model");
 
-        // An UNKNOWN wire status: GrpcMapper.ToDomain throws for it.
-        await h.CompleteAndAwaitMappingFailureAsync(
-            "task-unmappable", (CopilotHive.Shared.Grpc.TaskStatus)9999);
+            // An UNKNOWN wire status: GrpcMapper.ToDomain throws for it. The helper barriers on a
+            // following Progress message, so a returned call proves the handler RETURNED rather
+            // than unwinding the read loop.
+            await h.CompleteAndAwaitMappingFailureAsync(
+                "task-unmappable", (CopilotHive.Shared.Grpc.TaskStatus)9999);
 
-        // NOTHING WAS RELEASED, REMOVED OR NOTIFIED.
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-unmappable", h.Worker.CurrentTaskId);
-        Assert.Equal("assigned-model", h.Worker.CurrentModel);
-        Assert.NotNull(h.Queue.GetActiveTask("task-unmappable"));
-        Assert.Equal(0, h.NotificationCount);
-        Assert.False(h.StreamEnded, "a mapping failure must not unwind the worker's stream");
+            // NOTHING WAS RELEASED, REMOVED OR NOTIFIED.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-unmappable", h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-unmappable"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-unmappable"));
+            Assert.False(h.StreamEnded, "a mapping failure must not unwind the worker's stream");
 
-        // THE FOLLOWING READY IS IGNORED: the task is still active in the queue.
-        h.Queue.Enqueue(h.BuildTask("task-next", "next-model"));
-        await h.ReadyAndAwaitIgnoredAsync();
+            // THE FOLLOWING READY IS IGNORED: the task is still active in the queue.
+            h.Queue.Enqueue(h.BuildTask("task-next", "next-model"));
+            await h.ReadyAndAwaitIgnoredAsync();
 
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-unmappable", h.Worker.CurrentTaskId);
-        Assert.NotNull(h.Queue.GetActiveTask("task-unmappable"));
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-unmappable", h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask("task-unmappable"));
 
-        // The pending task was never dequeued for this ignored Ready.
-        var stillPending = h.Queue.TryDequeueAny();
-        Assert.NotNull(stillPending);
-        Assert.Equal("task-next", stillPending!.TaskId);
+            // The pending task was never dequeued for this ignored Ready.
+            var stillPending = h.Queue.TryDequeueAny();
+            Assert.NotNull(stillPending);
+            Assert.Equal("task-next", stillPending!.TaskId);
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -264,12 +354,14 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Ready_InitialReadyOnIdleWorker_IsAccepted()
     {
-        await using var h = Harness.Create();
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            await h.ReadyAndAwaitAcceptedAsync();
 
-        await h.ReadyAndAwaitAcceptedAsync();
-
-        Assert.False(h.Worker.IsBusy);
-        Assert.Null(h.Worker.CurrentTaskId);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+        });
     }
 
     /// <summary>
@@ -279,16 +371,19 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Ready_AfterAcceptedCompletion_IsAccepted()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-then-ready", model: "assigned-model");
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-then-ready", model: "assigned-model");
 
-        await h.CompleteAndAwaitNotificationAsync("task-then-ready");
-        Assert.Null(h.Queue.GetActiveTask("task-then-ready"));
+            await h.CompleteAndAwaitDownstreamAsync("task-then-ready");
+            Assert.Null(h.Queue.GetActiveTask("task-then-ready"));
 
-        await h.ReadyAndAwaitAcceptedAsync();
+            await h.ReadyAndAwaitAcceptedAsync();
 
-        Assert.False(h.Worker.IsBusy);
-        Assert.Null(h.Worker.CurrentTaskId);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+        });
     }
 
     /// <summary>
@@ -298,21 +393,24 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Ready_WithStillActiveQueueEntry_IsIgnoredBeforeIdlingOrDequeuing()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-held", model: "assigned-model");
-        h.Queue.Enqueue(h.BuildTask("task-pending", "pending-model"));
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-held", model: "assigned-model");
+            h.Queue.Enqueue(h.BuildTask("task-pending", "pending-model"));
 
-        await h.ReadyAndAwaitIgnoredAsync();
+            await h.ReadyAndAwaitIgnoredAsync();
 
-        Assert.True(h.Worker.IsBusy);
-        Assert.Equal("task-held", h.Worker.CurrentTaskId);
-        Assert.Equal("assigned-model", h.Worker.CurrentModel);
-        Assert.NotNull(h.Queue.GetActiveTask("task-held"));
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-held", h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-held"));
 
-        // The pending task was never dequeued.
-        var pending = h.Queue.TryDequeueAny();
-        Assert.NotNull(pending);
-        Assert.Equal("task-pending", pending!.TaskId);
+            // The pending task was never dequeued.
+            var pending = h.Queue.TryDequeueAny();
+            Assert.NotNull(pending);
+            Assert.Equal("task-pending", pending!.TaskId);
+        });
     }
 
     /// <summary>
@@ -324,28 +422,30 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Ready_WithInconsistentOwnershipShape_IsRefusedByTheCheckedIdle()
     {
-        await using var h = Harness.Create();
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            // The inconsistent shape, with NO active queue entry for the task.
+            h.Pool.MarkBusy(WorkerId, "task-inconsistent");
+            h.Worker.Role = DomainWorkerRole.Coder;
+            h.Worker.IsBusy = false;
+            Assert.Null(h.Queue.GetActiveTask("task-inconsistent"));
 
-        // The inconsistent shape, with NO active queue entry for the task.
-        h.Pool.MarkBusy(WorkerId, "task-inconsistent");
-        h.Worker.Role = DomainWorkerRole.Coder;
-        h.Worker.IsBusy = false;
-        Assert.Null(h.Queue.GetActiveTask("task-inconsistent"));
+            h.Queue.Enqueue(h.BuildTask("task-pending", "pending-model"));
 
-        h.Queue.Enqueue(h.BuildTask("task-pending", "pending-model"));
+            await h.ReadyAndAwaitRefusedIdleAsync();
 
-        await h.ReadyAndAwaitRefusedIdleAsync();
+            // NOTHING WAS CLEARED by the refused idle.
+            Assert.Equal("task-inconsistent", h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Worker.CurrentTaskStartedAt);
+            Assert.Equal(DomainWorkerRole.Coder, h.Worker.Role);
 
-        // NOTHING WAS CLEARED by the refused idle.
-        Assert.Equal("task-inconsistent", h.Worker.CurrentTaskId);
-        Assert.NotNull(h.Worker.CurrentTaskStartedAt);
-        Assert.Equal(DomainWorkerRole.Coder, h.Worker.Role);
-
-        // And no pending task was dequeued or assigned.
-        var pending = h.Queue.TryDequeueAny();
-        Assert.NotNull(pending);
-        Assert.Equal("task-pending", pending!.TaskId);
-        Assert.Null(h.Queue.GetActiveTask("task-pending"));
+            // And no pending task was dequeued or assigned.
+            var pending = h.Queue.TryDequeueAny();
+            Assert.NotNull(pending);
+            Assert.Equal("task-pending", pending!.TaskId);
+            Assert.Null(h.Queue.GetActiveTask("task-pending"));
+        });
     }
 
     /// <summary>
@@ -378,34 +478,45 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task Completion_ForReplacedWorkerInstance_IsRefusedByThePinnedInstanceGuard()
     {
-        await using var h = Harness.Create();
-        h.Assign("task-aba", model: "assigned-model");
-        var stale = h.Worker;
+        var h = Harness.Create();
+        await RunAsync(h, () =>
+        {
+            h.Assign("task-aba", model: "assigned-model");
+            var stale = h.Worker;
 
-        // The pinned instance is replaced under the SAME id, and the replacement takes over the
-        // very same task — so ONLY the pinned-instance check can refuse this delivery. This is the
-        // state the TOCTOU window leaves behind: the stream's own check already passed against the
-        // pre-replacement instance, and the handler is reached with the now-stale pin.
-        Assert.True(h.Pool.RemoveWorker(stale));
-        var replacement = h.Pool.RegisterWorker(WorkerId, []);
-        h.Pool.MarkBusy(WorkerId, "task-aba");
-        replacement.CurrentModel = "replacement-model";
+            // The pinned instance is replaced under the SAME id, and the replacement takes over the
+            // very same task — so ONLY the pinned-instance check can refuse this delivery. This is
+            // the state the TOCTOU window leaves behind: the stream's own check already passed
+            // against the pre-replacement instance, and the handler is reached with the stale pin.
+            Assert.True(h.Pool.RemoveWorker(stale));
+            var replacement = h.Pool.RegisterWorker(WorkerId, []);
+            h.Pool.MarkBusy(WorkerId, "task-aba");
+            replacement.CurrentModel = "replacement-model";
 
-        h.InvokeHandleTaskCompleteDirectly(stale, "task-aba");
+            // A DIRECT, SYNCHRONOUS call: it RETURNING is itself the post-handler barrier, and any
+            // throw from the removed early return would surface here rather than being swallowed.
+            h.InvokeHandleTaskCompleteDirectly(stale, "task-aba");
 
-        Assert.Contains(
-            h.Logger.Messages,
-            m => m.Contains(SignallingLogger.CompletionIgnored, StringComparison.Ordinal)
-                 && m.Contains(
-                     HiveOrchestratorService.OwnershipRefusalReasons.PinnedInstanceReplaced,
-                     StringComparison.Ordinal));
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.PinnedInstanceReplaced,
+                         StringComparison.Ordinal));
 
-        // The replacement's own assignment, and the queue entry, both survive.
-        Assert.True(replacement.IsBusy);
-        Assert.Equal("task-aba", replacement.CurrentTaskId);
-        Assert.Equal("replacement-model", replacement.CurrentModel);
-        Assert.NotNull(h.Queue.GetActiveTask("task-aba"));
-        Assert.Equal(0, h.NotificationCount);
+            // THE HANDLER STOPPED AT THE PINNED-INSTANCE GATE: it never reached the acceptance
+            // provenance line that follows all four validations.
+            h.AssertNeverAccepted("task-aba");
+
+            // The replacement's own assignment, and the queue entry, both survive.
+            Assert.True(replacement.IsBusy);
+            Assert.Equal("task-aba", replacement.CurrentTaskId);
+            Assert.Equal("replacement-model", replacement.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-aba"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-aba"));
+            return Task.CompletedTask;
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -419,14 +530,23 @@ public sealed class CompletionTransportOwnershipTests
     /// <para>
     /// THE SEQUENCE: (1) a REAL Ready is pushed on the real stream; the handler dequeues the
     /// queued task, applies the assignment and publishes it through the REAL
-    /// <see cref="WorkerAssignmentPublisher"/> over a REAL SQLite store — the worker genuinely owns
-    /// the task. (2) <see cref="GoalDispatcher.CancelGoalAsync"/> — logical cancellation —
-    /// SUCCEEDS: the pipeline is marked Failed and removed, but the worker keeps the task. (3) The
-    /// worker's LATE REAL completion then arrives on the real stream: the TRANSPORT guard accepts
-    /// it (both authorities still agree), so the worker's OWN transport ownership clears — but the
-    /// domain completion handling (the real <see cref="GoalDispatcher.HandleTaskCompletionAsync"/>
-    /// path) drops it through its no-pipeline/terminal guards, so the CANCELLED goal cannot
-    /// advance. (4) The following Ready is then ACCEPTED: the released worker is idle with no task.
+    /// <see cref="WorkerAssignmentPublisher"/> over a REAL SQLite store — and the assignment is
+    /// observed WHERE THE REAL PUMP FORWARDS IT, at the gRPC response writer. (2)
+    /// <see cref="GoalDispatcher.CancelGoalAsync"/> — logical cancellation — SUCCEEDS: the pipeline
+    /// is marked Failed and removed, but the worker keeps the task. (3) The worker's LATE REAL
+    /// completion arrives on the real stream: the TRANSPORT guard accepts it (both authorities
+    /// still agree), so the worker's OWN transport ownership clears, and the domain result is
+    /// handed to the REAL <see cref="GoalDispatcher.HandleTaskCompletionAsync"/> — which drops it
+    /// through <c>TaskCompletionService</c>'s missing-pipeline guard. (4) The following Ready is
+    /// then ACCEPTED: the released worker is idle with no task.
+    /// </para>
+    /// <para>
+    /// HOW THE "CANCELLED GOAL CANNOT ADVANCE" CLAIM IS EVIDENCED — and it is NOT by re-reading
+    /// pre-removed pipeline state. The proof is (a) the REAL downstream guard's own production log
+    /// line for THIS task id, emitted by <c>TaskCompletionService</c> after production's
+    /// <c>NotifyAsync</c> awaited the dispatcher, and (b) the fact that NO successor task was
+    /// enqueued — an advancing pipeline would have dispatched one through the real
+    /// <c>PipelineDriver</c>.
     /// </para>
     /// <para>
     /// NOT CLAIMED HERE: no recovery, no fabricated completion for never-delivered work, and no
@@ -442,78 +562,90 @@ public sealed class CompletionTransportOwnershipTests
 
         try
         {
-            await using var h = Harness.CreateWithPublishedAssignmentSupport(dbPath);
+            var h = Harness.CreateWithPublishedAssignmentSupport(dbPath);
 
-            const string goalId = "goal-owned-seq";
-            const string taskId = "task-owned-seq";
+            await RunAsync(h, async () =>
+            {
+                const string goalId = "goal-owned-seq";
+                const string taskId = "task-owned-seq";
 
-            // ── THE DISPATCHABLE SETUP: a real pipeline with a Pending slot at the active-task
-            //    pointer, the task→goal mapping registered, and the task QUEUED so the real Ready
-            //    path can dequeue it. ──
-            var goal = new Goal { Id = goalId, Description = "owned transport sequence" };
-            h.Manager.CreatePipeline(goal, maxRetries: 3);
-            h.GoalSource.Register(goal);
-            var pipeline = h.Manager.GetByGoalId(goalId);
-            Assert.NotNull(pipeline);
+                // ── THE DISPATCHABLE SETUP: a real pipeline with a Pending slot at the active-task
+                //    pointer, the task→goal mapping registered, and the task QUEUED so the real
+                //    Ready path can dequeue it. ──
+                var goal = new Goal { Id = goalId, Description = "owned transport sequence" };
+                h.Manager.CreatePipeline(goal, maxRetries: 3);
+                h.GoalSource.Register(goal);
+                var pipeline = h.Manager.GetByGoalId(goalId);
+                Assert.NotNull(pipeline);
 
-            var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
-            var slotBuild = pipeline!.AllocateAttemptAndRegisterSlot(taskId, position);
-            pipeline.SetActiveTask(taskId);
-            h.Manager.RegisterTask(taskId, goalId);
+                var position = new WorkSlotPosition(1, GoalPhase.Coding, 1);
+                pipeline!.AllocateAttemptAndRegisterSlot(taskId, position);
+                pipeline.SetActiveTask(taskId);
+                h.Manager.RegisterTask(taskId, goalId);
 
-            h.Queue.Enqueue(h.BuildTask(taskId, "seq-model") with { GoalId = goalId });
+                h.Queue.Enqueue(h.BuildTask(taskId, "seq-model") with { GoalId = goalId });
 
-            // ── (1) THE GENUINELY PUBLISHED ASSIGNMENT, through the REAL Ready path ──
-            await h.ReadyAndAwaitAssignmentPublishedAsync();
+                // ── (1) THE GENUINELY PUBLISHED ASSIGNMENT, through the REAL Ready path ──
+                await h.ReadyAndAwaitAssignmentPublishedAsync(taskId);
 
-            // The published assignment left the worker genuinely busy, with its model set and the
-            // queue entry active — exactly the state the completion guard will validate later.
-            Assert.True(h.Worker.IsBusy);
-            Assert.Equal(taskId, h.Worker.CurrentTaskId);
-            Assert.Equal("seq-model", h.Worker.CurrentModel);
-            Assert.NotNull(h.Queue.GetActiveTask(taskId));
-            Assert.Equal(1, h.AssignmentsPublished); // the real channel write happened
+                // The published assignment left the worker genuinely busy, with its model set and
+                // the queue entry active — exactly the state the completion guard validates later.
+                Assert.True(h.Worker.IsBusy);
+                Assert.Equal(taskId, h.Worker.CurrentTaskId);
+                Assert.Equal("seq-model", h.Worker.CurrentModel);
+                Assert.NotNull(h.Queue.GetActiveTask(taskId));
 
-            // ── (2) THE LOGICAL CANCELLATION — the real GoalDispatcher path ─────────
-            var cancelledPipeline = h.Manager.GetByGoalId(goalId);
-            Assert.NotNull(cancelledPipeline);
-            var dispatcher = h.Dispatcher!;
-            Assert.True(await dispatcher.CancelGoalAsync(goalId, TestContext.Current.CancellationToken));
+                // ── (2) THE LOGICAL CANCELLATION — the real GoalDispatcher path ─────────
+                var cancelledPipeline = h.Manager.GetByGoalId(goalId);
+                Assert.NotNull(cancelledPipeline);
+                Assert.True(
+                    await h.Dispatcher.CancelGoalAsync(goalId, TestContext.Current.CancellationToken));
 
-            // Cancellation is LOGICAL ONLY: the pipeline is failed AND REMOVED (so the goal can
-            // never advance), but the worker's transport ownership SURVIVES.
-            Assert.Equal(GoalPhase.Failed, cancelledPipeline.Phase);
-            Assert.Null(h.Manager.GetByGoalId(goalId));
-            Assert.Null(h.Manager.GetByTaskId(taskId));
-            Assert.True(h.Worker.IsBusy, "logical cancellation must not release the worker");
-            Assert.Equal(taskId, h.Worker.CurrentTaskId);
-            Assert.NotNull(h.Queue.GetActiveTask(taskId));
+                // Cancellation is LOGICAL ONLY: the pipeline is failed, but the worker's transport
+                // ownership SURVIVES.
+                Assert.Equal(GoalPhase.Failed, cancelledPipeline!.Phase);
+                Assert.True(h.Worker.IsBusy, "logical cancellation must not release the worker");
+                Assert.Equal(taskId, h.Worker.CurrentTaskId);
+                Assert.NotNull(h.Queue.GetActiveTask(taskId));
 
-            // ── (3) THE LATE REAL INCOMING COMPLETION on the real stream ────────────
-            // The transport guard accepts it (pool and queue still agree) and clears THIS task's
-            // transport ownership; the domain notification is genuinely delivered to the real
-            // dispatcher, whose TaskCompletionService drops it (no pipeline → warning) so the
-            // cancelled goal cannot advance.
-            var result = await h.CompleteAndAwaitNotificationAsync(taskId);
+                // ── (3) THE LATE REAL INCOMING COMPLETION on the real stream ────────────
+                // The transport guard accepts it and clears THIS task's transport ownership; the
+                // domain result is handed to the REAL dispatcher, which production's own
+                // NotifyAsync awaits.
+                var tasksEnqueuedBeforeLateCompletion = h.TasksEnqueued;
+                var result = await h.CompleteAndAwaitDownstreamAsync(taskId);
 
-            Assert.Equal(taskId, result.TaskId);
-            Assert.False(h.Worker.IsBusy, "the late completion clears its own transport ownership");
-            Assert.Null(h.Worker.CurrentTaskId);
-            Assert.Null(h.Worker.CurrentModel);
-            Assert.Null(h.Queue.GetActiveTask(taskId));
+                Assert.Equal(taskId, result.TaskId);
+                Assert.False(h.Worker.IsBusy, "the late completion clears its own transport ownership");
+                Assert.Null(h.Worker.CurrentTaskId);
+                Assert.Null(h.Worker.CurrentModel);
+                Assert.Null(h.Queue.GetActiveTask(taskId));
 
-            // THE GOAL CANNOT ADVANCE: the pipeline was removed by the cancellation, so the
-            // domain handling found no pipeline for the late result. The stream is alive.
-            Assert.False(h.StreamEnded);
+                // ── THE GOAL CANNOT ADVANCE, evidenced by the REAL DOWNSTREAM GUARD ─────
+                // (a) The production TaskCompletionService missing-pipeline guard fired for THIS
+                //     task id. This is the real guard's own log line, not test bookkeeping.
+                Assert.Contains(
+                    h.DispatcherLogger.Messages,
+                    m => m.Contains(ProductionLogFragments.NoPipelineForTask, StringComparison.Ordinal)
+                         && m.Contains(taskId, StringComparison.Ordinal));
 
-            // ── (4) THE FOLLOWING READY IS ACCEPTED ────────────────────────────────
-            await h.ReadyAndAwaitAcceptedAsync();
+                // (b) …and NOTHING was dispatched: an advancing pipeline drives the real
+                //     PipelineDriver, which enqueues the successor task. No enqueue happened.
+                Assert.Equal(tasksEnqueuedBeforeLateCompletion, h.TasksEnqueued);
 
-            Assert.False(h.Worker.IsBusy);
-            Assert.Null(h.Worker.CurrentTaskId);
+                // The stream is alive — the late completion did not unwind it.
+                Assert.False(h.StreamEnded);
+
+                // ── (4) THE FOLLOWING READY IS ACCEPTED ────────────────────────────────
+                await h.ReadyAndAwaitAcceptedAsync();
+
+                Assert.False(h.Worker.IsBusy);
+                Assert.Null(h.Worker.CurrentTaskId);
+            });
         }
         finally
         {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
             {
                 try
@@ -535,61 +667,86 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// A live <see cref="HiveOrchestratorService"/> over real collaborators and a REAL
-    /// <c>WorkStream</c>, with deterministic log/notification signals.
+    /// <c>WorkStream</c>, wired so that downstream completion handling really runs through the REAL
+    /// <see cref="GoalDispatcher"/> and publication is observed at the gRPC response writer.
     /// </summary>
-    private sealed class Harness : IAsyncDisposable
+    private sealed class Harness
     {
         public required HiveOrchestratorService Service { get; init; }
         public required WorkerPool Pool { get; init; }
         public required TaskQueue Queue { get; init; }
         public required ConnectedWorker Worker { get; init; }
-        public required SignallingLogger Logger { get; init; }
-        public required TaskCompletionNotifier Notifier { get; init; }
+
+        /// <summary>The service's own signalling logger — the source of every transport log gate.</summary>
+        public required SignallingLogger<HiveOrchestratorService> ServiceLogger { get; init; }
+
+        /// <summary>
+        /// The REAL dispatcher's logger, and therefore the source of the REAL
+        /// <c>TaskCompletionService</c> downstream log lines. Downstream evidence is read HERE.
+        /// </summary>
+        public required SignallingLogger<GoalDispatcher> DispatcherLogger { get; init; }
+
+        /// <summary>
+        /// The REAL dispatcher. It is the LAST subscriber on the SHARED notifier, so production's
+        /// own <c>NotifyAsync</c> awaits its handler chain.
+        /// </summary>
+        public required GoalDispatcher Dispatcher { get; init; }
+
+        /// <summary>The pipeline registry shared by the service and the dispatcher.</summary>
+        public required GoalPipelineManager Manager { get; init; }
+
+        /// <summary>The in-memory goal source backing the sequence vector's real cancellation.</summary>
+        public required SequenceGoalSource GoalSource { get; init; }
+
+        /// <summary>
+        /// THE PUBLICATION OBSERVATION POINT: the gRPC response writer the real <c>WorkStream</c>
+        /// pump forwards to. The test never reads the worker's message channel, so it can never
+        /// race the production pump.
+        /// </summary>
+        public required SignallingStreamWriter Writer { get; init; }
+
         private ChannelStreamReader Reader { get; init; } = null!;
+
+        /// <summary>The RETAINED producer task; the strict teardown joins exactly this instance.</summary>
         private Task StreamTask { get; init; } = null!;
 
-        private int _notificationCount;
-        private readonly Queue<TaskCompletionSource<TaskResult>> _resultWaiters = new();
+        private readonly CompletionObservations _observations;
 
-        /// <summary>Completion notifications the transport notifier emitted.</summary>
-        public int NotificationCount => Volatile.Read(ref _notificationCount);
+        private int _barrierSequence;
+        private int _tasksEnqueued;
+
+        private Harness(CompletionObservations observations) => _observations = observations;
+
+        /// <summary>Transport-level notifications the shared notifier emitted (auxiliary observation).</summary>
+        public int TransportNotifications => _observations.Count;
+
+        /// <summary>How many tasks the REAL queue accepted — the "did the pipeline advance" probe.</summary>
+        public int TasksEnqueued => Volatile.Read(ref _tasksEnqueued);
 
         /// <summary>Whether the real stream task has terminated.</summary>
         public bool StreamEnded => StreamTask.IsCompleted;
 
         /// <summary>
-        /// The REAL dispatcher, so the sequence vector's late completion flows into the REAL
-        /// <see cref="GoalDispatcher.HandleTaskCompletionAsync"/> domain path. Null in the plain
-        /// vectors, which never reach the domain layer.
+        /// How many times the REAL downstream <c>TaskCompletionService</c> handled a completion for
+        /// <paramref name="taskId"/>, counted from ITS OWN production log lines.
         /// </summary>
-        public GoalDispatcher? Dispatcher { get; private init; }
-
-        /// <summary>
-        /// The pipeline registry shared by the service, dispatcher and sequence vector.
-        /// </summary>
-        public GoalPipelineManager Manager { get; private init; } = null!;
-
-        /// <summary>
-        /// The REAL assignment publisher used by the sequence vector's Ready path; null otherwise.
-        /// </summary>
-        public WorkerAssignmentPublisher? ServiceAssignmentPublisher { get; private init; }
-
-        /// <summary>The in-memory goal source backing the sequence vector's real cancellation.</summary>
-        public SequenceGoalSource GoalSource { get; private init; } = null!;
-
-        /// <summary>How many assignment messages the REAL publisher wrote to the pinned channel.</summary>
-        public int AssignmentsPublished => Volatile.Read(ref _assignmentsPublished);
-
-        private int _assignmentsPublished;
+        /// <remarks>
+        /// Every terminating path of <c>TaskCompletionService.HandleTaskCompletionAsync</c> emits a
+        /// line naming the task id (the missing-pipeline warning, the terminal-goal line, the
+        /// stale/duplicate warnings, or the "task completed" progress line), so a zero here means
+        /// the real downstream chain was never entered for that task at all.
+        /// </remarks>
+        public int DownstreamHandledCount(string taskId) =>
+            DispatcherLogger.Messages.Count(
+                m => m.Contains(taskId, StringComparison.Ordinal)
+                     && ProductionLogFragments.DownstreamEntered(m));
 
         public static Harness Create() => CreateCore(withPublishedAssignmentSupport: false, dbPath: null);
 
         /// <summary>
         /// Creates a harness WITH the published-assignment support the sequence vector needs: a
         /// REAL <see cref="WorkerAssignmentPublisher"/> over a REAL file-backed SQLite store
-        /// supplied to the service, and the REAL dispatcher's notifier subscription replaced by a
-        /// counting one so publication to the pinned channel is observable without a second
-        /// notification path.
+        /// supplied to the service.
         /// </summary>
         public static Harness CreateWithPublishedAssignmentSupport(string dbPath) =>
             CreateCore(withPublishedAssignmentSupport: true, dbPath);
@@ -603,27 +760,33 @@ public sealed class CompletionTransportOwnershipTests
 
             var goalManager = new GoalManager();
             var goalSource = new SequenceGoalSource();
-            if (withPublishedAssignmentSupport)
-            {
-                // The REAL dispatcher's cancellation persists the goal's status through its
-                // GoalManager, so the sequence vector registers a minimal test goal source
-                // (mirroring the GoalDispatcherCancelTests pattern) BEFORE the dispatcher
-                // subscribes — it is TEST-only persistence, not state the transport consults.
-                goalManager.AddSource(goalSource);
-            }
 
-            // TWO notifiers: the dispatcher subscribes to its own, so the transport notifier
-            // carries exactly ONE subscriber — the harness's own handler.
-            var transportNotifier = new TaskCompletionNotifier();
-            var dispatcherNotifier = new TaskCompletionNotifier();
+            // The REAL dispatcher's cancellation persists the goal's status through its
+            // GoalManager, so a minimal test goal source is registered BEFORE the dispatcher
+            // subscribes — TEST-only persistence, not state the transport consults.
+            goalManager.AddSource(goalSource);
 
+            // ── ONE NOTIFIER FOR BOTH ────────────────────────────────────────────────────
+            // The transport publishes here and the REAL dispatcher subscribes here, so the late
+            // completion is genuinely handed to GoalDispatcher.HandleTaskCompletionAsync.
+            var completionNotifier = new TaskCompletionNotifier();
+
+            // THE OBSERVER SUBSCRIBES FIRST, ON PURPOSE. TaskCompletionNotifier.NotifyAsync awaits
+            // only the LAST subscriber in the multicast chain, so the dispatcher — constructed
+            // below — must be last: production then AWAITS the real downstream chain instead of
+            // leaving it unobserved. This observer records the emitted TaskResult for the model
+            // assertions; it is never used as evidence that the downstream guard ran.
+            var observations = new CompletionObservations();
+            completionNotifier.OnTaskCompleted += observations.Record;
+
+            var dispatcherLogger = new SignallingLogger<GoalDispatcher>();
             var dispatcher = new GoalDispatcher(
                 goalManager,
                 pipelineManager,
                 queue,
                 new GrpcWorkerGateway(pool),
-                dispatcherNotifier,
-                NullLogger<GoalDispatcher>.Instance,
+                completionNotifier,
+                dispatcherLogger,
                 new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
             IWorkerAssignmentPublisher? assignmentPublisher = null;
@@ -642,80 +805,44 @@ public sealed class CompletionTransportOwnershipTests
                         factory, NullLogger<WorkerAssignmentContextStore>.Instance));
             }
 
-            var logger = new SignallingLogger();
+            var serviceLogger = new SignallingLogger<HiveOrchestratorService>();
             var service = new HiveOrchestratorService(
                 pool,
                 queue,
                 pipelineManager,
-                transportNotifier,
+                completionNotifier,
                 dispatcher,
-                logger,
+                serviceLogger,
                 dashboardNotifier: dashboard,
                 assignmentPublisher: assignmentPublisher);
 
             var worker = pool.RegisterWorker(WorkerId, []);
             var reader = new ChannelStreamReader();
-            var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
 
-            var harness = new Harness
+            // THE SINGLE CONSUMER OF THE WORKER'S CHANNEL IS THE PRODUCTION PUMP. Publication is
+            // observed at the writer the pump forwards to — no competing test reader.
+            var writer = new SignallingStreamWriter();
+            var streamTask = service.WorkStream(reader, writer, MockContext());
+
+            var harness = new Harness(observations)
             {
                 Service = service,
                 Pool = pool,
                 Queue = queue,
                 Worker = worker,
-                Logger = logger,
-                Notifier = transportNotifier,
-                Reader = reader,
-                StreamTask = streamTask,
+                ServiceLogger = serviceLogger,
+                DispatcherLogger = dispatcherLogger,
                 Dispatcher = dispatcher,
                 Manager = pipelineManager,
-                ServiceAssignmentPublisher = assignmentPublisher as WorkerAssignmentPublisher,
                 GoalSource = goalSource,
+                Writer = writer,
+                Reader = reader,
+                StreamTask = streamTask,
             };
 
-            transportNotifier.OnTaskCompleted += result =>
-            {
-                Interlocked.Increment(ref harness._notificationCount);
-                TaskCompletionSource<TaskResult>? waiter = null;
-                lock (harness._resultWaiters)
-                {
-                    if (harness._resultWaiters.Count > 0)
-                        waiter = harness._resultWaiters.Dequeue();
-                }
-
-                waiter?.TrySetResult(result);
-                return Task.CompletedTask;
-            };
-
-            // THE PUBLICATION OBSERVER: the real publisher's channel write is drained on another
-            // task, so this counting subscription is the deterministic signal that a publication
-            // genuinely reached the pinned worker's channel. The drained message is dropped.
-            if (withPublishedAssignmentSupport)
-            {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await foreach (var _ in worker.MessageChannel.Reader.ReadAllAsync(
-                            CancellationToken.None))
-                        {
-                            Interlocked.Increment(ref harness._assignmentsPublished);
-                            TaskCompletionSource? signal = null;
-                            lock (harness._publicationSignals)
-                            {
-                                if (harness._publicationSignals.Count > 0)
-                                    signal = harness._publicationSignals.Dequeue();
-                            }
-
-                            signal?.TrySetResult();
-                        }
-                    }
-                    catch (ChannelClosedException)
-                    {
-                        // The pinned channel closes with the worker's teardown — expected.
-                    }
-                });
-            }
+            // THE ADVANCE PROBE: a pipeline that advances dispatches its successor through the real
+            // PipelineDriver, which enqueues here.
+            queue.OnEnqueue = _ => Interlocked.Increment(ref harness._tasksEnqueued);
 
             return harness;
         }
@@ -865,7 +992,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.NotNull(Queue.GetActiveTask(taskId));
         }
 
-        private GrpcTaskComplete BuildComplete(
+        private static GrpcTaskComplete BuildComplete(
             string taskId,
             string? model,
             bool modelPresent,
@@ -884,14 +1011,72 @@ public sealed class CompletionTransportOwnershipTests
             return complete;
         }
 
-        /// <summary>Delivers a completion and awaits the domain result the notifier emitted.</summary>
-        public async Task<TaskResult> CompleteAndAwaitNotificationAsync(
+        // ── THE POST-HANDLER BARRIER ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// THE POST-HANDLER BARRIER, and the reason every refusal vector here is removal-proof.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A refusal warning is emitted BEFORE the guard's early return, so waiting on the warning
+        /// alone proves nothing about what the handler did next: delete the return and the handler
+        /// runs on and throws, which would unwind the read loop while the asserted state still
+        /// looked untouched.
+        /// </para>
+        /// <para>
+        /// THE BARRIER CLOSES THAT HOLE USING THE REAL LOOP. <c>WorkStream</c> reads its request
+        /// stream STRICTLY SEQUENTIALLY and <c>HandleTaskComplete</c>/<c>HandleWorkerReady</c> are
+        /// awaited inline, so the NEXT message can only be processed after the previous handler
+        /// RETURNED. This pushes a Progress message carrying a UNIQUE token and waits for
+        /// <c>HandleTaskProgress</c>'s own production log line. A handler that threw never lets the
+        /// loop reach this message, so the wait expires and the vector FAILS.
+        /// </para>
+        /// </remarks>
+        public async Task BarrierAsync()
+        {
+            var token = $"ownership-barrier-{Interlocked.Increment(ref _barrierSequence)}";
+            var signal = ServiceLogger.WaitFor(token);
+
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Progress = new TaskProgress
+                {
+                    TaskId = "barrier",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = token,
+                },
+            });
+
+            try
+            {
+                await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    $"POST-HANDLER BARRIER '{token}' was never reached: the WorkStream read loop " +
+                    "did not process the following message, which means the handler under test did " +
+                    "NOT return normally (streamCompleted=" + StreamTask.IsCompleted + ").",
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// Delivers a completion, awaits the REAL downstream <c>TaskCompletionService</c> handling
+        /// for that task id, and returns the domain result the transport emitted.
+        /// </summary>
+        /// <remarks>
+        /// THE DOWNSTREAM SIGNAL IS THE REAL ONE: production's <c>NotifyAsync</c> awaits the
+        /// dispatcher (the last subscriber), and this waits for a production
+        /// <c>TaskCompletionService</c> log line naming the task — so a returned call proves the
+        /// real domain chain actually ran, not merely that a test handler fired.
+        /// </remarks>
+        public async Task<TaskResult> CompleteAndAwaitDownstreamAsync(
             string taskId, string? model = null, bool modelPresent = false)
         {
-            var waiter = new TaskCompletionSource<TaskResult>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-            lock (_resultWaiters)
-                _resultWaiters.Enqueue(waiter);
+            var recorded = _observations.NextResult();
+            var downstream = DispatcherLogger.WaitFor(taskId);
 
             Reader.Push(new WorkerMessage
             {
@@ -900,23 +1085,36 @@ public sealed class CompletionTransportOwnershipTests
                     taskId, model, modelPresent, CopilotHive.Shared.Grpc.TaskStatus.Completed),
             });
 
-            return await waiter.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            var result = await recorded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await downstream.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
+            return result;
         }
 
         /// <summary>
         /// Delivers a completion and awaits the PRODUCTION IGNORED warning carrying
-        /// <paramref name="expectedReason"/> — the deterministic signal that THIS SPECIFIC guard
-        /// refused the delivery.
+        /// <paramref name="expectedReason"/>, THEN the post-handler barrier.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// WAITING ON THE REASON, not merely on "a refusal", is what keeps these vectors
         /// discriminating: the checked release at the end of the handler would otherwise refuse a
         /// mis-validated delivery too, and a generic wait would be satisfied by that late refusal
-        /// even though the early validation had been removed.
+        /// even though the early validation had been removed. The barrier then proves the handler
+        /// RETURNED after emitting it.
+        /// </para>
+        /// <para>
+        /// THE STOP IS PROVEN BY A DOWNSTREAM-OF-THE-GUARD OBSERVABLE, not only by the barrier. The
+        /// handler's ACCEPTANCE PROVENANCE line ("Task … completed by …") is emitted ONLY after ALL
+        /// FOUR validation gates have passed. Asserting its absence for this task id is what makes
+        /// each vector reject a deleted early return even when a LATER gate would have refused the
+        /// delivery anyway — the barrier alone cannot see that, because the handler still returns
+        /// normally in that case.
+        /// </para>
         /// </remarks>
         public async Task CompleteAndAwaitIgnoredAsync(string taskId, string expectedReason)
         {
-            var signal = Logger.WaitFor(expectedReason);
+            var signal = ServiceLogger.WaitFor(expectedReason);
             Reader.Push(new WorkerMessage
             {
                 WorkerId = WorkerId,
@@ -925,44 +1123,63 @@ public sealed class CompletionTransportOwnershipTests
             });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
 
+            // THE EARLY RETURN IS PROVEN, not assumed.
+            await BarrierAsync();
+
             // The refusal really was the expected guard's, and it named this task.
             Assert.Contains(
-                Logger.Messages,
-                m => m.Contains(SignallingLogger.CompletionIgnored, StringComparison.Ordinal)
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
                      && m.Contains(expectedReason, StringComparison.Ordinal)
                      && m.Contains(taskId, StringComparison.Ordinal));
+
+            // THE HANDLER STOPPED AT THAT GUARD: it never reached the post-validation acceptance
+            // provenance line, so no later gate silently "rescued" a deleted early return.
+            AssertNeverAccepted(taskId);
         }
 
         /// <summary>
-        /// Delivers a completion whose mapping FAILS and awaits the production mapping-failure
-        /// warning.
+        /// Asserts the handler NEVER passed its validation gates for <paramref name="taskId"/>, by
+        /// the absence of the acceptance provenance line that follows them.
+        /// </summary>
+        public void AssertNeverAccepted(string taskId) =>
+            Assert.DoesNotContain(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionAccepted, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+        /// <summary>
+        /// Delivers a completion whose mapping FAILS, awaits the production mapping-failure warning
+        /// and then the post-handler barrier proving the handler returned locally.
         /// </summary>
         public async Task CompleteAndAwaitMappingFailureAsync(
             string taskId, CopilotHive.Shared.Grpc.TaskStatus status)
         {
-            var signal = Logger.WaitFor(SignallingLogger.MappingFailed);
+            var signal = ServiceLogger.WaitFor(ProductionLogFragments.MappingFailed);
             Reader.Push(new WorkerMessage
             {
                 WorkerId = WorkerId,
                 Complete = BuildComplete(taskId, null, false, status),
             });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
         }
 
         /// <summary>
         /// Pushes a Ready and awaits the production READY-IGNORED warning naming the STILL-ACTIVE
-        /// queue entry as the refusing guard — never merely "some" Ready refusal.
+        /// queue entry as the refusing guard, then the post-handler barrier.
         /// </summary>
         public async Task ReadyAndAwaitIgnoredAsync()
         {
-            var signal = Logger.WaitFor(
+            var signal = ServiceLogger.WaitFor(
                 HiveOrchestratorService.OwnershipRefusalReasons.ReadyTaskStillActive);
             Reader.Push(new WorkerMessage { WorkerId = WorkerId, Ready = new WorkerReady() });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
 
             Assert.Contains(
-                Logger.Messages,
-                m => m.Contains(SignallingLogger.ReadyIgnored, StringComparison.Ordinal)
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReadyIgnored, StringComparison.Ordinal)
                      && m.Contains(
                          HiveOrchestratorService.OwnershipRefusalReasons.ReadyTaskStillActive,
                          StringComparison.Ordinal));
@@ -970,18 +1187,19 @@ public sealed class CompletionTransportOwnershipTests
 
         /// <summary>
         /// Pushes a Ready and awaits the production READY-IGNORED warning naming the CHECKED-IDLE
-        /// refusal as the refusing guard.
+        /// refusal as the refusing guard, then the post-handler barrier.
         /// </summary>
         public async Task ReadyAndAwaitRefusedIdleAsync()
         {
-            var signal = Logger.WaitFor(
+            var signal = ServiceLogger.WaitFor(
                 HiveOrchestratorService.OwnershipRefusalReasons.ReadyCheckedIdleRefused);
             Reader.Push(new WorkerMessage { WorkerId = WorkerId, Ready = new WorkerReady() });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
 
             Assert.Contains(
-                Logger.Messages,
-                m => m.Contains(SignallingLogger.ReadyIgnored, StringComparison.Ordinal)
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReadyIgnored, StringComparison.Ordinal)
                      && m.Contains(
                          HiveOrchestratorService.OwnershipRefusalReasons.ReadyCheckedIdleRefused,
                          StringComparison.Ordinal));
@@ -989,13 +1207,14 @@ public sealed class CompletionTransportOwnershipTests
 
         /// <summary>
         /// Pushes a Ready and awaits the production "is ready" line, which is emitted ONLY after
-        /// the checked idle was applied.
+        /// the checked idle was applied, then the post-handler barrier.
         /// </summary>
         public async Task ReadyAndAwaitAcceptedAsync()
         {
-            var signal = Logger.WaitFor(SignallingLogger.ReadyAccepted);
+            var signal = ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
             Reader.Push(new WorkerMessage { WorkerId = WorkerId, Ready = new WorkerReady() });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
         }
 
         /// <summary>
@@ -1005,6 +1224,11 @@ public sealed class CompletionTransportOwnershipTests
         /// same ID really can land in. Direct invocation is how that interleaving is reproduced
         /// deterministically without adding a production seam.
         /// </summary>
+        /// <remarks>
+        /// THE CALL ITSELF IS THE BARRIER on this path: it is synchronous, so returning proves the
+        /// handler returned, and any exception a removed early return would raise propagates
+        /// straight into the vector (unwrapped below) instead of into a swallowed stream fault.
+        /// </remarks>
         public void InvokeHandleTaskCompleteDirectly(ConnectedWorker pinned, string taskId)
         {
             var method = typeof(HiveOrchestratorService).GetMethod(
@@ -1012,64 +1236,151 @@ public sealed class CompletionTransportOwnershipTests
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             Assert.NotNull(method);
 
-            method!.Invoke(
-                Service,
-                [
-                    pinned,
-                    new GrpcTaskComplete
-                    {
-                        TaskId = taskId,
-                        Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
-                        Output = $"output-{taskId}",
-                    },
-                ]);
+            try
+            {
+                method!.Invoke(
+                    Service,
+                    [
+                        pinned,
+                        new GrpcTaskComplete
+                        {
+                            TaskId = taskId,
+                            Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
+                            Output = $"output-{taskId}",
+                        },
+                    ]);
+            }
+            catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+            {
+                // Surface the PRODUCTION exception itself, not the reflection wrapper.
+                ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+                throw;
+            }
         }
 
         /// <summary>
-        /// Pushes a Ready and awaits the production READY-ACCEPTED line AND the real publisher's
-        /// channel write, so a returned call proves the Ready was accepted AND the assignment was
-        /// genuinely published to the pinned worker's channel.
+        /// Pushes a Ready and awaits BOTH the production READY-ACCEPTED line AND the real pump's
+        /// forwarding of the published assignment to the gRPC response writer — so a returned call
+        /// proves the Ready was accepted AND the assignment genuinely left the transport.
         /// </summary>
-        public async Task ReadyAndAwaitAssignmentPublishedAsync()
+        /// <remarks>
+        /// THE OBSERVATION POINT IS THE WRITER, NOT THE CHANNEL. The production pump is the only
+        /// consumer of the worker's message channel; observing there would mean competing with it
+        /// (either reader could win). Waiting at the writer observes the publication AFTER the real
+        /// pump forwarded it, so nothing is intercepted and nothing races.
+        /// </remarks>
+        public async Task ReadyAndAwaitAssignmentPublishedAsync(string expectedTaskId)
         {
-            var published = new TaskCompletionSource(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-            var publishedBefore = AssignmentsPublished;
-            lock (_publicationSignals)
-                _publicationSignals.Enqueue(published);
+            var forwarded = Writer.WaitForAssignment();
 
             await ReadyAndAwaitAcceptedAsync();
 
-            await published.Task.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
-            Assert.Equal(publishedBefore + 1, AssignmentsPublished);
+            var assignment = await forwarded.WaitAsync(
+                BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(expectedTaskId, assignment.TaskId);
         }
 
-        private readonly Queue<TaskCompletionSource> _publicationSignals = new();
-
-        /// <summary>Ends the stream and joins it, bounded, on every path.</summary>
-        public async ValueTask DisposeAsync()
+        /// <summary>
+        /// THE SHARED STRICT TEARDOWN: ends the request stream and joins the RETAINED producer with
+        /// a finite bound. It NEVER throws — the outcome is RETURNED so a primary assertion failure
+        /// stays authoritative.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS STRICT IN BOTH DIRECTIONS, which is the whole point:
+        /// </para>
+        /// <list type="bullet">
+        ///   <item><description>A BOUNDED EXPIRY IS A FAILURE, never "cleanup succeeded": the
+        ///     producer is still live.</description></item>
+        ///   <item><description>A TERMINAL FAULT IS A FAILURE too. The old teardown swallowed the
+        ///     fault of a completed task, which is exactly how a deleted early return could hide —
+        ///     the guard's warning was still emitted, the handler then threw, and the fault
+        ///     disappeared into cleanup.</description></item>
+        /// </list>
+        /// </remarks>
+        /// <returns><c>null</c> when the producer terminated cleanly; otherwise the failure.</returns>
+        public async Task<Exception?> StopAsync()
         {
             Reader.Complete();
+
             try
             {
                 await StreamTask.WaitAsync(BoundedWait, CancellationToken.None);
+                return null;
             }
-            catch (Exception) when (StreamTask.IsCompleted)
+            catch (TimeoutException ex)
             {
-                // A terminal fault of a COMPLETED task is a joined termination.
+                return new TimeoutException(
+                    $"TEARDOWN LEAK: the WorkStream for worker '{WorkerId}' did not terminate " +
+                    $"within {BoundedWait.TotalSeconds:F0}s — a live producer remains.",
+                    ex);
             }
-            catch (TimeoutException)
+            catch (Exception ex) when (StreamTask.IsCompleted)
             {
-                // Bounded: a non-terminating stream is reported by the assertion that needed it.
+                return new InvalidOperationException(
+                    "THE WORKSTREAM TERMINATED WITH A FAULT. A clean vector must leave the transport " +
+                    "draining normally; a fault here means a handler escaped instead of returning.",
+                    ex);
+            }
+            catch (Exception ex)
+            {
+                return new InvalidOperationException(
+                    $"TEARDOWN LEAK: the WorkStream for worker '{WorkerId}' is still running after " +
+                    "its join failed — a live producer remains.",
+                    ex);
             }
         }
     }
 
     /// <summary>
-    /// Records every logged message and hands out FRESH per-call signals for the production lines
-    /// the vectors synchronize on. A previously emitted line can never satisfy a later wait.
+    /// The transport-side observation of the SHARED notifier: it records each emitted
+    /// <see cref="TaskResult"/> so the model assertions have a value to read.
     /// </summary>
-    private sealed class SignallingLogger : ILogger<HiveOrchestratorService>
+    /// <remarks>
+    /// IT IS NEVER DOWNSTREAM EVIDENCE. This observer proves only that the TRANSPORT published a
+    /// domain result; whether the REAL downstream chain received and classified it is read from
+    /// <c>TaskCompletionService</c>'s own production log lines. It is subscribed FIRST so the real
+    /// dispatcher stays the last (and therefore awaited) subscriber.
+    /// </remarks>
+    private sealed class CompletionObservations
+    {
+        private readonly Queue<TaskCompletionSource<TaskResult>> _waiters = new();
+        private int _count;
+
+        /// <summary>How many results the transport published on the shared notifier.</summary>
+        public int Count => Volatile.Read(ref _count);
+
+        /// <summary>A FRESH waiter for the NEXT published result; never satisfied by an earlier one.</summary>
+        public Task<TaskResult> NextResult()
+        {
+            var waiter = new TaskCompletionSource<TaskResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_waiters)
+                _waiters.Enqueue(waiter);
+            return waiter.Task;
+        }
+
+        public Task Record(TaskResult result)
+        {
+            Interlocked.Increment(ref _count);
+
+            TaskCompletionSource<TaskResult>? waiter = null;
+            lock (_waiters)
+            {
+                if (_waiters.Count > 0)
+                    waiter = _waiters.Dequeue();
+            }
+
+            waiter?.TrySetResult(result);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// THE PRODUCTION LOG FRAGMENTS these vectors synchronize on. Kept together so a wording change
+    /// in production surfaces as one obvious edit rather than as scattered flaky waits.
+    /// </summary>
+    private static class ProductionLogFragments
     {
         /// <summary>The guarded completion-refusal warning's stable fragment.</summary>
         public const string CompletionIgnored = "completion for task";
@@ -1083,6 +1394,43 @@ public sealed class CompletionTransportOwnershipTests
         /// <summary>The accepted-Ready information line, emitted after the checked idle.</summary>
         public const string ReadyAccepted = "is ready";
 
+        /// <summary>
+        /// THE COMPLETION ACCEPTANCE PROVENANCE line, emitted ONLY after ALL FOUR of
+        /// <c>HandleTaskComplete</c>'s validation gates have passed. Its ABSENCE for a task id is
+        /// the evidence that the handler stopped at a guard.
+        /// </summary>
+        public const string CompletionAccepted = "completed by";
+
+        /// <summary>
+        /// <c>TaskCompletionService</c>'s MISSING-PIPELINE guard — the real downstream drop the
+        /// cancellation sequence proves.
+        /// </summary>
+        public const string NoPipelineForTask = "No pipeline found for completed task";
+
+        /// <summary>
+        /// Whether a dispatcher log line is one of <c>TaskCompletionService</c>'s own
+        /// completion-handling lines — i.e. the real downstream chain was entered.
+        /// </summary>
+        /// <remarks>
+        /// Every terminating path of <c>HandleTaskCompletionAsync</c> emits exactly one of these,
+        /// so their ABSENCE for a task id means the downstream chain never ran for it at all.
+        /// </remarks>
+        public static bool DownstreamEntered(string message) =>
+            message.Contains(NoPipelineForTask, StringComparison.Ordinal)
+            || message.Contains("already", StringComparison.Ordinal)
+            || message.Contains("StaleCompletion", StringComparison.Ordinal)
+            || message.Contains("ignoring stale completion", StringComparison.Ordinal)
+            || message.Contains("WorkSlotIntegrity", StringComparison.Ordinal)
+            || message.Contains("task completed", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Records every logged message and hands out FRESH per-call signals for the production lines
+    /// the vectors synchronize on. A previously emitted line can never satisfy a later wait.
+    /// </summary>
+    /// <typeparam name="TCategory">The logger category — the service or the real dispatcher.</typeparam>
+    private sealed class SignallingLogger<TCategory> : ILogger<TCategory>
+    {
         private readonly List<string> _messages = [];
         private readonly List<(string Fragment, TaskCompletionSource Signal)> _waiters = [];
 
@@ -1163,15 +1511,65 @@ public sealed class CompletionTransportOwnershipTests
         }
     }
 
-    private sealed class MockStreamWriter : IServerStreamWriter<OrchestratorMessage>
+    /// <summary>
+    /// THE PUBLICATION OBSERVATION POINT: the gRPC response writer the real <c>WorkStream</c> pump
+    /// forwards every queued <see cref="OrchestratorMessage"/> to.
+    /// </summary>
+    /// <remarks>
+    /// This is where "was an assignment delivered to this worker" is observable WITHOUT competing
+    /// with the production pump for the worker's message channel. It records what it is given and
+    /// signals per assignment; it never intercepts, delays or drops anything.
+    /// </remarks>
+    private sealed class SignallingStreamWriter : IServerStreamWriter<OrchestratorMessage>
     {
+        private readonly List<OrchestratorMessage> _messages = [];
+        private readonly Queue<TaskCompletionSource<TaskAssignment>> _assignmentWaiters = new();
+
         public WriteOptions? WriteOptions { get; set; }
 
-        Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(OrchestratorMessage message)
-            => Task.CompletedTask;
+        /// <summary>Every message the transport forwarded, in order.</summary>
+        public IReadOnlyList<OrchestratorMessage> Messages
+        {
+            get
+            {
+                lock (_messages)
+                    return [.. _messages];
+            }
+        }
+
+        /// <summary>
+        /// A FRESH signal completed by the NEXT forwarded assignment. Allocated BEFORE the Ready is
+        /// pushed, so it can never be missed and never satisfied by an earlier publication.
+        /// </summary>
+        public Task<TaskAssignment> WaitForAssignment()
+        {
+            var waiter = new TaskCompletionSource<TaskAssignment>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_messages)
+                _assignmentWaiters.Enqueue(waiter);
+            return waiter.Task;
+        }
+
+        private Task RecordAsync(OrchestratorMessage message)
+        {
+            TaskCompletionSource<TaskAssignment>? waiter = null;
+            lock (_messages)
+            {
+                _messages.Add(message);
+
+                if (message.Assignment is not null && _assignmentWaiters.Count > 0)
+                    waiter = _assignmentWaiters.Dequeue();
+            }
+
+            waiter?.TrySetResult(message.Assignment!);
+            return Task.CompletedTask;
+        }
+
+        Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(OrchestratorMessage message) =>
+            RecordAsync(message);
 
         Task IAsyncStreamWriter<OrchestratorMessage>.WriteAsync(
-            OrchestratorMessage message, CancellationToken cancellationToken)
-            => Task.CompletedTask;
+            OrchestratorMessage message, CancellationToken cancellationToken) =>
+            RecordAsync(message);
     }
 }
