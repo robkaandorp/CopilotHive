@@ -64,7 +64,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task TokenCancellationWhileBodyDraining_LoopCannotFinishUntilUnwindReleases()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
         using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 
         var responses = new ChannelResponseReader();
@@ -104,7 +104,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // FIRST, then join every original task, so the service is never disposed with live work.
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -119,7 +119,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task EofWhileBodyDraining_LoopCannotFinishUntilUnwindReleases()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -157,7 +157,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -173,7 +173,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task ReaderFaultWhileBodyDraining_LoopCannotFinishUntilUnwindReleases()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var original = new InvalidOperationException("reader fault");
         var responses = new FaultingResponseReader();
@@ -213,7 +213,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -227,7 +227,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task CompletedAssignmentRetained_MatchingCancelNoDuplicateReady_IdleCancelEmitsReady()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -275,7 +275,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // using-disposal runs — even after an assertion failure.
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -294,7 +294,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task SecondSequentialLoopInvocation_StartsWithEmptySlotAndCompletes()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         // Hoisted so the finally can release and join EVERY started producer, even after an
         // assertion failure mid-way through either sequential block.
@@ -356,7 +356,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             firstResponses.TryComplete();
             secondResponses.TryComplete();
-            await JoinAllForTeardownAsync(("first loop", firstLoop), ("second loop", secondLoop));
+            await JoinAllForTeardownAsync(service, ("first loop", firstLoop), ("second loop", secondLoop));
         }
     }
 
@@ -369,7 +369,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task ResetFailure_NoAssignmentInstalledAndHeartbeatStateCleared()
     {
         var runner = new GatedPromptRunner(resetFails: true);
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -398,7 +398,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // has already been awaited in the try, so this join is instantaneous.
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -440,7 +440,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var configRepoDir = Path.Combine(root, "config-repo");
         Directory.CreateDirectory(configRepoDir);
         using var processRunner = InstallHealthyGit(configRepoDir);
-        using var service = BuildService(runner, configRepoDir);
+        var service = BuildService(runner, configRepoDir);
         if (provisioned)
             service.TestProvisioner = new ProvisionerHarness(EligibleConfigUrl, "ghp_retention").Provisioner;
 
@@ -499,7 +499,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
             TryDelete(root);
         }
     }
@@ -548,7 +548,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var configRepoDir = Path.Combine(root, "config-repo");
         Directory.CreateDirectory(configRepoDir);
         using var processRunner = InstallHealthyGit(configRepoDir);
-        using var service = BuildService(runner, configRepoDir);
+        var service = BuildService(runner, configRepoDir);
         if (provisioned)
             service.TestProvisioner = new ProvisionerHarness(EligibleConfigUrl, "ghp_retention").Provisioner;
 
@@ -604,7 +604,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
             TryDelete(root);
         }
     }
@@ -624,7 +624,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var root = CreateRetentionRoot();
         var configRepoDir = Path.Combine(root, "config-repo");
         Directory.CreateDirectory(configRepoDir);
-        using var service = BuildService(runner, configRepoDir);
+        var service = BuildService(runner, configRepoDir);
         service.TestProvisioner = new WorkerConfigProvisioner(
             "worker-1",
             (_, _) => Task.FromException<GetWorkerConfigResponse>(
@@ -669,7 +669,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             requests.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
             TryDelete(root);
         }
     }
@@ -681,18 +681,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// the owner, B has neither started nor been installed, and once A is released B receives a
     /// fresh empty holder that never observes A's result.
     /// <para>
-    /// ORDERING PROOF — the removal-proof part. A message merely being CONSUMED is not evidence
-    /// that the handler ran to a particular point: <c>ChannelResponseReader.MoveNext</c> signals
-    /// <c>Consumed</c> BEFORE <c>ProcessMessagesAsync</c> dispatches on the payload, so the
-    /// pre-release assertions below could in principle be evaluated before a drain-less mutant had
-    /// started B. The airtight evidence is therefore captured INSIDE B's own prompt entry: the
-    /// runner records whether A's ORIGINAL execution task had ALREADY completed at the instant B's
-    /// prompt started. A correct handler awaits A's execution first, so that capture is
-    /// necessarily <c>true</c>; a handler that removed — or failed to await — the replacement drain
-    /// starts B while A is still parked in its Ready write (the test releases that gate only later),
-    /// so the capture is necessarily <c>false</c> and this test fails by name. No polling, no
-    /// sleeps, and no inspection of Task internals: the capture reads the public completion state
-    /// of a task the test itself holds.
+    /// ORDERING PROOF — the removal-proof part. A message merely being consumed is normally not
+    /// evidence that its handler ran, so this fixture uses <see cref="InlineDispatchResponseReader"/>
+    /// and first proves the loop has a pending read. Completing that read with B resumes production
+    /// inline: <c>Push</c> cannot return until B's real handler reaches its first incomplete await —
+    /// A's replacement drain in the correct code, or the gated reset in a drain-less/not-awaited
+    /// mutant. The pre-release assertions are therefore made only after dispatch. The reset and
+    /// prompt-entry captures additionally record whether A's ORIGINAL execution was already complete
+    /// at those exact production boundaries. No polling, sleeps, or Task-internal inspection is used.
     /// </para>
     /// </summary>
     [Fact]
@@ -702,11 +698,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         const string taskB = "task-B-successor";
         var runner = new RetentionRunner(LongOutput);
         var requests = new RetentionRequestStream();
-        var responses = new ChannelResponseReader();
+        var responses = new InlineDispatchResponseReader();
         var root = CreateRetentionRoot();
         var configRepoDir = Path.Combine(root, "config-repo");
         Directory.CreateDirectory(configRepoDir);
-        using var service = BuildService(runner, configRepoDir);
+        var service = BuildService(runner, configRepoDir);
 
         var stream = BuildStream(requests, responses);
         var loop = InvokeProcessMessages(service, stream, "worker-1", TestContext.Current.CancellationToken);
@@ -765,6 +761,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // until the test releases that gate.
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The loop is now parked in its next MoveNext. This fixture completes that pending read
+            // with inline continuations, so Push(B) cannot return until B's real handler reaches its
+            // first incomplete await: the replacement drain (correct) or the reset gate (mutant).
+            await responses.WaitForParkedReadCountAsync(3)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // Deliver B through the REAL loop while A is still unfinished, followed by a probe the
             // sequential loop can only consume once it has finished handling B.
@@ -863,7 +865,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             requests.ReleaseAll();
             bResetRelease.TrySetResult();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(
+            await JoinAllForTeardownAsync(service,
                 ("assignment body A", executionA),
                 ("assignment body B", executionB),
                 ("loop", loop));
@@ -891,7 +893,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task MatchingCancelWithThrowingCallback_JoinsBodyThenClearsAndSurfacesError()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -955,11 +957,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(
+            armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service,
                 ("matching-cancel drain", matchingDrain?.Completion),
                 ("assignment body", bodyExecution),
                 ("loop", loop));
-            armed?.DisposeRegistration();
         }
     }
 
@@ -973,7 +975,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task EofWithThrowingCallback_JoinsBodyThenClearsAndSurfacesError()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -1035,8 +1037,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
         }
     }
 
@@ -1050,7 +1052,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task ReaderFaultPrimaryWithThrowingCallback_PreservesReaderFaultAndStillJoins()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var originalFault = new ReaderPrimaryFailureException("reader fault");
         var responses = new FaultingResponseReader();
@@ -1116,8 +1118,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
         }
     }
 
@@ -1140,7 +1142,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task ReaderFaultPrimaryWithFailingDiagnostics_CleanupStillCompletesAndPrimarySurfaces()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var originalFault = new ReaderPrimaryFailureException("reader fault");
         var responses = new FaultingResponseReader();
@@ -1204,8 +1206,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
         }
     }
 
@@ -1220,7 +1222,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     public async Task MatchingCancel_BodyFaultDiagnosticThrows_StillDisposesSourceAndClearsOwnership()
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         var responses = new ChannelResponseReader();
         var requests = new RecordingRequestStream();
@@ -1271,7 +1273,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("loop", loop));
+            await JoinAllForTeardownAsync(service, ("loop", loop));
         }
     }
 
@@ -1305,7 +1307,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         bool cancelReadyWrite)
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         // A provisioning failure inside the body, BEFORE any executor exists: the body reaches its
         // generic sanitized catch, which is where the degraded diagnostic sink strikes.
@@ -1398,8 +1400,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
         }
     }
 
@@ -1434,7 +1436,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         ReadyBranch branch)
     {
         var runner = new GatedPromptRunner();
-        using var service = BuildService(runner);
+        var service = BuildService(runner);
 
         if (branch == ReadyBranch.HandlerWritesSuccessfully)
         {
@@ -1508,10 +1510,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             responses.Push(MatchingCancel("task-A"));
 
             // THE DISCRIMINATOR: with no prior primary the handler must surface the deferred
-            // callback failure out of the loop. A silently-returning handler leaves the loop healthy
-            // and this assertion fails by name.
+            // callback failure out of the loop. A silently-returning handler leaves the loop healthy;
+            // a failsafe timeout is rejected explicitly and cannot impersonate callback evidence.
             var surfaced = await Assert.ThrowsAnyAsync<Exception>(
                 () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.IsNotType<TimeoutException>(surfaced);
             Assert.Contains(armed.CallbackFailure, Flatten(surfaced));
 
             // The single-Ready contract is intact for this branch.
@@ -1538,8 +1541,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Console.SetError(originalErr);
             runner.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(("assignment body", bodyExecution), ("loop", loop));
             armed?.DisposeRegistration();
+            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
         }
     }
 
@@ -2434,32 +2437,58 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// HERE ONLY — the real outcome is asserted on the test's normal path.
     /// </para>
     /// </remarks>
+    /// <param name="service">The service to dispose only after every known producer is terminal.</param>
     /// <param name="producers">
     /// The started tasks, in the order they should be joined. <c>null</c> entries (a producer a
     /// test never started) are skipped.
     /// </param>
-    private static async Task JoinAllForTeardownAsync(params (string Name, Task? Producer)[] producers)
+    private static async Task JoinAllForTeardownAsync(
+        WorkerService service,
+        params (string Name, Task? Producer)[] producers)
     {
         List<Exception> failures = [];
 
+        // Capture any assignment body that started before the test reached its explicit local
+        // assignment. This closes assertion-failure windows without relying on the loop to be the
+        // body's only join owner.
+        var active = GetActiveAssignment(service);
+        var activeExecution = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+        if (activeExecution is not null
+            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, activeExecution)))
+        {
+            producers = [.. producers, ("active assignment body", activeExecution)];
+        }
+
         foreach (var (name, producer) in producers)
         {
-            if (producer is null)
-                continue;
+            if (producer is not null)
+                await JoinOneAsync(name, producer);
+        }
 
+        // The loop may have started an assignment from an already-buffered message after the first
+        // snapshot. Re-snapshot after all listed joins were attempted and independently join that
+        // late body too; one timeout never prevents this second observation.
+        active = GetActiveAssignment(service);
+        var lateActiveExecution = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+        if (lateActiveExecution is not null
+            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, lateActiveExecution)))
+        {
+            producers = [.. producers, ("late active assignment body", lateActiveExecution)];
+            await JoinOneAsync("late active assignment body", lateActiveExecution);
+        }
+
+        // A using declaration would dispose the service while a timed-out original task is still
+        // live. Dispose manually only after every known producer is terminal; on timeout the service
+        // is intentionally left undisposed and the named failure below is the authoritative result.
+        if (producers.All(candidate => candidate.Producer is null || candidate.Producer.IsCompleted))
+        {
             try
             {
-                await producer.WaitAsync(Failsafe, CancellationToken.None);
-            }
-            catch (TimeoutException)
-            {
-                failures.Add(new Xunit.Sdk.XunitException(
-                    $"Teardown failed to join '{name}' within the bounded failsafe; live work remains."));
-            }
-            catch (Exception) when (producer.IsCompleted)
-            {
-                // Terminal fault/cancellation: the original task is quiescent, which is all the
-                // teardown contract requires.
+                service.Dispose();
             }
             catch (Exception ex)
             {
@@ -2472,6 +2501,27 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         if (failures.Count > 1)
             throw new AggregateException("Teardown could not join every original task.", failures);
+
+        async Task JoinOneAsync(string name, Task producer)
+        {
+            try
+            {
+                await producer.WaitAsync(Failsafe, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    $"Teardown failed to join '{name}' within the bounded failsafe; live work remains."));
+            }
+            catch (Exception) when (producer.IsCompleted)
+            {
+                // Terminal fault/cancellation: the original task is quiescent.
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
     }
 
     /// <summary>
@@ -2669,6 +2719,148 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
 
         public Task CompleteAsync() => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A deterministic reader whose pending <c>MoveNext</c> continuation runs inline when
+    /// <see cref="Push"/> supplies a message. The replacement-ordering fixture first proves the
+    /// loop has a pending read, then pushes B; that call cannot return until B's real handler reaches
+    /// its first incomplete await. This gives a handler-dispatch boundary without polling, sleeps,
+    /// or inspecting Task internals.
+    /// </summary>
+    private sealed class InlineDispatchResponseReader : IAsyncStreamReader<OrchestratorMessage>
+    {
+        private readonly object _gate = new();
+        private readonly Queue<OrchestratorMessage> _queued = new();
+        private readonly Dictionary<int, TaskCompletionSource> _consumedWaiters = [];
+        private readonly Dictionary<int, TaskCompletionSource> _parkedReadWaiters = [];
+        private TaskCompletionSource<bool>? _pendingRead;
+        private bool _completed;
+        private int _consumed;
+        private int _parkedReads;
+
+        public OrchestratorMessage Current { get; private set; } = null!;
+
+        public void Push(OrchestratorMessage message)
+        {
+            TaskCompletionSource<bool>? pending;
+            List<TaskCompletionSource> consumedReady = [];
+            lock (_gate)
+            {
+                if (_completed)
+                    throw new InvalidOperationException("Cannot push after reader completion.");
+
+                pending = _pendingRead;
+                if (pending is null)
+                {
+                    _queued.Enqueue(message);
+                    return;
+                }
+
+                _pendingRead = null;
+                Current = message;
+                RecordConsumedLocked(consumedReady);
+            }
+
+            foreach (var waiter in consumedReady)
+                waiter.TrySetResult();
+
+            // Deliberately NOT RunContinuationsAsynchronously: this is the fixture's dispatch
+            // rendezvous. Production resumes inline and runs until its next incomplete await.
+            pending.SetResult(true);
+        }
+
+        public void TryComplete()
+        {
+            TaskCompletionSource<bool>? pending;
+            lock (_gate)
+            {
+                _completed = true;
+                pending = _pendingRead;
+                _pendingRead = null;
+            }
+            pending?.TrySetResult(false);
+        }
+
+        public Task Consumed(int count)
+        {
+            lock (_gate)
+            {
+                if (_consumed >= count) return Task.CompletedTask;
+                if (!_consumedWaiters.TryGetValue(count, out var waiter))
+                {
+                    waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _consumedWaiters[count] = waiter;
+                }
+                return waiter.Task;
+            }
+        }
+
+        public Task WaitForParkedReadCountAsync(int count)
+        {
+            lock (_gate)
+            {
+                if (_parkedReads >= count) return Task.CompletedTask;
+                if (!_parkedReadWaiters.TryGetValue(count, out var waiter))
+                {
+                    waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _parkedReadWaiters[count] = waiter;
+                }
+                return waiter.Task;
+            }
+        }
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            List<TaskCompletionSource> consumedReady = [];
+            List<TaskCompletionSource> parkedReady = [];
+            Task<bool> result;
+            lock (_gate)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (_queued.TryDequeue(out var queued))
+                {
+                    Current = queued;
+                    RecordConsumedLocked(consumedReady);
+                    result = Task.FromResult(true);
+                }
+                else if (_completed)
+                {
+                    result = Task.FromResult(false);
+                }
+                else
+                {
+                    if (_pendingRead is not null)
+                        throw new InvalidOperationException("Only one pending MoveNext is supported.");
+
+                    _pendingRead = new TaskCompletionSource<bool>();
+                    _parkedReads++;
+                    foreach (var (threshold, waiter) in _parkedReadWaiters)
+                    {
+                        if (_parkedReads >= threshold)
+                            parkedReady.Add(waiter);
+                    }
+                    result = _pendingRead.Task;
+                }
+            }
+
+            foreach (var waiter in consumedReady)
+                waiter.TrySetResult();
+            foreach (var waiter in parkedReady)
+                waiter.TrySetResult();
+            return result;
+        }
+
+        private void RecordConsumedLocked(List<TaskCompletionSource> ready)
+        {
+            _consumed++;
+            foreach (var (threshold, waiter) in _consumedWaiters)
+            {
+                if (_consumed >= threshold)
+                    ready.Add(waiter);
+            }
+        }
     }
 
     /// <summary>
