@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Grpc.Core;
 using Grpc.Net.Client;
@@ -109,6 +110,23 @@ public sealed class WorkerService(
         HiveOrchestrator.HiveOrchestratorClient,
         CancellationToken,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>>? WorkStreamFactory { get; set; }
+
+    /// <summary>
+    /// TEST SEAM — the HEARTBEAT TASK at its existing launch point. When non-null,
+    /// <see cref="RunAsync"/> obtains its <c>heartbeatTask</c> from here, receiving the ACTUAL owned
+    /// heartbeat <see cref="CancellationTokenSource"/>; when <c>null</c>, the existing
+    /// <see cref="RunHeartbeatAsync"/> loop with its unchanged 30-second
+    /// <see cref="PeriodicTimer"/> is used.
+    /// <para>
+    /// This is a TASK replacement ONLY — neither a supervisor, nor a timer framework, nor operator
+    /// configuration, and production never sets it. <see cref="RunAsync"/> owns cancellation,
+    /// joining and source disposal IDENTICALLY for both branches, so a controlled task is joined
+    /// exactly like the production loop: it is the same <c>heartbeatTask</c> slot the teardown
+    /// awaits, and it is never abandoned. The controlled task is not required to be — and must not
+    /// be described as — a real heartbeat RPC, and no timer tick is ever awaited because of it.
+    /// </para>
+    /// </summary>
+    internal Func<WorkerConnection, CancellationTokenSource, Task>? HeartbeatTaskFactory { get; set; }
 
     /// <summary>The currently published connection, or <c>null</c> when none is published.</summary>
     private WorkerConnection? CurrentConnection => Volatile.Read(ref _connection);
@@ -299,6 +317,13 @@ public sealed class WorkerService(
         // the stream and channel — while a nominally usable connection is still published.
         CancellationTokenSource? heartbeatCts = null;
         Task? heartbeatTask = null;
+
+        // The body's PRIMARY failure, recorded before the cleanup block runs. It is the outcome
+        // that must survive cleanup: a secondary cancellation-cleanup failure is reported (sanitized)
+        // beside it rather than allowed to replace it. Recorded by rethrowing unchanged, so the
+        // original exception identity and stack trace are preserved for the caller.
+        Exception? primaryFailure = null;
+
         try
         {
             // 5. Install the LAZY provisioning callback. It is the connection's OWN checked entry
@@ -307,15 +332,28 @@ public sealed class WorkerService(
             //    the connection's provisioner.
             _agentRunner.SetConfigProvisioner(connection.CreateProvisioningCallback());
 
-            // 6. Start heartbeat background task
+            // 6. Start heartbeat background task. The launch point is UNCHANGED: with no seam
+            //    supplied this is the production loop over its own 30-second PeriodicTimer; a
+            //    controlled task (test seam) receives the SAME ACTUAL owned heartbeatCts, and
+            //    RunAsync owns cancellation, joining and disposal identically either way.
             heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            heartbeatTask = RunHeartbeatAsync(connection, heartbeatCts.Token);
+            heartbeatTask = HeartbeatTaskFactory is null
+                ? RunHeartbeatAsync(connection, heartbeatCts.Token)
+                : HeartbeatTaskFactory(connection, heartbeatCts);
 
             // 7. Send WorkerReady
             await SendWorkerReady(connection, ct);
 
             // 8. Main message loop
             await ProcessMessagesAsync(connection, ct);
+        }
+        catch (Exception ex)
+        {
+            // RECORD the primary failure and rethrow it UNCHANGED (original identity and stack
+            // trace), so cleanup below can tell a real message-loop/reader failure from a
+            // secondary cancellation-cleanup failure.
+            primaryFailure = ex;
+            throw;
         }
         finally
         {
@@ -331,15 +369,171 @@ public sealed class WorkerService(
             // Stop and join the heartbeat, then release the linked source. Both are null when the
             // setup step that creates them faulted, so this cleanup is safe for EVERY point at
             // which the body above can leave.
-            if (heartbeatCts is not null)
-                await heartbeatCts.CancelAsync();
+            //
+            // A THROWING CANCELLATION CALLBACK IS CAPTURED, not allowed to bypass the rest of the
+            // cleanup: the failure is retained VERBATIM and the teardown still awaits the ORIGINAL
+            // heartbeatTask and still disposes its source. Only an already-disposed source (a
+            // repeated drain) is tolerated silently.
+            var cancellationFailure = heartbeatCts is null
+                ? null
+                : await CaptureCancellationFailureAsync(heartbeatCts);
 
-            if (heartbeatTask is not null)
-            {
-                try { await heartbeatTask; } catch (OperationCanceledException) { }
-            }
+            // THE JOIN OUTCOME IS CAPTURED TOO. Awaiting the ORIGINAL heartbeat task can itself
+            // fault with a non-cancellation error (the heartbeat loop's own diagnostic is guarded,
+            // but the seam-supplied task is arbitrary). Letting that fault unwind this `finally`
+            // would skip the disposal below AND silently replace both a RunAsync primary and the
+            // captured cancellation-callback failure, so it is captured instead. Ordinary
+            // cancellation stays tolerated exactly as before.
+            var joinFailure = heartbeatTask is null
+                ? null
+                : await CaptureJoinFailureAsync(heartbeatTask);
 
             heartbeatCts?.Dispose();
+
+            // ERROR PRECEDENCE — ONE authoritative outcome; every other failure is merely REPORTED
+            // through guarded sanitized logging (a logger failure can never replace a real one):
+            //   1. a RunAsync/message-loop PRIMARY already in flight wins, and BOTH cleanup
+            //      failures are reported beside it;
+            //   2. otherwise the deferred cancellation-callback failure wins — the heartbeat-join
+            //      failure may never replace or discard it, so it is reported instead;
+            //   3. otherwise the heartbeat-join failure propagates.
+            // Nothing is raised until the join above and the disposal above have completed, so a
+            // throwing callback (or a faulting heartbeat) can never be turned into a fabricated
+            // successful teardown and can never skip releasing the source.
+            if (primaryFailure is not null)
+            {
+                ReportIfPresent(cancellationFailure, HeartbeatCancellationFailedMessage);
+                ReportIfPresent(joinFailure, HeartbeatJoinFailedMessage);
+            }
+            else if (cancellationFailure is not null)
+            {
+                ReportIfPresent(joinFailure, HeartbeatJoinFailedMessage);
+                RethrowDeferred(cancellationFailure);
+            }
+            else
+            {
+                RethrowDeferred(joinFailure);
+            }
+        }
+    }
+
+    /// <summary>The sanitized report message for a failed heartbeat cancellation request.</summary>
+    private const string HeartbeatCancellationFailedMessage = "Heartbeat cancellation cleanup failed";
+
+    /// <summary>The sanitized report message for a failed heartbeat JOIN.</summary>
+    private const string HeartbeatJoinFailedMessage = "Heartbeat join failed";
+
+    /// <summary>The sanitized report message for a failed assignment cancellation request.</summary>
+    private const string TaskCancellationFailedMessage = "Task cancellation cleanup failed";
+
+    /// <summary>
+    /// Requests cancellation on <paramref name="source"/> and CAPTURES a failure raised by a
+    /// cancellation callback instead of letting it unwind the caller's cleanup.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="CancellationTokenSource.CancelAsync"/> surfaces a throwing callback as the
+    /// callback's OWN exception (wrapped in an <see cref="AggregateException"/> when the runtime
+    /// aggregated several). That exception is returned VERBATIM — never unwrapped, never
+    /// normalized into a single invented type — so the caller can keep the actual caught evidence
+    /// observable after it has joined its work and released its resources.
+    /// </para>
+    /// <para>
+    /// An ALREADY-DISPOSED source returns <c>null</c>: that is the pre-existing tolerance for a
+    /// repeated drain, not a callback failure, and there is nothing left to cancel. Success also
+    /// returns <c>null</c> — a fabricated cancellation outcome is never manufactured.
+    /// </para>
+    /// </remarks>
+    /// <param name="source">The source to cancel.</param>
+    /// <returns>The deferred cancellation failure to propagate, or <c>null</c> when none arose.</returns>
+    private static async Task<Exception?> CaptureCancellationFailureAsync(CancellationTokenSource source)
+    {
+        try
+        {
+            await source.CancelAsync();
+            return null;
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed by an earlier drain — nothing to cancel.
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// JOINS <paramref name="task"/> to termination and CAPTURES a non-cancellation failure instead
+    /// of letting it unwind the caller's cleanup.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The task is awaited WITHOUT a caller token, so the join can never be made vacuous and the
+    /// work is never abandoned. Ordinary cancellation is tolerated exactly as before (a cancelled
+    /// heartbeat is the normal teardown outcome and returns <c>null</c>); anything else is returned
+    /// VERBATIM — never unwrapped or normalized into a single invented type — so the caller can
+    /// release its resources first and then apply its precedence policy to the actual evidence.
+    /// </para>
+    /// <para>
+    /// A successful join also returns <c>null</c>: no failure is ever manufactured.
+    /// </para>
+    /// </remarks>
+    /// <param name="task">The ORIGINAL task to join.</param>
+    /// <returns>The captured join failure, or <c>null</c> for success or ordinary cancellation.</returns>
+    private static async Task<Exception?> CaptureJoinFailureAsync(Task task)
+    {
+        try
+        {
+            await task;
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: this is how a cancelled background task unwinds.
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// Reports a non-authoritative failure through the guarded sanitized log. A no-op when there is
+    /// nothing to report.
+    /// </summary>
+    /// <param name="failure">The failure to report, or <c>null</c>.</param>
+    /// <param name="message">The static, secret-free message describing the cleanup stage.</param>
+    private void ReportIfPresent(Exception? failure, string message)
+    {
+        if (failure is not null)
+            TryLogSanitized(message, failure);
+    }
+
+    /// <summary>
+    /// Reports a cleanup-related failure in sanitized form, GUARDED so a diagnostic can never itself
+    /// skip or replace cleanup. Used when a primary failure already exists: the primary propagates
+    /// and this is the non-throwing report beside it.
+    /// </summary>
+    /// <remarks>
+    /// The log write is deliberately guarded: a failing <see cref="Console.Error"/> (a test seam, or
+    /// a closed stream) must not be able to replace the real failure or abort the remaining cleanup.
+    /// Nothing here inspects the failure's message — <see cref="SafeExceptionLog.Describe"/> renders
+    /// type names and status codes only, so a provisioned secret can never reach the log.
+    /// </remarks>
+    /// <param name="message">The static, secret-free message describing the cleanup stage.</param>
+    /// <param name="failure">The failure to classify — never rendered as text.</param>
+    private void TryLogSanitized(string message, Exception failure)
+    {
+        try
+        {
+            _log.Error($"{message} [{SafeExceptionLog.Describe(failure)}]");
+        }
+        catch
+        {
+            // A diagnostic must never mask the authoritative outcome.
         }
     }
 
@@ -470,32 +664,105 @@ public sealed class WorkerService(
     /// WITHOUT cancelling it (its Ready already flowed, so it is finished or finishing),
     /// disposes its CTS, and only then clears the slot.
     /// </summary>
+    /// <remarks>
+    /// The clear happens ONLY after the drain returned — i.e. after the body joined and its CTS
+    /// disposal was attempted — so a replacement never installs its own assignment while the
+    /// original body is still running. With <c>cancelFirst: false</c> there is no cancellation
+    /// callback to fail, so nothing is deferred here.
+    /// </remarks>
     private async Task DrainRetainedForReplacementAsync()
     {
         var drained = TakeActiveAssignment();
-        await DrainAssignmentAsync(drained, cancelFirst: false);
+        var deferredCancellationFailure = await DrainAssignmentAsync(drained, cancelFirst: false);
         ClearActiveAssignment();
+
+        RethrowDeferred(deferredCancellationFailure);
     }
 
     /// <summary>
     /// Ownership transition — MATCHING-CANCEL clear. Cancels and drains the retained
     /// assignment, disposes its CTS, and only then clears the slot. Returns the drained
-    /// assignment so the caller can still consult its single-flight Ready claim afterwards.
+    /// assignment (so the caller can still consult its single-flight Ready claim) together with
+    /// any DEFERRED cancellation-cleanup failure for the caller to propagate AFTER its own
+    /// cleanup.
     /// </summary>
-    private async Task<ActiveAssignment> DrainRetainedForMatchingCancelAsync()
+    /// <remarks>
+    /// The slot is cleared here, but the deferred failure is deliberately RETURNED rather than
+    /// thrown: the call site still has to clear <c>_currentTaskId</c>/<c>_currentRole</c> (and, on
+    /// the cancel path, consult the Ready claim), and a throwing cancellation callback must never
+    /// skip that cleanup. Neither value is a new outcome framework — the drained owner and the
+    /// verbatim caught evidence are simply handed back.
+    /// </remarks>
+    private async Task<(ActiveAssignment Drained, Exception? DeferredCancellationFailure)>
+        DrainRetainedForMatchingCancelAsync()
     {
         var drained = TakeActiveAssignment();
-        await DrainAssignmentAsync(drained, cancelFirst: true);
+        var deferredCancellationFailure = await DrainAssignmentAsync(drained, cancelFirst: true);
         ClearActiveAssignment();
-        return drained;
+
+        return (drained, deferredCancellationFailure);
     }
 
     /// <summary>
     /// Ownership transition — TEARDOWN clear, called from the message loop's <c>finally</c>.
-    /// Identical to the matching-cancel clear (cancel, drain, dispose, then clear); the
-    /// returned assignment is not used because teardown emits no Ready of its own.
+    /// Identical to the matching-cancel clear (cancel, drain, dispose, then clear), except that the
+    /// returned assignment is not used (teardown emits no Ready of its own) and the deferred
+    /// cancellation failure is handled by the caller AFTER its own heartbeat-state cleanup.
     /// </summary>
-    private Task DrainRetainedForTeardownAsync() => DrainRetainedForMatchingCancelAsync();
+    /// <remarks>
+    /// The ownership slot is cleared here — after the body joined and its CTS disposal was
+    /// attempted — so a deferred cancellation failure can never leave the slot occupied for a
+    /// subsequent loop invocation.
+    /// </remarks>
+    private async Task<Exception?> DrainRetainedForTeardownAsync()
+    {
+        var (_, deferredCancellationFailure) = await DrainRetainedForMatchingCancelAsync();
+        return deferredCancellationFailure;
+    }
+
+    /// <summary>
+    /// THE ERROR-PRECEDENCE RULE for a deferred cancellation-cleanup failure, applied only AFTER
+    /// the joins and the resource cleanup have completed.
+    /// </summary>
+    /// <remarks>
+    /// With a PRIMARY failure already propagating, that primary is authoritative and the secondary
+    /// failure is merely REPORTED in sanitized, guarded form — it never replaces the real failure.
+    /// Without a primary, the deferred failure is re-raised with its ORIGINAL evidence (the exact
+    /// instance the cancellation produced, including any <see cref="AggregateException"/> wrapper),
+    /// so a throwing callback can never become a fabricated successful teardown. A <c>null</c>
+    /// deferred failure and a <c>null</c> primary are both no-ops.
+    /// </remarks>
+    /// <param name="deferredCancellationFailure">The captured cancellation-cleanup failure, or <c>null</c>.</param>
+    /// <param name="primaryFailure">The already-propagating primary failure, or <c>null</c>.</param>
+    /// <param name="reportMessage">The static, secret-free message used when reporting a secondary failure.</param>
+    private void PropagateOrReport(
+        Exception? deferredCancellationFailure, Exception? primaryFailure, string reportMessage)
+    {
+        if (deferredCancellationFailure is null)
+            return;
+
+        if (primaryFailure is not null)
+        {
+            TryLogSanitized(reportMessage, deferredCancellationFailure);
+            return;
+        }
+
+        ExceptionDispatchInfo.Capture(deferredCancellationFailure).Throw();
+    }
+
+    /// <summary>
+    /// Re-raises a DEFERRED cancellation-cleanup failure with its ORIGINAL evidence — the exact
+    /// instance <see cref="CancellationTokenSource.CancelAsync"/> produced, including an
+    /// <see cref="AggregateException"/> wrapper — so the caller observes the same failure the
+    /// callback raised rather than a normalized or synthesized substitute. A no-op when there is no
+    /// deferred failure.
+    /// </summary>
+    /// <param name="deferredCancellationFailure">The captured failure, or <c>null</c>.</param>
+    private static void RethrowDeferred(Exception? deferredCancellationFailure)
+    {
+        if (deferredCancellationFailure is not null)
+            ExceptionDispatchInfo.Capture(deferredCancellationFailure).Throw();
+    }
 
     /// <summary>
     /// Removes and returns the retained assignment. Failing fast on an empty slot keeps the
@@ -529,6 +796,11 @@ public sealed class WorkerService(
     private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
     {
         var stream = connection.Stream;
+
+        // The loop's PRIMARY failure (a reader fault, a cancelled read, a handler failure). It is
+        // recorded before the cleanup block, so a secondary cancellation-cleanup failure reported by
+        // the teardown drain can never REPLACE an already-propagating primary error.
+        Exception? primaryFailure = null;
 
         try
         {
@@ -668,7 +940,7 @@ public sealed class WorkerService(
                                 break;
                             }
 
-                            var cancelled = await DrainRetainedForMatchingCancelAsync();
+                            var (cancelled, cancelDrainFailure) = await DrainRetainedForMatchingCancelAsync();
 
                             _currentTaskId = null;
                             _currentRole = null;
@@ -676,8 +948,33 @@ public sealed class WorkerService(
                             // Single-flight: the drained body normally claims Ready itself. Only
                             // emit here if it did not (e.g. it was cancelled before reaching the
                             // claim), so a cancel never produces a second dequeue.
+                            //
+                            // THE WRITE'S OUTCOME IS CAPTURED, not allowed to jump past the
+                            // deferred failure below: a Ready write that fails or is cancelled
+                            // would otherwise unwind straight to the loop's catch and SILENTLY
+                            // DISCARD the captured cancellation-callback evidence.
+                            Exception? readyFailure = null;
                             if (cancelled.Ready.TryClaim())
-                                await SendWorkerReady(connection, ct);
+                            {
+                                try
+                                {
+                                    await SendWorkerReady(connection, ct);
+                                }
+                                catch (Exception ex)
+                                {
+                                    readyFailure = ex;
+                                }
+                            }
+
+                            // ERROR PRECEDENCE. The ownership clear, the heartbeat-state cleanup and
+                            // this cancel handler's single Ready have all completed by now.
+                            // A FAILED Ready write is a genuine PRIOR PRIMARY (real transport or
+                            // caller cancellation), so it keeps its own identity and propagates,
+                            // while the deferred cancellation-callback failure is reported through
+                            // the guarded sanitized log rather than being discarded. With a
+                            // successful (or unclaimed) Ready the deferred failure propagates.
+                            PropagateOrReport(cancelDrainFailure, readyFailure, TaskCancellationFailedMessage);
+                            RethrowDeferred(readyFailure);
                         }
                         else
                         {
@@ -712,6 +1009,14 @@ public sealed class WorkerService(
                 }
             }
         }
+        catch (Exception ex)
+        {
+            // RECORD the loop's primary failure (reader fault, cancelled read, handler failure) and
+            // rethrow it UNCHANGED, so cleanup below can preserve it ahead of a secondary
+            // cancellation-cleanup failure.
+            primaryFailure = ex;
+            throw;
+        }
         finally
         {
             // END RESPONSE WAITS FIRST — BEFORE the assignment cancellation/drain below. A tool call
@@ -726,8 +1031,13 @@ public sealed class WorkerService(
             // after this returns, and a still-running turn holds the client lifecycle lease.
             // Cancel then drain so the runner is quiescent before disposal. The ownership
             // slot must be empty after successful loop cleanup.
-            if (_activeAssignment is not null)
-                await DrainRetainedForTeardownAsync();
+            //
+            // A deferred cancellation-cleanup failure is held until AFTER the ownership clear, the
+            // heartbeat-state cleanup and retirement below, so a throwing cancellation callback can
+            // never skip any of them (nor the join of the body itself).
+            var teardownDrainFailure = _activeAssignment is not null
+                ? await DrainRetainedForTeardownAsync()
+                : null;
 
             _currentTaskId = null;
             _currentRole = null;
@@ -736,6 +1046,14 @@ public sealed class WorkerService(
             // failure with a LIVE token therefore still got its single Ready attempt; from here on,
             // any NEW operation on this connection fails disconnected instead of starting transport.
             connection.Retire();
+
+            // ERROR PRECEDENCE. With a primary loop failure already propagating (a reader fault, a
+            // cancelled read, a handler failure), that primary is what surfaces and the secondary
+            // cancellation-cleanup failure is reported through guarded sanitized logging ONLY — a
+            // logger failure can never replace the real failure. Without a primary, the deferred
+            // failure propagates now, AFTER the clear, the retirement and the join above.
+            PropagateOrReport(
+                teardownDrainFailure, primaryFailure, TaskCancellationFailedMessage);
         }
     }
 
@@ -744,24 +1062,36 @@ public sealed class WorkerService(
     /// <see cref="CancellationTokenSource"/>. Never throws for cancellation — the whole point is
     /// to reach a quiescent state.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A THROWING CANCELLATION CALLBACK IS CAPTURED, not allowed to escape: it is returned to the
+    /// caller (to be re-raised <em>after</em> the joins and the resource cleanup) instead of
+    /// skipping <c>await assignment.Execution</c> and <c>Cts.Dispose()</c>. The body is still
+    /// awaited to termination with no caller token — a caller token can never make the join vacuous
+    /// — and the deferred failure is never converted into a fabricated successful cancellation.
+    /// </para>
+    /// <para>
+    /// Ordinary cancellation tolerance and the sanitized treatment of body faults are unchanged:
+    /// an <see cref="OperationCanceledException"/> from the body is expected, and any other body
+    /// fault is reported in sanitized form (guarded, so a diagnostic can never skip the disposal
+    /// below) rather than propagating into the message loop or teardown path.
+    /// </para>
+    /// </remarks>
     /// <param name="assignment">The assignment to drain.</param>
     /// <param name="cancelFirst">
     /// <c>true</c> to request cancellation before awaiting (cancel handling and stream teardown);
     /// <c>false</c> to simply await an assignment that is already finishing.
     /// </param>
-    private async Task DrainAssignmentAsync(ActiveAssignment assignment, bool cancelFirst)
+    /// <returns>
+    /// The deferred cancellation-cleanup failure to propagate after cleanup, or <c>null</c> when
+    /// none arose (success, no cancellation requested, or an already-disposed source).
+    /// </returns>
+    private async Task<Exception?> DrainAssignmentAsync(ActiveAssignment assignment, bool cancelFirst)
     {
-        if (cancelFirst)
-        {
-            try
-            {
-                await assignment.Cts.CancelAsync();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed by an earlier drain — nothing to cancel.
-            }
-        }
+        // CAPTURE FIRST: a callback failure must not bypass the join and the disposal below.
+        var deferredCancellationFailure = cancelFirst
+            ? await CaptureCancellationFailureAsync(assignment.Cts)
+            : null;
 
         try
         {
@@ -775,10 +1105,14 @@ public sealed class WorkerService(
         {
             // The body already sanitizes and logs its own failures; this is a last-resort guard so
             // draining never propagates a task fault into the message loop or teardown path.
-            _log.Error($"Task drain observed a fault [{SafeExceptionLog.Describe(ex)}]");
+            TryLogSanitized("Task drain observed a fault", ex);
         }
 
+        // Disposal is attempted AFTER the join and runs even when a deferred cancellation failure
+        // is waiting to propagate — the deferred failure surfaces only once resources are released.
         assignment.Cts.Dispose();
+
+        return deferredCancellationFailure;
     }
 
     #region Assignment execution and config-repo preparation
@@ -1361,7 +1695,18 @@ public sealed class WorkerService(
         {
             // Sanitized: heartbeats retry across the gRPC boundary, whose status details can
             // echo request configuration back to the worker.
-            Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
+            //
+            // GUARDED: a heartbeat fault is a best-effort diagnostic, so a degraded stderr (a
+            // redirected/closed writer, a throwing test seam) must not be able to fault the
+            // heartbeat loop and turn a swallow-and-retry tick into a teardown-time join failure.
+            try
+            {
+                Console.Error.WriteLine($"[Worker] Heartbeat failed [{SafeExceptionLog.Describe(ex)}]");
+            }
+            catch
+            {
+                // The tick's swallow-and-retry contract is what matters, not the diagnostic.
+            }
         }
     }
 

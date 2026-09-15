@@ -50,6 +50,13 @@ public sealed class WorkerConnectionLifecycleTests
     /// <summary>Generous failsafe bound; never an ordering device.</summary>
     private static readonly TimeSpan Failsafe = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Bound on teardown's drain-to-fixpoint loop. Each pass joins every newly admitted assignment
+    /// execution; exceeding this means the runner kept admitting new work after the recording was
+    /// sealed, which is reported as a named failure rather than looped on forever.
+    /// </summary>
+    private const int MaxTeardownDrainPasses = 8;
+
     // ══════════════════════════════════════════════════════════════════════════
     // (1) The REAL RunAsync flow.
     // ══════════════════════════════════════════════════════════════════════════
@@ -90,7 +97,7 @@ public sealed class WorkerConnectionLifecycleTests
         var launcher = new FakeGitLauncher(HealthyRepoHandler(configRepoDir));
         using var processRunner = WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher);
 
-        using var service = BuildService(runner, provisionerHarness.Provisioner, configRepoDir);
+        var service = BuildService(runner, provisionerHarness.Provisioner, configRepoDir);
 
         var requests = new RecordingRequestStream();
         var responses = new ChannelResponseReader();
@@ -238,9 +245,9 @@ public sealed class WorkerConnectionLifecycleTests
         }
         finally
         {
-            await loopCts.CancelAsync();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
             TryDelete(configRepoDir);
         }
     }
@@ -256,30 +263,41 @@ public sealed class WorkerConnectionLifecycleTests
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
         var runner = new ProvisionerCapturingRunner();
         var streamOpened = 0;
-        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
-        service.CallInvokerFactory = () => invoker;
-        service.WorkStreamFactory = (_, _) =>
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
         {
-            Interlocked.Increment(ref streamOpened);
-            throw new InvalidOperationException("No stream may be opened for a rejected registration.");
-        };
+            service.CallInvokerFactory = () => invoker;
+            service.WorkStreamFactory = (_, _) =>
+            {
+                Interlocked.Increment(ref streamOpened);
+                throw new InvalidOperationException("No stream may be opened for a rejected registration.");
+            };
 
-        await service.RunAsync(TestContext.Current.CancellationToken);
+            await service.RunAsync(TestContext.Current.CancellationToken);
 
-        Assert.Null(GetPublishedConnection(service));
-        Assert.Equal(0, streamOpened);
-        Assert.Null(runner.ConfigProvisioner);
-        Assert.Equal(1, invoker.RegisterCalls);
-        Assert.Equal(0, invoker.WorkerConfigCalls);
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(0, streamOpened);
+            Assert.Null(runner.ConfigProvisioner);
+            Assert.Equal(1, invoker.RegisterCalls);
+            Assert.Equal(0, invoker.WorkerConfigCalls);
 
-        // Nothing usable was published, so access fails with the EXISTING error category.
-        var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
+            // Nothing usable was published, so access fails with the EXISTING error category.
+            var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
 
-        var sendFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.ReportProgressAsync("t", "s", "d", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, sendFailure.Message);
+            var sendFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ReportProgressAsync("t", "s", "d", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, sendFailure.Message);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -314,7 +332,7 @@ public sealed class WorkerConnectionLifecycleTests
             (_, _) => { });
 
         var runner = new ProvisionerCapturingRunner();
-        using var service = BuildService(runner, witness);
+        var service = BuildService(runner, witness);
 
         var requests = new RecordingRequestStream();
         var responses = new ChannelResponseReader();
@@ -368,9 +386,9 @@ public sealed class WorkerConnectionLifecycleTests
         }
         finally
         {
-            await loopCts.CancelAsync();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
             responses.TryComplete();
-            await ObserveForTeardownAsync(run);
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
         }
     }
 
@@ -415,12 +433,13 @@ public sealed class WorkerConnectionLifecycleTests
             throw setupFailure;
         });
 
-        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
         serviceRef = service;
+        var responses = new ChannelResponseReader();
 
         var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
             new RecordingRequestStream(),
-            new ChannelResponseReader(),
+            responses,
             _ => Task.FromResult(new Metadata()),
             _ => new Status(StatusCode.OK, string.Empty),
             _ => new Metadata(),
@@ -435,29 +454,39 @@ public sealed class WorkerConnectionLifecycleTests
         service.CallInvokerFactory = () => invoker;
         service.WorkStreamFactory = (_, _) => stream;
 
-        // The setup step throws, so the failure propagates to the caller unchanged.
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.RunAsync(TestContext.Current.CancellationToken)
-                .WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-        Assert.Same(setupFailure, thrown);
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(TestContext.Current.CancellationToken);
 
-        // The connection really was published and usable when the fallible step ran — otherwise the
-        // teardown assertions below would be vacuous.
-        Assert.NotNull(published);
-        Assert.True(publishedAtSetup, "The connection must be published and usable at the setup step.");
+            // The setup step throws, so the failure propagates to the caller unchanged.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(setupFailure, thrown);
 
-        // ...and the cleanup that now covers the setup interval retired and unpublished it BEFORE
-        // the transport was disposed.
-        Assert.Null(GetPublishedConnection(service));
-        Assert.True(published!.IsRetired);
-        Assert.Equal(1, disposals);
-        Assert.True(retiredAtDisposal, "The connection must be retired before its stream is disposed.");
-        Assert.True(unpublishedAtDisposal, "The connection must be unpublished before its stream is disposed.");
+            // The connection really was published and usable when the fallible step ran — otherwise the
+            // teardown assertions below would be vacuous.
+            Assert.NotNull(published);
+            Assert.True(publishedAtSetup, "The connection must be published and usable at the setup step.");
 
-        // And the service is genuinely disconnected afterwards — no nominally usable connection.
-        var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
+            // ...and the cleanup that now covers the setup interval retired and unpublished it BEFORE
+            // the transport was disposed.
+            Assert.Null(GetPublishedConnection(service));
+            Assert.True(published!.IsRetired);
+            Assert.Equal(1, disposals);
+            Assert.True(retiredAtDisposal, "The connection must be retired before its stream is disposed.");
+            Assert.True(unpublishedAtDisposal, "The connection must be unpublished before its stream is disposed.");
+
+            // And the service is genuinely disconnected afterwards — no nominally usable connection.
+            var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, sessionFailure.Message);
+        }
+        finally
+        {
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("RunAsync", run));
+        }
     }
 
     /// <summary>
@@ -486,7 +515,7 @@ public sealed class WorkerConnectionLifecycleTests
             _ => null,
             (_, _) => { });
 
-        using var service = BuildService(new ProvisionerCapturingRunner(), witness);
+        var service = BuildService(new ProvisionerCapturingRunner(), witness);
 
         var requests = new RecordingRequestStream();
         var responses = new ChannelResponseReader();
@@ -523,13 +552,903 @@ public sealed class WorkerConnectionLifecycleTests
         finally
         {
             responses.TryComplete();
-            await ObserveForTeardownAsync(loop);
+            await JoinAllForTeardownAsync(service, ("message loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// A THROWING HEARTBEAT CANCELLATION CALLBACK CANNOT SKIP JOINING THE ORIGINAL HEARTBEAT TASK.
+    /// <para>
+    /// The controlled heartbeat task provided by <c>HeartbeatTaskFactory</c> is deliberately NOT a
+    /// real heartbeat RPC: it parks until the test releases it and never observes the token, so the
+    /// ONLY thing that can complete it is the test. While it is unreleased, teardown must stay
+    /// parked in <c>await heartbeatTask</c>: the source is not yet disposed, the transport is not
+    /// yet disposed, and <see cref="WorkerService.RunAsync"/> has not returned.
+    /// </para>
+    /// <para>
+    /// After release, the deferred cancellation failure surfaces on the run task — with the
+    /// runtime's own <see cref="AggregateException"/> wrapper and the callback's original exception
+    /// inside it — and only then are the source and the transport disposed. The seam was entered
+    /// exactly once with the ACTUAL owned source, so the task joined is provably the SAME control
+    /// task the factory returned: no live heartbeat is abandoned.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ThrowingHeartbeatCancellationCallback_JoinsOriginalTaskBeforeDisposingSourceAndTransport()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+
+        // Hoisted so the stream's disposal callback observes the ACTUAL connection's teardown state.
+        WorkerConnection? connection = null;
+        var retiredAtStreamDisposal = false;
+        var unpublishedAtStreamDisposal = false;
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ =>
+            {
+                Interlocked.Increment(ref streamDisposals);
+                retiredAtStreamDisposal = connection?.IsRetired ?? false;
+                unpublishedAtStreamDisposal = GetPublishedConnection(service) is null;
+            },
+            null!);
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        var heartbeatJoinFailure = new HeartbeatJoinFailureException("controlled heartbeat join failure");
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task replaces the production heartbeat loop at its existing launch
+            // point. It parks until released and then faults with unique evidence. The resulting
+            // guarded join diagnostic is the positive signal that RunAsync awaited THIS task.
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatJoinFailure;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        var joinObserved = new MarkerObservingWriter("Heartbeat join failed", stdErr);
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        CancellationTokenRegistration registration = default;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The seam ran at the EXISTING launch point (after publication), with the ACTUAL owned
+            // heartbeat source, and it returned the ONE task teardown must join.
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, Volatile.Read(ref heartbeatFactoryCalls));
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+            Assert.False(joinedTask.IsCompleted);
+            connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+
+            // The callback records its invocation AND throws a type distinct from every competing
+            // failure, so propagated/reported evidence cannot be misclassified.
+            var callbackFailure = new HeartbeatCancellationCallbackException(
+                "throwing heartbeat cancellation callback");
+            var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            registration = heartbeatCts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+
+            Console.SetError(joinObserved);
+
+            // EOF ends the body, so RunAsync's cleanup requests cancellation — and the callback throws.
+            responses.TryComplete();
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // CLEANUP MUST STILL BE PARKED IN THE JOIN. The controlled task is held, so the source is
+            // undisposed, the transport is undisposed and the run has not returned.
+            Assert.False(joinedTask.IsCompleted, "The ORIGINAL heartbeat task must still be the one being awaited.");
+            Assert.False(run.IsCompleted, "Teardown must not return while the original heartbeat task is still running.");
+            Assert.Null(Record.Exception(() => _ = heartbeatCts.Token));
+            Assert.True(heartbeatCts.IsCancellationRequested, "The cancellation request must still have taken effect.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            // Release the ORIGINAL task: it faults with unique evidence. The join diagnostic is a
+            // positive production signal that RunAsync awaited this exact task; a skipped join can
+            // neither fabricate this classification nor complete the marker.
+            heartbeatGate.TrySetResult();
+            await joinObserved.MarkerObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // The deferred failure kept its ORIGINAL evidence, wrapped exactly as the runtime produced it.
+            Assert.IsType<AggregateException>(surfaced);
+            Assert.Contains(callbackFailure, Flatten(surfaced));
+
+            // The SAME task was joined, the source is now disposed, and the transport went away only
+            // after the join — with retirement/unpublication still preceding disposal.
+            Assert.True(joinedTask.IsCompleted, "The task the factory returned must have been joined.");
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+            Assert.True(retiredAtStreamDisposal, "The connection must be retired before its stream is disposed.");
+            Assert.True(unpublishedAtStreamDisposal, "The connection must be unpublished before its stream is disposed.");
+
+            var diagnostics = stdErr.ToString();
+            Assert.Contains(nameof(HeartbeatJoinFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(heartbeatJoinFailure.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// A PRIMARY <c>RunAsync</c> FAILURE IS PRESERVED when the cancellation cleanup ALSO fails: the
+    /// primary propagates with its original identity, the join of the ORIGINAL heartbeat task still
+    /// happens, and the secondary failure is reported through the EXISTING sanitized logger seam
+    /// (type classification only, never the message) without replacing the real failure.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithThrowingHeartbeatCallback_PreservesPrimaryAndStillJoins()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The PRIMARY failure: the initial Ready write fails, inside RunAsync's covered body.
+        var primaryFailure = new PrimaryTransportFailureException("primary transport failure");
+
+        var requests = new RecordingRequestStream { FailNextReadyWrite = primaryFailure };
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        var joinObserved = new MarkerObservingWriter("Heartbeat join failed", stdErr);
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        var heartbeatJoinFailure = new HeartbeatJoinFailureException("controlled heartbeat join failure");
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+
+        // The callback records its invocation AND throws. Its distinct type proves the secondary,
+        // rather than the primary, is what the sanitized cancellation diagnostic classifies.
+        var callbackFailure = new HeartbeatCancellationCallbackException(
+            "throwing heartbeat cancellation callback");
+        var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task parks until released and then faults with a distinct sentinel.
+            // Its guarded join diagnostic is the positive signal that THIS task was awaited.
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatJoinFailure;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The heartbeat had already been launched at its unchanged launch point BEFORE the
+            // primary failure, so the cleanup below always has a running heartbeat to join.
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+
+            // The diagnostics below go to the existing logger seam. The marker gives a positive,
+            // bounded signal only after the original heartbeat task's join fault was observed.
+            Console.SetError(joinObserved);
+
+            // The secondary failure fired during cleanup; the join must still be parked on the
+            // ORIGINAL controlled task.
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "The join must still occur even though a primary failure exists.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            heartbeatGate.TrySetResult();
+            await joinObserved.MarkerObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The PRIMARY propagates — unchanged, with its own identity.
+            var thrown = await Assert.ThrowsAsync<PrimaryTransportFailureException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            // The join happened, the source was disposed, and the transport went away afterwards.
+            Assert.True(joinedTask.IsFaulted);
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+
+            // The secondary failure was REPORTED in sanitized form — classified by type, never by
+            // message — so the provisioned-content redaction contract is unchanged.
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Heartbeat cancellation cleanup failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(
+                nameof(HeartbeatCancellationCallbackException), diagnostics, StringComparison.Ordinal);
+            Assert.Contains("Heartbeat join failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(nameof(HeartbeatJoinFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(nameof(PrimaryTransportFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(callbackFailure.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // (1b) The heartbeat JOIN outcome (defect A).
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A FAULTING ORIGINAL HEARTBEAT TASK CANNOT BYPASS <c>heartbeatCts.Dispose()</c> NOR REPLACE A
+    /// PRIOR PRIMARY.
+    /// <para>
+    /// The controlled heartbeat task faults with a NON-cancellation exception (the production
+    /// analogue: a heartbeat tick whose diagnostic sink is degraded), while a PRIMARY transport
+    /// failure is already in flight from <c>RunAsync</c>'s covered body. The join outcome must be
+    /// captured: the source is still disposed, the transport is still disposed, and the PRIMARY is
+    /// what surfaces — the heartbeat fault is only REPORTED through the existing guarded sanitized
+    /// logging (type classification, never the message).
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF. If the join outcome escapes the cleanup <c>finally</c>, the source is never
+    /// disposed (the <c>ObjectDisposedException</c> assertion fails) and the surfaced exception is
+    /// the heartbeat fault rather than the primary (the <c>Assert.Same</c> fails), so both named
+    /// assertions fail together.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_FaultingHeartbeatTaskWithPrimary_DisposesSourceAndPrimarySurfaces()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
+
+        // The PRIMARY failure: the initial Ready write fails, inside RunAsync's covered body.
+        var primaryFailure = new PrimaryTransportFailureException("primary transport failure");
+
+        var requests = new RecordingRequestStream { FailNextReadyWrite = primaryFailure };
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        // The ORIGINAL heartbeat task's NON-cancellation fault has a distinct type, so the
+        // diagnostic cannot accidentally classify the primary and still satisfy the assertion.
+        var heartbeatFault = new HeartbeatJoinFailureException("heartbeat task fault");
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            ownedHeartbeatCts = cts;
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // Replaces the production heartbeat LOOP at the existing launch point; no RPC, no tick.
+            // It parks until the test releases it and THEN faults, so the fault can only be
+            // observed by a teardown that actually joined this ORIGINAL task.
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatFault;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+
+            // The diagnostics below go to the EXISTING logger seam (Console.Error).
+            Console.SetError(stdErr);
+
+            // The primary already failed, yet teardown is parked joining the ORIGINAL task: nothing
+            // is disposed while it still runs.
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "Teardown must not return while the original heartbeat task is still running.");
+            Assert.Null(Record.Exception(() => _ = heartbeatCts.Token));
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            // Release the ORIGINAL task so it faults; the join observes that fault.
+            heartbeatGate.TrySetResult();
+
+            // The PRIMARY propagates — unchanged, with its own identity.
+            var thrown = await Assert.ThrowsAsync<PrimaryTransportFailureException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            // THE JOIN OUTCOME DID NOT BYPASS DISPOSAL: the source is released and the transport
+            // went away after the join.
+            Assert.True(joinedTask.IsFaulted, "The ORIGINAL heartbeat task must have faulted and been joined.");
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+
+            // The heartbeat fault was REPORTED in sanitized form — type only, never the message.
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Heartbeat join failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(nameof(HeartbeatJoinFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(nameof(PrimaryTransportFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(heartbeatFault.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// WITH NO PRIOR PRIMARY, a faulting ORIGINAL heartbeat task still cannot bypass
+    /// <c>heartbeatCts.Dispose()</c>: the fault propagates from <c>RunAsync</c> only AFTER the join
+    /// and the disposal have completed, with its ORIGINAL identity preserved.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_FaultingHeartbeatTaskWithoutPrimary_DisposesSourceThenPropagatesFault()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var heartbeatFault = new HeartbeatJoinFailureException("heartbeat task fault");
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+        CancellationTokenRegistration registration = default;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() => cancellationObserved.TrySetResult());
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatFault;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The connection is live and the heartbeat launched: the initial Ready proves it.
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+
+            // Ordinary EOF ends the body with NO primary failure at all. The callback signal proves
+            // teardown actually requested cancellation before the pre-release state is inspected.
+            responses.TryComplete();
+            await cancellationObserved.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Teardown is parked joining the ORIGINAL task; nothing has been disposed.
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "Teardown must not return while the original heartbeat task is still running.");
+            Assert.Null(Record.Exception(() => _ = heartbeatCts.Token));
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            heartbeatGate.TrySetResult();
+
+            // The heartbeat fault is the authoritative outcome, with its ORIGINAL identity.
+            var thrown = await Assert.ThrowsAsync<HeartbeatJoinFailureException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(heartbeatFault, thrown);
+
+            // ...raised only AFTER the join and the disposal completed.
+            Assert.True(joinedTask.IsFaulted);
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+        }
+        finally
+        {
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// A CANCELLATION-CALLBACK FAILURE IS NEVER REPLACED OR DISCARDED BY A HEARTBEAT-JOIN FAILURE.
+    /// <para>
+    /// With NO prior primary, both cleanup failures occur: the cancellation callback throws AND the
+    /// ORIGINAL heartbeat task then faults. The captured cancellation evidence is the authoritative
+    /// outcome (kept verbatim, inside the runtime's own <see cref="AggregateException"/> wrapper),
+    /// the heartbeat fault is only REPORTED, and the source is still disposed.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CallbackFailureAndFaultingHeartbeat_CallbackEvidenceWinsAndSourceDisposed()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var heartbeatFault = new HeartbeatJoinFailureException("heartbeat task fault");
+        var callbackFailure = new HeartbeatCancellationCallbackException(
+            "throwing heartbeat cancellation callback");
+        var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+        CancellationTokenRegistration registration = default;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatFault;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        var joinObserved = new MarkerObservingWriter("Heartbeat join failed", stdErr);
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+
+            Console.SetError(joinObserved);
+
+            // EOF ends the body with NO primary; the cancellation request then raises the callback
+            // failure, and the join must still be parked on the ORIGINAL task.
+            responses.TryComplete();
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "Teardown must not return while the original heartbeat task is still running.");
+            Assert.Null(Record.Exception(() => _ = heartbeatCts.Token));
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            heartbeatGate.TrySetResult();
+            await joinObserved.MarkerObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE CALLBACK EVIDENCE WINS — verbatim, inside the runtime's own wrapper — and is
+            // neither replaced nor discarded by the heartbeat fault.
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.IsType<AggregateException>(surfaced);
+            Assert.Contains(callbackFailure, Flatten(surfaced));
+            Assert.DoesNotContain(heartbeatFault, Flatten(surfaced));
+
+            // The join still happened and the source was still disposed.
+            Assert.True(joinedTask.IsFaulted);
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+
+            // The non-authoritative heartbeat fault was reported, sanitized.
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Heartbeat join failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(nameof(HeartbeatJoinFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(nameof(HeartbeatCancellationCallbackException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(heartbeatFault.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// THE HEARTBEAT TICK'S DIAGNOSTIC IS GUARDED: a degraded <c>Console.Error</c> cannot turn a
+    /// swallow-and-retry heartbeat fault into a propagating failure. The REAL factored tick is
+    /// driven directly (no timer tick is awaited) against a retired connection, which is the
+    /// existing non-cancellation failure path, while the diagnostic sink throws on every write.
+    /// <para>
+    /// REMOVAL PROOF. Without the guard, the sink's throw escapes <c>SendHeartbeatAsync</c>, so the
+    /// awaited tick faults and this assertion fails by name — which is exactly how the production
+    /// heartbeat loop would fault and hand teardown a join failure.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task HeartbeatTick_WithFailingDiagnostics_StillSwallowsTheFaultAndDoesNotThrow()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
+        var connection = PublishFakeClientConnection(service, invoker, assignedId: AssignedWorkerId);
+
+        // RETIRED: the tick's checked access fails with a non-cancellation error, which is the
+        // existing sanitized-log-and-continue path.
+        connection.Retire();
+
+        var originalErr = Console.Error;
+        var throwingWriter = new ThrowingErrorWriter();
+        var tick = Task.CompletedTask;
+        try
+        {
+            Console.SetError(throwingWriter);
+
+            // The guarded diagnostic must swallow the sink's throw: the tick completes normally.
+            tick = InvokeHeartbeatTickAsync(service, connection);
+            await tick.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(throwingWriter.WriteAttempts > 0, "The heartbeat diagnostic must be attempted.");
+            // ...and no heartbeat RPC was issued for the retired connection.
+            Assert.Equal(0, invoker.HeartbeatCalls);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            await JoinAllForTeardownAsync(service, ("heartbeat tick", tick));
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     // (2) Focused fake-client connection tests.
     // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A FAILING DIAGNOSTIC cannot prevent the heartbeat teardown and cannot replace the primary
+    /// failure. This is the logger-failure cell of the RunAsync error-precedence rule: with a
+    /// PRIMARY transport failure AND a secondary heartbeat-cancellation-callback failure BOTH in
+    /// play, the guarded sanitized report itself throws because <c>Console.Error</c> has been
+    /// replaced by a writer that throws on every write. The cleanup must still complete — the
+    /// ORIGINAL heartbeat task joins, its source is disposed, the transport is disposed — and the
+    /// PRIMARY propagates with its ORIGINAL identity, never replaced by the diagnostic failure.
+    /// <para>
+    /// REMOVAL PROOF. Without the guard around the diagnostic write, the throwing log call inside
+    /// <c>PropagateOrReport</c> unwinds the cleanup's <c>finally</c> and REPLACES the propagating
+    /// primary: the surfaced exception would be the injected diagnostic failure, so
+    /// <c>Assert.Same</c> on the primary instance fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithFailingDiagnostics_JoinsHeartbeatAndPrimarySurfaces()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The PRIMARY failure: the initial Ready write fails, inside RunAsync's covered body.
+        var primaryFailure = new PrimaryTransportFailureException("primary transport failure");
+
+        var requests = new RecordingRequestStream { FailNextReadyWrite = primaryFailure };
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        var heartbeatJoinFailure = new HeartbeatJoinFailureException("controlled heartbeat join failure");
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+
+        // The callback records its invocation AND throws a distinct secondary type.
+        var callbackFailure = new HeartbeatCancellationCallbackException(
+            "throwing heartbeat cancellation callback");
+        var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task parks until released and then faults with unique join evidence.
+            async Task ControlledHeartbeatAsync()
+            {
+                await heartbeatGate.Task;
+                throw heartbeatJoinFailure;
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var originalErr = Console.Error;
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The heartbeat was launched at its unchanged launch point BEFORE the primary failure,
+            // so the cleanup always has a running heartbeat to join.
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+            Assert.Equal(1, Volatile.Read(ref heartbeatFactoryCalls));
+
+            // From here on the diagnostics sink itself is BROKEN: every write throws. It also
+            // signals specifically when the heartbeat-join report is attempted, proving the
+            // ORIGINAL controlled task reached the production join boundary.
+            var throwingWriter = new ThrowingErrorWriter("Heartbeat join failed");
+            Console.SetError(throwingWriter);
+
+            // The secondary failure fired during cleanup; the join must still be parked on the
+            // ORIGINAL controlled task — nothing was skipped because the sink is broken.
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "The join must still occur even though the diagnostics sink is broken.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            // Release the ORIGINAL task. The throwing writer's marker is fired only when production
+            // reports this task's distinct join failure, so a skipped join cannot pass post-hoc.
+            heartbeatGate.TrySetResult();
+            await throwingWriter.MarkerObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The PRIMARY propagates — unchanged, with its own identity, despite the throwing
+            // diagnostic sink inside the guarded report.
+            var thrown = await Assert.ThrowsAsync<PrimaryTransportFailureException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            // The join happened, the source was disposed, and the transport went away afterwards.
+            Assert.True(joinedTask.IsFaulted, "The task the factory returned must have been joined.");
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+            Assert.True(throwingWriter.WriteAttempts > 0, "The guarded diagnostic must be attempted.");
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure,
+                ("controlled heartbeat task", controlledHeartbeatTask), ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// A diagnostic sink that throws on EVERY write — modelling a broken or closed
+    /// <c>Console.Error</c>. Used to prove the guarded sanitized report cannot skip cleanup or
+    /// replace the primary failure: without the production guard the throw from this writer
+    /// unwinds the cleanup's finally.
+    /// </summary>
+    private sealed class PrimaryTransportFailureException(string message) : Exception(message);
+
+    private sealed class HeartbeatCancellationCallbackException(string message) : Exception(message);
+
+    private sealed class HeartbeatJoinFailureException(string message) : Exception(message);
+
+    /// <summary>
+    /// Records all diagnostics and signals when a specific production report is written. The marker
+    /// is the positive boundary used by controlled-heartbeat tests: it can only be emitted after
+    /// RunAsync awaited and classified the ORIGINAL heartbeat task's fault.
+    /// </summary>
+    private sealed class MarkerObservingWriter(string marker, System.IO.TextWriter inner)
+        : System.IO.TextWriter
+    {
+        private readonly TaskCompletionSource _markerObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        internal Task MarkerObserved => _markerObserved.Task;
+
+        public override void WriteLine(string? value)
+        {
+            inner.WriteLine(value);
+            Observe(value);
+        }
+
+        public override void Write(string? value)
+        {
+            inner.Write(value);
+            Observe(value);
+        }
+
+        public override void Write(char value) => inner.Write(value);
+
+        private void Observe(string? value)
+        {
+            if (value is not null && value.Contains(marker, StringComparison.Ordinal))
+                _markerObserved.TrySetResult();
+        }
+    }
+
+    private sealed class ThrowingErrorWriter(string? marker = null) : System.IO.TextWriter
+    {
+        private readonly TaskCompletionSource _markerObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _writeAttempts;
+
+        public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        internal int WriteAttempts => Volatile.Read(ref _writeAttempts);
+
+        internal Task MarkerObserved => _markerObserved.Task;
+
+        public override void Write(char value) => Throw(value.ToString());
+
+        public override void Write(string? value) => Throw(value);
+
+        public override void WriteLine(string? value) => Throw(value);
+
+        private void Throw(string? value)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            if (marker is not null && value is not null && value.Contains(marker, StringComparison.Ordinal))
+                _markerObserved.TrySetResult();
+            throw new InvalidOperationException("injected diagnostic failure");
+        }
+    }
 
     /// <summary>
     /// SESSION LOAD and SAVE go through the CONNECTION's own client, carrying the exact arguments
@@ -540,26 +1459,37 @@ public sealed class WorkerConnectionLifecycleTests
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
         invoker.SessionToReturn = new GetSessionResponse { Found = true, SessionJson = "{\"turn\":7}" };
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        var loaded = await service.GetSessionAsync("goal-1:coder", TestContext.Current.CancellationToken);
-        Assert.Equal("{\"turn\":7}", loaded);
-        Assert.Equal(1, invoker.GetSessionCalls);
-        Assert.Equal("goal-1:coder", invoker.LastGetSessionId);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker);
 
-        await service.SaveSessionAsync("goal-1:coder", "{\"turn\":8}", TestContext.Current.CancellationToken);
-        Assert.Equal(1, invoker.SaveSessionCalls);
-        Assert.Equal("goal-1:coder", invoker.LastSaveSessionId);
-        Assert.Equal("{\"turn\":8}", invoker.LastSaveSessionJson);
+            var loaded = await service.GetSessionAsync("goal-1:coder", TestContext.Current.CancellationToken);
+            Assert.Equal("{\"turn\":7}", loaded);
+            Assert.Equal(1, invoker.GetSessionCalls);
+            Assert.Equal("goal-1:coder", invoker.LastGetSessionId);
 
-        // A not-found response loads as null — absence is not an error.
-        invoker.SessionToReturn = new GetSessionResponse { Found = false };
-        Assert.Null(await service.GetSessionAsync("missing:role", TestContext.Current.CancellationToken));
+            await service.SaveSessionAsync("goal-1:coder", "{\"turn\":8}", TestContext.Current.CancellationToken);
+            Assert.Equal(1, invoker.SaveSessionCalls);
+            Assert.Equal("goal-1:coder", invoker.LastSaveSessionId);
+            Assert.Equal("{\"turn\":8}", invoker.LastSaveSessionJson);
 
-        // Both RPCs went through THIS connection's client (one client per connection).
-        Assert.NotNull(connection.Client);
-        Assert.Equal(2, invoker.GetSessionCalls);
+            // A not-found response loads as null — absence is not an error.
+            invoker.SessionToReturn = new GetSessionResponse { Found = false };
+            Assert.Null(await service.GetSessionAsync("missing:role", TestContext.Current.CancellationToken));
+
+            // Both RPCs went through THIS connection's client (one client per connection).
+            Assert.NotNull(connection.Client);
+            Assert.Equal(2, invoker.GetSessionCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -578,19 +1508,30 @@ public sealed class WorkerConnectionLifecycleTests
             LlmProvider = "copilot",
         };
 
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(
-            service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // A NULL provisioner override, so the connection built the PRODUCTION provisioner.
-        Assert.NotNull(connection.Provisioner);
-        await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(
+                service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
 
-        Assert.Equal(1, invoker.WorkerConfigCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+            // A NULL provisioner override, so the connection built the PRODUCTION provisioner.
+            Assert.NotNull(connection.Provisioner);
+            await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
 
-        // The provisioned token is forwarded out of the response.
-        Assert.Equal("ghp_provisioned_by_orchestrator", connection.Provisioner.ResolveConfigRepoCredential());
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+
+            // The provisioned token is forwarded out of the response.
+            Assert.Equal("ghp_provisioned_by_orchestrator", connection.Provisioner.ResolveConfigRepoCredential());
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -602,21 +1543,32 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task ProductionProvisioningPath_FailsDisconnectedAfterRetirement_WithoutTransport()
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(
-            service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // A live fetch reaches the fake client once and carries the ASSIGNED identity.
-        await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
-        Assert.Equal(1, invoker.WorkerConfigCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(
+                service, invoker, assignedId: AssignedWorkerId, productionProvisioner: true);
 
-        // A NEW fetch after retirement fails disconnected BEFORE starting transport.
-        connection.Retire();
-        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
-        Assert.Equal(1, invoker.WorkerConfigCalls);
+            // A live fetch reaches the fake client once and carries the ASSIGNED identity.
+            await connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken);
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastWorkerConfigWorkerId);
+
+            // A NEW fetch after retirement fails disconnected BEFORE starting transport.
+            connection.Retire();
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.Provisioner!.EnsureProvisionedAsync(FixtureModel, TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, failure.Message);
+            Assert.Equal(1, invoker.WorkerConfigCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -629,36 +1581,47 @@ public sealed class WorkerConnectionLifecycleTests
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
         var requests = new RecordingRequestStream();
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker, writer: requests);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        connection.Retire();
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker, writer: requests);
 
-        var ensure = Assert.Throws<InvalidOperationException>(() => connection.EnsureUsable());
-        Assert.Equal(WorkerConnection.DisconnectedMessage, ensure.Message);
+            connection.Retire();
 
-        var fetch = await Assert.ThrowsAsync<InvalidOperationException>(() => connection.FetchWorkerConfigAsync(
-            new GetWorkerConfigRequest { WorkerId = connection.AssignedId },
-            TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, fetch.Message);
+            var ensure = Assert.Throws<InvalidOperationException>(() => connection.EnsureUsable());
+            Assert.Equal(WorkerConnection.DisconnectedMessage, ensure.Message);
 
-        var load = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, load.Message);
+            var fetch = await Assert.ThrowsAsync<InvalidOperationException>(() => connection.FetchWorkerConfigAsync(
+                new GetWorkerConfigRequest { WorkerId = connection.AssignedId },
+                TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, fetch.Message);
 
-        var save = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.SaveSessionAsync("goal:role", "{}", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, save.Message);
+            var load = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.GetSessionAsync("goal:role", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, load.Message);
 
-        var send = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.ReportNarrativeAsync("t", "n", TestContext.Current.CancellationToken));
-        Assert.Equal(WorkerConnection.DisconnectedMessage, send.Message);
+            var save = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.SaveSessionAsync("goal:role", "{}", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, save.Message);
 
-        // NO transport was ever started for the retired connection.
-        Assert.Equal(0, invoker.GetSessionCalls);
-        Assert.Equal(0, invoker.SaveSessionCalls);
-        Assert.Equal(0, invoker.WorkerConfigCalls);
-        Assert.Empty(requests.Writes);
+            var send = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.ReportNarrativeAsync("t", "n", TestContext.Current.CancellationToken));
+            Assert.Equal(WorkerConnection.DisconnectedMessage, send.Message);
+
+            // NO transport was ever started for the retired connection.
+            Assert.Equal(0, invoker.GetSessionCalls);
+            Assert.Equal(0, invoker.SaveSessionCalls);
+            Assert.Equal(0, invoker.WorkerConfigCalls);
+            Assert.Empty(requests.Writes);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -670,31 +1633,42 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task HeartbeatTick_ForwardsConnectionIdentityAndTaskState_AndSkipsWhenRetired()
     {
         var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
-        using var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
-        var connection = PublishFakeClientConnection(service, invoker, assignedId: AssignedWorkerId);
+        var service = BuildService(new ProvisionerCapturingRunner(), new ProvisionerHarness().Provisioner);
 
-        // Idle: no current task, so Busy is false and the state fields are empty.
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(1, invoker.HeartbeatCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
-        Assert.False(invoker.LastHeartbeatBusy);
-        Assert.Equal(string.Empty, invoker.LastHeartbeatTaskId);
-        Assert.Equal(string.Empty, invoker.LastHeartbeatRole);
-        Assert.Equal(0, invoker.LastHeartbeatContextUsage);
+        // The service is disposed by the teardown helper, never by a `using` declaration:
+        // disposal must not race ahead of the joins below, and a still-live producer must
+        // surface as a loud named failure instead of being disposed out from under.
+        try
+        {
+            var connection = PublishFakeClientConnection(service, invoker, assignedId: AssignedWorkerId);
 
-        // Busy: the tick reflects the task state AT the tick.
-        SetCurrentTaskState(service, taskId: "task-hb", role: "coder");
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(2, invoker.HeartbeatCalls);
-        Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
-        Assert.True(invoker.LastHeartbeatBusy);
-        Assert.Equal("task-hb", invoker.LastHeartbeatTaskId);
-        Assert.Equal("coder", invoker.LastHeartbeatRole);
+            // Idle: no current task, so Busy is false and the state fields are empty.
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(1, invoker.HeartbeatCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
+            Assert.False(invoker.LastHeartbeatBusy);
+            Assert.Equal(string.Empty, invoker.LastHeartbeatTaskId);
+            Assert.Equal(string.Empty, invoker.LastHeartbeatRole);
+            Assert.Equal(0, invoker.LastHeartbeatContextUsage);
 
-        // RETIRED: checked access comes first, so no heartbeat RPC is issued at all.
-        connection.Retire();
-        await InvokeHeartbeatTickAsync(service, connection);
-        Assert.Equal(2, invoker.HeartbeatCalls);
+            // Busy: the tick reflects the task state AT the tick.
+            SetCurrentTaskState(service, taskId: "task-hb", role: "coder");
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(2, invoker.HeartbeatCalls);
+            Assert.Equal(AssignedWorkerId, invoker.LastHeartbeatWorkerId);
+            Assert.True(invoker.LastHeartbeatBusy);
+            Assert.Equal("task-hb", invoker.LastHeartbeatTaskId);
+            Assert.Equal("coder", invoker.LastHeartbeatRole);
+
+            // RETIRED: checked access comes first, so no heartbeat RPC is issued at all.
+            connection.Retire();
+            await InvokeHeartbeatTickAsync(service, connection);
+            Assert.Equal(2, invoker.HeartbeatCalls);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
     }
 
     /// <summary>
@@ -711,7 +1685,7 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task QueuedSend_ChecksRetirementAfterGateAcquisition_AndWritesNothing()
     {
         var gated = new GatedOverlapDetectingRequestStream();
-        using var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"]);
+        var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"]);
         var connection = PublishStreamConnection(service, AssignedWorkerId, gated);
 
         Task? holder = null;
@@ -749,8 +1723,7 @@ public sealed class WorkerConnectionLifecycleTests
         {
             gated.EnterTeardownMode();
             gated.ReleaseAllParkedWrites();
-            await JoinForTeardownAsync(holder);
-            await JoinForTeardownAsync(queued);
+            await JoinAllForTeardownAsync(service, ("holder send", holder), ("queued send", queued));
         }
     }
 
@@ -779,7 +1752,7 @@ public sealed class WorkerConnectionLifecycleTests
         var gatedA = new GatedOverlapDetectingRequestStream();
         var requestsB = new RecordingRequestStream();
 
-        using var service = new WorkerService("http://localhost:9999", SharedWorkerId, ["coder"]);
+        var service = new WorkerService("http://localhost:9999", SharedWorkerId, ["coder"]);
 
         var connectionA = PublishStreamConnection(service, SharedWorkerId, gatedA);
         var connectionB = PublishStreamConnection(service, SharedWorkerId, requestsB);
@@ -840,8 +1813,7 @@ public sealed class WorkerConnectionLifecycleTests
             // Guaranteed release + join: nothing outlives this finally, even after a failure.
             gatedA.EnterTeardownMode();
             gatedA.ReleaseAllParkedWrites();
-            await JoinForTeardownAsync(holder);
-            await JoinForTeardownAsync(contender);
+            await JoinAllForTeardownAsync(service, ("holder send", holder), ("contender send", contender));
         }
     }
 
@@ -918,8 +1890,27 @@ public sealed class WorkerConnectionLifecycleTests
         return service;
     }
 
+    /// <summary>
+    /// The service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the ownership
+    /// slot is empty. Observation only — it never mutates production state.
+    /// </summary>
+    private static Task? TryGetActiveExecution(WorkerService service)
+    {
+        var active = typeof(WorkerService)
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service);
+        return active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+    }
+
     private static void ReplaceRunner(WorkerService service, IAgentRunner runner)
     {
+        // INSTALL THE REAL-EXECUTION PROBE so the double records the enclosing
+        // ActiveAssignment.Execution rather than a completed placeholder.
+        if (runner is ProvisionerCapturingRunner capturing)
+            capturing.ExecutionProbe = () => TryGetActiveExecution(service);
+
         var field = typeof(WorkerService).GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("WorkerService._agentRunner field not found.");
         if (field.GetValue(service) is IAgentRunner existing)
@@ -1016,22 +2007,198 @@ public sealed class WorkerConnectionLifecycleTests
         PublishFakeClientConnection(
             service, new FakeOrchestratorInvoker(new RegisterResponse()), assignedId, writer);
 
-    /// <summary>Bounded failsafe join that never masks an assertion failure.</summary>
-    private static async Task ObserveForTeardownAsync(Task? producer)
+    /// <summary>
+    /// Requests teardown cancellation without allowing a throwing linked-token callback to skip the
+    /// response completion and original-task joins that follow in a test's <c>finally</c> block.
+    /// </summary>
+    private static async Task<Exception?> CancelForTeardownAsync(CancellationTokenSource source)
     {
-        if (producer is null) return;
         try
         {
-            await producer.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await source.CancelAsync();
+            return null;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Teardown only: the loop may fault (cancelled teardown, reader fault). Its real
-            // outcome was asserted in the try body; rethrowing here would mask that assertion.
+            // Defer rather than throw: readers are completed and every original producer is joined
+            // before the cancellation-cleanup evidence is rethrown with the other teardown failures.
+            return ex;
         }
     }
 
-    private static Task JoinForTeardownAsync(Task? producer) => ObserveForTeardownAsync(producer);
+    /// <summary>
+    /// JOINS EVERY ORIGINAL TASK a test started, each under its OWN bounded wait, and only then
+    /// reports whatever went wrong.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A test's <c>finally</c> must first release every gate, cancel, and complete/fault every
+    /// reader, and then call this ONCE with every started task. Because each join is attempted
+    /// independently and failures are accumulated, one still-live producer can never skip the joins
+    /// that follow it — which is what previously let a <c>WorkerService</c> be disposed while other
+    /// original work was still running.
+    /// </para>
+    /// <para>
+    /// A STILL-LIVE task is a LOUD, distinct failure (never a silent return): it is reported as a
+    /// named teardown failure identifying the producer. A task that terminated with a fault or a
+    /// cancellation is quiescent, which is all teardown requires, so its outcome is swallowed HERE
+    /// ONLY — the real outcome is asserted on the test's normal path.
+    /// </para>
+    /// </remarks>
+    /// <param name="service">The service to dispose only after every known producer is terminal.</param>
+    /// <param name="producers">
+    /// The started tasks, in the order they should be joined. <c>null</c> entries (a producer a
+    /// test never started) are skipped.
+    /// </param>
+    private static Task JoinAllForTeardownAsync(
+        WorkerService service,
+        params (string Name, Task? Producer)[] producers) =>
+        JoinAllForTeardownAsync(service, priorFailure: null, producers);
+
+    private static async Task JoinAllForTeardownAsync(
+        WorkerService service,
+        Exception? priorFailure,
+        params (string Name, Task? Producer)[] producers)
+    {
+        List<Exception> failures = priorFailure is null ? [] : [priorFailure];
+
+        // EVERY BODY THAT EVER STARTED, from the runner's own append-only record. A gate dictionary
+        // cannot answer "is a late-started invocation still parked?", and the ownership slot only
+        // exposes the CURRENT body — so this is the authoritative teardown input.
+        var runnerField = typeof(WorkerService)
+            .GetField("_agentRunner", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var recordedRunner = runnerField.GetValue(service) as ProvisionerCapturingRunner;
+        var startedBodies = recordedRunner?.AssignmentExecutions ?? [];
+
+        for (var index = 0; index < startedBodies.Count; index++)
+        {
+            var body = startedBodies[index];
+            if (!producers.Any(candidate => ReferenceEquals(candidate.Producer, body)))
+                producers = [.. producers, ($"recorded assignment execution #{index}", body)];
+        }
+
+        // A body can start before an assertion captures it in a local. Discover the service's active
+        // original execution after gates/readers were settled and join it independently from its
+        // parent loop.
+        var active = typeof(WorkerService)
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service);
+        var activeExecution = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+        if (activeExecution is not null
+            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, activeExecution)))
+        {
+            producers = [.. producers, ("active assignment body", activeExecution)];
+        }
+
+        foreach (var (name, producer) in producers)
+        {
+            if (producer is not null)
+                await JoinOneAsync(name, producer);
+        }
+
+        // A buffered assignment can start after the first snapshot while the parent loop is being
+        // joined. Re-snapshot and independently join that late body before considering disposal.
+        active = typeof(WorkerService)
+            .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service);
+        var lateActiveExecution = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+        if (lateActiveExecution is not null
+            && !producers.Any(candidate => ReferenceEquals(candidate.Producer, lateActiveExecution)))
+        {
+            producers = [.. producers, ("late active assignment body", lateActiveExecution)];
+            await JoinOneAsync("late active assignment body", lateActiveExecution);
+        }
+
+        // FINAL SWEEP of the runner's record: a body may have started while the joins above ran (a
+        // buffered assignment the loop only reached during teardown).
+        // THE CLOSURE HANDSHAKE. Seal the recording, then drain to a FIXPOINT: join everything
+        // recorded, and if an execution was admitted concurrently with (or after) the seal, take
+        // the new snapshot and join again. Each join keeps its own bounded wait, so a body that
+        // starts during teardown is joined rather than missed.
+        recordedRunner?.SealRecording();
+        var drainPasses = 0;
+        while (recordedRunner is not null)
+        {
+            var admittedNew = false;
+            foreach (var execution in recordedRunner.AssignmentExecutions)
+            {
+                if (producers.Any(candidate => ReferenceEquals(candidate.Producer, execution)))
+                    continue;
+
+                admittedNew = true;
+                producers = [.. producers, ($"sealed assignment execution #{drainPasses}", execution)];
+                await JoinOneAsync($"sealed assignment execution #{drainPasses}", execution);
+            }
+
+            if (!admittedNew && !recordedRunner.RecordedSinceSeal)
+                break;
+
+            if (++drainPasses > MaxTeardownDrainPasses)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    "Teardown could not reach a closed join set: the runner kept admitting new "
+                    + "assignment executions after the recording was sealed."));
+                break;
+            }
+
+            recordedRunner.TakeRecordedSinceSeal();
+        }
+
+        // Do not let lexical disposal race a timed-out original task. These tests own service
+        // disposal manually: dispose only after every known producer is terminal, otherwise leave
+        // it undisposed and surface the named live-work failure below.
+        if (producers.All(candidate => candidate.Producer is null || candidate.Producer.IsCompleted))
+        {
+            try
+            {
+                service.Dispose();
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
+
+        if (failures.Count == 1)
+            throw failures[0];
+
+        if (failures.Count > 1)
+            throw new AggregateException("Teardown could not join every original task.", failures);
+
+        async Task JoinOneAsync(string name, Task producer)
+        {
+            try
+            {
+                await producer.WaitAsync(Failsafe, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                failures.Add(new Xunit.Sdk.XunitException(
+                    $"Teardown failed to join '{name}' within the bounded failsafe; live work remains."));
+            }
+            catch (Exception) when (producer.IsCompleted)
+            {
+                // Terminal fault/cancellation: the original task is quiescent.
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Flattens an exception (and any <see cref="AggregateException"/> wrapper the runtime produced)
+    /// so a test can locate the ORIGINAL callback evidence without normalizing it away.
+    /// </summary>
+    private static IReadOnlyList<Exception> Flatten(Exception exception) =>
+        exception is AggregateException aggregate
+            ? [.. aggregate.Flatten().InnerExceptions]
+            : [exception];
 
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
@@ -1188,6 +2355,13 @@ public sealed class WorkerConnectionLifecycleTests
         /// </summary>
         internal Action<WorkerMessage>? OnWrite { get; set; }
 
+        /// <summary>
+        /// ONE-SHOT injected failure for the next <c>WorkerReady</c> write. It models a transport
+        /// write that faults INSIDE the covered lifecycle body, so a test can produce a real
+        /// PRIMARY <c>RunAsync</c> failure alongside a cancellation-cleanup failure. Consumed on use.
+        /// </summary>
+        internal Exception? FailNextReadyWrite { get; set; }
+
         internal IReadOnlyList<WorkerMessage> Writes
         {
             get { lock (_gate) return _writes.ToList(); }
@@ -1237,10 +2411,23 @@ public sealed class WorkerConnectionLifecycleTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             Record(message);
-            return Task.CompletedTask;
+            return ReadyWriteFailure(message);
         }
 
         public Task CompleteAsync() => Task.CompletedTask;
+
+        /// <summary>
+        /// Reports the armed one-shot Ready-write failure AFTER the write was recorded, so the
+        /// recorded-write bookkeeping (and any count waiter) still observes the attempt.
+        /// </summary>
+        private Task ReadyWriteFailure(WorkerMessage message)
+        {
+            if (message.PayloadCase != WorkerMessage.PayloadOneofCase.Ready || FailNextReadyWrite is not { } failure)
+                return Task.CompletedTask;
+
+            FailNextReadyWrite = null;
+            return Task.FromException(failure);
+        }
 
         private void Record(WorkerMessage message)
         {
@@ -1465,16 +2652,116 @@ public sealed class WorkerConnectionLifecycleTests
     /// </summary>
     private sealed class ProvisionerCapturingRunner : IAgentRunner
     {
+        private readonly object _gate = new();
+
+        /// <summary>
+        /// APPEND-ONLY record of the REAL enclosing assignment executions
+        /// (<c>ActiveAssignment.Execution</c>) this double observed, discovered through
+        /// <see cref="ExecutionProbe"/> at the production boundaries it already sees.
+        /// </summary>
+        /// <remarks>
+        /// A completed placeholder per prompt is NOT recorded here: it would assert that the
+        /// assignment work is terminal while the enclosing <c>Task.Run</c> body is still creating
+        /// its result and writing Complete/Ready, which is exactly the surrogate hazard teardown
+        /// must avoid. Only the real execution is admitted.
+        /// </remarks>
+        private readonly List<Task> _assignmentExecutions = [];
+
+        /// <summary>Set once <see cref="SealRecording"/> has run.</summary>
+        private bool _sealed;
+
+        /// <summary>Set whenever an execution is admitted AFTER the seal.</summary>
+        private bool _recordedSinceSeal;
+
         internal Func<string?, CancellationToken, Task>? ConfigProvisioner { get; private set; }
+
+        /// <summary>
+        /// Snapshot of every REAL enclosing assignment execution this double ever observed. This is
+        /// the authoritative teardown join set.
+        /// </summary>
+        internal IReadOnlyList<Task> AssignmentExecutions
+        {
+            get { lock (_gate) return [.. _assignmentExecutions]; }
+        }
+
+        /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the
+        /// ownership slot is empty. Installed by the fixture so this double records the real
+        /// execution instead of a surrogate.
+        /// </summary>
+        internal Func<Task?>? ExecutionProbe { get; set; }
+
+        /// <summary>Whether an execution was admitted AFTER <see cref="SealRecording"/>.</summary>
+        internal bool RecordedSinceSeal
+        {
+            get { lock (_gate) return _recordedSinceSeal; }
+        }
+
+        /// <summary>
+        /// CLOSURE HANDSHAKE — latches the recording set. Recording continues so late work stays
+        /// visible; every later admission is flagged so teardown can re-drain to a fixpoint.
+        /// </summary>
+        internal IReadOnlyList<Task> SealRecording()
+        {
+            lock (_gate)
+            {
+                _sealed = true;
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>Clears the post-seal flag and returns the snapshot for the next drain pass.</summary>
+        internal IReadOnlyList<Task> TakeRecordedSinceSeal()
+        {
+            lock (_gate)
+            {
+                _recordedSinceSeal = false;
+                return [.. _assignmentExecutions];
+            }
+        }
+
+        /// <summary>
+        /// Records the REAL enclosing execution currently installed, if any. Idempotent by reference.
+        /// </summary>
+        private void RecordCurrentExecution()
+        {
+            if (ExecutionProbe?.Invoke() is not { } execution)
+                return;
+
+            lock (_gate)
+            {
+                foreach (var recorded in _assignmentExecutions)
+                {
+                    if (ReferenceEquals(recorded, execution))
+                        return;
+                }
+
+                _assignmentExecutions.Add(execution);
+                if (_sealed)
+                    _recordedSinceSeal = true;
+            }
+        }
 
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
             ConfigProvisioner = provisioner;
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
-            => Task.CompletedTask;
+        {
+            // The reset for assignment N+1 runs while assignment N may still be installed.
+            RecordCurrentExecution();
+            return Task.CompletedTask;
+        }
+
         public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
-            => Task.FromResult(string.Empty);
+        {
+            // Record the REAL enclosing execution — never a completed placeholder standing in for
+            // assignment work that is still running.
+            RecordCurrentExecution();
+            return Task.FromResult(string.Empty);
+        }
 
         public TestResultReport? LastTestReport => null;
         public WorkerReport? LastWorkerReport => null;
