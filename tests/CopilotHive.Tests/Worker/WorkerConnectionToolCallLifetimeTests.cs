@@ -258,6 +258,7 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         }
 
         TaskScheduler.UnobservedTaskException += OnUnobserved;
+        Task? plainAfterFailure = null;
         try
         {
             var abandonedResponse = await ExerciseSendFailureRaceAsync(
@@ -270,8 +271,11 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             Assert.Equal(0, Volatile.Read(ref matchingUnobservedFaults));
 
             // The shared send gate released after failure, and non-response-bearing sends are not
-            // blocked by the closed response lifetime.
-            await service.ReportNarrativeAsync("task-f", "n", CancellationToken.None);
+            // blocked by the closed response lifetime. The producer is RETAINED (never awaited
+            // inline) and observed through the explicit bound, so a broken/removed gate release
+            // parks it forever and this fails by name instead of hanging before `finally`.
+            plainAfterFailure = service.ReportNarrativeAsync("task-f", "n", CancellationToken.None);
+            await AwaitProducerWithinBoundAsync(plainAfterFailure, nameof(plainAfterFailure));
             Assert.Equal(2, requests.WriteCount);
         }
         finally
@@ -279,6 +283,7 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             TaskScheduler.UnobservedTaskException -= OnUnobserved;
             requests.Fail(injected);
             connection.EndToolResponses();
+            await JoinForCleanupAsync(plainAfterFailure, nameof(plainAfterFailure));
         }
     }
 
@@ -347,12 +352,23 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     }
 
     /// <summary>
-    /// LINEARIZATION PROOF: once a response-bearing send has observed the lifetime OPEN inside the
-    /// connection boundary, <c>EndToolResponses</c> cannot complete until the underlying write has
-    /// been INITIATED. The test seam blocks that exact instant while a dedicated end thread is
-    /// observed blocked on the connection lock; the ordered event record proves write initiation
-    /// precedes end completion. Moving the check out of the write boundary makes
-    /// <c>end-complete</c> precede <c>write-start</c> and fails this test by name.
+    /// LINEARIZATION PROOF: the openness decision and the WRITE INITIATION are ONE atomic boundary.
+    /// <para>
+    /// The decisive observation is taken from INSIDE the actual write initiation — the fake request
+    /// stream's <c>WriteAsync</c>, reached from <c>WriteResponseBearingAsync</c> — where
+    /// <see cref="Monitor.IsEntered"/> must report the per-connection response lock as HELD. That
+    /// binds the invariant to the write itself rather than only to the preceding seam, so a
+    /// check-then-write implementation (<c>lock { check; hook(); }</c> followed by a
+    /// <c>WriteAsync</c> issued after the lock is released) fails on EVERY schedule: its initiation
+    /// never runs under the lock, no matter how the request and end threads interleave. The
+    /// observation's failure is captured and surfaced through <c>starterFailure</c>, so it fails the
+    /// test deterministically instead of being silently recorded.
+    /// </para>
+    /// <para>
+    /// The blocked end-thread observation and the ordered event record are retained as supporting
+    /// evidence: while the seam holds the boundary, a dedicated end thread is observed waiting on the
+    /// same lock and <c>end-complete</c> can only follow <c>write-start</c>.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task ResponseWriteBoundary_EndCannotCompleteBetweenOpenDecisionAndWriteInitiation()
@@ -360,6 +376,13 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         var requests = new RecordingToolRequestStream();
         using var service = NewService();
         var connection = Publish(service, requests);
+
+        // The PRIVATE per-connection response lock — the one boundary that production must hold for
+        // BOTH the openness decision and the write initiation. Resolved before any producer starts,
+        // so the write-initiation observation below can consult it.
+        var responseLock = typeof(WorkerConnection)
+            .GetField("_toolResponsesLock", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(connection)!;
 
         using var boundaryEntered = new ManualResetEventSlim();
         using var releaseBoundary = new ManualResetEventSlim();
@@ -369,6 +392,12 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         var events = new List<string>();
         void Record(string value) { lock (eventGate) events.Add(value); }
 
+        // The captured-failure channel. Everything is published under `eventGate`, so the test
+        // thread's reads are properly ordered no matter which thread made the observation.
+        Exception? starterFailure = null;
+        var writeInitiatedUnderResponseLock = false;
+        void CaptureFailure(Exception ex) { lock (eventGate) starterFailure ??= ex; }
+
         connection.OnResponseBearingWriteInitiating = () =>
         {
             Record("open-observed");
@@ -376,15 +405,38 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             releaseBoundary.Wait();
             Record("boundary-released");
         };
-        requests.OnWrite = _ => Record("write-start");
+
+        // THE WRITE-INITIATION OBSERVATION. This runs inside the fake writer's WriteAsync, i.e. at
+        // the very instant production initiates the transport write. Asserting the response lock is
+        // HELD here is what a check-then-write implementation can never satisfy. The assertion's
+        // failure is captured (not thrown into production's call path) and surfaced through
+        // starterFailure, which the body asserts null.
+        requests.OnWrite = _ =>
+        {
+            Record("write-start");
+            try
+            {
+                Assert.True(
+                    Monitor.IsEntered(responseLock),
+                    "The response-bearing write was INITIATED without the response lock held — the "
+                        + "openness check and the write initiation are not one atomic boundary, so "
+                        + "EndToolResponses can win between them.");
+
+                lock (eventGate) writeInitiatedUnderResponseLock = true;
+            }
+            catch (Exception ex)
+            {
+                CaptureFailure(ex);
+            }
+        };
 
         Task<string>? call = null;
-        Exception? starterFailure = null;
         var requestThread = new Thread(() =>
         {
             try { call = service.GetGoalAsync("task-linear", "goal-linear", CancellationToken.None); }
-            catch (Exception ex) { starterFailure = ex; }
-        }) { IsBackground = true, Name = "response-write-starter" };
+            catch (Exception ex) { CaptureFailure(ex); }
+        })
+        { IsBackground = true, Name = "response-write-starter" };
 
         var endThread = new Thread(() =>
         {
@@ -393,7 +445,8 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             connection.EndToolResponses();
             Record("end-complete");
             endCompleted.Set();
-        }) { IsBackground = true, Name = "response-lifetime-ender" };
+        })
+        { IsBackground = true, Name = "response-lifetime-ender" };
 
         try
         {
@@ -404,9 +457,6 @@ public sealed class WorkerConnectionToolCallLifetimeTests
 
             // The seam contract itself says this instant is INSIDE the response lock. Prove that
             // directly from this different thread; a seam moved outside the boundary fails here.
-            var responseLock = typeof(WorkerConnection)
-                .GetField("_toolResponsesLock", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .GetValue(connection)!;
             var unexpectedlyAcquired = Monitor.TryEnter(responseLock);
             if (unexpectedlyAcquired) Monitor.Exit(responseLock);
             Assert.False(unexpectedlyAcquired, "The response-write seam was not holding the response lock.");
@@ -429,7 +479,17 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             releaseBoundary.Set();
             Assert.True(requestThread.Join(Failsafe), "The request-start thread did not finish after release.");
             Assert.True(endThread.Join(Failsafe), "The end thread did not finish after write initiation.");
-            Assert.Null(starterFailure);
+
+            lock (eventGate)
+            {
+                // The write-initiation observation is the decisive evidence: it must have RUN (never
+                // vacuous) and it must have found the response lock held.
+                Assert.Null(starterFailure);
+                Assert.True(
+                    writeInitiatedUnderResponseLock,
+                    "The write-initiation observation never ran, so the atomic-boundary proof would be vacuous.");
+            }
+
             Assert.NotNull(call);
 
             var disconnected = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -448,6 +508,7 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         {
             releaseBoundary.Set();
             connection.OnResponseBearingWriteInitiating = null;
+            requests.OnWrite = null;
             connection.EndToolResponses();
             await JoinThreadsAndTasksForCleanupAsync(
                 [(requestThread, nameof(requestThread)), (endThread, nameof(endThread))],
@@ -1227,6 +1288,27 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             .GetField("_sendGate", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(service)!;
         return SendGateObserver.WaitForWaitersAsync(gate, count, ct);
+    }
+
+    /// <summary>
+    /// BODY-PHASE bounded observation of a RETAINED producer. The producer's own outcome propagates
+    /// unchanged (so the body still asserts it), and a bound expiry while the ORIGINAL task is still
+    /// live is a NAMED FAILURE — never treated as success — so a producer that can no longer make
+    /// progress (for example one parked forever on a send gate whose release was removed) is
+    /// diagnosed instead of hanging the test before its <c>finally</c>.
+    /// </summary>
+    private static async Task AwaitProducerWithinBoundAsync(Task producer, string name)
+    {
+        try
+        {
+            await producer.WaitAsync(Failsafe);
+        }
+        catch (TimeoutException ex) when (!producer.IsCompleted)
+        {
+            throw new TimeoutException(
+                $"Producer '{name}' was still live after {Failsafe} — it never completed, so the "
+                    + "behavior under test did not hold.", ex);
+        }
     }
 
     /// <summary>
