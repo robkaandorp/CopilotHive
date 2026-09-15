@@ -527,6 +527,266 @@ public sealed class WorkerConnectionLifecycleTests
         }
     }
 
+    /// <summary>
+    /// A THROWING HEARTBEAT CANCELLATION CALLBACK CANNOT SKIP JOINING THE ORIGINAL HEARTBEAT TASK.
+    /// <para>
+    /// The controlled heartbeat task provided by <c>HeartbeatTaskFactory</c> is deliberately NOT a
+    /// real heartbeat RPC: it parks until the test releases it and never observes the token, so the
+    /// ONLY thing that can complete it is the test. While it is unreleased, teardown must stay
+    /// parked in <c>await heartbeatTask</c>: the source is not yet disposed, the transport is not
+    /// yet disposed, and <see cref="WorkerService.RunAsync"/> has not returned.
+    /// </para>
+    /// <para>
+    /// After release, the deferred cancellation failure surfaces on the run task — with the
+    /// runtime's own <see cref="AggregateException"/> wrapper and the callback's original exception
+    /// inside it — and only then are the source and the transport disposed. The seam was entered
+    /// exactly once with the ACTUAL owned source, so the task joined is provably the SAME control
+    /// task the factory returned: no live heartbeat is abandoned.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ThrowingHeartbeatCancellationCallback_JoinsOriginalTaskBeforeDisposingSourceAndTransport()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+
+        // Hoisted so the stream's disposal callback observes the ACTUAL connection's teardown state.
+        WorkerConnection? connection = null;
+        var retiredAtStreamDisposal = false;
+        var unpublishedAtStreamDisposal = false;
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ =>
+            {
+                Interlocked.Increment(ref streamDisposals);
+                retiredAtStreamDisposal = connection?.IsRetired ?? false;
+                unpublishedAtStreamDisposal = GetPublishedConnection(service) is null;
+            },
+            null!);
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task replaces the PRODUCTION heartbeat LOOP at its existing launch
+            // point. It performs no heartbeat RPC and waits for no timer tick: it simply parks
+            // until the test releases it, ignoring the token, so only the test can finish it.
+            async Task ControlledHeartbeatAsync() => await heartbeatGate.Task;
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        CancellationTokenRegistration registration = default;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The seam ran at the EXISTING launch point (after publication), with the ACTUAL owned
+            // heartbeat source, and it returned the ONE task teardown must join.
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, Volatile.Read(ref heartbeatFactoryCalls));
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+            Assert.False(joinedTask.IsCompleted);
+            connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+
+            // The callback records its invocation AND throws.
+            var callbackFailure = new InvalidOperationException("throwing heartbeat cancellation callback");
+            var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            registration = heartbeatCts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+
+            // EOF ends the body, so RunAsync's cleanup requests cancellation — and the callback throws.
+            responses.TryComplete();
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // CLEANUP MUST STILL BE PARKED IN THE JOIN. The controlled task is held, so the source is
+            // undisposed, the transport is undisposed and the run has not returned.
+            Assert.False(joinedTask.IsCompleted, "The ORIGINAL heartbeat task must still be the one being awaited.");
+            Assert.False(run.IsCompleted, "Teardown must not return while the original heartbeat task is still running.");
+            Assert.Null(Record.Exception(() => _ = heartbeatCts.Token));
+            Assert.True(heartbeatCts.IsCancellationRequested, "The cancellation request must still have taken effect.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            // Release the ORIGINAL task: only now can teardown finish.
+            heartbeatGate.TrySetResult();
+
+            var surfaced = await Assert.ThrowsAnyAsync<Exception>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // The deferred failure kept its ORIGINAL evidence, wrapped exactly as the runtime produced it.
+            Assert.IsType<AggregateException>(surfaced);
+            Assert.Contains(callbackFailure, Flatten(surfaced));
+
+            // The SAME task was joined, the source is now disposed, and the transport went away only
+            // after the join — with retirement/unpublication still preceding disposal.
+            Assert.True(joinedTask.IsCompleted, "The task the factory returned must have been joined.");
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+            Assert.True(retiredAtStreamDisposal, "The connection must be retired before its stream is disposed.");
+            Assert.True(unpublishedAtStreamDisposal, "The connection must be unpublished before its stream is disposed.");
+        }
+        finally
+        {
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await ObserveForTeardownAsync(run);
+        }
+    }
+
+    /// <summary>
+    /// A PRIMARY <c>RunAsync</c> FAILURE IS PRESERVED when the cancellation cleanup ALSO fails: the
+    /// primary propagates with its original identity, the join of the ORIGINAL heartbeat task still
+    /// happens, and the secondary failure is reported through the EXISTING sanitized logger seam
+    /// (type classification only, never the message) without replacing the real failure.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithThrowingHeartbeatCallback_PreservesPrimaryAndStillJoins()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The PRIMARY failure: the initial Ready write fails, inside RunAsync's covered body.
+        var primaryFailure = new InvalidOperationException("primary transport failure");
+
+        var requests = new RecordingRequestStream { FailNextReadyWrite = primaryFailure };
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+
+        // The callback records its invocation AND throws. It is registered INSIDE the seam — the
+        // moment the ACTUAL owned source exists and BEFORE the primary failure — so the later
+        // cleanup provably raises a real cancellation-callback failure.
+        var callbackFailure = new InvalidOperationException("throwing heartbeat cancellation callback");
+        var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task replaces the PRODUCTION heartbeat LOOP at its existing launch
+            // point. It performs no heartbeat RPC and waits for no timer tick: it simply parks
+            // until the test releases it, ignoring the token, so only the test can finish it.
+            async Task ControlledHeartbeatAsync() => await heartbeatGate.Task;
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The heartbeat had already been launched at its unchanged launch point BEFORE the
+            // primary failure, so the cleanup below always has a running heartbeat to join.
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+
+            // The diagnostics below go to the EXISTING logger seam (Console.Error).
+            Console.SetError(stdErr);
+
+            // The secondary failure fired during cleanup; the join must still be parked on the
+            // ORIGINAL controlled task.
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "The join must still occur even though a primary failure exists.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            heartbeatGate.TrySetResult();
+
+            // The PRIMARY propagates — unchanged, with its own identity.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            // The join happened, the source was disposed, and the transport went away afterwards.
+            Assert.True(joinedTask.IsCompleted);
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+
+            // The secondary failure was REPORTED in sanitized form — classified by type, never by
+            // message — so the provisioned-content redaction contract is unchanged.
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Heartbeat cancellation cleanup failed", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(
+                nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(callbackFailure.Message, diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await ObserveForTeardownAsync(run);
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // (2) Focused fake-client connection tests.
     // ══════════════════════════════════════════════════════════════════════════
@@ -1033,6 +1293,15 @@ public sealed class WorkerConnectionLifecycleTests
 
     private static Task JoinForTeardownAsync(Task? producer) => ObserveForTeardownAsync(producer);
 
+    /// <summary>
+    /// Flattens an exception (and any <see cref="AggregateException"/> wrapper the runtime produced)
+    /// so a test can locate the ORIGINAL callback evidence without normalizing it away.
+    /// </summary>
+    private static IReadOnlyList<Exception> Flatten(Exception exception) =>
+        exception is AggregateException aggregate
+            ? [.. aggregate.Flatten().InnerExceptions]
+            : [exception];
+
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1188,6 +1457,13 @@ public sealed class WorkerConnectionLifecycleTests
         /// </summary>
         internal Action<WorkerMessage>? OnWrite { get; set; }
 
+        /// <summary>
+        /// ONE-SHOT injected failure for the next <c>WorkerReady</c> write. It models a transport
+        /// write that faults INSIDE the covered lifecycle body, so a test can produce a real
+        /// PRIMARY <c>RunAsync</c> failure alongside a cancellation-cleanup failure. Consumed on use.
+        /// </summary>
+        internal Exception? FailNextReadyWrite { get; set; }
+
         internal IReadOnlyList<WorkerMessage> Writes
         {
             get { lock (_gate) return _writes.ToList(); }
@@ -1237,10 +1513,23 @@ public sealed class WorkerConnectionLifecycleTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             Record(message);
-            return Task.CompletedTask;
+            return ReadyWriteFailure(message);
         }
 
         public Task CompleteAsync() => Task.CompletedTask;
+
+        /// <summary>
+        /// Reports the armed one-shot Ready-write failure AFTER the write was recorded, so the
+        /// recorded-write bookkeeping (and any count waiter) still observes the attempt.
+        /// </summary>
+        private Task ReadyWriteFailure(WorkerMessage message)
+        {
+            if (message.PayloadCase != WorkerMessage.PayloadOneofCase.Ready || FailNextReadyWrite is not { } failure)
+                return Task.CompletedTask;
+
+            FailNextReadyWrite = null;
+            return Task.FromException(failure);
+        }
 
         private void Record(WorkerMessage message)
         {
