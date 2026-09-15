@@ -792,6 +792,146 @@ public sealed class WorkerConnectionLifecycleTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
+    /// A FAILING DIAGNOSTIC cannot prevent the heartbeat teardown and cannot replace the primary
+    /// failure. This is the logger-failure cell of the RunAsync error-precedence rule: with a
+    /// PRIMARY transport failure AND a secondary heartbeat-cancellation-callback failure BOTH in
+    /// play, the guarded sanitized report itself throws because <c>Console.Error</c> has been
+    /// replaced by a writer that throws on every write. The cleanup must still complete — the
+    /// ORIGINAL heartbeat task joins, its source is disposed, the transport is disposed — and the
+    /// PRIMARY propagates with its ORIGINAL identity, never replaced by the diagnostic failure.
+    /// <para>
+    /// REMOVAL PROOF. Without the guard around the diagnostic write, the throwing log call inside
+    /// <c>PropagateOrReport</c> unwinds the cleanup's <c>finally</c> and REPLACES the propagating
+    /// primary: the surfaced exception would be the injected diagnostic failure, so
+    /// <c>Assert.Same</c> on the primary instance fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithFailingDiagnostics_JoinsHeartbeatAndPrimarySurfaces()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new ProvisionerCapturingRunner();
+        using var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // The PRIMARY failure: the initial Ready write fails, inside RunAsync's covered body.
+        var primaryFailure = new InvalidOperationException("primary transport failure");
+
+        var requests = new RecordingRequestStream { FailNextReadyWrite = primaryFailure };
+        var responses = new ChannelResponseReader();
+        var streamDisposals = 0;
+        var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => Interlocked.Increment(ref streamDisposals),
+            null!);
+
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatFactoryCalls = 0;
+        CancellationTokenSource? ownedHeartbeatCts = null;
+        Task? controlledHeartbeatTask = null;
+
+        // The callback records its invocation AND throws — a genuine secondary cancellation-cleanup
+        // failure, armed INSIDE the seam on the ACTUAL owned source, before the primary failure.
+        var callbackFailure = new InvalidOperationException("throwing heartbeat cancellation callback");
+        var callbackInvoked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            Interlocked.Increment(ref heartbeatFactoryCalls);
+            ownedHeartbeatCts = cts;
+            registration = cts.Token.Register(() =>
+            {
+                callbackInvoked.TrySetResult();
+                throw callbackFailure;
+            });
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeatTask = ControlledHeartbeatAsync();
+            return controlledHeartbeatTask;
+
+            // The controlled task replaces the PRODUCTION heartbeat LOOP at its existing launch
+            // point. It performs no heartbeat RPC and waits for no timer tick: it simply parks
+            // until the test releases it, ignoring the token, so only the test can finish it.
+            async Task ControlledHeartbeatAsync() => await heartbeatGate.Task;
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        var originalErr = Console.Error;
+        using var loopCts = new CancellationTokenSource();
+        var run = Task.CompletedTask;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The heartbeat was launched at its unchanged launch point BEFORE the primary failure,
+            // so the cleanup always has a running heartbeat to join.
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var heartbeatCts = Assert.IsAssignableFrom<CancellationTokenSource>(ownedHeartbeatCts);
+            var joinedTask = Assert.IsAssignableFrom<Task>(controlledHeartbeatTask);
+            Assert.Equal(1, Volatile.Read(ref heartbeatFactoryCalls));
+
+            // From here on the diagnostics sink itself is BROKEN: every write throws.
+            Console.SetError(new ThrowingErrorWriter());
+
+            // The secondary failure fired during cleanup; the join must still be parked on the
+            // ORIGINAL controlled task — nothing was skipped because the sink is broken.
+            await callbackInvoked.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(joinedTask.IsCompleted);
+            Assert.False(run.IsCompleted, "The join must still occur even though the diagnostics sink is broken.");
+            Assert.Equal(0, Volatile.Read(ref streamDisposals));
+
+            // Release the ORIGINAL task: only now can teardown finish.
+            heartbeatGate.TrySetResult();
+
+            // The PRIMARY propagates — unchanged, with its own identity, despite the throwing
+            // diagnostic sink inside the guarded report.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            // The join happened, the source was disposed, and the transport went away afterwards.
+            Assert.True(joinedTask.IsCompleted, "The task the factory returned must have been joined.");
+            Assert.Throws<ObjectDisposedException>(() => _ = heartbeatCts.Token);
+            Assert.Equal(1, Volatile.Read(ref streamDisposals));
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            registration.Dispose();
+            heartbeatGate.TrySetResult();
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await ObserveForTeardownAsync(run);
+        }
+    }
+
+    /// <summary>
+    /// A diagnostic sink that throws on EVERY write — modelling a broken or closed
+    /// <c>Console.Error</c>. Used to prove the guarded sanitized report cannot skip cleanup or
+    /// replace the primary failure: without the production guard the throw from this writer
+    /// unwinds the cleanup's finally.
+    /// </summary>
+    private sealed class ThrowingErrorWriter : System.IO.TextWriter
+    {
+        public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        public override void Write(char value) => throw new InvalidOperationException("injected diagnostic failure");
+
+        public override void Write(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+
+        public override void WriteLine(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+    }
+
+    /// <summary>
     /// SESSION LOAD and SAVE go through the CONNECTION's own client, carrying the exact arguments
     /// the caller supplied, and a not-found response loads as <c>null</c>.
     /// </summary>

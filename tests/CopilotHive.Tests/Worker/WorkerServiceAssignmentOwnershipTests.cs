@@ -1065,6 +1065,112 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
     }
 
+    /// <summary>
+    /// A FAILING DIAGNOSTIC cannot prevent cleanup and cannot replace the primary error. This is
+    /// the logger-failure cell of the error-precedence rule: with a PRIMARY reader fault AND a
+    /// secondary cancellation-callback failure BOTH in play, the guarded sanitized report itself
+    /// throws because <c>Console.Error</c> has been replaced by a writer that throws on every
+    /// write. The cleanup must still complete — the body joins, the ownership slot clears, the
+    /// source is disposed, the connection retires — and the PRIMARY reader fault surfaces with
+    /// its ORIGINAL identity, never replaced by the diagnostic failure.
+    /// <para>
+    /// REMOVAL PROOF. Without the guard around the diagnostic write, the throwing log call inside
+    /// <c>PropagateOrReport</c> unwinds the <c>finally</c> and REPLACES the propagating primary:
+    /// the surfaced exception would be the injected diagnostic failure (or a wrapper around it),
+    /// so <c>Assert.Same</c> on the reader's original instance fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ReaderFaultPrimaryWithFailingDiagnostics_CleanupStillCompletesAndPrimarySurfaces()
+    {
+        var runner = new GatedPromptRunner();
+        using var service = BuildService(runner);
+
+        var originalFault = new InvalidOperationException("reader fault");
+        var responses = new FaultingResponseReader();
+        var requests = new RecordingRequestStream();
+        var stream = BuildStream(requests, responses);
+
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+        using var drainObserverCts = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+
+        var originalErr = Console.Error;
+        ArmedCancellationCallback? armed = null;
+        DrainEntryObservation? drainObservation = null;
+        try
+        {
+            responses.Push(Assignment("task-A"));
+            await runner.PromptStarted("task-A");
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var execution = GetActiveExecution(service);
+            armed = ArmThrowingCancellationCallback(service);
+            var ownerCts = armed.Source;
+
+            // From here on the diagnostics sink itself is BROKEN: every write throws.
+            Console.SetError(new ThrowingErrorWriter());
+
+            drainObservation = ObserveOwnerDrainEntry(execution, drainObserverCts.Token);
+
+            // The reader faults while the body is still running: a REAL loop primary, and the
+            // teardown's cancellation request raises the armed callback failure.
+            responses.ArmFault(originalFault);
+            await drainObservation.Entered.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(armed.CallbackInvoked, "The armed callback must have been invoked by the teardown's cancellation request.");
+            Assert.False(execution.IsCompleted, "A's body must still be running while its drain is parked.");
+            Assert.False(loop.IsCompleted, "Cleanup must still be parked on the original body.");
+
+            runner.ReleaseUnwind();
+
+            // The PRIMARY — the reader's own exception instance — is what surfaces, even though
+            // the secondary report's sink threw: a failing diagnostic is not an error channel.
+            var propagated = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(originalFault, propagated);
+
+            // The join and the clear still happened, the source was disposed, and retirement ran:
+            // the diagnostic failure skipped nothing.
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+            Assert.True(ownerCts.IsCancellationRequested);
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.Equal(1, armed.InvocationCount);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            await drainObserverCts.CancelAsync();
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await ObserveLoopForTeardownAsync(loop);
+            if (drainObservation is not null)
+                await ObserveLoopForTeardownAsync(drainObservation.Producer);
+            armed?.DisposeRegistration();
+        }
+    }
+
+    /// <summary>
+    /// A diagnostic sink that throws on EVERY write — modelling a broken or closed
+    /// <c>Console.Error</c>. Used to prove the guarded sanitized report cannot skip cleanup or
+    /// replace the primary failure: without the production guard the throw from this writer
+    /// unwinds the cleanup's finally.
+    /// </summary>
+    private sealed class ThrowingErrorWriter : System.IO.TextWriter
+    {
+        public override System.Text.Encoding Encoding => System.Text.Encoding.UTF8;
+
+        public override void Write(char value) => throw new InvalidOperationException("injected diagnostic failure");
+
+        public override void Write(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+
+        public override void WriteLine(string? value) => throw new InvalidOperationException("injected diagnostic failure");
+    }
+
     // ── Retention assertions and harness ──────────────────────────────────────
 
     private const string EligibleConfigUrl = "https://github.com/org/config-repo.git";
