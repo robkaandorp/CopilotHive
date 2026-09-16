@@ -3811,17 +3811,22 @@ public sealed class TaskDispatchServiceTests
 
         var deleteSentinel = new InvalidOperationException("delete-sentinel");
         using var storeFixture = new SqliteMappingFixture();
-        var pipelineManager = new GoalPipelineManager(
-            storeFixture.CreateStore(new SentinelThrowingInterceptor(deleteSentinel, "DELETE")));
-
-        var taskQueue = new TaskQueue();
         var goal = new Goal
         {
             Id = $"goal-{Guid.NewGuid():N}",
             Description = "Test goal",
             RepositoryNames = ["test-repo"],
         };
+        // THE INELIGIBLE (LEGACY) ROUTE: <c>TryUnregisterTask</c> — the step whose partial outcome
+        // this vector exercises — belongs ONLY to the legacy sequence, so a persisted row is seeded
+        // first to make the manager-created pipeline ineligible.
+        var store = storeFixture.CreateStore(new SentinelThrowingInterceptor(deleteSentinel, "DELETE"));
+        store.SavePipeline(new GoalPipeline(goal));
+        var pipelineManager = new GoalPipelineManager(store);
+
+        var taskQueue = new TaskQueue();
         var pipeline = pipelineManager.CreatePipeline(goal);
+        Assert.False(pipeline.OwnershipCheckpointEligible);
         pipeline.AdvanceTo(GoalPhase.Coding);
         SetPlan(pipeline, ModelTier.Default);
 

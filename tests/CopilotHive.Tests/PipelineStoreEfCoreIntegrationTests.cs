@@ -1145,6 +1145,62 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     }
 
     /// <summary>
+    /// THE EVIDENCE CARRIER IS THE EXACT WRITE PAYLOAD: the <c>out</c> token returned by the
+    /// ownership-aware route is byte-identical to the registry text the SAME transaction installed
+    /// (read back RAW), and the convenience (evidence-discarding) overload produces the identical
+    /// row — there is only ONE implementation.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF. Producing the token by a second encode, a decode/re-encode round trip or a
+    /// fresh read would have to reproduce the same bytes for THIS canonical payload — so the vector
+    /// pins identity additionally by feeding the token straight into the guarded inverse, which must
+    /// COMMIT against the row it came from.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_ReturnsTheExactWrittenRegistryToken()
+    {
+        const string goalId = "goal-evidence-token";
+        const string taskId = "task-evidence-token";
+        var candidate = RichCapture(goalId, taskId);
+        var subject = CreatePipeline(goalId, taskId);
+        var store = CreateStore();
+
+        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate, out var token);
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        var durable = Assert.IsType<string>(ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Equal(durable, token);
+
+        // THE TOKEN IS USABLE AS-IS: the guarded inverse commits against the very row it came from.
+        var rollback = store.CommitPendingAdmissionRollback(goalId, taskId, token);
+        Assert.Equal(AdmissionOwnershipCommitStatus.Committed, rollback.Status);
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+    }
+
+    /// <summary>
+    /// THE CONVENIENCE OVERLOAD IS A PURE DELEGATION: with the SAME capture it writes the identical
+    /// tuple, so a divergent second implementation would be visible here as a differing row.
+    /// </summary>
+    [Fact]
+    public void SaveAdmissionWithPointer_EvidenceDiscardingOverload_DelegatesToTheSingleImplementation()
+    {
+        const string goalId = "goal-evidence-convenience";
+        const string taskId = "task-evidence-convenience";
+        var candidate = RichCapture(goalId, taskId);
+        var store = CreateStore();
+
+        var result = store.SaveAdmissionWithPointer(CreatePipeline(goalId, taskId), taskId, candidate);
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+        Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+    }
+
+    /// <summary>
     /// A MAPPING CONFLICT ON THE NEW ROUTE STAGES NO CHECKPOINT: the pre-seeded mapping row yields
     /// <see cref="AdmissionStoreResult.PersistConflict"/> and the pipeline row is never even
     /// LOOKED UP (zero tracked entries), let alone written — its pointer and its blob stay exactly
@@ -1165,9 +1221,15 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var subject = CreatePipeline(goalId, taskId);
         var candidate = RichCapture(goalId, taskId);
 
-        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate);
+        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate, out var token);
 
         Assert.Equal(AdmissionStoreResult.PersistConflict, result);
+
+        // THE LAYERING, stated honestly: this REFUSAL returns normally, so the route's out token
+        // HAS been assigned (it describes the write this call attempted). Publication is gated one
+        // layer up — GoalPipelineManager exposes RollbackEvidence ONLY for a CONFIRMED Committed
+        // outcome, which is what keeps a refused admission on the legacy (non-evidence) route.
+        Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), token);
 
         // The mapping row is the PRE-EXISTING one — untouched.
         Assert.Equal("goal-other", ExecuteScalarOnKeeper(
@@ -1211,9 +1273,11 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
         var subject = CreatePipeline(goalId, taskId);
         var candidate = RichCapture(goalId, taskId);
+        // The out token's pre-call value; the stage-2 failure's effect on it is asserted below.
+        string? token = null;
 
         var ex = Assert.ThrowsAny<Exception>(
-            () => store.SaveAdmissionWithPointer(subject, taskId, candidate));
+            () => store.SaveAdmissionWithPointer(subject, taskId, candidate, out token));
 
         // THE ORIGINAL exception, BY IDENTITY — never reclassified as a conflict.
         var update = Assert.IsType<DbUpdateException>(ex);
@@ -1221,6 +1285,15 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         Assert.Equal(1, interceptor.ThrowCount);
         Assert.Equal(19, interceptor.Sentinel.SqliteErrorCode);
         Assert.Equal(1555, interceptor.Sentinel.SqliteExtendedErrorCode);
+
+        // THE LAYERING, stated honestly: the route assigns its out token BEFORE the shared
+        // transaction body runs, and an `out` parameter writes straight to the caller's storage —
+        // so after a stage-2 FAILURE the token holds the text this call ATTEMPTED to write, not a
+        // confirmation that it landed. Publication is therefore gated one layer up:
+        // GoalPipelineManager exposes RollbackEvidence ONLY for a CONFIRMED Committed outcome
+        // (see LiveOwnershipCheckpointTests' PersistenceFailed case), which is what keeps a failed
+        // admission on the legacy (non-evidence) route.
+        Assert.Equal(WorkSlotRegistryCodec.Encode(candidate.Registry), token);
 
         // ALL THREE VALUES ROLLED BACK.
         Assert.Null(ExecuteScalarOnKeeper(
@@ -5551,7 +5624,8 @@ public sealed class PipelineStoreAdmissionOwnershipRouteDirectContextTests : IDi
     /// <summary>
     /// THE PREFLIGHT FAILURE ON A DIRECT CONTEXT: the malformed-history capture is refused with the
     /// preflight's own error and NO statement is issued — the mapping table and the pipeline table
-    /// are both untouched, and the context's change tracker stays empty.
+    /// are both untouched, and the context's change tracker stays empty. The out token is left
+    /// EXACTLY as the caller had it: a pre-context refusal never publishes rollback evidence.
     /// </summary>
     [Fact]
     public void SaveAdmissionWithPointer_OwnershipRoute_MalformedCapture_IssuesNoStatement()
@@ -5568,10 +5642,15 @@ public sealed class PipelineStoreAdmissionOwnershipRouteDirectContextTests : IDi
                 [new WorkSlotView(new WorkSlot(taskId, position, 1), WorkSlotState.Pending)],
                 []));
 
+        // The out token's pre-call value; the refusal must leave it untouched.
+        string? token = null;
         var thrown = Assert.Throws<ArgumentException>(
-            () => store.SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), taskId, malformed));
+            () => store.SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), taskId, malformed, out token));
 
         Assert.Contains("has no attempt entry for its position", thrown.Message, StringComparison.Ordinal);
+        // NO EVIDENCE FROM A REFUSAL: the assignment sits after every pre-context validation, so a
+        // rejection escapes before it and the caller observes nothing.
+        Assert.Null(token);
         Assert.Empty(recorder.Commands);
         Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
         Assert.Empty(context.ChangeTracker.Entries<PipelineEntity>().ToList());

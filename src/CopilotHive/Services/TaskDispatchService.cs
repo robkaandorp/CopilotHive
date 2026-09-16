@@ -464,66 +464,95 @@ internal sealed class TaskDispatchService
         }
         catch (Exception)
         {
-            // THE BEST-EFFORT ROLLBACK, in exact order: slot → mapping → persisted pointer →
-            // in-memory pointer → warning → rethrow of the ORIGINAL exception (never a wrapper).
+            // THE BEST-EFFORT ROLLBACK — THE ORIGINAL enqueue exception is what leaves this catch
+            // on EVERY path below: bare, never wrapped and never aggregated with rollback evidence.
+            //
+            // THE ROUTE DECISION is made from THE EVIDENCE OF THIS ADMISSION, never from a fresh
+            // eligibility guess: a CONFIRMED successful eligible admission carries its
+            // invocation-local RollbackEvidence, and only such an admission takes the guarded
+            // atomic-inverse route. Every other admission (the legacy/ineligible route, NoStore,
+            // and every refusal/failure — where there is either nothing persisted or the admission
+            // already rolled its own claim back) keeps the pre-existing sequence byte-identically.
+            //
+            // THE WHOLE NEW ROUTE — the manager invocation AND every diagnostic — is guarded, so a
+            // throwing logger, or any unexpected escape from the manager operation, can neither
+            // replace the original exception nor skip the remaining settlement.
+            //
+            // THE SLOT-RELEASE TRUTH travels back from the route: the legacy sequence ALWAYS
+            // releases the slot (its AbandonSlot runs unconditionally), while the evidence route
+            // releases it only when the Pending fence actually succeeded. A SKIPPED rollback
+            // deliberately mutates NOTHING, so claiming "the slot is released" for it would be a
+            // false diagnostic.
+            var slotReleased = true;
+            if (admission.RollbackEvidence is not null)
+            {
+                slotReleased = TryRollbackPendingAdmission(pipeline, taskId, admission.RollbackEvidence);
+            }
+            else
+            {
+                // ── THE PRE-EXISTING SEQUENCE for every admission without evidence ──
 
-            // (a) Release the slot. Belt-and-braces: the call is sealed, non-virtual and has no
-            // feasible failure vector, but a throw here must not abort the remaining rollback.
-            try
-            {
-                pipeline.AbandonSlot(taskId);
-            }
-            catch (Exception ex)
-            {
-                LogRollbackFailure(pipeline.GoalId, taskId, "abandon", ex);
+                // (a) Release the slot. Belt-and-braces: the call is sealed, non-virtual and has no
+                // feasible failure vector, but a throw here must not abort the remaining rollback.
+                try
+                {
+                    pipeline.AbandonSlot(taskId);
+                }
+                catch (Exception ex)
+                {
+                    LogRollbackFailure(pipeline.GoalId, taskId, "abandon", ex);
+                }
+
+                // (b) Remove OUR mapping. The result is ALWAYS logged; only the partial outcome
+                // (our memory ownership removed but the row delete failed-or-was-not-ours) is a
+                // WARNING. A raced (false, false) removed nothing of ours — DEBUG only.
+                try
+                {
+                    var unregister = _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
+                    // GUARDED SITE (β-PREP-2): the dispatch-owned unregister-result record goes
+                    // through LogSafely, so a throwing logger is swallowed and the rollback
+                    // continues — the cleanup-before-log contract.
+                    LogSafely(() => _logger.LogDebug(
+                        "WorkSlotIntegrity: unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved}",
+                        pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved));
+
+                    if (unregister.MemoryRemoved && !unregister.PersistenceRemoved)
+                        LogRollbackFailure(pipeline.GoalId, taskId, "unregister-persist", null);
+                }
+                catch (Exception ex)
+                {
+                    // TryUnregisterTask promises never to throw; an escape is a contract violation.
+                    LogRollbackFailure(pipeline.GoalId, taskId, "unregister", ex);
+                }
+
+                // (b2) Roll the PERSISTED pointer back — ONLY when THIS dispatch committed it.
+                // On NoStore nothing was persisted, so there is nothing to undo. The store's
+                // clear is ownership-checked (a newer pointer is never erased) and never throws;
+                // a Failed outcome is recorded as a rollback failure and the cleanup continues.
+                if (admission.CommittedThisInvocation)
+                {
+                    var pointerRollback = _pipelineManager.RollbackPersistedPointer(pipeline, taskId);
+                    if (pointerRollback == PointerRollbackResult.Failed)
+                        LogRollbackFailure(pipeline.GoalId, taskId, "pointer-rollback", null);
+                }
+
+                // (c) Clear the pointer ONLY when it still names this task — a newer dispatch's
+                // pointer must never be erased. Belt-and-braces for the same reason as (a).
+                try
+                {
+                    pipeline.ClearActiveTaskIfCurrent(taskId);
+                }
+                catch (Exception ex)
+                {
+                    LogRollbackFailure(pipeline.GoalId, taskId, "pointer", ex);
+                }
             }
 
-            // (b) Remove OUR mapping. The result is ALWAYS logged; only the partial outcome
-            // (our memory ownership removed but the row delete failed-or-was-not-ours) is a
-            // WARNING. A raced (false, false) removed nothing of ours — DEBUG only.
-            try
-            {
-                var unregister = _pipelineManager.TryUnregisterTask(taskId, pipeline.GoalId);
-                // GUARDED SITE (β-PREP-2): the dispatch-owned unregister-result record goes
-                // through LogSafely, so a throwing logger is swallowed and the rollback
-                // continues — the cleanup-before-log contract.
-                LogSafely(() => _logger.LogDebug(
-                    "WorkSlotIntegrity: unregister goal={GoalId} task={TaskId} memoryRemoved={MemoryRemoved} persistenceRemoved={PersistenceRemoved}",
-                    pipeline.GoalId, taskId, unregister.MemoryRemoved, unregister.PersistenceRemoved));
-
-                if (unregister.MemoryRemoved && !unregister.PersistenceRemoved)
-                    LogRollbackFailure(pipeline.GoalId, taskId, "unregister-persist", null);
-            }
-            catch (Exception ex)
-            {
-                // TryUnregisterTask promises never to throw; an escape is a contract violation.
-                LogRollbackFailure(pipeline.GoalId, taskId, "unregister", ex);
-            }
-
-            // (b2) Roll the PERSISTED pointer back — ONLY when THIS dispatch committed it.
-            // On NoStore nothing was persisted, so there is nothing to undo. The store's
-            // clear is ownership-checked (a newer pointer is never erased) and never throws;
-            // a Failed outcome is recorded as a rollback failure and the cleanup continues.
-            if (admission.CommittedThisInvocation)
-            {
-                var pointerRollback = _pipelineManager.RollbackPersistedPointer(pipeline, taskId);
-                if (pointerRollback == PointerRollbackResult.Failed)
-                    LogRollbackFailure(pipeline.GoalId, taskId, "pointer-rollback", null);
-            }
-
-            // (c) Clear the pointer ONLY when it still names this task — a newer dispatch's
-            // pointer must never be erased. Belt-and-braces for the same reason as (a).
-            try
-            {
-                pipeline.ClearActiveTaskIfCurrent(taskId);
-            }
-            catch (Exception ex)
-            {
-                LogRollbackFailure(pipeline.GoalId, taskId, "pointer", ex);
-            }
-
-            // (d) The slot-release record, then (e) the ORIGINAL failure.
-            LogAbandonedRegistration(pipeline.GoalId, taskId, slot.Position);
+            // (d) The slot-release record — emitted ONLY when the slot really was released, so a
+            // SKIPPED rollback (which mutated nothing) never carries a false "the slot is released"
+            // claim next to its own outcome=skipped record. Then (e) the ORIGINAL failure, bare.
+            if (slotReleased)
+                LogAbandonedRegistration(pipeline.GoalId, taskId, slot.Position);
             throw;
         }
         _logger.LogInformation("Dispatched {Role} task {TaskId} for goal {GoalId} (branch={Branch})",
@@ -821,6 +850,194 @@ internal sealed class TaskDispatchService
         DeliveryRecovery.Preserve => "remains active; the outcome is unknowable; the recovery is deferred",
         _ => throw new InvalidOperationException($"Unhandled DeliveryRecovery: {recovery}"),
     };
+
+    /// <summary>
+    /// THE GUARDED, ENQUEUE-ONLY CONSUMPTION of <see cref="GoalPipelineManager.RollbackPendingAdmission"/>:
+    /// the eligible admission's atomic inverse plus the honest reporting of its outcome. NEVER
+    /// THROWS — every step, including the manager invocation and EVERY diagnostic, is guarded so the
+    /// ORIGINAL enqueue exception stays authoritative in the caller.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE MEMORY SETTLEMENT already happened inside the manager operation (the pair-scoped removal
+    /// plus <see cref="GoalPipeline.ClearActiveTaskIfCurrent"/>), so nothing here performs memory or
+    /// durable cleanup of its own: there is NO durable fallback on refusal, uncertainty or throw —
+    /// no separate mapping deletion, no pointer clear, no unconditional save, no read-back repair and
+    /// no retry. This helper exists to REPORT the recorded outcome and to keep a diagnostic failure
+    /// from ever escaping.
+    /// </para>
+    /// <para>
+    /// HONEST CLASSIFICATION, with no invented outcome framework: a confirmed
+    /// <see cref="PendingAdmissionRollbackStatus.Committed"/> is the ONLY outcome logged as a
+    /// completed rollback; <c>Skipped</c>, <c>Refused</c>, <c>Indeterminate</c> and <c>Failed</c>
+    /// are reported through the existing SAFE logging helpers (<see cref="LogSafely"/>). The store's
+    /// exact evidence is reported WITHOUT wrapping or aggregation: the PRIMARY exception instance is
+    /// passed to the logger as its exception argument, and — when the store also captured a
+    /// ROLLBACK exception (a throwing transaction rollback, which may accompany a null primary) —
+    /// a SECOND, independently guarded record carries THAT exact instance as its own exception
+    /// argument. Two instances need two records because one <see cref="ILogger"/> call can carry
+    /// only one; neither is ever wrapped, chained into an <c>InnerException</c>, aggregated, or
+    /// combined with the caller's original enqueue exception, which stays the only exception that
+    /// leaves the dispatch.
+    /// </para>
+    /// <para>
+    /// THE RETURN VALUE is the SLOT-RELEASE TRUTH the caller's closing record depends on:
+    /// <c>true</c> only when the Pending fence actually succeeded and the settlement ran (every
+    /// outcome except <see cref="PendingAdmissionRollbackStatus.Skipped"/>). A skipped attempt
+    /// mutated nothing, so the caller must NOT claim the slot was released. A contained escape
+    /// reports <c>false</c> for the same reason: the fence cannot be assumed to have run.
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The pipeline the admission was made for.</param>
+    /// <param name="taskId">The task the admission was made for.</param>
+    /// <param name="evidence">The invocation-local evidence of THAT admission.</param>
+    /// <returns><c>true</c> when the Pending fence succeeded (the slot really was released).</returns>
+    private bool TryRollbackPendingAdmission(
+        GoalPipeline pipeline, string taskId, AdmissionRollbackEvidence evidence)
+    {
+        // THE OUTER GUARD — the LAST line of defence for the caller's exception story: nothing this
+        // helper does (the manager invocation, the outcome switch, any diagnostic) may escape and
+        // replace the ORIGINAL enqueue exception. The memory settlement happens inside the manager
+        // operation and is idempotent, so an escape here needs no compensating cleanup.
+        try
+        {
+            PendingAdmissionRollbackResult rollback;
+            try
+            {
+                rollback = _pipelineManager.RollbackPendingAdmission(pipeline, taskId, evidence);
+            }
+            catch (Exception ex)
+            {
+                // The manager operation reports its store failures through its result and is not
+                // expected to throw; an escape is contained here. The fence's fate is unknown, so
+                // no slot-release claim is made.
+                LogSafely(() => _logger.LogWarning(
+                    ex,
+                    "WorkSlotIntegrity: rollback-failure goal={GoalId} task={TaskId} step=pending-admission — the rollback operation threw; continuing",
+                    pipeline.GoalId, taskId));
+                return false;
+            }
+
+            switch (rollback.Status)
+            {
+                case PendingAdmissionRollbackStatus.Committed:
+                    // THE ONLY outcome reported as a completed rollback: the store's transaction
+                    // confirmed the Pending abandon, the pointer clear and the mapping delete together.
+                    LogSafely(() => _logger.LogDebug(
+                        "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} outcome=committed — the persisted Pending admission was abandoned, its pointer cleared and its mapping deleted in one transaction",
+                        pipeline.GoalId, taskId));
+                    return true;
+
+                case PendingAdmissionRollbackStatus.Skipped:
+                    // NOT a failure and NOT a success: the attempt was never made (the manager no
+                    // longer owned the admission, or the slot was no longer Pending). NOTHING was
+                    // mutated, so the caller must emit NO slot-release record for this path.
+                    LogSafely(() => _logger.LogDebug(
+                        "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} outcome=skipped — the admission was no longer this manager's to roll back (the slot was absent, claimed, recorded or already abandoned); no rollback was attempted",
+                        pipeline.GoalId, taskId));
+                    return false;
+
+                case PendingAdmissionRollbackStatus.Refused:
+                    // A confirmed NO-MUTATION outcome — which does NOT prove that earlier cleanup
+                    // already happened. Reported honestly rather than as success.
+                    LogSafely(() => _logger.LogWarning(
+                        "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} outcome=refused — the rollback transaction confirmed no mutation (a missing row, a newer or null pointer, stale registry text, or a missing/foreign mapping); durable residue may remain",
+                        pipeline.GoalId, taskId));
+                    return true;
+
+                case PendingAdmissionRollbackStatus.Indeterminate:
+                    // MAY HAVE COMMITTED: neither success nor no-change is inferred. BOTH of the
+                    // store's exact instances must survive to the diagnostic surface, and ONE
+                    // ILogger call can carry only ONE exception argument — so the two truths are
+                    // emitted as TWO independently guarded records, never wrapped, chained or
+                    // aggregated (least of all with the caller's original enqueue exception).
+                    //
+                    // (1) THE OUTCOME RECORD carries the PRIMARY instance verbatim. Its exception
+                    //     argument is null EXACTLY when there was no primary failure — a throwing
+                    //     transaction rollback can accompany a clean body refusal — and the inline
+                    //     type/message rendering keeps that case readable at a glance.
+                    LogSafely(() => _logger.LogWarning(
+                        rollback.Failure,
+                        "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} outcome=indeterminate — the rollback transaction's fate is unknown; it may have committed (primary={Primary}; rollback={Rollback})",
+                        pipeline.GoalId, taskId,
+                        DescribeRollbackEvidence(rollback.Failure),
+                        DescribeRollbackEvidence(rollback.RollbackFailure)));
+
+                    // (2) THE ROLLBACK-EVIDENCE RECORD, emitted ONLY when the store actually
+                    //     captured a rollback exception, carries THAT exact instance as its own
+                    //     exception argument. Its own guard keeps a throwing logger here from
+                    //     masking either the record above or the original enqueue exception.
+                    if (rollback.RollbackFailure is { } rollbackFailure)
+                    {
+                        LogSafely(() => _logger.LogWarning(
+                            rollbackFailure,
+                            "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} step=transaction-rollback — the rollback transaction's own rollback threw; this record retains that exact exception",
+                            pipeline.GoalId, taskId));
+                    }
+
+                    return true;
+
+                case PendingAdmissionRollbackStatus.Failed:
+                    // THE STORE THREW — distinguishable from a skipped attempt. The exact exception
+                    // is the evidence argument; the local settlement already completed in the manager.
+                    LogSafely(() => _logger.LogWarning(
+                        rollback.Failure,
+                        "WorkSlotIntegrity: pending-admission-rollback goal={GoalId} task={TaskId} outcome=failed — the rollback store call threw; durable residue may remain",
+                        pipeline.GoalId, taskId));
+                    return true;
+
+                default:
+                    // NO SILENT FALLBACK: an undefined outcome is a contract violation, and
+                    // reporting it as anything else would be a false claim about durable state.
+                    throw new InvalidOperationException(
+                        $"Unhandled PendingAdmissionRollbackStatus: {rollback.Status}");
+            }
+        }
+        catch (Exception ex)
+        {
+            // The outer guard: the switch's contract-violation throw (and anything else) is
+            // contained so the caller's ORIGINAL enqueue exception remains authoritative. The
+            // fence's fate is unknown here, so no slot-release claim is made.
+            LogSafely(() => _logger.LogWarning(
+                ex,
+                "WorkSlotIntegrity: rollback-failure goal={GoalId} task={TaskId} step=pending-admission — the rollback reporting failed; continuing",
+                pipeline.GoalId, taskId));
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Renders ONE exception instance as a SAFE, bounded description (type plus message) for the
+    /// indeterminate outcome record — never a stack dump, never a wrapper and never an aggregate.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS READABILITY, NOT EVIDENCE RETENTION. The exact instances are retained by the
+    /// records' own exception arguments (the outcome record carries the primary; a second guarded
+    /// record carries the rollback exception); this rendering merely puts both truths on ONE line
+    /// so the uncertain outcome is legible without correlating records.
+    /// <para>
+    /// <see cref="Exception.Message"/> is a virtual property that can itself THROW, so the read is
+    /// guarded and degrades to a static placeholder: a diagnostic must never become the reason a
+    /// rollback report fails. The exception instance itself is never re-created or re-thrown —
+    /// this is a description of evidence, not a replacement for it.
+    /// </para>
+    /// </remarks>
+    /// <param name="exception">The exact instance to describe, or <c>null</c> when there was none.</param>
+    /// <returns>A short <c>Type: message</c> description, or <c>"none"</c> for a null instance.</returns>
+    private static string DescribeRollbackEvidence(Exception? exception)
+    {
+        if (exception is null)
+            return "none";
+
+        try
+        {
+            return $"{exception.GetType().Name}: {exception.Message}";
+        }
+        catch (Exception describeEx)
+        {
+            return $"{exception.GetType().Name}: <message getter threw: {describeEx.GetType().Name}>";
+        }
+    }
 
     /// <summary>
     /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never

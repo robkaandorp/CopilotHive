@@ -751,10 +751,17 @@ public sealed class PipelineStore : IAsyncDisposable
     /// THE LEGACY, UNCHANGED ROUTE. This overload validates against the pipeline's LIVE
     /// <c>ActiveTaskId</c>, writes no ownership checkpoint (the frozen pair is <c>null</c>, so the
     /// <c>work_slot_registry_json</c> column is left exactly as it was — an existing blob survives
-    /// byte-for-byte — and the pointer keeps its existing late live read) and DELEGATES the whole
-    /// transaction to <see cref="SaveAdmissionWithPointerCore"/> with no checkpoint. The body is
-    /// SHARED with the ownership-aware overload below: it is never copied, and there is exactly one
-    /// outcome surface (<see cref="AdmissionStoreResult"/>).
+    /// byte-for-byte) and DELEGATES the whole transaction to
+    /// <see cref="SaveAdmissionWithPointerCore"/> with no checkpoint. The body is SHARED with the
+    /// ownership-aware overload below: it is never copied, and there is exactly one outcome surface
+    /// (<see cref="AdmissionStoreResult"/>).
+    /// <para>
+    /// THE POINTER IS THE VALIDATED OVERRIDE, NOT A LATE LIVE READ: the non-blank
+    /// <paramref name="taskId"/> this overload validated above is passed through to the row write as
+    /// the <c>activeTaskIdOverride</c>, so the column receives EXACTLY the id the caller supplied —
+    /// the pipeline's live <c>ActiveTaskId</c> is never re-read at write time. (The pipeline's live
+    /// value is read by this overload's own equality VALIDATION only; it is not the written value.)
+    /// </para>
     /// </remarks>
     /// <param name="pipeline">The pipeline whose pointer is persisted alongside the mapping.</param>
     /// <param name="taskId">The task id being admitted; MUST equal <c>pipeline.ActiveTaskId</c>.</param>
@@ -773,11 +780,27 @@ public sealed class PipelineStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// THE OWNERSHIP-AWARE ADMISSION ROUTE: the same atomic <c>task_mappings</c> + pipeline-row
-    /// transaction as <see cref="SaveAdmissionWithPointer(GoalPipeline, string)"/>, but the
-    /// pipeline row is written from ONE detached <paramref name="ownership"/> capture — the frozen
-    /// active-task pointer AND the complete encoded work-slot registry — inside the SAME row write
-    /// and the SAME transaction as the mapping insert.
+    /// The convenience form of the ownership-aware admission route, for callers that do not need
+    /// the invocation-local rollback evidence: it DELEGATES to the
+    /// <c>out encodedRegistryJson</c> overload and discards the carrier. There is exactly ONE
+    /// implementation — this overload never validates, freezes or encodes anything itself.
+    /// </summary>
+    /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
+    /// <param name="taskId">The task id being admitted; MUST equal the CAPTURE's active task id.</param>
+    /// <param name="ownership">The detached ownership capture supplying the pointer AND the registry.</param>
+    /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
+    internal AdmissionStoreResult SaveAdmissionWithPointer(
+        GoalPipeline pipeline, string taskId, AdmissionOwnershipSnapshot ownership) =>
+        SaveAdmissionWithPointer(pipeline, taskId, ownership, out _);
+
+    /// <summary>
+    /// THE OWNERSHIP-AWARE ADMISSION ROUTE, with the invocation-local rollback evidence: the same
+    /// atomic <c>task_mappings</c> + pipeline-row transaction as
+    /// <see cref="SaveAdmissionWithPointer(GoalPipeline, string)"/>, but the pipeline row is written
+    /// from ONE detached <paramref name="ownership"/> capture — the frozen active-task pointer AND
+    /// the complete encoded work-slot registry — inside the SAME row write and the SAME transaction
+    /// as the mapping insert, and the EXACT frozen registry token that write installs is returned to
+    /// the caller.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -799,6 +822,16 @@ public sealed class PipelineStore : IAsyncDisposable
     /// write.
     /// </para>
     /// <para>
+    /// THE EVIDENCE IS THE ONE FROZEN TOKEN, NOT A SECOND ENCODE:
+    /// <paramref name="encodedRegistryJson"/> is read straight off the SAME
+    /// <see cref="FrozenOwnershipCheckpoint"/> instance that is passed into the shared transaction
+    /// body, so it is the ORIGINAL string that write installs. It is never derived from a later
+    /// live capture, from post-abandon state, from a fresh database read or from a
+    /// decode/re-encode round trip, and this route performs no additional encode merely to produce
+    /// it. The value describes the ROW WRITE'S expectation for this invocation only; the caller
+    /// decides what to do with it, and a rejection escapes before it is assigned at all.
+    /// </para>
+    /// <para>
     /// NO NEW VALIDATOR, SCHEMA, CODEC, ATTEMPT ALLOCATION OR EXPECTED-BLOB CACHE is introduced, and
     /// there is no second outcome surface: the result is the same <see cref="AdmissionStoreResult"/>
     /// (<see cref="AdmissionStoreResult.Committed"/> / <see cref="AdmissionStoreResult.PersistConflict"/>)
@@ -810,6 +843,10 @@ public sealed class PipelineStore : IAsyncDisposable
     /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
     /// <param name="taskId">The task id being admitted; MUST equal the CAPTURE's active task id.</param>
     /// <param name="ownership">The detached ownership capture supplying the pointer AND the registry.</param>
+    /// <param name="encodedRegistryJson">The EXACT frozen registry token this row write installs —
+    /// the same value threaded into the shared transaction body. Assigned only once every
+    /// pre-context validation has passed; unreachable on a rejection (the exception escapes
+    /// first).</param>
     /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="ownership"/> (or a required member of
     /// its registry) is <c>null</c> — from the reused preflight.</exception>
@@ -817,7 +854,8 @@ public sealed class PipelineStore : IAsyncDisposable
     /// malformed or has no matching Pending slot, the captured active task differs from
     /// <paramref name="taskId"/>, or the capture belongs to another goal.</exception>
     internal AdmissionStoreResult SaveAdmissionWithPointer(
-        GoalPipeline pipeline, string taskId, AdmissionOwnershipSnapshot ownership)
+        GoalPipeline pipeline, string taskId, AdmissionOwnershipSnapshot ownership,
+        out string? encodedRegistryJson)
     {
         // (1) THE SAME NON-BLANK GUARD as the legacy overload — identical shape and ParamName.
         if (string.IsNullOrWhiteSpace(taskId))
@@ -843,11 +881,15 @@ public sealed class PipelineStore : IAsyncDisposable
         //     before any context exists. The VALIDATED carrier is frozen from here on.
         var checkpoint = FreezeOwnershipCheckpoint(pipeline, validated);
 
+        // THE EVIDENCE — read STRAIGHT OFF the very checkpoint the shared body installs. No second
+        // encode, no live re-read, no round trip.
+        encodedRegistryJson = checkpoint.EncodedRegistryJson;
+
         return SaveAdmissionWithPointerCore(pipeline, taskId, checkpoint);
     }
 
     /// <summary>
-    /// THE ONE SHARED TRANSACTION BODY of both <c>SaveAdmissionWithPointer</c> overloads. The
+    /// THE ONE SHARED TRANSACTION BODY of all three <c>SaveAdmissionWithPointer</c> overloads. The
     /// <paramref name="checkpoint"/> — the frozen pointer/registry pair, or <c>null</c> on the
     /// legacy route — is threaded into the EXISTING stage-2 pipeline-row write; nothing else about
     /// the transaction differs between the routes.
@@ -855,7 +897,8 @@ public sealed class PipelineStore : IAsyncDisposable
     /// <param name="pipeline">The pipeline whose row is written.</param>
     /// <param name="taskId">The validated task id the mapping row is inserted for.</param>
     /// <param name="checkpoint">The frozen ownership pair to install, or <c>null</c> for the legacy
-    /// route (no override: the registry column is left untouched and the pointer keeps its late read).</param>
+    /// route (no override: the registry column is left untouched and the pointer keeps its validated
+    /// task-id override — or, when a direct caller passes none, the existing late read).</param>
     /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
     private AdmissionStoreResult SaveAdmissionWithPointerCore(
         GoalPipeline pipeline, string taskId, FrozenOwnershipCheckpoint? checkpoint)
@@ -1576,11 +1619,14 @@ public sealed class PipelineStore : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// SCOPE, honestly: this is the FIRST ITERATION of a deliberately STORE-ONLY slice. It has NO
-    /// production callers, it does NOT retire Claimed/Recorded attempts, it does NOT invalidate
-    /// workers on restart, it issues NO completion receipt, and it makes NO durable
-    /// receipt/replay or restart-safety claim. A persisted Pending slot alone does NOT prove that
-    /// no completion has claimed the attempt in live memory — no such ordering is asserted here.
+    /// SCOPE, honestly: this is a deliberately NARROW durable inverse. Its ONE production caller is
+    /// <c>GoalPipelineManager.RollbackPendingAdmission</c>, reached from the dispatch's
+    /// enqueue-failure path for an ELIGIBLE admission that carries its own invocation-local
+    /// evidence — a bounded best-effort unwind of THAT admission, nothing more. It does NOT retire
+    /// Claimed/Recorded attempts, it does NOT invalidate workers on restart, it issues NO completion
+    /// receipt, and it makes NO durable receipt/replay or restart-safety claim. A persisted Pending
+    /// slot alone does NOT prove that no completion has claimed the attempt in live memory — no such
+    /// ordering is asserted here; the CALLER fences the live slot before it calls in.
     /// </para>
     /// <para>
     /// VALIDATE-BEFORE-ANY-I/O. <paramref name="goalId"/> and <paramref name="taskId"/> must be
@@ -1885,10 +1931,10 @@ public sealed class PipelineStore : IAsyncDisposable
     /// <summary>
     /// THE FROZEN OWNERSHIP PAIR an eligible ordinary checkpoint writes: the captured active-task
     /// pointer (which may legitimately be <c>null</c>) and the ALREADY-ENCODED registry blob, both
-    /// taken from ONE detached <see cref="AdmissionOwnershipSnapshot"/>. It exists because
-    /// <c>null</c> cannot double as both "no override" and "the captured pointer is null" — the
-    /// pair's presence IS the override, so a captured null is written as SQL NULL and never falls
-    /// back to a late live-pointer read.
+    /// taken from ONE detached <see cref="AdmissionOwnershipSnapshot"/>. It exists because the
+    /// ADMISSION's validated snapshot carries the pointer separately from the frozen pair: the
+    /// pair's presence IS the override, so a captured <c>null</c> pointer is written as SQL NULL
+    /// and never falls back to a later live-pointer read of <see cref="GoalPipeline.ActiveTaskId"/>.
     /// </summary>
     private readonly record struct FrozenOwnershipCheckpoint(string? ActiveTaskId, string EncodedRegistryJson);
 
@@ -1930,14 +1976,18 @@ public sealed class PipelineStore : IAsyncDisposable
         entity.TestRetries = pipeline.TestRetries;
         entity.MaxRetries = pipeline.MaxRetries;
         entity.MaxIterations = pipeline.MaxIterations;
-        // THE OVERRIDE, in precedence order — the frozen ownership checkpoint wins, because it is
-        // the eligible ordinary save's SINGLE detached capture of the pointer and the complete
-        // registry together (see the ownership-aware SavePipeline/SavePipelineState overloads):
+        // THE OVERRIDE, in precedence order:
         //   (1) a frozen checkpoint → its captured ActiveTaskId VERBATIM, including null (SQL NULL),
-        //       so a captured null can never fall back to a late live-pointer read;
-        //   (2) the admission's validated snapshot (passed through by SaveAdmissionWithPointer from
-        //       GoalPipelineManager.PersistAdmission on the production dispatch path) → the
-        //       immutable value;
+        //       so a captured null can never fall back to a later live-pointer read of
+        //       pipeline.ActiveTaskId. (A captured NULL is reachable ONLY from an ORDINARY eligible
+        //       checkpoint — SavePipeline/SavePipelineState — where an idle pointer is legitimate.
+        //       The eligible ADMISSION route can never freeze a null: its reused preflight rejects a
+        //       blank active task AND requires a matching Pending slot, so a captured null is
+        //       refused there before any context exists.)
+        //   (2) the admission's IMMUTABLE validated task id (passed through by
+        //       SaveAdmissionWithPointer from GoalPipelineManager.PersistAdmission on the production
+        //       dispatch path) → the exact value the caller supplied and the store validated; it is
+        //       never re-read live at this point;
         //   (3) neither → the existing LATE read at this point: behavior IDENTICAL under all
         //       concurrency (the capture point unchanged) for every legacy/direct caller.
         entity.ActiveTaskId = checkpoint is { } frozen

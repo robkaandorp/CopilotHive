@@ -1110,6 +1110,73 @@ internal sealed class SentinelThrowingInterceptor : DbCommandInterceptor
 }
 
 /// <summary>
+/// Throws a caller-supplied sentinel BEFORE the PENDING-ROLLBACK's own CAS statement executes —
+/// the unique-shaped <c>UPDATE … SET active_task_id = NULL, work_slot_registry_json = …</c>, whose
+/// pointer CLEAR distinguishes it from the ADMISSION's row write (which names a concrete pointer).
+/// Armed AFTER the admission, so fixture setup runs through untouched and only the rollback's
+/// statement is targeted. While armed it also RECORDS every later UPDATE/DELETE statement, so a
+/// test can prove that a failed rollback issued no follow-up durable writes.
+/// </summary>
+internal sealed class PendingRollbackThrowInterceptor : DbCommandInterceptor
+{
+    private readonly Exception _sentinel;
+    private int _throwCount;
+    private volatile bool _armed;
+
+    public PendingRollbackThrowInterceptor(Exception sentinel) => _sentinel = sentinel;
+
+    /// <summary>How many times the sentinel was thrown (the vacuity guard).</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    /// <summary>Every UPDATE/DELETE statement observed AFTER the throw — must stay EMPTY.</summary>
+    public List<string> StatementsAfterThrow { get; } = [];
+
+    /// <summary>Arms the gate (call AFTER the admission so only the rollback is targeted).</summary>
+    public void Arm() => _armed = true;
+
+    private void Inspect(DbCommand command)
+    {
+        var text = command.CommandText;
+        var isWrite = text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+            || text.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
+        if (!isWrite)
+            return;
+
+        if (!_armed)
+            return;
+
+        // THE ROLLBACK'S OWN CAS — the pointer CLEAR plus the replacement blob.
+        if (text.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("work_slot_registry_json", StringComparison.Ordinal)
+            && text.Contains("active_task_id = NULL", StringComparison.Ordinal))
+        {
+            Interlocked.Increment(ref _throwCount);
+            throw _sentinel;
+        }
+
+        // Any LATER durable write is recorded for the no-fallback proof.
+        StatementsAfterThrow.Add(text);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        Inspect(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        Inspect(command);
+        return ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
 /// Records every <c>task_mappings</c> statement issued while recording is enabled, so a test can
 /// prove that a refusal path never reached the database. The callback performs NO re-entrant work.
 /// </summary>
@@ -1197,6 +1264,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
     private readonly SqliteConnection _keeper;
     private readonly List<SqliteConnection> _connections = [];
+    private readonly List<AdmissionSecondCommitFaultConnection> _secondCommitConnections = [];
     private readonly List<CopilotHiveDbContext> _contexts = [];
 
     public WorkSlotAdmissionCommitTests()
@@ -1216,6 +1284,8 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     {
         foreach (var context in _contexts)
             context.Dispose();
+        foreach (var faultConnection in _secondCommitConnections)
+            faultConnection.Dispose();
         foreach (var connection in _connections)
             connection.Dispose();
         _keeper.Dispose();
@@ -1252,6 +1322,29 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     /// </remarks>
     private void SeedPersistedMapping(string taskId, string goalId) =>
         CreateStore().SaveTaskMapping(taskId, goalId);
+
+    /// <summary>
+    /// A manager whose store runs over the real, file-backed
+    /// <see cref="AdmissionSecondCommitFaultConnection"/>: the ADMISSION's own transaction (the first
+    /// explicit one) commits normally, and the ROLLBACK's commit throws the sentinel — before or
+    /// after the underlying SQLite commit, per <paramref name="throwAfterCommit"/>. SETUP still
+    /// succeeds because the plain <c>SaveChanges</c> saves of <c>CreatePipeline</c> open no explicit
+    /// transaction — which is what lets a REAL admission reach a REAL rollback.
+    /// </summary>
+    private GoalPipelineManager CreateSecondCommitFaultManager(
+        bool throwAfterCommit, out AdmissionSecondCommitFaultConnection connection)
+    {
+        connection = new AdmissionSecondCommitFaultConnection(_connectionString, throwAfterCommit);
+        connection.Open();
+        _secondCommitConnections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite((DbConnection)connection).Options);
+        _contexts.Add(context);
+        return new GoalPipelineManager(
+            new PipelineStore(context, NullLogger<PipelineStore>.Instance),
+            new TestLogger<GoalPipelineManager>());
+    }
 
     private void ExecuteOnKeeper(string sql)
     {
@@ -1306,6 +1399,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
             logger.LogEntries,
             e => e.LogLevel == level && string.Equals(e.Message, message, StringComparison.Ordinal));
 
+
     // ═══════════════════════════════════════════════════════════════════════
     // (A) PersistAdmission — the outcome matrix
     // ═══════════════════════════════════════════════════════════════════════
@@ -1323,10 +1417,7 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         var result = manager.PersistAdmission(pipeline, "task-commit");
 
-        Assert.Equal(new AdmissionCommitResult(
-            AdmissionCommitStatus.Committed,
-            ClaimedThisInvocation: true,
-            CommittedThisInvocation: true), result);
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
         Assert.True(result.ClaimedThisInvocation);
         Assert.True(result.CommittedThisInvocation);
         Assert.Null(result.PersistenceException);
@@ -1337,6 +1428,17 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         Assert.Equal("goal-commit", ReadPersistedGoalId("task-commit"));
         Assert.Equal(1L, ExecuteScalarOnKeeper(
             "SELECT COUNT(*) FROM pipelines WHERE goal_id = 'goal-commit' AND active_task_id = 'task-commit'"));
+
+        // THE INVOCATION-LOCAL ROLLBACK EVIDENCE: present on this confirmed ELIGIBLE admission with
+        // the invocation's OWN goal/task, and its token is the EXACT admission-write payload — read
+        // back RAW through the keeper and compared byte-for-byte (behavioral provenance, not a
+        // source-shape probe).
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(result.RollbackEvidence);
+        Assert.Equal("goal-commit", evidence.GoalId);
+        Assert.Equal("task-commit", evidence.TaskId);
+        Assert.Equal(
+            ExecuteScalarOnKeeper("SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-commit'"),
+            evidence.EncodedRegistryJson);
 
         AssertSingleLog(logger, LogLevel.Debug, "Admission committed goal=goal-commit task=task-commit");
     }
@@ -1796,13 +1898,14 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
             TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
         // THE CONSISTENCY PROOF (observed AFTER both): the admission committed…
-        Assert.Equal(new AdmissionCommitResult(
-            AdmissionCommitStatus.Committed,
-            ClaimedThisInvocation: true,
-            CommittedThisInvocation: true), admissionResult);
+        Assert.Equal(AdmissionCommitStatus.Committed, admissionResult.Status);
         Assert.True(admissionResult.ClaimedThisInvocation);
         Assert.True(admissionResult.CommittedThisInvocation);
         Assert.Null(admissionResult.PersistenceException);
+        // …and its confirmed ELIGIBLE admission really produced its invocation-local evidence.
+        Assert.NotNull(admissionResult.RollbackEvidence);
+        Assert.Equal("goal-serial", admissionResult.RollbackEvidence!.GoalId);
+        Assert.Equal("task-serial", admissionResult.RollbackEvidence.TaskId);
         Assert.Same(pipeline, manager.GetByTaskId("task-serial"));
         Assert.Equal("goal-serial", ReadPersistedGoalId("task-serial"));
         // …AND the disjoint unregister's mutation landed.
@@ -2018,10 +2121,14 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
 
         var result = manager.PersistAdmission(pipeline, "task-c-log");
 
-        Assert.Equal(new AdmissionCommitResult(
-            AdmissionCommitStatus.Committed,
-            ClaimedThisInvocation: true,
-            CommittedThisInvocation: true), result);
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.True(result.CommittedThisInvocation);
+        // THE UNCHANGED OUTCOME CONTRACT: a committed admission carries NO persistence exception,
+        // the evidence is present, and the logger's throw neither removed either fact nor replaced
+        // the returned outcome.
+        Assert.Null(result.PersistenceException);
+        Assert.NotNull(result.RollbackEvidence);
         Assert.Same(pipeline, manager.GetByTaskId("task-c-log"));
         Assert.Equal("goal-c-log", ReadPersistedGoalId("task-c-log"));
         Assert.True(logger.ThrewAtLeastOnce, "the committed site's logger must actually have thrown");
@@ -2132,14 +2239,304 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         Assert.True(logger.ThrewAtLeastOnce, "the no-store site's logger must actually have thrown");
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // (E2) RollbackPendingAdmission — the single eligible-inverse manager operation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>NULL evidence, NULL pipeline or a blank task id is the safe no-op: SKIPPED, and not
+    /// a single statement reaches the database.</summary>
+    [Fact]
+    public void RollbackPendingAdmission_NullEvidenceOrIdentity_SkippedWithoutStoreCall()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-null", "task-rpa-null");
+        manager.RegisterTask("task-rpa-null", "goal-rpa-null");
+        counter.Start();
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped,
+            manager.RollbackPendingAdmission(pipeline, "task-rpa-null", evidence: null).Status);
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped,
+            manager.RollbackPendingAdmission(null, "task-rpa-null",
+                new AdmissionRollbackEvidence("goal-rpa-null", "task-rpa-null", "ignored")).Status);
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped,
+            manager.RollbackPendingAdmission(pipeline, "   ",
+                new AdmissionRollbackEvidence("goal-rpa-null", "   ", "ignored")).Status);
+
+        // NOTHING reached the database, and nothing was mutated in memory.
+        Assert.Empty(counter.Commands);
+        Assert.Same(pipeline, manager.GetByTaskId("task-rpa-null"));
+    }
+
+    /// <summary>EVIDENCE THAT DOES NOT NAME THE REQUESTED PAIR SKIPS: a foreign goal, a foreign
+    /// task and both are all refused before any memory or durable mutation.</summary>
+    [Theory]
+    [InlineData("goal-foreign", "task-rpa-mismatch")]
+    [InlineData("goal-rpa-mismatch", "task-foreign")]
+    [InlineData("goal-foreign", "task-foreign")]
+    public void RollbackPendingAdmission_MismatchedEvidenceIdentity_Skipped(string evidenceGoal, string evidenceTask)
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-mismatch", "task-rpa-mismatch");
+        manager.RegisterTask("task-rpa-mismatch", "goal-rpa-mismatch");
+        counter.Start();
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-mismatch",
+            new AdmissionRollbackEvidence(evidenceGoal, evidenceTask, "ignored"));
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Empty(counter.Commands);
+        // The slot, the pointer and the mapping are all untouched.
+        Assert.Same(pipeline, manager.GetByTaskId("task-rpa-mismatch"));
+        Assert.Equal("task-rpa-mismatch", pipeline.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+    }
+
+    /// <summary>A REPLACED PIPELINE INSTANCE SKIPS: the manager's current instance for the goal is
+    /// a different object, so its mapping surface is not ours to mutate.</summary>
+    [Fact]
+    public void RollbackPendingAdmission_ReplacedPipelineInstance_Skipped()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-replaced", "task-rpa-replaced");
+        var replacement = new GoalPipeline(CreateGoal("goal-rpa-replaced"));
+        // The replacement instance is installed under the manager's own lock surface.
+        var pipelinesField = typeof(GoalPipelineManager)
+            .GetField("_pipelines", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var pipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>)
+            pipelinesField.GetValue(manager)!;
+        pipelines["goal-rpa-replaced"] = replacement;
+        counter.Start();
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-replaced",
+            new AdmissionRollbackEvidence("goal-rpa-replaced", "task-rpa-replaced", "ignored"));
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Empty(counter.Commands);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Equal("task-rpa-replaced", pipeline.ActiveTaskId);
+    }
+
+    /// <summary>A FOREIGN MEMORY MAPPING SKIPS: the task now belongs to another goal, so the
+    /// ownership check refuses and no durable work is attempted.</summary>
+    [Fact]
+    public void RollbackPendingAdmission_ForeignMemoryMapping_Skipped()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        manager.CreatePipeline(CreateGoal("goal-rpa-other"));
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-steal", "task-rpa-steal");
+        manager.UnregisterTask("task-rpa-steal");
+        manager.RegisterTask("task-rpa-steal", "goal-rpa-other");
+        counter.Start();
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-steal",
+            new AdmissionRollbackEvidence("goal-rpa-steal", "task-rpa-steal", "ignored"));
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Empty(counter.Commands);
+        // The foreign owner survives, the slot stays Pending and the pointer is untouched.
+        Assert.Equal("goal-rpa-other", manager.GetByTaskId("task-rpa-steal")?.GoalId);
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Equal("task-rpa-steal", pipeline.ActiveTaskId);
+    }
+
+    /// <summary>AN ALREADY-CLAIMED SLOT SKIPS — the fence refuses: a completion has already claimed
+    /// the attempt, so the Pending-only abandon returns false and NO durable work is attempted. A
+    /// durable Pending row must never be treated as authorisation to retire a claimed attempt.</summary>
+    [Fact]
+    public void RollbackPendingAdmission_AlreadyClaimedSlot_SkippedWithoutRetiringTheCompletion()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-claimed", "task-rpa-claimed");
+        manager.RegisterTask("task-rpa-claimed", "goal-rpa-claimed");
+        // THE COMPLETION WINS THE PENDING FENCE.
+        Assert.Equal(AdmissionOutcome.Admitted, pipeline.AdmitCompletion("task-rpa-claimed"));
+        counter.Start();
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-claimed",
+            new AdmissionRollbackEvidence("goal-rpa-claimed", "task-rpa-claimed", "ignored"));
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Empty(counter.Commands);
+        // THE CLAIMED ATTEMPT SURVIVES: still Claimed, still mapped, still pointed at.
+        Assert.Equal(WorkSlotState.Claimed, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Same(pipeline, manager.GetByTaskId("task-rpa-claimed"));
+        Assert.Equal("task-rpa-claimed", pipeline.ActiveTaskId);
+    }
+
+    /// <summary>A REAL ELIGIBLE ADMISSION'S OWN EVIDENCE DRIVES THE ATOMIC INVERSE: the store's
+    /// transaction confirms the abandon + pointer clear + mapping delete, the memory pair is
+    /// settled (unmapped, if-current-cleared) and the durable slot reads <c>Abandoned</c> — with
+    /// history and counters preserved.</summary>
+    [Fact]
+    public void RollbackPendingAdmission_RealAdmissionEvidence_CommitsTheAtomicInverseAndSettlesMemory()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-commit", "task-rpa-commit");
+
+        var admission = manager.PersistAdmission(pipeline, "task-rpa-commit");
+        Assert.Equal(AdmissionCommitStatus.Committed, admission.Status);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(admission.RollbackEvidence);
+        // THE EVIDENCE IS THE ADMISSION-WRITE PAYLOAD.
+        Assert.Equal(
+            ExecuteScalarOnKeeper("SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-rpa-commit'"),
+            evidence.EncodedRegistryJson);
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-commit", evidence);
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Committed, result.Status);
+        Assert.Null(result.Failure);
+        Assert.Null(result.RollbackFailure);
+
+        // DURABLE: pointer cleared, mapping gone, the matching slot Abandoned.
+        Assert.Null(ExecuteScalarOnKeeper("SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-rpa-commit'"));
+        Assert.Null(ReadPersistedGoalId("task-rpa-commit"));
+        var durable = WorkSlotRegistryCodec.Decode(
+            (string)ExecuteScalarOnKeeper("SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-rpa-commit'")!);
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(durable.Slots).State);
+
+        // MEMORY: pair-scoped removal plus the if-current clear.
+        Assert.Null(manager.GetByTaskId("task-rpa-commit"));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A THROWN STORE FAILURE IS DISTINGUISHABLE FROM A SKIP: with the rollback's own commit faulted
+    /// on a real connection, the operation reports <c>Indeterminate</c> carrying the EXACT commit
+    /// sentinel, and STILL settles memory. There is NO durable fallback: no follow-up delete, pointer
+    /// clear or save is issued.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RollbackPendingAdmission_RollbackCommitThrows_IndeterminateWithExactEvidenceAndSettledMemory(
+        bool throwAfterUnderlyingCommit)
+    {
+        var goalId = "goal-rpa-fault-" + throwAfterUnderlyingCommit;
+        var taskId = "task-rpa-fault-" + throwAfterUnderlyingCommit;
+        var manager = CreateSecondCommitFaultManager(throwAfterUnderlyingCommit, out var connection);
+        var pipeline = CreateActivePipeline(manager, goalId, taskId);
+
+        var admission = manager.PersistAdmission(pipeline, taskId);
+        // The admitted pair is genuine: the FIRST explicit transaction (the admission's) committed.
+        Assert.Equal(AdmissionCommitStatus.Committed, admission.Status);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(admission.RollbackEvidence);
+        Assert.Equal(ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"),
+            evidence.EncodedRegistryJson);
+
+        var result = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+
+        // NOT a skip: the attempt really ran and its fate is unresolved.
+        Assert.NotEqual(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Equal(PendingAdmissionRollbackStatus.Indeterminate, result.Status);
+        Assert.Same(connection.CommitSentinel, result.Failure);
+        Assert.Equal(1, connection.SecondCommitCount);
+
+        // THE LOCAL SETTLEMENT COMPLETED, and NO extra durable cleanup was attempted.
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A STORE CALL THAT THROWS BEFORE IT COULD RECORD AN OUTCOME IS <c>Failed</c>, NOT a skip and
+    /// NOT an indeterminate: a body error whose transaction the store's own guarded rollback
+    /// CONFIRMED propagates the EXACT exception out of
+    /// <see cref="PipelineStore.CommitPendingAdmissionRollback"/>, the manager records it verbatim,
+    /// and the memory settlement still completes. There is NO durable fallback: no follow-up
+    /// delete, pointer clear or save is issued, so the admitted durable witnesses (the pointer, the
+    /// blob and the mapping row) survive EXACTLY as the failing invocation left them.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: collapsing <c>Failed</c> into <c>Skipped</c> (a thrown store call
+    /// would be indistinguishable from an attempt never made) fails the outcome and sentinel
+    /// identity assertions; reporting it as <c>Indeterminate</c> or <c>Committed</c> fails the
+    /// same. A fallback that deleted the mapping or cleared the pointer after the failure would
+    /// change the durable witnesses below.
+    /// </remarks>
+    [Fact]
+    public void RollbackPendingAdmission_RollbackBodyErrorWithConfirmedRollback_FailedWithExactEvidenceAndSettledMemory()
+    {
+        var goalId = "goal-rpa-failed";
+        var taskId = "task-rpa-failed";
+        var sentinel = new InvalidOperationException("pending-rollback-body-sentinel");
+        var interceptor = new PendingRollbackThrowInterceptor(sentinel);
+        var manager = new GoalPipelineManager(CreateStore(interceptor), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, goalId, taskId);
+
+        var admission = manager.PersistAdmission(pipeline, taskId);
+        // The admitted pair is genuine: the admission's own transaction committed normally.
+        Assert.Equal(AdmissionCommitStatus.Committed, admission.Status);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(admission.RollbackEvidence);
+        var blobAtAdmission = ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'");
+        Assert.Equal(blobAtAdmission, evidence.EncodedRegistryJson);
+
+        // Arm AFTER the admission so ONLY the rollback's own CAS statement is targeted.
+        interceptor.Arm();
+        var result = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+
+        // THE EXACT OUTCOME: the attempt really ran (never a skip) and its fate is KNOWN — the
+        // store's transaction was rolled back CONFIRMED, so this is Failed, not Indeterminate.
+        Assert.Equal(PendingAdmissionRollbackStatus.Failed, result.Status);
+        Assert.NotEqual(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.NotEqual(PendingAdmissionRollbackStatus.Indeterminate, result.Status);
+        Assert.Same(sentinel, result.Failure);
+        Assert.Null(result.RollbackFailure);
+        // THE VACUITY GUARD: the rollback's statement really was reached and threw exactly once.
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // NO FOLLOW-UP DURABLE WRITES: after the throwing statement, not a single further UPDATE or
+        // DELETE was issued — no mapping-delete fallback, no pointer clear, no save.
+        Assert.Empty(interceptor.StatementsAfterThrow);
+
+        // THE DURABLE WITNESSES ARE EXACTLY AS THE FAILING INVOCATION LEFT THEM.
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Equal(blobAtAdmission, ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Equal(goalId, ReadPersistedGoalId(taskId));
+
+        // THE LOCAL SETTLEMENT STILL COMPLETED: abandoned, unmapped, if-current-cleared.
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A SKIPPED OPERATION PERFORMS NO STORE WORK AND NO MEMORY MUTATION, and the memory pair is
+    /// never removed — the caller's admission state survives exactly.
+    /// </summary>
+    [Fact]
+    public void RollbackPendingAdmission_AbsentSlotForAKnownPair_Skipped()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+        // A MAPPED pair whose slot is ALREADY Abandoned (a superseded dispatch) refuses the fence.
+        var pipeline = CreateActivePipeline(manager, "goal-rpa-abandoned", "task-rpa-abandoned");
+        manager.RegisterTask("task-rpa-abandoned", "goal-rpa-abandoned");
+        Assert.True(pipeline.AbandonSlot("task-rpa-abandoned"));
+        counter.Start();
+
+        var result = manager.RollbackPendingAdmission(pipeline, "task-rpa-abandoned",
+            new AdmissionRollbackEvidence("goal-rpa-abandoned", "task-rpa-abandoned", "ignored"));
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, result.Status);
+        Assert.Empty(counter.Commands);
+        Assert.Same(pipeline, manager.GetByTaskId("task-rpa-abandoned"));
+    }
+
     /// <summary>
     /// β-PREP-2 vector logger for <see cref="GoalPipelineManager.PersistAdmission"/>: throws ONLY
     /// when the formatted message matches the predicate — the targeted seam proving that ONE
     /// guarded outcome site swallows the logger's exception while the outcome record is still
     /// returned.
     /// </summary>
-    private sealed class AdmissionPredicateThrowingLogger : ILogger<GoalPipelineManager>
-    {
+    private sealed class AdmissionPredicateThrowingLogger : ILogger<GoalPipelineManager>    {
         private readonly Func<string, bool> _shouldThrow;
 
         public AdmissionPredicateThrowingLogger(Func<string, bool> shouldThrow) => _shouldThrow = shouldThrow;

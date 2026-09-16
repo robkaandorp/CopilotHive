@@ -1048,6 +1048,9 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
         // THE β FLAGS ARE UNCHANGED: this call DID claim, and nothing committed.
         Assert.True(result.ClaimedThisInvocation);
         Assert.False(result.CommittedThisInvocation);
+        // NO ROLLBACK EVIDENCE: a refusal is not a confirmed successful admission, so there is
+        // nothing to invert — and the dispatch must keep the legacy (non-evidence) route.
+        Assert.Null(result.RollbackEvidence);
         // THE ORIGINAL exception, by identity and by shape: the store's own preflight refusal.
         var refusal = Assert.IsType<ArgumentException>(result.PersistenceException);
         Assert.Contains("has no matching slot in the registry", refusal.Message, StringComparison.Ordinal);
@@ -1146,6 +1149,255 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
         Assert.Equal(taskId, RawPointer(goalId));
         // …and the blob is byte-identical — SQL NULL stayed SQL NULL, opaque text untouched.
         Assert.Equal(blob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE INVOCATION-LOCAL ROLLBACK EVIDENCE IS THE ADMISSION-WRITE PAYLOAD — PROVEN
+    /// BEHAVIORALLY, not by source shape. A successful ELIGIBLE admission returns evidence whose
+    /// token is BYTE-IDENTICAL to the registry text the same transaction wrote to the row (read back
+    /// RAW through the keeper), and whose goal/task are the invocation's own validated pair.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: producing the evidence by a SECOND encode, by a decode/re-encode
+    /// round trip, or from a fresh database read. A round trip would still match byte-for-byte for a
+    /// canonical payload, so the token's IDENTITY is additionally pinned through the SECOND half of
+    /// this vector: the rollback that consumes it succeeds against the ORIGINAL durable text.
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_EligibleRoute_EvidenceIsExactlyTheAdmissionWritePayload()
+    {
+        const string goalId = "live-evidence-payload";
+        const string taskId = "live-evidence-payload-task";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        AllocateTo(pipeline, taskId, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        pipeline.SetActiveTask(taskId, "copilothive/" + goalId);
+
+        var result = manager.PersistAdmission(pipeline, taskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(result.RollbackEvidence);
+        Assert.Equal(goalId, evidence.GoalId);
+        Assert.Equal(taskId, evidence.TaskId);
+        // THE EXACT WRITTEN TEXT.
+        Assert.Equal(RawBlob(goalId), evidence.EncodedRegistryJson);
+
+        // THE TOKEN IS USABLE AS-IS: the guarded inverse accepts it and commits.
+        var rollback = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+        Assert.Equal(PendingAdmissionRollbackStatus.Committed, rollback.Status);
+        Assert.Null(RawPointer(goalId));
+    }
+
+    /// <summary>
+    /// EVIDENCE IS POPULATED ONLY ON A CONFIRMED SUCCESSFUL ELIGIBLE ADMISSION. The LEGACY/ineligible
+    /// route, the NoStore route and every refusal/failure outcome all leave it <c>null</c> — the
+    /// dispatch's route selection is decided from THIS field, so a stray carrier would make an
+    /// ineligible admission take the eligible (atomic-inverse) route.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_NonEligibleAndNonCommittedOutcomes_CarryNoEvidence()
+    {
+        // (a) INELIGIBLE (an existing-row replacement): committed, but NO evidence.
+        var ineligibleGoal = "live-evidence-ineligible";
+        var store = CreateStore();
+        store.SavePipeline(NewPipeline(ineligibleGoal));
+        var ineligibleTask = "live-evidence-ineligible-task";
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var replacement = manager.CreatePipeline(NewGoal(ineligibleGoal));
+        Assert.False(replacement.OwnershipCheckpointEligible);
+        AllocateTo(replacement, ineligibleTask, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        replacement.SetActiveTask(ineligibleTask);
+
+        var ineligibleResult = manager.PersistAdmission(replacement, ineligibleTask);
+        Assert.Equal(AdmissionCommitStatus.Committed, ineligibleResult.Status);
+        Assert.Null(ineligibleResult.RollbackEvidence);
+
+        // (b) NO STORE: claimed in memory only, and no evidence.
+        var noStoreManager = new GoalPipelineManager(store: null, NullLogger<GoalPipelineManager>.Instance);
+        var noStore = noStoreManager.CreatePipeline(NewGoal("live-evidence-nostore"));
+        AllocateTo(noStore, "live-evidence-nostore-task", Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        noStore.SetActiveTask("live-evidence-nostore-task");
+        var noStoreResult = noStoreManager.PersistAdmission(noStore, "live-evidence-nostore-task");
+        Assert.Equal(AdmissionCommitStatus.NoStore, noStoreResult.Status);
+        Assert.Null(noStoreResult.RollbackEvidence);
+
+        // (c) A REFUSAL: an eligible admission whose persisted mapping is owned by another attempt.
+        var conflictGoal = "live-evidence-conflict";
+        var conflictStore = CreateStore();
+        var conflictTask = "live-evidence-conflict-task";
+        // THE COMPETING ROW, seeded RAW through the keeper so no tracked entity confuses the shape.
+        using (var command = _keeper.CreateCommand())
+        {
+            command.CommandText =
+                "INSERT INTO task_mappings (task_id, goal_id) VALUES ($task, 'goal-competitor')";
+            command.Parameters.AddWithValue("$task", conflictTask);
+            Assert.Equal(1, command.ExecuteNonQuery());
+        }
+        var conflictManager = new GoalPipelineManager(conflictStore, NullLogger<GoalPipelineManager>.Instance);
+        var conflict = conflictManager.CreatePipeline(NewGoal(conflictGoal));
+        Assert.True(conflict.OwnershipCheckpointEligible);
+        AllocateTo(conflict, conflictTask, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        conflict.SetActiveTask(conflictTask);
+
+        var conflictResult = conflictManager.PersistAdmission(conflict, conflictTask);
+        Assert.Equal(AdmissionCommitStatus.PersistConflict, conflictResult.Status);
+        Assert.Null(conflictResult.RollbackEvidence);
+
+        // (d) A PERSISTENCE FAILURE on the ELIGIBLE route, AFTER the ownership-aware overload has
+        // already assigned its out token: the store's SQL throws at the mapping INSERT, so the
+        // admission reports PersistenceFailed — and the evidence must still be null, because only a
+        // CONFIRMED successful admission may carry it. (Without this case an implementation that
+        // published the token on every eligible attempt would go unnoticed, and the dispatch would
+        // then take the atomic-inverse route for an admission that never committed.)
+        var failureGoal = "live-evidence-persistfail";
+        var failureTask = "live-evidence-persistfail-task";
+        var failureSentinel = new InvalidOperationException("live-evidence-persistfail-sentinel");
+        var failureManager = new GoalPipelineManager(
+            CreateStore(new SentinelThrowingInterceptor(failureSentinel, "INSERT")),
+            NullLogger<GoalPipelineManager>.Instance);
+        var failing = failureManager.CreatePipeline(NewGoal(failureGoal));
+        Assert.True(failing.OwnershipCheckpointEligible);
+        AllocateTo(failing, failureTask, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        failing.SetActiveTask(failureTask);
+
+        var failureResult = failureManager.PersistAdmission(failing, failureTask);
+
+        Assert.Equal(AdmissionCommitStatus.PersistenceFailed, failureResult.Status);
+        // THE VACUITY GUARD: the store's SQL really was reached and really threw, so the out token
+        // HAD been assigned by the route before the failure — this is not a pre-store refusal.
+        var wrapper = Assert.IsType<DbUpdateException>(failureResult.PersistenceException);
+        Assert.Same(failureSentinel, wrapper.InnerException);
+        // THE LOAD-BEARING ASSERTION: no evidence on a failed admission.
+        Assert.Null(failureResult.RollbackEvidence);
+        // …and nothing was committed, so there is genuinely nothing to invert.
+        Assert.False(failureResult.CommittedThisInvocation);
+        Assert.Null(RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", failureTask)));
+    }
+
+    /// <summary>
+    /// A POST-CAPTURE LIVE MUTATION CANNOT ALTER THE EVIDENCE — and the rollback it later drives
+    /// still matches the ORIGINAL durable text. The mutation lands at the admission's own row lookup
+    /// (strictly after the single capture, before the row write), the committed pair is the captured
+    /// one, and the returned evidence is exactly that committed text.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: deriving the evidence from a LATER live capture or a fresh read
+    /// would produce the mutated registry, which can never match the row's actual text — the
+    /// byte-equality assertion fails and the round-trip rollback below would REFUSE.
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_LiveMutationAfterCapture_DoesNotAlterTheEvidenceToken()
+    {
+        const string goalId = "live-evidence-frozen";
+        var mutation = new LivePipelineMutationInterceptor();
+        using var factory = new LiveCheckpointContextFactory(_connectionString, mutation);
+        var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+
+        var (source, taskId) = BuildRichPipeline(goalId + "-src");
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        pipeline.RestoreRegistry(source.CaptureRegistry());
+        pipeline.SetActiveTask(taskId, "copilothive/" + goalId);
+
+        mutation.Mutate = () =>
+        {
+            // The live registry gains a slot the capture never carried — WITHOUT erasing the
+            // captured task's own Pending slot, so the rollback's memory fence still succeeds and
+            // only the EVIDENCE's provenance decides whether its CAS commits or refuses.
+            AllocateTo(pipeline, "late-live-evidence-task", Pos(9, GoalPhase.DocWriting, 1), WorkSlotState.Pending);
+        };
+        mutation.Arm();
+
+        var result = manager.PersistAdmission(pipeline, taskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        Assert.True(mutation.Fired, "the mutation interceptor must actually have fired");
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(result.RollbackEvidence);
+
+        // THE EVIDENCE IS THE COMMITTED (CAPTURED) TEXT — never the mutated live registry.
+        Assert.Equal(RawBlob(goalId), evidence.EncodedRegistryJson);
+        Assert.DoesNotContain("late-live-evidence-task", evidence.EncodedRegistryJson, StringComparison.Ordinal);
+
+        // PROVEN USABLE: the inverse still finds the exact durable text and commits. A token derived
+        // from the LATER live capture would carry the late slot, mismatch the row's text, and REFUSE.
+        var rollback = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+        Assert.Equal(PendingAdmissionRollbackStatus.Committed, rollback.Status);
+    }
+
+    /// <summary>
+    /// A LATER-CHANGED DURABLE BLOB MAKES THE ROLLBACK REFUSE — it never refreshes its expectation
+    /// from the row it finds. The stale text is written RAW, the supplied evidence is the ORIGINAL
+    /// token, and the guarded inverse reports a CONFIRMED no-mutation refusal with the durable row
+    /// left exactly as the stale write left it.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_StaleDurableBlobAfterAdmission_MakesTheRollbackRefuse()
+    {
+        const string goalId = "live-evidence-stale";
+        const string taskId = "live-evidence-stale-task";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        AllocateTo(pipeline, taskId, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        pipeline.SetActiveTask(taskId, "copilothive/" + goalId);
+
+        var result = manager.PersistAdmission(pipeline, taskId);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(result.RollbackEvidence);
+
+        // THE STALE REWRITE: a JSON-shaped payload that is NOT the admitted text.
+        var stale = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot([], []));
+        Assert.NotEqual(stale, evidence.EncodedRegistryJson);
+        SeedBlob(goalId, stale);
+
+        var rollback = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Refused, rollback.Status);
+        Assert.Null(rollback.Failure);
+        Assert.Null(rollback.RollbackFailure);
+        // NO DESTRUCTIVE FALLBACK: the stale text, the pointer and the mapping all survive.
+        Assert.Equal(stale, RawBlob(goalId));
+        Assert.Equal(taskId, RawPointer(goalId));
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", taskId)));
+    }
+
+    /// <summary>
+    /// A REPLACED PIPELINE INSTANCE SKIPS THE ROLLBACK: the manager's CURRENT instance for the goal
+    /// is a different object, so the evidence is not ours to act on and NOTHING is written.
+    /// </summary>
+    [Fact]
+    public void RollbackPendingAdmission_ReplacedPipelineInstance_SkipsWithoutAnyWrite()
+    {
+        const string goalId = "live-evidence-replaced";
+        const string taskId = "live-evidence-replaced-task";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        AllocateTo(pipeline, taskId, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        pipeline.SetActiveTask(taskId, "copilothive/" + goalId);
+        var admission = manager.PersistAdmission(pipeline, taskId);
+        var evidence = Assert.IsType<AdmissionRollbackEvidence>(admission.RollbackEvidence);
+        var blobAtAdmission = RawBlob(goalId);
+
+        // THE REPLACEMENT — a different instance is now the manager's current pipeline for the goal.
+        var pipelinesField = typeof(GoalPipelineManager)
+            .GetField("_pipelines", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var pipelines = (System.Collections.Concurrent.ConcurrentDictionary<string, GoalPipeline>)
+            pipelinesField.GetValue(manager)!;
+        pipelines[goalId] = new GoalPipeline(NewGoal(goalId));
+
+        var rollback = manager.RollbackPendingAdmission(pipeline, taskId, evidence);
+
+        Assert.Equal(PendingAdmissionRollbackStatus.Skipped, rollback.Status);
+        // NOTHING was written: the pair is EXACTLY as admitted.
+        Assert.Equal(taskId, RawPointer(goalId));
+        Assert.Equal(blobAtAdmission, RawBlob(goalId));
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", taskId)));
     }
 
     /// <summary>
@@ -1415,12 +1667,19 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
     /// EXACTLY ONE call to the reused preflight, and the freeze helper itself emits EXACTLY ONE
     /// call to <see cref="WorkSlotRegistryCodec.Encode"/>.
     /// </summary>
+    /// <remarks>
+    /// THE OVERLOAD IS THE EVIDENCE-CARRYING ONE ON PURPOSE: it is the SINGLE implementation. The
+    /// convenience three-argument form merely delegates to it (and performs no validation, freeze or
+    /// encode of its own), so counting here covers the whole ownership-aware route. If the evidence
+    /// were ever produced by a SECOND encode, the freeze helper's count would become two — or the
+    /// route would grow a second encode call — and this vector fails.
+    /// </remarks>
     [Fact]
     public void OwnershipAwareAdmissionRoute_EmitsExactlyOneFreezeAndOneEncode()
     {
         var route = RequireMethod(
             typeof(PipelineStore), "SaveAdmissionWithPointer",
-            typeof(GoalPipeline), typeof(string), typeof(AdmissionOwnershipSnapshot));
+            typeof(GoalPipeline), typeof(string), typeof(AdmissionOwnershipSnapshot), typeof(string).MakeByRefType());
         var freeze = RequireMethod(
             typeof(PipelineStore), "FreezeOwnershipCheckpoint",
             typeof(GoalPipeline), typeof(AdmissionOwnershipSnapshot));
@@ -1442,6 +1701,26 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
             encodeCalls == 1,
             $"FreezeOwnershipCheckpoint emits {encodeCalls} call(s) to WorkSlotRegistryCodec.Encode — " +
             "the registry is encoded exactly once, before any context exists.");
+
+        // THE EVIDENCE ADDS NO SECOND ENCODE: the route body itself must emit ZERO encode calls, so
+        // the token it returns comes ONLY from the single freeze/encode inside FreezeOwnershipCheckpoint.
+        // A mutant that produced the evidence by re-encoding the validated registry would have to
+        // match the frozen token byte-for-byte on a canonical payload — so this structural count is
+        // the discriminator (behaviorally indistinguishable here), and it is an assertion ON the
+        // EXISTING exactly-once test rather than a new source-shape family.
+        var routeEncodeCalls = CountCallsTo(route, typeof(WorkSlotRegistryCodec), "Encode");
+        Assert.True(
+            routeEncodeCalls == 0,
+            $"the ownership-aware route emits {routeEncodeCalls} call(s) to WorkSlotRegistryCodec.Encode — " +
+            "the route body must perform NO encode of its own; the single encode lives in the freeze.");
+
+        // THE CONVENIENCE FORM IS A PURE DELEGATION: no freeze of its own, so the single
+        // implementation above really is the only one.
+        var convenience = RequireMethod(
+            typeof(PipelineStore), "SaveAdmissionWithPointer",
+            typeof(GoalPipeline), typeof(string), typeof(AdmissionOwnershipSnapshot));
+        Assert.Equal(0, CountCallsTo(convenience, typeof(PipelineStore), "FreezeOwnershipCheckpoint"));
+        Assert.Equal(0, CountCallsTo(convenience, typeof(WorkSlotRegistryCodec), "Encode"));
     }
 
     /// <summary>

@@ -71,6 +71,35 @@ internal enum AdmissionCommitStatus
     NoStore,
 }
 
+/// <summary>
+/// THE INVOCATION-LOCAL ROLLBACK EVIDENCE of ONE eligible admission: the goal and task that
+/// admission was made for plus the EXACT registry text the admission WROTE
+/// (<see cref="EncodedRegistryJson"/> — the frozen token the store's own single encode produced
+/// for that row write).
+/// </summary>
+/// <remarks>
+/// <para>
+/// WHAT THIS IS AND IS NOT. It is the durable compare-and-swap expectation an enqueue-failure
+/// rollback may present to <c>PipelineStore.CommitPendingAdmissionRollback</c> for THIS admission,
+/// carried out of the store call so no later capture, no fresh database read and no
+/// decode/re-encode round trip is ever needed to reconstruct it. It is NOT a global latest-blob
+/// cache, NOT a durable receipt, NOT an acknowledgement and NOT permission to replay anything: it
+/// exists for the lifetime of the admission's own dispatch invocation only.
+/// </para>
+/// <para>
+/// ITS IDENTITY MEMBERS ARE THE ONES THE STORE VALIDATED, NOT A FRESH GUESS:
+/// <see cref="GoalId"/> and <see cref="TaskId"/> are the invocation's requested pair, which the
+/// ownership-aware store route proved ordinally equal to the capture's own active task and
+/// goal-agreement-checked before a single statement ran. A rollback re-checks them against the
+/// requested pipeline/task before it touches anything, so a stale or foreign carrier is skipped.
+/// </para>
+/// </remarks>
+/// <param name="GoalId">The goal the admission was committed for.</param>
+/// <param name="TaskId">The task whose Pending slot the admission committed.</param>
+/// <param name="EncodedRegistryJson">The ORIGINAL frozen registry token that same admission wrote
+/// — never rebuilt, never re-encoded.</param>
+internal sealed record AdmissionRollbackEvidence(string GoalId, string TaskId, string EncodedRegistryJson);
+
 /// <summary>PersistAdmission's outcome, extended with the cleanup truth the production dispatch's
 /// refusal and rollback flows act on.</summary>
 /// <param name="Status">The admission's outcome status (the α enum, unchanged:
@@ -90,11 +119,68 @@ internal enum AdmissionCommitStatus
 /// from SaveAdmissionWithPointer (the EF DbUpdateException wrapper when the store's SQL failure
 /// surfaces through EF; the interceptor's sentinel is that wrapper's InnerException — the α's
 /// existing identity contract preserved). Non-null IFF Status == PersistenceFailed.</param>
+/// <param name="RollbackEvidence">The invocation-local durable-inverse expectation of THIS
+/// admission — present ONLY on a CONFIRMED successful ELIGIBLE admission (Status == Committed on
+/// the ownership-checkpoint route) and <c>null</c> on every other outcome, including the whole
+/// legacy/ineligible route and the NoStore route. It is the ONLY value the enqueue-failure
+/// rollback may present to the store; nothing else may be substituted for it.</param>
 internal sealed record AdmissionCommitResult(
     AdmissionCommitStatus Status,
     bool ClaimedThisInvocation,
     bool CommittedThisInvocation,
-    Exception? PersistenceException = null);
+    Exception? PersistenceException = null,
+    AdmissionRollbackEvidence? RollbackEvidence = null);
+
+/// <summary>
+/// The outcome kind of <see cref="GoalPipelineManager.RollbackPendingAdmission"/> — the
+/// enqueue-failure inverse of ONE eligible admission. Deliberately five truths, so a SKIPPED
+/// attempt (this manager never owned the admission any more) is never confused with an attempt
+/// that really ran and failed.
+/// </summary>
+internal enum PendingAdmissionRollbackStatus
+{
+    /// <summary>The rollback was NOT attempted: the evidence did not identify the requested
+    /// pipeline/task, this manager no longer holds that pipeline instance, the memory mapping is
+    /// no longer that goal's, or the slot was absent/already Claimed/Recorded/Abandoned. NOTHING
+    /// was mutated — not in memory, not in the database.</summary>
+    Skipped,
+
+    /// <summary>The store's own transaction CONFIRMED the inverse: the Pending slot was abandoned,
+    /// the pointer cleared and the mapping deleted in ONE transaction. The ONLY outcome that
+    /// authorises a durable-success report.</summary>
+    Committed,
+
+    /// <summary>The store's transaction confirmed NO mutation (a missing row, a newer/null
+    /// pointer, stale registry text, or a missing/foreign mapping). This proves nothing about
+    /// whether earlier cleanup already happened, and it is NOT reported as a success.</summary>
+    Refused,
+
+    /// <summary>The store's transaction fate is UNKNOWN — a throwing rollback or ANY commit
+    /// exception, which can be raised AFTER the underlying commit. It may have committed.</summary>
+    Indeterminate,
+
+    /// <summary>The store call THREW before it could record an outcome (a preflight/context/
+    /// transaction-begin failure, or a body error with a confirmed rollback) — the exact caught
+    /// exception is carried on <see cref="PendingAdmissionRollbackResult.Failure"/>. Distinct from
+    /// <see cref="Skipped"/>: this attempt really ran.</summary>
+    Failed,
+}
+
+/// <summary>
+/// The outcome of <see cref="GoalPipelineManager.RollbackPendingAdmission"/>: the recorded
+/// <see cref="Status"/> plus the EXACT exception evidence the store surfaced, when there was any.
+/// </summary>
+/// <param name="Status">The recorded outcome.</param>
+/// <param name="Failure">The exact exception the store call threw
+/// (<see cref="PendingAdmissionRollbackStatus.Failed"/>), or the store's primary commit/body
+/// exception (<see cref="PendingAdmissionRollbackStatus.Indeterminate"/>); <c>null</c> otherwise.
+/// Never re-created, re-messaged or aggregated.</param>
+/// <param name="RollbackFailure">The store's rollback exception when the rollback itself threw
+/// (<see cref="PendingAdmissionRollbackStatus.Indeterminate"/>); <c>null</c> otherwise.</param>
+internal readonly record struct PendingAdmissionRollbackResult(
+    PendingAdmissionRollbackStatus Status,
+    Exception? Failure = null,
+    Exception? RollbackFailure = null);
 
 /// <summary>
 /// Singleton that holds all active goal pipelines and provides lookup by goalId or taskId.
@@ -542,7 +628,10 @@ public sealed class GoalPipelineManager
     /// manager-created pipeline that found no existing persisted row), the admission ALSO persists
     /// the COMPLETE captured work-slot registry: the detached capture is taken EXACTLY ONCE, while
     /// <see cref="_mappingLock"/> is held and after the in-memory claim, and the captured pointer
-    /// (including a captured <c>null</c>) plus the encoded whole registry travel into the SAME
+    /// (a captured <c>null</c> is NOT reachable here — the reused preflight rejects a blank active
+    /// task and requires a matching Pending slot, so a null capture is REFUSED before any statement;
+    /// only the ORDINARY eligible checkpoint may legitimately freeze a null) plus the encoded whole
+    /// registry travel into the SAME
     /// pipeline-row write as the mapping insert — one transaction, one outcome surface. The
     /// pipeline monitor is RELEASED inside the capture, so the preflight, the single registry
     /// encode, the EF work and the machine-position capture all run outside it; a live mutation
@@ -663,11 +752,23 @@ public sealed class GoalPipelineManager
             //     another attempt's), PersistenceFailed carried with the ORIGINAL exception and
             //     the flags unchanged. No new status is introduced.
             AdmissionStoreResult storeResult;
+            string? admissionEvidence = null;
             try
             {
-                storeResult = pipeline.OwnershipCheckpointEligible
-                    ? _store.SaveAdmissionWithPointer(pipeline, taskId, pipeline.CaptureAdmissionOwnership())
-                    : _store.SaveAdmissionWithPointer(pipeline, taskId);
+                if (pipeline.OwnershipCheckpointEligible)
+                {
+                    // THE INVOCATION-LOCAL EVIDENCE CARRIER: the ownership-aware route returns the
+                    // EXACT frozen registry token it actually wrote, so the enqueue-failure rollback
+                    // can present that ORIGINAL string later WITHOUT a second encode, a fresh
+                    // database read or a decode/re-encode round trip. It is populated ONLY on this
+                    // eligible route and (below) exposed ONLY for a CONFIRMED Committed outcome.
+                    storeResult = _store.SaveAdmissionWithPointer(
+                        pipeline, taskId, pipeline.CaptureAdmissionOwnership(), out admissionEvidence);
+                }
+                else
+                {
+                    storeResult = _store.SaveAdmissionWithPointer(pipeline, taskId);
+                }
             }
             catch (Exception ex)
             {
@@ -713,7 +814,12 @@ public sealed class GoalPipelineManager
                     return new AdmissionCommitResult(
                         AdmissionCommitStatus.Committed,
                         ClaimedThisInvocation: true,
-                        CommittedThisInvocation: true);
+                        CommittedThisInvocation: true,
+                        RollbackEvidence: admissionEvidence is null
+                            ? null
+                            // The evidence identity is the invocation's own validated pair, and the
+                            // token is the EXACT string the store wrote — never rebuilt here.
+                            : new AdmissionRollbackEvidence(pipeline.GoalId, taskId, admissionEvidence));
 
                 case AdmissionStoreResult.PersistConflict:
                     _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
@@ -772,6 +878,140 @@ public sealed class GoalPipelineManager
         {
             return _store?.ClearActiveTaskIdIfMatches(pipeline.GoalId, taskId)
                    ?? PointerRollbackResult.NotMatched;  // the null store — nothing persisted
+        }
+    }
+
+    /// <summary>
+    /// THE ENQUEUE-FAILURE INVERSE of ONE eligible admission: fences the admission's Pending slot
+    /// in memory and then issues the store's guarded atomic rollback — the Pending-slot abandon,
+    /// the pointer clear and the mapping delete in ONE transaction — while BOTH memory and the
+    /// durable mapping are still intact.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS A BOUNDED BEST-EFFORT INTEGRATION, NOT RECOVERY. It runs only for the admission
+    /// that is being unwound at this instant, with the evidence THAT admission carried
+    /// (<see cref="AdmissionCommitResult.RollbackEvidence"/>) — never a fresh eligibility guess and
+    /// never a value reconstructed from later state. There is NO durable fallback of any kind: no
+    /// separate mapping deletion, no <see cref="RollbackPersistedPointer"/>, no unconditional save,
+    /// no read-back repair and no retry. Every outcome is simply reported to the caller, which is
+    /// what performs the memory settlement.
+    /// </para>
+    /// <para>
+    /// THE ONE <see cref="_mappingLock"/> SPAN holds the three ordered steps: (a) the evidence's
+    /// goal/task must EQUAL the requested pipeline/task ordinally; (b) the pipeline must still be
+    /// THIS manager's current instance for that goal (<c>_pipelines</c> reference equality) and the
+    /// memory mapping must still be the requested pair; (c) only then does the existing Pending-only
+    /// <see cref="GoalPipeline.AbandonSlot"/> run — the atomic Pending → Abandoned transition that
+    /// FENCES every later <see cref="GoalPipeline.AdmitCompletion"/> for this slot. Any failure of
+    /// (a)/(b), or a <c>false</c> from <c>AbandonSlot</c> (the slot is absent, or already Claimed /
+    /// Recorded / Abandoned), SKIPS the operation ENTIRELY: no memory mutation beyond nothing, no
+    /// store call, and NO treatment of a durable Pending row as permission to retire an attempt a
+    /// completion has already claimed.
+    /// </para>
+    /// <para>
+    /// THE STORE ATTEMPT AND THE LOCAL SETTLEMENT RUN UNDER THE SAME LOCK: <c>AbandonSlot</c>
+    /// acquires and RELEASES the pipeline's own monitor internally, so no pipeline monitor is held
+    /// across the codec or SQL work (the same release discipline the admission path uses), while
+    /// the manager lock stays held through the store call and the pair's removal — so a concurrent
+    /// ordinary manager checkpoint can never persist the intermediate in-memory state.
+    /// </para>
+    /// <para>
+    /// SETTLEMENT IS MEMORY-ONLY AND PAIR-SCOPED: once the fence succeeded, the requested
+    /// task/goal pair is removed from <see cref="_taskToGoal"/> and
+    /// <see cref="GoalPipeline.ClearActiveTaskIfCurrent"/> is called — for EVERY store outcome,
+    /// including a throw. A newer mapping for the task, and a newer pointer on the pipeline, BOTH
+    /// survive. <see cref="TryUnregisterTask"/>/<see cref="UnregisterTask"/> are deliberately NOT
+    /// used here: both have durable side effects. Local cleanup never implies durable success —
+    /// <see cref="PendingAdmissionRollbackStatus.Refused"/> says only that THIS transaction made no
+    /// mutation, and <see cref="PendingAdmissionRollbackStatus.Indeterminate"/> may have committed.
+    /// Store failures are caught and reported, never propagated: the caller owns the exception story
+    /// (the enqueue catch rethrows its ORIGINAL exception bare).
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The pipeline the admission was made for.</param>
+    /// <param name="taskId">The task the admission was made for.</param>
+    /// <param name="evidence">The invocation-local evidence of THAT admission, or <c>null</c> when
+    /// the admission did not produce one (the legacy/ineligible and NoStore routes) — a null is the
+    /// safe no-op.</param>
+    /// <returns>The recorded rollback outcome with its exact exception evidence.</returns>
+    internal PendingAdmissionRollbackResult RollbackPendingAdmission(
+        GoalPipeline? pipeline, string? taskId, AdmissionRollbackEvidence? evidence)
+    {
+        // THE OUT-OF-LOCK REFUSALS — the same safe no-op shape as RollbackPersistedPointer: a null
+        // pipeline, a blank task id or absent evidence identifies no admission to unwind.
+        if (pipeline is null || string.IsNullOrWhiteSpace(taskId) || evidence is null)
+            return new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Skipped);
+
+        lock (_mappingLock)
+        {
+            // (a) THE EVIDENCE IDENTITY: the carrier must describe EXACTLY the requested pair. A
+            //     stale, foreign or mismatched carrier is skipped without touching anything.
+            if (!string.Equals(evidence.GoalId, pipeline.GoalId, StringComparison.Ordinal)
+                || !string.Equals(evidence.TaskId, taskId, StringComparison.Ordinal))
+            {
+                return new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Skipped);
+            }
+
+            // (b) THE CURRENT-INSTANCE AND OWNERSHIP CHECKS: the pipeline must still be THIS
+            //     manager's instance for the goal (a replaced pipeline is not ours to mutate), and
+            //     the memory mapping must still be the requested pair (a steal must not be undone).
+            if (!_pipelines.TryGetValue(pipeline.GoalId, out var current) || !ReferenceEquals(current, pipeline))
+                return new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Skipped);
+
+            if (!_taskToGoal.TryGetValue(taskId, out var mappedGoalId)
+                || !string.Equals(mappedGoalId, pipeline.GoalId, StringComparison.Ordinal))
+            {
+                return new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Skipped);
+            }
+
+            // (c) THE FENCE. The pipeline monitor is acquired and RELEASED inside this call, so the
+            //     store work below runs with NO pipeline monitor held. A false — absent, Claimed,
+            //     Recorded or already Abandoned — means a completion may own the attempt: SKIP
+            //     ENTIRELY rather than guess, and do NOT fall back to any legacy cleanup sequence.
+            if (!pipeline.AbandonSlot(taskId))
+                return new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Skipped);
+
+            // THE STORE ATTEMPT — the EXISTING guarded primitive, consumed untouched, with the
+            // ORIGINAL evidence string. Memory and the durable mapping are both still intact.
+            PendingAdmissionRollbackResult result;
+            try
+            {
+                var commit = _store!.CommitPendingAdmissionRollback(
+                    evidence.GoalId, evidence.TaskId, evidence.EncodedRegistryJson);
+
+                result = commit.Status switch
+                {
+                    AdmissionOwnershipCommitStatus.Committed =>
+                        new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Committed),
+                    AdmissionOwnershipCommitStatus.Refused =>
+                        new PendingAdmissionRollbackResult(PendingAdmissionRollbackStatus.Refused),
+                    AdmissionOwnershipCommitStatus.Indeterminate =>
+                        new PendingAdmissionRollbackResult(
+                            PendingAdmissionRollbackStatus.Indeterminate,
+                            commit.PrimaryException,
+                            commit.RollbackException),
+                    _ => throw new InvalidOperationException(
+                        $"Unhandled admission rollback store outcome '{commit.Status}' for task '{taskId}' (goal={pipeline.GoalId})."),
+                };
+            }
+            catch (Exception ex)
+            {
+                // A THROWN store failure is DISTINGUISHABLE from a skipped attempt, and — like
+                // Refused/Indeterminate — it authorises the SAME memory settlement below. It is
+                // reported, never propagated: the caller owns the original enqueue exception.
+                result = new PendingAdmissionRollbackResult(
+                    PendingAdmissionRollbackStatus.Failed, ex, RollbackFailure: null);
+            }
+
+            // THE LOCAL SETTLEMENT — PAIR-SCOPED and MEMORY-ONLY, for EVERY outcome above. It runs
+            // under the same lock as the store attempt, so no ordinary manager checkpoint can
+            // persist this intermediate state. No TryUnregisterTask/UnregisterTask: both write
+            // durable state, which this integration deliberately does not do.
+            _taskToGoal.TryRemove(KeyValuePair.Create(taskId, pipeline.GoalId));
+            pipeline.ClearActiveTaskIfCurrent(taskId);
+
+            return result;
         }
     }
 

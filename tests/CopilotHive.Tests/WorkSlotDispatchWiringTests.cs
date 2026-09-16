@@ -57,6 +57,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     private readonly SqliteConnection _keeper;
     private readonly List<SqliteConnection> _connections = [];
     private readonly List<CopilotHiveDbContext> _contexts = [];
+    private readonly List<AdmissionSecondCommitFaultConnection> _secondCommitConnections = [];
+    private readonly List<CopilotHiveDbContext> _secondCommitContexts = [];
 
     public WorkSlotDispatchWiringTests()
     {
@@ -69,7 +71,11 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     {
         foreach (var context in _contexts)
             context.Dispose();
+        foreach (var context in _secondCommitContexts)
+            context.Dispose();
         foreach (var connection in _connections)
+            connection.Dispose();
+        foreach (var connection in _secondCommitConnections)
             connection.Dispose();
         _keeper.Dispose();
         foreach (var directory in _tempDirectories)
@@ -173,6 +179,38 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         goalParameter.ParameterName = "$goalId";
         goalParameter.Value = goalId;
         command.Parameters.Add(goalParameter);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Forces the persisted <c>pipelines.work_slot_registry_json</c> column to
+    /// <paramref name="blob"/> RAW, bypassing EF entirely — used to arrange STALE durable registry
+    /// text so the rollback's byte-exact compare-and-swap must refuse.
+    /// </summary>
+    private void ForcePersistedRegistryBlob(string goalId, string? blob)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "UPDATE pipelines SET work_slot_registry_json = $blob WHERE goal_id = $goalId";
+        var blobParameter = command.CreateParameter();
+        blobParameter.ParameterName = "$blob";
+        blobParameter.Value = (object?)blob ?? DBNull.Value;
+        command.Parameters.Add(blobParameter);
+        var goalParameter = command.CreateParameter();
+        goalParameter.ParameterName = "$goalId";
+        goalParameter.Value = goalId;
+        command.Parameters.Add(goalParameter);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>Deletes the persisted <c>task_mappings</c> row RAW — the missing-mapping arrangement.</summary>
+    private void ForceDeletePersistedMapping(string taskId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "DELETE FROM task_mappings WHERE task_id = $taskId";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "$taskId";
+        parameter.Value = taskId;
+        command.Parameters.Add(parameter);
         command.ExecuteNonQuery();
     }
 
@@ -735,12 +773,25 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// <see cref="GoalPipeline.ActiveTaskId"/> — the same instance production is mutating, never a
     /// recorded copy or a stand-in. The closing <c>abandoned-registration</c> record then confirms
     /// the post-(c) state, so the c/d boundary is pinned too. No production seam is required.
+    /// <para>
+    /// THE ROUTE IS THE INELIGIBLE (LEGACY) ONE ON PURPOSE: this sequence only exists where the
+    /// admission carries NO rollback evidence. An ELIGIBLE admission takes the atomic-inverse route
+    /// instead, whose own ordering is pinned by the eligible vectors.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Dispatch_EnqueueThrows_AbandonPrecedesUnregisterPrecedesPointerClear()
     {
-        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        // THE INELIGIBLE ROUTE: a persisted row already exists for this goal, so the manager-created
+        // replacement pipeline is INELIGIBLE and this admission takes the LEGACY route — no
+        // ownership checkpoint and therefore no rollback evidence. That is precisely the path whose
+        // (a)→(b)→(c) order these probes pin; the ELIGIBLE route's own atomic inverse is a different
+        // sequence, covered by its own vectors.
+        var store = CreateStore();
+        store.SavePipeline(new GoalPipeline(CreateGoal(GoalId)));
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
         var pipeline = WithControlledNonce(manager.CreatePipeline(CreateGoal(GoalId)));
+        Assert.False(pipeline.OwnershipCheckpointEligible);
         Arrange(pipeline, GoalPhase.Coding);
 
         var sentinel = new InvalidOperationException("enqueue-sentinel");
@@ -865,14 +916,22 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// so the result is <c>(true, false)</c> — the <c>step=unregister-persist</c> warning, rendered
     /// verbatim, and the persisted residue is left behind honestly.
     /// </summary>
+    /// <remarks>
+    /// THE ROUTE IS THE INELIGIBLE (LEGACY) ONE, because <c>TryUnregisterTask</c> — the step that
+    /// owns this partial outcome — is deliberately NOT part of the eligible route's atomic inverse
+    /// (it has durable side effects). The persisted row is seeded first so the creation is
+    /// ineligible, and the mapping row is then seeded for THIS task so the admission can still
+    /// commit it.
+    /// </remarks>
     [Fact]
     public async Task Dispatch_EnqueueThrowsAndRowDeleteFails_LogsUnregisterPersistWarning()
     {
         var deleteSentinel = new InvalidOperationException("delete-sentinel");
-        var manager = new GoalPipelineManager(
-            CreateStore(new SentinelThrowingInterceptor(deleteSentinel, "DELETE")),
-            new TestLogger<GoalPipelineManager>());
+        var store = CreateStore(new SentinelThrowingInterceptor(deleteSentinel, "DELETE"));
+        store.SavePipeline(new GoalPipeline(CreateGoal(GoalId)));
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.False(pipeline.OwnershipCheckpointEligible);
         Arrange(pipeline, GoalPhase.Coding);
 
         var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
@@ -1029,8 +1088,1002 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Null(manager.GetByTaskId(taskId));
     }
 
+    /// <summary>
+    /// THE ROLLBACK USES THE ORIGINAL ADMISSION TOKEN — PROVEN BEHAVIORALLY. An eligible admission
+    /// commits; the enqueue callback then lands a LIVE registry mutation on the pipeline (a fresh
+    /// Pending slot for another task); and the rollback, which still succeeds, writes back exactly
+    /// the ORIGINAL admission's Abandoned replacement — with the live post-capture slot ABSENT from
+    /// the durable blob.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: any rollback that derived its expectation from a FRESH live capture
+    /// (or a re-encode of the post-capture registry) would mismatch the durable blob's exact text,
+    /// so its compare-and-swap would REFUSE — the durable slot would stay <c>Pending</c> and the
+    /// confirmed-outcome record would never be emitted. Both assertions fail under that mutant.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_LiveMutationAfterCapture_StillRollsBackWithTheOriginalToken()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            // A POST-CAPTURE LIVE MUTATION: a brand-new Pending slot that the admission's frozen
+            // token can never contain.
+            pipeline.AllocateAttemptAndRegisterSlot(
+                "late-live-rollback-task", new WorkSlotPosition(7, GoalPhase.Testing, 1));
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = taskIdAtEntry!;
+        var durable = WorkSlotRegistryCodec.Decode(ReadPersistedRegistryBlob(GoalId)!);
+
+        // THE ORIGINAL TOKEN WAS USED: the admission's own slot is Abandoned…
+        var durableSlot = Assert.Single(durable.Slots, s => s.Slot.TaskId == taskId);
+        Assert.Equal(WorkSlotState.Abandoned, durableSlot.State);
+        // …while the LIVE post-capture mutation never entered the committed/rolled-back pair.
+        Assert.DoesNotContain(durable.Slots, s => s.Slot.TaskId == "late-live-rollback-task");
+
+        // And the rest of the inverse held: pointer cleared, mapping deleted.
+        Assert.Null(ReadPersistedActiveTaskId(GoalId));
+        Assert.Null(ReadPersistedGoalId(taskId));
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug &&
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A LATER-CHANGED DURABLE BLOB MAKES THE ROLLBACK REFUSE — it never refreshes its expectation
+    /// from the row it finds. The enqueue callback overwrites the durable registry text with STALE
+    /// content, so the original token's compare-and-swap matches nothing, the whole rollback
+    /// transaction is refused, and everything durable is left EXACTLY as it was.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: a rollback that re-read the current blob (or re-encoded the current
+    /// memory) would "succeed" against the stale text — the refused-outcome record would be missing
+    /// and the durable witnesses would change. Both fail here. THERE IS NO DESTRUCTIVE FALLBACK: the
+    /// pointer, the mapping and the stale blob all survive.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_StaleDurableBlob_RefusesWithoutRepair()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // STALE TEXT, written by the callback: deliberately JSON-shaped but NOT the admitted text.
+        var staleBlob = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot([], []));
+
+        queue.OnEnqueue = t =>
+        {
+            // The admission's own row text at entry (the state the CAS would have matched)…
+            ForcePersistedRegistryBlob(GoalId, staleBlob);
+            // …is replaced before the rollback runs. The actual id is captured for the assertions.
+            throw sentinel;
+        };
+
+        // The settled id, resolved from the durable text the CALLBACK replaced — so read it first
+        // through the in-memory registry, which the rollback settles regardless of the store outcome.
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = SettledTaskId(pipeline);
+
+        // THE DURABLE WITNESSES ARE EXACTLY AS THE CALLBACK LEFT THEM — no destructive fallback ran.
+        Assert.Equal(staleBlob, ReadPersistedRegistryBlob(GoalId));
+        Assert.False(string.IsNullOrEmpty(ReadPersistedActiveTaskId(GoalId)));
+        Assert.Equal(GoalId, ReadPersistedGoalId(taskId));
+
+        // The outcome is reported HONESTLY as a refusal, never as a success.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=refused", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+
+        // THE MEMORY SETTLEMENT STILL HAPPENED: abandoned, unmapped, if-current-cleared.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A MISSING DURABLE MAPPING REFUSES THE BETWEEN-STATEMENT ROLLBACK: the callback deletes the
+    /// mapping row, so the rollback's second statement matches nothing and the preceding UPDATE is
+    /// rolled back — the durable pointer and registry text stay exactly as admitted.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_MissingDurableMapping_RefusesAndRollsTheUpdateBack()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            ForceDeletePersistedMapping(t.TaskId);
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = SettledTaskId(pipeline);
+        Assert.Equal(taskId, taskIdAtEntry);
+
+        // THE BETWEEN-STATEMENT ROLLBACK: the pointer and the admitted blob are UNCHANGED.
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(GoalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(GoalId));
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=refused", StringComparison.Ordinal));
+
+        // Memory is still settled.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+    }
+
+    /// <summary>
+    /// A FOREIGN DURABLE MAPPING (the same task id owned by a NEWER goal) REFUSES the rollback
+    /// without stealing the row, and the newer owner's mapping survives untouched.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_ForeignDurableMapping_RefusesWithoutStealing()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            // Re-point the mapping at a FOREIGN, newer goal through the store's own seeding path.
+            using var command = _keeper.CreateCommand();
+            command.CommandText = "UPDATE task_mappings SET goal_id = 'newer-foreign-goal' WHERE task_id = $taskId";
+            var parameter = command.CreateParameter();
+            parameter.ParameterName = "$taskId";
+            parameter.Value = t.TaskId;
+            command.Parameters.Add(parameter);
+            command.ExecuteNonQuery();
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = SettledTaskId(pipeline);
+        Assert.Equal(taskId, taskIdAtEntry);
+
+        // THE FOREIGN OWNER SURVIVES — never a steal — and the preceding UPDATE was rolled back.
+        Assert.Equal("newer-foreign-goal", ReadPersistedGoalId(taskId));
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(GoalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(GoalId));
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=refused", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A NEWER DURABLE POINTER REFUSES THE ROLLBACK: the callback moves the durable pointer to a
+    /// different task, so the ownership-checked rollback declines and the newer pointer survives.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_NewerDurablePointer_RefusesAndLeavesItIntact()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? blobAtEntry = null;
+        queue.OnEnqueue = _ =>
+        {
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            ForcePersistedActiveTaskId(GoalId, "newer-durable-task");
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        // THE NEWER DURABLE POINTER SURVIVES and the admitted blob is unchanged (the UPDATE rolled back).
+        Assert.Equal("newer-durable-task", ReadPersistedActiveTaskId(GoalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(GoalId));
+
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=refused", StringComparison.Ordinal));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    // (7b) THE OWNERSHIP CHECKPOINT — the REAL dispatch route
+    // (7c) THE ELIGIBLE ROLLBACK'S OWN OWNERSHIP GUARDS — the skips
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A REPLACED PIPELINE INSTANCE PRODUCES A SKIP: by the time the enqueue fails, the manager's
+    /// current instance for the goal is a DIFFERENT pipeline, so the rollback is skipped ENTIRELY —
+    /// no store write, the ownership intact and the mapping row preserved.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: dropping the current-instance/reference check lets the stale
+    /// pipeline's rollback run against the replaced pipeline's durable row — the durable witnesses
+    /// would change and the skipped-outcome record would be replaced by a committed/refused one.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailureAfterPipelineReplacement_SkipsWithOwnershipIntact()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            // THE REPLACEMENT: swap the manager's CURRENT instance for the goal with a different
+            // one, WITHOUT the durable side effect of RemovePipeline (the row must stay intact for
+            // the "no store write happened" assertions below).
+            var pipelinesField = typeof(GoalPipelineManager)
+                .GetField("_pipelines", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var pipelines = (ConcurrentDictionary<string, GoalPipeline>)pipelinesField.GetValue(manager)!;
+            pipelines[GoalId] = new GoalPipeline(CreateGoal(GoalId));
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = taskIdAtEntry!;
+
+        // THE SKIP: no store write at all — the durable pair is EXACTLY as admitted…
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(GoalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(GoalId));
+        // …and the outcome is reported as a SKIP, never as a commitment or a refusal.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug &&
+            e.Message.Contains("outcome=skipped", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal) ||
+            e.Message.Contains("outcome=refused", StringComparison.Ordinal));
+
+        // NO FALSE SLOT-RELEASE CLAIM: a skipped rollback mutates NOTHING, so the
+        // abandoned-registration record — whose text asserts "the slot is released" — must be
+        // ABSENT. Asserting the template's ABSENCE (not merely the skip record's presence) is what
+        // kills an unconditional release record sitting next to outcome=skipped.
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("abandoned-registration", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("the slot is released", StringComparison.Ordinal));
+
+        // The skipped route performs NO memory settlement of its own, so the stale pipeline's own
+        // pointer is left exactly as the admission set it — nothing was invented or repaired.
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A FOREIGN MEMORY MAPPING PRODUCES A SKIP: the callback re-points the task at another goal
+    /// (without the pipeline being replaced), so the ownership guard declines and no rollback write
+    /// is attempted — the other owner's memory mapping and the durable row both survive.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailureAfterMemoryMappingSteal_SkipsWithForeignMappingIntact()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        manager.CreatePipeline(CreateGoal("goal-other"));
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            // THE STEAL, in the same two steps a real competitor uses.
+            manager.UnregisterTask(t.TaskId);
+            manager.RegisterTask(t.TaskId, "goal-other");
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+        Assert.Same(sentinel, thrown);
+
+        var taskId = SettledTaskId(pipeline);
+        Assert.Equal(taskId, taskIdAtEntry);
+
+        // THE FOREIGN OWNER SURVIVES; no rollback write ran.
+        Assert.Equal("goal-other", manager.GetByTaskId(taskId)?.GoalId);
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(GoalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(GoalId));
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug &&
+            e.Message.Contains("outcome=skipped", StringComparison.Ordinal));
+
+        // NO FALSE SLOT-RELEASE CLAIM on this skip either — the release template must be ABSENT.
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("abandoned-registration", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("the slot is released", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// AN ABANDON-WINNING CASE REJECTS SUBSEQUENT COMPLETION ADMISSION: the rollback's atomic
+    /// Pending → Abandoned fence is what the memory settlement records, so a completion arriving
+    /// afterwards is refused by <see cref="GoalPipeline.AdmitCompletion"/> with
+    /// <see cref="AdmissionOutcome.SlotAbandoned"/> — the attempt is genuinely retired.
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailureAfterRollback_SlotIsFencedAgainstLaterCompletion()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue { OnEnqueue = _ => throw sentinel };
+        var service = CreateService(manager, queue, new TestLogger<TaskDispatchService>());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        var taskId = SettledTaskId(pipeline);
+
+        // THE FENCE: the abandon already happened atomically, so the later completion is refused
+        // (never Claimed) — the slot cannot be re-admitted by a racing completion.
+        Assert.Equal(AdmissionOutcome.SlotAbandoned, pipeline.AdmitCompletion(taskId));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7d) THE ELIGIBLE ROLLBACK'S STORE OUTCOMES — evidence preservation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A THROWING STORE COMMIT ON THE ROLLBACK (the SECOND explicit transaction on this connection):
+    /// the rollback's fate is UNKNOWN, so the dispatch reports <c>outcome=indeterminate</c> carrying
+    /// the store's EXACT commit sentinel, the memory settlement still completes, and the ORIGINAL
+    /// enqueue exception is what leaves the dispatch — never the store's sentinel. NO durable
+    /// fallback runs afterwards: the rollback's own two statements are the LAST durable writes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE SECOND-COMMIT LATCH IS WHAT MAKES THIS DETERMINISTIC: the connection lets the ADMISSION's
+    /// commit (the first explicit transaction) land normally, so the admission carries real
+    /// invocation-local evidence, and throws ONLY at the rollback's commit.
+    /// </para>
+    /// <para>
+    /// THE DURABLE CLAIM IS SPLIT HONESTLY. With <paramref name="throwAfterUnderlyingCommit"/> the
+    /// SQLite commit may have landed underneath, so the row's CONTENT is deliberately left
+    /// UNRESOLVED and nothing in the dispatch may claim otherwise. With the throw BEFORE the
+    /// underlying commit the transaction really was rolled back, so the admitted witnesses (pointer,
+    /// registry blob and mapping row) MUST all survive unchanged — that arm is asserted in full,
+    /// matching the body-error vector's proof style. Both arms assert the STATEMENT-LEVEL
+    /// no-follow-up-write rule, so a legacy delete/clear/save fallback after an indeterminate
+    /// outcome is visible either way.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Dispatch_EligibleEnqueueFailure_RollbackCommitThrows_IndeterminateWithExactEvidence(
+        bool throwAfterUnderlyingCommit)
+    {
+        var goalId = GoalId + "-rollback-commit-" + throwAfterUnderlyingCommit;
+        var connection = new AdmissionSecondCommitFaultConnection(_connectionString, throwAfterUnderlyingCommit);
+        connection.Open();
+        _secondCommitConnections.Add(connection);
+        // THE STATEMENT RECORDER: armed at the enqueue callback, so it captures EXACTLY the
+        // rollback-time statements — the no-durable-fallback witness.
+        var recorder = new AdmissionCommandCounter();
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite((DbConnection)connection)
+                .AddInterceptors(recorder).Options);
+        _secondCommitContexts.Add(context);
+        var manager = new GoalPipelineManager(
+            new PipelineStore(context, NullLogger<PipelineStore>.Instance),
+            new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(goalId);
+            recorder.Start();
+            throw enqueueSentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL EXCEPTION LEFT THE DISPATCH — never the store's sentinel.
+        Assert.Same(enqueueSentinel, thrown);
+        // THE ADMISSION COMMITTED AND THE ROLLBACK'S COMMIT WAS REALLY ATTEMPTED…
+        Assert.True(connection.FirstCommitCount >= 1, "the admission's own commit must have been attempted");
+        Assert.Equal(1, connection.SecondCommitCount);
+        // …so this really is the throwing-rollback-commit vector, not a mis-arranged no-op.
+        Assert.True(connection.SecondCommitAttempted, "the rollback's own commit must have been attempted");
+
+        // THE HONEST OUTCOME: indeterminate, never a false success.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=indeterminate", StringComparison.Ordinal) &&
+            ReferenceEquals(e.Exception, connection.CommitSentinel));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+
+        // ── THE NO-DURABLE-FALLBACK WITNESS (statement level) ──
+        // The rollback's OWN transaction issues exactly its two guarded statements: the CAS update
+        // and the mapping delete. NOTHING further — no fallback mapping delete, no pointer clear,
+        // no unconditional save — may follow an indeterminate outcome.
+        var writes = recorder.Commands
+            .Where(c => c.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+                || c.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.Equal(2, writes.Count);
+        Assert.Single(writes, c =>
+            c.Contains("work_slot_registry_json", StringComparison.Ordinal) &&
+            c.Contains("active_task_id = NULL", StringComparison.Ordinal));
+        Assert.Single(writes, c =>
+            c.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase) &&
+            c.Contains("task_mappings", StringComparison.Ordinal));
+
+        var taskId = taskIdAtEntry!;
+        if (!throwAfterUnderlyingCommit)
+        {
+            // THE THROW PRECEDED THE UNDERLYING COMMIT: the transaction really rolled back, so the
+            // admitted durable witnesses ALL survive exactly as the failing invocation left them.
+            Assert.Equal(taskId, ReadPersistedActiveTaskId(goalId));
+            Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(goalId));
+            Assert.Equal(goalId, ReadPersistedGoalId(taskId));
+        }
+
+        // THE LOCAL SETTLEMENT STILL COMPLETED: abandoned, unmapped, if-current-cleared.
+        Assert.Equal(taskId, Assert.Single(pipeline.GetSlotsForTest()).Slot.TaskId);
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A THROWING TRANSACTION ROLLBACK ON THE PENDING-ADMISSION ROLLBACK: the store records
+    /// <c>Indeterminate</c> carrying its EXACT rollback exception (with a <c>null</c> primary,
+    /// because the body itself refused cleanly), and BOTH evidence slots reach the dispatch's
+    /// diagnostic. The ORIGINAL enqueue exception is still what leaves the dispatch, unchanged and
+    /// unaggregated.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE MUTATION THIS KILLS: dropping the rollback evidence when there is NO primary. On this
+    /// vector the primary is <c>null</c> — a clean body refusal whose ROLLBACK then threw — so a
+    /// Failure-only report emits an indeterminate warning carrying NO exception evidence at all,
+    /// and rendering the instance as type/message text would destroy it at the diagnostic boundary.
+    /// The identity assertion below fails under either mutant.
+    /// </para>
+    /// <para>
+    /// WHY THIS VECTOR IS NOT REDUNDANT with the dual-non-null vector that follows: only THIS one
+    /// pins the null-primary half of the contract — that the outcome record's exception argument is
+    /// null EXACTLY when there is no primary failure, while the rollback instance is still retained
+    /// by its own record.
+    /// </para>
+    /// <para>
+    /// THE ARRANGEMENT IS REAL AND DETERMINISTIC: the existing second-commit fault connection lets
+    /// the ADMISSION's transaction commit normally (so the admission produces genuine
+    /// invocation-local evidence), and the rollback fault is armed from the enqueue callback so ONLY
+    /// the pending-admission rollback's own transaction can throw at <c>Rollback()</c>. A stale
+    /// durable blob makes the store's guarded body REFUSE — which is exactly the path whose
+    /// confirmed rollback is then faulted.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_RollbackTransactionRollbackThrows_ReportsBothExactInstances()
+    {
+        var goalId = GoalId + "-rollback-rollback-throws";
+        var connection = new AdmissionSecondCommitFaultConnection(_connectionString, throwAfterCommit: false);
+        connection.Open();
+        _secondCommitConnections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite((DbConnection)connection).Options);
+        _secondCommitContexts.Add(context);
+        var manager = new GoalPipelineManager(
+            new PipelineStore(context, NullLogger<PipelineStore>.Instance),
+            new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // A STALE durable blob makes the store's own guarded body refuse CLEANLY (primary == null);
+        // the faulted transaction Rollback() is then the ONLY exception the store captures.
+        var staleBlob = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot([], []));
+        queue.OnEnqueue = _ =>
+        {
+            ForcePersistedRegistryBlob(goalId, staleBlob);
+            connection.ArmRollbackFault();
+            throw enqueueSentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL EXCEPTION LEFT THE DISPATCH — never a store sentinel, never a wrapper.
+        Assert.Same(enqueueSentinel, thrown);
+        Assert.NotSame(connection.RollbackSentinel, thrown);
+        Assert.Null(thrown.InnerException);
+
+        // THE VACUITY GUARD: the transaction rollback really was faulted.
+        Assert.Equal(1, connection.RollbackFaultCount);
+
+        // ── BOTH EVIDENCE SLOTS REACH THE DIAGNOSTIC ──
+        // (1) THE OUTCOME RECORD: the primary is NULL here (a clean body refusal), so its exception
+        // argument must be null EXACTLY — that is the null-primary half of the contract, which the
+        // dual-non-null vector below cannot pin.
+        var record = Assert.Single(
+            logger.LogEntries,
+            e => e.Message.Contains("outcome=indeterminate", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, record.LogLevel);
+        Assert.Null(record.Exception);
+        Assert.Contains("primary=none", record.Message, StringComparison.Ordinal);
+
+        // (2) THE ROLLBACK-EVIDENCE RECORD: the EXACT instance, asserted by OBJECT IDENTITY. A
+        // type/message rendering is NOT sufficient — reducing the instance to text destroys it at
+        // the diagnostic boundary, which is precisely the defect this assertion kills.
+        Assert.Contains(logger.LogEntries, e =>
+            e.Message.Contains("pending-admission-rollback", StringComparison.Ordinal) &&
+            ReferenceEquals(e.Exception, connection.RollbackSentinel));
+
+        // …and it is never reported as a success.
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+
+        // THE LOCAL SETTLEMENT STILL COMPLETED: abandoned, unmapped, if-current-cleared.
+        var taskId = Assert.Single(pipeline.GetSlotsForTest()).Slot.TaskId;
+        Assert.Equal(WorkSlotState.Abandoned, Assert.Single(pipeline.GetSlotsForTest()).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A ROLLBACK BODY ERROR FOLLOWED BY A THROWING TRANSACTION ROLLBACK produces an
+    /// <c>Indeterminate</c> result with TWO non-null exception instances. The dispatch diagnostic
+    /// must carry BOTH exact objects — not merely the primary object plus a type/message rendering
+    /// of the rollback object — while the ORIGINAL enqueue exception still leaves unchanged.
+    /// </summary>
+    /// <remarks>
+    /// This is the dispatch-level counterpart to
+    /// <c>CommitPendingAdmissionRollback_BodyErrorAndRollbackThrow_IndeterminateWithBothExactInstances</c>.
+    /// The existing null-primary rollback-throw vector cannot prove preservation of two identities:
+    /// rendering the rollback type/message passes it while silently dropping the actual instance.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_RollbackBodyAndTransactionRollbackThrow_DiagnosticCarriesBothExactInstances()
+    {
+        var goalId = GoalId + "-rollback-body-and-rollback-throw";
+        var bodySentinel = new InvalidOperationException("pending-rollback-body-primary-sentinel");
+        var bodyFault = new PendingRollbackThrowInterceptor(bodySentinel);
+        var connection = new AdmissionSecondCommitFaultConnection(_connectionString, throwAfterCommit: false);
+        connection.Open();
+        _secondCommitConnections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite((DbConnection)connection)
+                .AddInterceptors(bodyFault)
+                .Options);
+        _secondCommitContexts.Add(context);
+        var manager = new GoalPipelineManager(
+            new PipelineStore(context, NullLogger<PipelineStore>.Instance),
+            new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+        queue.OnEnqueue = _ =>
+        {
+            // Arm AFTER the real eligible admission committed, so the rollback's CAS body throws and
+            // its transaction rollback then throws independently.
+            bodyFault.Arm();
+            connection.ArmRollbackFault();
+            throw enqueueSentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // The original enqueue exception remains the sole propagated exception.
+        Assert.Same(enqueueSentinel, thrown);
+        Assert.Null(thrown.InnerException);
+
+        // VACUITY GUARDS: both distinct rollback faults actually occurred.
+        Assert.Equal(1, bodyFault.ThrowCount);
+        Assert.Equal(1, connection.RollbackFaultCount);
+        Assert.NotSame(bodySentinel, connection.RollbackSentinel);
+
+        // BOTH exact instances must be carried by the diagnostic surface. A type/message-only
+        // rendering of the rollback sentinel is insufficient and fails the second identity check.
+        Assert.Contains(logger.LogEntries, e =>
+            e.Message.Contains("outcome=indeterminate", StringComparison.Ordinal) &&
+            ReferenceEquals(e.Exception, bodySentinel));
+        Assert.Contains(logger.LogEntries, e =>
+            e.Message.Contains("pending-admission-rollback", StringComparison.Ordinal) &&
+            ReferenceEquals(e.Exception, connection.RollbackSentinel));
+
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A STORE CALL THAT THROWS BEFORE IT COULD RECORD AN OUTCOME — a body error whose transaction
+    /// the store's own guarded rollback CONFIRMED — reports <c>outcome=failed</c> at the dispatch
+    /// carrying the store's EXACT exception, with the memory settlement still completed and the
+    /// ORIGINAL enqueue exception preserved. NO fallback durable cleanup runs: the durable
+    /// witnesses (pointer, blob, mapping row) survive exactly as the failing rollback left them.
+    /// </summary>
+    /// <remarks>
+    /// THE SECOND-COMMIT LATCH IS WHAT MAKES THIS DETERMINISTIC: the connection lets the ADMISSION's
+    /// commit land normally (real invocation-local evidence) and the interceptor then throws at the
+    /// ROLLBACK's own CAS statement — a body error, distinct from the commit-throws vector above.
+    /// Collapsing <c>Failed</c> into <c>Skipped</c> or <c>Indeterminate</c>, or reporting a false
+    /// success, fails the outcome assertions; a fallback mapping delete or pointer clear changes
+    /// the durable witnesses.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_RollbackBodyErrorWithConfirmedRollback_FailedWithExactEvidence()
+    {
+        var goalId = GoalId + "-rollback-body-failed";
+        var sentinel = new InvalidOperationException("pending-rollback-body-sentinel");
+        var interceptor = new PendingRollbackThrowInterceptor(sentinel);
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+        var context = new CopilotHiveDbContext(
+            new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite((DbConnection)connection)
+                .AddInterceptors(interceptor)
+                .Options);
+        _contexts.Add(context);
+        var manager = new GoalPipelineManager(
+            new PipelineStore(context, NullLogger<PipelineStore>.Instance),
+            new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(goalId);
+            // Arm AFTER the admission's checkpoint was observed durable — only the ROLLBACK's own
+            // statement can be targeted from here.
+            interceptor.Arm();
+            throw enqueueSentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL EXCEPTION LEFT THE DISPATCH — never the store's sentinel.
+        Assert.Same(enqueueSentinel, thrown);
+
+        var taskId = taskIdAtEntry!;
+        // THE VACUITY GUARD: the rollback's CAS really threw exactly once, and NO follow-up durable
+        // UPDATE/DELETE ran afterwards — no mapping-delete fallback, no pointer clear, no save.
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Empty(interceptor.StatementsAfterThrow);
+
+        // THE HONEST OUTCOME: failed, with the store's EXACT exception — never a false success.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message.Contains("outcome=failed", StringComparison.Ordinal) &&
+            e.Message.Contains("pending-admission-rollback", StringComparison.Ordinal) &&
+            ReferenceEquals(e.Exception, sentinel));
+        Assert.DoesNotContain(logger.LogEntries, e =>
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+
+        // THE DURABLE WITNESSES ARE EXACTLY AS THE FAILING INVOCATION LEFT THEM.
+        Assert.Equal(taskId, ReadPersistedActiveTaskId(goalId));
+        Assert.Equal(blobAtEntry, ReadPersistedRegistryBlob(goalId));
+        Assert.Equal(goalId, ReadPersistedGoalId(taskId));
+
+        // THE LOCAL SETTLEMENT STILL COMPLETED: abandoned, unmapped, if-current-cleared.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+    }
+
+    /// <summary>
+    /// A MANAGER ROLLBACK THAT THROWS IS CONTAINED: the dispatch's guarded route swallows the escape
+    /// (recording <c>step=pending-admission</c>), the remaining settlement still runs, and the
+    /// ORIGINAL enqueue exception is rethrown BARE.
+    /// </summary>
+    /// <remarks>
+    /// THE SEAM: a fault-commit connection whose commit throws for the admission too, so the
+    /// admission itself is uncertain — this vector's purpose is only to prove that NOTHING a
+    /// rollback does can replace the enqueue exception or skip the settlement.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_RollbackReportingThrows_OriginalEnqueueExceptionIsPreserved()
+    {
+        // A logger that throws at the rollback-outcome record — the guarded diagnostic seam.
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue { OnEnqueue = _ => throw enqueueSentinel };
+        var logger = new SelectivelyThrowingLogger<TaskDispatchService>(
+            m => m.Contains("pending-admission-rollback", StringComparison.Ordinal));
+        var service = CreateService(manager, queue, logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE TWO-EXCEPTION DISTINCTION: the logger's throw was swallowed and the ORIGINAL left.
+        Assert.Same(enqueueSentinel, thrown);
+        Assert.True(logger.ThrewAtLeastOnce, "the rollback-outcome record's logger must have thrown");
+
+        // THE SETTLEMENT STILL RAN: abandoned, unmapped, if-current-cleared, and the slot-release
+        // record was emitted after the swallowed throw.
+        var taskId = SettledTaskId(pipeline);
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
+        Assert.Null(pipeline.ActiveTaskId);
+        Assert.Contains(logger.SeenMessages, m => m == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7e) THE EVIDENCE-ROUTE ORDERING — the manager's capture-through-settlement span
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE MANAGER LOCK IS HELD THROUGH THE ROLLBACK'S STORE WORK <b>AND ITS LOCAL SETTLEMENT</b>.
+    /// The rollback is first parked inside its own SQL (the manager's mapping monitor held), and is
+    /// then WEDGED inside its SETTLEMENT phase by holding the pipeline's monitor — the monitor
+    /// <c>ClearActiveTaskIfCurrent</c> must acquire. While it is wedged there, a concurrent DISJOINT
+    /// manager save CANNOT complete: the settlement runs INSIDE the <c>_mappingLock</c> span.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE MUTATION THIS KILLS: moving <c>_taskToGoal.TryRemove</c> and
+    /// <c>ClearActiveTaskIfCurrent</c> OUTSIDE the lock span. The earlier bounded non-completion
+    /// (while SQL is gated) cannot see that, and a bare "observe at the competitor's entry" probe
+    /// only RACES two field writes. The WEDGE removes the race entirely: the rollback is held in its
+    /// settlement phase for as long as the test wants, so the disjoint save's completion becomes a
+    /// deterministic discriminator — with the settlement inside the lock it must stay blocked; with
+    /// the settlement outside it, the lock has already been released and the save completes.
+    /// </para>
+    /// <para>
+    /// THE WEDGE IS SOUND because the pipeline monitor is provably RELEASED during the store work
+    /// (asserted below via a cross-thread probe), so taking it while the rollback is parked in SQL
+    /// cannot deadlock the arrangement. The disjoint pipeline is a DIFFERENT instance with its own
+    /// monitor, so its save is never blocked by the wedge itself — only by the manager lock. Every
+    /// wait is bounded (a timeout IS the failure), there are no sleeps and no reentrant callbacks.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleRollback_HoldsTheMappingLockThroughStoreWorkAndSettlement()
+    {
+        const string disjointGoalId = "goal-serial-disjoint";
+        var gate = new PendingRollbackGateInterceptor();
+        var manager = new GoalPipelineManager(CreateStore(gate), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        // A DISJOINT eligible pipeline — its OWN instance, hence its own monitor — that the
+        // concurrent save will checkpoint.
+        var disjoint = manager.CreatePipeline(CreateGoal(disjointGoalId));
+        disjoint.AllocateAttemptAndRegisterSlot("serial-disjoint-task", new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        disjoint.SetActiveTask("serial-disjoint-task");
+
+        var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // THE WEDGE HANDLE: the ROLLED-BACK pipeline's own private monitor, taken by reflection —
+        // the same established direct-monitor pattern the mapping-surface contention vector uses.
+        var pipelineLock = typeof(GoalPipeline)
+            .GetField("_lock", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(pipeline);
+        Assert.NotNull(pipelineLock);
+
+        var wedgeHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var wedgeRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var wedge = new Thread(() =>
+        {
+            lock (pipelineLock!)
+            {
+                wedgeHeld.SetResult();
+                wedgeRelease.Task.GetAwaiter().GetResult();
+            }
+        })
+        { IsBackground = true, Name = "settlement-wedge" };
+
+        // Arm the gate AFTER setup: only the rollback's registry UPDATE can block.
+        gate.Arm();
+        string? taskIdAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            // The rollback is now due; the gate will park it inside the store call.
+            taskIdAtEntry = t.TaskId;
+            throw enqueueSentinel;
+        };
+
+        var dispatch = Task.Factory.StartNew(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        Task? disjointSave = null;
+        try
+        {
+            await gate.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            // THE PIPELINE MONITOR IS RELEASED DURING THE STORE WORK. This probe runs on ANOTHER
+            // thread while the dispatch is parked inside the rollback's store call; if the pipeline
+            // monitor were held across that work, the probe would BLOCK instead of completing — so
+            // it is evaluated under a bounded wait (a timeout IS the failure, never a hang). A
+            // same-thread probe could not prove this, because Monitor is reentrant per thread.
+            var probe = Task.Factory.StartNew(
+                () => Assert.Single(pipeline.GetSlotsForTest()).State,
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            var probedState = await probe.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            // …and the FENCE had already happened BEFORE the store work: the slot reads Abandoned.
+            Assert.Equal(WorkSlotState.Abandoned, probedState);
+
+            // THE MAPPING AND THE POINTER ARE STILL OURS while the store work is parked — so the
+            // settlement assertions below are real state CHANGES, not values that were never set.
+            Assert.Same(pipeline, manager.GetByTaskId(taskIdAtEntry!));
+            Assert.Equal(taskIdAtEntry, pipeline.ActiveTaskId);
+
+            // TAKE THE WEDGE (safe: the pipeline monitor is free, as just proven), then let the
+            // store work finish. The rollback proceeds into its SETTLEMENT and blocks there, on
+            // ClearActiveTaskIfCurrent — still holding the manager lock.
+            wedge.Start();
+            await wedgeHeld.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            gate.Release();
+
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            disjointSave = Task.Factory.StartNew(
+                () =>
+                {
+                    started.SetResult();
+                    manager.PersistState(disjoint);
+                },
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // ── THE SETTLEMENT-SPAN PROOF ──
+            // The rollback is WEDGED inside its settlement. A disjoint manager save — which needs
+            // only the manager lock and touches an unrelated pipeline and row — must NOT complete,
+            // because the settlement is still inside the _mappingLock span. Under the mutant that
+            // settles OUTSIDE the lock, the lock is already free here and this save completes.
+            await Assert.ThrowsAsync<TimeoutException>(
+                () => disjointSave.WaitAsync(TimeSpan.FromMilliseconds(750), TestContext.Current.CancellationToken));
+            Assert.False(disjointSave.IsCompleted);
+            Assert.Null(ReadPersistedRegistryBlob(disjointGoalId));
+
+            // The dispatch itself is likewise still in flight — wedged mid-settlement.
+            Assert.False(dispatch.IsCompleted);
+        }
+        finally
+        {
+            // Release in the order that cannot strand a thread: the gate first (harmless if already
+            // released), then the wedge.
+            gate.Release();
+            wedgeRelease.TrySetResult();
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => dispatch.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+        await disjointSave!.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.True(wedge.Join(TimeSpan.FromSeconds(10)), "the wedge thread must have exited");
+
+        Assert.Equal(1, gate.BlockCount);
+
+        // BOTH local settlement actions completed once the wedge released.
+        Assert.Null(manager.GetByTaskId(taskIdAtEntry!));
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // The rollback completed confirmably and the disjoint save landed afterwards.
+        Assert.Null(ReadPersistedActiveTaskId(GoalId));
+        Assert.Null(ReadPersistedGoalId(SettledTaskId(pipeline)));
+        Assert.NotNull(ReadPersistedRegistryBlob(disjointGoalId));
+        Assert.Contains(logger.LogEntries, e => e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7c) THE OWNERSHIP CHECKPOINT — the REAL dispatch route
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
@@ -1099,20 +2152,20 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     /// <summary>
-    /// THE ENQUEUE-FAILURE RESIDUE ON THE ELIGIBLE ROUTE, pinned EXPLICITLY: the ORIGINAL enqueue
-    /// exception leaves the dispatch, the mapping is removed and the matching DURABLE pointer is
-    /// cleared — but the admission's durable slot may REMAIN Pending while the in-memory registry
-    /// shows it Abandoned.
-    /// <para>
-    /// THAT IS NOT A REPLAYABLE ADMISSION AND NOT A DURABLE ROLLBACK SUCCESS. The blob is a
-    /// POINT-IN-TIME CHECKPOINT taken at the admission; the rollback's in-memory abandon is not
-    /// written back here, and nothing in this slice reconciles the two. The residue is asserted
-    /// HONESTLY (with a positive observation of the still-Pending durable slot) rather than hidden
-    /// behind an unconditional <c>PersistState</c> repair.
-    /// </para>
+    /// THE ENQUEUE-FAILURE ROLLBACK ON THE ELIGIBLE ROUTE, pinned EXPLICITLY: the ORIGINAL enqueue
+    /// exception leaves the dispatch and the admission is undone by its OWN guarded atomic inverse —
+    /// the DURABLE registry's matching Pending slot becomes <c>Abandoned</c> (no longer Pending),
+    /// the DURABLE matching pointer is cleared and the matching mapping row is deleted, all in ONE
+    /// rollback transaction — while history, counters and the ordinary fields are preserved.
     /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: routing an evidence-carrying eligible admission into the LEGACY
+    /// sequence (or dropping the rollback call entirely) leaves the durable slot <c>Pending</c>, so
+    /// the <c>Abandoned</c> assertions below fail while every in-memory assertion still passes —
+    /// exactly the gap this vector closes.
+    /// </remarks>
     [Fact]
-    public async Task Dispatch_EligibleEnqueueFailure_ResiduePinned_DurableSlotStaysPendingWhileMemoryIsAbandoned()
+    public async Task Dispatch_EligibleEnqueueFailure_RollsBackThePendingAdmissionAtomically()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
@@ -1142,29 +2195,45 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         var taskId = SettledTaskId(pipeline);
         Assert.Equal(taskId, taskIdAtEntry);
 
-        // THE POSITIVE OBSERVATION: the admission's checkpoint was durable with a Pending slot.
+        // THE POSITIVE OBSERVATION BEFORE THE ROLLBACK: the admission's checkpoint was durable with
+        // a Pending slot (so the Abandoned assertion below is a real state CHANGE, not a default).
         var atEntry = WorkSlotRegistryCodec.Decode(blobAtEntry!);
-        Assert.Contains(atEntry.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
+        var entrySlot = Assert.Single(atEntry.Slots, s => s.Slot.TaskId == taskId);
+        Assert.Equal(WorkSlotState.Pending, entrySlot.State);
 
-        // ── THE RESIDUE ──
-        // The mapping row is REMOVED…
+        // ── THE ATOMIC INVERSE ──
+        // The matching mapping row is DELETED…
         Assert.Null(ReadPersistedGoalId(taskId));
-        // …and the matching DURABLE pointer is CLEARED.
+        // …the matching DURABLE pointer is CLEARED…
         Assert.Null(ReadPersistedActiveTaskId(GoalId));
-        // …while the DURABLE registry still shows the admission's slot Pending — the rollback's
-        // abandon is in MEMORY only.
+        // …and the DURABLE registry's matching slot is ABANDONED — in ONE rollback transaction.
         var durable = WorkSlotRegistryCodec.Decode(ReadPersistedRegistryBlob(GoalId)!);
-        Assert.Contains(durable.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
-        // The IN-MEMORY registry disagrees — Abandoned, which the durable blob does not reflect.
+        var durableSlot = Assert.Single(durable.Slots, s => s.Slot.TaskId == taskId);
+        Assert.Equal(WorkSlotState.Abandoned, durableSlot.State);
+        // HISTORY, IDENTITY AND COUNTERS ARE PRESERVED EXACTLY — the position, the attempt and every
+        // high-water entry the admission wrote survive the rollback untouched.
+        Assert.Equal(entrySlot.Slot.Position, durableSlot.Slot.Position);
+        Assert.Equal(entrySlot.Slot.Attempt, durableSlot.Slot.Attempt);
+        Assert.Equal(atEntry.DispatchAttempts, durable.DispatchAttempts);
+
+        // ── THE MEMORY SETTLEMENT: abandoned, unmapped and if-current-cleared ──
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(manager.GetByTaskId(taskId));
         Assert.Null(pipeline.ActiveTaskId);
 
-        // NOTHING claims this is recoverable: the durable Pending slot has NO mapping row, so no
-        // consumer could replay it, and no repair ran (the dispatch performs no PersistState).
+        // THE CONFIRMED ROLLBACK IS REPORTED HONESTLY (DEBUG), and no rollback-failure is recorded.
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Debug &&
+            e.Message.Contains("WorkSlotIntegrity: pending-admission-rollback", StringComparison.Ordinal) &&
+            e.Message.Contains("outcome=committed", StringComparison.Ordinal));
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
+
+        // THE SLOT-RELEASE RECORD IS STILL EMITTED.
         Assert.Contains(logger.LogEntries, e =>
             e.LogLevel == LogLevel.Warning &&
             e.Message == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
-        Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
+
+        // NOTHING claims recoverability: the durable slot is Abandoned AND has no mapping row.
     }
 
 
@@ -1286,15 +2355,21 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// <remarks>
     /// The interceptor targets <c>UPDATE ... pipelines</c> ONLY, so the admission's INSERTs commit
     /// normally and only E3's clear fails — the narrow injection that isolates this step.
+    /// <para>
+    /// THE ROUTE IS THE INELIGIBLE (LEGACY) ONE: E3 (<c>RollbackPersistedPointer</c>) is a step of
+    /// the legacy sequence only — the evidence-carrying eligible route uses the atomic inverse and
+    /// never calls it. The persisted row is seeded first so the creation is ineligible.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Dispatch_EnqueueThrowsAndPersistedPointerRollbackFails_LogsPointerRollbackAndContinues()
     {
         var updateSentinel = new InvalidOperationException("pointer-update-sentinel");
-        var manager = new GoalPipelineManager(
-            CreateStore(new PipelinesUpdateThrowingInterceptor(updateSentinel)),
-            new TestLogger<GoalPipelineManager>());
+        var store = CreateStore(new PipelinesUpdateThrowingInterceptor(updateSentinel));
+        store.SavePipeline(new GoalPipeline(CreateGoal(GoalId)));
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.False(pipeline.OwnershipCheckpointEligible);
         Arrange(pipeline, GoalPhase.Coding);
 
         var enqueueSentinel = new InvalidOperationException("enqueue-sentinel");
@@ -1341,6 +2416,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// records state at that statement observes the world strictly BETWEEN E2 and E4. Moving E3
     /// above E2 makes the mapping still present; moving it below E4 makes the in-memory pointer
     /// already null — either mutation flips one of the two assertions.
+    /// <para>
+    /// THE ROUTE IS THE INELIGIBLE (LEGACY) ONE: E2→E3→E4 is the legacy sequence, and the eligible
+    /// route's evidence-carrying rollback never issues E3's statement at all. The persisted row is
+    /// seeded first so the creation is ineligible, and the mapping row for THIS task is seeded so
+    /// the admission can still commit.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Dispatch_EnqueueThrows_RunsE3BetweenMappingRemovalAndPointerClear()
@@ -1366,9 +2447,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             memoryPointerDuringE3 = pipeline!.ActiveTaskId;
         });
 
-        var manager = new GoalPipelineManager(
-            CreateStore(observer), new TestLogger<GoalPipelineManager>());
+        var store = CreateStore(observer);
+        // THE INELIGIBLE SEED: a persisted row makes the replacement pipeline ineligible.
+        store.SavePipeline(new GoalPipeline(CreateGoal(GoalId)));
+        var manager = new GoalPipelineManager(store, new TestLogger<GoalPipelineManager>());
         pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.False(pipeline.OwnershipCheckpointEligible);
         Arrange(pipeline, GoalPhase.Coding);
         var service = CreateService(manager, queue, logger);
 
@@ -3287,6 +4371,203 @@ public sealed class WorkSlotPipelineManagerLoggerRegistrationTests
         var logger = loggerField!.GetValue(manager);
         Assert.NotNull(logger);
         Assert.IsAssignableFrom<ILogger<GoalPipelineManager>>(logger);
+    }
+}
+
+/// <summary>
+/// A transaction wrapper that lets the FIRST explicit transaction COMMIT normally and throws a
+/// pre-created sentinel at every LATER commit — BEFORE the underlying SQLite commit
+/// (<c>throwAfterCommit</c> = <c>false</c>) or immediately after it (the ambiguity the store must
+/// never resolve).
+/// </summary>
+/// <remarks>
+/// WHY THE FIRST COMMIT IS LET THROUGH: on the production dispatch the ADMISSION's transaction is
+/// the first one, so letting it land is what makes the admission produce real invocation-local
+/// rollback evidence; the rollback's own transaction is then the one whose commit throws. A blanket
+/// fault connection would break the admission instead and could never reach the vector this test is
+/// about.
+/// </remarks>
+internal sealed class AdmissionSecondCommitFaultConnection : AdmissionTransactionConnectionBase
+{
+    private readonly bool _throwAfterCommit;
+    private int _firstCommitCount;
+    private int _secondCommitCount;
+    private int _rollbackFaultCount;
+    private volatile bool _rollbackFaultArmed;
+
+    public AdmissionSecondCommitFaultConnection(string connectionString, bool throwAfterCommit)
+        : base(connectionString) => _throwAfterCommit = throwAfterCommit;
+
+    /// <summary>The distinct exception every faulting commit throws.</summary>
+    public InvalidOperationException CommitSentinel { get; } = new("rollback commit timing sentinel");
+
+    /// <summary>
+    /// The DISTINCT exception every faulting transaction ROLLBACK throws — deliberately a different
+    /// instance from <see cref="CommitSentinel"/> so a test can tell the two evidence slots apart.
+    /// </summary>
+    public InvalidOperationException RollbackSentinel { get; } = new("rollback transaction rollback sentinel");
+
+    /// <summary>How many commits returned normally (the admission's).</summary>
+    public int FirstCommitCount => Volatile.Read(ref _firstCommitCount);
+
+    /// <summary>How many commits were faulted (the rollback's).</summary>
+    public int SecondCommitCount => Volatile.Read(ref _secondCommitCount);
+
+    /// <summary>True once a faulting commit was attempted.</summary>
+    public bool SecondCommitAttempted => SecondCommitCount > 0;
+
+    /// <summary>How many transaction rollbacks were faulted (the vacuity guard).</summary>
+    public int RollbackFaultCount => Volatile.Read(ref _rollbackFaultCount);
+
+    /// <summary>
+    /// Arms the TRANSACTION-ROLLBACK fault. Call it AFTER the admission has committed (from the
+    /// enqueue callback), so only the pending-admission rollback's own transaction can be affected
+    /// and the fixture's setup runs through untouched.
+    /// </summary>
+    public void ArmRollbackFault() => _rollbackFaultArmed = true;
+
+    internal bool RollbackFaultArmed => _rollbackFaultArmed;
+
+    /// <summary>Counts a commit attempt; the FIRST is the admission's (not faulted).</summary>
+    internal int RecordCommitAttempt() => Interlocked.Increment(ref _firstCommitCount);
+
+    /// <summary>Counts a faulted commit attempt.</summary>
+    internal void RecordFaultedCommit() => Interlocked.Increment(ref _secondCommitCount);
+
+    /// <summary>Counts a faulted transaction rollback.</summary>
+    internal void RecordFaultedRollback() => Interlocked.Increment(ref _rollbackFaultCount);
+
+    protected override DbTransaction WrapTransaction(SqliteTransaction transaction) =>
+        new FaultTransaction(this, transaction);
+
+    private sealed class FaultTransaction : DbTransaction
+    {
+        private readonly AdmissionSecondCommitFaultConnection _owner;
+        private readonly SqliteTransaction _inner;
+
+        public FaultTransaction(AdmissionSecondCommitFaultConnection owner, SqliteTransaction inner)
+        {
+            _owner = owner;
+            _inner = inner;
+        }
+
+        public override System.Data.IsolationLevel IsolationLevel => _inner.IsolationLevel;
+        protected override DbConnection DbConnection => _owner;
+
+        public override void Commit()
+        {
+            // The FIRST commit (the admission's) lands normally; every later one is faulted.
+            if (_owner.RecordCommitAttempt() == 1)
+            {
+                _inner.Commit();
+                return;
+            }
+
+            _owner.RecordFaultedCommit();
+            if (!_owner._throwAfterCommit)
+                throw _owner.CommitSentinel;
+            _inner.Commit();
+            throw _owner.CommitSentinel;
+        }
+
+        public override void Rollback()
+        {
+            // ONLY once armed — so the admission's own transaction is never affected.
+            if (_owner.RollbackFaultArmed)
+            {
+                _owner.RecordFaultedRollback();
+                throw _owner.RollbackSentinel;
+            }
+
+            _inner.Rollback();
+        }
+
+        protected override void Dispose(bool disposing) => _inner.Dispose();
+    }
+}
+
+/// <summary>
+/// Parks the FIRST statement that writes the work-slot registry column on the <c>pipelines</c> row
+/// (<c>UPDATE … SET … work_slot_registry_json …</c>) on an external gate while armed — the
+/// rollback's own CAS update, which the manager reaches with its mapping monitor held. The gate
+/// performs no re-entrant work and is released by the test; the bounded wait keeps a never-released
+/// gate a test failure rather than a hang.
+/// </summary>
+internal sealed class PendingRollbackGateInterceptor : DbCommandInterceptor
+{
+    private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _blockCount;
+    private volatile bool _armed;
+
+    /// <summary>Completes the first time the targeted statement is reached.</summary>
+    public Task Entered => _entered.Task;
+
+    /// <summary>How many targeted statements actually parked (the vacuity guard).</summary>
+    public int BlockCount => Volatile.Read(ref _blockCount);
+
+    /// <summary>Arms the gate (call AFTER setup so only the rollback's statement can park).</summary>
+    public void Arm() => _armed = true;
+
+    /// <summary>Releases a parked statement.</summary>
+    public void Release() => _release.TrySetResult();
+
+    private void BlockIfTargeted(DbCommand command)
+    {
+        if (!_armed)
+            return;
+
+        var text = command.CommandText.TrimStart();
+        if (!text.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase))
+            return;
+        // THE ROLLBACK'S OWN CAS STATEMENT — its unique shape is the pointer CLEAR plus the
+        // replacement blob. The ADMISSION's row write names a concrete pointer (so it never matches
+        // this predicate), which is what keeps the gate from parking the admission instead.
+        if (!text.Contains("work_slot_registry_json", StringComparison.Ordinal))
+            return;
+        if (!text.Contains("active_task_id = NULL", StringComparison.Ordinal))
+            return;
+
+        // Only the FIRST targeted statement blocks; TrySetResult is the one-shot latch.
+        if (!_entered.TrySetResult())
+            return;
+
+        Interlocked.Increment(ref _blockCount);
+        _release.Task.Wait(TimeSpan.FromSeconds(60));
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        BlockIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        BlockIfTargeted(command);
+        return ValueTask.FromResult(result);
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        BlockIfTargeted(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        BlockIfTargeted(command);
+        return ValueTask.FromResult(result);
     }
 }
 
