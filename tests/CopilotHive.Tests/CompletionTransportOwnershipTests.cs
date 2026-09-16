@@ -185,15 +185,25 @@ public sealed class CompletionTransportOwnershipTests
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE ACCEPTED COMPLETION'S RECEIPT IS REAL AND DURABLE: the same invocation that released the
-    /// worker and notified the real downstream dispatcher left a receipt row written by the REAL
-    /// recorder over the REAL stores, carrying the mapped result and the recorded slot.
+    /// THE ACCEPTED COMPLETION'S RECEIPT IS REAL AND DURABLE, AND IT ALREADY EXISTS AT THE MOMENT
+    /// THE DOWNSTREAM NOTIFICATION IS OBSERVED: the same invocation that released the worker and
+    /// notified the real downstream dispatcher left a receipt row written by the REAL recorder over
+    /// the REAL stores, carrying the mapped result and the recorded slot.
     /// </summary>
     /// <remarks>
-    /// THE ORDER OF THE ASSERTIONS MATTERS. The downstream evidence is awaited FIRST — production's
-    /// own <c>NotifyAsync</c> chain — and the receipt is read afterwards, so this vector really
-    /// proves the receipt existed when the notification was observed, rather than merely that the
-    /// write happened eventually.
+    /// <para>
+    /// THE ORDERING EVIDENCE IS TAKEN INSIDE THE NOTIFICATION ITSELF, not after it. The shared
+    /// notifier's FIRST subscriber probes the REAL receipt store for this task id and captures the
+    /// row BEFORE the awaiting test is released (see
+    /// <see cref="CompletionObservations.ReceiptProbe"/>). A regression that published the
+    /// completion BEFORE persisting the receipt would therefore observe a MISSING row at that
+    /// instant and fail here — which a post-call readback alone cannot detect, because it would be
+    /// satisfied by a write that landed later.
+    /// </para>
+    /// <para>
+    /// THE POST-CALL READBACK IS KEPT as additional DURABILITY evidence: the row is still there,
+    /// through a fresh store, after the whole handler returned.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Completion_Accepted_RetainsDurableReceiptAndReleasesOnce()
@@ -202,6 +212,10 @@ public sealed class CompletionTransportOwnershipTests
         await RunAsync(h, async () =>
         {
             h.Assign("task-receipt-valid", model: "assigned-model");
+
+            // The assignment's own dashboard notification is excluded, so the count asserted below
+            // is the COMPLETION's own.
+            h.ResetDashboardNotifications();
 
             var result = await h.CompleteAndAwaitDownstreamAsync("task-receipt-valid");
 
@@ -213,8 +227,32 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(1, h.TransportNotifications);
             Assert.Equal("task-receipt-valid", result.TaskId);
 
-            // THE REAL RECEIPT ROW is readable, and it carries what the RECORDED assignment and the
-            // MAPPED result actually said.
+            // …and EXACTLY ONE dashboard state-change for the accepted completion.
+            Assert.Equal(1, h.DashboardNotifications);
+
+            // ── THE RECEIPT ALREADY EXISTED WHEN THE NOTIFICATION WAS OBSERVED ───────────────
+            // Read from INSIDE the notifier observation, through a real store load, before this
+            // test was released. This is the record-BEFORE-notification ordering proof.
+            var observed = h.LastObservation;
+            Assert.NotNull(observed);
+            Assert.Null(observed!.ProbeFailure);
+            Assert.NotNull(observed.ReceiptAtNotification);
+
+            var atNotification = observed.ReceiptAtNotification!.Receipt;
+            Assert.Equal("goal-ownership", atNotification.GoalId);
+            Assert.Equal(WorkerId, atNotification.WorkerId);
+            Assert.Equal(DomainWorkerRole.Coder, atNotification.Role);
+            Assert.Equal("task-receipt-valid", atNotification.Slot.TaskId);
+            Assert.Equal(GoalPhase.Coding, atNotification.Slot.Position!.Phase);
+            Assert.Equal(1, atNotification.Slot.Position.Iteration);
+            Assert.Equal(1, atNotification.Slot.Position.Occurrence);
+            Assert.Equal(1, atNotification.Slot.Attempt);
+            Assert.Equal("output-task-receipt-valid", atNotification.Result.Output);
+            Assert.Equal("assigned-model", atNotification.Result.Model);
+            Assert.Equal(TaskOutcome.Completed, atNotification.Result.Status);
+
+            // THE REAL RECEIPT ROW is still readable afterwards, and it carries what the RECORDED
+            // assignment and the MAPPED result actually said — the durability half of the evidence.
             var loaded = h.ReadReceipt("task-receipt-valid");
             Assert.NotNull(loaded);
             Assert.Equal("goal-ownership", loaded!.Receipt.GoalId);
@@ -226,6 +264,240 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(1, loaded.Receipt.Slot.Position.Occurrence);
             Assert.Equal(1, loaded.Receipt.Slot.Attempt);
             Assert.Equal("output-task-receipt-valid", loaded.Receipt.Result.Output);
+
+            // THE SAME ROW, not a rewritten one: the notification-time and post-call reads agree on
+            // the first-stored instant.
+            Assert.Equal(
+                observed.ReceiptAtNotification.FirstStoredAtUtc.Ticks, loaded.FirstStoredAtUtc.Ticks);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (2c) THE RECORD-BEFORE-RELEASE BOUNDARY — a refusal AFTER the receipt was written
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE HEADLINE ORDERING PROOF: the receipt is written BEFORE the checked release runs, so a
+    /// release that is refused AFTER the record leaves the durable evidence in place and mutates
+    /// NOTHING.
+    /// <para>
+    /// The ownership is invalidated INSIDE the recording call, by a decorator that performs the
+    /// REAL store write through the REAL recorder and only then clears the worker's busy flag and
+    /// current task. The handler therefore passes every PRE-record validation, really retains the
+    /// receipt, and is then refused by <c>ApplyTaskCompletion</c>'s own re-validation.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THIS IS THE VECTOR THAT PINS THE ORDER. Every other refusal here stops BEFORE the
+    /// recorder runs, so none of them can distinguish "record, then release" from "release, then
+    /// record". This one can: the receipt provably exists while the release provably refused.
+    /// </para>
+    /// <para>
+    /// THE REFUSAL IS ATTRIBUTED, NOT ASSUMED. The vector waits for the CHECKED-RELEASE refusal
+    /// reason specifically, and separately asserts the acceptance provenance line IS present — so a
+    /// pre-record gate silently refusing instead would fail both ways.
+    /// </para>
+    /// <para>
+    /// IT IS FULLY DETERMINISTIC: the mutation happens synchronously inside the handler's own call
+    /// stack, on the handler's thread. There is no live race and no timing sleep.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Completion_OwnershipClearedAfterRecording_ReleaseRefusedAndReceiptRemains()
+    {
+        var h = Harness.CreateWithOwnershipMutationAfterRecord();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-post-record-idle", model: "assigned-model");
+
+            // The assignment's own dashboard notification is excluded, so a NON-zero count below
+            // can only come from the completion path.
+            h.ResetDashboardNotifications();
+
+            // THE MUTATION, ARMED FOR THIS DELIVERY: the REAL write happens first, then the pool's
+            // busy flag and current task are cleared — the shape the checked release refuses.
+            h.RecorderHook!.AfterRecord = () => h.Pool.MarkIdle(WorkerId);
+
+            await h.CompleteAndAwaitCheckedReleaseRefusedAsync("task-post-record-idle");
+
+            // THE RECORDER REALLY RAN: the refusal is genuinely POST-record.
+            Assert.Equal(1, h.RecorderHook.RecordCount);
+
+            // THE DURABLE RECEIPT REMAINS — never deleted, compensated or rebound by the refusal.
+            var afterRefusal = h.ReadReceipt("task-post-record-idle");
+            Assert.NotNull(afterRefusal);
+            Assert.Equal("goal-ownership", afterRefusal!.Receipt.GoalId);
+            Assert.Equal(WorkerId, afterRefusal.Receipt.WorkerId);
+            Assert.Equal(DomainWorkerRole.Coder, afterRefusal.Receipt.Role);
+            Assert.Equal("task-post-record-idle", afterRefusal.Receipt.Slot.TaskId);
+            Assert.Equal("output-task-post-record-idle", afterRefusal.Receipt.Result.Output);
+
+            // THE CHECKED RELEASE MUTATED NOTHING. CurrentModel is the discriminator: the pool
+            // clears it INSIDE an accepted release and nowhere else, and the test's own MarkIdle
+            // deliberately does not touch it — so its survival proves the release never applied.
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+
+            // …and the ACTIVE QUEUE ENTRY survives: only an accepted release removes it.
+            Assert.NotNull(h.Queue.GetActiveTask("task-post-record-idle"));
+
+            // NOTHING WAS NOTIFIED: no dashboard success notification and no completion
+            // notification, so nothing downstream ran either.
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-post-record-idle"));
+
+            // The stream is alive — a refused release must not unwind it.
+            Assert.False(h.StreamEnded);
+
+            // THE ROW IS STABLE across the following activity too: same payload, same first-stored
+            // instant, so nothing rewrote or refreshed it afterwards.
+            var later = h.ReadReceipt("task-post-record-idle");
+            Assert.NotNull(later);
+            Assert.Equal(afterRefusal.FirstStoredAtUtc.Ticks, later!.FirstStoredAtUtc.Ticks);
+            Assert.Equal(afterRefusal.Receipt.Result.Output, later.Receipt.Result.Output);
+        });
+    }
+
+    /// <summary>
+    /// THE SAME BOUNDARY, WITH THE WORKER MOVED ON: the worker takes a DIFFERENT task inside the
+    /// recording call, so the checked release is refused and the SUCCESSOR's own ownership and
+    /// active queue entry are left completely untouched — while the predecessor's receipt remains.
+    /// </summary>
+    /// <remarks>
+    /// THE SUCCESSOR IS REAL STATE, not a fixture flag: it has its own active queue entry assigned
+    /// to this worker and the pool's busy pointer names it. An accepted release would have cleared
+    /// that pointer, cleared the model and removed a queue entry; none of that happened.
+    /// </remarks>
+    [Fact]
+    public async Task Completion_WorkerMovedOnAfterRecording_ReleaseRefusedAndSuccessorSurvives()
+    {
+        var h = Harness.CreateWithOwnershipMutationAfterRecord();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-post-record-moved", model: "assigned-model");
+
+            // The successor's own REAL transport state, prepared up front so the mutation below is a
+            // single deterministic pointer move rather than a multi-step setup inside the handler.
+            var successor = h.BuildTask("task-post-record-successor", "successor-model");
+            h.Queue.Activate(successor, WorkerId);
+
+            // Every dashboard notification the setup produced is excluded.
+            h.ResetDashboardNotifications();
+
+            h.RecorderHook!.AfterRecord = () =>
+            {
+                // THE WORKER MOVES ON — same pinned instance (so the stream's own pinned-instance
+                // guard is untouched), different current task.
+                h.Pool.MarkBusy(WorkerId, "task-post-record-successor");
+            };
+
+            await h.CompleteAndAwaitCheckedReleaseRefusedAsync("task-post-record-moved");
+
+            Assert.Equal(1, h.RecorderHook.RecordCount);
+
+            // THE PREDECESSOR'S RECEIPT REMAINS.
+            var afterRefusal = h.ReadReceipt("task-post-record-moved");
+            Assert.NotNull(afterRefusal);
+            Assert.Equal("task-post-record-moved", afterRefusal!.Receipt.Slot.TaskId);
+
+            // THE SUCCESSOR IS UNTOUCHED: still busy with its own task, its queue entry intact.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-post-record-successor", h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask("task-post-record-successor"));
+
+            // AND THE PREDECESSOR'S OWN ENTRY AND MODEL SURVIVE: the refused release removed
+            // nothing and cleared nothing.
+            Assert.NotNull(h.Queue.GetActiveTask("task-post-record-moved"));
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-post-record-moved"));
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// THE SAME BOUNDARY FOR AN ABA REPLACEMENT: the pinned instance is REPLACED inside the
+    /// recording call, so the checked release refuses and the replacement's own assignment survives
+    /// — while the predecessor's receipt remains durably stored.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THIS ONE IS INVOKED DIRECTLY, stated honestly. Replacing the pinned instance makes the
+    /// real read loop's OWN per-message pinned-instance guard end the stream on the next message, so
+    /// the post-handler barrier could never run. The direct, SYNCHRONOUS invocation is the same
+    /// deterministic technique the existing TOCTOU vector uses: the call RETURNING is itself the
+    /// barrier, and any escaping exception surfaces in the vector rather than in a swallowed stream
+    /// fault.
+    /// </para>
+    /// <para>
+    /// The two stream-driven vectors above cover the other two refusal shapes of the checked
+    /// release, so the ordering claim does not rest on this simulation alone.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Completion_PinnedInstanceReplacedAfterRecording_ReleaseRefusedAndReceiptRemains()
+    {
+        var h = Harness.CreateWithOwnershipMutationAfterRecord();
+        await RunAsync(h, () =>
+        {
+            h.Assign("task-post-record-aba", model: "assigned-model");
+            var stale = h.Worker;
+
+            h.ResetDashboardNotifications();
+
+            ConnectedWorker? replacement = null;
+            h.RecorderHook!.AfterRecord = () =>
+            {
+                // THE REPLACEMENT under the SAME id, taking over the very same task — so ONLY the
+                // checked release's instance check can refuse the mutation.
+                Assert.True(h.Pool.RemoveWorker(stale));
+                replacement = h.Pool.RegisterWorker(WorkerId, []);
+                h.Pool.MarkBusy(WorkerId, "task-post-record-aba");
+                replacement.CurrentModel = "replacement-model";
+            };
+
+            // A DIRECT, SYNCHRONOUS call: returning IS the post-handler barrier here.
+            h.InvokeHandleTaskCompleteDirectly(stale, "task-post-record-aba");
+
+            Assert.Equal(1, h.RecorderHook.RecordCount);
+
+            // THE REFUSAL WAS THE CHECKED RELEASE'S, and it named this task.
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.CheckedReleaseRefused,
+                         StringComparison.Ordinal)
+                     && m.Contains("task-post-record-aba", StringComparison.Ordinal));
+
+            // THE PRE-RECORD VALIDATION PASSED: the acceptance provenance line was emitted, so this
+            // really is a POST-record refusal rather than an early gate.
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionAccepted, StringComparison.Ordinal)
+                     && m.Contains("task-post-record-aba", StringComparison.Ordinal));
+
+            // THE DURABLE RECEIPT REMAINS.
+            var afterRefusal = h.ReadReceipt("task-post-record-aba");
+            Assert.NotNull(afterRefusal);
+            Assert.Equal("task-post-record-aba", afterRefusal!.Receipt.Slot.TaskId);
+            Assert.Equal("output-task-post-record-aba", afterRefusal.Receipt.Result.Output);
+
+            // THE REPLACEMENT'S OWN ASSIGNMENT, and the queue entry, both survive.
+            Assert.NotNull(replacement);
+            Assert.True(replacement!.IsBusy);
+            Assert.Equal("task-post-record-aba", replacement.CurrentTaskId);
+            Assert.Equal("replacement-model", replacement.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-post-record-aba"));
+
+            // NOTHING WAS NOTIFIED.
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-post-record-aba"));
+            return Task.CompletedTask;
         });
     }
 
@@ -253,6 +525,10 @@ public sealed class CompletionTransportOwnershipTests
             h.Worker.CurrentModel = "assigned-model";
             h.Queue.Activate(h.BuildTask("task-unrecorded", "assigned-model"), WorkerId);
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP, so the zero asserted below can only be
+            // broken by a notification the COMPLETION path itself raised.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-unrecorded",
                 nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
@@ -263,6 +539,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("assigned-model", h.Worker.CurrentModel);
             Assert.NotNull(h.Queue.GetActiveTask("task-unrecorded"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-unrecorded"));
             Assert.Null(h.ReadReceipt("task-unrecorded"));
             Assert.False(h.StreamEnded, "a receipt refusal must not unwind the worker's stream");
@@ -301,6 +578,9 @@ public sealed class CompletionTransportOwnershipTests
                 "task-foreign-context", "goal-ownership", DomainWorkerRole.Coder,
                 workerId: "worker-somewhere-else");
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-foreign-context",
                 nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
@@ -309,8 +589,70 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("task-foreign-context", h.Worker.CurrentTaskId);
             Assert.NotNull(h.Queue.GetActiveTask("task-foreign-context"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-foreign-context"));
             Assert.Null(h.ReadReceipt("task-foreign-context"));
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// THE REMAINING MISMATCHED-CONTEXT CELLS — a stored GOAL that disagrees with the active task,
+    /// and a stored ROLE that disagrees with it — are refused exactly like the foreign-worker cell:
+    /// the completion is retained, no receipt is written, and NOTHING is notified on any channel.
+    /// </summary>
+    /// <remarks>
+    /// THE ROLE CELL IS A CONSTRUCTIBLE DISAGREEMENT, not a fabricated one: the stored context is
+    /// recorded at the TESTING phase (whose existing mapping yields <c>Tester</c>), which the
+    /// assignment context's own constructor accepts, while the active task is a <c>Coder</c> task.
+    /// </remarks>
+    /// <param name="cell">Which stored-context disagreement to seed.</param>
+    [Theory]
+    [InlineData("goal")]
+    [InlineData("role")]
+    public async Task Completion_StoredContextDisagreesOnGoalOrRole_IsRetainedAndNothingNotified(string cell)
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            var taskId = $"task-mismatch-{cell}";
+
+            h.Pool.MarkBusy(WorkerId, taskId);
+            h.Worker.Role = DomainWorkerRole.Coder;
+            h.Worker.CurrentModel = "assigned-model";
+            h.Queue.Activate(h.BuildTask(taskId, "assigned-model"), WorkerId);
+
+            switch (cell)
+            {
+                case "goal":
+                    // The SAME worker and role, a DIFFERENT goal than the active task's.
+                    h.RecordAssignmentContext(taskId, "goal-somewhere-else", DomainWorkerRole.Coder);
+                    break;
+
+                case "role":
+                    // The SAME worker and goal, a role the active Coder task does not carry.
+                    h.RecordAssignmentContext(taskId, "goal-ownership", DomainWorkerRole.Tester);
+                    break;
+
+                default:
+                    throw new InvalidOperationException($"Unknown mismatch cell '{cell}'.");
+            }
+
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP.
+            h.ResetDashboardNotifications();
+
+            await h.CompleteAndAwaitNotRecordedAsync(
+                taskId, nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
+
+            // THE COMPLETION IS RETAINED and NOTHING was notified on ANY channel.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal(taskId, h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask(taskId));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount(taskId));
+            Assert.Null(h.ReadReceipt(taskId));
             Assert.False(h.StreamEnded);
         });
     }
@@ -333,6 +675,9 @@ public sealed class CompletionTransportOwnershipTests
             var before = h.ReadReceipt("task-conflict");
             Assert.NotNull(before);
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-conflict",
                 nameof(WorkerCompletionRecordingFailureReason.Conflict));
@@ -342,6 +687,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("assigned-model", h.Worker.CurrentModel);
             Assert.NotNull(h.Queue.GetActiveTask("task-conflict"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-conflict"));
             Assert.False(h.StreamEnded);
 
@@ -393,6 +739,10 @@ public sealed class CompletionTransportOwnershipTests
             {
                 h.Assign("task-indeterminate", model: "assigned-model");
 
+                // THE DASHBOARD COUNTER IS RESET AFTER THE ASSIGNMENT, so the zero asserted for the
+                // refusal below is the completion path's own.
+                h.ResetDashboardNotifications();
+
                 // ── THE UNCONFIRMED WRITE ────────────────────────────────────────────────────
                 await h.CompleteAndAwaitNotRecordedAsync(
                     "task-indeterminate",
@@ -404,6 +754,7 @@ public sealed class CompletionTransportOwnershipTests
                 Assert.Equal("assigned-model", h.Worker.CurrentModel);
                 Assert.NotNull(h.Queue.GetActiveTask("task-indeterminate"));
                 Assert.Equal(0, h.TransportNotifications);
+                Assert.Equal(0, h.DashboardNotifications);
                 Assert.Equal(0, h.DownstreamHandledCount("task-indeterminate"));
                 Assert.False(h.StreamEnded);
 
@@ -414,6 +765,7 @@ public sealed class CompletionTransportOwnershipTests
 
                 // ── THE IDENTICAL LATER COMPLETION settles AlreadyStored AND PROCEEDS ────────
                 interceptor.Disarm();
+                h.ResetDashboardNotifications();
                 var result = await h.CompleteAndAwaitDownstreamAsync("task-indeterminate");
 
                 Assert.Equal("task-indeterminate", result.TaskId);
@@ -422,6 +774,10 @@ public sealed class CompletionTransportOwnershipTests
                 Assert.Null(h.Queue.GetActiveTask("task-indeterminate"));
                 Assert.Equal(1, h.DownstreamHandledCount("task-indeterminate"));
                 Assert.Equal(1, h.TransportNotifications);
+
+                // THE ACCEPTED SETTLEMENT DID notify the dashboard exactly once — the positive
+                // control for the zeros asserted on the refusal above.
+                Assert.Equal(1, h.DashboardNotifications);
 
                 // THE STORED ROW AND ITS TIME ARE UNCHANGED by either invocation.
                 var settled = h.ReadReceipt("task-indeterminate");
@@ -481,6 +837,9 @@ public sealed class CompletionTransportOwnershipTests
                 "VALUES ('task-corrupt', 'goal-ownership', '" + corruptPayload + "', '" +
                 seededFirstStored + "')");
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-corrupt",
                 nameof(WorkerCompletionRecordingFailureReason.StoreError));
@@ -489,6 +848,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("task-corrupt", h.Worker.CurrentTaskId);
             Assert.NotNull(h.Queue.GetActiveTask("task-corrupt"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-corrupt"));
             Assert.False(h.StreamEnded);
 
@@ -515,6 +875,9 @@ public sealed class CompletionTransportOwnershipTests
         {
             h.Assign("task-no-recorder", model: "assigned-model");
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE ASSIGNMENT.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-no-recorder",
                 nameof(WorkerCompletionRecordingFailureReason.MissingRecorder));
@@ -525,6 +888,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("assigned-model", h.Worker.CurrentModel);
             Assert.NotNull(h.Queue.GetActiveTask("task-no-recorder"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-no-recorder"));
             Assert.Null(h.ReadReceipt("task-no-recorder"));
             Assert.False(h.StreamEnded);
@@ -558,6 +922,9 @@ public sealed class CompletionTransportOwnershipTests
 
             h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.CompletionNotRecorded);
 
+            // THE DASHBOARD COUNTER IS RESET AFTER THE SETUP.
+            h.ResetDashboardNotifications();
+
             await h.CompleteAndAwaitNotRecordedAsync(
                 "task-logger-fault",
                 nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
@@ -567,6 +934,7 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal("task-logger-fault", h.Worker.CurrentTaskId);
             Assert.NotNull(h.Queue.GetActiveTask("task-logger-fault"));
             Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.DownstreamHandledCount("task-logger-fault"));
             Assert.Null(h.ReadReceipt("task-logger-fault"));
             Assert.False(h.StreamEnded, "a throwing diagnostic must never unwind the worker's stream");
@@ -1116,6 +1484,13 @@ public sealed class CompletionTransportOwnershipTests
         /// </summary>
         public required SignallingStreamWriter Writer { get; init; }
 
+        /// <summary>
+        /// THE OWNERSHIP-MUTATING RECORDER DECORATOR, when the vector asked for one. It is the seam
+        /// the post-record checked-release vectors use to invalidate ownership AFTER the real
+        /// receipt has been written. <c>null</c> for every other harness.
+        /// </summary>
+        public OwnershipMutatingRecorder? RecorderHook { get; private init; }
+
         private ChannelStreamReader Reader { get; init; } = null!;
 
         /// <summary>The RETAINED producer task; the strict teardown joins exactly this instance.</summary>
@@ -1125,11 +1500,42 @@ public sealed class CompletionTransportOwnershipTests
 
         private int _barrierSequence;
         private int _tasksEnqueued;
+        private int _dashboardNotifications;
 
         private Harness(CompletionObservations observations) => _observations = observations;
 
         /// <summary>Transport-level notifications the shared notifier emitted (auxiliary observation).</summary>
         public int TransportNotifications => _observations.Count;
+
+        /// <summary>
+        /// How many REAL <see cref="DashboardNotifier.NotifyStateChanged"/> invocations have been
+        /// observed since the last <see cref="ResetDashboardNotifications"/>.
+        /// </summary>
+        /// <remarks>
+        /// THE OBSERVATION IS THE PRODUCTION EVENT ITSELF: the harness subscribes to the real
+        /// notifier's existing <see cref="DashboardNotifier.OnStateChanged"/> event, so a stray
+        /// state-change raised anywhere on the completion path is counted here. No production type
+        /// is modified to make this observable.
+        /// </remarks>
+        public int DashboardNotifications => Volatile.Read(ref _dashboardNotifications);
+
+        /// <summary>
+        /// Zeroes the dashboard counter, so a vector's assertion can only be broken by a
+        /// notification raised AFTER the reset.
+        /// </summary>
+        /// <remarks>
+        /// EVERY REFUSAL VECTOR RESETS AFTER ITS SETUP. The assignment path legitimately notifies
+        /// (ApplyTaskAssignment does), so without the reset a setup notification would mask a stray
+        /// completion-path notification — and, worse, a vector could "pass" while a regression
+        /// notified.
+        /// </remarks>
+        public void ResetDashboardNotifications() => Interlocked.Exchange(ref _dashboardNotifications, 0);
+
+        /// <summary>
+        /// The LAST observation the shared notifier's first subscriber recorded, including the
+        /// receipt probe taken AT the notification instant. <c>null</c> before any notification.
+        /// </summary>
+        public CompletionObservations.Observation? LastObservation => _observations.Last;
 
         /// <summary>How many tasks the REAL queue accepted — the "did the pipeline advance" probe.</summary>
         public int TasksEnqueued => Volatile.Read(ref _tasksEnqueued);
@@ -1178,11 +1584,30 @@ public sealed class CompletionTransportOwnershipTests
             CreateCore(
                 withPublishedAssignmentSupport: false, dbPath: null, interceptors: null, withRecorder: false);
 
+        /// <summary>
+        /// Creates a harness whose recorder is the REAL <see cref="WorkerCompletionRecorder"/>
+        /// wrapped in an <see cref="OwnershipMutatingRecorder"/> decorator, so a vector can
+        /// invalidate transport ownership at the instant AFTER the real receipt was written.
+        /// </summary>
+        /// <remarks>
+        /// THE DECORATOR CHANGES NO RECORDING BEHAVIOUR: it delegates to the real recorder first
+        /// and, only on a successful return, runs the vector's own mutation. Nothing about the
+        /// production write path, its refusals or its evidence is altered.
+        /// </remarks>
+        public static Harness CreateWithOwnershipMutationAfterRecord() =>
+            CreateCore(
+                withPublishedAssignmentSupport: false,
+                dbPath: null,
+                interceptors: null,
+                withRecorder: true,
+                withOwnershipMutationHook: true);
+
         private static Harness CreateCore(
             bool withPublishedAssignmentSupport,
             string? dbPath,
             IInterceptor[]? interceptors = null,
-            bool withRecorder = true)
+            bool withRecorder = true,
+            bool withOwnershipMutationHook = false)
         {
             var pool = new WorkerPool();
             var queue = new TaskQueue();
@@ -1237,6 +1662,27 @@ public sealed class CompletionTransportOwnershipTests
             }
 
             var serviceLogger = new SignallingLogger<HiveOrchestratorService>();
+
+            // THE RECORDER THE SERVICE GETS: the REAL one, optionally wrapped in the
+            // ownership-mutating decorator the post-record release vectors need.
+            OwnershipMutatingRecorder? recorderHook = null;
+            IWorkerCompletionRecorder? completionRecorder = null;
+            if (withRecorder)
+            {
+                var realRecorder = new WorkerCompletionRecorder(
+                    recordStores.AssignmentStore, recordStores.ReceiptStore);
+
+                if (withOwnershipMutationHook)
+                {
+                    recorderHook = new OwnershipMutatingRecorder(realRecorder);
+                    completionRecorder = recorderHook;
+                }
+                else
+                {
+                    completionRecorder = realRecorder;
+                }
+            }
+
             var service = new HiveOrchestratorService(
                 pool,
                 queue,
@@ -1246,10 +1692,7 @@ public sealed class CompletionTransportOwnershipTests
                 serviceLogger,
                 dashboardNotifier: dashboard,
                 assignmentPublisher: assignmentPublisher,
-                completionRecorder: withRecorder
-                    ? new WorkerCompletionRecorder(
-                        recordStores.AssignmentStore, recordStores.ReceiptStore)
-                    : null);
+                completionRecorder: completionRecorder);
 
             var worker = pool.RegisterWorker(WorkerId, []);
             var reader = new ChannelStreamReader();
@@ -1274,7 +1717,18 @@ public sealed class CompletionTransportOwnershipTests
                 Reader = reader,
                 StreamTask = streamTask,
                 Stores = recordStores,
+                RecorderHook = recorderHook,
             };
+
+            // THE DASHBOARD SIDE-EFFECT OBSERVATION: the REAL notifier's own state-changed event.
+            // Every NotifyStateChanged the production paths raise increments this counter, so a
+            // refusal vector asserting zero really sees a stray notification.
+            dashboard.OnStateChanged += () => Interlocked.Increment(ref harness._dashboardNotifications);
+
+            // THE RECEIPT PROBE the accepted vector reads AT the notification instant: the first
+            // notifier subscriber loads the row through the REAL store BEFORE the awaiting test is
+            // released, so an ordering regression is visible rather than merely eventually correct.
+            observations.ReceiptProbe = taskId => recordStores.ReceiptStore.Load(taskId);
 
             // THE ADVANCE PROBE: a pipeline that advances dispatches its successor through the real
             // PipelineDriver, which enqueues here.
@@ -1863,6 +2317,65 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
+        /// Delivers a completion whose CHECKED RELEASE is refused AFTER the receipt was recorded,
+        /// awaits the production checked-release refusal warning and then the post-handler barrier
+        /// proving the handler returned locally.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THE REFUSAL IS ATTRIBUTED TO THE CHECKED RELEASE SPECIFICALLY, by waiting on that
+        /// guard's OWN reason text. A pre-record gate refusing instead would emit a different
+        /// reason and this wait would expire.
+        /// </para>
+        /// <para>
+        /// THE PRE-RECORD VALIDATION IS PROVEN TO HAVE PASSED, by the presence of the acceptance
+        /// provenance line for this task id — which production emits only after all four ownership
+        /// gates and before the recording call. Together with the recorder's own invocation count,
+        /// that is what makes this a POST-record refusal rather than an early one.
+        /// </para>
+        /// </remarks>
+        /// <param name="taskId">The completing task's identifier.</param>
+        public async Task CompleteAndAwaitCheckedReleaseRefusedAsync(string taskId)
+        {
+            var signal = ServiceLogger.WaitFor(
+                HiveOrchestratorService.OwnershipRefusalReasons.CheckedReleaseRefused);
+
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Complete = BuildComplete(
+                    taskId, null, false, CopilotHive.Shared.Grpc.TaskStatus.Completed),
+            });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE EARLY RETURN IS PROVEN, not assumed.
+            await BarrierAsync();
+
+            // The refusal really was the CHECKED RELEASE's, and it named this task.
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.CheckedReleaseRefused,
+                         StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+            // THE PRE-RECORD VALIDATION PASSED: the acceptance provenance line is present, so the
+            // handler reached the recorder — this is NOT an early ownership refusal.
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionAccepted, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+            // AND IT WAS NOT A RECORDING REFUSAL EITHER: the canonical receipt-not-confirmed
+            // disposition never appeared for this task.
+            Assert.DoesNotContain(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionNotRecorded, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+        }
+
+        /// <summary>
         /// Pushes a Ready and awaits the production READY-IGNORED warning naming the STILL-ACTIVE
         /// queue entry as the refusing guard, then the post-handler barrier.
         /// </summary>
@@ -2045,21 +2558,67 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// The transport-side observation of the SHARED notifier: it records each emitted
-    /// <see cref="TaskResult"/> so the model assertions have a value to read.
+    /// <see cref="TaskResult"/> so the model assertions have a value to read, AND — crucially — it
+    /// probes the REAL receipt store AT THAT INSTANT, before the awaiting test is released.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// IT IS NEVER DOWNSTREAM EVIDENCE. This observer proves only that the TRANSPORT published a
     /// domain result; whether the REAL downstream chain received and classified it is read from
     /// <c>TaskCompletionService</c>'s own production log lines. It is subscribed FIRST so the real
     /// dispatcher stays the last (and therefore awaited) subscriber.
+    /// </para>
+    /// <para>
+    /// THE PROBE IS THE ORDERING EVIDENCE. Because this subscriber runs INSIDE production's
+    /// <c>NotifyAsync</c> invocation chain, the row it loads is the row that existed at the moment
+    /// the completion was published. A regression that published BEFORE persisting the receipt
+    /// would be caught here; a post-call readback could not tell the two apart.
+    /// </para>
     /// </remarks>
     private sealed class CompletionObservations
     {
         private readonly Queue<TaskCompletionSource<TaskResult>> _waiters = new();
+        private readonly object _gate = new();
         private int _count;
+        private Observation? _last;
+
+        /// <summary>
+        /// ONE observation: the published result, the receipt read AT that instant, and the probe's
+        /// own failure when the load itself threw.
+        /// </summary>
+        /// <param name="Result">The domain result the transport published.</param>
+        /// <param name="ReceiptAtNotification">
+        /// The receipt row as it existed when the notification was raised, or <c>null</c> when no
+        /// row existed at that instant.
+        /// </param>
+        /// <param name="ProbeFailure">
+        /// The exception the probe's own load threw, or <c>null</c>. It is CAPTURED rather than
+        /// thrown so a probe failure can never corrupt the production notification chain under
+        /// observation.
+        /// </param>
+        public sealed record Observation(
+            TaskResult Result,
+            CompletionReceiptReadResult? ReceiptAtNotification,
+            Exception? ProbeFailure);
+
+        /// <summary>
+        /// The REAL receipt load the probe performs, installed by the harness. It is a plain read
+        /// through the production store — it mutates nothing and it is never used by production.
+        /// </summary>
+        public Func<string, CompletionReceiptReadResult?>? ReceiptProbe { get; set; }
 
         /// <summary>How many results the transport published on the shared notifier.</summary>
         public int Count => Volatile.Read(ref _count);
+
+        /// <summary>The most recent observation, including its notification-instant receipt probe.</summary>
+        public Observation? Last
+        {
+            get
+            {
+                lock (_gate)
+                    return _last;
+            }
+        }
 
         /// <summary>A FRESH waiter for the NEXT published result; never satisfied by an earlier one.</summary>
         public Task<TaskResult> NextResult()
@@ -2075,6 +2634,27 @@ public sealed class CompletionTransportOwnershipTests
         {
             Interlocked.Increment(ref _count);
 
+            // ── THE NOTIFICATION-INSTANT PROBE, taken BEFORE the waiter is released ──────────
+            // A throwing probe is captured, never propagated: this subscriber sits inside
+            // production's own multicast chain, and a test-owned fault must not alter it.
+            CompletionReceiptReadResult? atNotification = null;
+            Exception? probeFailure = null;
+            var probe = ReceiptProbe;
+            if (probe is not null)
+            {
+                try
+                {
+                    atNotification = probe(result.TaskId);
+                }
+                catch (Exception ex)
+                {
+                    probeFailure = ex;
+                }
+            }
+
+            lock (_gate)
+                _last = new Observation(result, atNotification, probeFailure);
+
             TaskCompletionSource<TaskResult>? waiter = null;
             lock (_waiters)
             {
@@ -2084,6 +2664,54 @@ public sealed class CompletionTransportOwnershipTests
 
             waiter?.TrySetResult(result);
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// THE OWNERSHIP-MUTATING RECORDER: a DECORATOR over the REAL
+    /// <see cref="WorkerCompletionRecorder"/> that performs the genuine store write first and then
+    /// runs the vector's own mutation, so a test can invalidate transport ownership at exactly the
+    /// instant BETWEEN the record and the checked release.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT IS NOT A FAKE RECORDER. The real recorder does the whole job — the real assignment load,
+    /// the real agreement checks, the real <c>InsertOnce</c> — and every refusal it raises
+    /// propagates UNCHANGED, because the mutation runs only after a successful return. The durable
+    /// evidence the vectors then read is production-written.
+    /// </para>
+    /// <para>
+    /// IT IS DETERMINISTIC. <see cref="AfterRecord"/> runs synchronously on the handler's own
+    /// thread, inside its call stack, so the interleaving is exact rather than raced. The callback
+    /// is consumed ONCE per arming, so a later delivery in the same vector is unaffected.
+    /// </para>
+    /// </remarks>
+    internal sealed class OwnershipMutatingRecorder(IWorkerCompletionRecorder inner)
+        : IWorkerCompletionRecorder
+    {
+        private int _recordCount;
+
+        /// <summary>
+        /// The mutation to run IMMEDIATELY AFTER a successful real record, or <c>null</c> for none.
+        /// It is cleared as it fires, so exactly one delivery is affected per arming.
+        /// </summary>
+        public Action? AfterRecord { get; set; }
+
+        /// <summary>How many times the REAL recorder returned successfully through this decorator.</summary>
+        public int RecordCount => Volatile.Read(ref _recordCount);
+
+        /// <inheritdoc />
+        public void Record(string workerId, WorkTask task, TaskResult result)
+        {
+            // THE REAL RECORDING, unchanged: a refusal propagates from here and the mutation below
+            // never runs, so a refusing vector still exercises the production contract exactly.
+            inner.Record(workerId, task, result);
+
+            Interlocked.Increment(ref _recordCount);
+
+            var mutation = AfterRecord;
+            AfterRecord = null;
+            mutation?.Invoke();
         }
     }
 
