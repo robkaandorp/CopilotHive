@@ -102,9 +102,23 @@ public interface IAgentRunner : IAsyncDisposable
     void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner);
 
     /// <summary>
-    /// Prepares the runner. It deliberately creates NO LLM client: the client is created lazily
-    /// on the first <see cref="SendPromptAsync"/>, after credentials have been provisioned.
+    /// Prepares the runner for a new connection. It deliberately creates NO LLM client: the client is
+    /// created lazily on the first <see cref="SendPromptAsync"/>, after credentials have been
+    /// provisioned.
     /// </summary>
+    /// <remarks>
+    /// <b>QUIESCENT-USE CONTRACT.</b> Implementations may be called for SEQUENTIAL, QUIESCENT
+    /// connection preparation: the caller must have reached a state where no prompt turn, reset or
+    /// disposal is in flight on the instance (the worker runs one attempt at a time, and the previous
+    /// attempt is fully wound down — including its lexical transport disposal — before the next one
+    /// starts). Implementations are expected to prepare the runner for a fresh connection without
+    /// destroying it: a DISPOSED runner is never resurrected, no LLM client is created here, and any
+    /// state restored is limited to the per-connection preparation baseline — per-assignment state
+    /// (model, reasoning effort, session, bridge, task/goal identity, reports, compaction, sub-agents)
+    /// remains the responsibility of <see cref="ResetSessionAsync"/> and the caller's assignment
+    /// setup. Complete fresh-runner state equivalence is deliberately NOT promised.
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
     Task ConnectAsync(CancellationToken ct = default);
 
     /// <summary>

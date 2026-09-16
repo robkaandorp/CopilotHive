@@ -177,9 +177,15 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
 
             // The LAZY runner callback is the connection-owned wrapper, and reaching it provisions
             // through A's OWN production provisioner and A's OWN client identity.
+            //
+            // CAPTURED WHILE LIVE: the real lifecycle DETACHES the callback at quiescence (after the
+            // run's transport disposal, before releasing the run guard), so a post-run field read
+            // would only ever see null. The captured delegate is the exact object production
+            // installed for A and stays bound to A's connection.
             Assert.NotNull(runnerA.ConfigProvisioner);
+            var callbackA = runnerA.ConfigProvisioner!;
             Assert.Equal(0, invokerA.WorkerConfigCalls);
-            await runnerA.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
+            await callbackA(FixtureModel, TestContext.Current.CancellationToken);
             Assert.Equal(1, invokerA.WorkerConfigCalls);
             Assert.Equal(AssignedIdA, invokerA.LastWorkerConfigWorkerId);
 
@@ -211,10 +217,14 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
 
             // A'S CAPTURED RETIRED CALLBACK STARTS NO FETCH. Retirement is checked before the fetch
             // delegate, so the override-free production path fails with the EXISTING disconnected
-            // error and A's client sees no further RPC.
+            // error and A's client sees no further RPC. The captured callback is still A's, so this
+            // also proves the retired callback is never retargeted.
             var fetchCallsBeforeRetiredCallback = invokerA.WorkerConfigCalls;
             var retiredCallbackFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => runnerA.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
+                () => callbackA(FixtureModel, TestContext.Current.CancellationToken));
+
+            // A also DETACHED the callback: the runner no longer holds A's retired connection binding.
+            Assert.Null(runnerA.ConfigProvisioner);
             Assert.Equal(WorkerConnection.DisconnectedMessage, retiredCallbackFailure.Message);
             Assert.Equal(fetchCallsBeforeRetiredCallback, invokerA.WorkerConfigCalls);
             fetchCallsAfterRetiredCallback = invokerA.WorkerConfigCalls;
@@ -855,8 +865,196 @@ public sealed class WorkerProvisioningEnvironmentProductionChainTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // THE SAME-SERVICE PROVENANCE REGRESSION.
+    //
+    // The two-attempt test above proves provenance is shared across two services. THIS one proves the
+    // SAME ONE SERVICE can be reused sequentially — the service/runner lifetime contract this round
+    // establishes — WITHOUT the process's provenance semantics changing: an original operator value
+    // stays authoritative and is never overwritten, while a value only ever PROVISIONED by an earlier
+    // attempt is replaced (or cleared) by the next attempt's response instead of being promoted to
+    // operator authority. Both attempts run the REAL WorkerService.RunAsync on the SAME instance.
+    //
+    // It reuses the existing helpers and asserts ONLY provenance: runner reuse and Program.cs's
+    // final-only-disposal contract are separate deliverables and are deliberately not re-pinned here.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// ONE service, TWO sequential <see cref="WorkerService.RunAsync"/> attempts, ONE shared
+    /// provenance: attempt 1's server-provisioned values never become operator overrides for attempt
+    /// 2, while the genuine operator values survive both.
+    /// </summary>
+    [Fact]
+    public async Task OneServiceTwoSequentialAttempts_SharedProvenance_KeepsOperatorAuthority()
+    {
+        var teardown = new TeardownLedger();
+
+        var env = new FakeEnv(
+            (WorkerConfigProvisioner.OllamaUrlVar, OperatorOllamaUrl),
+            (WorkerConfigProvisioner.GitHubTokenVar, OperatorGithubToken),
+            (WorkerConfigProvisioner.ConfigRepoUrlVar, OperatorConfigRepoUrl));
+        var shared = new WorkerProvisioningEnvironment(env.Read, env.Write);
+
+        var runner = new CapturingRunner();
+        var readerA = new ScriptedReader();
+        var writerA = new RecordingWriter();
+
+        // The SAME service for both attempts, built through the EXACT attempt-construction path
+        // Program.cs uses (the shared-provenance constructor).
+        var service = BuildAttempt(shared, runner, new FakeInvoker(RegisterFor(AssignedIdA)), readerA, writerA);
+
+        // Per-attempt seams, swapped between the two sequential runs. The reader/writer and the
+        // invoker are per-ATTEMPT (each RunAsync opens its own stream and registration), while the
+        // service, its runner and the provenance object are shared.
+        var readerB = new ScriptedReader();
+        var writerB = new RecordingWriter();
+        var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome> runA = Task.FromResult(WorkerRunOutcome.RegistrationRejected);
+        Task<WorkerRunOutcome> runB = Task.FromResult(WorkerRunOutcome.RegistrationRejected);
+        WorkerConnection? connectionA = null;
+
+        try
+        {
+            // ── ATTEMPT 1: provision server values through the real lifecycle ──
+            var invokerA = new FakeInvoker(RegisterFor(AssignedIdA))
+            {
+                WorkerConfigToReturn = new GetWorkerConfigResponse
+                {
+                    GithubToken = "ghp_attempt_a",
+                    LlmProvider = "ollama-cloud",
+                    OllamaModel = "attempt-a-model",
+                    OllamaApiKey = "attempt-a-key",
+                },
+            };
+            service.CallInvokerFactory = () => invokerA;
+            service.WorkStreamFactory = (_, _) => StreamFor(writerA, readerA);
+
+            runA = service.RunAsync(loopCts.Token);
+            await writerA.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(AssignedIdA, writerA.Writes[0].WorkerId);
+
+            connectionA = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.Null(service.TestProvisioner);
+            Assert.NotNull(connectionA.Provisioner);
+
+            // The LAZY callback is captured WHILE LIVE: the lifecycle detaches it at quiescence.
+            Assert.NotNull(runner.ConfigProvisioner);
+            var callbackA = runner.ConfigProvisioner!;
+            await callbackA(FixtureModel, TestContext.Current.CancellationToken);
+            Assert.Equal(1, invokerA.WorkerConfigCalls);
+            Assert.Equal(AssignedIdA, invokerA.LastWorkerConfigWorkerId);
+
+            // Provisioned space was written; the OPERATOR's values are untouched.
+            Assert.Equal("ollama-cloud", env[WorkerConfigProvisioner.LlmProviderVar]);
+            Assert.Equal("attempt-a-model", env[WorkerConfigProvisioner.OllamaModelVar]);
+            Assert.Null(env[WorkerConfigProvisioner.GhTokenVar]);
+            Assert.Equal(OperatorOllamaUrl, env[WorkerConfigProvisioner.OllamaUrlVar]);
+            Assert.Equal(OperatorGithubToken, env[WorkerConfigProvisioner.GitHubTokenVar]);
+            Assert.Equal(OperatorConfigRepoUrl, env[WorkerConfigProvisioner.ConfigRepoUrlVar]);
+
+            // EOF ends attempt 1 with the EXISTING clean-return behavior: the transport was disposed,
+            // the connection retired/unpublished, the callback detached, and the guard returned to Idle.
+            readerA.Complete();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await runA.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.True(connectionA.IsRetired);
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Null(runner.ConfigProvisioner);
+
+            // ── ATTEMPT 2: the SAME service, the SAME provenance object ──
+            var invokerB = new FakeInvoker(RegisterFor(AssignedIdB))
+            {
+                WorkerConfigToReturn = new GetWorkerConfigResponse { LlmProvider = "copilot" },
+            };
+            service.CallInvokerFactory = () => invokerB;
+            service.WorkStreamFactory = (_, _) => StreamFor(writerB, readerB);
+
+            runB = service.RunAsync(loopCts.Token);
+            await writerB.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(AssignedIdB, writerB.Writes[0].WorkerId);
+
+            var connectionB = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.NotNull(connectionB.Provisioner);
+            Assert.NotSame(connectionA!.Provisioner, connectionB.Provisioner);
+
+            Assert.NotNull(runner.ConfigProvisioner);
+            await runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
+            Assert.Equal(1, invokerB.WorkerConfigCalls);
+            Assert.Equal(AssignedIdB, invokerB.LastWorkerConfigWorkerId);
+
+            // REPLACED — attempt 2's own value, not attempt 1's.
+            Assert.Equal("copilot", env[WorkerConfigProvisioner.LlmProviderVar]);
+            // CLEARED — values only ever PROVISIONED (by attempt 1) are removed, NOT promoted to
+            // operator overrides. With per-attempt provenance these would survive as attempt 1's values.
+            Assert.Null(env[WorkerConfigProvisioner.OllamaModelVar]);
+            Assert.Null(env[WorkerConfigProvisioner.OllamaApiKeyVar]);
+            Assert.False(env.IsSet(WorkerConfigProvisioner.OllamaModelVar));
+
+            // THE GENUINE ORIGINAL OPERATOR VALUES SURVIVE BOTH ATTEMPTS — unchanged, and still
+            // recognized as operator-supplied.
+            Assert.Equal(OperatorOllamaUrl, env[WorkerConfigProvisioner.OllamaUrlVar]);
+            Assert.Equal(OperatorGithubToken, env[WorkerConfigProvisioner.GitHubTokenVar]);
+            Assert.Equal(OperatorConfigRepoUrl, env[WorkerConfigProvisioner.ConfigRepoUrlVar]);
+            Assert.True(shared.IsOperatorProvided(WorkerConfigProvisioner.OllamaUrlVar));
+            Assert.True(shared.IsOperatorProvided(WorkerConfigProvisioner.ConfigRepoUrlVar));
+            Assert.False(shared.IsOperatorProvided(WorkerConfigProvisioner.LlmProviderVar));
+
+            // Attempt 2's response provenance is its own, so the chain falls through to the ORIGINAL
+            // operator environment — the intentional documented fallback.
+            Assert.Null(connectionB.Provisioner!.ProvisionedConfigRepoUrl);
+            Assert.Equal(OperatorConfigRepoUrl, connectionB.Provisioner.ResolvedConfigRepoUrl);
+            Assert.Equal(OperatorGithubToken, connectionB.Provisioner.ResolveConfigRepoCredential());
+
+            // Attempt 1's stale response provenance stays attempt 1's own and is never inherited.
+            Assert.Equal("ghp_attempt_a", connectionA!.Provisioner!.ResolveConfigRepoCredential());
+
+            readerB.Complete();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await runB.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.True(connectionB.IsRetired);
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Null(runner.ConfigProvisioner);
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            readerA.Complete();
+            readerB.Complete();
+            await teardown.DrainAsync("same-service attempt A RunAsync", runA);
+            await teardown.DrainAsync("same-service attempt B RunAsync", runB);
+            await teardown.DrainAsync("attempt A reader waits", readerA.WhenAllWaitsSettledAsync());
+            await teardown.DrainAsync("attempt B reader waits", readerB.WhenAllWaitsSettledAsync());
+            await writerA.SettleAndObserveOutstandingWaiters();
+            await writerB.SettleAndObserveOutstandingWaiters();
+
+            // Both attempts are terminal by now, so the single final disposal is admissible.
+            service.Dispose();
+            loopCts.Dispose();
+        }
+
+        Assert.True(runA.IsCompleted, "Attempt A's RunAsync must have completed.");
+        Assert.True(runB.IsCompleted, "Attempt B's RunAsync must have completed.");
+        AssertTeardownDrained(teardown);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
+
+    private static RegisterResponse RegisterFor(string assignedId) =>
+        new() { Accepted = true, AssignedWorkerId = assignedId };
+
+    /// <summary>Builds the per-attempt duplex stream over the existing writer/reader doubles.</summary>
+    private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> StreamFor(
+        RecordingWriter writer, ScriptedReader reader) =>
+        new(
+            writer, reader,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => { },
+            null!);
 
     /// <summary>
     /// Builds ONE attempt's service through the INTERNAL attempt-construction path <c>Program.cs</c>

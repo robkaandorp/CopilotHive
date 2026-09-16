@@ -53,66 +53,60 @@ var delay = TimeSpan.FromSeconds(5);
 var maxDelay = TimeSpan.FromSeconds(60);
 
 // THE PROCESS'S ENVIRONMENT PROVENANCE, created ONCE here — OUTSIDE the attempt loop — and handed
-// to EVERY attempt's WorkerService. The provisioning snapshot is what distinguishes an ORIGINAL
+// to the PROCESS'S ONE WorkerService. The provisioning snapshot is what distinguishes an ORIGINAL
 // operator override from a value the orchestrator provisioned, and that distinction belongs to the
-// PROCESS, not to one connection attempt: this loop deliberately builds a FRESH service per attempt
-// (no stale connection state leaks through retries), so if each attempt snapshotted for itself a
-// later attempt would read the PREVIOUS attempt's server-provisioned values out of the environment
-// and promote them to operator authority. Sharing this one object keeps the operator snapshot
-// authoritative for the whole process while every attempt keeps its own identity, client, stream,
-// provisioner and response provenance. It carries no locks: attempts are strictly sequential and
-// the previous one is retired and drained before the next starts.
+// PROCESS, not to one connection attempt: the service keeps its identity, client, stream, provisioner
+// and response provenance per attempt, but if each attempt snapshotted for itself a later attempt
+// would read the PREVIOUS attempt's server-provisioned values out of the environment and promote them
+// to operator authority. This one object therefore stays authoritative for the whole process. It
+// carries no locks: attempts are strictly sequential and the previous one is retired and drained
+// before the next starts.
 var provisioningEnvironment = new WorkerProvisioningEnvironment();
+
+// THE PROCESS'S ONE WORKER SERVICE, constructed ONCE here — OUTSIDE the attempt loop — and reused by
+// EVERY sequential attempt for the whole process lifetime. The service's own Idle/Running/Disposed
+// run guard is what enforces that rule: an overlapping RunAsync is refused, and this instance is
+// never disposed between attempts — only ONCE, after the loop terminates, below. Each attempt still
+// builds its OWN connection (identity, stream, client, provisioner, response provenance), so a
+// retired WorkerConnection is never reused.
+//
+// It is deliberately NOT declared with `using`: that would place the compiler-generated Dispose()
+// AFTER the exit-code decision below, so a throwing disposal — and runner disposal is deliberately
+// fallible and propagating — would escape top level and be dumped by the runtime with its RAW message
+// and stack, bypassing SafeExceptionLog. The ONE final disposal is performed explicitly, after loop
+// termination, inside the sanitized handling below.
+var service = new WorkerService(
+    orchestratorUrl: orchestratorUrl,
+    workerId: workerId,
+    capabilities: capabilities,
+    provisioningEnvironment: provisioningEnvironment);
+
+// THE PROCESS EXIT CODE. It starts at success and is only ever raised to 1 by an explicit fatal
+// classification. It is deliberately NOT returned early anywhere inside the loop: an early `return`
+// would freeze the outcome BEFORE the ONE FINAL DISPOSAL below has run, so a failing disposal after an
+// otherwise clean termination could no longer turn the process into a failure. Every loop exit
+// therefore `break`s, and the ONE final exit-code return statement at the very end of the file
+// decides the process outcome.
+var exitCode = 0;
 
 while (!cts.IsCancellationRequested)
 {
-    // Fresh instance each attempt so no stale connection state leaks through retries.
-    //
-    // The instance is deliberately NOT declared with `using` at loop scope: that would place
-    // the compiler-generated Dispose() AFTER the catch blocks below, so a throwing disposal —
-    // and runner disposal is deliberately fallible and propagating — would escape top level and
-    // be dumped by the runtime with its RAW message and stack, bypassing SafeExceptionLog.
-    // Instead the service is disposed inside the try, in a finally, so every disposal fault is
-    // routed through the sanitized catches below.
-    var service = new WorkerService(
-        orchestratorUrl: orchestratorUrl,
-        workerId: workerId,
-        capabilities: capabilities,
-        provisioningEnvironment: provisioningEnvironment);
-
     // THE ELIGIBLE OUTCOME — the ONLY value the post-region handling below may act on. It stays
-    // NULL unless the awaited RunAsync genuinely RETURNED *and* the attempt's disposal then
-    // completed without throwing, so the classification catches keep sole authority over the
-    // retry/fatal control flow and no reconstructed or defaulted value can stand in for a real,
-    // fully completed attempt.
+    // NULL unless the awaited RunAsync genuinely RETURNED, so the classification catches keep sole
+    // authority over the retry/fatal control flow and no reconstructed or defaulted value can stand
+    // in for a real, fully completed attempt.
     WorkerRunOutcome? completedOutcome = null;
 
     try
     {
-        // The run's returned value, held locally until disposal has also succeeded. A thrown
-        // disposal unwinds out of the block below, SKIPPING the eligibility assignment that
-        // follows, so a failed teardown can never be mistaken for a completed attempt.
-        WorkerRunOutcome runOutcome;
-
-        try
-        {
-            // The returned outcome is the REAL result of the run — a rejected registration or an
-            // accepted work stream that ended with the whole lifecycle teardown completing.
-            // NOTHING else happens inside this covered region: the outcome is merely captured, so
-            // no diagnostic of ours can ever be classified as a connection failure and retried.
-            runOutcome = await service.RunAsync(cts.Token);
-        }
-        finally
-        {
-            // Disposal propagates (by design) and still runs on EVERY path, including when
-            // RunAsync itself threw. Running it here means any fault it raises is caught and
-            // REDACTED by the handlers below instead of reaching the runtime.
-            service.Dispose();
-        }
-
-        // REACHED ONLY WHEN BOTH STEPS SUCCEEDED: the run returned and the disposal completed
-        // without throwing. Only now does the outcome become eligible for the handling below.
-        completedOutcome = runOutcome;
+        // The returned outcome is the REAL result of the run — a rejected registration or an
+        // accepted work stream that ended with the whole lifecycle teardown completing.
+        // NOTHING else happens inside this covered region: the outcome is merely captured, so
+        // no diagnostic of ours can ever be classified as a connection failure and retried.
+        //
+        // The attempt is awaited to COMPLETION here, so the SAME service is never entered by a
+        // second run before this one has fully finished — including its lexical transport disposal.
+        completedOutcome = await service.RunAsync(cts.Token);
     }
     catch (OperationCanceledException)
     {
@@ -137,24 +131,28 @@ while (!cts.IsCancellationRequested)
         delay = delay * 2 > maxDelay ? maxDelay : delay * 2;
 
         // EXPLICITLY END THIS ITERATION. A classified thrown failure must proceed to the NEXT
-        // attempt exactly as the pre-change control flow did: it may never fall through into the
-        // returned-outcome handling below, whatever any local still holds.
+        // attempt on the SAME service — the previous run has already completed or faulted, so that
+        // service is quiescent — and it may never fall through into the returned-outcome handling
+        // below, whatever any local still holds.
         continue;
     }
     catch (Exception ex)
     {
-        // All other exceptions are fatal — bad config, invalid credentials, etc. This also
-        // covers a propagating teardown fault from the finally above.
+        // All other exceptions are fatal — bad config, invalid credentials, etc.
         // Sanitized for the same reason: a provider client that rejects a provisioned
         // credential can quote that credential in its exception message.
         Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
-        return 1;
+
+        // RECORD THE CLASSIFICATION AND LEAVE THE LOOP. Never `return` here: the ONE final disposal
+        // below must still run, and the exit code is decided only AFTER it.
+        exitCode = 1;
+        break;
     }
 
     // ── RETURNED-OUTCOME HANDLING, OUTSIDE EVERY RETRY-GOVERNING CATCH ──────────────
     //
-    // DEFENSE IN DEPTH. Every catch above already ends its own iteration (break / continue /
-    // return), and an ineligible attempt never assigns the value, so this guard is unreachable in
+    // DEFENSE IN DEPTH. Every catch above already ends its own iteration (break / continue), and an
+    // ineligible attempt never assigns the value, so this guard is unreachable in
     // the corrected flow — it stays as the safety net that keeps a non-returned attempt from ever
     // being handled as a completed one.
     if (completedOutcome is not { } outcome)
@@ -179,14 +177,43 @@ while (!cts.IsCancellationRequested)
             $"Unexpected worker run outcome: {(int)outcome}.");
         WriteBestEffort(
             Console.Error, $"[Worker] Fatal error [{SafeExceptionLog.Describe(unexpectedOutcome)}]");
-        return 1;
+        exitCode = 1;
+        break;
     }
 
     // The registration-rejection diagnostic is emitted by the service itself. BOTH known outcomes
     // stop this loop with the same exit code as before: the attempt is over.
     break;
 }
-return 0;
+
+// ── THE ONE FINAL SERVICE DISPOSAL, AFTER LOOP TERMINATION ────────────────────────
+//
+// FINAL, AND NEVER RETRIED. Only an ATTEMPT error may retry; process-level teardown must not, so this
+// disposal sits OUTSIDE every retry-governing catch above and is deliberately NOT classified the way
+// an attempt is: an RpcException, an HttpRequestException, an IOException and an
+// OperationCanceledException raised here are all DISPOSAL faults, not connection failures, so none of
+// them creates another attempt and none of them is swallowed as a graceful shutdown. The disposal is
+// attempted EXACTLY ONCE, whatever it throws.
+//
+// The service's own guard already makes a repeat call a no-op and rejects a run afterwards, and the
+// runner disposal is deliberately fallible and propagating: a fault here is reported SANITIZED
+// (classification only — never the raw exception message or stack, which can echo a provisioned
+// credential) and turns an otherwise normal or cancelled termination into a failure.
+try
+{
+    service.Dispose();
+}
+catch (Exception ex)
+{
+    // Sanitized for the same reason as the attempt paths: this boundary reaches the provider client,
+    // whose errors can quote provisioned configuration.
+    WriteBestEffort(Console.Error, $"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+    exitCode = 1;
+}
+
+// THE EXIT CODE IS DECIDED HERE — after the one final disposal — so no earlier `return` can freeze a
+// success that teardown then failed to deliver.
+return exitCode;
 
 // Writes ONE static, already-sanitized diagnostic, GUARDED so a degraded sink (a redirected and
 // closed stdout/stderr raising IOException) can never escape to the runtime, can never be

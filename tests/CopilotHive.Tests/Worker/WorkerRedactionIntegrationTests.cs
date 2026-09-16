@@ -1,5 +1,6 @@
 using CopilotHive.Goals;
 using CopilotHive.Services;
+using CopilotHive.Shared.Grpc;
 using CopilotHive.Worker;
 using CopilotHive.Workers;
 
@@ -192,53 +193,99 @@ public sealed class WorkerRedactionIntegrationTests
     // ── CRITICAL 2: Program.cs teardown route ─────────────────────────────────
 
     /// <summary>
-    /// Reproduces the EXACT control flow Program.cs now uses — service disposal inside the try,
-    /// in a <c>finally</c>, so the sanitized catches see it — and proves a throwing disposal is
-    /// redacted instead of escaping to the runtime with its raw message.
+    /// Reproduces the EXACT control flow Program.cs now uses — ONE service outside the attempt loop,
+    /// attempts that `break` rather than `return`, and ONE FINAL disposal AFTER loop termination whose
+    /// fault is sanitized and turns an otherwise normal termination into exit code 1 — and proves a
+    /// throwing disposal is redacted instead of escaping to the runtime with its raw message.
     /// <para>
-    /// Under the old structure (<c>using var service</c> declared OUTSIDE the try) the exception
-    /// below would propagate past the catches uncaught, and this test would fail by throwing.
+    /// THE FINAL-DISPOSAL POLICY, PROVEN NOT ASSUMED: the attempt count stays at ONE (teardown never
+    /// retries, and is never classified by the retry filter — an <c>RpcException</c>, an
+    /// <c>IOException</c> and an <c>OperationCanceledException</c> raised by the disposal are all
+    /// teardown faults), the outcome is decided only AFTER the disposal, and a disposal fault makes
+    /// the exit code 1 rather than the 0 an early `return` would have frozen.
+    /// </para>
+    /// <para>
+    /// Under the OLD structure (<c>using var service</c> declared OUTSIDE the try, or a per-attempt
+    /// disposal inside the loop's try/finally) the exception below would either propagate past the
+    /// catches uncaught or be treated as a retryable attempt failure, and this test would fail by
+    /// throwing / by observing a retry.
     /// </para>
     /// </summary>
-    [Fact]
-    public async Task ProgramTeardown_ThrowingDisposal_IsSanitizedNotRaw()
+    /// <param name="disposalFault">
+    /// The fault the disposal raises. Every one of these is a TEARDOWN fault — including the three
+    /// types the attempt loop treats as retryable — so the test proves the final disposal is outside
+    /// the retry classification for all of them.
+    /// </param>
+    [Theory]
+    [InlineData("invalid")]
+    [InlineData("rpc")]
+    [InlineData("io")]
+    [InlineData("cancel")]
+    public async Task ProgramFinalDisposal_ThrowingDisposal_IsSanitizedNotRaw_AndExitCodeIsOne(string disposalFault)
     {
         var stdErr = new StringWriter();
         var originalErr = Console.Error;
         Console.SetError(stdErr);
 
-        var sanitizedFatal = false;
+        var attempts = 0;
+        var exitCode = 0;
+        var disposalAttempts = 0;
+
+        Exception fault = disposalFault switch
+        {
+            "rpc" => new RpcException(new Status(StatusCode.Unavailable, $"Bearer {SecretToken}")),
+            "io" => new IOException($"write failed with GH_TOKEN={SecretToken}"),
+            "cancel" => new OperationCanceledException($"timed out with api_key={SecretApiKey}"),
+            _ => new InvalidOperationException($"dispose failed for GH_TOKEN={SecretToken}"),
+        };
+
         try
         {
-            // ── This block mirrors Program.cs's loop body exactly. ──
-            var service = BuildServiceWithThrowingRunner(
-                new InvalidOperationException($"dispose failed for GH_TOKEN={SecretToken}"));
+            // ── THIS BLOCK MIRRORS Program.cs's STRUCTURE EXACTLY ──
+            // ONE service, built OUTSIDE the loop, disposed ONCE after it — and never disposed inside.
+            var service = BuildServiceWithThrowingRunner(fault);
 
-            try
+            while (true)
             {
+                attempts++;
+
                 try
                 {
                     // Stand-in for RunAsync returning normally: the fault comes from teardown.
                     await Task.CompletedTask;
                 }
-                finally
+                catch (OperationCanceledException)
                 {
-                    service.Dispose();
+                    break;
                 }
+                catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)
+                {
+                    Console.Error.WriteLine(
+                        $"[Worker] Connection failed [{SafeExceptionLog.Describe(ex)}]. Retrying...");
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                    exitCode = 1;
+                    break;
+                }
+
+                // A returned outcome ends the loop in the real program; here the first attempt always
+                // succeeds, so the loop ends immediately.
+                break;
             }
-            catch (OperationCanceledException)
+
+            // THE ONE FINAL DISPOSAL, AFTER LOOP TERMINATION, INSIDE SANITIZED HANDLING.
+            try
             {
-                // Not expected here.
-            }
-            catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)
-            {
-                Console.Error.WriteLine(
-                    $"[Worker] Connection failed [{SafeExceptionLog.Describe(ex)}]. Retrying...");
+                disposalAttempts++;
+                service.Dispose();
             }
             catch (Exception ex)
             {
-                sanitizedFatal = true;
                 Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                exitCode = 1;
             }
         }
         finally
@@ -246,13 +293,281 @@ public sealed class WorkerRedactionIntegrationTests
             Console.SetError(originalErr);
         }
 
-        // The disposal fault reached the SANITIZED fatal handler rather than escaping.
-        Assert.True(sanitizedFatal, "A throwing disposal must be caught by the sanitized fatal handler.");
+        // THE DISPOSAL FAULT WAS NOT RETRIED AND DID NOT RE-ENTER THE ATTEMPT LOOP.
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, disposalAttempts);
+
+        // ...and it became a FAILING process outcome rather than a frozen success.
+        Assert.Equal(1, exitCode);
 
         var output = stdErr.ToString();
         Assert.DoesNotContain(SecretToken, output);
+        Assert.DoesNotContain(SecretApiKey, output);
         Assert.Contains("Fatal error", output);
-        Assert.Contains(nameof(InvalidOperationException), output);
+        Assert.DoesNotContain("Retrying", output);
+    }
+
+    /// <summary>
+    /// PER-ATTEMPT RETRY STILL APPLIES ONLY TO ATTEMPT ERRORS — and it RETRIES ON THE SAME SERVICE.
+    /// The Program-mirrored loop below drives the REAL <see cref="WorkerService.RunAsync"/> twice
+    /// (attempt 1 faults with a retry-class <see cref="RpcException"/>, attempt 2 returns
+    /// <see cref="WorkerRunOutcome.RegistrationRejected"/>), with a probe recording whether any
+    /// disposal was ever attempted on the service path.
+    /// <para>
+    /// THE NON-VACUITY CONTROL is the counter case: the loop's retry catch is exercised with the
+    /// SAME fault the disposal theory raises, so this test cannot merely be exercising a loop that
+    /// never enters its retry classification.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ProgramAttemptLoop_RetryClassAttemptFault_RetriesWithoutAnyDisposalAttempt()
+    {
+        var stdErr = new StringWriter();
+        var originalErr = Console.Error;
+        Console.SetError(stdErr);
+
+        var attempts = 0;
+        var exitCode = 0;
+        var disposalAttempts = 0;
+        var outcomes = new List<WorkerRunOutcome>();
+
+        // THE SAME-SERVICE SECOND-ATTEMPT PROBE: the second invocation uses a DIFFERENT invoker —
+        // one whose Register is ACCEPTED and whose stream is the pre-built controlled-EOF duplex —
+        // so attempt 2 is a real, returned outcome on the SAME service, not just a repeat of the
+        // faulting registration.
+        var acceptedInvoker = new AcceptedRegisterInvoker();
+        var acceptedRequests = new RequestStreamStub();
+        var acceptedResponses = new ChannelReaderStub();
+        var acceptedStream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+            acceptedRequests,
+            acceptedResponses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => { },
+            null!);
+
+        // ── THIS BLOCK MIRRORS Program.cs's STRUCTURE EXACTLY ──
+        var configRepoDir = CreateTempConfigRepoDir();
+        var launcher = new FakeGitLauncher(HealthyRepoHandler(configRepoDir));
+        using var processRunner = WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher);
+
+        var service = new WorkerService(
+            "http://localhost:9999", "worker-retry-loop", ["coder"], configRepoDir: configRepoDir);
+        // The TestProvisioner override keeps attempt 2's accepted assignment free of network
+        // access: the eager per-assignment provisioning site takes this in-memory provisioner.
+        service.TestProvisioner = new ProvisionerHarness(
+            configRepoUrl: "https://github.com/org/config-repo.git",
+            ghToken: "ghp_fixture_retry_loop").Provisioner;
+        service.CallInvokerFactory = () =>
+            new RegisterFaultingInvoker(
+                new RpcException(new Status(StatusCode.Unavailable, "unreachable")));
+        service.WorkStreamFactory = (_, _) => throw new InvalidOperationException("no stream expected");
+
+        // THE RETRY-CLASSIFICATION COUNTER: observed INSIDE the retry catch, so the assertion
+        // pins that this loop's own retry filter genuinely fired — the control against a loop
+        // that "retries" only because it never entered the classification at all.
+        var retryCatchEntered = 0;
+        var fatalType = "none";
+
+        // The worker's logger writes to the CONSOLE on every run (preparation info, registration
+        // outcome). The real test host's stdout is not redirected, so point Console.Out at a bounded
+        // sink while the loop runs and restore it in this test's own finally.
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+            Console.SetError(stdErr);
+
+            while (true)
+            {
+                attempts++;
+
+                // THE BOUNDED-BACKOFF MIRROR: the production loop paces with Task.Delay between
+                // attempts before the next one; the mirror records the classification and moves
+                // straight to the next attempt. ONE retry is admitted — a second consecutive
+                // retry-class failure breaks instead, which is what the backoff bound would
+                // eventually produce anyway.
+                if (retryCatchEntered >= 1)
+                {
+                    service.CallInvokerFactory = () => acceptedInvoker;
+                    service.WorkStreamFactory = (_, _) => acceptedStream;
+                }
+
+                try
+                {
+                    WorkerRunOutcome returnedOutcome =
+                        await service.RunAsync(TestContext.Current.CancellationToken);
+                    outcomes.Add(returnedOutcome);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)
+                {
+                    retryCatchEntered++;
+                    Console.Error.WriteLine(
+                        $"[Worker] Connection failed [{SafeExceptionLog.Describe(ex)}]. Retrying...");
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                    fatalType = ex.GetType().Name + ": " + ex.Message;
+                    exitCode = 1;
+                    break;
+                }
+
+                // A returned outcome ends the loop in the real program.
+                break;
+            }
+
+            // THE ONE FINAL DISPOSAL, AFTER LOOP TERMINATION.
+            try
+            {
+                disposalAttempts++;
+                service.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                exitCode = 1;
+            }
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+            stdOut.Dispose();
+        }
+
+        TryDeleteDir(configRepoDir);
+
+        // THE RETRY CLASSIFICATION FIRED, THEN A SECOND ATTEMPT RAN — both on the SAME service.
+        Assert.Equal(1, retryCatchEntered);
+        Assert.Equal(2, attempts);
+
+        // THE DIAGNOSTIC FIRST: whatever happened, the stderr carries the evidence.
+        var output = stdErr.ToString();
+        if (output.Contains("Fatal error", StringComparison.Ordinal))
+            throw new Xunit.Sdk.XunitException(
+                "The second attempt was FATAL rather than returned. Sanitized stderr:\n" + output
+                + "\nAccepted stream writes: "
+                + string.Join("; ", acceptedRequests.Writes.Select(w => w.PayloadCase.ToString()))
+                + "; outcomes: " + string.Join(",", outcomes)
+                + "; attempts=" + attempts + " retryCatchEntered=" + retryCatchEntered
+                + " fatalType=" + fatalType);
+
+        // The accepted attempt is a real returned outcome (its stream ends with a clean EOF), not a
+        // replay of the faulting registration.
+        Assert.Equal([WorkerRunOutcome.WorkStreamEnded], outcomes);
+
+        // THE FINAL DISPOSAL WAS STILL EXACTLY ONE — attempt faults never dispose per attempt.
+        Assert.Equal(1, disposalAttempts);
+
+        // The accepted attempt's stream moved ONLY through its own lifecycle: its Ready was written
+        // and the clean EOF ended it — no replay of attempt 1's faulting registration.
+        var acceptedWrites = acceptedRequests.Writes;
+        Assert.Single(acceptedWrites);
+        Assert.Equal(WorkerMessage.PayloadOneofCase.Ready, acceptedWrites[0].PayloadCase);
+
+        // The attempt fault was classified as a connection failure with the sanitized category,
+        // and the process still exits 0 (a retryable failure is not a fatal one).
+        Assert.Contains("[Worker] Connection failed [", output, StringComparison.Ordinal);
+        Assert.Contains("RpcException(status=Unavailable)", output, StringComparison.Ordinal);
+        Assert.Contains("Retrying", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("Fatal error", output, StringComparison.Ordinal);
+        Assert.Equal(0, exitCode);
+    }
+
+    /// <summary>
+    /// ONCE THE ATTEMPT LOOP HAS TERMINATED, A <see cref="OperationCanceledException"/> FROM THE FINAL
+    /// DISPOSAL ITSELF IS STILL A FATAL TEARDOWN FAULT — it does NOT re-enter the graceful-shutdown
+    /// classification that governs ATTEMPTS. The exit code is decided AFTER the disposal, and the
+    /// fault is reported sanitized with no raw exception message.
+    /// <para>
+    /// THE NON-VACUITY CONTROL: the same <see cref="OperationCanceledException"/> on the ATTEMPT path
+    /// takes the graceful <c>break</c> (see the production catch), so a survivor here would prove the
+    /// disposal fault leaked into the attempt classification rather than the disposal simply not
+    /// throwing.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ProgramFinalDisposal_OperationCanceledFromDisposal_IsFatalNotGraceful_AndNeverRaw()
+    {
+        var stdErr = new StringWriter();
+        var originalErr = Console.Error;
+        Console.SetError(stdErr);
+
+        var attempts = 0;
+        var exitCode = 0;
+        var disposalAttempts = 0;
+
+        var cancelFault = new OperationCanceledException($"dispose cancelled api_key={SecretApiKey}");
+        var service = BuildServiceWithThrowingRunner(cancelFault);
+
+        try
+        {
+            while (true)
+            {
+                attempts++;
+
+                try
+                {
+                    // The attempt "succeeds" (as in the production loop, a returned outcome ends it).
+                    await Task.CompletedTask;
+                }
+                catch (OperationCanceledException)
+                {
+                    // THE ATTEMPT-PATH CLASSIFICATION, EXERCISED HERE AS THE CONTROL: graceful break.
+                    break;
+                }
+                catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)
+                {
+                    Console.Error.WriteLine(
+                        $"[Worker] Connection failed [{SafeExceptionLog.Describe(ex)}]. Retrying...");
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                    exitCode = 1;
+                    break;
+                }
+
+                break;
+            }
+
+            // THE ONE FINAL DISPOSAL, whose fault is the cancellation.
+            try
+            {
+                disposalAttempts++;
+                service.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
+                exitCode = 1;
+            }
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // NOT GRACEFUL: the cancellation from DISPOSAL fails the process, exactly like every other
+        // teardown fault — the graceful category belongs to ATTEMPTS only.
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, disposalAttempts);
+        Assert.Equal(1, exitCode);
+
+        var output = stdErr.ToString();
+        Assert.Contains("Fatal error", output);
+        Assert.Contains(nameof(OperationCanceledException), output);
+        Assert.DoesNotContain(SecretApiKey, output);
+        Assert.DoesNotContain("dispose cancelled", output, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -275,38 +590,50 @@ public sealed class WorkerRedactionIntegrationTests
     }
 
     /// <summary>
-    /// STRUCTURAL REGRESSION for the returned-outcome handling in the worker entry point: an
-    /// outcome becomes ELIGIBLE for post-catch handling only after BOTH the awaited
-    /// <see cref="WorkerService.RunAsync"/> return AND the attempt's <see cref="WorkerService.Dispose"/>
-    /// completed without throwing; the retry catch ends its own iteration explicitly; the handling
-    /// sits AFTER every retry-governing catch; and both diagnostics it writes are guarded.
+    /// STRUCTURAL REGRESSION for the process-lifetime contract in the worker entry point: ONE
+    /// <see cref="WorkerService"/> is constructed OUTSIDE the attempt loop and reused by every
+    /// sequential attempt; the per-attempt disposal is GONE; the ONE final disposal happens only
+    /// after loop termination, inside sanitized handling; the returned-outcome handling sits AFTER
+    /// every retry-governing catch; the retry catch ends its own iteration explicitly; and both
+    /// diagnostics it writes are guarded.
     /// <para>
-    /// THE REVIEWER MAJORS this pins. Iteration 1 emitted the returned-outcome handling before
-    /// <c>break</c> and INSIDE the catch region whose <c>IOException</c> branch retries, so a
-    /// throwing Console write could become a clean-EOF reconnect. Iteration 2 moved the handling
-    /// after the catches but assigned the captured value BEFORE the fallible disposal, so a
-    /// retry-class disposal fault (<c>RpcException</c>/<c>HttpRequestException</c>/<c>IOException</c>)
-    /// after a normal return logged, backed off, and then FELL THROUGH with the value still
-    /// populated — exiting instead of creating the fresh attempt the pre-change flow created.
-    /// Iteration 3 fixed both halves: a two-step capture (the raw run value inside the inner try,
-    /// disposal in its finally, the eligibility assignment only after the try/finally) plus an
-    /// explicit <c>continue;</c> in the retry catch. The brace-scoped assertions below fail loudly
-    /// under either earlier shape.
+    /// WHAT IT REPLACES. The earlier shape built a FRESH service per attempt and disposed it inside
+    /// the attempt's try/finally (with a two-step <c>runOutcome</c>/<c>completedOutcome</c> capture so
+    /// a throwing per-attempt disposal could not be mistaken for a completed attempt). That structure
+    /// is now intentionally gone: the service — and its ONE readonly runner — must survive every
+    /// retry, so disposal moved OUT of the loop into a single final, never-retried step, and the exit
+    /// code is decided only AFTER it.
+    /// </para>
+    /// <para>
+    /// THE FAILURE MODES THESE ASSERTIONS PIN.
+    /// <list type="bullet">
+    ///   <item><description>a SECOND service construction (or a per-attempt disposal) would restore
+    ///   the old per-attempt lifetime and silently discard the runner between retries;</description></item>
+    ///   <item><description>an early <c>return</c> inside the loop would freeze the process outcome
+    ///   BEFORE the final disposal, so a failing disposal could no longer fail the process;</description></item>
+    ///   <item><description>letting the final disposal be classified by the retry filter
+    ///   (<c>RpcException</c>/<c>HttpRequestException</c>/<c>IOException</c>) would turn a teardown
+    ///   fault into a fresh connection attempt — teardown must never retry.</description></item>
+    /// </list>
     /// </para>
     /// </summary>
     [Fact]
-    public void WorkerProgram_ReturnedOutcomeHandling_IsOutsideRetryGoverningCatches()
+    public void WorkerProgram_ProcessLifetimeContract_FinalOnlyDisposalOutsideEveryRetryCatch()
     {
         var programPath = Path.Combine(FindRepoRoot(), "src", "CopilotHive.Worker", "Program.cs");
         Assert.True(File.Exists(programPath), $"Worker Program.cs not found at '{programPath}'.");
         var source = File.ReadAllText(programPath).ReplaceLineEndings("\n");
 
-        // ── THE TWO-STEP CAPTURE ──────────────────────────────────────────────
-        // The RAW run value is assigned inside the inner try; the ELIGIBLE value is assigned
-        // separately, and both literals occur exactly once.
-        const string RawRunCapture = "runOutcome = await service.RunAsync(cts.Token);";
-        const string EligibilityAssignment = "completedOutcome = runOutcome;";
-        const string DisposalInFinally = "service.Dispose();";
+        // ── THE PROCESS'S ONE SERVICE, AND THE ONE ATTEMPT RUN ON IT ──────────
+        const string ServiceConstruction = "var service = new WorkerService(";
+        const string AttemptRun = "completedOutcome = await service.RunAsync(cts.Token);";
+        const string DisposalCall = "service.Dispose();";
+        const string LoopAnchor = "while (!cts.IsCancellationRequested)";
+
+        // ── THE EXIT-CODE DECISION, MADE AFTER THE FINAL DISPOSAL ─────────────
+        const string ExitCodeInitialization = "var exitCode = 0;";
+        const string FatalExitAssignment = "exitCode = 1;";
+        const string ExitDecision = "return exitCode;";
 
         // ── THE RETRY CATCH ENDS ITS OWN ITERATION ────────────────────────────
         // A classified thrown failure must proceed to the NEXT attempt exactly as the pre-change
@@ -314,9 +641,8 @@ public sealed class WorkerRedactionIntegrationTests
         const string RetryCatchBackoff = "delay = delay * 2 > maxDelay ? maxDelay : delay * 2;";
         const string RetryCatchContinue = "continue;";
 
-        // ── THE DEFENSE-IN-DEPTH GUARD AND THE UNCONDITIONAL EXIT ─────────────
+        // ── THE DEFENSE-IN-DEPTH GUARD AND THE GUARDED DIAGNOSTICS ────────────
         const string NullOutcomeContinues = "if (completedOutcome is not { } outcome)\n        continue;";
-        const string CleanExitBreak = "    break;\n}\nreturn 0;";
         // Both diagnostics the returned-outcome path emits are guarded writes, never raw Console.
         const string WorkStreamEndedDiagnostic =
             "WriteBestEffort(Console.Out, \"[Worker] Work stream ended; the worker is exiting.\");";
@@ -324,9 +650,8 @@ public sealed class WorkerRedactionIntegrationTests
 
         foreach (var fragment in new[]
                  {
-                     RawRunCapture, EligibilityAssignment, DisposalInFinally,
-                     NullOutcomeContinues, CleanExitBreak, WorkStreamEndedDiagnostic,
-                     BestEffortHelper,
+                     ServiceConstruction, AttemptRun, DisposalCall, ExitCodeInitialization,
+                     ExitDecision, NullOutcomeContinues, WorkStreamEndedDiagnostic, BestEffortHelper,
                  })
         {
             Assert.True(
@@ -334,43 +659,66 @@ public sealed class WorkerRedactionIntegrationTests
                 $"Expected exactly one worker Program.cs occurrence of '{fragment}'.");
         }
 
-        // ── ORDER: CAPTURE → DISPOSAL → ELIGIBILITY ───────────────────────────
-        // The raw value is captured first, the disposal then runs in the finally, and ONLY after
-        // the disposal succeeded does the outcome become eligible. Under the iteration-2 defect
-        // (the eligible assignment was the capture itself, before the disposal) this fails: a
-        // throwing Dispose could leave the eligible value populated.
+        // ── ONE SERVICE, BUILT BEFORE THE LOOP ────────────────────────────────
+        // A second construction would mean a per-attempt lifetime; the single construction must also
+        // precede the loop, since a service built inside it could not be reused by a retry.
         Assert.True(
-            source.IndexOf(RawRunCapture, StringComparison.Ordinal)
-            < source.IndexOf(DisposalInFinally, StringComparison.Ordinal),
-            "The run outcome must be captured before service disposal runs.");
+            source.IndexOf(ExitCodeInitialization, StringComparison.Ordinal)
+            < source.IndexOf(LoopAnchor, StringComparison.Ordinal),
+            "The exit code must be initialized BEFORE the attempt loop so no exit path can bypass it.");
         Assert.True(
-            source.IndexOf(DisposalInFinally, StringComparison.Ordinal)
-            < source.IndexOf(EligibilityAssignment, StringComparison.Ordinal),
-            "The outcome must become eligible only AFTER service disposal completed: a throwing "
-            + "disposal must skip the eligibility assignment.");
+            source.IndexOf(ServiceConstruction, StringComparison.Ordinal)
+            < source.IndexOf(LoopAnchor, StringComparison.Ordinal),
+            "The service must be constructed OUTSIDE the attempt loop: one instance serves the whole "
+            + "process, so its runner is never discarded between retries.");
 
-        // ── BRACE-SCOPED: the covered region really ends with the eligibility assignment ──
-        // Extract the outer try block (anchored on the eligibility field's declaration, so the
-        // ProcessExit handler's earlier try cannot be picked up) and prove the assignment is the
-        // LAST statement of the covered region — nothing between the disposal's try/finally and
-        // the assignment, so the disposal's exception path cannot reach it.
-        var coveredRegion = ExtractBracedBlock(
-            source, "WorkerRunOutcome? completedOutcome = null;\n\n    try\n    {");
-        Assert.False(coveredRegion is null, "The outer covered try block was not found.");
-        Assert.Contains(RawRunCapture, coveredRegion!, StringComparison.Ordinal);
-        Assert.Contains(DisposalInFinally, coveredRegion!, StringComparison.Ordinal);
-        Assert.Contains(EligibilityAssignment, coveredRegion!, StringComparison.Ordinal);
+        // ── THE PER-ATTEMPT DISPOSAL IS GONE: DISPOSAL IS OUTSIDE THE LOOP ────
+        var loopBlock = ExtractBracedBlock(source, LoopAnchor);
+        Assert.False(loopBlock is null, "The attempt loop block was not found.");
+        Assert.Contains(AttemptRun, loopBlock!, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            DisposalCall, StripLineComments(loopBlock!), StringComparison.Ordinal);
+        // NO EARLY RETURN INSIDE THE LOOP. Comments are stripped first, so this is a claim about the
+        // loop's STATEMENTS: an early `return` would decide the process outcome before the ONE final
+        // disposal could fail it.
+        var loopCode = StripLineComments(loopBlock!);
+        Assert.DoesNotContain("return", loopCode, StringComparison.Ordinal);
+        Assert.Contains("break;", loopCode, StringComparison.Ordinal);
+
+        // ── ORDER: RUN → FINAL DISPOSAL → EXIT DECISION ───────────────────────
+        // The run is awaited inside the loop, the ONE final disposal follows loop termination, and
+        // the exit code is only decided afterwards — so an early return cannot freeze success first.
+        var attemptRunIndex = source.IndexOf(AttemptRun, StringComparison.Ordinal);
+        var disposalIndex = source.IndexOf(DisposalCall, StringComparison.Ordinal);
+        var exitDecisionIndex = source.IndexOf(ExitDecision, StringComparison.Ordinal);
         Assert.True(
-            coveredRegion!.LastIndexOf(DisposalInFinally, StringComparison.Ordinal)
-            < coveredRegion.LastIndexOf(EligibilityAssignment, StringComparison.Ordinal),
-            "Within the covered region, disposal must precede the eligibility assignment.");
-        // The assignment follows the inner try/finally's closing braces — no statement sits between
-        // them, so a disposal fault unwinding out of the inner finally provably skips the capture.
-        var innerFinallyEnd = coveredRegion.LastIndexOf("        }\n\n", StringComparison.Ordinal);
+            0 <= attemptRunIndex && attemptRunIndex < disposalIndex,
+            "The attempt run must precede the one final service disposal.");
         Assert.True(
-            innerFinallyEnd >= 0
-            && coveredRegion.IndexOf(EligibilityAssignment, StringComparison.Ordinal) > innerFinallyEnd,
-            "The eligibility assignment must follow the inner try/finally unwinding point.");
+            disposalIndex < exitDecisionIndex,
+            "The exit code must be decided AFTER the final service disposal: an early return would "
+            + "freeze the outcome before teardown could fail it.");
+
+        // ── THE FINAL DISPOSAL IS NEVER RETRIED, AND NEVER SILENTLY IGNORED ───
+        // The REGION between the final disposal and the exit decision IS the final disposal handling:
+        // it must record the failure as a fatal exit code and must contain NO retry classification
+        // (no filter on the retryable exception set) and no loop continuation.
+        var finalDisposalRegion = source[disposalIndex..exitDecisionIndex];
+        Assert.Contains(FatalExitAssignment, finalDisposalRegion, StringComparison.Ordinal);
+        Assert.Contains("catch (Exception", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("RpcException", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("HttpRequestException", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("IOException", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("OperationCanceledException", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("continue;", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("while (", finalDisposalRegion, StringComparison.Ordinal);
+        // Its diagnostic is the SAME guarded, sanitized write the fatal path uses — never a raw
+        // Console write and never the exception message.
+        Assert.Contains(
+            "WriteBestEffort(Console.Error, $\"[Worker] Fatal error [",
+            finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("ex.Message", finalDisposalRegion, StringComparison.Ordinal);
+        Assert.DoesNotContain("ex.ToString()", finalDisposalRegion, StringComparison.Ordinal);
 
         // ── BRACE-SCOPED: the retry catch explicitly proceeds to the next iteration ──
         // Extract the retry catch's body and prove it ends its OWN iteration with `continue;`
@@ -398,17 +746,21 @@ public sealed class WorkerRedactionIntegrationTests
         var outcomeHandlingStart = source.IndexOf(NullOutcomeContinues, StringComparison.Ordinal);
         Assert.True(
             catchRegionStart >= 0 && finalFatalCatch > catchRegionStart,
-            "The sanitized catch region must exist after the covered try/finally.");
+            "The sanitized catch region must exist inside the attempt loop.");
         Assert.True(
             outcomeHandlingStart > finalFatalCatch,
             "Returned-outcome handling must come AFTER the final fatal catch: a throwing diagnostic "
             + "there can never be classified as a connection failure and retried.");
-
-        // ── A RETURNED OUTCOME ALWAYS STOPS THE LOOP WITH THE SAME EXIT CODE ──
+        // The handling is still INSIDE the loop (it decides the NEXT iteration or ends it).
         Assert.True(
-            source.IndexOf(WorkStreamEndedDiagnostic, StringComparison.Ordinal)
-            < source.IndexOf(CleanExitBreak, StringComparison.Ordinal),
-            "The WorkStreamEnded diagnostic must precede the unconditional loop exit.");
+            outcomeHandlingStart > source.IndexOf(LoopAnchor, StringComparison.Ordinal)
+            && outcomeHandlingStart < disposalIndex,
+            "Returned-outcome handling belongs INSIDE the attempt loop, before the final disposal.");
+
+        // ── A RETURNED OUTCOME ALWAYS STOPS THE LOOP ──────────────────────────
+        Assert.True(
+            source.IndexOf(WorkStreamEndedDiagnostic, StringComparison.Ordinal) < disposalIndex,
+            "The WorkStreamEnded diagnostic must precede the loop's exit and the final disposal.");
 
         // ── THE GUARDED HELPER SWALLOWS EVERYTHING ─────────────────────────────
         var helperBody = source[source.IndexOf(BestEffortHelper, StringComparison.Ordinal)..];
@@ -506,6 +858,20 @@ public sealed class WorkerRedactionIntegrationTests
     }
 
     /// <summary>
+    /// Removes whole-line <c>//</c> comments from a source fragment, so a structural claim is made
+    /// about STATEMENTS rather than about prose a comment happens to contain.
+    /// </summary>
+    private static string StripLineComments(string fragment) =>
+        string.Join(
+            "\n",
+            fragment.Split('\n')
+                .Select(line =>
+                {
+                    var index = line.IndexOf("//", StringComparison.Ordinal);
+                    return index >= 0 ? line[..index] : line;
+                }));
+
+    /// <summary>
     /// Extracts the brace-balanced block whose opening line contains <paramref name="anchor"/>,
     /// starting at the anchor's own opening brace. Returns the block's body INCLUDING the opening
     /// and closing braces, or null when no such anchor exists. Brace counting ignores braces inside
@@ -559,6 +925,56 @@ public sealed class WorkerRedactionIntegrationTests
         return dir;
     }
 
+    /// <summary>A hermetic temp config-repo directory for the retry-loop test.</summary>
+    private static string CreateTempConfigRepoDir()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"redaction-retry-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    /// <summary>
+    /// A git handler for a HEALTHY repo whose origin is a credential-free HTTPS URL matching the
+    /// provisioned config-repo URL, so the preparation probes, never clones, and never touches the
+    /// network (the same shape the lifecycle tests use).
+    /// </summary>
+    private static Func<IReadOnlyList<string>, GitProcessResult> HealthyRepoHandler(string configRepoDir) =>
+        tokens =>
+        {
+            if (MatchesTokens(tokens, "rev-parse", "--is-inside-work-tree"))
+                return new GitProcessResult(0, "true\n", "");
+            if (MatchesTokens(tokens, "rev-parse", "--show-toplevel"))
+                return new GitProcessResult(0, configRepoDir + "\n", "");
+            if (MatchesTokens(tokens, "remote", "get-url", "origin"))
+                return new GitProcessResult(0, "https://github.com/org/config-repo.git\n", "");
+            return new GitProcessResult(0, "", "");
+        };
+
+    private static bool MatchesTokens(IReadOnlyList<string> tokens, params string[] prefix)
+    {
+        if (tokens.Count < prefix.Length)
+            return false;
+        for (var i = 0; i < prefix.Length; i++)
+        {
+            if (!string.Equals(tokens[i], prefix[i], StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
+
+    private static void TryDeleteDir(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            // Best effort: a leaked temp directory must never fail a test.
+        }
+    }
+
     /// <summary>
     /// Builds a real <see cref="WorkerService"/> whose agent runner throws on disposal, by
     /// swapping the private <c>_agentRunner</c> field — the same reflection seam the existing
@@ -588,6 +1004,141 @@ public sealed class WorkerRedactionIntegrationTests
         Role = CopilotHive.Workers.WorkerRole.Coder,
         Repositories = [],
     };
+
+    /// <summary>
+    /// A minimal write stream for the accepted attempt: the Ready write is recorded and completes,
+    /// so the accepted attempt's initial Ready lands and the CLEAN EOF then ends the run. It derives
+    /// from the shared <see cref="FakeClientStreamWriter{T}"/> double, so the token-aware
+    /// <c>WriteAsync(T, CancellationToken)</c> the production sends actually invoke is honoured.
+    /// </summary>
+    private sealed class RequestStreamStub : FakeClientStreamWriter<WorkerMessage>
+    {
+        private readonly List<WorkerMessage> _writes = [];
+
+        internal IReadOnlyList<WorkerMessage> Writes
+        {
+            get { lock (_writes) return [.. _writes]; }
+        }
+
+        public override Task WriteAsync(WorkerMessage message)
+        {
+            lock (_writes)
+                _writes.Add(message);
+            return Task.CompletedTask;
+        }
+
+        public override Task CompleteAsync() => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// An invoker whose Register RPC is ACCEPTED, so a loop's second attempt genuinely returns an
+    /// outcome instead of faulting again.
+    /// </summary>
+    private sealed class AcceptedRegisterInvoker : CallInvoker
+    {
+        public override TResponse BlockingUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected blocking call {method.FullName}.");
+
+        public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
+        {
+            object payload = method.FullName switch
+            {
+                "/copilothive.HiveOrchestrator/Register" => new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = "worker-retry-loop-second",
+                    OrchestratorVersion = "test",
+                },
+                "/copilothive.HiveOrchestrator/GetWorkerConfig" =>
+                    new GetWorkerConfigResponse
+                    {
+                        GithubToken = "ghp_fixture_retry_loop",
+                        LlmProvider = "copilot",
+                        ConfigRepoUrl = "https://github.com/org/config-repo.git",
+                    },
+                "/copilothive.HiveOrchestrator/GetSession" => new GetSessionResponse { Found = false },
+                "/copilothive.HiveOrchestrator/SaveSession" => new SaveSessionResponse { Success = true },
+                "/copilothive.HiveOrchestrator/Heartbeat" => new HeartbeatResponse { Acknowledged = true },
+                _ => throw new NotSupportedException($"Unexpected unary call {method.FullName}."),
+            };
+
+            return new AsyncUnaryCall<TResponse>(
+                Task.FromResult((TResponse)payload),
+                Task.FromResult(new Metadata()),
+                () => new Status(StatusCode.OK, string.Empty),
+                () => new Metadata(),
+                () => { });
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected server-streaming call {method.FullName}.");
+
+        public override AsyncClientStreamingCall<TRequest, TResponse> AsyncClientStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected client-streaming call {method.FullName}.");
+
+        public override AsyncDuplexStreamingCall<TRequest, TResponse> AsyncDuplexStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException(
+                $"Unexpected duplex call {method.FullName} — the fixture supplies the stream explicitly.");
+    }
+
+    /// <summary>
+    /// A bounded response reader: the first MoveNext returns <c>false</c> immediately (a CLEAN EOF),
+    /// so the accepted attempt's work stream ends with the existing
+    /// <see cref="WorkerRunOutcome.WorkStreamEnded"/> teardown path.
+    /// </summary>
+    private sealed class ChannelReaderStub : IAsyncStreamReader<OrchestratorMessage>
+    {
+        private bool _read;
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken) =>
+            Task.FromResult(!_read && (_read = true));
+
+        public OrchestratorMessage Current => new();
+    }
+
+    /// <summary>An invoker whose Register RPC faults with the supplied exception.</summary>
+    private sealed class RegisterFaultingInvoker(Exception registerFailure) : CallInvoker
+    {
+        public override TResponse BlockingUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected blocking call {method.FullName}.");
+
+        public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
+        {
+            Task<TResponse> payload = method.FullName switch
+            {
+                "/copilothive.HiveOrchestrator/Register" =>
+                    Task.FromException<TResponse>(registerFailure),
+                _ => Task.FromException<TResponse>(
+                    new NotSupportedException($"Unexpected unary call {method.FullName}.")),
+            };
+
+            return new AsyncUnaryCall<TResponse>(
+                payload,
+                Task.FromResult(new Metadata()),
+                () => new Status(StatusCode.OK, string.Empty),
+                () => new Metadata(),
+                () => { });
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected server-streaming call {method.FullName}.");
+
+        public override AsyncClientStreamingCall<TRequest, TResponse> AsyncClientStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected client-streaming call {method.FullName}.");
+
+        public override AsyncDuplexStreamingCall<TRequest, TResponse> AsyncDuplexStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected duplex-streaming call {method.FullName}.");
+    }
 
     /// <summary>An <see cref="IAgentRunner"/> that throws the supplied exception from SendPromptAsync.</summary>
     private sealed class SecretThrowingAgentRunner(Exception toThrow) : IAgentRunner

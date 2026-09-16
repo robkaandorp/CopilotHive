@@ -224,6 +224,115 @@ public sealed class WorkerService(
         + "  *) printf '%s' \"$GITHUB_CONFIG_REPO_TOKEN\" ;;\n"
         + "esac\n";
 
+    #region Service lifecycle guard (Idle / Running / Disposed)
+
+    /// <summary>The service owns no run: a new <see cref="RunAsync"/> may claim it, or <see cref="Dispose"/> may retire it.</summary>
+    private const int LifecycleIdle = 0;
+
+    /// <summary>A run currently owns the service's single runner. Nothing else may claim it, and it may not be disposed yet.</summary>
+    private const int LifecycleRunning = 1;
+
+    /// <summary>Final disposal has been CLAIMED (before the fallible runner disposal ran). Terminal and one-way.</summary>
+    private const int LifecycleDisposed = 2;
+
+    /// <summary>
+    /// THE SERVICE'S ONE ATOMIC LIFECYCLE STATE — an <c>int</c> read and claimed with the
+    /// <see cref="Interlocked"/> helpers so exactly one caller can win a transition. It deliberately
+    /// carries no queue, no waiter list and no blocking drain: the contract is a single
+    /// Idle → Running claim per run, back to Idle at quiescence, and one terminal Idle → Disposed.
+    /// </summary>
+    private int _lifecycleState = LifecycleIdle;
+
+    /// <summary>
+    /// CLAIMS the run guard for one invocation of <see cref="RunAsync"/>: Idle → Running, or a
+    /// fail-fast rejection. Called BEFORE the agent runner is prepared, so an overlapping run can
+    /// never touch the shared runner.
+    /// </summary>
+    /// <remarks>
+    /// The read-then-claim loop is a retry of the SAME claim, never a wait: whichever thread loses the
+    /// <see cref="Interlocked.CompareExchange(ref int, int, int)"/> re-reads the state and reports the
+    /// matching typed failure on that same call, so neither rejection depends on timing.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Another run currently owns the service.</exception>
+    /// <exception cref="ObjectDisposedException">The service has been finally disposed.</exception>
+    private void ClaimRunGuard()
+    {
+        while (true)
+        {
+            var observed = Volatile.Read(ref _lifecycleState);
+
+            if (observed == LifecycleDisposed)
+            {
+                throw new ObjectDisposedException(
+                    nameof(WorkerService),
+                    "The worker service has been disposed and cannot run again.");
+            }
+
+            if (observed == LifecycleRunning)
+            {
+                throw new InvalidOperationException(
+                    "A run is already in progress on this worker service — runs must be sequential.");
+            }
+
+            if (Interlocked.CompareExchange(ref _lifecycleState, LifecycleRunning, LifecycleIdle) == LifecycleIdle)
+                return;
+        }
+    }
+
+    /// <summary>
+    /// RELEASES the run guard back to Idle: Running → Idle. A no-op when the state is anything else,
+    /// so a release that races a completed final disposal can never revive a disposed service.
+    /// </summary>
+    private void ReleaseRunGuard() =>
+        Interlocked.CompareExchange(ref _lifecycleState, LifecycleIdle, LifecycleRunning);
+
+    /// <summary>The sanitized report message for a failed provisioning-callback detachment.</summary>
+    private const string ProvisionerDetachmentFailedMessage = "Provisioner detachment failed";
+
+    /// <summary>
+    /// DETACHES the run's provisioning callback from the shared runner, ONCE the run's execution and
+    /// heartbeat have reached quiescence (this runs after the whole invocation body, including its
+    /// lexical transport disposal, has finished or faulted) and BEFORE the run guard is released.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT IS REQUIRED. The installed callback is the retired connection's OWN checked entry point.
+    /// Leaving it installed would let a LATER sequential run's first lazy client creation provision
+    /// through a connection that no longer exists — the callback fails disconnected, or worse, is
+    /// silently retargeted. Detaching with the EXISTING <see cref="IAgentRunner.SetConfigProvisioner"/>
+    /// member (passing <c>null</c>) keeps the callback's own binding untouched: an already CAPTURED
+    /// callback stays bound to the retired connection it came from and is never pointed anywhere else.
+    /// </para>
+    /// <para>
+    /// ERROR PRECEDENCE. A detachment failure is fallible runner interaction, so it must never skip
+    /// lexical cleanup (it cannot: the cleanup already ran) and must never replace a prior run/cleanup
+    /// failure. With <paramref name="primaryFailure"/> already in flight the detachment failure is
+    /// merely REPORTED through the guarded sanitized log — the same existing diagnostics path the
+    /// heartbeat-cleanup failures use, with type classification only, never a raw message — and the
+    /// primary propagates unchanged. Without a primary it propagates with its ORIGINAL evidence.
+    /// </para>
+    /// </remarks>
+    /// <param name="primaryFailure">The run failure already propagating, or <c>null</c>.</param>
+    private void DetachProvisioner(Exception? primaryFailure)
+    {
+        try
+        {
+            _agentRunner.SetConfigProvisioner(null);
+        }
+        catch (Exception ex)
+        {
+            if (primaryFailure is not null)
+            {
+                ReportIfPresent(ex, ProvisionerDetachmentFailedMessage);
+                return;
+            }
+
+            ExceptionDispatchInfo.Capture(ex).Throw();
+        }
+    }
+
+    #endregion
+
     /// <summary>
     /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
     /// opens a bidirectional gRPC stream, and processes task assignments until cancelled.
@@ -242,6 +351,28 @@ public sealed class WorkerService(
     /// task success, the absence of a concurrent cancellation request, retryability, or a failure
     /// reason — and no synthetic shutdown state is introduced.
     /// </para>
+    /// <para>
+    /// ONE RUN AT A TIME, ONE DISPOSAL AT THE VERY END. This method CLAIMS the service's single
+    /// Idle → Running run guard BEFORE the agent runner is prepared, so an OVERLAPPING invocation
+    /// fails fast with <see cref="InvalidOperationException"/> instead of racing the same runner, and
+    /// an invocation after final disposal fails with <see cref="ObjectDisposedException"/>. No runner
+    /// is ever created or replaced: the SAME readonly <see cref="IAgentRunner"/> serves every
+    /// sequential run of this service.
+    /// </para>
+    /// <para>
+    /// The guard is released back to Idle in this method's OUTERMOST <c>finally</c> — after the whole
+    /// invocation body (see <see cref="RunCoreAsync"/>), INCLUDING its lexical stream/channel
+    /// disposal, has finished or faulted — so exactly one run can own the runner at a time and a
+    /// follow-up sequential run is admitted only once the previous one is fully quiescent.
+    /// </para>
+    /// <para>
+    /// The runner's provisioning callback is DETACHED here as well, AFTER that quiescence and BEFORE
+    /// the guard is released, on EVERY path — including early setup failures and the paths that never
+    /// reached the installation at all. A callback bound to a connection this run has retired must
+    /// never be inherited by a later run (it would provision through a dead connection), and detaching
+    /// strictly before the release guarantees a follow-up run cannot have ITS OWN callback cleared by
+    /// its predecessor's teardown.
+    /// </para>
     /// </remarks>
     /// <param name="ct">Cancellation token that stops the worker.</param>
     /// <returns>
@@ -249,7 +380,50 @@ public sealed class WorkerService(
     /// <see cref="WorkerRunOutcome.WorkStreamEnded"/> once the accepted connection's work stream
     /// ended and the entire lifecycle teardown completed.
     /// </returns>
+    /// <exception cref="InvalidOperationException">Another run is already in progress on this service.</exception>
+    /// <exception cref="ObjectDisposedException">This service has been finally disposed.</exception>
     public async Task<WorkerRunOutcome> RunAsync(CancellationToken ct)
+    {
+        ClaimRunGuard();
+
+        // The run's PRIMARY failure, recorded by rethrowing UNCHANGED — the caller still observes the
+        // ORIGINAL instance and stack trace — while the OUTERMOST `finally` below applies the existing
+        // error-precedence rule to the detachment failure.
+        Exception? primaryFailure = null;
+        try
+        {
+            return await RunCoreAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+            throw;
+        }
+        finally
+        {
+            // DETACH, THEN RELEASE — in that order, on EVERY path, including an early setup failure
+            // and even a run that never installed a callback. The release runs even when the
+            // detachment itself fails, so a failing detach can never leave the service stuck Running.
+            try
+            {
+                DetachProvisioner(primaryFailure);
+            }
+            finally
+            {
+                ReleaseRunGuard();
+            }
+        }
+    }
+
+    /// <summary>
+    /// THE RUN BODY — everything between claiming the run guard and releasing it. The lexical
+    /// transport ownership (<c>using var ownedChannel</c> / <c>using var stream</c>) lives here, so
+    /// both the channel and the stream have been disposed or faulted before
+    /// <see cref="RunAsync"/>'s <c>finally</c> detaches the provisioner and releases the guard.
+    /// </summary>
+    /// <param name="ct">Cancellation token that stops the worker.</param>
+    /// <returns>The observed run outcome.</returns>
+    private async Task<WorkerRunOutcome> RunCoreAsync(CancellationToken ct)
     {
         // Prepare the agent runner. This creates NO LLM client: worker containers hold no LLM
         // credentials of their own, so the client is created lazily on the first prompt, after
@@ -1753,17 +1927,59 @@ public sealed class WorkerService(
         }
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// FINALLY disposes this service's single agent runner. The runner is fallible to dispose, and
+    /// its failure PROPAGATES unchanged (see the remarks), but the service's lifecycle state is
+    /// claimed ONE-WAY first, so the whole operation is idempotent and a throwing first disposal is
+    /// never retried.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// RUN-GUARD FIRST. Disposal while a run is IN PROGRESS is refused with
+    /// <see cref="InvalidOperationException"/> WITHOUT changing state and WITHOUT touching the
+    /// runner: the caller must cancel the run and await it first. Claiming is an atomic
+    /// Idle → Disposed transition performed BEFORE the fallible runner disposal, so a repeat call is
+    /// a NO-OP even when the FIRST disposal threw, and the ORIGINAL exception the first call surfaced
+    /// is preserved rather than re-raised or replaced by a second runner interaction.
+    /// </para>
+    /// <para>
+    /// There is deliberately NO blocking drain and no wait for in-flight work: refusing while Running
+    /// is the whole contract, and it keeps disposal from silently racing a live run.
+    /// </para>
+    /// <para>
+    /// Runner disposal is deliberately fallible and PROPAGATES. <c>GetAwaiter().GetResult()</c>
+    /// rethrows the original exception rather than wrapping it in an AggregateException the
+    /// way Wait() does, so the sanitized handler in Program.cs classifies the real fault.
+    /// Program.cs runs this inside its try, so a throwing disposal is redacted, never dumped
+    /// raw by the runtime.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">A run is in progress; cancel and await it first.</exception>
     public void Dispose()
     {
-        // Dispose the agent runner (which disposes the IChatClient) so each
-        // retry gets a fresh connection without leaking the previous one.
-        //
-        // Runner disposal is deliberately fallible and PROPAGATES. GetAwaiter().GetResult()
-        // rethrows the original exception rather than wrapping it in an AggregateException the
-        // way Wait() does, so the sanitized handler in Program.cs classifies the real fault.
-        // Program.cs runs this inside its try, so a throwing disposal is redacted, never dumped
-        // raw by the runtime.
+        while (true)
+        {
+            var observed = Volatile.Read(ref _lifecycleState);
+
+            // A run owns the runner: fail fast, change NO state, and do NOT dispose underneath it.
+            if (observed == LifecycleRunning)
+            {
+                throw new InvalidOperationException(
+                    "Cannot dispose the worker service while a run is in progress — cancel and await "
+                    + "the run first.");
+            }
+
+            // Already CLAIMED (the first call won, whether or not its runner disposal threw): a
+            // repeat is a no-op, so the original failure is never re-raised or replaced.
+            if (observed == LifecycleDisposed)
+                return;
+
+            if (Interlocked.CompareExchange(ref _lifecycleState, LifecycleDisposed, LifecycleIdle) == LifecycleIdle)
+                break;
+        }
+
+        // CLAIMED BEFORE this fallible step: a throwing disposal therefore still leaves the service
+        // terminally disposed, exactly like a successful one.
         _agentRunner.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 }

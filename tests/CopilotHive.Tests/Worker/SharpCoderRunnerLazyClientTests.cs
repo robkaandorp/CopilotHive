@@ -1,9 +1,12 @@
 using CopilotHive.Worker;
+using CopilotHive.Workers;
 
 using Microsoft.Extensions.AI;
 
 using System.Reflection;
 using System.Runtime.CompilerServices;
+
+using SharpCoder;
 
 namespace CopilotHive.Tests.Worker;
 
@@ -31,11 +34,24 @@ public sealed class SharpCoderRunnerLazyClientTests
         typeof(SharpCoderRunner).GetField("_pendingModel", BindingFlags.NonPublic | BindingFlags.Instance)
         ?? throw new InvalidOperationException("_pendingModel field not found.");
 
+    /// <summary>
+    /// The runner's tester-report field. It is observed DIRECTLY — not through a later
+    /// <c>SetCustomAgent</c>-mediated tool render — because <c>SetCustomAgent</c> clears this SAME
+    /// field, so any observation taken after one cannot attribute the clear to
+    /// <see cref="SharpCoderRunner.ConnectAsync"/>.
+    /// </summary>
+    private static readonly FieldInfo TesterReportField =
+        typeof(SharpCoderRunner).GetField("_testerReport", BindingFlags.NonPublic | BindingFlags.Instance)
+        ?? throw new InvalidOperationException("_testerReport field not found.");
+
     private static IChatClient? GetChatClient(SharpCoderRunner runner) =>
         (IChatClient?)ChatClientField.GetValue(runner);
 
     private static string? GetPendingModel(SharpCoderRunner runner) =>
         (string?)PendingModelField.GetValue(runner);
+
+    private static string? GetTesterReport(SharpCoderRunner runner) =>
+        (string?)TesterReportField.GetValue(runner);
 
     // ── Stub chat client ───────────────────────────────────────────────────────
 
@@ -465,5 +481,209 @@ public sealed class SharpCoderRunnerLazyClientTests
         {
             Directory.Delete(workDir, recursive: true);
         }
+    }
+
+    // ===========================================================================
+    // ConnectAsync: quiescent connection preparation
+    //
+    // Everything here is asserted through the REAL agent-options seam
+    // (OnAgentOptionsCreated / the tools it exposes), so the contract is pinned on what the
+    // production prompt turn actually receives — not on field reflection alone.
+    // ===========================================================================
+
+    /// <summary>
+    /// CONNECTION PREPARATION IS A ROLE/PROMPT RESET, NOT A PER-ASSIGNMENT ONE.
+    /// <para>
+    /// The runner carries the PREVIOUS connection's <c>UpdateAgents</c> role and guidance
+    /// (<c>"STALE-CONNECTION-GUIDANCE"</c>). A connection start with NO update must prepare from the
+    /// constructor defaults: the ACTUAL <c>AgentOptions.SystemPrompt</c> handed to the production
+    /// prompt turn is the default role's prompt and carries NONE of the stale guidance. A LATER
+    /// <c>UpdateAgents</c> on the new connection IS honored — so the reset cannot be moved into the
+    /// per-assignment path, which would erase it.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_RestoresConnectionStartDefaults_AndALaterUpdateIsHonored()
+    {
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner("/config-repo");
+            runner.ClientCreationSeam = _ => new StubClient();
+
+            const string StaleGuidance = "STALE-CONNECTION-GUIDANCE";
+            const string FreshGuidance = "FRESH-CONNECTION-GUIDANCE";
+
+            // The PREVIOUS connection's UpdateAgents state, still on the runner.
+            runner.SetCustomAgent(WorkerRole.Coder, StaleGuidance);
+
+            AgentOptions? firstOptions = null;
+            runner.OnAgentOptionsCreated = options => firstOptions = options;
+
+            // CONNECTION START with no update at all.
+            await runner.ConnectAsync(TestContext.Current.CancellationToken);
+            await runner.SendPromptAsync("first prompt", workDir, TestContext.Current.CancellationToken);
+
+            var first = Assert.IsType<AgentOptions>(firstOptions);
+            // The ACTUAL prompt the agent turn would use: the DEFAULT role's prompt, built with the
+            // DEFAULT (null) guidance — the same thing a freshly constructed runner would produce.
+            Assert.Equal(
+                SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Unspecified, null),
+                first.SystemPrompt);
+            Assert.DoesNotContain(StaleGuidance, first.SystemPrompt, StringComparison.Ordinal);
+
+            // A LATER UpdateAgents on the NEW connection is HONORED — the reset is a
+            // connection-start preparation, never a per-assignment one.
+            runner.SetCustomAgent(WorkerRole.Coder, FreshGuidance);
+            AgentOptions? secondOptions = null;
+            runner.OnAgentOptionsCreated = options => secondOptions = options;
+            await runner.SendPromptAsync("second prompt", workDir, TestContext.Current.CancellationToken);
+
+            var second = Assert.IsType<AgentOptions>(secondOptions);
+            Assert.Equal(
+                SharpCoderRunner.BuildRoleSystemPrompt(WorkerRole.Coder, FreshGuidance),
+                second.SystemPrompt);
+            Assert.Contains(FreshGuidance, second.SystemPrompt, StringComparison.Ordinal);
+            Assert.DoesNotContain(StaleGuidance, second.SystemPrompt, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// CONNECTION PREPARATION CLEARS A STALE TESTER REPORT — attributed to
+    /// <see cref="SharpCoderRunner.ConnectAsync"/> ITSELF.
+    /// <para>
+    /// THE ATTRIBUTION PROBLEM THIS SOLVES. <c>SetCustomAgent</c> clears the SAME field, so an
+    /// observation taken only after a post-<c>ConnectAsync</c> <c>SetCustomAgent</c> stays green even
+    /// with the clear removed from <c>ConnectAsync</c>. The decisive observation is therefore taken
+    /// IMMEDIATELY after <c>ConnectAsync</c> and BEFORE anything else touches the runner: removing
+    /// <c>_testerReport = null</c> from <c>ConnectAsync</c> fails THIS assertion by name.
+    /// </para>
+    /// <para>
+    /// The BEFORE-CONTROL is retained and strengthened: the report is first observed present BOTH on
+    /// the field AND through the <c>get_test_report</c> tool the production reviewer turn actually
+    /// receives (non-vacuity — the recorded report really is live), and the end-to-end render after
+    /// preparation is still asserted, so the behavior remains pinned through the production tool too.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_ClearsStaleTesterReport_SurfacedThroughTheProductionTool()
+    {
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            const string StaleReport = "STALE-TESTER-REPORT";
+            var runner = new SharpCoderRunner("/config-repo");
+            runner.ClientCreationSeam = _ => new StubClient();
+
+            // The previous connection's reviewer state: role + a recorded tester report.
+            runner.SetCustomAgent(WorkerRole.Reviewer, "reviewer guidance");
+            runner.SetTesterReport(StaleReport);
+
+            // BEFORE-CONTROL (non-vacuity): the report is live on the field AND really is exposed by
+            // the production tool, so the post-preparation observations below are not vacuous.
+            Assert.Equal(StaleReport, GetTesterReport(runner));
+
+            IList<AITool>? toolsBefore = null;
+            runner.OnAgentOptionsCreated = options => toolsBefore = options.CustomTools;
+            await runner.SendPromptAsync("review", workDir, TestContext.Current.CancellationToken);
+
+            Assert.Contains(
+                StaleReport,
+                await InvokeGetTestReportAsync(toolsBefore!),
+                StringComparison.Ordinal);
+            Assert.Equal(StaleReport, GetTesterReport(runner));
+
+            // ── THE DECISIVE, ISOLATED OBSERVATION ────────────────────────────
+            // CONNECTION START, and NOTHING else: no SetCustomAgent, no prompt, no reset. The field is
+            // read immediately afterwards, so the clear can only be attributed to ConnectAsync.
+            await runner.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.Null(GetTesterReport(runner));
+
+            // ...and the END-TO-END render still matches: the connection's own UpdateAgents sets the
+            // role again, so the tool is available but no longer carries the stale report.
+            runner.SetCustomAgent(WorkerRole.Reviewer, "reviewer guidance");
+
+            IList<AITool>? toolsAfter = null;
+            runner.OnAgentOptionsCreated = options => toolsAfter = options.CustomTools;
+            await runner.SendPromptAsync("review again", workDir, TestContext.Current.CancellationToken);
+
+            var report = await InvokeGetTestReportAsync(toolsAfter!);
+            Assert.DoesNotContain(StaleReport, report, StringComparison.Ordinal);
+            Assert.Contains("No test report available", report, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// CONNECTION PREPARATION CREATES NO LLM CLIENT and never invokes the client-creation seam: the
+    /// existing lazy creation contract is unchanged, so preparation can never start provisioning
+    /// transport on its own.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_DoesNotInvokeTheClientCreationSeam()
+    {
+        var runner = new SharpCoderRunner("/config-repo");
+        var seamCalls = 0;
+        runner.ClientCreationSeam = _ =>
+        {
+            Interlocked.Increment(ref seamCalls);
+            return new StubClient();
+        };
+
+        await runner.ConnectAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, Volatile.Read(ref seamCalls));
+        Assert.Null(GetChatClient(runner));
+    }
+
+    /// <summary>
+    /// CONNECTION PREPARATION NEVER RESURRECTS A DISPOSED RUNNER: it neither re-creates the client
+    /// lifecycle gate nor re-enables prompting. After final disposal a connection start returns
+    /// normally, yet the disposed runner still behaves as disposed — a prompt turn still fails with
+    /// the same .NET disposal category, and no client is created.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_OnDisposedRunner_DoesNotResurrectIt()
+    {
+        var workDir = CreateTempWorkDir();
+        try
+        {
+            var runner = new SharpCoderRunner("/config-repo");
+            runner.ClientCreationSeam = _ => new StubClient();
+            await runner.ConnectAsync(TestContext.Current.CancellationToken);
+
+            await runner.DisposeAsync();
+
+            // Preparation itself does not throw and does not create anything...
+            await runner.ConnectAsync(TestContext.Current.CancellationToken);
+            Assert.Null(GetChatClient(runner));
+
+            // ...and the runner is STILL disposed: the next prompt turn fails with the existing
+            // disposal category instead of silently re-creating the gate.
+            await Assert.ThrowsAsync<ObjectDisposedException>(
+                () => runner.SendPromptAsync("prompt", workDir, TestContext.Current.CancellationToken));
+            Assert.Null(GetChatClient(runner));
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    /// <summary>Invokes the production <c>get_test_report</c> tool from a captured tool set.</summary>
+    private static async Task<string> InvokeGetTestReportAsync(IList<AITool> tools)
+    {
+        var tool = Assert.IsAssignableFrom<AIFunction>(
+            tools.Single(t => t is AIFunction f && f.Name == "get_test_report"));
+        var result = await tool.InvokeAsync(
+            new AIFunctionArguments(), TestContext.Current.CancellationToken);
+        return result?.ToString() ?? string.Empty;
     }
 }

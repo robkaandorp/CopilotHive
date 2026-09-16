@@ -8,6 +8,7 @@ using Grpc.Core;
 using Microsoft.Extensions.AI;
 
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
 using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
@@ -174,10 +175,16 @@ public sealed class WorkerConnectionLifecycleTests
             Assert.NotNull(runner.ConfigProvisioner);
             Assert.NotEqual(connection.Provisioner!.EnsureProvisionedAsync, runner.ConfigProvisioner);
 
+            // CAPTURE the callback WHILE LIVE. RunAsync DETACHES it at quiescence (before releasing
+            // the run guard), so a post-run field read would only ever see null. The captured
+            // delegate is the very object the production lifecycle installed, and it stays bound to
+            // the connection it was created for — never retargeted.
+            var lazyCallback = runner.ConfigProvisioner!;
+
             // The LAZY runner callback reaches that instance and performs one fetch on this
             // fixture's in-memory environment.
             Assert.Equal(0, provisionerHarness.FetchCount);
-            await runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken);
+            await lazyCallback(FixtureModel, TestContext.Current.CancellationToken);
             Assert.Equal(1, provisionerHarness.FetchCount);
 
             // ...and the EAGER per-assignment site reaches that SAME instance: the count advances
@@ -243,10 +250,14 @@ public sealed class WorkerConnectionLifecycleTests
             // delegate, so this proves the connection-owned wrapper — not the provisioner's own
             // plumbing — is what rejects a post-teardown attempt: the disconnected error is raised
             // and the override provisioner is never started (its fetch count does not move).
+            //
+            // The CALLBACK is the one CAPTURED while the connection was live (the lifecycle detaches
+            // it at quiescence), and it is still bound to the RETIRED connection — proof the retired
+            // callback is never retargeted onto a replacement.
             var overrideFetchesBefore = provisionerHarness.FetchCount;
             var fetchCallsBefore = invoker.WorkerConfigCalls;
             var lazyFailure = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => runner.ConfigProvisioner!(FixtureModel, TestContext.Current.CancellationToken));
+                () => lazyCallback(FixtureModel, TestContext.Current.CancellationToken));
             Assert.Equal(WorkerConnection.DisconnectedMessage, lazyFailure.Message);
             Assert.Equal(overrideFetchesBefore, provisionerHarness.FetchCount);
 
@@ -560,6 +571,14 @@ public sealed class WorkerConnectionLifecycleTests
             Assert.Equal(1, disposals);
             Assert.True(retiredAtDisposal, "The connection must be retired before its stream is disposed.");
             Assert.True(unpublishedAtDisposal, "The connection must be unpublished before its stream is disposed.");
+
+            // THE DETACH RAN ON THE EARLY SETUP-FAILURE PATH TOO. The run installed a callback only
+            // for the install attempt to throw, yet the lifecycle still detached (a SECOND
+            // SetConfigProvisioner call receiving null) before releasing the run guard — exactly as
+            // the setup-success paths do. The install call is first, so a missing detach leaves this
+            // count at 1 and fails by name.
+            Assert.Equal(2, runner.SetConfigProvisionerCalls);
+            Assert.True(runner.Detached, "The run's provisioning callback must be detached even on an early setup failure.");
 
             // And the service is genuinely disconnected afterwards — no nominally usable connection.
             var sessionFailure = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -1918,6 +1937,941 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // (4) The service / runner lifetime guard: ONE run at a time, ONE disposal.
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // The production contract these pin: the service owns ONE readonly agent runner, claims a single
+    // Idle → Running guard BEFORE preparation, releases it back to Idle in the OUTERMOST finally —
+    // after every invocation resource, including the lexical transport disposal — and claims one
+    // terminal Idle → Disposed in Dispose. The runner is NEVER replaced, and its provisioning
+    // callback is DETACHED after quiescence and before the release.
+
+    /// <summary>
+    /// AN OVERLAPPING RUN IS REFUSED BEFORE IT TOUCHES ANYTHING. Run 1 is held INSIDE its preparation
+    /// (the gate is entered, so it provably owns the guard), and a second invocation must fail fast
+    /// with the EXISTING <see cref="InvalidOperationException"/> category — not by reaching the runner
+    /// a second time.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_OverlappingRun_FailsFastWithoutTouchingTheRunner()
+    {
+        var runner = new LifetimeProbeRunner
+        {
+            ConnectGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // PRODUCER-START EVIDENCE: run 1 is inside `ConnectAsync`, i.e. it has claimed the guard
+            // and is preparing the runner. Its gate is still shut.
+            await runner.ConnectEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, runner.ConnectCalls);
+            Assert.False(run.IsCompleted);
+
+            // THE OVERLAP IS REFUSED — and the refused call never prepared the runner.
+            var overlapping = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Contains("already in progress", overlapping.Message, StringComparison.Ordinal);
+            Assert.Equal(1, runner.ConnectCalls);
+            Assert.Equal(0, runner.DisposeCalls);
+            Assert.Empty(runner.ProvisionerHistory);
+
+            // The refused call changed nothing about run 1, which then completes normally.
+            runner.ConnectGate.TrySetResult(true);
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            await JoinAllForTeardownAsync(service, ("run", run));
+        }
+    }
+
+    /// <summary>
+    /// DISPOSE WHILE A RUN IS IN FLIGHT REFUSES, WITHOUT CHANGING STATE AND WITHOUT DISPOSING THE
+    /// RUNNER. The in-flight run is provably undisturbed (its gate can still complete it), the runner
+    /// is not disposed underneath it, and the service stays usable for that run.
+    /// </summary>
+    [Fact]
+    public async Task Dispose_WhileRunInFlight_RefusesWithoutStateChangeOrRunnerDisposal()
+    {
+        var runner = new LifetimeProbeRunner
+        {
+            ConnectGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await runner.ConnectEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // REFUSED: the caller must cancel/await the run first. The runner is NOT touched.
+            var refusal = Assert.Throws<InvalidOperationException>(service.Dispose);
+            Assert.Contains("run is in progress", refusal.Message, StringComparison.Ordinal);
+            Assert.Equal(0, runner.DisposeCalls);
+
+            // ...and the refusal changed NO state: the run is still owned by the guard, so a second
+            // overlapping run is still refused and the held run still completes normally.
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.False(run.IsCompleted, "The in-flight run must be untouched by the refused disposal.");
+
+            runner.ConnectGate.TrySetResult(true);
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // ONCE THE RUN'S RESOURCES HAVE ENDED the same service is still usable: the guard returned
+            // to Idle, and a further SEQUENTIAL run is admitted on the SAME runner instance.
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(2, runner.ConnectCalls);
+            Assert.Equal(0, runner.DisposeCalls);
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            await JoinAllForTeardownAsync(service, ("run", run));
+        }
+    }
+
+    /// <summary>
+    /// AN ACCEPTED RUN THAT ENDS LEAVES THE SERVICE REUSABLE: a SECOND sequential run is admitted on
+    /// the SAME service and the SAME runner instance, and each run's provisioning callback is
+    /// installed for it and detached at its own quiescence — in that order, once per run.
+    /// </summary>
+    /// <remarks>
+    /// The ordered <c>ProvisionerHistory</c> is what makes detachment observable: an install that is
+    /// never detached would leave the history at <c>["callback", "callback"]</c>, and run 2's own
+    /// install could then be clobbered by run 1's late teardown. This is the SERVICE-level reuse
+    /// proof; the process-level retry disposition belongs to the attempt loop.
+    /// </remarks>
+    [Fact]
+    public async Task RunAsync_AcceptedRunEnds_AnotherSequentialRunIsAllowedOnTheSameRunner()
+    {
+        const string RunAId = "worker-run-a";
+        const string RunBId = "worker-run-b";
+
+        var runner = new LifetimeProbeRunner();
+        var service = BuildServiceWithRunner(runner);
+
+        var requestsA = new RecordingRequestStream();
+        var responsesA = new ChannelResponseReader();
+        var disposalsA = 0;
+        var streamA = BuildRunStream(requestsA, responsesA, () => Interlocked.Increment(ref disposalsA));
+
+        var requestsB = new RecordingRequestStream();
+        var responsesB = new ChannelResponseReader();
+        var disposalsB = 0;
+        var streamB = BuildRunStream(requestsB, responsesB, () => Interlocked.Increment(ref disposalsB));
+
+        var invokerA = new FakeOrchestratorInvoker(
+            new RegisterResponse { Accepted = true, AssignedWorkerId = RunAId });
+        var invokerB = new FakeOrchestratorInvoker(
+            new RegisterResponse { Accepted = true, AssignedWorkerId = RunBId });
+
+        service.CallInvokerFactory = () => invokerA;
+        service.WorkStreamFactory = (_, _) => streamA;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome> runA = Task.FromResult(WorkerRunOutcome.RegistrationRejected);
+        Task<WorkerRunOutcome> runB = Task.FromResult(WorkerRunOutcome.RegistrationRejected);
+        try
+        {
+            // ── RUN 1: accepted registration, controlled EOF ──
+            runA = service.RunAsync(loopCts.Token);
+            await requestsA.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(RunAId, requestsA.Writes[0].WorkerId);
+            responsesA.TryComplete();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await runA.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // The lexical transport disposal ran, the connection is gone, and run 1's callback was
+            // detached with the EXISTING SetConfigProvisioner(null) call.
+            Assert.Equal(1, Volatile.Read(ref disposalsA));
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(1, runner.ConnectCalls);
+            Assert.Equal(new string?[] { "callback", null }, runner.ProvisionerHistory);
+
+            // ── RUN 2 ON THE SAME SERVICE AND THE SAME RUNNER ──
+            service.CallInvokerFactory = () => invokerB;
+            service.WorkStreamFactory = (_, _) => streamB;
+
+            runB = service.RunAsync(loopCts.Token);
+            await requestsB.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal(RunBId, requestsB.Writes[0].WorkerId);
+            responsesB.TryComplete();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await runB.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            Assert.Equal(2, runner.ConnectCalls);
+            Assert.Equal(1, Volatile.Read(ref disposalsB));
+            // INSTALL → DETACH → INSTALL → DETACH: each run installed exactly one callback for its OWN
+            // connection and detached it, so no run inherited the other's retired binding.
+            Assert.Equal(new string?[] { "callback", null, "callback", null }, runner.ProvisionerHistory);
+            // The runner was never disposed (nor recreated) between the runs.
+            Assert.Equal(0, runner.DisposeCalls);
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            responsesA.TryComplete();
+            responsesB.TryComplete();
+            await JoinAllForTeardownAsync(service, ("run A", runA), ("run B", runB));
+        }
+    }
+
+    /// <summary>
+    /// THE GUARD SPANS THE EXISTING JOINS — it is NOT released early, and the callback is detached
+    /// only at QUIESCENCE.
+    /// <para>
+    /// The controlled heartbeat task parks until the test releases it, so teardown is provably inside
+    /// its existing heartbeat join. At that instant: the transport is undisposed, the callback is
+    /// STILL INSTALLED (no detach), an overlapping run is STILL refused, and disposal is STILL
+    /// refused. Only after the join completes is the transport disposed, the callback detached and the
+    /// guard released.
+    /// </para>
+    /// <para>
+    /// TEARDOWN ARRIVAL IS ACKNOWLEDGED BY PRODUCTION, NOT ASSUMED. EOF alone says only that the
+    /// reader was completed; the run could still be parked inside <c>MoveNext</c> when the assertions
+    /// run, which would make them pass even for a guard released right after
+    /// <c>ProcessMessagesAsync</c> returned. The test therefore waits for a signal raised from a
+    /// cancellation callback registered on THE ACTUAL heartbeat <see cref="CancellationTokenSource"/>
+    /// the production teardown owns: that callback can only fire from
+    /// <c>CaptureCancellationFailureAsync</c>, i.e. after the message loop returned and immediately
+    /// before the heartbeat join — so every assertion below is taken with teardown provably past the
+    /// reader and at the join.
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF. Releasing the guard (or detaching) anywhere earlier than the joins — e.g. right
+    /// after the message loop returned — lets the overlapping run in and/or records the detach while
+    /// the heartbeat is still held, so the refused-run assertions and the detach-time observations
+    /// fail by name. And because the detach callback itself reads the ACTUAL guard field, moving
+    /// <c>ReleaseRunGuard</c> before <c>SetConfigProvisioner(null)</c> fails
+    /// <c>lifecycleStateAtDetach</c> (and the in-detach refusal) by name too.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_GuardSpansHeartbeatJoinAndTransportDisposal_DetachingOnlyAtQuiescence()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new LifetimeProbeRunner();
+        var service = BuildServiceWithRunner(runner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var disposals = 0;
+        var transportDisposed = false;
+        var stream = BuildRunStream(requests, responses, () =>
+        {
+            Interlocked.Increment(ref disposals);
+            transportDisposed = true;
+        });
+
+        // The controlled heartbeat task: parks until released, never observes the token.
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // THE TEARDOWN-ARRIVAL SIGNAL, raised from a callback on the ACTUAL owned heartbeat source.
+        // Production cancels that source only AFTER the message loop returned and immediately BEFORE
+        // it awaits the heartbeat task, so this is a production-boundary acknowledgement that the run
+        // has left the reader and reached the join.
+        var teardownReachedJoin = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration heartbeatCancellationRegistration = default;
+        Task? controlledHeartbeat = null;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            heartbeatCancellationRegistration = cts.Token.Register(() => teardownReachedJoin.TrySetResult());
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeat = HeartbeatAsync();
+            return controlledHeartbeat;
+
+            async Task HeartbeatAsync() => await heartbeatGate.Task;
+        };
+
+        Task<WorkerRunOutcome>? run = null;
+
+        // THE DETACH-TIME OBSERVATION: recorded from INSIDE the production detach call, so it states
+        // what was ALREADY true when the runner's callback was cleared.
+        var transportDisposedAtDetach = false;
+        var heartbeatJoinedAtDetach = false;
+        var lifecycleStateAtDetach = -1;
+        Exception? competingRunFailureAtDetach = null;
+        runner.OnSetConfigProvisioner = provisioner =>
+        {
+            if (provisioner is not null)
+                return;
+
+            transportDisposedAtDetach = transportDisposed;
+            heartbeatJoinedAtDetach = controlledHeartbeat?.IsCompleted ?? false;
+
+            // THE GUARD IS STILL HELD AT THE DETACH. Read the ACTUAL guard field, and additionally
+            // prove it BEHAVIOURALLY: a competing run started from right here must be refused. The
+            // claim is synchronous — ClaimRunGuard runs before RunAsync's first await, so the
+            // returned task is already faulted and is fully observed here, never abandoned.
+            lifecycleStateAtDetach = ReadLifecycleState(service);
+            var competing = service.RunAsync(CancellationToken.None);
+            competingRunFailureAtDetach = competing.IsCompleted
+                ? competing.Exception?.Flatten().InnerExceptions.FirstOrDefault()
+                : new Xunit.Sdk.XunitException(
+                    "A competing run started during the detach did not complete synchronously, so the "
+                    + "guard claim is no longer a synchronous fail-fast.");
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // The initial Ready proves publication through the REAL lifecycle and that the heartbeat
+            // was launched at its unchanged point.
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // EOF ends the message loop. Teardown then cancels the linked source and PARKS ON THE
+            // ORIGINAL heartbeat join — which this test still holds shut.
+            responses.TryComplete();
+
+            // BARRIER: production acknowledged the teardown. Without it the assertions below could run
+            // while the run was still blocked in the reader, and would then also pass for a guard that
+            // is released right after the message loop returns.
+            await teardownReachedJoin.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Nothing has been disposed, nothing detached, and the run has not returned: teardown is
+            // parked in the EXISTING join.
+            Assert.Equal(0, Volatile.Read(ref disposals));
+            Assert.Equal(0, runner.DetachInvoked);
+            Assert.False(run.IsCompleted);
+            Assert.False(controlledHeartbeat!.IsCompleted, "The heartbeat join must still be held open.");
+
+            // THE GUARD STILL SPANS THE JOIN: an overlapping run and a disposal are BOTH still refused.
+            var overlapping = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Contains("already in progress", overlapping.Message, StringComparison.Ordinal);
+            Assert.Throws<InvalidOperationException>(service.Dispose);
+            Assert.Equal(1, runner.ConnectCalls);
+            Assert.Equal(0, runner.DisposeCalls);
+
+            // Release the ORIGINAL heartbeat task; the join completes and the run finishes normally.
+            heartbeatGate.TrySetResult();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // THE ORDERING: the detach happened AFTER the heartbeat join AND after the lexical
+            // transport disposal, and while the run guard was STILL HELD.
+            Assert.Equal(1, Volatile.Read(ref disposals));
+            Assert.True(transportDisposedAtDetach, "The lexical transport must be disposed before the detach.");
+            Assert.True(heartbeatJoinedAtDetach, "The original heartbeat task must be joined before the detach.");
+
+            // DETACH-BEFORE-RELEASE, proven from inside the detach itself: the guard field read
+            // Running, and a competing run started at that instant was refused with the existing
+            // category. A release moved ahead of the detach makes BOTH of these fail.
+            Assert.Equal(GuardRunning, lifecycleStateAtDetach);
+            var refusedAtDetach = Assert.IsType<InvalidOperationException>(competingRunFailureAtDetach);
+            Assert.Contains("already in progress", refusedAtDetach.Message, StringComparison.Ordinal);
+
+            // ...and the guard is released only afterwards, so the service is usable again.
+            Assert.Equal(GuardIdle, ReadLifecycleState(service));
+            Assert.Equal(1, runner.DetachInvoked);
+            Assert.Equal(new string?[] { "callback", null }, runner.ProvisionerHistory);
+        }
+        finally
+        {
+            heartbeatCancellationRegistration.Dispose();
+            heartbeatGate.TrySetResult();
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("controlled heartbeat task", controlledHeartbeat), ("run", run));
+        }
+    }
+
+    /// <summary>
+    /// A FAULTING LEXICAL TRANSPORT DISPOSAL KEEPS THE GUARD HELD THROUGH THE DISPOSAL ATTEMPT,
+    /// PRESERVES THE DISPOSAL FAULT, AND STILL RELEASES FOR THE NEXT RUN.
+    /// <para>
+    /// Every other vector's stream disposal completes normally, so the faulted lexical-disposal
+    /// ordering was untested. Here the stream's disposal callback THROWS as <c>RunCoreAsync</c>
+    /// unwinds: the fault becomes the run's primary, the detach — which runs strictly after that
+    /// unwinding — observes the guard STILL <c>Running</c> and the disposal ALREADY attempted, the
+    /// ORIGINAL disposal exception surfaces from <c>RunAsync</c> with its own identity, and the guard
+    /// is nonetheless released so a subsequent run is admitted on the same service and runner.
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF: a guard released before the detach makes the in-detach state read fail; a
+    /// detach placed before the transport disposal makes <c>transportDisposalAttemptedAtDetach</c>
+    /// fail; a swallowed disposal fault makes the <c>Assert.Same</c> fail; and a guard not released on
+    /// this fault path makes the follow-up run fail with the overlap refusal.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ThrowingTransportDisposal_HoldsGuardThroughDisposal_PreservesFaultAndReleases()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new LifetimeProbeRunner();
+        var service = BuildServiceWithRunner(runner);
+
+        // THE FAULTING LEXICAL DISPOSAL: the attempt is recorded BEFORE the throw, so "the disposal
+        // was attempted" stays observable even though it never completes normally.
+        var disposalFailure = new TransportDisposalFailureException("transport disposal failed");
+        var disposalAttempts = 0;
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = BuildRunStream(requests, responses, () =>
+        {
+            Interlocked.Increment(ref disposalAttempts);
+            throw disposalFailure;
+        });
+
+        // THE DETACH-TIME OBSERVATION, taken from inside the production detach call.
+        var lifecycleStateAtDetach = -1;
+        var transportDisposalAttemptedAtDetach = 0;
+        runner.OnSetConfigProvisioner = provisioner =>
+        {
+            if (provisioner is null)
+            {
+                lifecycleStateAtDetach = ReadLifecycleState(service);
+                transportDisposalAttemptedAtDetach = Volatile.Read(ref disposalAttempts);
+            }
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+
+            // EOF ends the loop; the lexical transport disposal then throws while unwinding.
+            responses.TryComplete();
+
+            // THE ORIGINAL DISPOSAL FAULT SURFACES, unchanged and unwrapped.
+            var thrown = await Assert.ThrowsAsync<TransportDisposalFailureException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(disposalFailure, thrown);
+            Assert.Equal(1, Volatile.Read(ref disposalAttempts));
+
+            // THE GUARD WAS STILL HELD THROUGH THE DISPOSAL ATTEMPT: the detach — which runs after the
+            // transport unwinding — observed the disposal already attempted AND the guard Running.
+            Assert.Equal(1, transportDisposalAttemptedAtDetach);
+            Assert.Equal(GuardRunning, lifecycleStateAtDetach);
+            Assert.Equal(1, runner.DetachInvoked);
+            Assert.Equal(new string?[] { "callback", null }, runner.ProvisionerHistory);
+
+            // ...AND IT WAS RELEASED ANYWAY: a subsequent run is admitted on the SAME service and the
+            // SAME runner, which a guard stranded by the faulted disposal would refuse.
+            Assert.Equal(GuardIdle, ReadLifecycleState(service));
+            service.CallInvokerFactory = () => new FakeOrchestratorInvoker(
+                new RegisterResponse { Accepted = false });
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(2, runner.ConnectCalls);
+            Assert.Equal(0, runner.DisposeCalls);
+
+            // Final disposal still works exactly once afterwards.
+            service.Dispose();
+            Assert.Equal(1, runner.DisposeCalls);
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("run", run));
+        }
+    }
+
+    /// <summary>The <c>LifecycleIdle</c> guard value, mirrored for readable assertions.</summary>
+    private const int GuardIdle = 0;
+
+    /// <summary>The <c>LifecycleRunning</c> guard value, mirrored for readable assertions.</summary>
+    private const int GuardRunning = 1;
+
+    /// <summary>The <c>LifecycleDisposed</c> guard value, mirrored for readable assertions.</summary>
+    private const int GuardDisposed = 2;
+
+    /// <summary>A distinct failure type for the faulting lexical transport disposal.</summary>
+    private sealed class TransportDisposalFailureException(string message) : Exception(message);
+
+    /// <summary>
+    /// FINAL DISPOSAL HAPPENS ONCE, AFTER FINAL DISPOSAL THE SERVICE CANNOT RUN AGAIN, and the state
+    /// is claimed BEFORE the fallible runner disposal.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_AfterFinalDisposal_FailsWithObjectDisposedException_AndDisposalHappensOnce()
+    {
+        var runner = new LifetimeProbeRunner();
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+
+        Assert.Equal(
+            WorkerRunOutcome.RegistrationRejected,
+            await service.RunAsync(TestContext.Current.CancellationToken));
+
+        service.Dispose();
+        Assert.Equal(1, runner.DisposeCalls);
+
+        // A REPEAT DISPOSAL IS A NO-OP: the runner is not interacted with a second time.
+        service.Dispose();
+        Assert.Equal(1, runner.DisposeCalls);
+
+        // ...and a run after final disposal is refused with the EXISTING .NET disposal category,
+        // BEFORE it prepares the runner.
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => service.RunAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(1, runner.ConnectCalls);
+        Assert.Equal(1, runner.DisposeCalls);
+    }
+
+    /// <summary>
+    /// A THROWING RUNNER DISPOSAL STILL LEAVES THE SERVICE TERMINALLY DISPOSED. The state is claimed
+    /// BEFORE the fallible step, so the FIRST call surfaces the ORIGINAL exception unwrapped, a
+    /// REPEAT call is a no-op (the original failure is neither re-raised nor replaced by a second
+    /// runner interaction), and a run afterwards is refused.
+    /// </summary>
+    [Fact]
+    public async Task Dispose_ThrowingRunnerDisposal_ClaimsBeforeFallibleStep_AndRepeatIsNoOp()
+    {
+        var disposeFailure = new InvalidOperationException("runner dispose failed");
+        var runner = new LifetimeProbeRunner { DisposeFailure = disposeFailure };
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+
+        Assert.Equal(
+            WorkerRunOutcome.RegistrationRejected,
+            await service.RunAsync(TestContext.Current.CancellationToken));
+
+        var thrown = Assert.Throws<InvalidOperationException>(service.Dispose);
+        Assert.Same(disposeFailure, thrown);
+        Assert.Equal(1, runner.DisposeCalls);
+
+        // THE ORIGINAL FAILURE IS PRESERVED, not retried: a repeat disposal neither throws nor
+        // touches the runner again.
+        Assert.Null(Record.Exception(service.Dispose));
+        Assert.Equal(1, runner.DisposeCalls);
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => service.RunAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(1, runner.ConnectCalls);
+    }
+
+    /// <summary>
+    /// WITH NO PRIOR FAILURE, A DETACHMENT FAILURE PROPAGATES WITH ITS ORIGINAL EVIDENCE — and the
+    /// lexical cleanup it is sequenced after has already completed, so the guard is still released and
+    /// the service stays reusable.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_DetachmentFailureWithoutPrimary_PropagatesAndStillReleasesGuard()
+    {
+        const string RunId = "worker-detach";
+        var detachmentFailure = new InvalidOperationException("provisioner detach failed");
+        var runner = new LifetimeProbeRunner { DetachFailureOnce = detachmentFailure };
+        var service = BuildServiceWithRunner(runner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var disposals = 0;
+        var stream = BuildRunStream(requests, responses, () => Interlocked.Increment(ref disposals));
+        service.CallInvokerFactory = () =>
+            new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true, AssignedWorkerId = RunId });
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            responses.TryComplete();
+
+            // THE DETACHMENT FAILURE IS THE AUTHORITATIVE OUTCOME — unchanged, with its own identity.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(detachmentFailure, thrown);
+
+            // IT DID NOT SKIP THE LEXICAL CLEANUP (which runs strictly earlier): the transport was
+            // disposed and the connection retired/unpublished.
+            Assert.Equal(1, Volatile.Read(ref disposals));
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(1, runner.DetachInvoked);
+
+            // ...and the guard was STILL RELEASED, so the service is reusable and disposable.
+            service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(2, runner.ConnectCalls);
+        }
+        finally
+        {
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("run", run));
+        }
+    }
+
+    /// <summary>
+    /// WITH A PRIMARY FAILURE ALREADY IN FLIGHT, THE PRIMARY IS AUTHORITATIVE: the detachment failure
+    /// is merely REPORTED through the EXISTING guarded sanitized diagnostics (stage marker plus a type
+    /// classification — never the message), and the guard is still released.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithDetachmentFailure_PreservesPrimaryAndReportsDetachment()
+    {
+        var primaryFailure = new InvalidOperationException("registration RPC failed");
+        var detachmentFailure = new InvalidOperationException("provisioner detach failed");
+        var runner = new LifetimeProbeRunner { DetachFailureOnce = detachmentFailure };
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FaultingRegisterInvoker(primaryFailure);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        try
+        {
+            Console.SetError(stdErr);
+
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+            Assert.Equal(1, runner.DetachInvoked);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        var diagnostics = stdErr.ToString();
+        Assert.Contains("Provisioner detachment failed", diagnostics, StringComparison.Ordinal);
+        Assert.Contains(nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(detachmentFailure.Message, diagnostics, StringComparison.Ordinal);
+
+        // The guard was released even though BOTH failures occurred, so a later run is admitted.
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+        Assert.Equal(
+            WorkerRunOutcome.RegistrationRejected,
+            await service.RunAsync(TestContext.Current.CancellationToken));
+    }
+
+    /// <summary>
+    /// THE DETACHMENT REPORT IS GUARDED TOO: a diagnostic sink that THROWS on every write cannot
+    /// replace the primary failure, cannot skip the release of the run guard, and cannot corrupt the
+    /// service — the marker proves the production report was genuinely attempted.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_PrimaryFailureWithFailingDetachmentDiagnostics_StillReleasesGuard()
+    {
+        var primaryFailure = new InvalidOperationException("registration RPC failed");
+        var detachmentFailure = new InvalidOperationException("provisioner detach failed");
+        var runner = new LifetimeProbeRunner { DetachFailureOnce = detachmentFailure };
+        var service = BuildServiceWithRunner(runner);
+        service.CallInvokerFactory = () => new FaultingRegisterInvoker(primaryFailure);
+
+        var originalErr = Console.Error;
+        var throwingWriter = new ThrowingErrorWriter("Provisioner detachment failed");
+        try
+        {
+            Console.SetError(throwingWriter);
+
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Same(primaryFailure, thrown);
+
+            await throwingWriter.MarkerObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(throwingWriter.WriteAttempts > 0);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // The guarded report could not skip the release, so the service is still usable and disposable.
+        service.CallInvokerFactory = () => new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+        Assert.Equal(
+            WorkerRunOutcome.RegistrationRejected,
+            await service.RunAsync(TestContext.Current.CancellationToken));
+        service.Dispose();
+        Assert.Equal(1, runner.DisposeCalls);
+    }
+
+    /// <summary>
+    /// A RUN THAT FAILS DURING RUNNER PREPARATION — BEFORE ANY PROVISIONING CALLBACK WAS EVER
+    /// INSTALLED AND BEFORE ANY TRANSPORT IS CREATED — STILL DETACHES AND STILL RELEASES THE RUN
+    /// GUARD.
+    /// <para>
+    /// The install-time failure test (<see cref="ThrowingPostPublicationSetup_RetiresAndUnpublishesBeforeStreamDisposal"/>)
+    /// covers a setup failure AT the install call itself; this is the EARLIEST cell: the invocation
+    /// body faults while PREPARING the runner, before registration and before the work-stream factory
+    /// is ever invoked. The only <c>SetConfigProvisioner</c> call must therefore be the <c>null</c>
+    /// DETACH, the preparation failure must propagate with its original identity, and the guard must
+    /// be released so the service stays reusable and finally disposable.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ConnectPreparationFails_StillDetachesAndReleasesGuard_WithNoTransportCreated()
+    {
+        var preparationFailure = new InvalidOperationException("runner preparation failed");
+        var runner = new LifetimeProbeRunner { ConnectFailure = preparationFailure };
+        var service = BuildServiceWithRunner(runner);
+
+        // NON-VACUITY CONTROL: on a healthy run this factory IS invoked (the accepted-run tests rely
+        // on it), so a zero count below proves THIS body faulted before stream creation, not that the
+        // seam is disconnected from the production flow.
+        var workStreamFactoryCalls = 0;
+        var transportDisposals = 0;
+        var stream = BuildRunStream(
+            new RecordingRequestStream(), new ChannelResponseReader(),
+            () => Interlocked.Increment(ref transportDisposals));
+        service.WorkStreamFactory = (_, _) =>
+        {
+            Interlocked.Increment(ref workStreamFactoryCalls);
+            return stream;
+        };
+
+        service.CallInvokerFactory = () =>
+            new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true, AssignedWorkerId = "prep" });
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        try
+        {
+            Console.SetError(stdErr);
+
+            // THE PREPARATION FAILURE PROPAGATES UNCHANGED...
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Same(preparationFailure, thrown);
+
+            // ...AND THE BODY NEVER REACHED STREAM CREATION: no transport exists to unwind.
+            Assert.Equal(1, runner.ConnectCalls);
+            Assert.Equal(0, Volatile.Read(ref workStreamFactoryCalls));
+            Assert.Equal(0, Volatile.Read(ref transportDisposals));
+
+            // WITH NO CALLBACK EVER INSTALLED, THE ONLY SetConfigProvisioner CALL IS THE DETACH.
+            Assert.Equal(new string?[] { null }, runner.ProvisionerHistory);
+            Assert.Equal(1, runner.DetachInvoked);
+
+            // THE GUARD WAS RELEASED: the service is reusable and finally disposable.
+            runner.ConnectFailure = null;
+            service.CallInvokerFactory = () =>
+                new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await service.RunAsync(TestContext.Current.CancellationToken));
+            service.Dispose();
+            Assert.Equal(1, runner.DisposeCalls);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // A DETACHMENT FAILURE REPORT (guarded diagnostics) IS NOT EXPECTED HERE: the preparation
+        // failure is the primary and the detach SUCCEEDED, so the sanitized stderr carries no
+        // detachment marker at all.
+        Assert.DoesNotContain("Provisioner detachment failed", stdErr.ToString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ON THE EARLIEST FAILURE PATH, A DETACHMENT FAILURE MUST NOT REPLACE THE PREPARATION FAILURE:
+    /// the primary propagates with its original identity, the detach failure is only REPORTED through
+    /// the existing guarded sanitized diagnostics, and the run guard is still released so the service
+    /// stays reusable and finally disposable.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ConnectPreparationFailsWithDetachmentFailure_PreservesPrimaryAndStillReleasesGuard()
+    {
+        var preparationFailure = new InvalidOperationException("runner preparation failed");
+        var detachmentFailure = new InvalidOperationException("provisioner detach failed");
+        var runner = new LifetimeProbeRunner
+        {
+            ConnectFailure = preparationFailure,
+            DetachFailureOnce = detachmentFailure,
+        };
+        var service = BuildServiceWithRunner(runner);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        try
+        {
+            Console.SetError(stdErr);
+
+            // THE PREPARATION FAILURE IS AUTHORITATIVE — SAME INSTANCE, NOT the detach failure.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Same(preparationFailure, thrown);
+            Assert.Equal(1, runner.DetachInvoked);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // THE DETACHMENT FAILURE WAS ONLY REPORTED: sanitized marker plus type classification,
+        // never the raw message.
+        var diagnostics = stdErr.ToString();
+        Assert.Contains("Provisioner detachment failed", diagnostics, StringComparison.Ordinal);
+        Assert.Contains(nameof(InvalidOperationException), diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(detachmentFailure.Message, diagnostics, StringComparison.Ordinal);
+
+        // THE GUARD WAS STILL RELEASED: another run is admitted and final disposal works.
+        runner.ConnectFailure = null;
+        runner.DetachFailureOnce = null;
+        service.CallInvokerFactory = () =>
+            new FakeOrchestratorInvoker(new RegisterResponse { Accepted = false });
+        Assert.Equal(
+            WorkerRunOutcome.RegistrationRejected,
+            await service.RunAsync(TestContext.Current.CancellationToken));
+        service.Dispose();
+        Assert.Equal(1, runner.DisposeCalls);
+    }
+
+    /// <summary>
+    /// THE RUN GUARD IS OBSERVABLY <c>Running</c> FOR THE WHOLE BODY AND <c>Idle</c> ONLY AFTER THE
+    /// BODY HAS FULLY RETURNED — a structural complement to the behavioral refusal proofs: the guard
+    /// field itself is diagnosed while teardown is still parked in the existing heartbeat join, and
+    /// it is read as <c>Idle</c> from a caller only after the run returned, with final disposal then
+    /// succeeding and post-disposal runs still refused.
+    /// <para>
+    /// TEARDOWN ARRIVAL IS ACKNOWLEDGED BY PRODUCTION. The parked-teardown read is taken only after a
+    /// signal raised from a cancellation callback on THE ACTUAL owned heartbeat
+    /// <see cref="CancellationTokenSource"/> — production cancels it after the message loop returned
+    /// and immediately before the heartbeat join — so the observation can never be taken while the
+    /// run is still blocked in the reader.
+    /// </para>
+    /// <para>
+    /// REMOVAL PROOF: a guard released anywhere before the outermost finally (e.g. right after the
+    /// message loop returned) makes the parked-teardown read <c>Idle</c> and fails this test by name.
+    /// Without the acknowledgement barrier that same regression could slip through, because the read
+    /// might land before the loop had even observed EOF.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_GuardStateIsRunningWhileTeardownParks_AndIdleOnlyAfterTheRunReturns()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+        var runner = new LifetimeProbeRunner();
+        var service = BuildServiceWithRunner(runner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = BuildRunStream(requests, responses, () => { });
+
+        // The controlled heartbeat task parks until the test releases it, so the body is provably
+        // still inside its existing heartbeat join when the guard is observed.
+        var heartbeatEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var heartbeatGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // THE TEARDOWN-ARRIVAL SIGNAL: raised from the ACTUAL owned heartbeat source's cancellation,
+        // which production requests only after the message loop returned and just before the join.
+        var teardownReachedJoin = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration heartbeatCancellationRegistration = default;
+        Task? controlledHeartbeat = null;
+        service.HeartbeatTaskFactory = (_, cts) =>
+        {
+            heartbeatCancellationRegistration = cts.Token.Register(() => teardownReachedJoin.TrySetResult());
+            heartbeatEntered.TrySetResult();
+            controlledHeartbeat = HeartbeatAsync();
+            return controlledHeartbeat;
+
+            async Task HeartbeatAsync() => await heartbeatGate.Task;
+        };
+
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+            await heartbeatEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // EOF starts teardown, which parks on the heartbeat join this test still holds shut.
+            responses.TryComplete();
+
+            // BARRIER: production acknowledged that teardown left the reader and reached the join.
+            await teardownReachedJoin.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, runner.DetachInvoked);
+            Assert.False(run.IsCompleted);
+            Assert.False(controlledHeartbeat!.IsCompleted, "The heartbeat join must still be held open.");
+
+            // THE GUARD FIELD ITSELF IS Running WHILE THE BODY IS PARKED IN THE JOIN.
+            Assert.Equal(GuardRunning, ReadLifecycleState(service));
+            var overlapping = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Contains("already in progress", overlapping.Message, StringComparison.Ordinal);
+
+            // Release the join; the run finishes and ONLY THEN is the guard observed as Idle.
+            heartbeatGate.TrySetResult();
+            Assert.Equal(
+                WorkerRunOutcome.WorkStreamEnded,
+                await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal(GuardIdle, ReadLifecycleState(service));
+            Assert.Equal(1, runner.DetachInvoked);
+            Assert.Equal(new string?[] { "callback", null }, runner.ProvisionerHistory);
+
+            // The service is genuinely usable again, and final disposal still works.
+            service.CallInvokerFactory = () => new FakeOrchestratorInvoker(
+                new RegisterResponse { Accepted = false });
+            Assert.Equal(
+                WorkerRunOutcome.RegistrationRejected,
+                await service.RunAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(GuardIdle, ReadLifecycleState(service));
+            service.Dispose();
+            Assert.Equal(GuardDisposed, ReadLifecycleState(service));
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(
+                () => service.RunAsync(TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            heartbeatCancellationRegistration.Dispose();
+            heartbeatGate.TrySetResult();
+            await loopCts.CancelAsync();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("controlled heartbeat task", controlledHeartbeat), ("run", run));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -1991,6 +2945,33 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     /// <summary>
+    /// Builds a service over a supplied runner WITHOUT touching the provisioner seam: the lifecycle
+    /// tests exercise the run/disposal guard, not config-repo preparation.
+    /// </summary>
+    private static WorkerService BuildServiceWithRunner(IAgentRunner runner)
+    {
+        var service = new WorkerService("http://localhost:9999", LocalWorkerId, ["coder"]);
+        ReplaceRunner(service, runner);
+        return service;
+    }
+
+    /// <summary>
+    /// Builds a fake duplex transport for the REAL <see cref="WorkerService.RunAsync"/>, invoking
+    /// <paramref name="onDisposed"/> from the stream's disposal callback so a test can observe the
+    /// lexical transport disposal as an event.
+    /// </summary>
+    private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> BuildRunStream(
+        IClientStreamWriter<WorkerMessage> requests, IAsyncStreamReader<OrchestratorMessage> responses,
+        Action onDisposed) =>
+        new(
+            requests, responses,
+            _ => Task.FromResult(new Metadata()),
+            _ => new Status(StatusCode.OK, string.Empty),
+            _ => new Metadata(),
+            _ => onDisposed(),
+            null!);
+
+    /// <summary>
     /// The service's CURRENT <c>ActiveAssignment.Execution</c>, or <c>null</c> when the ownership
     /// slot is empty. Observation only — it never mutates production state.
     /// </summary>
@@ -2005,8 +2986,7 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     private static void ReplaceRunner(WorkerService service, IAgentRunner runner)
-    {
-        // INSTALL THE REAL-EXECUTION PROBE so the double records the enclosing
+    {        // INSTALL THE REAL-EXECUTION PROBE so the double records the enclosing
         // ActiveAssignment.Execution rather than a completed placeholder.
         if (runner is ProvisionerCapturingRunner capturing)
             capturing.ExecutionProbe = () => TryGetActiveExecution(service);
@@ -2018,7 +2998,14 @@ public sealed class WorkerConnectionLifecycleTests
         field.SetValue(service, runner);
     }
 
-    /// <summary>Reflects the real published-connection field (observation only).</summary>
+    /// <summary>Reflects the real lifecycle-guard field (observation only — never mutated).</summary>
+    private static int ReadLifecycleState(WorkerService service)
+    {
+        var guardField = typeof(WorkerService)
+            .GetField("_lifecycleState", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var boxed = guardField.GetValue(service)!;
+        return Volatile.Read(ref Unsafe.Unbox<int>(boxed));
+    }
     private static WorkerConnection? GetPublishedConnection(WorkerService service) =>
         (WorkerConnection?)typeof(WorkerService)
             .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -2778,11 +3765,46 @@ public sealed class WorkerConnectionLifecycleTests
     /// FALLIBLE post-publication setup step. The interface permits an implementation to throw, and
     /// production calls it after the connection is published, so this is the seam that exercises the
     /// setup interval's cleanup coverage.
+    /// <para>
+    /// ONLY THE FIRST (INSTALL) CALL runs the callback and throws. The lifecycle calls this member a
+    /// SECOND time to DETACH the run's callback at quiescence, and that call must be observable as a
+    /// separate event rather than re-running the install step: a fixture that treated both calls
+    /// alike would rewrite the captured publication observation during teardown. The detach call is
+    /// still COUNTED and still throws (via <see cref="DetachFailure"/> when armed), so the test can
+    /// additionally prove a throwing detachment neither replaces the setup failure nor skips the
+    /// release of the run guard.
+    /// </para>
     /// </summary>
     private sealed class ThrowingSetupRunner(Action onSetConfigProvisioner) : IAgentRunner
     {
-        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) =>
-            onSetConfigProvisioner();
+        private int _calls;
+
+        /// <summary>How many times <c>SetConfigProvisioner</c> was invoked (install and detach).</summary>
+        internal int SetConfigProvisionerCalls => Volatile.Read(ref _calls);
+
+        /// <summary>Whether a later call received <c>null</c> — i.e. the run genuinely detached.</summary>
+        internal bool Detached { get; private set; }
+
+        /// <summary>When armed, a DETACH call throws this instead of returning.</summary>
+        internal Exception? DetachFailure { get; set; }
+
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner)
+        {
+            var call = Interlocked.Increment(ref _calls);
+            if (call == 1)
+            {
+                // THE INSTALL: the fallible post-publication setup step under test.
+                onSetConfigProvisioner();
+                return;
+            }
+
+            // THE DETACH (every later call). Recorded, and fallible when the test armed a failure.
+            if (provisioner is null)
+                Detached = true;
+
+            if (DetachFailure is { } failure)
+                throw failure;
+        }
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
@@ -2807,6 +3829,131 @@ public sealed class WorkerConnectionLifecycleTests
         public void SetCompactionMaxTokens(int? maxTokens) { }
         public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// An <see cref="IAgentRunner"/> recording the SERVICE/RUNNER LIFETIME interactions the real
+    /// <see cref="WorkerService"/> performs: <c>ConnectAsync</c> (preparation), every
+    /// <c>SetConfigProvisioner</c> call IN ORDER, and disposal.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ORDERED <c>ProvisionerHistory</c> is the observable that makes detachment provable: it
+    /// records <c>"callback"</c> for an install and <c>null</c> for a detach, so a missing detach (or
+    /// a detach ordered after a following install) is directly visible instead of being inferred.
+    /// </para>
+    /// <para>
+    /// All observables are TCS/counters: the gates are test-controlled, and every await is bounded by
+    /// the fixture's failsafe. Nothing here polls or sleeps.
+    /// </para>
+    /// </remarks>
+    private sealed class LifetimeProbeRunner : IAgentRunner
+    {
+        private readonly object _gate = new();
+        private readonly List<string?> _provisionerHistory = [];
+        private int _connectCalls;
+        private int _disposeCalls;
+        private int _detachInvoked;
+
+        /// <summary>Gate for <c>ConnectAsync</c>; <c>null</c> completes immediately.</summary>
+        internal TaskCompletionSource<bool>? ConnectGate { get; set; }
+
+        /// <summary>
+        /// When non-null, <c>ConnectAsync</c> THROWS it after being counted/entered — a run whose
+        /// preparation fails BEFORE any provisioning callback was ever installed.
+        /// </summary>
+        internal Exception? ConnectFailure { get; set; }
+
+        /// <summary>Completed once <c>ConnectAsync</c> has been entered.</summary>
+        internal TaskCompletionSource<bool> ConnectEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>When non-null, the next DETACH throws this instead of returning.</summary>
+        internal Exception? DetachFailureOnce { get; set; }
+
+        /// <summary>When non-null, disposal returns a ValueTask faulted with it.</summary>
+        internal Exception? DisposeFailure { get; set; }
+
+        /// <summary>Invoked for EVERY <c>SetConfigProvisioner</c> call, with the supplied callback.</summary>
+        internal Action<Func<string?, CancellationToken, Task>?>? OnSetConfigProvisioner { get; set; }
+
+        internal int ConnectCalls => Volatile.Read(ref _connectCalls);
+        internal int DisposeCalls => Volatile.Read(ref _disposeCalls);
+
+        /// <summary>How many times a DETACH was requested (a <c>null</c> provisioner was installed).</summary>
+        internal int DetachInvoked => Volatile.Read(ref _detachInvoked);
+
+        /// <summary>
+        /// The ORDERED record of <c>SetConfigProvisioner</c> calls: <c>"callback"</c> for an install,
+        /// <c>null</c> for a detach.
+        /// </summary>
+        internal IReadOnlyList<string?> ProvisionerHistory
+        {
+            get { lock (_gate) return [.. _provisionerHistory]; }
+        }
+
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner)
+        {
+            lock (_gate)
+                _provisionerHistory.Add(provisioner is null ? null : "callback");
+
+            OnSetConfigProvisioner?.Invoke(provisioner);
+
+            if (provisioner is not null)
+                return;
+
+            Interlocked.Increment(ref _detachInvoked);
+
+            if (DetachFailureOnce is { } failure)
+            {
+                DetachFailureOnce = null;
+                throw failure;
+            }
+        }
+
+        public async Task ConnectAsync(CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _connectCalls);
+            ConnectEntered.TrySetResult(true);
+
+            if (ConnectFailure is { } prepareFailure)
+                throw prepareFailure;
+
+            if (ConnectGate is { } gate)
+                await gate.Task.WaitAsync(ct);
+        }
+
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
+            => Task.CompletedTask;
+
+        public Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+            => Task.FromResult(string.Empty);
+
+        public TestResultReport? LastTestReport => null;
+        public WorkerReport? LastWorkerReport => null;
+        public void ClearTestReport() { }
+        public void ClearWorkerReport() { }
+        public void SetToolBridge(IToolCallBridge? bridge) { }
+        public void SetCurrentTaskId(string? taskId) { }
+        public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
+        public void SetCustomAgent(DomainWorkerRole role, string agentsMdContent) { }
+        public void SetSession(object? session) { }
+        public object? GetSession() => null;
+        public void SetMaxContextTokens(int maxTokens) { }
+        public int GetContextUsagePercent() => 0;
+        public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
+        public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
+
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref _disposeCalls);
+
+            return DisposeFailure is { } failure
+                ? ValueTask.FromException(failure)
+                : ValueTask.CompletedTask;
+        }
     }
 
     /// <summary>

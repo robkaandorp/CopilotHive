@@ -81,6 +81,21 @@ public sealed class SharpCoderRunner : IAgentRunner
         _clientFactory = _ => chatClient;
     }
 
+    /// <summary>
+    /// THE CONSTRUCTOR DEFAULT ROLE — the role the runner holds before any <c>UpdateAgents</c> has
+    /// been applied on a connection. <see cref="ConnectAsync"/> RESTORES it, so an idle runner never
+    /// keeps carrying the PREVIOUS run's last <c>UpdateAgents</c> role into a new connection's
+    /// preparation.
+    /// </summary>
+    private const WorkerRole DefaultRole = WorkerRole.Unspecified;
+
+    /// <summary>
+    /// THE CONSTRUCTOR DEFAULT CUSTOM AGENT SYSTEM PROMPT — no per-connection guidance at all.
+    /// <see cref="ConnectAsync"/> restores it together with <see cref="DefaultRole"/>, so the two
+    /// per-connection preparation values are always reverted as ONE pair.
+    /// </summary>
+    private const string? DefaultCustomAgentSystemPrompt = null;
+
     private IToolCallBridge? _toolBridge;
     private string? _currentTaskId;
     private string? _currentGoalId;
@@ -508,6 +523,47 @@ public sealed class SharpCoderRunner : IAgentRunner
         return (int)Math.Min(100, (tokens * 100.0) / contextDenominator);
     }
 
+    /// <summary>
+    /// Prepares the runner for a NEW connection. It deliberately creates NO LLM client (the client is
+    /// created lazily on the first prompt, after credentials have been provisioned) and it neither
+    /// re-creates nor disposes the client-lifecycle gate.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>QUIESCENT-USE CONTRACT.</b> This method is safe for QUIESCENT SEQUENTIAL connection
+    /// preparation: the caller must invoke it only when no prompt turn, reset or disposal is in
+    /// flight on this instance (the worker runs one attempt at a time and the previous attempt's
+    /// <c>RunAsync</c> is fully wound down, including its lexical transport disposal, before the next
+    /// one starts). It performs NO synchronization of its own, so concurrent use is NOT a supported
+    /// contract.
+    /// </para>
+    /// <para>
+    /// <b>ON A DISPOSED RUNNER.</b> It NEVER RESURRECTS one: it creates no LLM client, it neither
+    /// re-creates nor disposes <c>_clientLifecycleGate</c>, and it does not clear the one-way disposed
+    /// flag — so a disposed runner stays disposed and the next <see cref="SendPromptAsync"/> still
+    /// fails with the existing disposal error. It is deliberately NOT described as a total no-op: it
+    /// still writes the per-connection preparation fields below (they are unreachable state on a
+    /// runner that can never run again, so writing them changes no observable behavior).
+    /// </para>
+    /// <para>
+    /// <b>WHAT IT RESETS, AND WHAT IT DELIBERATELY DOES NOT.</b> It restores the CONSTRUCTOR
+    /// DEFAULTS of the per-connection role state — <c>_currentRole</c> and
+    /// <c>_customAgentSystemPrompt</c> — and clears <c>_testerReport</c>, so preparation for a new
+    /// connection never inherits the previous connection's <c>UpdateAgents</c> role/prompt or a stale
+    /// tester report. It is deliberately NOT a per-assignment reset: applying the constructor defaults
+    /// HERE only (never before each assignment) is what keeps a connection's delivered
+    /// <c>UpdateAgents</c> guidance authoritative for that connection's assignments.
+    /// </para>
+    /// <para>
+    /// Everything else stays the per-assignment setup's responsibility — the existing
+    /// <see cref="ResetSessionAsync"/> plus <c>TaskExecutor</c> own model, reasoning effort, session
+    /// restore/reset, the tool bridge, task/goal identity, reports, compaction and sub-agent
+    /// settings. The previous chat client and session may legitimately stay in place during an idle
+    /// backoff, and the next assignment still resets before any prompt, so this promises NO complete
+    /// fresh-runner state equivalence outside that supported execution path.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
     public Task ConnectAsync(CancellationToken ct = default)
     {
         // Deliberately creates NO client. Worker containers hold no LLM credentials of their
@@ -515,6 +571,16 @@ public sealed class SharpCoderRunner : IAgentRunner
         // fetch runs immediately before the FIRST client creation, which happens lazily in
         // SendPromptAsync. Creating a client here would run before provisioning and before the
         // operator has necessarily signed in.
+        //
+        // Prepare for a NEW connection in the QUIESCENT state documented above: restore the
+        // constructor defaults of the per-connection role state and drop any stale tester report, so
+        // this connection starts from the same role/prompt baseline a fresh runner would have. A
+        // delivered UpdateAgents on this connection is applied later, by the message loop, and is
+        // never reverted — that is why this reset lives here and NOT before each assignment.
+        _currentRole = DefaultRole;
+        _customAgentSystemPrompt = DefaultCustomAgentSystemPrompt;
+        _testerReport = null;
+
         _log.Info("SharpCoderRunner ready — the LLM client is created lazily on first prompt.");
         return Task.CompletedTask;
     }
