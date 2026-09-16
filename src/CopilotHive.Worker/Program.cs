@@ -80,28 +80,39 @@ while (!cts.IsCancellationRequested)
         capabilities: capabilities,
         provisioningEnvironment: provisioningEnvironment);
 
-    // The run's OBSERVED outcome. It stays NULL unless the awaited RunAsync genuinely RETURNED:
-    // a thrown failure leaves it null, so the classification catches below keep sole authority over
-    // the retry/fatal control flow and no reconstructed or defaulted value can stand in for a real
-    // returned outcome.
+    // THE ELIGIBLE OUTCOME — the ONLY value the post-region handling below may act on. It stays
+    // NULL unless the awaited RunAsync genuinely RETURNED *and* the attempt's disposal then
+    // completed without throwing, so the classification catches keep sole authority over the
+    // retry/fatal control flow and no reconstructed or defaulted value can stand in for a real,
+    // fully completed attempt.
     WorkerRunOutcome? completedOutcome = null;
 
     try
     {
+        // The run's returned value, held locally until disposal has also succeeded. A thrown
+        // disposal unwinds out of the block below, SKIPPING the eligibility assignment that
+        // follows, so a failed teardown can never be mistaken for a completed attempt.
+        WorkerRunOutcome runOutcome;
+
         try
         {
             // The returned outcome is the REAL result of the run — a rejected registration or an
             // accepted work stream that ended with the whole lifecycle teardown completing.
             // NOTHING else happens inside this covered region: the outcome is merely captured, so
             // no diagnostic of ours can ever be classified as a connection failure and retried.
-            completedOutcome = await service.RunAsync(cts.Token);
+            runOutcome = await service.RunAsync(cts.Token);
         }
         finally
         {
-            // Disposal propagates (by design). Running it here means any fault it raises is
-            // caught and REDACTED by the handlers below instead of reaching the runtime.
+            // Disposal propagates (by design) and still runs on EVERY path, including when
+            // RunAsync itself threw. Running it here means any fault it raises is caught and
+            // REDACTED by the handlers below instead of reaching the runtime.
             service.Dispose();
         }
+
+        // REACHED ONLY WHEN BOTH STEPS SUCCEEDED: the run returned and the disposal completed
+        // without throwing. Only now does the outcome become eligible for the handling below.
+        completedOutcome = runOutcome;
     }
     catch (OperationCanceledException)
     {
@@ -124,6 +135,11 @@ while (!cts.IsCancellationRequested)
             break;
         }
         delay = delay * 2 > maxDelay ? maxDelay : delay * 2;
+
+        // EXPLICITLY END THIS ITERATION. A classified thrown failure must proceed to the NEXT
+        // attempt exactly as the pre-change control flow did: it may never fall through into the
+        // returned-outcome handling below, whatever any local still holds.
+        continue;
     }
     catch (Exception ex)
     {
@@ -137,9 +153,10 @@ while (!cts.IsCancellationRequested)
 
     // ── RETURNED-OUTCOME HANDLING, OUTSIDE EVERY RETRY-GOVERNING CATCH ──────────────
     //
-    // A THROWN connection failure was already classified and backed off above and left the outcome
-    // null, so this attempt simply retries. Reaching the handling below therefore means RunAsync
-    // genuinely RETURNED.
+    // DEFENSE IN DEPTH. Every catch above already ends its own iteration (break / continue /
+    // return), and an ineligible attempt never assigns the value, so this guard is unreachable in
+    // the corrected flow — it stays as the safety net that keeps a non-returned attempt from ever
+    // being handled as a completed one.
     if (completedOutcome is not { } outcome)
         continue;
 
