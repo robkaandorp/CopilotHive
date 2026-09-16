@@ -172,6 +172,35 @@ public sealed class GoalPipeline
     }
 
     /// <summary>
+    /// THE PERSISTENCE-PROVENANCE FACT that decides whether an ORDINARY manager full/state save may
+    /// checkpoint this pipeline's active pointer and COMPLETE work-slot registry (slots and
+    /// per-position counters) INSIDE the same pipeline-row write.
+    /// <para>
+    /// DEFAULT <c>false</c>, and only <see cref="GoalPipelineManager.CreatePipeline"/> ever raises
+    /// it — never a restore. The two lifetimes, exhaustively:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>A pipeline constructed from a <see cref="PipelineSnapshot"/> is
+    ///     INELIGIBLE and STAYS ineligible for the whole instance lifetime: a restored row's stored
+    ///     blob is opaque historical evidence and this slice contains NO recovery activation. Both
+    ///     restore routes therefore keep using the legacy blob-preserving save paths — even when the
+    ///     stored blob is SQL NULL, empty, malformed or unsupported, and even after new slots are
+    ///     allocated post-restore. Only a future EXPLICIT recovery activation could change that; a
+    ///     save never can.</description></item>
+    ///   <item><description>A pipeline the manager created FRESH — its
+    ///     <see cref="GoalPipelineManager.CreatePipeline"/> found NO existing persisted row for the
+    ///     goal — is ELIGIBLE. A creation that DID encounter an existing row (a replacement, or a
+    ///     goal-ID reuse) stays ineligible rather than erasing opaque historical evidence.</description></item>
+    /// </list>
+    /// <para>
+    /// THIS IS PROVENANCE, NOT AUTHORITY. It is a persistence-only fact about where the INSTANCE came
+    /// from: never completion admission, never authorization, and neither a public API nor a
+    /// persisted column. No empty/nonempty dictionary and no parsed stored JSON contributes to it.
+    /// </para>
+    /// </summary>
+    internal bool OwnershipCheckpointEligible { get; set; }
+
+    /// <summary>
     /// Creates a new pipeline for the specified goal.
     /// </summary>
     /// <param name="goal">The goal to track.</param>

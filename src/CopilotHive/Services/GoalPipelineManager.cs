@@ -104,12 +104,25 @@ public sealed class GoalPipelineManager
     private readonly ConcurrentDictionary<string, string> _taskToGoal = new();
 
     /// <summary>
-    /// THE SINGLE LOCK over this manager's MAPPING SURFACE — <see cref="RegisterTask"/>,
+    /// THE SINGLE LOCK over this manager's MAPPING SURFACE AND ITS MANAGER-OWNED ORDINARY SAVES —
+    /// <see cref="RegisterTask"/>,
     /// <see cref="TryRegisterTask"/>, <see cref="UnregisterTask"/>, <see cref="TryUnregisterTask"/>,
-    /// <see cref="RestorePipeline"/>, <see cref="RestoreFromStore"/>, <see cref="RemovePipeline"/>
-    /// and <see cref="PersistAdmission"/>. Every mutation of <see cref="_taskToGoal"/> performed by
+    /// <see cref="RestorePipeline"/>, <see cref="RestoreFromStore"/>, <see cref="RemovePipeline"/>,
+    /// <see cref="PersistAdmission"/> and — since the ownership checkpoint —
+    /// <see cref="CreatePipeline"/>, <see cref="PersistFull"/> and <see cref="PersistState"/>. Every
+    /// mutation of <see cref="_taskToGoal"/> performed by
     /// those methods runs under it, so the WRITERS are serialized: a memory claim and its persisted
     /// counterpart can no longer be interleaved by a second mapping-surface call.
+    /// <para>
+    /// WHY THE THREE ORDINARY SAVES ARE HERE: for an eligible pipeline they capture the pointer and
+    /// the whole slot registry under the pipeline monitor and then encode and store. Holding this
+    /// lock across that capture-through-save span is what keeps an OLDER captured MANAGER checkpoint
+    /// from finishing after a NEWER manager save (the capture and the row write can no longer be
+    /// reordered by two concurrent manager saves). It is IN-PROCESS serialization by the manager
+    /// that already owned this surface: there is no global lock service, no new lock hierarchy and no
+    /// cross-process guarantee. The pipeline monitor itself is always RELEASED before the codec and
+    /// the store work, so <c>ApplyToEntity</c>/<c>CaptureMachinePosition</c> never run under it.
+    /// </para>
     /// <para>
     /// MEMORY-ONLY OWNERSHIP OF THE REGISTERS (admission-atomic-switch). <see cref="RegisterTask"/>
     /// and <see cref="TryRegisterTask"/> guard <see cref="_taskToGoal"/> ONLY — they no longer
@@ -204,13 +217,39 @@ public sealed class GoalPipelineManager
     }
 
     /// <summary>Create and register a new pipeline for a goal.</summary>
+    /// <remarks>
+    /// THE ELIGIBILITY DECISION, made ONCE here and retained for the instance's lifetime: a pipeline
+    /// created while this manager, under <see cref="_mappingLock"/>, found NO EXISTING persisted row
+    /// for the goal is <see cref="GoalPipeline.OwnershipCheckpointEligible"/> — its ordinary full/
+    /// state saves checkpoint the pointer and the complete registry. A creation that DOES encounter
+    /// an existing row (a REPLACEMENT, or a goal-ID reuse) stays INELIGIBLE so the row's opaque
+    /// historical registry blob is never overwritten — the same rule the
+    /// <see cref="PipelineSnapshot"/> constructor applies unconditionally. With no store there is no
+    /// persisted row at all, so no eligibility is inferred and the pipeline stays memory-only.
+    /// <para>
+    /// The whole create — the row probe AND the first <c>SavePipeline</c> — runs INSIDE
+    /// <see cref="_mappingLock"/>, the lock that already serializes the manager's admission,
+    /// rollback, removal and restore, so this first save cannot interleave with those. The caller's
+    /// own argument validation and the duplicate-pipeline refusal are unchanged.
+    /// </para>
+    /// </remarks>
     public GoalPipeline CreatePipeline(Goal goal, int maxRetries = Constants.DefaultMaxRetriesPerTask, int maxIterations = Constants.DefaultMaxIterations)
     {
         var pipeline = new GoalPipeline(goal, maxRetries, maxIterations);
-        if (!_pipelines.TryAdd(goal.Id, pipeline))
-            throw new InvalidOperationException($"Pipeline already exists for goal '{goal.Id}'");
 
-        _store?.SavePipeline(pipeline);
+        lock (_mappingLock)
+        {
+            if (!_pipelines.TryAdd(goal.Id, pipeline))
+                throw new InvalidOperationException($"Pipeline already exists for goal '{goal.Id}'");
+
+            // The provenance probe runs BEFORE the pipeline's own first save, and only when the
+            // pipeline is actually registered: a refused duplicate never probes and never saves.
+            pipeline.OwnershipCheckpointEligible =
+                _store is not null && !_store.PipelineRowExists(goal.Id);
+
+            _store?.SavePipeline(pipeline);
+        }
+
         return pipeline;
     }
 
@@ -688,11 +727,79 @@ public sealed class GoalPipelineManager
         }
     }
 
-    /// <summary>Persist the current state of a pipeline (call after state mutations).</summary>
-    public void PersistState(GoalPipeline pipeline) => _store?.SavePipelineState(pipeline);
+    /// <summary>
+    /// Persist the current state of a pipeline (call after state mutations).
+    /// </summary>
+    /// <remarks>
+    /// THE ELIGIBLE ORDINARY CHECKPOINT (state variant). For a pipeline whose
+    /// <see cref="GoalPipeline.OwnershipCheckpointEligible"/> provenance fact is set — a fresh
+    /// manager-created pipeline that found no existing persisted row — ONE detached ownership
+    /// capture is taken under the pipeline's own monitor INSIDE <see cref="_mappingLock"/>, and the
+    /// captured pointer plus the encoded complete registry are written in the SAME pipeline-row
+    /// <c>SaveChanges</c> as the ordinary fields (conversation untouched, exactly as the legacy
+    /// state save). The pipeline monitor is RELEASED before the encode and the store call, so it is
+    /// never held across <c>ApplyToEntity</c>/<c>CaptureMachinePosition</c>.
+    /// <para>
+    /// The <see cref="_mappingLock"/> span covers capture THROUGH save, with
+    /// <see cref="CreatePipeline"/> and <see cref="PersistFull"/>, so an older captured manager
+    /// checkpoint cannot complete after a newer manager save. This is IN-PROCESS serialization by
+    /// the manager that already owned the mapping surface — no global lock service, no new lock
+    /// hierarchy, no cross-process CAS. Ineligible and no-store pipelines keep the byte-identical
+    /// legacy path.
+    /// </para>
+    /// </remarks>
+    public void PersistState(GoalPipeline pipeline)
+    {
+        ArgumentNullException.ThrowIfNull(pipeline);
 
-    /// <summary>Persist the full pipeline including conversation.</summary>
-    public void PersistFull(GoalPipeline pipeline) => _store?.SavePipeline(pipeline);
+        lock (_mappingLock)
+        {
+            if (_store is null)
+                return;
+
+            if (!pipeline.OwnershipCheckpointEligible)
+            {
+                _store.SavePipelineState(pipeline);
+                return;
+            }
+
+            // THE ONE CAPTURE — short, and the only pipeline-monitor acquisition on this path. It
+            // yields goal identity, the pointer INCLUDING null, every slot and every counter
+            // high-water entry, already detached.
+            var ownership = pipeline.CaptureAdmissionOwnership();
+            _store.SavePipelineState(pipeline, ownership);
+        }
+    }
+
+    /// <summary>
+    /// Persist the full pipeline including conversation.
+    /// </summary>
+    /// <remarks>
+    /// The full-save sibling of <see cref="PersistState"/>: the same single detached ownership
+    /// capture, taken under the pipeline monitor inside the <see cref="_mappingLock"/> span and
+    /// RELEASED before the encode/store work, written into the same pipeline-row
+    /// <c>SaveChanges</c> as the ordinary fields — conversation included, exactly as the legacy full
+    /// save. Ineligible and no-store pipelines keep the byte-identical legacy path.
+    /// </remarks>
+    public void PersistFull(GoalPipeline pipeline)
+    {
+        ArgumentNullException.ThrowIfNull(pipeline);
+
+        lock (_mappingLock)
+        {
+            if (_store is null)
+                return;
+
+            if (!pipeline.OwnershipCheckpointEligible)
+            {
+                _store.SavePipeline(pipeline);
+                return;
+            }
+
+            var ownership = pipeline.CaptureAdmissionOwnership();
+            _store.SavePipeline(pipeline, ownership);
+        }
+    }
 
     /// <summary>Get all active (non-completed) pipelines.</summary>
     public IReadOnlyList<GoalPipeline> GetActivePipelines() =>

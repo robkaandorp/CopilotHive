@@ -205,6 +205,218 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// THE ELIGIBLE ORDINARY CHECKPOINT, FULL SAVE: persists the pipeline exactly as
+    /// <see cref="SavePipeline(GoalPipeline)"/> does — scalars, machine position AND the
+    /// conversation — but writes the ACTIVE POINTER and the COMPLETE WORK-SLOT REGISTRY (slots and
+    /// per-position counters) from the ONE detached <paramref name="ownership"/> capture.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE POINT OF THE PAIR. <paramref name="ownership"/> is captured ONCE under the pipeline's own
+    /// monitor by the caller (<c>GoalPipeline.CaptureAdmissionOwnership</c>) and handed over
+    /// ALREADY DETACHED, so the pointer column and the registry column of this write come from the
+    /// SAME instant. A captured <c>null</c> pointer is written as SQL NULL — never re-read live —
+    /// and the registry is the capture's own value, so a domain mutation landing after the capture
+    /// cannot reach this row. Ordinary checkpoints may legitimately carry Pending, Claimed, Recorded
+    /// and Abandoned slots and a null pointer; no Pending-only validation is applied here.
+    /// </para>
+    /// <para>
+    /// VALIDATE-AND-ENCODE BEFORE ANY DATABASE TOUCH. The carrier's goal must equal the pipeline's
+    /// (<see cref="ArgumentException"/> with no context and no statement otherwise), and
+    /// <see cref="WorkSlotRegistryCodec.Encode"/> runs EXACTLY ONCE here — BEFORE a context is
+    /// resolved — so an encoding failure propagates having created no context and issued no write.
+    /// No validator is duplicated, no schema is added and no task ID is parsed.
+    /// </para>
+    /// <para>
+    /// ONE ROW WRITE. Both captured values travel through the existing pipeline-row upsert and are
+    /// flushed by that row's single <c>SaveChanges</c>. The legacy
+    /// <see cref="SaveWorkSlotRegistry"/> is deliberately NOT called afterwards: this checkpoint is
+    /// not two independent writes.
+    /// </para>
+    /// <para>
+    /// SCOPE, honestly — this is a CHECKPOINT, not whole-pipeline atomicity. Only the pointer and
+    /// the registry share the one capture; every other mutable field (plan, phase, metrics, the
+    /// phase log, the conversation) keeps its existing capture timing and may change afterwards.
+    /// The result is not a durably-consistent whole-pipeline snapshot, no admission/rollback
+    /// semantics are changed, and NOTHING consumes these checkpoints for recovery yet. A throwing
+    /// <c>SaveChanges</c> does NOT by itself prove a rollback: after-commit/provider uncertainty is
+    /// the existing limitation.
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
+    /// <param name="ownership">The detached ownership capture supplying BOTH columns.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="pipeline"/> or
+    /// <paramref name="ownership"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The carrier's goal does not match the pipeline's.</exception>
+    /// <exception cref="WorkSlotRegistryCodecException">The captured registry cannot be encoded.</exception>
+    internal void SavePipeline(GoalPipeline pipeline, AdmissionOwnershipSnapshot ownership)
+    {
+        ArgumentNullException.ThrowIfNull(pipeline);
+        var checkpoint = FreezeOwnershipCheckpoint(pipeline, ownership);
+
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null, checkpoint);
+            SaveConversationCore(db, pipeline);
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            // THE BORROWED-CONTEXT HYGIENE: a failed row write must not leave a half-staged
+            // checkpoint in the tracker, where a LATER legacy save on the same caller-owned context
+            // could flush the rejected blob. The affected entry is detached, which DISCARDS its
+            // pending pointer/registry values; when it had a durable counterpart (Unchanged/Modified)
+            // it is reloaded through the tracker so the caller still observes that row exactly as
+            // before. The primary exception is preserved and rethrown verbatim.
+            OnCheckpointSaveFailure(db, pipeline.GoalId, ex);
+            // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper, so
+            // a throwing ILogger can never replace the row-write exception rethrown on the next line
+            // — which is exactly the guarantee this method's contract makes. The primary exception's
+            // own text is read through the existing no-throw guard for the same reason.
+            BestEffortWarning(
+                "Failed to save pipeline for goal {GoalId} — the ownership checkpoint's row write failed; the primary exception is rethrown unchanged: {PrimaryMessage}",
+                pipeline.GoalId, CleanupMessageOrPlaceholder(ex));
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// THE ELIGIBLE ORDINARY CHECKPOINT, STATE SAVE: the scalar-only sibling of
+    /// <see cref="SavePipeline(GoalPipeline, AdmissionOwnershipSnapshot)"/>. It writes the SAME
+    /// pointer/registry checkpoint in the SAME single row write, but — like
+    /// <see cref="SavePipelineState(GoalPipeline)"/> — it never touches the conversation.
+    /// </summary>
+    /// <remarks>
+    /// Scope and error semantics are those of the full-save overload; the ONLY difference is the
+    /// absent conversation write, which is what keeps a state-only save conversation-neutral.
+    /// </remarks>
+    /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
+    /// <param name="ownership">The detached ownership capture supplying BOTH columns.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="pipeline"/> or
+    /// <paramref name="ownership"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The carrier's goal does not match the pipeline's.</exception>
+    /// <exception cref="WorkSlotRegistryCodecException">The captured registry cannot be encoded.</exception>
+    internal void SavePipelineState(GoalPipeline pipeline, AdmissionOwnershipSnapshot ownership)
+    {
+        ArgumentNullException.ThrowIfNull(pipeline);
+        var checkpoint = FreezeOwnershipCheckpoint(pipeline, ownership);
+
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null, checkpoint);
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            OnCheckpointSaveFailure(db, pipeline.GoalId, ex);
+            // THE GUARDED DIAGNOSTIC: see the full-save overload — a throwing ILogger must never
+            // replace the primary row-write exception rethrown on the next line.
+            BestEffortWarning(
+                "Failed to save pipeline state for goal {GoalId} — the ownership checkpoint's row write failed; the primary exception is rethrown unchanged: {PrimaryMessage}",
+                pipeline.GoalId, CleanupMessageOrPlaceholder(ex));
+            throw;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Validates the carrier's goal and ENCODES the captured registry EXACTLY ONCE — both BEFORE
+    /// any database interaction. The encode is the single point where a malformed capture can fail,
+    /// and it fails with no context created and no statement issued: an encoding failure can never
+    /// touch the database.
+    /// </summary>
+    /// <param name="pipeline">The pipeline the carrier must belong to.</param>
+    /// <param name="ownership">The detached capture to freeze.</param>
+    /// <returns>The frozen pair the row write installs.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="ownership"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The carrier's goal differs from the pipeline's.</exception>
+    /// <exception cref="WorkSlotRegistryCodecException">The captured registry cannot be encoded.</exception>
+    private static FrozenOwnershipCheckpoint FreezeOwnershipCheckpoint(
+        GoalPipeline pipeline, AdmissionOwnershipSnapshot? ownership)
+    {
+        ArgumentNullException.ThrowIfNull(ownership);
+
+        // THE GOAL-IDENTITY GUARD: a carrier captured from a different pipeline would install a
+        // foreign pointer and a foreign registry. It is detected from the carrier's own goal
+        // identity — never by reading the database.
+        if (!string.Equals(ownership.GoalId, pipeline.GoalId, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"The ownership capture's goal '{ownership.GoalId}' does not match the pipeline's goal '{pipeline.GoalId}'.",
+                nameof(ownership));
+        }
+
+        // THE SINGLE ENCODE, before any context exists. A codec failure escapes here.
+        return new FrozenOwnershipCheckpoint(ownership.ActiveTaskId, WorkSlotRegistryCodec.Encode(ownership.Registry));
+    }
+
+    /// <summary>
+    /// THE BORROWED-CONTEXT HYGIENE on a failed checkpoint row write: the affected goal's tracked
+    /// pipeline entry is put back into a state that CANNOT flush the rejected checkpoint later.
+    /// <para>
+    /// WHY IT IS NEEDED: on the direct (test-owned) context path the pipeline entity stays tracked
+    /// after a failed <c>SaveChanges</c>, still carrying the staged pointer/registry values. A
+    /// subsequent LEGACY save on the SAME context (whose <c>Find</c> hands back that very tracked
+    /// copy) would then flush the rejected blob as a side effect of an unrelated write. Detaching
+    /// the entry discards its pending change, so the legacy path re-reads the durable row instead.
+    /// A reload (rather than a detach) is used when the failing write was the FIRST staging of the
+    /// row, so the caller still observes the pipeline through the tracker exactly as before.
+    /// </para>
+    /// <para>
+    /// GUARDED AND NEVER MASKING: every step is wrapped, so a cleanup fault degrades to a warning
+    /// and the PRIMARY exception keeps propagating unchanged. This is a targeted, key-scoped fix —
+    /// deliberately NOT a general tracker-cleanup redesign.
+    /// </para>
+    /// </summary>
+    /// <param name="db">The context whose row write failed.</param>
+    /// <param name="goalId">The affected goal.</param>
+    /// <param name="primary">The failure being preserved (its message is logged only).</param>
+    private void OnCheckpointSaveFailure(CopilotHiveDbContext db, string goalId, Exception primary)
+    {
+        try
+        {
+            // Added/Deleted entries have no durable counterpart to reload: they are DISCARDED.
+            // An Unchanged/Modified entry is DETACHED and then reloaded through the tracker so the
+            // context keeps surfacing the durable row rather than the rejected in-flight copy —
+            // which is also why the failing write's own values are never re-inspected after the
+            // cleanup (an EF change-tracker entry's members can be unreliable once the write faulted,
+            // so this diagnostic deliberately reads none of them).
+            var reload = db.ChangeTracker.Entries<PipelineEntity>()
+                .Any(e => string.Equals(e.Entity.GoalId, goalId, StringComparison.Ordinal)
+                    && e.State is EntityState.Unchanged or EntityState.Modified);
+
+            DetachTrackedPipelinesForGoal(db, goalId);
+            if (reload)
+                db.Pipelines.Find(goalId);
+
+            // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper, so a
+            // throwing ILogger degrades to silence instead of turning a COMPLETED cleanup into the
+            // "cleanup did not complete" branch (and it can never escape the caller's failure path).
+            BestEffortWarning(
+                "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker hygiene completed ({PrimaryMessage})",
+                goalId, CleanupMessageOrPlaceholder(primary));
+        }
+        catch (Exception cleanupEx)
+        {
+            // Best-effort hygiene: the diagnostic must never replace the primary failure.
+            BestEffortWarning(
+                "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker cleanup did not complete: {Message}",
+                goalId, CleanupMessageOrPlaceholder(cleanupEx));
+        }
+    }
+
     /// <summary>Append a single conversation entry without rewriting the full conversation.</summary>
     public void AppendConversation(string goalId, ConversationEntry entry)
     {
@@ -420,6 +632,32 @@ public sealed class PipelineStore : IAsyncDisposable
 
             _logger.LogInformation("Loaded {Count} active pipeline(s) from store", results.Count);
             return results;
+        }
+        finally
+        {
+            if (ownsContext)
+                db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// TRUE iff a persisted row already exists for <paramref name="goalId"/> — the narrow EXISTENCE
+    /// probe the manager's eligibility decision needs.
+    /// </summary>
+    /// <remarks>
+    /// It answers only "is there a row?"; it does not load, deserialize or interpret any column, so
+    /// it can never fail on a malformed stored value the way a full snapshot load could. The query
+    /// is a server-side <c>EXISTS</c> and returns no entity, so it stages and tracks nothing — a
+    /// caller that only wants the provenance fact cannot disturb the context's tracker with it.
+    /// </remarks>
+    /// <param name="goalId">The goal whose pipeline row is probed.</param>
+    /// <returns><c>true</c> when the row exists.</returns>
+    internal bool PipelineRowExists(string goalId)
+    {
+        var (db, ownsContext) = ResolveDbContext();
+        try
+        {
+            return db.Pipelines.Any(p => p.GoalId == goalId);
         }
         finally
         {
@@ -1541,15 +1779,30 @@ public sealed class PipelineStore : IAsyncDisposable
         }
     }
 
-    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline) =>
-        UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null);
+    /// <summary>
+    /// THE FROZEN OWNERSHIP PAIR an eligible ordinary checkpoint writes: the captured active-task
+    /// pointer (which may legitimately be <c>null</c>) and the ALREADY-ENCODED registry blob, both
+    /// taken from ONE detached <see cref="AdmissionOwnershipSnapshot"/>. It exists because
+    /// <c>null</c> cannot double as both "no override" and "the captured pointer is null" — the
+    /// pair's presence IS the override, so a captured null is written as SQL NULL and never falls
+    /// back to a late live-pointer read.
+    /// </summary>
+    private readonly record struct FrozenOwnershipCheckpoint(string? ActiveTaskId, string EncodedRegistryJson);
 
-    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline, string? activeTaskIdOverride)
+    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline) =>
+        UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null, checkpoint: null);
+
+    private static void UpsertPipelineCore(CopilotHiveDbContext db, GoalPipeline pipeline, string? activeTaskIdOverride) =>
+        UpsertPipelineCore(db, pipeline, activeTaskIdOverride, checkpoint: null);
+
+    private static void UpsertPipelineCore(
+        CopilotHiveDbContext db, GoalPipeline pipeline, string? activeTaskIdOverride,
+        FrozenOwnershipCheckpoint? checkpoint)
     {
         var existing = db.Pipelines.Find(pipeline.GoalId);
         if (existing is not null)
         {
-            ApplyToEntity(pipeline, existing, activeTaskIdOverride);
+            ApplyToEntity(pipeline, existing, activeTaskIdOverride, checkpoint);
         }
         else
         {
@@ -1557,12 +1810,14 @@ public sealed class PipelineStore : IAsyncDisposable
             {
                 GoalId = pipeline.GoalId,
             };
-            ApplyToEntity(pipeline, entity, activeTaskIdOverride);
+            ApplyToEntity(pipeline, entity, activeTaskIdOverride, checkpoint);
             db.Pipelines.Add(entity);
         }
     }
 
-    private static void ApplyToEntity(GoalPipeline pipeline, PipelineEntity entity, string? activeTaskIdOverride)
+    private static void ApplyToEntity(
+        GoalPipeline pipeline, PipelineEntity entity, string? activeTaskIdOverride,
+        FrozenOwnershipCheckpoint? checkpoint)
     {
         entity.Description = pipeline.Description;
         entity.GoalJson = JsonSerializer.Serialize(pipeline.Goal, JsonOptions);
@@ -1572,12 +1827,29 @@ public sealed class PipelineStore : IAsyncDisposable
         entity.TestRetries = pipeline.TestRetries;
         entity.MaxRetries = pipeline.MaxRetries;
         entity.MaxIterations = pipeline.MaxIterations;
-        // THE OVERRIDE: null (the ordinary paths) → the existing LATE read at this point — the
-        // behavior IDENTICAL under all concurrency (the capture point unchanged); non-null (the
-        // admission's validated snapshot, passed through by SaveAdmissionWithPointer from
-        // GoalPipelineManager.PersistAdmission on the production dispatch path) → the immutable
-        // value.
-        entity.ActiveTaskId = activeTaskIdOverride ?? pipeline.ActiveTaskId;
+        // THE OVERRIDE, in precedence order — the frozen ownership checkpoint wins, because it is
+        // the eligible ordinary save's SINGLE detached capture of the pointer and the complete
+        // registry together (see the ownership-aware SavePipeline/SavePipelineState overloads):
+        //   (1) a frozen checkpoint → its captured ActiveTaskId VERBATIM, including null (SQL NULL),
+        //       so a captured null can never fall back to a late live-pointer read;
+        //   (2) the admission's validated snapshot (passed through by SaveAdmissionWithPointer from
+        //       GoalPipelineManager.PersistAdmission on the production dispatch path) → the
+        //       immutable value;
+        //   (3) neither → the existing LATE read at this point: behavior IDENTICAL under all
+        //       concurrency (the capture point unchanged) for every legacy/direct caller.
+        entity.ActiveTaskId = checkpoint is { } frozen
+            ? frozen.ActiveTaskId
+            : activeTaskIdOverride ?? pipeline.ActiveTaskId;
+
+        // THE SAME-ROW REGISTRY CHECKPOINT. When the caller is an eligible manager save, the blob
+        // captured alongside that very pointer is installed in this SAME pipeline-row write — no
+        // second, independent write. When it is not (every legacy/direct caller, and every
+        // ineligible restore-constructed pipeline), the column is left EXACTLY as it was: this
+        // method never reads, captures, clears or re-encodes it, so an existing blob survives
+        // byte-for-byte.
+        if (checkpoint is { } ownership)
+            entity.WorkSlotRegistryJson = ownership.EncodedRegistryJson;
+
         entity.CoderBranch = pipeline.CoderBranch;
         entity.PlanJson = pipeline.Plan is not null ? JsonSerializer.Serialize(pipeline.Plan, JsonOptions) : null;
         entity.MetricsJson = JsonSerializer.Serialize(pipeline.Metrics, JsonOptions);

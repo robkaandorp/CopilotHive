@@ -2057,7 +2057,7 @@ internal sealed class PipelineLookupGateInterceptor : DbCommandInterceptor
 ///   lookup: a concurrent in-memory clear lands inside the lookup→apply window, and the row
 ///   still commits the validated id.</item>
 ///   <item>The ordinary-path vector proves the override did NOT leak:
-///   <see cref="PipelineStore.SavePipelineState"/>'s late read still persists the value read
+///   <see cref="PipelineStore.SavePipelineState(GoalPipeline)"/>'s late read still persists the value read
 ///   at apply time (post-clear → NULL).</item>
 /// </list>
 /// THE WINDOW/SNAPSHOT COMMENT: before this slice the admission's Stage 2 re-read
