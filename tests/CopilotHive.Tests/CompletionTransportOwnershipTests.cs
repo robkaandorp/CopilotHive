@@ -1544,6 +1544,465 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // (N) STAGE 1 OF THE ACK PROTOCOL — NOTHING IS EMITTED
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE STAGE-1 NO-EMISSION INVARIANT, on an ACCEPTED completion whose worker asked for the ACK:
+    /// the reply to the registration reports it DISABLED, and the completion path publishes NO
+    /// <see cref="CompletionReceiptAck"/> on the worker's stream — the message is DEFINED but never
+    /// emitted.
+    /// </summary>
+    /// <remarks>
+    /// THE OBSERVATION POINT IS THE gRPC WRITER the real pump forwards to, so this sees exactly what
+    /// the worker would have received. A request that was recorded in the pool is therefore proven
+    /// NOT to have become a publication.
+    /// </remarks>
+    [Fact]
+    public async Task RequestedReceiptAck_AcceptedCompletion_PublishesNoAcknowledgement()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            // The registration fact really was recorded — so the absence below is a real refusal to
+            // emit, not a request that never reached the pool.
+            Assert.True(h.Worker.RequestCompletionReceiptAck);
+
+            h.Assign("task-ack-absent", model: "assigned-model");
+
+            // THE OBSERVATION POINT IS PROVEN LIVE BEFORE the absence is asserted: the pump really
+            // forwards what the worker's channel is given, so a silent pump cannot make the
+            // no-acknowledgement assertion pass vacuously.
+            await h.AssertPumpObservationIsLiveAsync();
+
+            var result = await h.CompleteAndAwaitDownstreamAsync("task-ack-absent");
+            Assert.Equal("task-ack-absent", result.TaskId);
+
+            AssertNoAcknowledgementPublished(h);
+
+            // The completion itself was still accepted in full: the worker was released and the
+            // real downstream chain ran. Stage 1 withholds the ACK, nothing else.
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-absent"));
+        });
+    }
+
+    /// <summary>
+    /// EVERY completion shape leaves the stream free of an acknowledgement — the REFUSED ones too.
+    /// A guard that returned early must not have emitted an ACK on its way out, and a refusal must
+    /// not fabricate one either.
+    /// </summary>
+    [Fact]
+    public async Task RequestedReceiptAck_RefusedCompletion_PublishesNoAcknowledgement()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            // The worker is genuinely busy — with a DIFFERENT task than the one it completes — so
+            // the ownership guard refuses the completion and the assignment stays held.
+            h.Assign("task-ack-own", model: "assigned-model");
+
+            // The observation point is proven live on THIS harness too, so the absence asserted
+            // below cannot be an artifact of a pump that forwards nothing.
+            await h.AssertPumpObservationIsLiveAsync();
+
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-ack-refused",
+                HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
+
+            // The assignment and the refusal both survive with no acknowledgement anywhere.
+            AssertNoAcknowledgementPublished(h);
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-ack-own", h.Worker.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-own"));
+        });
+    }
+
+    /// <summary>
+    /// Asserts NO acknowledgement was forwarded to the worker: not as the new oneof case, and not as
+    /// a stray message that happens to carry a <see cref="CompletionReceiptAck"/> payload.
+    /// </summary>
+    /// <param name="harness">The harness whose production pump observation is inspected.</param>
+    private static void AssertNoAcknowledgementPublished(Harness harness)
+    {
+        Assert.DoesNotContain(
+            harness.Writer.Messages,
+            m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
+        Assert.DoesNotContain(harness.Writer.Messages, m => m.CompletionReceiptAck is not null);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (A) THE EXCLUSIVE PER-INSTANCE WORKSTREAM ATTACHMENT CLAIM
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// EXACTLY ONE OF TWO LIVE STREAMS FOR THE SAME REGISTERED INSTANCE ATTACHES, and the winner
+    /// keeps working normally afterwards.
+    /// </summary>
+    /// <remarks>
+    /// THE WINNER IS IDENTIFIED BY PRODUCTION, NOT ASSUMED: this harness's primary stream is the one
+    /// that already pinned the instance, and it stays the only stream that ever consumes the
+    /// channel — so the later completion reaches the primary writer and the real downstream chain.
+    /// </remarks>
+    [Fact]
+    public async Task Attachment_TwoStreamsForSameInstance_OnlyOneWinsAndKeepsWorking()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            // The primary stream pins the instance first.
+            await h.BarrierAsync();
+            Assert.True(h.Worker.IsWorkStreamAttached);
+
+            // A SECOND stream attempts the SAME instance; it must lose.
+            var second = await h.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            h.AssertSecondStreamWasRejectedNormally(second);
+            Harness.AssertSecondStreamForwardedNothing(second);
+
+            // THE WINNER IS UNTOUCHED AND STILL FULLY FUNCTIONAL: its registration state survives,
+            // its channel still delivers, and its completion still reaches the real downstream chain.
+            Assert.Same(h.Worker, h.Pool.GetWorker(WorkerId));
+
+            h.Assign("task-attach-win", model: "assigned-model");
+            var result = await h.CompleteAndAwaitDownstreamAsync("task-attach-win");
+            Assert.Equal("task-attach-win", result.TaskId);
+            Assert.Equal(1, h.DownstreamHandledCount("task-attach-win"));
+
+            // The loser forwarded nothing, even after the winner's completion published.
+            Harness.AssertSecondStreamForwardedNothing(second);
+        });
+    }
+
+    /// <summary>
+    /// THE LOSING STREAM'S FIRST MESSAGE HAS NO EFFECT WHATSOEVER. Its first message is a Ready for
+    /// the SAME instance while a task is still held, so a stream that processed it would be refused
+    /// by the Ready guard and would EMIT the ready-ignored warning — the loser emits neither that
+    /// warning nor the acceptance line, keeps no ownership, and produces no receipt or notification.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_LosingFirstReady_HasNoDispatchReceiptOrNotificationEffect()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            // A held assignment: the winner is busy, so ANY stream that handled a Ready here would
+            // have to refuse it and log the refusal — an unmistakable production observable.
+            h.Assign("task-attach-held", model: "assigned-model");
+            var tasksEnqueuedBefore = h.TasksEnqueued;
+
+            // The primary stream pins the instance (Progress resolves no assignment).
+            await h.BarrierAsync();
+
+            var second = await h.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            h.AssertSecondStreamWasRejectedNormally(second);
+
+            // NO DISPATCH EFFECT: the loser never dequeued, never assigned and never enqueued.
+            Assert.Equal(tasksEnqueuedBefore, h.TasksEnqueued);
+            Assert.Equal("task-attach-held", h.Worker.CurrentTaskId);
+            Assert.True(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-attach-held"));
+
+            // NO READY-HANDLING EFFECT: the loser never reached the Ready guards, so NEITHER the
+            // refusal diagnostic nor the acceptance line exists for it.
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReadyIgnored, StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReadyAccepted, StringComparison.Ordinal));
+
+            // NO COMPLETION/RECEIPT/NOTIFICATION EFFECT.
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Null(h.ReadReceipt("task-attach-held"));
+
+            // The loser never forwarded a channel message either.
+            Harness.AssertSecondStreamForwardedNothing(second);
+        });
+    }
+
+    /// <summary>
+    /// A LOSING FIRST <c>Complete</c> OR <c>tool_request</c> MESSAGE IS LIKEWISE INERT. For a
+    /// completion, a stream that handled it would publish the acceptance provenance line, release
+    /// the assignment and record a receipt; for a tool request, it would run the tool and log the
+    /// call. The loser does none of them.
+    /// </summary>
+    /// <param name="shape">0 = Complete, 1 = tool_request.</param>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task Attachment_LosingFirstCompleteOrToolRequest_HasNoEffect(int shape)
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-attach-shape", model: "assigned-model");
+            var tasksEnqueuedBefore = h.TasksEnqueued;
+
+            // The primary stream pins the instance first.
+            await h.BarrierAsync();
+
+            const string toolName = "report_progress";
+            var first = shape switch
+            {
+                0 => new WorkerMessage
+                {
+                    WorkerId = WorkerId,
+                    Complete = new GrpcTaskComplete
+                    {
+                        TaskId = "task-attach-shape",
+                        Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
+                        Output = "loser-output",
+                    },
+                },
+                1 => new WorkerMessage
+                {
+                    WorkerId = WorkerId,
+                    ToolRequest = new ToolCallRequest
+                    {
+                        RequestId = "loser-req",
+                        TaskId = "task-attach-shape",
+                        ToolName = toolName,
+                        ArgumentsJson = "{\"status\":\"loser\",\"details\":\"loser\"}",
+                    },
+                },
+                _ => throw new InvalidOperationException($"unknown shape '{shape}'"),
+            };
+
+            var second = h.StartSecondStream(WorkerId, first);
+            second.Completion = await h.AwaitSecondStreamTerminationAsync(second);
+            h.AssertSecondStreamWasRejectedNormally(second);
+
+            // NO COMPLETION EFFECT: the winner still owns the task, nothing was released, no
+            // acceptance provenance line was emitted and no receipt was recorded.
+            Assert.Equal("task-attach-shape", h.Worker.CurrentTaskId);
+            Assert.True(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-attach-shape"));
+            Assert.Equal(tasksEnqueuedBefore, h.TasksEnqueued);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Null(h.ReadReceipt("task-attach-shape"));
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionAccepted, StringComparison.Ordinal));
+
+            // NO TOOL EFFECT: the loser never dispatched a tool call.
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains($"Tool call '{toolName}'", StringComparison.Ordinal));
+
+            Harness.AssertSecondStreamForwardedNothing(second);
+        });
+    }
+
+    /// <summary>
+    /// THE LOSER REMOVES NOTHING, CLEARS NO HEARTBEAT STATE AND NOTIFIES NO DISCONNECTION. The
+    /// dashboard counter and the heartbeat dictionary are production observables, so a loser that
+    /// ran the normal teardown would be caught even though its message named the same worker id.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_LosingStream_RemovesNothingClearsNoHeartbeatAndNotifiesNothing()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            await h.BarrierAsync();
+
+            // A genuine heartbeat entry for the instance, created by the REAL heartbeat path.
+            await h.SendHeartbeatAsync();
+            Assert.Contains(WorkerId, h.HeartbeatStateKeys());
+
+            h.ResetDashboardNotifications();
+
+            var second = await h.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            h.AssertSecondStreamWasRejectedNormally(second);
+
+            // NOT REMOVED: the instance is still registered, and the pool still identifies it.
+            Assert.Same(h.Worker, h.Pool.GetWorker(WorkerId));
+            Assert.Equal(1, h.Pool.ConnectedWorkerCount);
+
+            // NO HEARTBEAT CLEANUP: the winner's throttle entry survives the loser's teardown.
+            Assert.Contains(WorkerId, h.HeartbeatStateKeys());
+
+            // NO DISCONNECTION NOTIFICATION OF ANY KIND.
+            Assert.Equal(0, h.DashboardNotifications);
+        });
+    }
+
+    /// <summary>
+    /// A LOSING STREAM NEITHER CANCELS NOR UNWINDS THE WINNER: after the loser has returned
+    /// normally, the winner's stream is still live and still drives the full
+    /// completion -> release -> Ready sequence.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_LosingStream_DoesNotDisturbTheWinnersStream()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            await h.BarrierAsync();
+            Assert.False(h.StreamEnded);
+
+            var second = await h.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            h.AssertSecondStreamWasRejectedNormally(second);
+
+            // THE WINNER IS STILL LIVE: it accepts a completion AND a following Ready.
+            h.Assign("task-attach-live", model: "assigned-model");
+            await h.CompleteAndAwaitDownstreamAsync("task-attach-live");
+            await h.ReadyAndAwaitAcceptedAsync();
+
+            Assert.False(h.StreamEnded, "the winner must not be ended by the loser's rejection");
+            Assert.Same(h.Worker, h.Pool.GetWorker(WorkerId));
+        });
+    }
+
+    /// <summary>
+    /// THE CLAIM IS ONE-WAY AND PER INSTANCE: it is NOT reset by the winning stream's own teardown,
+    /// so the same instance can never be re-attached — while a re-registration under the same id
+    /// produces a NEW instance with a FRESH claim that attaches normally.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_ClaimIsOneWay_ReRegistrationYieldsANewEligibleInstance()
+    {
+        var first = Harness.Create();
+        await RunAsync(first, async () =>
+        {
+            await first.BarrierAsync();
+            Assert.True(first.Worker.IsWorkStreamAttached);
+
+            // A second stream loses even while the winner is live.
+            var whileLive = await first.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            first.AssertSecondStreamWasRejectedNormally(whileLive);
+        });
+
+        // The winning stream's teardown has now run; the claim is STILL held — never reset or reused.
+        Assert.True(first.Worker.IsWorkStreamAttached);
+        Assert.False(first.Worker.TryAttachWorkStream());
+
+        // A RE-REGISTERED instance is a DIFFERENT object with its OWN fresh claim.
+        var replacement = Harness.Create();
+        await RunAsync(replacement, async () =>
+        {
+            // Swap the instance under the same id BEFORE the stream pins it, so the stream that
+            // attaches is genuinely the replacement.
+            Assert.True(replacement.Pool.RemoveWorker(replacement.Worker));
+            var fresh = replacement.Pool.RegisterWorker(WorkerId, []);
+            Assert.NotSame(replacement.Worker, fresh);
+
+            await replacement.BarrierAsync();
+
+            Assert.Same(fresh, replacement.Pool.GetWorker(WorkerId));
+            Assert.True(fresh.IsWorkStreamAttached);
+
+            // The replacement is separately eligible — and a second stream still loses to IT.
+            var second = await replacement.StartSecondStreamAndAwaitTerminationAsync(WorkerId);
+            replacement.AssertSecondStreamWasRejectedNormally(second);
+        });
+    }
+
+    /// <summary>
+    /// DISTINCT WORKERS ATTACH INDEPENDENTLY: a second stream over a DIFFERENT registered instance
+    /// attaches, pins its own instance and reaches its own Ready acceptance — while the
+    /// already-attached diagnostic is never emitted for it.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_DistinctWorkers_AttachIndependentlyOnTheSameService()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            const string otherId = "ownership-worker-2";
+            var other = h.Pool.RegisterWorker(otherId, []);
+
+            // The primary stream takes THIS harness's instance.
+            await h.BarrierAsync();
+            Assert.True(h.Worker.IsWorkStreamAttached);
+
+            // A second stream for a DIFFERENT id must attach, and its own Ready acceptance line is
+            // the deterministic gate proving the claim happened in PRODUCTION.
+            var accepted = h.ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
+            var otherStream = h.StartSecondStream(otherId, new WorkerMessage
+            {
+                WorkerId = otherId,
+                Ready = new WorkerReady(),
+            });
+
+            await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.True(other.IsWorkStreamAttached);
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReadyAccepted, StringComparison.Ordinal)
+                     && m.Contains(otherId, StringComparison.Ordinal));
+
+            // The already-attached diagnostic was NEVER emitted for the distinct worker.
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.WorkStreamAlreadyAttached,
+                         StringComparison.Ordinal)
+                     && m.Contains(otherId, StringComparison.Ordinal));
+
+            // Both instances remain registered, each owning its own stream.
+            Assert.Same(h.Worker, h.Pool.GetWorker(WorkerId));
+            Assert.Same(other, h.Pool.GetWorker(otherId));
+            Assert.Equal(2, h.Pool.ConnectedWorkerCount);
+
+            // Ending the second stream's reader lets it complete normally.
+            otherStream.Reader.Complete();
+            await otherStream.Producer.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+        });
+    }
+
+    /// <summary>
+    /// REMOVING AND RE-REGISTERING THE SAME ID YIELDS A NEW ELIGIBLE INSTANCE, and a STALE winning
+    /// stream's cleanup cannot remove it. The replacement's own claim is intact, so the attachment
+    /// claim is stream ownership only — never a re-registration authorization.
+    /// </summary>
+    [Fact]
+    public async Task Attachment_StaleWinnerCleanup_CannotRemoveTheReRegisteredInstance()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            var stale = h.Worker;
+            await h.BarrierAsync();
+            Assert.True(stale.IsWorkStreamAttached);
+
+            // A replacement registers under the same id while the stale stream is still live, and it
+            // takes its OWN stream, which attaches to the replacement.
+            Assert.True(h.Pool.RemoveWorker(stale));
+            var replacement = h.Pool.RegisterWorker(WorkerId, []);
+            Assert.Same(replacement, h.Pool.GetWorker(WorkerId));
+
+            var accepted = h.ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
+            var replacementStream = h.StartSecondStream(WorkerId, new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Ready = new WorkerReady(),
+            });
+
+            await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // The replacement's stream was NOT rejected as a duplicate: it is a DIFFERENT instance.
+            Assert.True(replacement.IsWorkStreamAttached);
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(
+                    HiveOrchestratorService.OwnershipRefusalReasons.WorkStreamAlreadyAttached,
+                    StringComparison.Ordinal));
+
+            // The STALE stream's teardown path must refuse, because the pool no longer holds that
+            // instance — the same instance-aware removal the winning stream uses.
+            Assert.False(h.Pool.RemoveWorker(stale));
+
+            // The replacement — and its claim — survive untouched.
+            Assert.Same(replacement, h.Pool.GetWorker(WorkerId));
+            Assert.True(replacement.IsWorkStreamAttached);
+            Assert.Equal(1, h.Pool.ConnectedWorkerCount);
+            Assert.Equal(WorkerId, replacementStream.WorkerId);
+        });
+    }
+    // ═══════════════════════════════════════════════════════════════════════
     //  harness
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -1604,6 +2063,13 @@ public sealed class CompletionTransportOwnershipTests
 
         /// <summary>The RETAINED producer task; the strict teardown joins exactly this instance.</summary>
         private Task StreamTask { get; init; } = null!;
+
+        /// <summary>
+        /// EVERY ADDITIONAL stream a vector started through
+        /// <see cref="StartSecondStream"/>: its own reader, writer and retained task. They are
+        /// joined by the SAME strict teardown as the primary stream, so a vector never leaks one.
+        /// </summary>
+        private readonly List<SecondStream> _extraStreams = [];
 
         private readonly CompletionObservations _observations;
 
@@ -1670,6 +2136,17 @@ public sealed class CompletionTransportOwnershipTests
         public static Harness Create() => CreateCore(withPublishedAssignmentSupport: false, dbPath: null);
 
         /// <summary>
+        /// Creates a harness whose worker REGISTERED WITH THE COMPLETION-RECEIPT REQUEST SET — the
+        /// registration shape the stage-1 no-emission invariant must hold for. Everything else is
+        /// the plain harness.
+        /// </summary>
+        public static Harness CreateWithRequestedCompletionReceiptAck() =>
+            CreateCore(
+                withPublishedAssignmentSupport: false,
+                dbPath: null,
+                requestCompletionReceiptAck: true);
+
+        /// <summary>
         /// Creates a harness WITH the published-assignment support the sequence vector needs: a
         /// REAL <see cref="WorkerAssignmentPublisher"/> over a REAL file-backed SQLite store
         /// supplied to the service.
@@ -1716,7 +2193,8 @@ public sealed class CompletionTransportOwnershipTests
             string? dbPath,
             IInterceptor[]? interceptors = null,
             bool withRecorder = true,
-            bool withOwnershipMutationHook = false)
+            bool withOwnershipMutationHook = false,
+            bool requestCompletionReceiptAck = false)
         {
             var pool = new WorkerPool();
             var queue = new TaskQueue();
@@ -1807,7 +2285,8 @@ public sealed class CompletionTransportOwnershipTests
                 assignmentPublisher: assignmentPublisher,
                 completionRecorder: completionRecorder);
 
-            var worker = pool.RegisterWorker(WorkerId, []);
+            var worker = pool.RegisterWorker(
+                WorkerId, [], requestCompletionReceiptAck: requestCompletionReceiptAck);
             var reader = new ChannelStreamReader();
 
             // THE SINGLE CONSUMER OF THE WORKER'S CHANNEL IS THE PRODUCTION PUMP. Publication is
@@ -2210,6 +2689,36 @@ public sealed class CompletionTransportOwnershipTests
         public CompletionReceiptReadResult? ReadReceipt(string taskId) =>
             Stores.NewReceiptStore().Load(taskId);
 
+        /// <summary>
+        /// Sends a heartbeat for the pinned worker through the REAL RPC, so the production throttle
+        /// dictionary gains an entry for it.
+        /// </summary>
+        public Task SendHeartbeatAsync() =>
+            Service.Heartbeat(
+                new HeartbeatRequest { WorkerId = WorkerId, Busy = false, ContextUsagePercent = 10 },
+                MockContext());
+
+        /// <summary>
+        /// The worker ids currently present in the service's OWN <c>_heartbeatState</c> dictionary —
+        /// read via reflection because the dictionary is the production throttle authority the
+        /// loser's teardown must not touch.
+        /// </summary>
+        /// <returns>A snapshot of the dictionary's keys.</returns>
+        public IReadOnlyList<string> HeartbeatStateKeys() =>
+            HeartbeatState().Keys.ToList();
+
+        private IDictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)> HeartbeatState()
+        {
+            var field = typeof(HiveOrchestratorService).GetField(
+                "_heartbeatState",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.NotNull(field);
+            var dict = field!.GetValue(Service)
+                as IDictionary<string, (DateTime LastNotify, bool WasBusy, int LastNotifiedCtx)>;
+            Assert.NotNull(dict);
+            return dict!;
+        }
+
         /// <summary>A raw column read through the harness's own factory — the byte-identity probe.</summary>
         /// <param name="sql">The scalar query to execute.</param>
         /// <returns>The scalar, or <c>null</c> for SQL NULL.</returns>
@@ -2255,6 +2764,41 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         // ── THE POST-HANDLER BARRIER ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// PROVES THE PUBLICATION OBSERVATION POINT IS LIVE, so a later "nothing was forwarded"
+        /// assertion is a real absence rather than a silent/dead pump.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A message written straight to the worker's own channel must appear AT THE WRITER. That is
+        /// the same production pump path every acknowledgement would have to travel, so once this
+        /// returns, an observed absence genuinely means nothing was published. The probe message
+        /// carries no payload case of its own beyond <c>None</c>, so it can neither satisfy nor be
+        /// mistaken for a real acknowledgment.
+        /// </para>
+        /// <para>
+        /// A POST-HANDLER BARRIER RUNS FIRST, ON PURPOSE. The production pump only forwards once the
+        /// stream has pinned the worker on its first inbound message, and the barrier's Progress
+        /// message is exactly that first inbound message — so the probe below cannot be mistaken for
+        /// a dead pump merely because nothing was pushed to the reader yet.
+        /// </para>
+        /// </remarks>
+        public async Task AssertPumpObservationIsLiveAsync()
+        {
+            await BarrierAsync();
+
+            var token = $"ownership-pump-live-{Interlocked.Increment(ref _barrierSequence)}";
+            var forwarded = Writer.WaitForMessage(m => m.UpdateAgents?.Role == token);
+
+            Assert.True(Worker.MessageChannel.Writer.TryWrite(new OrchestratorMessage
+            {
+                UpdateAgents = new UpdateAgents { Role = token },
+            }));
+
+            var observed = await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(token, observed.UpdateAgents.Role);
+        }
 
         /// <summary>
         /// THE POST-HANDLER BARRIER, and the reason every refusal vector here is removal-proof.
@@ -2629,6 +3173,120 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(expectedTaskId, assignment.TaskId);
         }
 
+        // ── THE EXCLUSIVE WORKSTREAM ATTACHMENT CLAIM ────────────────────────────────
+
+        /// <summary>
+        /// Starts a SECOND, independent stream for <paramref name="workerId"/> on the SAME service,
+        /// with its own request reader and its own response writer, and returns the retained handle.
+        /// The teardown joins it like any other producer.
+        /// </summary>
+        /// <remarks>
+        /// THE FIRST MESSAGE IS THE ATTACHMENT ATTEMPT: it is pushed into this second stream's own
+        /// reader, so whichever stream wins the claim is decided by production, not by the test.
+        /// </remarks>
+        /// <param name="workerId">The worker id the second stream's first message names.</param>
+        /// <param name="firstMessage">The message the second stream sees first.</param>
+        /// <returns>The retained handle for the second stream.</returns>
+        public SecondStream StartSecondStream(string workerId, WorkerMessage firstMessage)
+        {
+            var reader = new ChannelStreamReader();
+            var writer = new SignallingStreamWriter();
+            var task = Service.WorkStream(reader, writer, MockContext());
+
+            reader.Push(firstMessage);
+
+            var handle = new SecondStream(reader, writer, task, workerId);
+            _extraStreams.Add(handle);
+            return handle;
+        }
+
+        /// <summary>
+        /// Starts a second stream whose first message is a Ready for <paramref name="workerId"/> and
+        /// AWAITS its normal termination, so a loser's clean completion is directly observable.
+        /// </summary>
+        /// <param name="workerId">The worker id the second stream's Ready names.</param>
+        /// <returns>The retained handle, already finished.</returns>
+        public async Task<SecondStream> StartSecondStreamAndAwaitTerminationAsync(string workerId)
+        {
+            var second = StartSecondStream(workerId, new WorkerMessage
+            {
+                WorkerId = workerId,
+                Ready = new WorkerReady(),
+            });
+
+            second.Completion = await AwaitCleanCompletionAsync(second);
+            return second;
+        }
+
+        /// <summary>
+        /// Awaits a second stream's termination and records how it ended, so a vector that supplied
+        /// its own first message can still assert a CLEAN return.
+        /// </summary>
+        /// <param name="second">The second-stream handle to join.</param>
+        /// <returns>The classified completion, also stored on the handle.</returns>
+        public async Task<StreamCompletion> AwaitSecondStreamTerminationAsync(SecondStream second)
+        {
+            var completion = await AwaitCleanCompletionAsync(second);
+            second.Completion = completion;
+            return completion;
+        }
+
+        /// <summary>
+        /// AWAITS A LOSING STREAM'S NORMAL COMPLETION and classifies how it ended, so "returned
+        /// normally" is asserted rather than assumed.
+        /// </summary>
+        /// <param name="second">The second-stream handle to join.</param>
+        /// <returns>The observed completion.</returns>
+        private static async Task<StreamCompletion> AwaitCleanCompletionAsync(SecondStream second)
+        {
+            try
+            {
+                await second.Producer.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                return new StreamCompletion(Faulted: false, Fault: null);
+            }
+            catch (TimeoutException ex)
+            {
+                return new StreamCompletion(
+                    Faulted: true,
+                    Fault: new TimeoutException(
+                        $"the second WorkStream for '{second.WorkerId}' did not terminate within " +
+                        $"{BoundedWait.TotalSeconds:F0}s — it neither completed nor faulted cleanly.",
+                        ex));
+            }
+            catch (Exception ex)
+            {
+                // A clean loser must RETURN, never fault, so ANY exception is a failure — an
+                // RpcException with a transport status especially so.
+                return new StreamCompletion(Faulted: true, Fault: ex);
+            }
+        }
+
+        /// <summary>
+        /// Asserts the second stream REALLY was rejected: it terminated normally, emitted the
+        /// guarded already-attached warning for its worker id, and never became the channel's
+        /// consumer.
+        /// </summary>
+        /// <param name="second">The second-stream handle.</param>
+        public void AssertSecondStreamWasRejectedNormally(SecondStream second)
+        {
+            Assert.NotNull(second.Completion);
+            Assert.False(
+                second.Completion!.Faulted,
+                $"a losing WorkStream must return normally, not fault: {second.Completion.Fault}");
+
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.WorkStreamAlreadyAttached,
+                         StringComparison.Ordinal)
+                     && m.Contains(second.WorkerId, StringComparison.Ordinal));
+        }
+
+        /// <summary>The second stream's own writer never received a forwarded message.</summary>
+        /// <param name="second">The second-stream handle.</param>
+        public static void AssertSecondStreamForwardedNothing(SecondStream second) =>
+            Assert.Empty(second.Writer.Messages);
+
         /// <summary>
         /// THE SHARED STRICT TEARDOWN: ends the request stream and joins the RETAINED producer with
         /// a finite bound. It NEVER throws — the outcome is RETURNED so a primary assertion failure
@@ -2691,8 +3349,62 @@ public sealed class CompletionTransportOwnershipTests
                 // Best-effort — a leftover fixture must never fail a test.
             }
 
+            // EVERY ADDITIONAL STREAM IS JOINED TOO — no vector may leak a second producer.
+            foreach (var extra in _extraStreams)
+            {
+                extra.Reader.Complete();
+
+                if (!extra.Producer.IsCompleted)
+                {
+                    try
+                    {
+                        await extra.Producer.WaitAsync(BoundedWait, CancellationToken.None);
+                    }
+                    catch (TimeoutException ex)
+                    {
+                        failure ??= new TimeoutException(
+                            $"TEARDOWN LEAK: the second WorkStream for '{extra.WorkerId}' did not " +
+                            $"terminate within {BoundedWait.TotalSeconds:F0}s — a live producer remains.",
+                            ex);
+                    }
+                    catch (Exception ex) when (!extra.Producer.IsCompleted)
+                    {
+                        failure ??= new InvalidOperationException(
+                            $"TEARDOWN LEAK: the second WorkStream for '{extra.WorkerId}' is still " +
+                            "running after its join failed — a live producer remains.",
+                            ex);
+                    }
+                }
+            }
+
             return failure;
         }
+
+        /// <summary>
+        /// ONE ADDITIONAL STREAM over a worker id: its own request reader, its own response writer
+        /// and its retained producer, plus the classified completion a vector observed.
+        /// </summary>
+        public sealed record SecondStream(
+            ChannelStreamReader Reader,
+            SignallingStreamWriter Writer,
+            Task Producer,
+            string WorkerId)
+        {
+            /// <summary>
+            /// How the stream terminated once <see cref="Harness.AwaitCleanCompletionAsync"/> joined
+            /// it, or <c>null</c> when the vector never awaited it.
+            /// </summary>
+            public StreamCompletion? Completion { get; set; }
+        }
+
+        /// <summary>
+        /// HOW A SECOND STREAM ENDED. <see cref="Faulted"/> is the whole point: a losing stream must
+        /// RETURN normally (a clean RPC completion), never fault with an
+        /// <see cref="RpcException"/>.
+        /// </summary>
+        /// <param name="Faulted">Whether the stream ended by throwing rather than returning.</param>
+        /// <param name="Fault">The observed failure, when <paramref name="Faulted"/> is <c>true</c>.</param>
+        public sealed record StreamCompletion(bool Faulted, Exception? Fault);
     }
 
     /// <summary>
@@ -3076,6 +3788,8 @@ public sealed class CompletionTransportOwnershipTests
     {
         private readonly List<OrchestratorMessage> _messages = [];
         private readonly Queue<TaskCompletionSource<TaskAssignment>> _assignmentWaiters = new();
+        private readonly List<(Func<OrchestratorMessage, bool> Predicate, TaskCompletionSource<OrchestratorMessage> Signal)>
+            _messageWaiters = [];
 
         public WriteOptions? WriteOptions { get; set; }
 
@@ -3087,6 +3801,21 @@ public sealed class CompletionTransportOwnershipTests
                 lock (_messages)
                     return [.. _messages];
             }
+        }
+
+        /// <summary>
+        /// A FRESH signal completed by the NEXT forwarded message satisfying
+        /// <paramref name="predicate"/>. Allocated BEFORE the message is produced, so a publication
+        /// can never be missed.
+        /// </summary>
+        /// <param name="predicate">Selects the forwarded message the caller is waiting for.</param>
+        public Task<OrchestratorMessage> WaitForMessage(Func<OrchestratorMessage, bool> predicate)
+        {
+            var signal = new TaskCompletionSource<OrchestratorMessage>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_messages)
+                _messageWaiters.Add((predicate, signal));
+            return signal.Task;
         }
 
         /// <summary>
@@ -3105,15 +3834,30 @@ public sealed class CompletionTransportOwnershipTests
         private Task RecordAsync(OrchestratorMessage message)
         {
             TaskCompletionSource<TaskAssignment>? waiter = null;
+            List<TaskCompletionSource<OrchestratorMessage>> matched = [];
+
             lock (_messages)
             {
                 _messages.Add(message);
 
                 if (message.Assignment is not null && _assignmentWaiters.Count > 0)
                     waiter = _assignmentWaiters.Dequeue();
+
+                for (var i = _messageWaiters.Count - 1; i >= 0; i--)
+                {
+                    if (!_messageWaiters[i].Predicate(message))
+                        continue;
+
+                    matched.Add(_messageWaiters[i].Signal);
+                    _messageWaiters.RemoveAt(i);
+                }
             }
 
             waiter?.TrySetResult(message.Assignment!);
+
+            foreach (var signal in matched)
+                signal.TrySetResult(message);
+
             return Task.CompletedTask;
         }
 

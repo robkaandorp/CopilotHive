@@ -71,16 +71,43 @@ public sealed class WorkerPool : IWorkerPool
     /// Registers a new worker with the pool and returns the created <see cref="ConnectedWorker"/>.
     /// Throws if a worker with the same ID is already registered.
     /// </summary>
+    /// <remarks>
+    /// THE EXISTING TWO-ARGUMENT ENTRY POINT, PRESERVED: callers that cannot express a negotiation
+    /// request register a worker that asked for nothing.
+    /// </remarks>
     /// <param name="id">Unique identifier for the worker.</param>
     /// <param name="capabilities">Capabilities advertised by the worker.</param>
     /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
-    public ConnectedWorker RegisterWorker(string id, string[] capabilities)
+    public ConnectedWorker RegisterWorker(string id, string[] capabilities) =>
+        RegisterWorker(id, capabilities, requestCompletionReceiptAck: false);
+
+    /// <summary>
+    /// Registers a new worker carrying the requested completion-receipt negotiation fact, and
+    /// returns the created <see cref="ConnectedWorker"/>. Throws if a worker with the same ID is
+    /// already registered.
+    /// </summary>
+    /// <remarks>
+    /// THE FLAG IS PUBLISHED WITH THE INSTANCE, never written afterwards: the
+    /// <see cref="ConnectedWorker"/> is fully constructed — requested flag included — BEFORE
+    /// <c>TryAdd</c> makes it visible to any other thread, so a registered worker is never
+    /// observable with an undecided request.
+    /// </remarks>
+    /// <param name="id">Unique identifier for the worker.</param>
+    /// <param name="capabilities">Capabilities advertised by the worker.</param>
+    /// <param name="requestCompletionReceiptAck">
+    /// Whether the worker requested durable completion-receipt acknowledgement. A request, never an
+    /// enablement.
+    /// </param>
+    /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
+    internal ConnectedWorker RegisterWorker(
+        string id, string[] capabilities, bool requestCompletionReceiptAck)
     {
         var worker = new ConnectedWorker
         {
             Id = id,
             Role = WorkerRole.Unspecified,
             Capabilities = capabilities,
+            RequestCompletionReceiptAck = requestCompletionReceiptAck,
         };
 
         if (!_workers.TryAdd(id, worker))

@@ -105,12 +105,29 @@ public sealed class HiveOrchestratorService(
         /// <summary>The checked idle was refused at the mutation point.</summary>
         public const string ReadyCheckedIdleRefused =
             "the worker's ownership changed or is inconsistent; the checked idle was refused";
+
+        /// <summary>
+        /// A SECOND stream tried to attach to an instance an earlier stream already claimed. The
+        /// loser returns normally: the winner owns the instance, its state and its channel.
+        /// </summary>
+        public const string WorkStreamAlreadyAttached =
+            "the worker instance is already attached to an existing WorkStream";
     }
 
 
     /// <summary>
     /// Registers a worker with the orchestrator and assigns it an ID.
     /// </summary>
+    /// <remarks>
+    /// THE COMPLETION-RECEIPT NEGOTIATION IS RECORD-ONLY IN THIS STAGE. The worker's request is
+    /// recorded as an immutable per-registration fact (see
+    /// <see cref="ConnectedWorker.RequestCompletionReceiptAck"/>), and EVERY reply — accepted,
+    /// rejected, requested or not — reports <c>completion_receipt_ack_enabled = false</c>. A request
+    /// is NOT enablement: no orchestrator path emits a
+    /// <see cref="CompletionReceiptAck"/> yet, so advertising <c>true</c> would promise durable
+    /// retention this build cannot deliver. Support is never inferred from the worker's
+    /// capabilities, model or version.
+    /// </remarks>
     /// <param name="request">Registration request containing the worker's role and capabilities.</param>
     /// <param name="context">Server call context.</param>
     /// <returns>A <see cref="RegisterResponse"/> indicating whether registration was accepted.</returns>
@@ -122,7 +139,8 @@ public sealed class HiveOrchestratorService(
 
         try
         {
-            workerPool.RegisterWorker(workerId, [.. request.Capabilities]);
+            workerPool.RegisterWorker(
+                workerId, [.. request.Capabilities], request.RequestCompletionReceiptAck);
             logger.LogInformation("Worker registered: {WorkerId}", workerId);
 
             lock (_heartbeatLock)
@@ -137,6 +155,7 @@ public sealed class HiveOrchestratorService(
                 Accepted = true,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
+                CompletionReceiptAckEnabled = false,
             });
         }
         catch (InvalidOperationException)
@@ -147,6 +166,7 @@ public sealed class HiveOrchestratorService(
                 Accepted = false,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
+                CompletionReceiptAckEnabled = false,
             });
         }
     }
@@ -155,6 +175,22 @@ public sealed class HiveOrchestratorService(
     /// Opens a bidirectional streaming RPC through which the orchestrator sends task assignments
     /// and the worker reports progress and completion.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ONE STREAM PER REGISTERED INSTANCE. The first known-worker message must claim
+    /// <see cref="ConnectedWorker.TryAttachWorkStream"/> BEFORE the pinned worker/pump reference is
+    /// published or that message is processed. A stream that LOSES the claim logs a guarded warning,
+    /// quiesces ONLY its own unbound channel pump and RETURNS NORMALLY — a clean RPC completion, not
+    /// an <see cref="RpcException"/>. The loser consumes no channel message, handles nothing,
+    /// removes nothing, clears no heartbeat state and never notifies disconnection for the winner.
+    /// </para>
+    /// <para>
+    /// CLEANUP OWNERSHIP IS EARNED, NOT ASSUMED: the pinned reference is assigned only AFTER a
+    /// successful claim, so a losing stream can never enter the teardown that removes the winner's
+    /// instance. The winner keeps the existing current-instance/ABA checks and instance-aware
+    /// removal.
+    /// </para>
+    /// </remarks>
     /// <param name="requestStream">Stream of messages from the worker.</param>
     /// <param name="responseStream">Stream used to send messages to the worker.</param>
     /// <param name="context">Server call context.</param>
@@ -166,6 +202,8 @@ public sealed class HiveOrchestratorService(
         // The exact ConnectedWorker instance this stream is pinned to. All handlers operate on
         // this instance, and removal in the finally block is instance-aware, so a replacement
         // worker that re-registers under the same ID (ABA) is never evicted by this stream.
+        // It is assigned ONLY once this stream has successfully CLAIMED the instance, so a losing
+        // stream never treats the winner's worker as its own.
         ConnectedWorker? pinnedWorker = null;
 
         try
@@ -201,14 +239,29 @@ public sealed class HiveOrchestratorService(
                 if (pinnedWorker is null)
                 {
                     // First message: pin the exact instance registered for this worker ID.
-                    pinnedWorker = workerPool.GetWorker(message.WorkerId);
-                    if (pinnedWorker is null)
+                    var candidate = workerPool.GetWorker(message.WorkerId);
+                    if (candidate is null)
                     {
                         logger.LogWarning("WorkStream message from unknown worker: {WorkerId}", message.WorkerId);
                         break;
                     }
 
-                    workerRef = pinnedWorker;
+                    // THE EXCLUSIVE ATTACHMENT CLAIM, taken BEFORE the pinned reference and the pump
+                    // binding below are published and before this message is processed.
+                    if (!candidate.TryAttachWorkStream())
+                    {
+                        // A second stream for the SAME instance. This stream RETURNS NORMALLY: the
+                        // winner owns the instance, its state and its channel, so nothing here may be
+                        // handled, removed, cleaned or notified. Only this stream's own unbound pump
+                        // is quiesced.
+                        LogWorkStreamAlreadyAttached(candidate.Id);
+                        await QuiesceUnboundChannelPumpAsync(cts, channelTask);
+                        return;
+                    }
+
+                    // CLEANUP OWNERSHIP IS ESTABLISHED ONLY HERE, after a successful claim.
+                    pinnedWorker = candidate;
+                    workerRef = candidate;
                 }
                 else
                 {
@@ -718,6 +771,60 @@ public sealed class HiveOrchestratorService(
         catch (Exception messageException)
         {
             return $"<message getter threw: {messageException.GetType().Name}>";
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED ALREADY-ATTACHED DIAGNOSTIC: a second WorkStream lost the exclusive attachment
+    /// claim for an instance another stream already owns, so this stream is ending normally without
+    /// touching the instance, its assignments, its channel or the winner's stream.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED like every other refusal diagnostic: the whole log call sits inside its own no-throw
+    /// guard, so a throwing logger can never turn a clean rejection into an escaping exception that
+    /// would fault the losing RPC.
+    /// </remarks>
+    /// <param name="workerId">Identifier of the instance that is already attached.</param>
+    private void LogWorkStreamAlreadyAttached(string workerId)
+    {
+        try
+        {
+            logger.LogWarning(
+                "WorkStream for worker {WorkerId} rejected: {Reason}; this stream ends normally and " +
+                "nothing was handled, removed or notified",
+                workerId,
+                OwnershipRefusalReasons.WorkStreamAlreadyAttached);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// QUIESCES A LOSING STREAM'S OWN UNBOUND CHANNEL PUMP: cancels the stream's own token and joins
+    /// exactly its own pump task, which never bound a worker and therefore cannot consume the
+    /// winner's channel messages.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS NOT A TEARDOWN REDESIGN. It touches nothing but this stream's own task: no worker
+    /// removal, no heartbeat state, no dashboard notification and no cancellation of the winner's
+    /// stream. The join is unbounded-safe because cancellation is requested before awaiting, and the
+    /// pump's only blocking waits are cancellation-aware channel reads and delays.
+    /// </remarks>
+    /// <param name="cts">This stream's own linked cancellation source.</param>
+    /// <param name="channelTask">This stream's own pump task — the only task joined.</param>
+    private static async Task QuiesceUnboundChannelPumpAsync(
+        CancellationTokenSource cts, Task channelTask)
+    {
+        await cts.CancelAsync();
+        try
+        {
+            await channelTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: the pump unblocks by cancellation.
         }
     }
 

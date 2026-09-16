@@ -55,12 +55,25 @@ message RegisterRequest {
   string worker_id = 1;       // Unique worker identifier
   reserved 2;                 // Removed: fixed WorkerRole (all workers are now generic)
   repeated string capabilities = 3;  // e.g., ["dotnet", "python", "nodejs"]
+
+  // ADDITIVE PROTOCOL NEGOTIATION — deliberately NOT a language/runtime capability, and never
+  // inferred from `capabilities`, the model or the orchestrator version. The worker asks the
+  // orchestrator to retain durable completion receipts for its tasks. The eventual ACK that
+  // answers this means ONLY that the exact task's completion evidence was durably retained: it
+  // is NOT processing, NOT phase advancement, NOT transport release and NOT recovery.
+  // Absent/false = "this worker requests nothing"; an old orchestrator ignores the field.
+  bool request_completion_receipt_ack = 4;
 }
 
 message RegisterResponse {
   bool accepted = 1;
   string orchestrator_version = 2;
   string assigned_worker_id = 3;  // Server may reassign ID
+
+  // The orchestrator's answer to RegisterRequest.request_completion_receipt_ack. A request is
+  // never enablement: default/false is the only value an orchestrator without the live ACK may
+  // send, and an old orchestrator sends no field at all — which parses as false.
+  bool completion_receipt_ack_enabled = 4;
 }
 
 // === Worker Roles (used only in TaskAssignment for per-task role) ===
@@ -94,7 +107,28 @@ message OrchestratorMessage {
     CancelTask cancel = 3;
     UpdateAgents update_agents = 4;
     ToolCallResponse tool_response = 5;
+    CompletionReceiptAck completion_receipt_ack = 6;
   }
+}
+
+// === Completion Receipt Acknowledgement ===
+
+// The orchestration->worker acknowledgement of a durably retained completion receipt.
+//
+// WHAT IT WILL MEAN (when it is eventually emitted): the orchestrator durably RETAINED the exact
+// completion evidence of the task named by `task_id`. It does NOT mean the completion was
+// processed, that a phase advanced, that transport ownership was released, or that anything was
+// recovered or replayed.
+//
+// IT IS DEFINED HERE AND DELIBERATELY NEVER EMITTED YET: no orchestrator path publishes it in this
+// stage, and nothing may advertise CompletionReceiptAck support while that remains true.
+message CompletionReceiptAck {
+  // The opaque task identity the acknowledgement is about. It is an opaque ordinal string that
+  // must be echoed VERBATIM and NEVER parsed, split, normalized or interpreted.
+  string task_id = 1;
+
+  // The worker identity the acknowledgement is addressed to, echoed verbatim and never parsed.
+  string worker_id = 2;
 }
 
 // === Task Assignment ===

@@ -1860,4 +1860,161 @@ public sealed class WorkerPoolTests
     }
 
     #endregion
+
+    // ── Completion-receipt negotiation fact ──────────────────────────────────
+
+    #region RegisterWorker — requested completion-receipt ACK
+
+    /// <summary>
+    /// THE EXISTING TWO-ARGUMENT CALLERS DEFAULT TO NO REQUEST. Every caller that cannot express a
+    /// negotiation request registers a worker that asked for nothing.
+    /// </summary>
+    [Fact]
+    public void RegisterWorker_TwoArgumentCaller_DefaultsRequestedAckToFalse()
+    {
+        var pool = CreatePool();
+
+        var worker = pool.RegisterWorker("w-no-request", []);
+
+        Assert.False(worker.RequestCompletionReceiptAck);
+        Assert.False(pool.GetWorker("w-no-request")!.RequestCompletionReceiptAck);
+    }
+
+    /// <summary>
+    /// THE REQUESTED FACT IS RETAINED PER REGISTRATION, and it is decided BEFORE the instance is
+    /// published: the returned worker — the very instance the pool holds — already carries the
+    /// correct value, so no observer can ever see an undecided request.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void RegisterWorker_ExplicitRequest_IsRetainedOnThePublishedInstance(bool requested)
+    {
+        var pool = CreatePool();
+
+        var worker = pool.RegisterWorker("w-explicit", [], requested);
+
+        Assert.Equal(requested, worker.RequestCompletionReceiptAck);
+        Assert.Same(worker, pool.GetWorker("w-explicit"));
+        Assert.Equal(requested, pool.GetWorker("w-explicit")!.RequestCompletionReceiptAck);
+    }
+
+    /// <summary>
+    /// A DUPLICATE registration is still rejected AND leaves the original instance — including the
+    /// fact it registered with — completely untouched. The second, conflicting request changes
+    /// nothing.
+    /// </summary>
+    [Fact]
+    public void RegisterWorker_Duplicate_IsRejectedAndDoesNotRebindTheRequestedFact()
+    {
+        var pool = CreatePool();
+        var original = pool.RegisterWorker("w-dup-request", [], requestCompletionReceiptAck: true);
+
+        Assert.Throws<InvalidOperationException>(
+            () => pool.RegisterWorker("w-dup-request", [], requestCompletionReceiptAck: false));
+
+        Assert.Same(original, pool.GetWorker("w-dup-request"));
+        Assert.True(original.RequestCompletionReceiptAck);
+        Assert.Equal(1, pool.ConnectedWorkerCount);
+    }
+
+    #endregion
+
+    // ── The exclusive per-instance WorkStream attachment claim ───────────────
+
+    #region RegisterWorker — exclusive WorkStream attachment claim
+
+    /// <summary>
+    /// EXACTLY ONE CALLER CAN EVER CLAIM AN INSTANCE, and the claim is visible afterwards.
+    /// </summary>
+    [Fact]
+    public void TryAttachWorkStream_FirstCallWinsAndEveryLaterCallLoses()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim", []);
+
+        Assert.False(worker.IsWorkStreamAttached);
+        Assert.True(worker.TryAttachWorkStream());
+        Assert.True(worker.IsWorkStreamAttached);
+
+        // EVERY later attempt loses — including one from the same thread.
+        Assert.False(worker.TryAttachWorkStream());
+        Assert.False(worker.TryAttachWorkStream());
+    }
+
+    /// <summary>
+    /// THE CLAIM IS ONE-WAY: removing the instance from the pool does not reset it, so the very
+    /// same object can never be re-attached. A re-registration under the same ID is a NEW instance
+    /// with its OWN fresh claim.
+    /// </summary>
+    [Fact]
+    public void TryAttachWorkStream_IsOneWayAndPerInstance()
+    {
+        var pool = CreatePool();
+        var first = pool.RegisterWorker("w-claim-oneway", []);
+        Assert.True(first.TryAttachWorkStream());
+
+        Assert.True(pool.RemoveWorker(first));
+        Assert.False(first.TryAttachWorkStream());
+        Assert.True(first.IsWorkStreamAttached);
+
+        var replacement = pool.RegisterWorker("w-claim-oneway", []);
+        Assert.NotSame(first, replacement);
+        Assert.False(replacement.IsWorkStreamAttached);
+        Assert.True(replacement.TryAttachWorkStream());
+    }
+
+    /// <summary>
+    /// THE CLAIM IS ATOMIC: under CONCURRENT attempts on the same instance exactly ONE wins. The
+    /// losing threads all observe <c>false</c>, and the winner count is exactly one.
+    /// </summary>
+    /// <remarks>
+    /// The contenders are released together by a barrier so the attempts genuinely overlap; the
+    /// assertion is on the OBSERVED winners, not on timing.
+    /// </remarks>
+    [Fact]
+    public async Task TryAttachWorkStream_ConcurrentAttempts_ExactlyOneWins()
+    {
+        const int contenders = 16;
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim-race", []);
+
+        using var gate = new Barrier(contenders);
+        var winners = 0;
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var attempts = Enumerable.Range(0, contenders).Select(_ => Task.Run(() =>
+        {
+            start.Task.GetAwaiter().GetResult();
+            gate.SignalAndWait();
+            if (worker.TryAttachWorkStream())
+                Interlocked.Increment(ref winners);
+        })).ToArray();
+
+        start.SetResult();
+        await Task.WhenAll(attempts);
+
+        Assert.Equal(1, winners);
+        Assert.True(worker.IsWorkStreamAttached);
+    }
+
+    /// <summary>
+    /// DISTINCT INSTANCES CLAIM INDEPENDENTLY: each worker owns its own claim, so N distinct
+    /// registrations all attach.
+    /// </summary>
+    [Fact]
+    public void TryAttachWorkStream_DistinctInstances_AllAttach()
+    {
+        var pool = CreatePool();
+        var workers = Enumerable.Range(0, 4)
+            .Select(i => pool.RegisterWorker($"w-claim-{i}", []))
+            .ToList();
+
+        foreach (var worker in workers)
+            Assert.True(worker.TryAttachWorkStream());
+
+        Assert.All(workers, w => Assert.True(w.IsWorkStreamAttached));
+    }
+
+    #endregion
 }
