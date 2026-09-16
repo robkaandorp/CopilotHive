@@ -143,6 +143,19 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         return value == DBNull.Value ? null : value as string;
     }
 
+    /// <summary>Reads the RAW persisted <c>work_slot_registry_json</c> blob — no EF, no tracker.</summary>
+    private string? ReadPersistedRegistryBlob(string goalId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $goalId";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "$goalId";
+        parameter.Value = goalId;
+        command.Parameters.Add(parameter);
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value as string;
+    }
+
     /// <summary>
     /// Forces the persisted <c>pipelines.active_task_id</c> to <paramref name="taskId"/> RAW,
     /// bypassing EF entirely — used to arrange a durable pointer owned by a DIFFERENT task so the
@@ -1015,6 +1028,145 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
         Assert.Null(manager.GetByTaskId(taskId));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // (7b) THE OWNERSHIP CHECKPOINT — the REAL dispatch route
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE REAL DISPATCH WRITES THE COMPLETE ADMISSION TUPLE BEFORE THE ENQUEUE. A genuine
+    /// <see cref="TaskDispatchService.DispatchToRole"/> call on an ELIGIBLE manager-created pipeline
+    /// observes — INSIDE the existing <see cref="TaskQueue.OnEnqueue"/> callback, i.e. at the
+    /// instant Enqueue was entered — the durable <c>task_mappings</c> row, the durable
+    /// <c>active_task_id</c> pointer AND the COMPLETE captured work-slot registry, all read RAW
+    /// through the keeper connection. That proves commit-before-enqueue on the production path
+    /// rather than a test-only store call.
+    /// </summary>
+    /// <remarks>
+    /// THE ORDERING PROOF lives in the callback: the callback runs synchronously inside
+    /// <c>TaskQueue.Enqueue</c>, so whatever it observes was already durable when Enqueue was
+    /// ENTERED. Moving the admission after the enqueue makes every callback observation null and
+    /// fails this test. No task ID is parsed and no counter is reconstructed: the decoded registry
+    /// is compared to what the production capture allocated.
+    /// </remarks>
+    [Fact]
+    public async Task Dispatch_EligibleAdmission_CommitsTheOwnershipTupleBeforeEnqueue()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        // The provenance fact the eligible route is selected on.
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        // Observations taken AT CALLBACK ENTRY.
+        string? taskIdAtEntry = null;
+        string? mappingGoalAtEntry = null;
+        string? pointerAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            mappingGoalAtEntry = ReadPersistedGoalId(t.TaskId);
+            pointerAtEntry = ReadPersistedActiveTaskId(GoalId);
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+        };
+
+        await service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken);
+
+        // THE TUPLE WAS ALREADY DURABLE WHEN Enqueue WAS ENTERED.
+        Assert.NotNull(taskIdAtEntry);
+        AssertSuffixedTaskId(taskIdAtEntry!, TaskIdPrefix(GoalId, WorkerRole.Coder));
+        Assert.Equal(GoalId, mappingGoalAtEntry);
+        Assert.Equal(taskIdAtEntry, pointerAtEntry);
+        Assert.NotNull(blobAtEntry);
+
+        // THE COMPLETE REGISTRY: the capture's own slot, in the Pending state the admission saw.
+        var decoded = WorkSlotRegistryCodec.Decode(blobAtEntry!);
+        var durable = Assert.Single(decoded.Slots);
+        Assert.Equal(taskIdAtEntry, durable.Slot.TaskId);
+        Assert.Equal(WorkSlotState.Pending, durable.State);
+        Assert.Equal(1, durable.Slot.Attempt);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), durable.Slot.Position);
+        var counter = Assert.Single(decoded.DispatchAttempts);
+        Assert.Equal(durable.Slot.Position, counter.Position);
+        Assert.Equal(durable.Slot.Attempt, counter.HighWaterAttempt);
+
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("WorkSlotIntegrity", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// THE ENQUEUE-FAILURE RESIDUE ON THE ELIGIBLE ROUTE, pinned EXPLICITLY: the ORIGINAL enqueue
+    /// exception leaves the dispatch, the mapping is removed and the matching DURABLE pointer is
+    /// cleared — but the admission's durable slot may REMAIN Pending while the in-memory registry
+    /// shows it Abandoned.
+    /// <para>
+    /// THAT IS NOT A REPLAYABLE ADMISSION AND NOT A DURABLE ROLLBACK SUCCESS. The blob is a
+    /// POINT-IN-TIME CHECKPOINT taken at the admission; the rollback's in-memory abandon is not
+    /// written back here, and nothing in this slice reconciles the two. The residue is asserted
+    /// HONESTLY (with a positive observation of the still-Pending durable slot) rather than hidden
+    /// behind an unconditional <c>PersistState</c> repair.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Dispatch_EligibleEnqueueFailure_ResiduePinned_DurableSlotStaysPendingWhileMemoryIsAbandoned()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var sentinel = new InvalidOperationException("enqueue-sentinel");
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var service = CreateService(manager, queue, logger);
+
+        string? taskIdAtEntry = null;
+        string? blobAtEntry = null;
+        queue.OnEnqueue = t =>
+        {
+            taskIdAtEntry = t.TaskId;
+            blobAtEntry = ReadPersistedRegistryBlob(GoalId);
+            throw sentinel;
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", TestContext.Current.CancellationToken));
+
+        // THE ORIGINAL enqueue exception left the dispatch.
+        Assert.Same(sentinel, thrown);
+
+        var taskId = SettledTaskId(pipeline);
+        Assert.Equal(taskId, taskIdAtEntry);
+
+        // THE POSITIVE OBSERVATION: the admission's checkpoint was durable with a Pending slot.
+        var atEntry = WorkSlotRegistryCodec.Decode(blobAtEntry!);
+        Assert.Contains(atEntry.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
+
+        // ── THE RESIDUE ──
+        // The mapping row is REMOVED…
+        Assert.Null(ReadPersistedGoalId(taskId));
+        // …and the matching DURABLE pointer is CLEARED.
+        Assert.Null(ReadPersistedActiveTaskId(GoalId));
+        // …while the DURABLE registry still shows the admission's slot Pending — the rollback's
+        // abandon is in MEMORY only.
+        var durable = WorkSlotRegistryCodec.Decode(ReadPersistedRegistryBlob(GoalId)!);
+        Assert.Contains(durable.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
+        // The IN-MEMORY registry disagrees — Abandoned, which the durable blob does not reflect.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(pipeline.ActiveTaskId);
+
+        // NOTHING claims this is recoverable: the durable Pending slot has NO mapping row, so no
+        // consumer could replay it, and no repair ran (the dispatch performs no PersistState).
+        Assert.Contains(logger.LogEntries, e =>
+            e.LogLevel == LogLevel.Warning &&
+            e.Message == AbandonedRegistrationMessage(GoalId, taskId, 1, GoalPhase.Coding, 1));
+        Assert.DoesNotContain(Warnings(logger), m => m.Contains("rollback-failure", StringComparison.Ordinal));
+    }
+
 
     // ═══════════════════════════════════════════════════════════════════════
     // (8b) E3 — the PERSISTED pointer rollback, at DISPATCH level

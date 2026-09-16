@@ -1169,14 +1169,21 @@ internal sealed class TaskMappingCommandCounter : DbCommandInterceptor
 }
 
 /// <summary>
-/// Slice E2a-ii-α — <see cref="GoalPipelineManager.PersistAdmission"/> (the complete API, UNUSED
-/// in production this slice) and the SINGLE-LOCK POLICY over the manager's mapping surface.
+/// Slice E2a-ii-α — <see cref="GoalPipelineManager.PersistAdmission"/> (the production dispatch's
+/// admission step) and the SINGLE-LOCK POLICY over the manager's mapping surface.
 /// </summary>
 /// <remarks>
 /// The API vectors cover every branch of the admission algorithm — the committed transaction, the
 /// two memory-conflict shapes (refused BEFORE any store call), the persisted conflict's pair-based
 /// rollback, the store failure's carried exception + rollback, the no-store claim, and the three
 /// pre-lock validations — each pinned by the EXACT log template a capturing logger observed.
+/// <para>
+/// SINCE THE OWNERSHIP CHECKPOINT, the committed vector ALSO exercises the ELIGIBLE route: a
+/// manager-created pipeline is eligible, so its admission persists the captured pointer and the
+/// COMPLETE work-slot registry inside the same transaction. That is why
+/// <see cref="CreateActivePipeline"/> installs a REAL Pending slot — a pointer-only fixture would
+/// now be refused by the store's own preflight rather than silently bypass the validation.
+/// </para>
 /// The two POLICY vectors prove mutual exclusion honestly: one blocks INSIDE the store call while
 /// <c>_mappingLock</c> is held (an external gate in an EF interceptor), the other blocks the
 /// private monitor directly via reflection. Neither asserts an unguaranteeable ordering between a
@@ -1277,10 +1284,18 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
     private static Goal CreateGoal(string id) =>
         new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
 
-    /// <summary>Creates a manager-owned pipeline whose active task pointer is already set.</summary>
+    /// <summary>
+    /// Creates a manager-owned pipeline whose active task pointer is already set AND whose registry
+    /// carries a REAL <see cref="WorkSlotState.Pending"/> slot for that task — the minimum the
+    /// eligible admission route's own preflight requires. A manager-created pipeline is ELIGIBLE
+    /// (it found no existing persisted row), so a pointer-only fixture would be refused by the
+    /// store's preflight before any statement; the slot is what makes the admission input valid
+    /// rather than a bypass of the validation.
+    /// </summary>
     private static GoalPipeline CreateActivePipeline(GoalPipelineManager manager, string goalId, string taskId)
     {
         var pipeline = manager.CreatePipeline(CreateGoal(goalId));
+        pipeline.AllocateAttemptAndRegisterSlot(taskId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
         pipeline.SetActiveTask(taskId);
         return pipeline;
     }
@@ -1570,6 +1585,142 @@ public sealed class WorkSlotAdmissionCommitTests : IDisposable
         Assert.Null(manager.GetByTaskId("task-active"));
         Assert.Same(witness, manager.GetByTaskId("task-witness"));
         Assert.Empty(counter.Commands);
+    }
+
+    /// <summary>
+    /// THE PIPELINE MONITOR IS RELEASED BEFORE THE STORE CALL. While an ELIGIBLE admission is parked
+    /// INSIDE the store's transaction (the gated mapping INSERT, with the manager's mapping lock
+    /// held), this thread obtains the pipeline's OWN <c>_lock</c> monitor with a bounded
+    /// <see cref="Monitor.TryEnter(object, TimeSpan)"/> and asserts it SUCCEEDED. If any
+    /// pipeline-monitor acquisition were held across the store call — i.e. the capture had not
+    /// released it — the attempt would time out and the test would fail.
+    /// </summary>
+    /// <remarks>
+    /// The monitor is released IMMEDIATELY (the very next statement), because the store's own
+    /// <c>ApplyToEntity</c> briefly re-acquires it for the machine-position capture: holding it for
+    /// the rest of the call would deadlock the admission rather than test it. The proof is the
+    /// acquisition at the parked instant, which is exactly the claim under test. Bounded waits keep
+    /// a never-released monitor a failure rather than a hang.
+    /// </remarks>
+    [Fact]
+    public async Task PersistAdmission_EligibleRoute_HoldsNoPipelineMonitorInsideTheStoreCall()
+    {
+        var gate = new GatedAdmissionInterceptor();
+        var manager = new GoalPipelineManager(CreateStore(gate), new TestLogger<GoalPipelineManager>());
+        var pipeline = CreateActivePipeline(manager, "goal-monitor-free", "task-monitor-free");
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+
+        var lockField = typeof(GoalPipeline).GetField(
+            "_lock", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(lockField);
+        var pipelineMonitor = lockField!.GetValue(pipeline);
+        Assert.NotNull(pipelineMonitor);
+
+        gate.Arm();
+        var admissionTask = Task.Factory.StartNew(
+            () => manager.PersistAdmission(pipeline, "task-monitor-free"),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        var monitorWasFree = false;
+        AdmissionCommitResult? admissionResult = null;
+        try
+        {
+            // The admission is INSIDE the store call with _mappingLock held.
+            await gate.Entered.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // THE PROOF: the pipeline's own monitor is obtainable while the store call is in flight.
+            monitorWasFree = Monitor.TryEnter(pipelineMonitor!, TimeSpan.FromSeconds(10));
+            if (monitorWasFree)
+                Monitor.Exit(pipelineMonitor!);
+        }
+        finally
+        {
+            gate.Release();
+        }
+
+        Assert.True(
+            monitorWasFree,
+            "the pipeline's monitor was NOT free while the store call was in flight — an acquisition is nested inside it");
+
+        admissionResult = await admissionTask.WaitAsync(
+            TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, gate.BlockCount);
+        Assert.NotNull(admissionResult);
+        Assert.Equal(AdmissionCommitStatus.Committed, admissionResult!.Status);
+        Assert.True(admissionResult.CommittedThisInvocation);
+        // The committed row carries the captured pair — the admission really did the checkpoint work
+        // without ever holding the pipeline monitor across it.
+        Assert.Equal("task-monitor-free", ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-monitor-free'"));
+        Assert.NotNull(ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-monitor-free'"));
+    }
+
+    /// <summary>
+    /// THE ELIGIBLE ROUTE'S MANAGER FAILURE CONTRACT: the store's own preflight refusal on an
+    /// ELIGIBLE pipeline surfaces as <see cref="AdmissionCommitStatus.PersistenceFailed"/> with the
+    /// ORIGINAL exception carried and the flags unchanged, and ONLY this invocation's claim is
+    /// removed — a PRE-EXISTING FOREIGN claim SURVIVES.
+    /// </summary>
+    /// <remarks>
+    /// THE WITNESS IS SEEDED BEFORE THE FAILURE, which is what makes the survival claim real: the
+    /// foreign pair (a DIFFERENT task id mapped to a DIFFERENT goal) already exists when the catch
+    /// path runs, so a catch that cleared the dictionary wholesale — or removed by key alone
+    /// instead of by PAIR — would destroy it and this vector would fail. A witness created AFTER
+    /// the cleanup would prove nothing.
+    /// <para>
+    /// THE ZERO-STATEMENT PROBE is armed after the seeding, so it observes only the failing
+    /// invocation: the new route's refusal precedes context acquisition entirely, so not a single
+    /// statement may reach the database.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_EligibleRouteRefusal_RemovesOnlyItsOwnClaim_ForeignWitnessSurvives()
+    {
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), new TestLogger<GoalPipelineManager>());
+
+        // ── (1) THE FOREIGN WITNESS, seeded BEFORE the failure: a DIFFERENT task id claimed by a
+        //        DIFFERENT goal, in memory AND durably.
+        var witness = manager.CreatePipeline(CreateGoal("goal-witness-claim"));
+        manager.RegisterTask("task-witness-claim", "goal-witness-claim");
+        SeedPersistedMapping("task-witness-claim", "goal-witness-claim");
+        Assert.Same(witness, manager.GetByTaskId("task-witness-claim"));
+        Assert.Equal("goal-witness-claim", ReadPersistedGoalId("task-witness-claim"));
+
+        // ELIGIBLE, pointer set, NO slot: the capture the store's preflight must refuse.
+        var pipeline = manager.CreatePipeline(CreateGoal("goal-own-claim"));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        pipeline.SetActiveTask("task-own-claim");
+
+        // ── (2) THE FAILURE. Only this invocation's statements can reach the counter now.
+        counter.Start();
+        var result = manager.PersistAdmission(pipeline, "task-own-claim");
+
+        // ── (3a) THE PRE-EXISTING WITNESS PAIR SURVIVES, with an IDENTICAL goal id — in memory…
+        Assert.Same(witness, manager.GetByTaskId("task-witness-claim"));
+        Assert.Equal("goal-witness-claim", manager.GetByTaskId("task-witness-claim")!.GoalId);
+        // …and durably (the row the catch must never touch).
+        Assert.Equal("goal-witness-claim", ReadPersistedGoalId("task-witness-claim"));
+
+        // ── (3b) THIS INVOCATION'S CLAIM WAS REMOVED.
+        Assert.Null(manager.GetByTaskId("task-own-claim"));
+
+        // ── (3c) NO DURABLE ROWS WERE WRITTEN — and no statement was issued at all.
+        Assert.Empty(counter.Commands);
+        Assert.Null(ReadPersistedGoalId("task-own-claim"));
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-own-claim'"));
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-own-claim'"));
+
+        // ── (3d) THE FLAGS AND THE ORIGINAL EXCEPTION are preserved.
+        Assert.Equal(AdmissionCommitStatus.PersistenceFailed, result.Status);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
+        var refusal = Assert.IsType<ArgumentException>(result.PersistenceException);
+        Assert.Contains("has no matching slot in the registry", refusal.Message, StringComparison.Ordinal);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

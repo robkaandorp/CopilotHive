@@ -54,7 +54,8 @@ internal record TaskUnregisterResult(bool MemoryRemoved, bool PersistenceRemoved
 /// </summary>
 internal enum AdmissionCommitStatus
 {
-    /// <summary>The in-memory claim is held AND the mapping+pointer rows were committed.</summary>
+    /// <summary>The in-memory claim is held AND the mapping+pointer rows were committed (and, on
+    /// the eligible route, the captured pointer and the complete work-slot registry with them).</summary>
     Committed,
 
     /// <summary>This manager already held an in-memory entry for the task; the store was never called.</summary>
@@ -81,9 +82,10 @@ internal enum AdmissionCommitStatus
 /// PersistConflict/PersistenceFailed (this call DID claim before the α rollback removed it).</param>
 /// <param name="CommittedThisInvocation">True ONLY on Committed: this call committed the DB rows
 /// (the task_mappings row AND the pipelines row's active_task_id pointer, one transaction via
-/// SaveAdmissionWithPointer). False on every other status — including NoStore (the in-memory
-/// claim alone; nothing persisted) and the conflict/failure statuses (the transaction refused,
-/// rolled back, or never ran).</param>
+/// SaveAdmissionWithPointer — plus, on the eligible route, the captured pointer and the complete
+/// work-slot registry in that same row write). False on every other status — including NoStore
+/// (the in-memory claim alone; nothing persisted) and the conflict/failure statuses (the
+/// transaction refused, rolled back, or never ran).</param>
 /// <param name="PersistenceException">The store's original exception — the exact exception caught
 /// from SaveAdmissionWithPointer (the EF DbUpdateException wrapper when the store's SQL failure
 /// surfaces through EF; the interceptor's sentinel is that wrapper's InnerException — the α's
@@ -529,14 +531,33 @@ public sealed class GoalPipelineManager
     /// <see cref="_taskToGoal"/> mutation runs under <see cref="_mappingLock"/>) and the DATABASE
     /// commit is ATOMIC — the <c>task_mappings</c> row and the pipelines row's <c>active_task_id</c>
     /// pointer land in ONE transaction (<c>SaveAdmissionWithPointer</c>) or neither does. The
-    /// persisted pointer is the IMMUTABLE SNAPSHOT validated at claim time (the taskId argument is
-    /// passed through as the store's <c>activeTaskIdOverride</c>), never a later live-pointer
-    /// re-read, so a concurrent pointer change can never be persisted by this commit.
+    /// persisted pointer is the IMMUTABLE SNAPSHOT validated at claim time, never a later
+    /// live-pointer re-read, so a concurrent pointer change can never be persisted by this commit.
+    /// On the LEGACY route the snapshot is the validated <paramref name="taskId"/> argument (passed
+    /// through as the store's <c>activeTaskIdOverride</c>).
+    /// </para>
+    /// <para>
+    /// THE ELIGIBLE ROUTE — the ownership checkpoint. For a pipeline whose
+    /// <see cref="GoalPipeline.OwnershipCheckpointEligible"/> provenance fact is set (a fresh
+    /// manager-created pipeline that found no existing persisted row), the admission ALSO persists
+    /// the COMPLETE captured work-slot registry: the detached capture is taken EXACTLY ONCE, while
+    /// <see cref="_mappingLock"/> is held and after the in-memory claim, and the captured pointer
+    /// (including a captured <c>null</c>) plus the encoded whole registry travel into the SAME
+    /// pipeline-row write as the mapping insert — one transaction, one outcome surface. The
+    /// pipeline monitor is RELEASED inside the capture, so the preflight, the single registry
+    /// encode, the EF work and the machine-position capture all run outside it; a live mutation
+    /// landing after the capture cannot change the committed pointer/registry pair and never
+    /// triggers a late live-pointer revalidation of it. The INELIGIBLE route (an existing-row
+    /// replacement or a restored pipeline) keeps the untouched legacy two-argument call, so its
+    /// row's opaque historical registry blob is never overwritten. The eligibility rule is decided
+    /// once, in <see cref="CreatePipeline"/>, and does not change here.
     /// </para>
     /// <para>
     /// NO-STORE BEHAVIOR: with no store configured the in-memory claim ALONE is the admission —
-    /// nothing is persisted and the result is <see cref="AdmissionCommitStatus.NoStore"/> with
-    /// <c>CommittedThisInvocation == false</c>.
+    /// nothing is persisted, no registry validation runs, the database is never touched, and the
+    /// result is <see cref="AdmissionCommitStatus.NoStore"/> with
+    /// <c>CommittedThisInvocation == false</c>. The same is true of the
+    /// <see cref="AdmissionCommitStatus.MemoryConflict"/> refusal.
     /// </para>
     /// <para>
     /// THERE IS NO SINGLE LINEARIZABLE MEMORY-PLUS-DATABASE EVENT: lock-free readers may observe the
@@ -615,11 +636,38 @@ public sealed class GoalPipelineManager
                     CommittedThisInvocation: false);
             }
 
-            // (4) THE E2a-i PRIMITIVE, consumed untouched.
+            // (4) THE ADMISSION PRIMITIVE, consumed untouched — on TWO routes that share ONE
+            //     transaction implementation and ONE outcome surface.
+            //
+            //     THE ELIGIBLE ROUTE (pipeline.OwnershipCheckpointEligible): a fresh
+            //     manager-created pipeline that found NO existing persisted row. The detached
+            //     ownership capture is taken EXACTLY ONCE here, while _mappingLock is held (this
+            //     whole block is inside the lock) and AFTER the in-memory claim and the no-store
+            //     return, so the ordering the flags describe is unchanged. The capture itself
+            //     acquires the pipeline's monitor and RELEASES it before returning, so the
+            //     validation, the single registry encode, the EF work and the machine-position
+            //     capture all run with NO pipeline monitor held — nothing nests a pipeline-monitor
+            //     acquisition inside the store call. The CARRIER is then frozen: a post-capture
+            //     live mutation of the pointer or the registry can neither change the committed
+            //     pair nor trigger a late live-pointer revalidation of it.
+            //
+            //     THE INELIGIBLE ROUTE (a snapshot-restored or existing-row replacement pipeline)
+            //     keeps the byte-identical legacy two-argument call: it writes NO checkpoint, so
+            //     the row's opaque historical registry blob is never overwritten. The eligibility
+            //     rule itself is unchanged and is decided once, in CreatePipeline.
+            //
+            //     THE FAILURE SEMANTICS ARE SHARED: a capture the store's own preflight refuses
+            //     (an invalid/missing/non-Pending active slot, a foreign goal, a pointer mismatch
+            //     or an encoding failure) writes nothing and surfaces here as a THROW, so it takes
+            //     the SAME catch below — this invocation's claim removed (pair-based, never
+            //     another attempt's), PersistenceFailed carried with the ORIGINAL exception and
+            //     the flags unchanged. No new status is introduced.
             AdmissionStoreResult storeResult;
             try
             {
-                storeResult = _store.SaveAdmissionWithPointer(pipeline, taskId);
+                storeResult = pipeline.OwnershipCheckpointEligible
+                    ? _store.SaveAdmissionWithPointer(pipeline, taskId, pipeline.CaptureAdmissionOwnership())
+                    : _store.SaveAdmissionWithPointer(pipeline, taskId);
             }
             catch (Exception ex)
             {

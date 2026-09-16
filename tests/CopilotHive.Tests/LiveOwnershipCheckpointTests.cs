@@ -1,5 +1,6 @@
 using System.Data.Common;
 using System.Reflection;
+using System.Reflection.Emit;
 
 using CopilotHive.Git;
 using CopilotHive.Goals;
@@ -900,7 +901,623 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
     }
 
     // ═════════════════════════════════════════════════════════════════════════════════════════
-    // (7) No store stays memory-only
+    // (7) THE ADMISSION — the eligible route writes mapping + pointer + the WHOLE registry
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ELIGIBLE ADMISSION COMMITS THE COMPLETE TUPLE: for a manager-created (ELIGIBLE) pipeline
+    /// the admission's OWN transaction lands the <c>task_mappings</c> row, the captured
+    /// <c>active_task_id</c> pointer AND the COMPLETE captured registry — read back through a FRESH
+    /// context and through RAW SQLite. No task ID is parsed and no counter is reconstructed
+    /// anywhere: the decoded registry is compared to the capture verbatim, historical slots in
+    /// every state and the counter-only/higher-than-slot entries included.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF. Reverting <c>PersistAdmission</c> to the two-argument store call leaves the
+    /// blob SQL NULL here and the pointer assertions fail; dropping the capture entirely fails the
+    /// registry comparison. The admission really takes the NEW route because the pipeline is
+    /// eligible and carries a genuine Pending active slot.
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_EligiblePipeline_WritesMappingCapturedPointerAndTheCompleteRegistry()
+    {
+        const string goalId = "live-admission-goal";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+
+        var (source, activeTaskId) = BuildRichPipeline(goalId + "-src");
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        pipeline.RestoreRegistry(source.CaptureRegistry());
+        pipeline.SetActiveTask(activeTaskId, "copilothive/" + goalId);
+
+        var captured = pipeline.CaptureAdmissionOwnership();
+        Assert.Equal(activeTaskId, captured.ActiveTaskId);
+        AssertSnapshotIsRich(captured.Registry);
+
+        var result = manager.PersistAdmission(pipeline, activeTaskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.True(result.CommittedThisInvocation);
+        Assert.Null(result.PersistenceException);
+
+        // ── RAW SQLITE: the exact mapping row, the exact pointer, the exact blob. ──
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", activeTaskId)));
+        Assert.Equal(activeTaskId, RawPointer(goalId));
+
+        // THE COMPLETE REGISTRY — every slot in every state and every counter entry.
+        var decoded = DecodeBlob(goalId);
+        Assert.Equal(SlotsOf(captured.Registry), SlotsOf(decoded));
+        Assert.Equal(CountersOf(captured.Registry), CountersOf(decoded));
+        AssertSnapshotIsRich(decoded);
+
+        // ── A FRESH CONTEXT: the same committed tuple, no tracker in the way. ──
+        var fresh = CreateStore().LoadPipeline(goalId);
+        Assert.NotNull(fresh);
+        Assert.Equal(activeTaskId, fresh!.ActiveTaskId);
+        Assert.Equal(WorkSlotRegistryCodec.Encode(captured.Registry), fresh.WorkSlotRegistryJson);
+    }
+
+    /// <summary>
+    /// THE ADMISSION'S CAPTURE IS FROZEN. An EF interceptor mutates the LIVE pointer AND the LIVE
+    /// registry at the admission's own pipeline-row lookup — strictly AFTER the capture and BEFORE
+    /// the captured pair is applied to the row — and the committed row is still the captured pair.
+    /// A late live-pointer read would commit the mutated pointer; a live registry read would commit
+    /// the mutated registry. Both assertions therefore fail under either mutant.
+    /// </summary>
+    /// <remarks>
+    /// The mutation fires at the FIRST <c>pipelines</c> statement while armed. The manager's capture
+    /// runs before the store is entered at all (the argument is evaluated first), so the only
+    /// statements before it are the mapping INSERT — which the interceptor ignores. The store's
+    /// transaction begins and the stage-2 row lookup is therefore the first armed statement,
+    /// provably after the capture.
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_LivePointerAndRegistryMutatedAfterCapture_WritesTheCapturedPair()
+    {
+        const string goalId = "live-admission-frozen-goal";
+        var mutation = new LivePipelineMutationInterceptor();
+        using var factory = new LiveCheckpointContextFactory(_connectionString, mutation);
+        var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+
+        var (source, activeTaskId) = BuildRichPipeline(goalId + "-src");
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        pipeline.RestoreRegistry(source.CaptureRegistry());
+        pipeline.SetActiveTask(activeTaskId, "copilothive/" + goalId);
+
+        // THE ORIGINAL CAPTURE — taken with no intervening mutation, so it is exactly what the
+        // manager's own (later) capture must produce.
+        var captured = pipeline.CaptureAdmissionOwnership();
+        Assert.Equal(activeTaskId, captured.ActiveTaskId);
+
+        // The mutation lands at the admission's own row lookup — after the capture, before apply.
+        mutation.Mutate = () =>
+        {
+            pipeline.SetActiveTask("late-live-admission-task");
+            pipeline.ClearRegistryForTest();
+            AllocateTo(pipeline, "late-live-admission-task", Pos(9, GoalPhase.DocWriting, 1), WorkSlotState.Pending);
+        };
+        mutation.Arm();
+
+        var result = manager.PersistAdmission(pipeline, activeTaskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        Assert.True(mutation.Fired, "the mutation interceptor must actually have fired");
+
+        // THE CAPTURED POINTER — never the late live pointer.
+        Assert.Equal(activeTaskId, RawPointer(goalId));
+
+        // THE CAPTURED REGISTRY — never the late live registry.
+        var decoded = DecodeBlob(goalId);
+        Assert.Equal(SlotsOf(captured.Registry), SlotsOf(decoded));
+        Assert.Equal(CountersOf(captured.Registry), CountersOf(decoded));
+        Assert.DoesNotContain(decoded.Slots, s => s.Slot.TaskId == "late-live-admission-task");
+
+        // The mapping row is the admitted task's, written by the same transaction.
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", activeTaskId)));
+    }
+
+    /// <summary>
+    /// THE ELIGIBLE ROUTE'S FAILURE SEMANTICS, on the store's own preflight: an eligible pipeline
+    /// whose captured active task has NO Pending slot is refused by the store BEFORE any context is
+    /// acquired, and the manager reports <see cref="AdmissionCommitStatus.PersistenceFailed"/>
+    /// carrying that ORIGINAL exception — with THIS invocation's claim removed (pair-based) and the
+    /// ownership flags exactly as the shared failure path always reports them. NOTHING was written.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_EligibleRoutePreflightRefusal_PersistenceFailedWithClaimRemovedAndNothingWritten()
+    {
+        const string goalId = "live-admission-preflight-goal";
+        const string taskId = "live-admission-preflight-task";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+
+        // ELIGIBLE, with a real pointer but NO registered slot — the capture the store's preflight
+        // must refuse. (A pointer-only fixture is exactly the shape the new route rejects.)
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        pipeline.SetActiveTask(taskId);
+
+        var result = manager.PersistAdmission(pipeline, taskId);
+
+        Assert.Equal(AdmissionCommitStatus.PersistenceFailed, result.Status);
+        // THE β FLAGS ARE UNCHANGED: this call DID claim, and nothing committed.
+        Assert.True(result.ClaimedThisInvocation);
+        Assert.False(result.CommittedThisInvocation);
+        // THE ORIGINAL exception, by identity and by shape: the store's own preflight refusal.
+        var refusal = Assert.IsType<ArgumentException>(result.PersistenceException);
+        Assert.Contains("has no matching slot in the registry", refusal.Message, StringComparison.Ordinal);
+
+        // THIS INVOCATION'S CLAIM — and only it — was removed.
+        Assert.Null(manager.GetByTaskId(taskId));
+
+        // NOTHING WAS WRITTEN: no mapping row, no registry blob, and the row's pointer is untouched.
+        Assert.Null(RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", taskId)));
+        Assert.Null(RawBlob(goalId));
+        Assert.Null(RawPointer(goalId));
+    }
+
+    /// <summary>
+    /// A LIVE MUTATION BETWEEN THE CAPTURE AND THE STORE CALL CANNOT FORCE A LATE REVALIDATION of
+    /// the captured pair: the capture is taken inside the manager with the mapping lock held and
+    /// handed over as a detached carrier, so clearing the live pointer afterwards leaves the
+    /// committed pointer exactly as captured.
+    /// </summary>
+    /// <remarks>
+    /// This vector uses the manager's own lock to arrange the mutation deterministically: the
+    /// mutation runs on a second thread and is ordered strictly after the admission returns, which
+    /// is the honest limit of the guarantee (a mutation AFTER the commit is not a revalidation
+    /// window at all — the pair is already durable).
+    /// </remarks>
+    [Fact]
+    public void PersistAdmission_CapturedPairIsNotRevalidated_AfterALatePointerClear()
+    {
+        const string goalId = "live-admission-no-revalidate";
+        const string taskId = "live-admission-no-revalidate-task";
+        var store = CreateStore();
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+
+        var pipeline = manager.CreatePipeline(NewGoal(goalId));
+        AllocateTo(pipeline, taskId, Pos(1, GoalPhase.Coding, 1), WorkSlotState.Pending);
+        pipeline.SetActiveTask(taskId);
+
+        var result = manager.PersistAdmission(pipeline, taskId);
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        Assert.Equal(taskId, RawPointer(goalId));
+
+        // A LATE live clear — the committed pointer must not be revalidated against it.
+        Assert.True(pipeline.ClearActiveTaskIfCurrent(taskId));
+        Assert.Equal(taskId, RawPointer(goalId));
+
+        // The committed registry still carries the admission's Pending slot.
+        var decoded = DecodeBlob(goalId);
+        Assert.Contains(decoded.Slots, s => s.Slot.TaskId == taskId && s.State == WorkSlotState.Pending);
+    }
+
+    /// <summary>
+    /// THE INELIGIBLE ROUTE PRESERVES THE COLUMN VERBATIM, for a RESTORED pipeline and for an
+    /// EXISTING-ROW replacement alike: the admission still writes its mapping row and the pointer,
+    /// but the row's registry blob — SQL NULL or an opaque/malformed payload — is left
+    /// byte-for-byte as it was, because the ineligible path writes NO checkpoint.
+    /// </summary>
+    [Theory]
+    [InlineData("restore-pipeline", "sql-null", null)]
+    [InlineData("restore-pipeline", "malformed", "{not json")]
+    [InlineData("restore-pipeline", "unsupported-version", "{\"version\":2,\"slots\":[],\"dispatchAttempts\":[]}")]
+    [InlineData("restore-from-store", "sql-null", null)]
+    [InlineData("restore-from-store", "malformed", "{not json")]
+    [InlineData("restore-from-store", "unsupported-version", "{\"version\":2,\"slots\":[],\"dispatchAttempts\":[]}")]
+    public void PersistAdmission_IneligibleRoute_PreservesTheBlobVerbatim(string route, string label, string? blob)
+    {
+        var goalId = $"live-admission-ineligible-{label}-{route}";
+        var taskId = $"live-admission-ineligible-task-{label}-{route}";
+        var store = CreateStore();
+
+        // A pre-existing row carrying the blob this vector is about.
+        var seed = NewPipeline(goalId);
+        seed.AdvanceTo(GoalPhase.Coding);
+        store.SavePipeline(seed);
+        SeedBlob(goalId, blob);
+        Assert.Equal(blob, RawBlob(goalId));
+
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var restored = route == "restore-pipeline"
+            ? manager.RestorePipeline(goalId)
+            : Assert.Single(manager.RestoreFromStore(), p => p.GoalId == goalId);
+        Assert.NotNull(restored);
+        Assert.False(restored!.OwnershipCheckpointEligible);
+
+        // A genuine Pending slot plus the pointer: the admission input is valid either way, so the
+        // blob preservation cannot be explained by a refusal.
+        AllocateTo(restored, taskId, Pos(1, GoalPhase.Testing, 1), WorkSlotState.Pending);
+        restored.SetActiveTask(taskId);
+
+        var result = manager.PersistAdmission(restored, taskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        // The admission DID its own work: the mapping row and the pointer landed.
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", taskId)));
+        Assert.Equal(taskId, RawPointer(goalId));
+        // …and the blob is byte-identical — SQL NULL stayed SQL NULL, opaque text untouched.
+        Assert.Equal(blob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE EXISTING-ROW REPLACEMENT, admitted: an INELIGIBLE replacement (a <c>CreatePipeline</c>
+    /// that FOUND a persisted row — a replacement or a goal-ID reuse) keeps that row's registry blob
+    /// VERBATIM through a real admission, while the admission's own mapping row and pointer land.
+    /// <para>
+    /// THE SAME FOUR BLOB VALUES the restore routes cover are covered here: SQL NULL (the
+    /// legacy-absence marker), OPAQUE text, MALFORMED JSON and an UNSUPPORTED VERSION envelope.
+    /// Every one is read back RAW through the keeper connection and compared byte-for-byte, so a
+    /// replacement route that started checkpointing — or that normalized/cleared the column —
+    /// fails on every row.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("sql-null", null)]
+    [InlineData("opaque", "historical-opaque-registry-blob")]
+    [InlineData("malformed", "{not json")]
+    [InlineData("unsupported-version", "{\"version\":2,\"slots\":[],\"dispatchAttempts\":[]}")]
+    public void PersistAdmission_ExistingRowReplacement_PreservesTheHistoricalBlob(string label, string? blob)
+    {
+        var goalId = $"live-admission-replacement-{label}";
+        var taskId = $"live-admission-replacement-task-{label}";
+        var store = CreateStore();
+
+        var seed = NewPipeline(goalId);
+        seed.AdvanceTo(GoalPhase.Coding);
+        store.SavePipeline(seed);
+        SeedBlob(goalId, blob);
+        Assert.Equal(blob, RawBlob(goalId));   // the seeded state is the byte-for-byte baseline
+
+        var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
+        var replacement = manager.CreatePipeline(NewGoal(goalId));
+        // THE PROVENANCE FACT: the creation FOUND a row, so this instance is ineligible.
+        Assert.False(replacement.OwnershipCheckpointEligible);
+
+        // A genuine Pending slot plus the pointer: the admission input is valid, so the blob
+        // preservation below cannot be explained away by a refusal.
+        AllocateTo(replacement, taskId, Pos(1, GoalPhase.Review, 1), WorkSlotState.Pending);
+        replacement.SetActiveTask(taskId);
+
+        var result = manager.PersistAdmission(replacement, taskId);
+
+        Assert.Equal(AdmissionCommitStatus.Committed, result.Status);
+        // The admission DID its own work: the mapping row and the pointer landed.
+        Assert.Equal(goalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", taskId)));
+        Assert.Equal(taskId, RawPointer(goalId));
+        // …and the blob is byte-identical — SQL NULL stayed SQL NULL, every opaque/malformed/
+        // unsupported payload untouched.
+        Assert.Equal(blob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// NO-STORE AND MEMORY-CONFLICT REQUIRE NO REGISTRY VALIDATION AND TOUCH NO DATABASE. An
+    /// eligible pipeline whose registry is INVALID (no Pending slot for the pointer) still returns
+    /// <see cref="AdmissionCommitStatus.NoStore"/> when no store is configured, and
+    /// <see cref="AdmissionCommitStatus.MemoryConflict"/> when the task is already mapped — neither
+    /// path reaches the store's preflight, so nothing throws and nothing is written.
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_NoStoreAndMemoryConflict_SkipRegistryValidationEntirely()
+    {
+        // (a) NO STORE — the claim alone is the admission; the invalid registry is never validated.
+        var noStoreManager = new GoalPipelineManager(store: null, NullLogger<GoalPipelineManager>.Instance);
+        var noStore = noStoreManager.CreatePipeline(NewGoal("live-admission-nostore-invalid"));
+        Assert.False(noStore.OwnershipCheckpointEligible);
+        noStore.SetActiveTask("live-admission-nostore-task");   // pointer with NO slot
+
+        var noStoreResult = noStoreManager.PersistAdmission(noStore, "live-admission-nostore-task");
+        Assert.Equal(AdmissionCommitStatus.NoStore, noStoreResult.Status);
+        Assert.True(noStoreResult.ClaimedThisInvocation);
+        Assert.False(noStoreResult.CommittedThisInvocation);
+        Assert.Null(noStoreResult.PersistenceException);
+
+        // (b) MEMORY CONFLICT — refused before the store call, with the SAME invalid registry.
+        var counter = new AdmissionCommandCounter();
+        var manager = new GoalPipelineManager(CreateStore(counter), NullLogger<GoalPipelineManager>.Instance);
+        var pipeline = manager.CreatePipeline(NewGoal("live-admission-mc-invalid"));
+        Assert.True(pipeline.OwnershipCheckpointEligible);
+        pipeline.SetActiveTask("live-admission-mc-task");   // pointer with NO slot
+        manager.RegisterTask("live-admission-mc-task", "live-admission-mc-invalid");
+        counter.Start();
+
+        var memoryConflict = manager.PersistAdmission(pipeline, "live-admission-mc-task");
+
+        Assert.Equal(AdmissionCommitStatus.MemoryConflict, memoryConflict.Status);
+        Assert.False(memoryConflict.ClaimedThisInvocation);
+        Assert.False(memoryConflict.CommittedThisInvocation);
+        Assert.Null(memoryConflict.PersistenceException);
+        // NO STATEMENT AT ALL — the refusal precedes the store call and any validation.
+        Assert.Empty(counter.Commands);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+    // (8) EXACTLY-ONCE: the single capture and the single encode, proved by INTERACTION
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // WHY TWO DIFFERENT MECHANISMS ARE USED HERE (the choice, stated explicitly):
+    //
+    //   • THE ENCODE uses mechanism (i), a RUNTIME COUNTING INSTRUMENT, because the encode really
+    //     does enumerate the caller's own collections: FreezeOwnershipCheckpoint hands
+    //     `ownership.Registry` straight to WorkSlotRegistryCodec.Encode, which walks Slots once and
+    //     DispatchAttempts once. Wrapping those two collections in counting enumerables therefore
+    //     yields an EXACT expected total (1 + 1) that a second encode would double. The
+    //     instrumented entry point is the ordinary checkpoint save, because that route passes the
+    //     caller's snapshot to the SAME FreezeOwnershipCheckpoint UNCOPIED — on the admission route
+    //     the preflight first copies the registry into fresh lists, so a wrapper handed to the
+    //     admission would be invisible to the encode and the probe would be vacuous.
+    //
+    //   • THE CAPTURE uses mechanism (ii), the repo's established EMITTED-CALL-SITE inspection,
+    //     because a second CaptureAdmissionOwnership is NOT observable by any wrapper: the capture
+    //     copies out of the pipeline's own private dictionaries, so no collection the test owns is
+    //     re-enumerated and no seam is re-entered. Counting the emitted call sites is the only
+    //     deterministic evidence available. The same structural backstop also pins the admission
+    //     route's SINGLE call to FreezeOwnershipCheckpoint, which — combined with the runtime
+    //     encode count above — is what makes "exactly one encode per eligible admission" provable.
+
+    /// <summary>A single decoded call instruction: its IL offset and resolved target.</summary>
+    private sealed record CallSite(int Offset, MethodBase Target);
+
+    /// <summary>Opcode lookup table built once from <see cref="OpCodes"/> reflection.</summary>
+    private static readonly Dictionary<short, OpCode> OpCodeByValue = BuildOpCodeTable();
+
+    private static Dictionary<short, OpCode> BuildOpCodeTable()
+    {
+        var table = new Dictionary<short, OpCode>();
+        foreach (var field in typeof(OpCodes).GetFields(BindingFlags.Public | BindingFlags.Static))
+        {
+            if (field.FieldType != typeof(OpCode))
+                continue;
+            var opCode = (OpCode)field.GetValue(null)!;
+            table[opCode.Value] = opCode;
+        }
+        return table;
+    }
+
+    /// <summary>
+    /// Walks a method's emitted IL instruction-by-instruction (using the real opcode table, so
+    /// operand bytes are never mistaken for opcodes) and returns every <c>call</c>/<c>callvirt</c>
+    /// site with its offset and resolved target — the established structural backstop this
+    /// codebase already uses for seam-free-interval proofs.
+    /// </summary>
+    private static List<CallSite> DecodeCallSites(MethodBase method)
+    {
+        var body = method.GetMethodBody()
+            ?? throw new Xunit.Sdk.XunitException($"'{method.Name}' has no method body.");
+        var il = body.GetILAsByteArray()
+            ?? throw new Xunit.Sdk.XunitException($"'{method.Name}' exposes no IL.");
+        var module = method.Module;
+        var genericTypeArgs = method.DeclaringType?.GetGenericArguments();
+        var genericMethodArgs = method.IsGenericMethodDefinition ? method.GetGenericArguments() : null;
+
+        var sites = new List<CallSite>();
+        var pos = 0;
+        while (pos < il.Length)
+        {
+            var start = pos;
+            short value;
+            if (il[pos] == 0xFE)
+            {
+                value = (short)(0xFE00 | il[pos + 1]);
+                pos += 2;
+            }
+            else
+            {
+                value = il[pos];
+                pos += 1;
+            }
+
+            if (!OpCodeByValue.TryGetValue(value, out var opCode))
+                throw new Xunit.Sdk.XunitException($"Unknown opcode 0x{value:X} at offset {start} in '{method.Name}'.");
+
+            var operandSize = OperandSize(opCode, il, pos);
+
+            if (opCode == OpCodes.Call || opCode == OpCodes.Callvirt)
+            {
+                var token = BitConverter.ToInt32(il, pos);
+                MethodBase? target = null;
+                try
+                {
+                    target = module.ResolveMethod(token, genericTypeArgs, genericMethodArgs);
+                }
+                catch (ArgumentException)
+                {
+                    // Not resolvable in this context; not a call this test asserts on.
+                }
+
+                if (target is not null)
+                    sites.Add(new CallSite(start, target));
+            }
+
+            pos += operandSize;
+        }
+
+        return sites;
+    }
+
+    private static int OperandSize(OpCode opCode, byte[] il, int operandStart) => opCode.OperandType switch
+    {
+        OperandType.InlineNone => 0,
+        OperandType.ShortInlineBrTarget or OperandType.ShortInlineI or OperandType.ShortInlineVar => 1,
+        OperandType.InlineVar => 2,
+        OperandType.InlineBrTarget or OperandType.InlineField or OperandType.InlineI
+            or OperandType.InlineMethod or OperandType.InlineSig or OperandType.InlineString
+            or OperandType.InlineTok or OperandType.InlineType or OperandType.ShortInlineR => 4,
+        OperandType.InlineI8 or OperandType.InlineR => 8,
+        OperandType.InlineSwitch => 4 + (4 * BitConverter.ToInt32(il, operandStart)),
+        _ => throw new Xunit.Sdk.XunitException($"Unhandled operand type {opCode.OperandType}."),
+    };
+
+    /// <summary>Counts the emitted call sites in <paramref name="caller"/> whose target is
+    /// <paramref name="declaringType"/>.<paramref name="name"/>.</summary>
+    private static int CountCallsTo(MethodBase caller, Type declaringType, string name) =>
+        DecodeCallSites(caller)
+            .Count(c => c.Target.DeclaringType == declaringType
+                && string.Equals(c.Target.Name, name, StringComparison.Ordinal));
+
+    private static MethodBase RequireMethod(Type type, string name, params Type[] parameterTypes)
+    {
+        var method = type.GetMethod(
+            name,
+            BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+            binder: null,
+            parameterTypes,
+            modifiers: null);
+        return method ?? throw new Xunit.Sdk.XunitException(
+            $"No method '{name}({string.Join(", ", parameterTypes.Select(t => t.Name))})' on {type.Name}.");
+    }
+
+    /// <summary>
+    /// THE EXACTLY-ONE-CAPTURE PROOF, asserted against the EMITTED BYTES of
+    /// <c>GoalPipelineManager.PersistAdmission</c> (deterministic — no timing anywhere): the
+    /// eligible admission route emits EXACTLY ONE call to
+    /// <see cref="GoalPipeline.CaptureAdmissionOwnership"/>.
+    /// <para>
+    /// A duplicated capture would take TWO detached snapshots at two different instants, so the
+    /// pointer and the registry the commit writes could drift apart from the pair the caller
+    /// believes was frozen. Payload comparison alone cannot see that; this count can.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PersistAdmission_EmitsExactlyOneOwnershipCapture()
+    {
+        var persistAdmission = RequireMethod(
+            typeof(GoalPipelineManager), "PersistAdmission", typeof(GoalPipeline), typeof(string));
+
+        var captures = CountCallsTo(persistAdmission, typeof(GoalPipeline), "CaptureAdmissionOwnership");
+
+        Assert.True(
+            captures == 1,
+            $"'PersistAdmission' emits {captures} call(s) to CaptureAdmissionOwnership — the eligible " +
+            "route must take EXACTLY ONE detached capture, so the committed pointer and registry " +
+            "come from one instant.");
+
+        // ANTI-VACUITY: the decoder really resolved this method's calls (it is not silently empty),
+        // and the route really does reach the ownership-aware store overload.
+        Assert.True(DecodeCallSites(persistAdmission).Count > 1, "the IL decoder resolved no call sites");
+        Assert.Equal(
+            2,
+            CountCallsTo(persistAdmission, typeof(PipelineStore), "SaveAdmissionWithPointer"));
+    }
+
+    /// <summary>
+    /// THE EXACTLY-ONE-ENCODE PROOF, part 1 (STRUCTURAL): the ownership-aware
+    /// <c>SaveAdmissionWithPointer</c> overload emits EXACTLY ONE call to the freeze helper and
+    /// EXACTLY ONE call to the reused preflight, and the freeze helper itself emits EXACTLY ONE
+    /// call to <see cref="WorkSlotRegistryCodec.Encode"/>.
+    /// </summary>
+    [Fact]
+    public void OwnershipAwareAdmissionRoute_EmitsExactlyOneFreezeAndOneEncode()
+    {
+        var route = RequireMethod(
+            typeof(PipelineStore), "SaveAdmissionWithPointer",
+            typeof(GoalPipeline), typeof(string), typeof(AdmissionOwnershipSnapshot));
+        var freeze = RequireMethod(
+            typeof(PipelineStore), "FreezeOwnershipCheckpoint",
+            typeof(GoalPipeline), typeof(AdmissionOwnershipSnapshot));
+
+        var freezeCalls = CountCallsTo(route, typeof(PipelineStore), "FreezeOwnershipCheckpoint");
+        Assert.True(
+            freezeCalls == 1,
+            $"the ownership-aware route emits {freezeCalls} call(s) to FreezeOwnershipCheckpoint — " +
+            "exactly one freeze (hence exactly one encode) is the contract.");
+
+        var preflightCalls = CountCallsTo(route, typeof(GoalPipeline), "PreflightAdmissionOwnership");
+        Assert.True(
+            preflightCalls == 1,
+            $"the ownership-aware route emits {preflightCalls} call(s) to PreflightAdmissionOwnership — " +
+            "the detached carrier is validated exactly once, by the reused validator.");
+
+        var encodeCalls = CountCallsTo(freeze, typeof(WorkSlotRegistryCodec), "Encode");
+        Assert.True(
+            encodeCalls == 1,
+            $"FreezeOwnershipCheckpoint emits {encodeCalls} call(s) to WorkSlotRegistryCodec.Encode — " +
+            "the registry is encoded exactly once, before any context exists.");
+    }
+
+    /// <summary>
+    /// THE EXACTLY-ONE-ENCODE PROOF, part 2 (RUNTIME): the registry the caller hands over is
+    /// ENUMERATED EXACTLY ONCE PER COLLECTION by the encode — the exact total the current
+    /// implementation produces (<c>Encode</c> walks <c>Slots</c> once and <c>DispatchAttempts</c>
+    /// once) — so a second encode inside <c>FreezeOwnershipCheckpoint</c> doubles the observed
+    /// counts and fails this vector.
+    /// </summary>
+    /// <remarks>
+    /// THE ENTRY POINT IS THE ORDINARY CHECKPOINT SAVE ON PURPOSE: it passes the caller's snapshot
+    /// to the SAME <c>FreezeOwnershipCheckpoint</c> WITHOUT copying it, so the counting wrappers
+    /// are the very collections the encode walks. (The admission route's preflight copies the
+    /// registry into fresh lists first, so a wrapper handed to the admission could not observe the
+    /// encode at all — the probe would be vacuous there.) The durable blob is decoded afterwards to
+    /// prove the single enumeration really produced the whole payload.
+    /// </remarks>
+    [Fact]
+    public void FreezeOwnershipCheckpoint_EnumeratesTheCapturedRegistryExactlyOncePerCollection()
+    {
+        const string goalId = "live-encode-once-goal";
+        var store = CreateStore();
+
+        var (source, activeTaskId) = BuildRichPipeline(goalId + "-src");
+        var captured = source.CaptureAdmissionOwnership();
+        AssertSnapshotIsRich(captured.Registry);
+
+        var slots = new CountingList<WorkSlotView>(captured.Registry.Slots);
+        var attempts = new CountingList<WorkSlotRegistryAttemptEntry>(captured.Registry.DispatchAttempts);
+        var instrumented = new AdmissionOwnershipSnapshot(
+            goalId, activeTaskId, new WorkSlotRegistrySnapshot(slots, attempts));
+
+        var pipeline = NewPipeline(goalId);
+        store.SavePipelineState(pipeline, instrumented);
+
+        // THE EXACT EXPECTED TOTAL, derived from the current implementation: ONE encode, which
+        // walks each collection ONCE. A duplicate encode makes these 2.
+        Assert.Equal(1, slots.EnumerationCount);
+        Assert.Equal(1, attempts.EnumerationCount);
+
+        // ANTI-VACUITY: the single enumeration really produced the COMPLETE durable payload.
+        var decoded = DecodeBlob(goalId);
+        Assert.Equal(SlotsOf(captured.Registry), SlotsOf(decoded));
+        Assert.Equal(CountersOf(captured.Registry), CountersOf(decoded));
+        Assert.Equal(activeTaskId, RawPointer(goalId));
+    }
+
+    /// <summary>
+    /// A read-only list that FORWARDS every element faithfully while COUNTING how many times it is
+    /// enumerated — the deterministic interaction instrument the encode-once proof needs.
+    /// </summary>
+    private sealed class CountingList<T> : IReadOnlyList<T>
+    {
+        private readonly IReadOnlyList<T> _inner;
+        private int _enumerationCount;
+
+        public CountingList(IReadOnlyList<T> inner) => _inner = inner;
+
+        /// <summary>How many times a caller began enumerating this collection.</summary>
+        public int EnumerationCount => Volatile.Read(ref _enumerationCount);
+
+        public T this[int index] => _inner[index];
+
+        public int Count => _inner.Count;
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            Interlocked.Increment(ref _enumerationCount);
+            return _inner.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+    // (9) No store stays memory-only
     // ═════════════════════════════════════════════════════════════════════════════════════════
 
     /// <summary>

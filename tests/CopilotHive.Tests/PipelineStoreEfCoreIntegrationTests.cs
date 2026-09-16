@@ -590,7 +590,7 @@ public sealed class PipelineStoreEfCoreIntegrationTests : IAsyncDisposable
 }
 
 /// <summary>
-/// Slice E2a-i — the store primitive <see cref="PipelineStore.SaveAdmissionWithPointer"/>: the
+/// Slice E2a-i — the store primitive <see cref="PipelineStore.SaveAdmissionWithPointer(GoalPipeline, string)"/>: the
 /// transaction machinery. THE ATOMIC COMMIT (mapping + pipeline in ONE transaction), the
 /// mapping-flush conflict (19+1555 → <see cref="AdmissionStoreResult.PersistConflict"/>, the
 /// pipeline row never staged), the STAGE GATE (19+1555 at the pipeline flush → the generic
@@ -666,6 +666,18 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
         using var command = _keeper.CreateCommand();
         command.CommandText = sql;
         return command.ExecuteScalar();
+    }
+
+    /// <summary>
+    /// The same raw keeper scalar read, with SQL NULL normalized from <see cref="DBNull"/> to a
+    /// genuine <c>null</c> — the shape a SQL NULL column's scalar read has to be asserted against.
+    /// </summary>
+    private object? ExecuteNullableScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        var value = command.ExecuteScalar();
+        return value is DBNull ? null : value;
     }
 
     private static Goal CreateGoal(string id = "goal-1") =>
@@ -1042,7 +1054,447 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
             "SELECT goal_id FROM task_mappings WHERE task_id = 'task-dispfail'"));
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // (9) The OWNERSHIP-AWARE route — the shared transaction, one row write
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ELIGIBLE NEW ROUTE, COMMITTED: ONE row write carries the mapping insert, the FROZEN
+    /// captured pointer and the COMPLETE encoded registry — read back through a FRESH context and
+    /// through RAW SQL on the keeper, with the ordinary scalars/machine position persisted as they
+    /// always were and NOT a second, independent registry write.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF. Drop the checkpoint from the stage-2 upsert and the pointer/blob assertions
+    /// fail; append a second independent registry write and the exactly-one-registry-write count
+    /// fails. No task ID is parsed and no counter is reconstructed anywhere here: the decoded
+    /// registry is compared to the CAPTURE verbatim, counter-only and higher-than-slot entries
+    /// included.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_CommitsMappingPointerAndTheCompleteRegistry()
+    {
+        const string goalId = "goal-ownsuccess";
+        const string taskId = "task-ownsuccess";
+        var candidate = RichCapture(goalId, taskId);
+        var encoded = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        var capture = new AdmissionOwnershipCommandCaptureInterceptor();
+
+        // A PRE-EXISTING row (so stage 2 is a real UPDATE) with a conversation entry that the
+        // admission must leave completely alone.
+        var subject = CreatePipeline(goalId, taskId);
+        subject.Conversation.Add(new ConversationEntry("user", "seeded conversation"));
+        CreateStore().SavePipeline(subject);
+
+        // The ordinary state the SAME row write must persist: a plan, a later phase, a later iteration.
+        subject.SetPlan(new IterationPlan { Phases = [GoalPhase.Planning, GoalPhase.Coding, GoalPhase.Testing] });
+        subject.AdvanceTo(GoalPhase.Coding);
+        subject.IterationBudget.TryConsume();
+
+        var context = CreateContext(capture);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate);
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+
+        // ── (1) RAW SQLITE: the exact mapping row, the exact pointer, the exact blob. ──
+        Assert.Equal(goalId, ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-ownsuccess'"));
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ownsuccess'"));
+        var durableBlob = Assert.IsType<string>(ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownsuccess'"));
+        Assert.Equal(encoded, durableBlob);
+
+        // THE COMPLETE REGISTRY, verbatim — every slot in every state (order preserved) and every
+        // counter entry, the counter-only one and the one standing ABOVE its slot's attempt included.
+        var decoded = WorkSlotRegistryCodec.Decode(durableBlob);
+        Assert.Equal(candidate.Registry.Slots, decoded.Slots);
+        Assert.Equal(candidate.Registry.DispatchAttempts, decoded.DispatchAttempts);
+        AssertSnapshotIsComplete(decoded);
+
+        // ── (2) A FRESH CONTEXT: the same committed tuple, no tracker in the way. ──
+        var fresh = CreateStore().LoadPipeline(goalId);
+        Assert.NotNull(fresh);
+        Assert.Equal(taskId, fresh!.ActiveTaskId);
+        Assert.Equal(encoded, fresh.WorkSlotRegistryJson);
+        Assert.Equal(GoalPhase.Coding, fresh.Phase);
+        Assert.Equal(2, fresh.Iteration);
+
+        // ── (3) THE ORDINARY FIELDS landed in that same write; the conversation did NOT. ──
+        Assert.Equal("Coding", ExecuteScalarOnKeeper(
+            "SELECT phase FROM pipelines WHERE goal_id = 'goal-ownsuccess'"));
+        Assert.Equal(2L, ExecuteScalarOnKeeper(
+            "SELECT iteration FROM pipelines WHERE goal_id = 'goal-ownsuccess'"));
+        Assert.Equal(1L, ExecuteScalarOnKeeper(
+            "SELECT COUNT(*) FROM conversation_entries WHERE goal_id = 'goal-ownsuccess'"));
+
+        // ── (4) ONE registry write, not two: exactly one write statement carries the column, and
+        //        the value it carries IS the frozen capture; exactly one mapping insert exists. ──
+        var registryWrite = Assert.Single(capture.Commands, command =>
+            IsWriteStatement(command.Sql)
+            && command.Sql.Contains("work_slot_registry_json", StringComparison.Ordinal));
+        Assert.StartsWith("UPDATE", registryWrite.Sql.TrimStart(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("pipelines", registryWrite.Sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(registryWrite.Parameters.Values, value => (value as string) == encoded);
+        Assert.Single(capture.Commands, command =>
+            IsWriteStatement(command.Sql)
+            && command.Sql.TrimStart().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
+            && command.Sql.Contains("task_mappings", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A MAPPING CONFLICT ON THE NEW ROUTE STAGES NO CHECKPOINT: the pre-seeded mapping row yields
+    /// <see cref="AdmissionStoreResult.PersistConflict"/> and the pipeline row is never even
+    /// LOOKED UP (zero tracked entries), let alone written — its pointer and its blob stay exactly
+    /// as they were, and both the mapping and the pipeline tracker entries are left detached.
+    /// </summary>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_MappingConflict_StagesNoCheckpoint()
+    {
+        const string goalId = "goal-ownconflict";
+        const string taskId = "task-ownconflict";
+        const string priorBlob = "prior-opaque-registry-blob";
+        ExecuteOnKeeper(
+            "INSERT INTO task_mappings (task_id, goal_id) VALUES ('task-ownconflict', 'goal-other')");
+        SeedPipelineRowWithBlob(goalId, priorBlob);
+
+        var context = CreateContext();
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        var subject = CreatePipeline(goalId, taskId);
+        var candidate = RichCapture(goalId, taskId);
+
+        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate);
+
+        Assert.Equal(AdmissionStoreResult.PersistConflict, result);
+
+        // The mapping row is the PRE-EXISTING one — untouched.
+        Assert.Equal("goal-other", ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-ownconflict'"));
+        Assert.Equal(1L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+
+        // NOTHING of the checkpoint reached the row — not the pointer, not the blob.
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ownconflict'"));
+        Assert.Equal(priorBlob, ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownconflict'"));
+        Assert.DoesNotContain(taskId, priorBlob, StringComparison.Ordinal);
+
+        // THE STAGING PROOF: the pipeline row was never staged — no tracked PipelineEntity exists at
+        // all (the stage-2 lookup never ran), and the mapping entry was detached.
+        Assert.Empty(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+        Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
+    }
+
+    /// <summary>
+    /// THE STAGE-2 FLUSH FAILURE ON THE NEW ROUTE: a genuine 19+1555 raised at the PIPELINE flush
+    /// (the stage has advanced) keeps its EXISTING stage classification — the ORIGINAL exception by
+    /// identity, NEVER a conflict result — and the guarded cleanup rolls ALL THREE values back: the
+    /// mapping row, the pointer and the registry blob.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: drop the stage gate and the 19+1555 at the pipeline flush is misreported as
+    /// <see cref="AdmissionStoreResult.PersistConflict"/> — the thrown-exception assertions fail.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_PipelineFlushFails_StageGateThrowsOriginalAndRollsBackAllThree()
+    {
+        const string goalId = "goal-ownflushfail";
+        const string taskId = "task-ownflushfail";
+        const string priorBlob = "flushfail-prior-blob";
+        SeedPipelineRowWithBlob(goalId, priorBlob);
+
+        var interceptor = new AdmissionTargetedThrowInterceptor(
+            AdmissionTargetedThrowInterceptor.Target.Pipelines, 19, 1555);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        var subject = CreatePipeline(goalId, taskId);
+        var candidate = RichCapture(goalId, taskId);
+
+        var ex = Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(subject, taskId, candidate));
+
+        // THE ORIGINAL exception, BY IDENTITY — never reclassified as a conflict.
+        var update = Assert.IsType<DbUpdateException>(ex);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Equal(19, interceptor.Sentinel.SqliteErrorCode);
+        Assert.Equal(1555, interceptor.Sentinel.SqliteExtendedErrorCode);
+
+        // ALL THREE VALUES ROLLED BACK.
+        Assert.Null(ExecuteScalarOnKeeper(
+            "SELECT goal_id FROM task_mappings WHERE task_id = 'task-ownflushfail'"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+        Assert.Equal(priorBlob, ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownflushfail'"));
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ownflushfail'"));
+    }
+
+    /// <summary>
+    /// THE BORROWED-CONTEXT LEAK GUARD ON THE NEW ROUTE: after the stage-2 flush failure the
+    /// rejected registry blob is NOT staged in the caller-owned tracker, so a LATER LEGACY save on
+    /// the SAME borrowed context cannot flush it — the durable blob survives byte-for-byte and the
+    /// legacy route's own pointer still lands.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: dropping the key-scoped cleanup leaves the pipeline entity tracked
+    /// with the rejected capture staged; the follow-up legacy save then flushes that blob (its
+    /// UPDATE carries the column) and the final byte-equality assertion fails.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_PipelineFlushFails_LaterLegacySaveOnTheSameContextCannotFlushTheRejectedBlob()
+    {
+        const string goalId = "goal-ownflushleak";
+        const string taskId = "task-ownflushleak";
+        const string legacyTask = "task-ownflushleak-legacy";
+        const string durableBlob = "durable-legacy-blob";
+        SeedPipelineRowWithBlob(goalId, durableBlob);
+
+        // A ONE-SHOT injection: only the checkpoint save's pipeline write fails, so the follow-up
+        // LEGACY save on the SAME context must succeed and be observable.
+        var interceptor = new OneShotPipelinesWriteThrowInterceptor();
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+        var subject = CreatePipeline(goalId, taskId);
+        var candidate = RichCapture(goalId, taskId);
+        var rejectedBlob = WorkSlotRegistryCodec.Encode(candidate.Registry);
+        Assert.NotEqual(durableBlob, rejectedBlob);
+        Assert.Contains(taskId, rejectedBlob, StringComparison.Ordinal);   // the leak would be visible
+
+        var thrown = Assert.ThrowsAny<Exception>(
+            () => store.SaveAdmissionWithPointer(subject, taskId, candidate));
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(interceptor.Sentinel, update.InnerException);
+        Assert.Equal(1, interceptor.ThrowCount);
+        Assert.Equal(durableBlob, ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownflushleak'"));
+
+        // THE LEAK GUARD: a LEGACY admission on the SAME borrowed context.
+        subject.SetActiveTask(legacyTask);
+        Assert.Equal(AdmissionStoreResult.Committed,
+            store.SaveAdmissionWithPointer(subject, legacyTask));
+
+        Assert.Equal(legacyTask, ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ownflushleak'"));
+        Assert.Equal(goalId, ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{legacyTask}'"));
+        Assert.Equal(durableBlob, ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownflushleak'"));
+        Assert.DoesNotContain(taskId, durableBlob, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE VALIDATED DETACHED CARRIER IS THE SOURCE OF TRUTH ON THE SUCCESS PATH TOO: the
+    /// pipeline's LIVE pointer is moved to a different task and its LIVE registry is mutated
+    /// AFTER the capture but BEFORE the save, and the committed row still carries the CAPTURED
+    /// pointer and the CAPTURED registry — never a re-read of the live state at write time.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF. A mutant that re-reads the live pointer instead of using the frozen
+    /// capture commits 'late-live-task' and the pointer assertion fails; a mutant that re-encodes
+    /// the live registry commits a blob containing 'late-live-task' and both the byte-equality
+    /// and the absence assertions fail.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_LiveStateMutatedAfterCapture_CommitsTheCapturedPair()
+    {
+        const string goalId = "goal-ownfrozen";
+        const string taskId = "task-ownfrozen";
+        var candidate = RichCapture(goalId, taskId);
+        var encoded = WorkSlotRegistryCodec.Encode(candidate.Registry);
+
+        var subject = CreatePipeline(goalId, taskId);
+        // THE LIVE DRIFT, deterministic and synchronous: the live pointer moves to a different
+        // task and the live registry gains a slot the capture must never carry.
+        subject.SetActiveTask("late-live-task");
+        subject.AllocateAttemptAndRegisterSlot(
+            "late-live-task", new WorkSlotPosition(9, GoalPhase.DocWriting, 1));
+
+        var store = CreateStore();
+        var result = store.SaveAdmissionWithPointer(subject, taskId, candidate);
+
+        Assert.Equal(AdmissionStoreResult.Committed, result);
+
+        // THE CAPTURED POINTER — never the late live read.
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = 'goal-ownfrozen'"));
+
+        // THE CAPTURED REGISTRY, byte-for-byte — never the mutated live registry.
+        var durableBlob = Assert.IsType<string>(ExecuteScalarOnKeeper(
+            "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = 'goal-ownfrozen'"));
+        Assert.Equal(encoded, durableBlob);
+        var decoded = WorkSlotRegistryCodec.Decode(durableBlob);
+        Assert.Equal(candidate.Registry.Slots, decoded.Slots);
+        Assert.Equal(candidate.Registry.DispatchAttempts, decoded.DispatchAttempts);
+        Assert.DoesNotContain(decoded.Slots, s => s.Slot.TaskId == "late-live-task");
+
+        // The same tuple through a fresh context.
+        var fresh = CreateStore().LoadPipeline(goalId);
+        Assert.Equal(taskId, fresh!.ActiveTaskId);
+        Assert.Equal(encoded, fresh.WorkSlotRegistryJson);
+    }
+
+    /// <summary>
+    /// THE LEGACY TWO-ARGUMENT ROUTE IS UNCHANGED: an opaque/malformed registry blob survives
+    /// BYTE-FOR-BYTE (never decoded, never re-encoded, never cleared), a row whose blob is SQL NULL
+    /// keeps SQL NULL (no manufactured empty envelope), and the pointer is still the pipeline's own
+    /// value — the legacy route writes no checkpoint at all.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOF: make the legacy route stage a checkpoint (the frozen pair non-null) and the
+    /// byte-equality and the SQL NULL preservation both fail.
+    /// </remarks>
+    [Theory]
+    [InlineData("truncated-json", "{\"version\":1,\"slots\":[")]
+    [InlineData("not-json-at-all", "opaque registry payload — no structure")]
+    [InlineData("old-version", "{\"version\":0,\"slots\":[],\"dispatchAttempts\":[]}")]
+    public void SaveAdmission_LegacyRoute_PreservesAnOpaqueBlobVerbatim(string label, string opaqueBlob)
+    {
+        var goalId = "goal-legacyopaque-" + label;
+        var taskId = "task-legacyopaque-" + label;
+        SeedPipelineRowWithBlob(goalId, opaqueBlob);
+
+        var pipeline = CreatePipeline(goalId, taskId);
+        var store = CreateStore();
+
+        // PRECONDITION: the pointer really is SQL NULL before the legacy route runs.
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+
+        Assert.Equal(AdmissionStoreResult.Committed, store.SaveAdmissionWithPointer(pipeline, taskId));
+
+        // The mapping and the pointer landed (the route really did its own work)…
+        Assert.Equal(goalId, ExecuteScalarOnKeeper(
+            $"SELECT goal_id FROM task_mappings WHERE task_id = '{taskId}'"));
+        Assert.Equal(taskId, ExecuteScalarOnKeeper(
+            $"SELECT active_task_id FROM pipelines WHERE goal_id = '{goalId}'"));
+        // …and the OPAQUE blob is byte-identical, neither repaired nor replaced.
+        Assert.Equal(opaqueBlob, ExecuteScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+
+        // The SAME opaque text through a fresh context (no tracker, no decode).
+        var fresh = CreateStore().LoadPipeline(goalId);
+        Assert.Equal(opaqueBlob, fresh!.WorkSlotRegistryJson);
+    }
+
+    /// <summary>
+    /// THE LEGACY ROUTE LEAVES A SQL NULL BLOB AS SQL NULL: it never manufactures an empty envelope
+    /// and never stores a captured registry, so "no snapshot supplied" stays distinct from "an empty
+    /// registry was captured".
+    /// </summary>
+    [Fact]
+    public void SaveAdmission_LegacyRoute_LeavesAMissingBlobAsSqlNull()
+    {
+        const string goalId = "goal-legacynullblob";
+        const string taskId = "task-legacynullblob";
+        SeedPipelineRowWithBlob(goalId, blob: null);
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+
+        var pipeline = CreatePipeline(goalId, taskId);
+        Assert.Equal(AdmissionStoreResult.Committed,
+            CreateStore().SaveAdmissionWithPointer(pipeline, taskId));
+
+        Assert.Null(ExecuteNullableScalarOnKeeper(
+            $"SELECT work_slot_registry_json FROM pipelines WHERE goal_id = '{goalId}'"));
+        Assert.Null(CreateStore().LoadPipeline(goalId)!.WorkSlotRegistryJson);
+    }
+
     // ───────────────────────────── shared helpers ─────────────────────────────
+
+    /// <summary>
+    /// Seeds a bare pipeline row (the ordinary legacy columns only) carrying an EXACT
+    /// <c>work_slot_registry_json</c> value — <c>null</c> for SQL NULL, or the supplied text
+    /// VERBATIM (bound as a parameter, never interpolated, so quotes and backslashes survive) —
+    /// plus a genuinely deserializable goal JSON so a later load is honest.
+    /// </summary>
+    private void SeedPipelineRowWithBlob(string goalId, string? blob)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO pipelines (goal_id, description, goal_json, phase, metrics_json, created_at, work_slot_registry_json)
+            VALUES ($goal, 'Seeded', $goalJson, 'Planning', '{}', '2025-06-15T10:00:00.0000000Z', $blob)
+            """;
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue(
+            "$goalJson",
+            System.Text.Json.JsonSerializer.Serialize(new
+            {
+                id = goalId,
+                description = "Seeded " + goalId,
+                repositories = new[] { "test-repo" },
+            }));
+        command.Parameters.AddWithValue("$blob", (object?)blob ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    /// <summary>TRUE for a write statement (an <c>UPDATE</c> or an <c>INSERT</c>).</summary>
+    private static bool IsWriteStatement(string sql)
+    {
+        var trimmed = sql.TrimStart();
+        return trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Builds a REAL captured Pending admission carrying complete history: a seeded dead Recorded
+    /// slot whose position's counter stands ABOVE its own attempt, a counter-only position, and
+    /// live allocations in the Claimed, Abandoned and Pending states — the richest shape the
+    /// preflight accepts, so the persistence assertions below cannot pass over a trivial registry.
+    /// </summary>
+    private static AdmissionOwnershipSnapshot RichCapture(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(CreateGoal(goalId));
+        var historical = new WorkSlotPosition(1, GoalPhase.Improve, 2);
+        var counterOnly = new WorkSlotPosition(2, GoalPhase.Merging, 1);
+        pipeline.RestoreRegistry(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("history-recorded", historical, 2), WorkSlotState.Recorded)],
+            [new WorkSlotRegistryAttemptEntry(historical, 9),
+             new WorkSlotRegistryAttemptEntry(counterOnly, 7)]));
+
+        var claimed = pipeline.AllocateAttemptAndRegisterSlot(
+            "history-claimed", new WorkSlotPosition(1, GoalPhase.Coding, 1));
+        Assert.Equal(1, claimed.Attempt);
+        Assert.Equal(SlotGuardResult.Proceed, pipeline.ResolveAndCheckSlot("history-claimed"));
+
+        var abandoned = pipeline.AllocateAttemptAndRegisterSlot(
+            "history-abandoned", new WorkSlotPosition(1, GoalPhase.Testing, 1));
+        Assert.Equal(1, abandoned.Attempt);
+        Assert.True(pipeline.AbandonSlot("history-abandoned"));
+
+        var active = pipeline.AllocateAttemptAndRegisterSlot(
+            taskId, new WorkSlotPosition(3, GoalPhase.Review, 1));
+        Assert.Equal(1, active.Attempt);
+        pipeline.SetActiveTask(taskId);
+
+        var captured = pipeline.CaptureAdmissionOwnership();
+        Assert.Equal(taskId, captured.ActiveTaskId);
+        AssertSnapshotIsComplete(captured.Registry);
+        return captured;
+    }
+
+    /// <summary>
+    /// THE ANTI-VACUOUS PRECONDITION for every registry readback: all four lifecycle states, a
+    /// counter-only position (a high-water entry with no slot there) and a counter standing HIGHER
+    /// than the attempt of the slot at its position.
+    /// </summary>
+    private static void AssertSnapshotIsComplete(WorkSlotRegistrySnapshot snapshot)
+    {
+        Assert.Equal(Enum.GetValues<WorkSlotState>().ToHashSet(), snapshot.Slots.Select(s => s.State).ToHashSet());
+
+        var counterOnly = snapshot.DispatchAttempts
+            .Where(a => snapshot.Slots.All(s => s.Slot.Position != a.Position))
+            .ToList();
+        Assert.Contains(counterOnly, a => a.HighWaterAttempt == 7);
+
+        var higher = Assert.Single(snapshot.DispatchAttempts, a => a.HighWaterAttempt == 9);
+        var slotThere = Assert.Single(snapshot.Slots, s => s.Slot.Position == higher.Position);
+        Assert.True(higher.HighWaterAttempt > slotThere.Slot.Attempt,
+            "the fixture must carry a counter standing above its position's slot attempt");
+    }
 
     /// <summary>
     /// THE IDENTITY PROOF for original-exception preservation: the propagated exception must be
@@ -1078,6 +1530,59 @@ public sealed class PipelineStoreAdmissionTransactionTests : IDisposable
     {
         for (var current = (Exception?)exception; current is not null; current = current.InnerException)
             yield return current;
+    }
+}
+
+/// <summary>
+/// Throws a genuine <see cref="SqliteException"/> EXACTLY ONCE — before the FIRST <c>pipelines</c>
+/// write — and then stands aside, so a SECOND save on the SAME context can complete. The instance is
+/// a pre-created <see cref="Sentinel"/> (identity assertions) and <see cref="ThrowCount"/> proves the
+/// one-shot really fired.
+/// </summary>
+internal sealed class OneShotPipelinesWriteThrowInterceptor : DbCommandInterceptor
+{
+    private int _fired;
+    private int _throwCount;
+
+    public SqliteException Sentinel { get; } =
+        new("one-shot pipelines write SENTINEL", 5, 5);   // SQLITE_BUSY
+
+    /// <summary>How many times the sentinel was thrown (0 or 1).</summary>
+    public int ThrowCount => Volatile.Read(ref _throwCount);
+
+    private void ThrowIfArmed(DbCommand command)
+    {
+        var text = command.CommandText;
+        if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
+            return;
+        var trimmed = text.TrimStart();
+        if (!trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+            && !trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _fired, 1) != 0)
+            return;
+
+        Interlocked.Increment(ref _throwCount);
+        throw Sentinel;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<int> NonQueryExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+    {
+        ThrowIfArmed(command);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+    {
+        ThrowIfArmed(command);
+        return result;
     }
 }
 
@@ -4744,4 +5249,333 @@ internal sealed class ThrowingMessageException : Exception
         _innerMessage is null
             ? "ThrowingMessageException (ToString also throws)"
             : _innerMessage + " / ThrowinigMessageException (ToString also throws)";
+}
+
+/// <summary>
+/// Direct-context contracts for the OWNERSHIP-AWARE
+/// <see cref="PipelineStore.SaveAdmissionWithPointer(GoalPipeline, string, AdmissionOwnershipSnapshot)"/>
+/// route: every validation — the non-blank task id, the reused preflight, the single encode and the
+/// captured-pointer agreement — happens BEFORE any context is acquired and before any statement is
+/// issued, and a pointer mismatch writes nothing at all.
+/// </summary>
+/// <remarks>
+/// The routes share ONE transaction body, so the legacy contracts (validation order, the guarded
+/// cleanup, the outcome surface) are covered by their existing vectors rather than duplicated here;
+/// these vectors pin the NEW route's ordering and its no-write refusals.
+/// </remarks>
+public sealed class PipelineStoreAdmissionOwnershipRouteDirectContextTests : IDisposable
+{
+    private readonly string _connectionString =
+        $"Data Source=file:memdb-admission-ownership-route-{Guid.NewGuid():N}?mode=memory&cache=shared";
+    private readonly SqliteConnection _keeper;
+    private readonly List<DbConnection> _connections = [];
+    private readonly List<CopilotHiveDbContext> _contexts = [];
+
+    public PipelineStoreAdmissionOwnershipRouteDirectContextTests()
+    {
+        _keeper = new SqliteConnection(_connectionString);
+        _keeper.Open();
+        CreateContext().Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        foreach (var context in _contexts)
+            context.Dispose();
+        foreach (var connection in _connections)
+            connection.Dispose();
+        _keeper.Dispose();
+    }
+
+    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        _connections.Add(connection);
+
+        var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
+        if (interceptor is not null)
+            builder.AddInterceptors(interceptor);
+
+        var context = new CopilotHiveDbContext(builder.Options);
+        _contexts.Add(context);
+        return context;
+    }
+
+    private object? ExecuteScalarOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        var value = command.ExecuteScalar();
+        return value == DBNull.Value ? null : value;
+    }
+
+    private static Goal Goal(string id) =>
+        new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
+
+    private static WorkSlotPosition Pos(int iteration, GoalPhase phase, int occurrence) =>
+        new(iteration, phase, occurrence);
+
+    /// <summary>A genuine captured Pending admission — the shape the new route accepts.</summary>
+    private static AdmissionOwnershipSnapshot Candidate(string goalId, string taskId)
+    {
+        var pipeline = new GoalPipeline(Goal(goalId));
+        var active = pipeline.AllocateAttemptAndRegisterSlot(taskId, Pos(1, GoalPhase.Coding, 1));
+        Assert.Equal(1, active.Attempt);
+        pipeline.SetActiveTask(taskId);
+        return pipeline.CaptureAdmissionOwnership();
+    }
+
+    /// <summary>Every command the context attempted, in order — the "no statement was issued" probe.</summary>
+    private sealed class CommandRecordingInterceptor : DbCommandInterceptor
+    {
+        private readonly List<string> _commands = [];
+
+        public IReadOnlyList<string> Commands => _commands;
+
+        private void Record(DbCommand command) => _commands.Add(command.CommandText);
+
+        /// <inheritdoc />
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            Record(command);
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            Record(command);
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override InterceptionResult<object> ScalarExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
+        {
+            Record(command);
+            return result;
+        }
+    }
+
+    /// <summary>A factory that COUNTS acquisitions and refuses to hand out anything.</summary>
+    private sealed class CountingRefusingFactory : IDbContextFactory<CopilotHiveDbContext>
+    {
+        private int _acquisitions;
+
+        public int Acquisitions => Volatile.Read(ref _acquisitions);
+
+        public CopilotHiveDbContext CreateDbContext()
+        {
+            Interlocked.Increment(ref _acquisitions);
+            throw new InvalidOperationException(
+                "the context factory must not be reached — the refusal precedes acquisition");
+        }
+    }
+
+    /// <summary>
+    /// THE ORDERING PROOF: each new-route refusal happens BEFORE the context is acquired AND
+    /// therefore before any statement could be issued (the factory would have thrown on the first
+    /// acquisition, and it is never reached).
+    /// </summary>
+    /// <remarks>
+    /// THE ENCODE'S POSITION IS PINNED SEPARATELY. Under the CURRENT validators a structural encode
+    /// failure cannot be produced after the preflight: every structural rejection the codec performs
+    /// (a null collection, a null entry, a null slot, a blank task id, a null position, an undefined
+    /// phase or state) is already refused by <c>ValidateDetachedRegistrySnapshot</c>, which the
+    /// preflight reuses — so a post-preflight encode failure is UNREACHABLE and is not faked here.
+    /// What is pinned instead is that the codec is NOT the decider for those inputs: the
+    /// null-slot-entry capture below is refused by the PREFLIGHT's <see cref="ArgumentException"/>,
+    /// not by <see cref="WorkSlotRegistryCodecException"/> — which places the preflight strictly
+    /// ahead of the encode. The remaining step of that freeze — the goal-agreement check — IS
+    /// reachable after the preflight and is covered by
+    /// <see cref="SaveAdmissionWithPointer_OwnershipRoute_RefusalsReportTheEarliestRule"/>.
+    /// </remarks>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_EveryRefusalPrecedesContextAcquisition()
+    {
+        const string goalId = "route-preflight-goal";
+        const string taskId = "route-preflight-task";
+        var position = Pos(1, GoalPhase.Coding, 1);
+
+        // A structurally fine registry whose active slot has NO high-water entry for its position:
+        // the PREFLIGHT's own rule, reused verbatim.
+        var missingHistory = new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot(taskId, position, 1), WorkSlotState.Pending)],
+            []);
+
+        // A well-formed registry whose only slot belongs to a DIFFERENT task.
+        var foreignSlot = new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("some-other-task", position, 1), WorkSlotState.Pending)],
+            [new WorkSlotRegistryAttemptEntry(position, 1)]);
+
+        // An UNENCODABLE structural shape (a null slot entry): the preflight refuses it FIRST.
+        var nullSlotEntry = new WorkSlotRegistrySnapshot([null!], []);
+
+        var cases = new (string Name, string TaskId, AdmissionOwnershipSnapshot? Ownership, Type Type, string Message)[]
+        {
+            ("blank-task", "  ", Candidate(goalId, taskId), typeof(ArgumentException), "non-blank"),
+            ("blank-capture-active",
+                taskId,
+                new AdmissionOwnershipSnapshot(goalId, "   ",
+                    new WorkSlotRegistrySnapshot(
+                        [new WorkSlotView(new WorkSlot(taskId, position, 1), WorkSlotState.Pending)],
+                        [new WorkSlotRegistryAttemptEntry(position, 1)])),
+                typeof(ArgumentException), "Admission active task ID must be a non-blank"),
+            ("malformed-registry", taskId,
+                new AdmissionOwnershipSnapshot(goalId, taskId, missingHistory),
+                typeof(ArgumentException), "has no attempt entry for its position"),
+            ("no-matching-slot", taskId,
+                new AdmissionOwnershipSnapshot(goalId, taskId, foreignSlot),
+                typeof(ArgumentException), "has no matching slot in the registry"),
+            ("pointer-mismatch", taskId, Candidate(goalId, "a-different-task"),
+                typeof(ArgumentException), "does not match the ownership capture's active task id"),
+            ("unencodable-structure-refused-by-the-preflight", taskId,
+                new AdmissionOwnershipSnapshot(goalId, taskId, nullSlotEntry),
+                typeof(ArgumentException), "null slot entry"),
+            ("null-ownership", taskId, null,
+                typeof(ArgumentNullException), "candidate"),
+        };
+
+        foreach (var item in cases)
+        {
+            var factory = new CountingRefusingFactory();
+            var store = new PipelineStore(factory, NullLogger<PipelineStore>.Instance);
+            var pipeline = new GoalPipeline(Goal(goalId));
+            pipeline.SetActiveTask(item.TaskId);
+
+            var thrown = Record.Exception(
+                () => store.SaveAdmissionWithPointer(pipeline, item.TaskId, item.Ownership!));
+
+            Assert.NotNull(thrown);
+            Assert.Equal(item.Type, thrown!.GetType());
+            Assert.Contains(item.Message, thrown.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, factory.Acquisitions);
+        }
+    }
+
+    /// <summary>
+    /// THE REFUSAL ORDER: the blank-task guard runs FIRST, the reused preflight SECOND, the
+    /// captured-pointer agreement THIRD, and the freeze's goal-agreement check LAST — so a candidate
+    /// that would fail several rules reports the EARLIEST one. Every one of them still precedes the
+    /// context acquisition.
+    /// </summary>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_RefusalsReportTheEarliestRule()
+    {
+        const string goalId = "route-order-goal";
+
+        // (1) A BLANK task id outranks an otherwise malformed candidate.
+        var malformed = new AdmissionOwnershipSnapshot(
+            "   ", null, new WorkSlotRegistrySnapshot([], []));
+        var blank = Assert.Throws<ArgumentException>(() =>
+            new PipelineStore(new CountingRefusingFactory(), NullLogger<PipelineStore>.Instance)
+                .SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), "  ", malformed));
+        Assert.Equal("taskId", blank.ParamName);
+
+        // (2) THE PREFLIGHT outranks the pointer agreement: the capture has NO matching slot AND
+        //     its active task differs from the requested id — the preflight's own error wins.
+        var position = Pos(1, GoalPhase.Coding, 1);
+        var noSlot = new AdmissionOwnershipSnapshot(goalId, "captured-task",
+            new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot("unrelated", position, 1), WorkSlotState.Pending)],
+                [new WorkSlotRegistryAttemptEntry(position, 1)]));
+        var preflightFirst = Assert.Throws<ArgumentException>(() =>
+            new PipelineStore(new CountingRefusingFactory(), NullLogger<PipelineStore>.Instance)
+                .SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), "requested-task", noSlot));
+        Assert.Contains("has no matching slot in the registry", preflightFirst.Message, StringComparison.Ordinal);
+
+        // (3) THE POINTER AGREEMENT outranks the goal-agreement check: the capture belongs to
+        //     ANOTHER goal AND its active task differs — the mismatch is reported first.
+        var foreignGoal = Candidate("route-order-other-goal", "captured-task");
+        var mismatchFirst = Assert.Throws<ArgumentException>(() =>
+            new PipelineStore(new CountingRefusingFactory(), NullLogger<PipelineStore>.Instance)
+                .SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), "requested-task", foreignGoal));
+        Assert.Equal("taskId", mismatchFirst.ParamName);
+        Assert.Contains("does not match the ownership capture's active task id", mismatchFirst.Message,
+            StringComparison.Ordinal);
+
+        // (4) …and with a MATCHING task id the freeze's GOAL-AGREEMENT check is next — the
+        //     post-preflight step of the freeze, still with NO context acquired.
+        var foreignGoalFactory = new CountingRefusingFactory();
+        var goalMismatch = Assert.Throws<ArgumentException>(() =>
+            new PipelineStore(foreignGoalFactory, NullLogger<PipelineStore>.Instance)
+                .SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), "captured-task", foreignGoal));
+        Assert.Equal("ownership", goalMismatch.ParamName);
+        Assert.Contains("route-order-other-goal", goalMismatch.Message, StringComparison.Ordinal);
+        Assert.Contains(goalId, goalMismatch.Message, StringComparison.Ordinal);
+        Assert.Equal(0, foreignGoalFactory.Acquisitions);
+
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
+
+    /// <summary>
+    /// A POINTER MISMATCH ON THE NEW ROUTE WRITES NOTHING AT ALL: not a mapping row, not a pipeline
+    /// row, and not a single statement — the recording interceptor observes an empty command log,
+    /// and the raw table counts stay at zero.
+    /// </summary>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_PointerMismatch_IssuesNoStatementAndWritesNothing()
+    {
+        const string goalId = "route-mismatch-goal";
+        var recorder = new CommandRecordingInterceptor();
+        var context = CreateContext(recorder);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        // The pipeline's OWN live pointer is deliberately the requested id: the new route compares
+        // the CAPTURE, so the live agreement cannot rescue a mismatching capture.
+        var pipeline = new GoalPipeline(Goal(goalId));
+        pipeline.SetActiveTask("requested-task");
+        var candidate = Candidate(goalId, "captured-task");
+
+        var thrown = Assert.Throws<ArgumentException>(
+            () => store.SaveAdmissionWithPointer(pipeline, "requested-task", candidate));
+
+        Assert.Equal("taskId", thrown.ParamName);
+        Assert.Contains("captured-task", thrown.Message, StringComparison.Ordinal);
+        Assert.Contains("requested-task", thrown.Message, StringComparison.Ordinal);
+
+        // NO STATEMENT WAS ISSUED — not even the mapping insert's flush.
+        Assert.Empty(recorder.Commands);
+        Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
+        Assert.Empty(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+
+        // NOTHING WAS WRITTEN, raw-probed.
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
+
+    /// <summary>
+    /// THE PREFLIGHT FAILURE ON A DIRECT CONTEXT: the malformed-history capture is refused with the
+    /// preflight's own error and NO statement is issued — the mapping table and the pipeline table
+    /// are both untouched, and the context's change tracker stays empty.
+    /// </summary>
+    [Fact]
+    public void SaveAdmissionWithPointer_OwnershipRoute_MalformedCapture_IssuesNoStatement()
+    {
+        const string goalId = "route-malformed-goal";
+        const string taskId = "route-malformed-task";
+        var recorder = new CommandRecordingInterceptor();
+        var context = CreateContext(recorder);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var position = Pos(1, GoalPhase.Coding, 1);
+        var malformed = new AdmissionOwnershipSnapshot(goalId, taskId,
+            new WorkSlotRegistrySnapshot(
+                [new WorkSlotView(new WorkSlot(taskId, position, 1), WorkSlotState.Pending)],
+                []));
+
+        var thrown = Assert.Throws<ArgumentException>(
+            () => store.SaveAdmissionWithPointer(new GoalPipeline(Goal(goalId)), taskId, malformed));
+
+        Assert.Contains("has no attempt entry for its position", thrown.Message, StringComparison.Ordinal);
+        Assert.Empty(recorder.Commands);
+        Assert.Empty(context.ChangeTracker.Entries<TaskMappingEntity>().ToList());
+        Assert.Empty(context.ChangeTracker.Entries<PipelineEntity>().ToList());
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM task_mappings"));
+        Assert.Equal(0L, ExecuteScalarOnKeeper("SELECT COUNT(*) FROM pipelines"));
+    }
 }

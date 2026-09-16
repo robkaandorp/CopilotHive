@@ -92,7 +92,7 @@ public sealed class PipelineStore : IAsyncDisposable
 
     /// <summary>
     /// THE DISPOSAL SEAM for the factory-owned contexts — used by
-    /// <see cref="SaveAdmissionWithPointer"/>, <see cref="ClearActiveTaskIdIfMatches"/> and
+    /// <see cref="SaveAdmissionWithPointer(GoalPipeline, string)"/>, <see cref="ClearActiveTaskIdIfMatches"/> and
     /// <see cref="CommitAdmissionOwnership"/>. When
     /// installed, it SUBSTITUTES the fallible
     /// dispose operation (<see cref="CopilotHiveDbContext"/> is sealed, so its
@@ -747,6 +747,15 @@ public sealed class PipelineStore : IAsyncDisposable
     /// staged in that case. Every other failure PROPAGATES (the original exception, never
     /// reclassified), and the finally's guarded cleanup never masks either outcome.
     /// </summary>
+    /// <remarks>
+    /// THE LEGACY, UNCHANGED ROUTE. This overload validates against the pipeline's LIVE
+    /// <c>ActiveTaskId</c>, writes no ownership checkpoint (the frozen pair is <c>null</c>, so the
+    /// <c>work_slot_registry_json</c> column is left exactly as it was — an existing blob survives
+    /// byte-for-byte — and the pointer keeps its existing late live read) and DELEGATES the whole
+    /// transaction to <see cref="SaveAdmissionWithPointerCore"/> with no checkpoint. The body is
+    /// SHARED with the ownership-aware overload below: it is never copied, and there is exactly one
+    /// outcome surface (<see cref="AdmissionStoreResult"/>).
+    /// </remarks>
     /// <param name="pipeline">The pipeline whose pointer is persisted alongside the mapping.</param>
     /// <param name="taskId">The task id being admitted; MUST equal <c>pipeline.ActiveTaskId</c>.</param>
     /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
@@ -760,6 +769,97 @@ public sealed class PipelineStore : IAsyncDisposable
                 $"Task id '{taskId}' does not match the pipeline's active task id '{pipeline.ActiveTaskId}' (goal={pipeline.GoalId}).",
                 nameof(taskId));
 
+        return SaveAdmissionWithPointerCore(pipeline, taskId, checkpoint: null);
+    }
+
+    /// <summary>
+    /// THE OWNERSHIP-AWARE ADMISSION ROUTE: the same atomic <c>task_mappings</c> + pipeline-row
+    /// transaction as <see cref="SaveAdmissionWithPointer(GoalPipeline, string)"/>, but the
+    /// pipeline row is written from ONE detached <paramref name="ownership"/> capture — the frozen
+    /// active-task pointer AND the complete encoded work-slot registry — inside the SAME row write
+    /// and the SAME transaction as the mapping insert.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// EVERYTHING HERE HAPPENS BEFORE ANY CONTEXT EXISTS, in this exact order: (1) the SAME
+    /// non-blank <paramref name="taskId"/> guard as the legacy overload (identical exception shape);
+    /// (2) <see cref="GoalPipeline.PreflightAdmissionOwnership"/> — REUSED verbatim, never
+    /// duplicated — validates the detached candidate (goal identity, complete registry history and
+    /// the matching Pending active slot); (3) the CAPTURED active task must equal
+    /// <paramref name="taskId"/> ordinally (<see cref="ArgumentException"/> otherwise); (4) the
+    /// EXISTING <see cref="FreezeOwnershipCheckpoint"/> performs the goal-agreement check and the
+    /// SINGLE <see cref="WorkSlotRegistryCodec.Encode"/>. Only after all four does the shared core
+    /// resolve a context.
+    /// </para>
+    /// <para>
+    /// THE VALIDATED DETACHED CARRIER IS USED FROM THERE ON — live ownership is NEVER re-read. A
+    /// domain mutation landing after the capture therefore cannot change the committed pointer or
+    /// registry; the frozen pair is installed by the existing stage-2 pipeline-row write
+    /// (<c>UpsertPipelineCore</c> → <c>ApplyToEntity</c>) and is NOT a second, independent registry
+    /// write.
+    /// </para>
+    /// <para>
+    /// NO NEW VALIDATOR, SCHEMA, CODEC, ATTEMPT ALLOCATION OR EXPECTED-BLOB CACHE is introduced, and
+    /// there is no second outcome surface: the result is the same <see cref="AdmissionStoreResult"/>
+    /// (<see cref="AdmissionStoreResult.Committed"/> / <see cref="AdmissionStoreResult.PersistConflict"/>)
+    /// with the same mapping-insert-IS-the-check semantics, the same mapping-flush-only primary-key
+    /// conflict classification, the same original-exception propagation and the same guarded
+    /// rollback / tracker-hygiene / transaction-dispose / owned-context-dispose sequence.
+    /// </para>
+    /// </remarks>
+    /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
+    /// <param name="taskId">The task id being admitted; MUST equal the CAPTURE's active task id.</param>
+    /// <param name="ownership">The detached ownership capture supplying the pointer AND the registry.</param>
+    /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="ownership"/> (or a required member of
+    /// its registry) is <c>null</c> — from the reused preflight.</exception>
+    /// <exception cref="ArgumentException"><paramref name="taskId"/> is blank, the capture is
+    /// malformed or has no matching Pending slot, the captured active task differs from
+    /// <paramref name="taskId"/>, or the capture belongs to another goal.</exception>
+    internal AdmissionStoreResult SaveAdmissionWithPointer(
+        GoalPipeline pipeline, string taskId, AdmissionOwnershipSnapshot ownership)
+    {
+        // (1) THE SAME NON-BLANK GUARD as the legacy overload — identical shape and ParamName.
+        if (string.IsNullOrWhiteSpace(taskId))
+            throw new ArgumentException("Task id must be a non-blank value.", nameof(taskId));
+
+        // (2) THE REUSED PREFLIGHT: the detached candidate's goal identity, its COMPLETE registry
+        //     history and its matching Pending active slot are validated by GoalPipeline's own
+        //     validator — no duplicate validator lives here. Every rejection escapes with no
+        //     context created and no statement issued.
+        var validated = GoalPipeline.PreflightAdmissionOwnership(ownership);
+
+        // (3) THE CAPTURED-POINTER AGREEMENT: the admission must be for the task the capture
+        //     actually owns — compared ORDINALLY against the captured value, never against a live
+        //     read of the pipeline.
+        if (!string.Equals(validated.ActiveTaskId, taskId, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Task id '{taskId}' does not match the ownership capture's active task id '{validated.ActiveTaskId}' (goal={pipeline.GoalId}).",
+                nameof(taskId));
+        }
+
+        // (4) THE REUSED FREEZE: the goal-agreement check and the SINGLE registry encode, both
+        //     before any context exists. The VALIDATED carrier is frozen from here on.
+        var checkpoint = FreezeOwnershipCheckpoint(pipeline, validated);
+
+        return SaveAdmissionWithPointerCore(pipeline, taskId, checkpoint);
+    }
+
+    /// <summary>
+    /// THE ONE SHARED TRANSACTION BODY of both <c>SaveAdmissionWithPointer</c> overloads. The
+    /// <paramref name="checkpoint"/> — the frozen pointer/registry pair, or <c>null</c> on the
+    /// legacy route — is threaded into the EXISTING stage-2 pipeline-row write; nothing else about
+    /// the transaction differs between the routes.
+    /// </summary>
+    /// <param name="pipeline">The pipeline whose row is written.</param>
+    /// <param name="taskId">The validated task id the mapping row is inserted for.</param>
+    /// <param name="checkpoint">The frozen ownership pair to install, or <c>null</c> for the legacy
+    /// route (no override: the registry column is left untouched and the pointer keeps its late read).</param>
+    /// <returns><see cref="AdmissionStoreResult.Committed"/> or <see cref="AdmissionStoreResult.PersistConflict"/>.</returns>
+    private AdmissionStoreResult SaveAdmissionWithPointerCore(
+        GoalPipeline pipeline, string taskId, FrozenOwnershipCheckpoint? checkpoint)
+    {
         var (db, ownsContext) = ResolveDbContext();
         IDbContextTransaction? transaction = null;
         var stage = AdmissionStage.MappingFlush;
@@ -774,8 +874,11 @@ public sealed class PipelineStore : IAsyncDisposable
             db.SaveChanges();
             stage = AdmissionStage.PipelineFlush;
 
-            // STAGE 2 — THE PIPELINE ROW.
-            UpsertPipelineCore(db, pipeline, taskId);
+            // STAGE 2 — THE PIPELINE ROW. The frozen ownership pair travels through the EXISTING
+            // pipeline-row upsert (its checkpoint parameter already installs the pair in this same
+            // row write); the legacy route passes null and therefore leaves the pointer/registry
+            // columns exactly as it always did.
+            UpsertPipelineCore(db, pipeline, taskId, checkpoint);
             db.SaveChanges();
 
             // STAGE 3 — THE COMMIT.
@@ -2087,7 +2190,8 @@ public sealed class PipelineSnapshot
 }
 
 /// <summary>
-/// The outcome of <see cref="PipelineStore.SaveAdmissionWithPointer"/>.
+/// The outcome of <see cref="PipelineStore.SaveAdmissionWithPointer(GoalPipeline, string)"/>, shared
+/// by both of its routes (the legacy and the ownership-aware overloads).
 /// </summary>
 internal enum AdmissionStoreResult
 {

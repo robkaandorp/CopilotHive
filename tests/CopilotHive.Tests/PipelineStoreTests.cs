@@ -1483,7 +1483,7 @@ public sealed class PipelineStorePointerRollbackTests : IDisposable
 
 
 /// <summary>
-/// Slice E2a-i — <see cref="PipelineStore.SaveAdmissionWithPointer"/> on the DIRECT-CONTEXT
+/// Slice E2a-i — <see cref="PipelineStore.SaveAdmissionWithPointer(GoalPipeline, string)"/> on the DIRECT-CONTEXT
 /// paths: the two validation refusals (no write on either), the pre-existing row's reload
 /// after a CONFIRMED rollback, the new row's Added-state detach and the deferred-orphan
 /// proof, the SUCCESS-PATH dispose failure (the durable commit still returns
@@ -2048,7 +2048,7 @@ internal sealed class PipelineLookupGateInterceptor : DbCommandInterceptor
 
 /// <summary>
 /// Slice E2a-ii-β-PREP-3 — the admission snapshot plumbing's one behavior-relevant change:
-/// <see cref="PipelineStore.SaveAdmissionWithPointer"/>'s pipeline upsert now carries the
+/// <see cref="PipelineStore.SaveAdmissionWithPointer(GoalPipeline, string)"/>'s pipeline upsert now carries the
 /// VALIDATED taskId (the snapshot taken at the call's entry) as the
 /// <c>activeTaskIdOverride</c>, so the committed active_task_id is immutable — never a mutable
 /// late read of <see cref="GoalPipeline.ActiveTaskId"/> that a concurrent clear could blank.
