@@ -80,24 +80,39 @@ while (!cts.IsCancellationRequested)
         capabilities: capabilities,
         provisioningEnvironment: provisioningEnvironment);
 
-    var cleanExit = false;
+    // THE ELIGIBLE OUTCOME — the ONLY value the post-region handling below may act on. It stays
+    // NULL unless the awaited RunAsync genuinely RETURNED *and* the attempt's disposal then
+    // completed without throwing, so the classification catches keep sole authority over the
+    // retry/fatal control flow and no reconstructed or defaulted value can stand in for a real,
+    // fully completed attempt.
+    WorkerRunOutcome? completedOutcome = null;
 
     try
     {
+        // The run's returned value, held locally until disposal has also succeeded. A thrown
+        // disposal unwinds out of the block below, SKIPPING the eligibility assignment that
+        // follows, so a failed teardown can never be mistaken for a completed attempt.
+        WorkerRunOutcome runOutcome;
+
         try
         {
-            await service.RunAsync(cts.Token);
-            cleanExit = true;
+            // The returned outcome is the REAL result of the run — a rejected registration or an
+            // accepted work stream that ended with the whole lifecycle teardown completing.
+            // NOTHING else happens inside this covered region: the outcome is merely captured, so
+            // no diagnostic of ours can ever be classified as a connection failure and retried.
+            runOutcome = await service.RunAsync(cts.Token);
         }
         finally
         {
-            // Disposal propagates (by design). Running it here means any fault it raises is
-            // caught and REDACTED by the handlers below instead of reaching the runtime.
+            // Disposal propagates (by design) and still runs on EVERY path, including when
+            // RunAsync itself threw. Running it here means any fault it raises is caught and
+            // REDACTED by the handlers below instead of reaching the runtime.
             service.Dispose();
         }
 
-        if (cleanExit)
-            break; // clean exit
+        // REACHED ONLY WHEN BOTH STEPS SUCCEEDED: the run returned and the disposal completed
+        // without throwing. Only now does the outcome become eligible for the handling below.
+        completedOutcome = runOutcome;
     }
     catch (OperationCanceledException)
     {
@@ -120,6 +135,11 @@ while (!cts.IsCancellationRequested)
             break;
         }
         delay = delay * 2 > maxDelay ? maxDelay : delay * 2;
+
+        // EXPLICITLY END THIS ITERATION. A classified thrown failure must proceed to the NEXT
+        // attempt exactly as the pre-change control flow did: it may never fall through into the
+        // returned-outcome handling below, whatever any local still holds.
+        continue;
     }
     catch (Exception ex)
     {
@@ -130,5 +150,55 @@ while (!cts.IsCancellationRequested)
         Console.Error.WriteLine($"[Worker] Fatal error [{SafeExceptionLog.Describe(ex)}]");
         return 1;
     }
+
+    // ── RETURNED-OUTCOME HANDLING, OUTSIDE EVERY RETRY-GOVERNING CATCH ──────────────
+    //
+    // DEFENSE IN DEPTH. Every catch above already ends its own iteration (break / continue /
+    // return), and an ineligible attempt never assigns the value, so this guard is unreachable in
+    // the corrected flow — it stays as the safety net that keeps a non-returned attempt from ever
+    // being handled as a completed one.
+    if (completedOutcome is not { } outcome)
+        continue;
+
+    // From here on nothing can reach the catches above, so a throwing diagnostic can neither be
+    // misclassified as a connection failure (creating a fresh attempt) nor alter the exit code.
+    if (outcome == WorkerRunOutcome.WorkStreamEnded)
+    {
+        // Static and secret-free: the accepted work stream ended and this process is exiting.
+        // Deliberately NOT a reconnect trigger — a returned outcome ALWAYS stops the loop, and the
+        // write is best-effort so a closed/redirected stdout cannot change that.
+        WriteBestEffort(Console.Out, "[Worker] Work stream ended; the worker is exiting.");
+    }
+    else if (outcome != WorkerRunOutcome.RegistrationRejected)
+    {
+        // An UNKNOWN/unexpected enum value must never silently retry and never silently exit. It is
+        // an ordinary fatal InvalidOperationException, classified by the SAME sanitizer the fatal
+        // catch above uses and exiting with the SAME fatal code — it is deliberately not raised into
+        // those catches, since nothing here may re-enter the retry classification.
+        var unexpectedOutcome = new InvalidOperationException(
+            $"Unexpected worker run outcome: {(int)outcome}.");
+        WriteBestEffort(
+            Console.Error, $"[Worker] Fatal error [{SafeExceptionLog.Describe(unexpectedOutcome)}]");
+        return 1;
+    }
+
+    // The registration-rejection diagnostic is emitted by the service itself. BOTH known outcomes
+    // stop this loop with the same exit code as before: the attempt is over.
+    break;
 }
 return 0;
+
+// Writes ONE static, already-sanitized diagnostic, GUARDED so a degraded sink (a redirected and
+// closed stdout/stderr raising IOException) can never escape to the runtime, can never be
+// classified as a connection failure, and can never alter the process exit code.
+static void WriteBestEffort(TextWriter writer, string message)
+{
+    try
+    {
+        writer.WriteLine(message);
+    }
+    catch (Exception)
+    {
+        // A diagnostic must never change the outcome it is merely reporting.
+    }
+}

@@ -228,8 +228,28 @@ public sealed class WorkerService(
     /// Runs the full worker lifecycle: connects to Copilot, registers with the orchestrator,
     /// opens a bidirectional gRPC stream, and processes task assignments until cancelled.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE RETURNED <see cref="WorkerRunOutcome"/> DISTINGUISHES THE TWO CLEAN FINISHES that a
+    /// caller previously could not tell apart: a REJECTED registration (which builds and publishes
+    /// nothing) and an ACCEPTED registration whose work stream ended with the whole run cleanup —
+    /// including this method's lexical transport disposal — completing normally.
+    /// </para>
+    /// <para>
+    /// The outcome is deliberately NOT an inference layer. Every exception that escaped before this
+    /// change still escapes unchanged, with the same identity and precedence, so a returned value
+    /// means only that no failure left this method: it says nothing about remote shutdown intent,
+    /// task success, the absence of a concurrent cancellation request, retryability, or a failure
+    /// reason — and no synthetic shutdown state is introduced.
+    /// </para>
+    /// </remarks>
     /// <param name="ct">Cancellation token that stops the worker.</param>
-    public async Task RunAsync(CancellationToken ct)
+    /// <returns>
+    /// <see cref="WorkerRunOutcome.RegistrationRejected"/> for a rejected registration, or
+    /// <see cref="WorkerRunOutcome.WorkStreamEnded"/> once the accepted connection's work stream
+    /// ended and the entire lifecycle teardown completed.
+    /// </returns>
+    public async Task<WorkerRunOutcome> RunAsync(CancellationToken ct)
     {
         // Prepare the agent runner. This creates NO LLM client: worker containers hold no LLM
         // credentials of their own, so the client is created lazily on the first prompt, after
@@ -273,9 +293,11 @@ public sealed class WorkerService(
         if (!registerResponse.Accepted)
         {
             // REJECTED: nothing was built and nothing is published, so no partial connection can
-            // ever be observed by another operation.
+            // ever be observed by another operation. The returned outcome is the ONLY thing this
+            // branch produces — no stream is opened, no connection is constructed, and the
+            // registration RPC's own failure (had there been one) would have propagated instead.
             _log.Error("Registration rejected by orchestrator.");
-            return;
+            return WorkerRunOutcome.RegistrationRejected;
         }
 
         var assignedId = string.IsNullOrEmpty(registerResponse.AssignedWorkerId)
@@ -415,6 +437,17 @@ public sealed class WorkerService(
                 RethrowDeferred(joinFailure);
             }
         }
+
+        // ACCEPTED-REGISTRATION NORMAL COMPLETION. This statement is lexically AFTER the cleanup
+        // block above and still INSIDE the lexical `using` scope, so it is reached only when the
+        // message loop returned normally AND the whole teardown — retire, unpublish, heartbeat
+        // cancel/join/dispose — completed without raising: every exception that escapes today still
+        // escapes, and a deferred cleanup failure rethrown above never reaches here. Because the
+        // stream and channel `using` disposals run as this scope unwinds, the value is observable
+        // to the caller only once the ENTIRE method, including that transport disposal, has
+        // finished. It reports observed normal completion of the accepted connection lifecycle and
+        // nothing more.
+        return WorkerRunOutcome.WorkStreamEnded;
     }
 
     /// <summary>The sanitized report message for a failed heartbeat cancellation request.</summary>
