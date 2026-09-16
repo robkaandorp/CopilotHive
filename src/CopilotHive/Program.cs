@@ -308,6 +308,31 @@ public sealed class Program
             builder.Services.AddSingleton<IWorkerAssignmentPublisher>(sp =>
                 sp.GetRequiredService<WorkerAssignmentPublisher>());
 
+            // Completion-receipt retention: the INSERT-ONCE completion-receipt store and the
+            // completion recorder that retains the durable evidence of a RETURNED worker completion
+            // from the STORED assignment context recorded immediately above.
+            //
+            // The store is FACTORY-ONLY for the same reason as the assignment store: every operation
+            // owns one short-lived context created through the IDbContextFactory registration above,
+            // so it must be constructed from the factory rather than bound to a context instance.
+            //
+            // The recorder is registered BOTH as the concrete type and as its narrow interface,
+            // resolved to the SAME singleton instance (the existing WorkerPool/IWorkerPool and
+            // WorkerAssignmentPublisher/IWorkerAssignmentPublisher pattern). The concrete registration
+            // is the mandatory production recorder — the interface is only the injection seam, never a
+            // replacement for it, and the transport has no fallback to an unrecorded completion path
+            // when no recorder is available.
+            builder.Services.AddSingleton(sp =>
+                new CompletionReceiptStore(
+                    sp.GetRequiredService<IDbContextFactory<CopilotHiveDbContext>>(),
+                    sp.GetRequiredService<ILogger<CompletionReceiptStore>>()));
+            builder.Services.AddSingleton(sp =>
+                new WorkerCompletionRecorder(
+                    sp.GetRequiredService<WorkerAssignmentContextStore>(),
+                    sp.GetRequiredService<CompletionReceiptStore>()));
+            builder.Services.AddSingleton<IWorkerCompletionRecorder>(sp =>
+                sp.GetRequiredService<WorkerCompletionRecorder>());
+
             // Backup service: creates tar.gz archives of runtime state
             builder.Services.AddSingleton(sp =>
                 new BackupService(stateDir,

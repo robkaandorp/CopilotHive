@@ -1,6 +1,7 @@
 using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
@@ -9,6 +10,8 @@ using Grpc.Core;
 
 using Google.Protobuf;
 
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
@@ -257,7 +260,8 @@ public sealed class HiveOrchestratorCompletionModelTests
         TaskQueue Queue,
         DashboardNotifier Dashboard,
         TaskCompletionNotifier TransportNotifier,
-        ConnectedWorker Worker);
+        ConnectedWorker Worker,
+        RecordingFixture Recording);
 
     private static Fixture CreateFixture()
     {
@@ -280,6 +284,11 @@ public sealed class HiveOrchestratorCompletionModelTests
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
+        // THE REAL COMPLETION-RECEIPT STORES and the REAL recorder over them. Without a recorder the
+        // transport FAILS CLOSED on every incoming completion, so the model-selection cells could
+        // never be observed; the model semantics under test are unchanged either way.
+        var recording = new RecordingFixture();
+
         var service = new HiveOrchestratorService(
             pool,
             taskQueue,
@@ -287,10 +296,74 @@ public sealed class HiveOrchestratorCompletionModelTests
             transportNotifier,
             dispatcher,
             NullLogger<HiveOrchestratorService>.Instance,
-            dashboardNotifier: dashboard);
+            dashboardNotifier: dashboard,
+            completionRecorder: recording.Recorder);
 
         var worker = pool.RegisterWorker(WorkerId, []);
-        return new Fixture(service, pool, taskQueue, dashboard, transportNotifier, worker);
+        return new Fixture(service, pool, taskQueue, dashboard, transportNotifier, worker, recording);
+    }
+
+    /// <summary>
+    /// THE REAL COMPLETION-RECEIPT STORES over a private in-memory SQLite database, plus the REAL
+    /// <see cref="WorkerCompletionRecorder"/> over them — the valid recorder injection and valid
+    /// assignment setup every ACCEPTING cell of this suite requires.
+    /// </summary>
+    /// <remarks>
+    /// A SMALL FIXTURE, NOT A SECOND HARNESS: there is no transport and no stream here. The anchor
+    /// connection must stay open for the test's lifetime — an in-memory SQLite database is destroyed
+    /// when its last connection closes — so the caller disposes the returned instance.
+    /// </remarks>
+    private sealed class RecordingFixture : IDisposable
+    {
+        private readonly SqliteConnection _connection;
+
+        public RecordingFixture()
+        {
+            _connection = new SqliteConnection("Data Source=:memory:");
+            _connection.Open();
+
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(_connection)
+                .Options;
+
+            using (var bootstrap = new CopilotHiveDbContext(options))
+                bootstrap.Database.EnsureCreated();
+
+            AssignmentStore = new WorkerAssignmentContextStore(
+                new SharedDbContextFactory(_connection, options),
+                NullLogger<WorkerAssignmentContextStore>.Instance);
+            ReceiptStore = new CompletionReceiptStore(
+                new SharedDbContextFactory(_connection, options),
+                NullLogger<CompletionReceiptStore>.Instance);
+            Recorder = new WorkerCompletionRecorder(AssignmentStore, ReceiptStore);
+        }
+
+        public WorkerAssignmentContextStore AssignmentStore { get; }
+
+        public CompletionReceiptStore ReceiptStore { get; }
+
+        public WorkerCompletionRecorder Recorder { get; }
+
+        /// <summary>
+        /// Records the GENUINE assignment context the completion recorder validates against: the
+        /// goal, the pinned worker and the role the queued task carries, at the phase whose existing
+        /// mapping produces that role (Tester ⇒ Testing).
+        /// </summary>
+        /// <param name="taskId">The queued task's identifier.</param>
+        public void RecordTesterContext(string taskId)
+        {
+            var context = new WorkerAssignmentContext(
+                "goal-model-selection",
+                WorkerId,
+                DomainWorkerRole.Tester,
+                new WorkSlot(taskId, new WorkSlotPosition(1, GoalPhase.Testing, 1), 1),
+                "assigned-model");
+
+            var write = AssignmentStore.InsertOnce(context);
+            Assert.Equal(WorkerAssignmentWriteStatus.Recorded, write.Status);
+        }
+
+        public void Dispose() => _connection.Dispose();
     }
 
     /// <summary>
@@ -353,7 +426,7 @@ public sealed class HiveOrchestratorCompletionModelTests
         bool fullPayload = false)
     {
         var fixture = CreateFixture();
-        var (service, _, taskQueue, dashboard, transportNotifier, worker) = fixture;
+        var (service, _, taskQueue, dashboard, transportNotifier, worker, recording) = fixture;
 
         // Seed the ACTIVE-TASK QUEUE through the production assignment path: this is what makes
         // the worker's busy/task state and the queue's assigned_worker agree.
@@ -365,6 +438,10 @@ public sealed class HiveOrchestratorCompletionModelTests
         service.ApplyTaskAssignment(worker, dequeued!);
         Assert.True(worker.IsBusy);
         Assert.Equal(taskId, worker.CurrentTaskId);
+
+        // THE VALID ASSIGNMENT SETUP the recording step requires: a GENUINE stored assignment
+        // context for the completing task, recorded through the REAL store.
+        recording.RecordTesterContext(taskId);
 
         var captured = new TaskCompletionSource<TaskResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -419,6 +496,7 @@ public sealed class HiveOrchestratorCompletionModelTests
             dashboard.OnStateChanged -= dashboardHandler;
             reader.Complete();
             await ObserveStreamForTeardownAsync(streamTask);
+            recording.Dispose();
         }
     }
 
@@ -439,7 +517,7 @@ public sealed class HiveOrchestratorCompletionModelTests
         bool present)
     {
         var fixture = CreateFixture();
-        var (service, pool, taskQueue, dashboard, transportNotifier, worker) = fixture;
+        var (service, pool, taskQueue, dashboard, transportNotifier, worker, recording) = fixture;
 
         // THE WORKER REALLY OWNS THE TASK, but the QUEUE does not: this isolates the
         // missing-active-entry refusal rather than merely failing the busy check.
@@ -486,6 +564,7 @@ public sealed class HiveOrchestratorCompletionModelTests
             dashboard.OnStateChanged -= dashboardHandler;
             reader.Complete();
             await ObserveStreamForTeardownAsync(streamTask);
+            recording.Dispose();
         }
     }
 
