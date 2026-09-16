@@ -355,6 +355,15 @@ public sealed class CompletionTransportOwnershipTests
             await h.ReadyAndAwaitIgnoredAsync();
             Assert.True(h.Worker.IsBusy);
             Assert.Equal("task-conflict", h.Worker.CurrentTaskId);
+
+            // AND IT DID NOT DEQUEUE: a pending task enqueued before the Ready is still in the
+            // queue, so the refusal's hold really blocked the dispatch.
+            h.Queue.Enqueue(h.BuildTask("task-conflict-pending", "pending-model"));
+            await h.ReadyAndAwaitIgnoredAsync();
+
+            var conflictPending = h.Queue.TryDequeueAny();
+            Assert.NotNull(conflictPending);
+            Assert.Equal("task-conflict-pending", conflictPending!.TaskId);
         });
     }
 
@@ -1020,6 +1029,14 @@ public sealed class CompletionTransportOwnershipTests
                 // (b) …and NOTHING was dispatched: an advancing pipeline drives the real
                 //     PipelineDriver, which enqueues the successor task. No enqueue happened.
                 Assert.Equal(tasksEnqueuedBeforeLateCompletion, h.TasksEnqueued);
+
+                // (c) THE RECEIPT PERSISTED through the late completion — even though the
+                //     downstream missing-pipeline guard dropped it. The recorder holds no
+                //     pipeline precondition, so the evidence survives the cancelled goal.
+                var lateReceipt = h.ReadReceipt(taskId);
+                Assert.NotNull(lateReceipt);
+                Assert.Equal(goalId, lateReceipt!.Receipt.GoalId);
+                Assert.Equal(taskId, lateReceipt.Receipt.Slot.TaskId);
 
                 // The stream is alive — the late completion did not unwind it.
                 Assert.False(h.StreamEnded);
