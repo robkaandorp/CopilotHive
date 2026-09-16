@@ -275,20 +275,23 @@ public sealed class WorkerRedactionIntegrationTests
     }
 
     /// <summary>
-    /// STRUCTURAL REGRESSION for the returned-outcome handling in the worker entry point: the
-    /// outcome consumed after the attempt loop's catch region is the value the awaited
-    /// <see cref="WorkerService.RunAsync"/> genuinely returned, the handling sits AFTER every
-    /// retry-governing catch, and both diagnostics it writes are guarded.
+    /// STRUCTURAL REGRESSION for the returned-outcome handling in the worker entry point: an
+    /// outcome becomes ELIGIBLE for post-catch handling only after BOTH the awaited
+    /// <see cref="WorkerService.RunAsync"/> return AND the attempt's <see cref="WorkerService.Dispose"/>
+    /// completed without throwing; the retry catch ends its own iteration explicitly; the handling
+    /// sits AFTER every retry-governing catch; and both diagnostics it writes are guarded.
     /// <para>
-    /// THE REVIEWER MAJOR this pins: iteration 1 emitted the returned-outcome handling — including
-    /// a <c>Console.WriteLine</c> — before <c>break</c> and INSIDE the catch region whose
-    /// <c>IOException</c> branch retries. A closed redirected stdout throws
-    /// <see cref="IOException"/> from <c>Console</c>, so a clean-EOF outcome could be converted
-    /// into a fresh connection attempt — a clean-EOF reconnect. The structure below makes that
-    /// misrouting impossible: the catch classification only ever sees exceptions raised inside the
-    /// covered region (RunAsync, disposal), and every diagnostic the returned-outcome path writes is
-    /// best-effort, so a degraded sink can neither create an attempt nor change the exit code nor
-    /// reach the runtime unhandled.
+    /// THE REVIEWER MAJORS this pins. Iteration 1 emitted the returned-outcome handling before
+    /// <c>break</c> and INSIDE the catch region whose <c>IOException</c> branch retries, so a
+    /// throwing Console write could become a clean-EOF reconnect. Iteration 2 moved the handling
+    /// after the catches but assigned the captured value BEFORE the fallible disposal, so a
+    /// retry-class disposal fault (<c>RpcException</c>/<c>HttpRequestException</c>/<c>IOException</c>)
+    /// after a normal return logged, backed off, and then FELL THROUGH with the value still
+    /// populated — exiting instead of creating the fresh attempt the pre-change flow created.
+    /// Iteration 3 fixed both halves: a two-step capture (the raw run value inside the inner try,
+    /// disposal in its finally, the eligibility assignment only after the try/finally) plus an
+    /// explicit <c>continue;</c> in the retry catch. The brace-scoped assertions below fail loudly
+    /// under either earlier shape.
     /// </para>
     /// </summary>
     [Fact]
@@ -298,14 +301,20 @@ public sealed class WorkerRedactionIntegrationTests
         Assert.True(File.Exists(programPath), $"Worker Program.cs not found at '{programPath}'.");
         var source = File.ReadAllText(programPath).ReplaceLineEndings("\n");
 
-        // The REAL result of the run is captured INSIDE the covered region and nothing else happens
-        // there: the outcome is merely captured, so no diagnostic of ours can ever be classified as
-        // a connection failure.
-        const string OutcomeCapture = "completedOutcome = await service.RunAsync(cts.Token);";
-        // Disposal stays in a finally INSIDE the try whose sanitized catches redact its faults.
+        // ── THE TWO-STEP CAPTURE ──────────────────────────────────────────────
+        // The RAW run value is assigned inside the inner try; the ELIGIBLE value is assigned
+        // separately, and both literals occur exactly once.
+        const string RawRunCapture = "runOutcome = await service.RunAsync(cts.Token);";
+        const string EligibilityAssignment = "completedOutcome = runOutcome;";
         const string DisposalInFinally = "service.Dispose();";
-        // A returned outcome unconditionally stops the loop; a thrown failure leaves the outcome
-        // null and simply retries.
+
+        // ── THE RETRY CATCH ENDS ITS OWN ITERATION ────────────────────────────
+        // A classified thrown failure must proceed to the NEXT attempt exactly as the pre-change
+        // control flow did; it may never fall through into the returned-outcome handling.
+        const string RetryCatchBackoff = "delay = delay * 2 > maxDelay ? maxDelay : delay * 2;";
+        const string RetryCatchContinue = "continue;";
+
+        // ── THE DEFENSE-IN-DEPTH GUARD AND THE UNCONDITIONAL EXIT ─────────────
         const string NullOutcomeContinues = "if (completedOutcome is not { } outcome)\n        continue;";
         const string CleanExitBreak = "    break;\n}\nreturn 0;";
         // Both diagnostics the returned-outcome path emits are guarded writes, never raw Console.
@@ -315,8 +324,9 @@ public sealed class WorkerRedactionIntegrationTests
 
         foreach (var fragment in new[]
                  {
-                     OutcomeCapture, DisposalInFinally, NullOutcomeContinues,
-                     CleanExitBreak, WorkStreamEndedDiagnostic, BestEffortHelper,
+                     RawRunCapture, EligibilityAssignment, DisposalInFinally,
+                     NullOutcomeContinues, CleanExitBreak, WorkStreamEndedDiagnostic,
+                     BestEffortHelper,
                  })
         {
             Assert.True(
@@ -324,15 +334,62 @@ public sealed class WorkerRedactionIntegrationTests
                 $"Expected exactly one worker Program.cs occurrence of '{fragment}'.");
         }
 
-        // ORDER: the outcome is captured before disposal (the finally), and the disposal — the last
-        // statement inside the covered region — is followed by the catch handlers BEFORE any
-        // returned-outcome handling. The handling's first observable statement therefore appears
-        // AFTER the final fatal catch, i.e. outside every retry-governing catch.
+        // ── ORDER: CAPTURE → DISPOSAL → ELIGIBILITY ───────────────────────────
+        // The raw value is captured first, the disposal then runs in the finally, and ONLY after
+        // the disposal succeeded does the outcome become eligible. Under the iteration-2 defect
+        // (the eligible assignment was the capture itself, before the disposal) this fails: a
+        // throwing Dispose could leave the eligible value populated.
         Assert.True(
-            source.IndexOf(OutcomeCapture, StringComparison.Ordinal)
+            source.IndexOf(RawRunCapture, StringComparison.Ordinal)
             < source.IndexOf(DisposalInFinally, StringComparison.Ordinal),
-            "The awaited outcome must be captured before service disposal runs.");
+            "The run outcome must be captured before service disposal runs.");
+        Assert.True(
+            source.IndexOf(DisposalInFinally, StringComparison.Ordinal)
+            < source.IndexOf(EligibilityAssignment, StringComparison.Ordinal),
+            "The outcome must become eligible only AFTER service disposal completed: a throwing "
+            + "disposal must skip the eligibility assignment.");
 
+        // ── BRACE-SCOPED: the covered region really ends with the eligibility assignment ──
+        // Extract the outer try block (anchored on the eligibility field's declaration, so the
+        // ProcessExit handler's earlier try cannot be picked up) and prove the assignment is the
+        // LAST statement of the covered region — nothing between the disposal's try/finally and
+        // the assignment, so the disposal's exception path cannot reach it.
+        var coveredRegion = ExtractBracedBlock(
+            source, "WorkerRunOutcome? completedOutcome = null;\n\n    try\n    {");
+        Assert.False(coveredRegion is null, "The outer covered try block was not found.");
+        Assert.Contains(RawRunCapture, coveredRegion!, StringComparison.Ordinal);
+        Assert.Contains(DisposalInFinally, coveredRegion!, StringComparison.Ordinal);
+        Assert.Contains(EligibilityAssignment, coveredRegion!, StringComparison.Ordinal);
+        Assert.True(
+            coveredRegion!.LastIndexOf(DisposalInFinally, StringComparison.Ordinal)
+            < coveredRegion.LastIndexOf(EligibilityAssignment, StringComparison.Ordinal),
+            "Within the covered region, disposal must precede the eligibility assignment.");
+        // The assignment follows the inner try/finally's closing braces — no statement sits between
+        // them, so a disposal fault unwinding out of the inner finally provably skips the capture.
+        var innerFinallyEnd = coveredRegion.LastIndexOf("        }\n\n", StringComparison.Ordinal);
+        Assert.True(
+            innerFinallyEnd >= 0
+            && coveredRegion.IndexOf(EligibilityAssignment, StringComparison.Ordinal) > innerFinallyEnd,
+            "The eligibility assignment must follow the inner try/finally unwinding point.");
+
+        // ── BRACE-SCOPED: the retry catch explicitly proceeds to the next iteration ──
+        // Extract the retry catch's body and prove it ends its OWN iteration with `continue;`
+        // AFTER the existing sanitized log and backoff — it never falls through into the
+        // returned-outcome handling, whatever the ineligible locals still hold.
+        var retryCatchBody = ExtractBracedBlock(
+            source, "catch (Exception ex) when (ex is RpcException or HttpRequestException or IOException)");
+        Assert.False(retryCatchBody is null, "The retry-class catch block was not found.");
+        Assert.Contains(
+            "[Worker] Connection failed [", retryCatchBody!, StringComparison.Ordinal);
+        Assert.Contains(RetryCatchBackoff, retryCatchBody!, StringComparison.Ordinal);
+        Assert.Contains(RetryCatchContinue, retryCatchBody!, StringComparison.Ordinal);
+        Assert.True(
+            retryCatchBody!.LastIndexOf(RetryCatchBackoff, StringComparison.Ordinal)
+            < retryCatchBody.LastIndexOf(RetryCatchContinue, StringComparison.Ordinal),
+            "The retry catch must `continue;` AFTER the backoff math: the next attempt starts exactly "
+            + "as the pre-change control flow did, never via fall-through into outcome handling.");
+
+        // ── THE HANDLING STAYS OUTSIDE EVERY RETRY-GOVERNING CATCH ────────────
         var catchRegionStart = source.IndexOf(
             "catch (OperationCanceledException)", StringComparison.Ordinal);
         var finalFatalCatch = source.IndexOf(
@@ -347,15 +404,13 @@ public sealed class WorkerRedactionIntegrationTests
             "Returned-outcome handling must come AFTER the final fatal catch: a throwing diagnostic "
             + "there can never be classified as a connection failure and retried.");
 
-        // A returned outcome always stops the loop with the SAME exit code as before: the break is
-        // reached for both known outcomes, and the WorkStreamEnded write cannot reroute the loop.
+        // ── A RETURNED OUTCOME ALWAYS STOPS THE LOOP WITH THE SAME EXIT CODE ──
         Assert.True(
             source.IndexOf(WorkStreamEndedDiagnostic, StringComparison.Ordinal)
             < source.IndexOf(CleanExitBreak, StringComparison.Ordinal),
             "The WorkStreamEnded diagnostic must precede the unconditional loop exit.");
 
-        // The guarded helper swallows everything: a degraded stdout/stderr can neither escape to the
-        // runtime nor alter the control flow the outcome dictates.
+        // ── THE GUARDED HELPER SWALLOWS EVERYTHING ─────────────────────────────
         var helperBody = source[source.IndexOf(BestEffortHelper, StringComparison.Ordinal)..];
         Assert.Contains("try", helperBody, StringComparison.Ordinal);
         Assert.Contains("catch (Exception)", helperBody, StringComparison.Ordinal);
@@ -448,6 +503,39 @@ public sealed class WorkerRedactionIntegrationTests
         }
 
         return count;
+    }
+
+    /// <summary>
+    /// Extracts the brace-balanced block whose opening line contains <paramref name="anchor"/>,
+    /// starting at the anchor's own opening brace. Returns the block's body INCLUDING the opening
+    /// and closing braces, or null when no such anchor exists. Brace counting ignores braces inside
+    /// string literals well enough for the worker Program.cs, whose blocks contain no
+    /// brace-bearing string literals at the anchors used here.
+    /// </summary>
+    private static string? ExtractBracedBlock(string source, string anchor, int? startLineIndent = null)
+    {
+        var anchorStart = source.IndexOf(anchor, StringComparison.Ordinal);
+        if (anchorStart < 0)
+            return null;
+
+        var open = source.IndexOf('{', anchorStart);
+        if (open < 0)
+            return null;
+
+        var depth = 0;
+        for (var i = open; i < source.Length; i++)
+        {
+            if (source[i] == '{')
+                depth++;
+            else if (source[i] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                    return source[anchorStart..(i + 1)];
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
