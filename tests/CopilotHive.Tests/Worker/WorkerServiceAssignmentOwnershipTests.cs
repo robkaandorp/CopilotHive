@@ -416,8 +416,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// entry, proving publication happened before transport completion.  The exact terminal
     /// payload for that outcome (output byte-for-byte, verdict, issues, counts and git summary)
     /// must be present both in the retained domain result and in the byte-for-byte pre-existing
-    /// wire mapping.  A successful report and body exit do not clear the owner; only the later
+    /// wire mapping.  A successful report and reporting exit do not clear the owner; only the later
     /// matching-cancel drain does.
+    /// <para>
+    /// THE EXECUTION/REPORTING SPLIT is observed at both gates. At the Complete gate the EXECUTION
+    /// task is already TERMINAL while REPORTING is held by the transport write; at the Ready gate
+    /// only REPORTING is incomplete. Completing reporting alone still leaves the owner, both
+    /// original tasks and the exact retained result in place — a successful write is not an
+    /// acknowledgement.
+    /// </para>
     /// <para>
     /// The OUTCOME dimension is what stops a status-conditional publication (for example one that
     /// only retains <see cref="TaskOutcome.Completed"/> results) from surviving: the Failed and
@@ -477,7 +484,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             var retainedBeforeWrite = AssertFullRetainedResult(service, taskId, outcome);
             AssertWirePayload(requests.Completes[0].Complete, taskId, outcome);
-            Assert.False(GetActiveExecution(service).IsCompleted);
+
+            // THE SPLIT, OBSERVED AT THE COMPLETE GATE. The held transport write keeps only the
+            // CONNECTION-BOUND REPORTING task alive; the EXECUTION task is already TERMINAL.
+            Assert.True(
+                GetActiveExecution(service).IsCompleted,
+                "Execution must be terminal once its result is retained — a held Complete write may not keep it running.");
+            Assert.False(
+                GetActiveReporting(service).IsCompleted,
+                "Reporting must still be held inside the gated Complete write.");
             Assert.Equal(1, runner.ExecutionEntryCount);
             Assert.Equal(1, runner.PromptCount);
 
@@ -487,12 +502,24 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // Successful transport is not an acknowledgement and does not release ownership.
             Assert.Same(retainedBeforeWrite, GetRetainedResult(service));
             var execution = GetActiveExecution(service);
-            Assert.False(execution.IsCompleted);
-            requests.ReleaseReady(0);
-            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var reporting = GetActiveReporting(service);
 
+            // AT THE READY GATE only REPORTING is incomplete.
+            Assert.True(execution.IsCompleted, "Execution must stay terminal while Ready is held.");
+            Assert.False(reporting.IsCompleted, "Reporting must still be held inside the gated Ready write.");
+            requests.ReleaseReady(0);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Completing REPORTING alone neither clears ownership nor implies acknowledgement: the
+            // owner, BOTH of its original tasks and the EXACT retained result are all still held.
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.Same(execution, GetActiveExecution(service));
+            Assert.Same(reporting, GetActiveReporting(service));
             Assert.Same(retainedBeforeWrite, GetRetainedResult(service));
             AssertFullResult(retainedBeforeWrite, taskId, outcome);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
 
             responses.Push(MatchingCancel(taskId));
             responses.Push(Probe("after-clear"));
@@ -516,9 +543,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// A transport failure (ordinary fault or cancellation) cannot replace the produced result
     /// with a reporting error, for ANY domain outcome.  Each cell runs both executor branches and
     /// both terminations against a Completed, Failed or Cancelled executor result, observes the
-    /// full result at the Complete gate, after the injected write termination, and after the body
-    /// itself exits, then verifies that execution occurred exactly once before explicitly draining
-    /// the owner.
+    /// full result at the Complete gate, after the injected write termination, and after the
+    /// reporting task itself exits, then verifies that execution occurred exactly once before
+    /// explicitly draining the owner.
+    /// <para>
+    /// A FAILED OR CANCELLED COMPLETE IS A REPORTING FAULT ONLY. The execution task is already
+    /// terminal at the gate and stays successfully completed, the reporting task also completes
+    /// successfully (no retry, exactly one Complete attempt), and the retained result is the
+    /// IDENTICAL instance throughout.
+    /// </para>
     /// </summary>
     [Theory]
     [InlineData(false, CompleteTermination.Failure, RetainedOutcome.Completed)]
@@ -578,21 +611,36 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             var retainedAtGate = AssertFullRetainedResult(service, taskId, outcome);
             AssertWirePayload(requests.Completes[0].Complete, taskId, outcome);
+
+            // The EXECUTION task already produced its result and terminated; only the
+            // CONNECTION-BOUND REPORTING is held by the write that is about to fail/cancel.
+            var execution = GetActiveExecution(service);
+            var reporting = GetActiveReporting(service);
+            Assert.True(execution.IsCompleted, "Execution must be terminal before the transport write terminates.");
+            Assert.False(reporting.IsCompleted, "Reporting must be held inside the gated Complete write.");
+
             requests.ReleaseComplete(0);
 
-            // Complete has now faulted/cancelled and the body's existing handler has advanced to
-            // Ready.  Ready is held only as a deterministic body-exit barrier, never as an ack.
+            // Complete has now faulted/cancelled and the reporting task's existing handler has
+            // advanced to Ready.  Ready is held only as a deterministic reporting-exit barrier,
+            // never as an ack.
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Same(retainedAtGate, GetRetainedResult(service));
             Assert.Single(requests.Completes);
             Assert.Equal(1, runner.ExecutionEntryCount);
             Assert.Equal(1, runner.PromptCount);
 
-            var execution = GetActiveExecution(service);
-            Assert.False(execution.IsCompleted);
+            Assert.True(execution.IsCompleted, "A failed Complete write must not revive or re-run execution.");
+            Assert.False(reporting.IsCompleted);
             requests.ReleaseReady(0);
-            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+            // THE PRODUCER SUCCEEDED: a transport failure is a REPORTING fault only. Both original
+            // tasks completed successfully, with the IDENTICAL retained result and no retry.
+            Assert.True(execution.IsCompletedSuccessfully, "A transport failure must not fault the execution task.");
+            Assert.True(
+                reporting.IsCompletedSuccessfully,
+                "A failed/cancelled Complete write must leave a successfully completed reporting task.");
             Assert.Same(retainedAtGate, GetRetainedResult(service));
             AssertFullResult(retainedAtGate, taskId, outcome);
             Assert.Single(requests.Completes);
@@ -618,10 +666,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// Provisioning fails inside the assignment body but before TaskExecutor exists.  The owner is
-    /// installed and retained through body exit, yet its terminal slot is empty: there is no
-    /// fabricated Complete and no executor invocation.  Matching cancel then performs the normal
-    /// drain-and-clear transition.
+    /// Provisioning fails inside the assignment's EXECUTION task but before TaskExecutor exists.
+    /// The owner is installed and retained through reporting exit, yet its terminal slot is empty:
+    /// there is no fabricated Complete and no executor invocation.  Matching cancel then performs
+    /// the normal drain-and-clear transition, joining BOTH original tasks.
     /// </summary>
     [Fact]
     public async Task ProvisioningFailureBeforeExecution_RetainedHolderStaysEmptyUntilExplicitDrain()
@@ -656,9 +704,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.Equal(0, runner.ExecutionEntryCount);
             Assert.Equal(0, runner.PromptCount);
 
+            // The setup failure ended EXECUTION; only the Ready attempt (reporting) is still held.
             var execution = GetActiveExecution(service);
+            var reporting = GetActiveReporting(service);
+            Assert.True(execution.IsCompleted, "A setup failure terminates execution before any Ready write.");
+            Assert.False(reporting.IsCompleted, "Reporting is held inside the gated Ready write.");
+
             requests.ReleaseReady(0);
-            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.Null(GetRetainedResult(service));
             Assert.Empty(requests.Completes);
@@ -683,11 +736,505 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// Replacement is forced through the REAL assignment handler while A is still blocked in its
-    /// Ready write. The loop consumes B, but the handler cannot reset the runner, start B's body or
-    /// install B's owner until A's ORIGINAL execution has been joined — so A and its result remain
-    /// the owner, B has neither started nor been installed, and once A is released B receives a
-    /// fresh empty holder that never observes A's result.
+    /// HELD REPORT AT EOF — the regression this split must not introduce. With the assignment's
+    /// EXECUTION already terminal and its CONNECTION-BOUND REPORTING held inside a gated Complete
+    /// write, the reader reaches EOF: the loop CANNOT finish and CANNOT retire the connection while
+    /// that report is still outstanding, because its teardown drain joins BOTH original tasks.
+    /// Releasing the gates lets the report finish, the drain complete, ownership clear and the
+    /// connection retire.
+    /// <para>
+    /// REMOVAL PROOF — deterministic, not schedule-dependent. A teardown that joined only the
+    /// execution would find it already terminal and run straight through, RETIRING the connection
+    /// while the report is still parked in its Complete write. The report's SUBSEQUENT Ready write
+    /// then hits the retired connection's checked access and can never enter the writer at all, so
+    /// the awaited <c>ReadyEntered(0)</c> below never completes and the single-Ready assertion fails
+    /// by name. That consequence is caused by production ordering, not by test scheduling.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task EofWhileReportHeld_LoopCannotFinishOrRetireUntilReportingReleases()
+    {
+        const string taskId = "task-held-report";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? execution = null;
+        Task? reporting = null;
+        var teardownEnteredRegistration = default(CancellationTokenRegistration);
+        try
+        {
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+
+            // A BENIGN rendezvous on the owner's OWN source: the teardown drain's cancellation
+            // request is the first thing it does, so this fires once teardown has entered the
+            // drain. It changes no outcome — it only records.
+            var teardownEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            teardownEnteredRegistration = GetOwnerCts(service).Token.Register(
+                () => teardownEntered.TrySetResult());
+
+            // Let the executor finish; the report then parks inside the gated Complete write.
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+
+            // EOF while the REPORT — and only the report — is still outstanding.
+            responses.TryComplete();
+            await teardownEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The teardown drain is parked on the reporting join, so nothing may be finished,
+            // cleared or retired. The report cannot complete before its gate opens.
+            Assert.True(execution.IsCompleted, "Execution is terminal; only the report is held.");
+            Assert.False(reporting.IsCompleted, "The report must still be held inside its Complete write.");
+            Assert.False(loop.IsCompleted, "The loop must not finish while the retained report is outstanding.");
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.False(connection.IsRetired, "Retirement must follow the drain of BOTH original tasks.");
+            Assert.Same(retained, GetRetainedResult(service));
+
+            // THE DETERMINISTIC DISCRIMINATOR. Release the Complete write: the report advances to
+            // its single Ready, which can only ENTER the writer while the connection is still
+            // usable — i.e. only if teardown really is waiting on this report.
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+        }
+        finally
+        {
+            teardownEnteredRegistration.Dispose();
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// A matching cancel arriving while execution is terminal and connection-bound reporting is
+    /// parked in its Ready write must join BOTH original tasks before clearing ownership.
+    /// <para>
+    /// THE CANCELLATION PHASE IS COMPLETED FIRST, BY THE TEST. Before invoking the transition, the
+    /// fixture calls <c>await ownerCts.CancelAsync()</c> and awaits it to completion, so every
+    /// registered callback has already run. That matters because
+    /// <c>DrainAssignmentAsync</c>'s first step is <c>CaptureCancellationFailureAsync</c>, whose
+    /// <c>CancelAsync</c> dispatches callbacks ASYNCHRONOUSLY: signalling from inside a callback
+    /// proves only that cancellation STARTED, not that the drain reached either join, which left a
+    /// legal schedule where a join-less mutant was still inside cancellation while the test took
+    /// its in-flight observations.
+    /// </para>
+    /// <para>
+    /// WITH THE SOURCE ALREADY CANCELLED that ambiguity disappears. <c>CancelAsync</c> on an
+    /// already-cancelled source completes synchronously, and the execution join is likewise already
+    /// complete, so the transition runs SYNCHRONOUSLY through its cancellation phase and both
+    /// preceding steps:
+    /// <list type="bullet">
+    ///   <item><description>CORRECT code reaches the HELD reporting join — its first genuinely
+    ///   incomplete await — and therefore returns an INCOMPLETE task, with the owner, the retained
+    ///   result and the undisposed CTS all still installed.</description></item>
+    ///   <item><description>A version with <c>await CaptureJoinFailureAsync(assignment.Reporting)</c>
+    ///   REMOVED has no incomplete await left: it disposes the CTS, clears the slot and completes
+    ///   BEFORE <c>InvokeMatchingCancelDrain</c> even returns. Every in-flight assertion below then
+    ///   fails by name, on every schedule.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// The release-side proof is retained and remains independent: a test-owned source is signalled
+    /// from the report's OWN Ready-write callback, on the reporting task's own call stack, and only
+    /// when the exact original owner and retained result are STILL installed at that last instant
+    /// where reporting is provably alive. A mutant that cleared ownership early can never produce
+    /// that signal; a no-op callback or a post-hoc count could not satisfy it either.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task MatchingCancelWhileReportHeldAtReadyGate_DrainJoinsReportingBeforeClear()
+    {
+        const string taskId = "task-cancel-held-report";
+        var runner = new RetentionRunner(LongOutput);
+
+        // SIGNALLED ONLY ON THE CORRECT PATH. The writer invokes this callback on the reporting
+        // task's own stack after its Ready gate opens but before that write returns. The callback
+        // signals only if the matching-cancel transition STILL owns the exact original assignment
+        // and result at that last instant where reporting is provably alive. Because the private
+        // transition below executes synchronously until its first incomplete await, a mutant that
+        // removes the reporting join has already cleared ownership before this gate is released and
+        // can never signal this source.
+        var ownerRetainedAtReportRelease = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        object? expectedOwner = null;
+        TaskResult? expectedResult = null;
+        WorkerService? serviceRef = null;
+        var requests = new RetentionRequestStream(readyTermination: index =>
+        {
+            if (index == 0
+                && serviceRef is { } observed
+                && ReferenceEquals(expectedOwner, GetActiveAssignment(observed))
+                && ReferenceEquals(expectedResult, GetRetainedResult(observed)))
+            {
+                ownerRetainedAtReportRelease.TrySetResult();
+            }
+
+            return null;
+        });
+
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+        serviceRef = service;
+
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+        var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+
+        Task? execution = null;
+        Task? reporting = null;
+        MatchingDrainOperation? matchingDrain = null;
+        CancellationTokenRegistration cancellationObservedRegistration = default;
+        try
+        {
+            // 1. Run A to its READY write. Complete already succeeded and the shared claim is
+            // consumed, leaving only the connection-bound reporting task alive.
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            expectedOwner = GetActiveAssignment(service);
+            var ownerCts = GetOwnerCts(service);
+            var ownerReadyClaim = GetOwnerReadyClaim(service);
+            expectedResult = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            AssertWirePayload(requests.Completes[0].Complete, taskId, RetainedOutcome.Completed);
+
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(execution.IsCompletedSuccessfully);
+            Assert.False(reporting.IsCompleted, "The report must be parked inside its Ready write.");
+            Assert.Equal(1, GetReadyClaimState(ownerReadyClaim));
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+
+            // 2. COMPLETE THE CANCELLATION PHASE UP FRONT, and prove it really ran: a callback on
+            // the assignment's own token records that cancellation was dispatched, and awaiting
+            // CancelAsync guarantees every such callback has run to completion before we continue.
+            // This is the SAME source and the SAME cancellation the transition performs, so nothing
+            // about production behaviour changes — it is merely already done when the call starts.
+            var cancellationObserved = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            cancellationObservedRegistration = ownerCts.Token.Register(
+                () => cancellationObserved.TrySetResult());
+
+            await ownerCts.CancelAsync();
+
+            Assert.True(ownerCts.IsCancellationRequested, "The assignment source must be cancelled up front.");
+            Assert.True(
+                cancellationObserved.Task.IsCompletedSuccessfully,
+                "Awaiting CancelAsync must have run every registered callback to completion.");
+
+            // The cancellation phase is finished, yet NOTHING has been drained or cleared: the
+            // report is still held, ownership and the retained result are intact, and the source is
+            // still usable. Cancelling alone is not an ownership transition.
+            Assert.False(reporting.IsCompleted);
+            Assert.Same(expectedOwner, GetActiveAssignment(service));
+            Assert.Same(expectedResult, GetRetainedResult(service));
+            Assert.Null(Record.Exception(() => _ = ownerCts.Token));
+
+            // 3. Invoke the ACTUAL private transition used by the matching-cancel handler while the
+            // loop itself remains parked on its reader. An async method runs synchronously until its
+            // first INCOMPLETE await. Cancellation is already complete (step 2) and so is the
+            // execution join, so correct code can only return here by reaching the HELD reporting
+            // join. A version with that join removed has no incomplete await left and therefore
+            // disposes the source, clears ownership and COMPLETES before this call returns.
+            matchingDrain = InvokeMatchingCancelDrain(service);
+
+            // IMMEDIATE, SCHEDULE-INDEPENDENT PRE-RELEASE PROOF — taken with no intervening await,
+            // so no continuation of any kind can have run in between. A no-reporting-join mutant
+            // fails these BY NAME on every run.
+            Assert.False(
+                matchingDrain.Completion.IsCompleted,
+                "Matching-cancel must remain incomplete while the original reporting task is held — "
+                + "with cancellation and the execution join already complete, the only await it can "
+                + "be parked on is the held reporting join.");
+            Assert.False(reporting.IsCompleted);
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.Same(expectedOwner, GetActiveAssignment(service));
+            Assert.Same(expectedResult, GetRetainedResult(service));
+            Assert.Null(Record.Exception(() => _ = ownerCts.Token));
+
+            // 4. Release the report. The test-owned source above is signalled only from the report's
+            // write callback while the exact original owner/result are still installed. A removed
+            // reporting join has already cleared them synchronously and cannot produce this signal.
+            requests.ReleaseReady(0);
+            await ownerRetainedAtReportRelease.Task.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await matchingDrain.Completion.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Null(matchingDrain.DeferredFailure());
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.False(connection.IsRetired, "A matching-cancel ownership transition does not retire the connection.");
+
+            // Exactly one execution, Complete and Ready attempt; the matching cancel found the
+            // report's claim consumed and could not retry anything. The retained local remains full.
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, GetReadyClaimState(ownerReadyClaim));
+            AssertFullResult(expectedResult, taskId, RetainedOutcome.Completed);
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(connection.IsRetired);
+        }
+        finally
+        {
+            cancellationObservedRegistration.Dispose();
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("matching-cancel drain", matchingDrain?.Completion),
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// A PRODUCER CANCELLED BEFORE ITS <c>Task.Run</c> BODY EVER STARTS is still OBSERVED by the
+    /// connection-bound reporting task, which terminates rather than being skipped.
+    /// <para>
+    /// HOW THE PRE-START CANCELLATION IS PRODUCED — through real production ordering, not a seam.
+    /// The assignment handler calls <c>ResetSessionAsync</c> with the LOOP token, and only
+    /// afterwards creates the assignment CTS and launches <c>Task.Run(..., ct)</c> with that SAME
+    /// loop token. Cancelling the loop source from INSIDE the runner's reset entry therefore lands
+    /// strictly between those two steps, so the runtime never invokes the delegate at all: the
+    /// execution task goes straight to <c>Canceled</c> with its body unrun.
+    /// (<c>ExecutionEntryCount</c> and <c>PromptCount</c> staying at zero prove the body never ran.)
+    /// </para>
+    /// <para>
+    /// WHAT THIS PINS. Reporting awaits that ORIGINAL task DIRECTLY, so this otherwise-unexercised
+    /// path is covered end to end and its contract is fixed:
+    /// <list type="bullet">
+    ///   <item><description>NO Complete is fabricated and NO Ready is attempted — the holder is
+    ///   empty and the claim is left UNCONSUMED;</description></item>
+    ///   <item><description>the heartbeat task state is cleared;</description></item>
+    ///   <item><description>the loop's teardown drain — which joins BOTH original tasks WITHOUT a
+    ///   caller token — REACHES COMPLETION and clears ownership, so neither task was abandoned. A
+    ///   report that never terminated would park that drain forever; the failsafe outcome is
+    ///   rejected by name below, so a hang cannot masquerade as the expected cancellation.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// SCOPE, STATED PLAINLY. This cell does NOT claim to kill a
+    /// <c>ContinueWith(..., NotOnCanceled)</c> mutant. On this exact path such a continuation
+    /// yields a CANCELLED reporting task, and the drain tolerates ordinary cancellation from either
+    /// owned task identically — so the externally observable outcome (no Complete, no Ready,
+    /// cleared state, completed teardown) is the same. What the cell does guarantee is that the
+    /// pre-start-cancelled producer is genuinely REACHED by production (proved by zero executor and
+    /// prompt entries against one session reset) and that the two-task drain still terminates
+    /// through it, which is exactly the regression an accidental rewrite of this path would break.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ProducerCancelledBeforeBodyStart_ReportingObservesItAndDrainStillCompletes()
+    {
+        const string taskId = "task-prestart-cancelled";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        var loop = InvokeProcessMessagesWith(service, connection, loopCts.Token);
+        try
+        {
+            // CANCEL THE LOOP SOURCE AT THE RESET BOUNDARY — after the handler's reset call, and
+            // strictly before it creates the assignment CTS and launches Task.Run with that token.
+            runner.OnResetEntered = _ => loopCts.Cancel();
+
+            responses.Push(ResultAssignment(taskId));
+
+            // The loop's next read observes the cancelled token and unwinds into its teardown,
+            // which cancels and drains BOTH original tasks before clearing ownership.
+            //
+            // REACHING COMPLETION IS THE JOIN EVIDENCE. DrainAssignmentAsync awaits the reporting
+            // task with NO caller token, so a report that never observed its pre-start-cancelled
+            // producer — and therefore never terminated — would park the drain forever and this
+            // wait would end in a TimeoutException. That outcome is rejected BY NAME below, so a
+            // hang can never be mistaken for the expected cancellation.
+            var loopOutcome = await Record.ExceptionAsync(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.IsNotType<TimeoutException>(loopOutcome);
+            Assert.IsAssignableFrom<OperationCanceledException>(loopOutcome);
+            Assert.True(loop.IsCompleted, "Both original tasks must have been joined by the teardown drain.");
+
+            // THE BODY NEVER RAN: the producer was cancelled before its delegate was invoked.
+            Assert.Equal(0, runner.ExecutionEntryCount);
+            Assert.Equal(0, runner.PromptCount);
+            Assert.Equal(1, runner.ResetCount);
+
+            // NOTHING WAS FABRICATED and NOTHING was written on the assignment's behalf.
+            Assert.Empty(requests.Completes);
+            Assert.Equal(0, requests.ReadyCount);
+
+            // OWNERSHIP AND HEARTBEAT STATE were cleaned up by the completed teardown drain.
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+        }
+        finally
+        {
+            runner.OnResetEntered = null;
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// Directly pins the reporting boundary's behavior for a producer cancelled before its
+    /// <c>Task.Run</c> delegate starts. This complements the end-to-end fixture above by retaining
+    /// the ORIGINAL reporting task itself and asserting it completes SUCCESSFULLY after observing
+    /// the cancelled producer; a cancellation-skippable continuation would instead be cancelled
+    /// and fail this assertion.
+    /// </summary>
+    [Fact]
+    public async Task PreStartCancelledProducer_ReportTaskObservesCancellationAndCompletesSuccessfully()
+    {
+        const string taskId = "task-direct-prestart-cancel";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var service = BuildService(runner, root);
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
+
+        try
+        {
+            // The token is cancelled BEFORE Task.Run is called, so the delegate can never start.
+            var bodyEntries = 0;
+            using var producerCts = new CancellationTokenSource();
+            producerCts.Cancel();
+            Task execution = Task.Run(
+                () => Interlocked.Increment(ref bodyEntries), producerCts.Token);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => execution);
+            Assert.True(execution.IsCanceled);
+            Assert.Equal(0, Volatile.Read(ref bodyEntries));
+
+            // Construct the same two assignment-local objects production passes to reporting. They
+            // are private implementation types, so reflection is observation/invocation only; no
+            // state is injected into the service's ownership slot.
+            var serviceType = typeof(WorkerService);
+            var holderType = serviceType.GetNestedType(
+                "TerminalResultHolder", BindingFlags.NonPublic)!;
+            var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+            var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+            var ready = Activator.CreateInstance(readyType, nonPublic: true)!;
+            var domainTask = GrpcMapper.ToDomain(ResultAssignment(taskId).Assignment);
+
+            serviceType.GetField("_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(service, taskId);
+            serviceType.GetField("_currentRole", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(service, "tester");
+
+            // Invoke the ACTUAL reporting method with the ORIGINAL pre-start-cancelled producer.
+            // ObserveExecutionAsync must catch that cancellation and let reporting run its cleanup
+            // to successful termination; it must not fabricate Complete/Ready or consume the claim.
+            var reporting = (Task)serviceType.GetMethod(
+                    "ReportAssignmentAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(service, [
+                    execution,
+                    domainTask,
+                    connection,
+                    holder,
+                    ready,
+                    CancellationToken.None,
+                ])!;
+
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(
+                reporting.IsCompletedSuccessfully,
+                "Reporting must observe a pre-start-cancelled producer and terminate successfully.");
+            Assert.True(execution.IsCanceled);
+            Assert.Equal(0, Volatile.Read(ref bodyEntries));
+            Assert.Null(holderType.GetProperty("Result")!.GetValue(holder));
+            Assert.Equal(0, GetReadyClaimState(ready));
+            Assert.Empty(requests.Completes);
+            Assert.Equal(0, requests.ReadyCount);
+            Assert.Null(GetHeartbeatTaskId(service));
+        }
+        finally
+        {
+            connection.Retire();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            service.Dispose();
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// Replacement is forced through the REAL assignment handler while A's REPORT is still blocked
+    /// in its Ready write. The loop consumes B, but the handler cannot reset the runner, start B's
+    /// body or install B's owner until BOTH of A's ORIGINAL tasks — its execution and its
+    /// connection-bound reporting — have been joined; so A and its result remain the owner, B has
+    /// neither started nor been installed, and once A is released B receives a fresh empty holder
+    /// that never observes A's result.
     /// <para>
     /// ORDERING PROOF — the removal-proof part. A message merely being consumed is not evidence
     /// that its handler ran, so this fixture layers three independent, production-visible
@@ -695,11 +1242,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// <see cref="InlineDispatchResponseReader"/> for exactly what the dispatch rendezvous does and
     /// does not guarantee across the async-iterator boundary):
     /// <list type="number">
-    ///   <item><description>PRE-RELEASE, while A is still parked: B's session-reset gate must NOT
-    ///   have been signalled. The test neither pre-releases that gate nor releases A beforehand, so
-    ///   correct code cannot have reached it — it is parked in the drain awaiting A.</description></item>
-    ///   <item><description>AT THE RESET AND PROMPT BOUNDARIES: each captures whether A's ORIGINAL
-    ///   execution was already complete at that exact production instant.</description></item>
+    ///   <item><description>PRE-RELEASE, while A's report is still parked: B's session-reset gate
+    ///   must NOT have been signalled. The test neither pre-releases that gate nor releases A
+    ///   beforehand, so correct code cannot have reached it — it is parked in the drain awaiting
+    ///   A.</description></item>
+    ///   <item><description>AT THE RESET AND PROMPT BOUNDARIES: each captures whether BOTH of A's
+    ///   ORIGINAL tasks were already complete at that exact production instant.</description></item>
     ///   <item><description>POST-RELEASE CONSEQUENCE: if a detached drain resumes after B is
     ///   installed, it clears B's slot. The fixture therefore asserts that the slot still holds B
     ///   while B's body is alive; as documented below, this targets but cannot force that schedule.</description></item>
@@ -748,9 +1296,13 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         var loop = InvokeProcessMessages(service, stream, "worker-1", TestContext.Current.CancellationToken);
 
         // Hoisted so the finally can join EVERY original task it started, even after a failure, and
-        // can release the reset gate that a parked handler may still be waiting on.
+        // can release the reset gate that a parked handler may still be waiting on. BOTH owned
+        // tasks per assignment are tracked: an execution can be terminal while its report is still
+        // parked in a transport write.
         Task? executionA = null;
+        Task? reportingA = null;
         Task? executionB = null;
+        Task? reportingB = null;
         var bResetRelease = new TaskCompletionSource();
         List<Exception> preReleaseFailures = [];
         try
@@ -763,21 +1315,24 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             var resultA = AssertFullRetainedResult(service, taskA, RetainedOutcome.Completed);
 
-            // Capture A's own owner and ORIGINAL body BEFORE replacement begins, so every ordering
-            // observation below is about THIS assignment and can never be satisfied by a later one.
+            // Capture A's own owner and BOTH ORIGINAL tasks BEFORE replacement begins, so every
+            // ordering observation below is about THIS assignment and can never be satisfied by a
+            // later one.
             var ownerA = GetActiveAssignment(service);
             executionA = GetActiveExecution(service);
+            reportingA = GetActiveReporting(service);
 
             // ARM THE ORDERING CAPTURES before B can possibly be handled. Each records, at a
-            // production-visible instant on B's path, whether A's ORIGINAL execution had already
-            // completed. `_resetCount` distinguishes B's reset from A's. The values are what
-            // discriminate — no polling, no sleeps, no Task-internals inspection.
+            // production-visible instant on B's path, whether BOTH of A's ORIGINAL tasks had
+            // already completed. `_resetCount` distinguishes B's reset from A's. The values are
+            // what discriminate — no polling, no sleeps, no Task-internals inspection.
             //
             // The reset ALSO parks on a gate the test owns, so the capture is taken at a fixed
             // point and the pre-release observations below cannot race a drain-less handler that
             // rushes ahead: such a handler necessarily reaches the reset (recording `false`) and
             // then waits there, where the test can observe it deterministically.
             var capturedExecutionA = executionA;
+            var capturedReportingA = reportingA;
             var bResetReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var aJoinedAtBReset = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
@@ -788,18 +1343,22 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             {
                 if (runner.ResetCount >= 2)
                 {
-                    aJoinedAtBReset.TrySetResult(capturedExecutionA.IsCompleted);
+                    aJoinedAtBReset.TrySetResult(
+                        capturedExecutionA.IsCompleted && capturedReportingA.IsCompleted);
                     bResetReached.TrySetResult();
                 }
             };
             runner.OnPromptEntered = enteredTaskId =>
             {
                 if (string.Equals(enteredTaskId, taskB, StringComparison.Ordinal))
-                    aJoinedAtBPromptEntry.TrySetResult(capturedExecutionA.IsCompleted);
+                {
+                    aJoinedAtBPromptEntry.TrySetResult(
+                        capturedExecutionA.IsCompleted && capturedReportingA.IsCompleted);
+                }
             };
 
-            // A's body is now parked inside its Ready write: its ORIGINAL execution cannot finish
-            // until the test releases that gate.
+            // A's REPORT is now parked inside its Ready write: that ORIGINAL task cannot finish
+            // until the test releases that gate (its execution is already terminal).
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
@@ -815,12 +1374,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             responses.Push(Probe("B-blocked-probe"));
             await responses.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // A's ORIGINAL body is provably still running, so the handler must still own A: it may
-            // not reset the runner, start B, or install B's owner yet.
+            // A's ORIGINAL REPORT is provably still running, so the handler must still own A: it
+            // may not reset the runner, start B, or install B's owner yet.
             CapturePreRelease(() =>
-                Assert.False(executionA.IsCompleted, "A's body must still be unwinding while its drain is parked."));
+                Assert.False(reportingA.IsCompleted, "A's report must still be parked while its drain waits."));
             CapturePreRelease(() =>
-                Assert.False(runner.HasPromptStarted(taskB), "B must not start while A's original body is still running."));
+                Assert.False(runner.HasPromptStarted(taskB), "B must not start while A's original report is still running."));
             CapturePreRelease(() =>
                 Assert.False(responses.Consumed(4).IsCompleted, "The loop must still be parked inside B's handler."));
             CapturePreRelease(() => Assert.Same(ownerA, GetActiveAssignment(service)));
@@ -843,39 +1402,43 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // THE POSITIVE PRE-RELEASE DISCRIMINATOR. B's session reset is the FIRST production step
             // after the replacement drain. The test does NOT pre-release the reset gate and does NOT
             // release A before this check, so correct code cannot have reached the reset: it is
-            // parked in the drain awaiting A's still-held ORIGINAL execution. A handler that
+            // parked in the drain awaiting A's still-held ORIGINAL report. A handler that
             // removed, detached, or failed to await that drain runs straight on to the reset, where
             // OnResetEntered signals this gate while A is still parked. Nothing in the test can
             // complete this signal, so it firing here is evidence production skipped the drain.
             CapturePreRelease(() => Assert.False(
                 bResetReached.Task.IsCompleted,
-                "B's session reset was reached while A's original execution was still parked — the "
+                "B's session reset was reached while A's original report was still parked — the "
                 + "replacement drain did not run, was detached, or was not awaited."));
 
             // RELEASE A ONLY NOW — after every pre-release observation above has been taken. From
-            // here A's ORIGINAL execution can terminate, which is what lets a correct drain join and
+            // here A's ORIGINAL report can terminate, which is what lets a correct drain join and
             // proceed, and what lets a DETACHED drain resume and expose its consequence below.
             requests.ReleaseReady(0);
 
             // THE DETERMINISTIC RENDEZVOUS. BOTH a correct handler and a drain-less one reach B's
             // session reset and park there, so this wait always completes; what DISCRIMINATES them
             // is the value each captured at that instant. A handler that REMOVED the replacement
-            // drain reaches the reset while A is still parked in its Ready write and records
-            // `false`.
+            // drain reaches the reset while A's report is still parked in its Ready write and
+            // records `false`.
             await bResetReached.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             var joinedAtReset = await aJoinedAtBReset.Task.WaitAsync(
                 Failsafe, TestContext.Current.CancellationToken);
             CapturePreRelease(() => Assert.True(
                 joinedAtReset,
-                "B's session reset ran before A's original execution was joined — the replacement "
-                + "drain did not run or was not awaited."));
+                "B's session reset ran before BOTH of A's original tasks were joined — the "
+                + "replacement drain did not run or was not awaited."));
 
-            // A's ORIGINAL execution is now genuinely terminal, which is the precondition for the
-            // detached-drain checks below.
+            // BOTH of A's ORIGINAL tasks are now genuinely terminal, which is the precondition for
+            // the detached-drain checks below.
             await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(
                 executionA.IsCompleted,
                 "A's original execution must be terminal once its Ready write was released.");
+            Assert.True(
+                reportingA.IsCompleted,
+                "A's original report must be terminal once its Ready write was released.");
 
             // Let B's handler continue past the reset, then await positive evidence that the real
             // handler attempted B and its body entered.
@@ -885,6 +1448,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 && string.Equals(GetActiveTaskId(service), taskB, StringComparison.Ordinal))
             {
                 executionB = GetActiveExecution(service);
+                reportingB = GetActiveReporting(service);
             }
 
             // The same ordering holds at B's own prompt entry. Record any failure so the test can
@@ -893,8 +1457,8 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 Failsafe, TestContext.Current.CancellationToken);
             CapturePreRelease(() => Assert.True(
                 joinedAtPrompt,
-                "B's body started before A's original execution was joined — the replacement drain "
-                + "did not run or was not awaited."));
+                "B's body started before BOTH of A's original tasks were joined — the replacement "
+                + "drain did not run or was not awaited."));
 
             // A following message boundary proves B's real handler completed owner installation.
             responses.Push(Probe("B-installed"));
@@ -913,10 +1477,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             Assert.Equal(taskB, GetActiveTaskId(service));
             executionB ??= GetActiveExecution(service);
+            reportingB ??= GetActiveReporting(service);
             Assert.NotSame(ownerA, GetActiveAssignment(service));
             Assert.Null(GetRetainedResult(service));
             Assert.Equal(2, runner.ResetCount);
             Assert.True(executionA.IsCompleted, "A's original execution must be joined before B is installed.");
+            Assert.True(reportingA.IsCompleted, "A's original report must be joined before B is installed.");
 
             // NO OBSERVED STRAY DRAIN MAY CLEAR B. A's execution is terminal by now, so any detached
             // replacement drain that resumes after B's install wrongly empties B's slot. The loop's
@@ -937,8 +1503,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             requests.ReleaseComplete(1);
             await requests.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionB = GetActiveExecution(service);
+            reportingB = GetActiveReporting(service);
             requests.ReleaseReady(1);
             await executionB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reportingB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Same(resultB, GetRetainedResult(service));
 
             responses.Push(MatchingCancel(taskB));
@@ -966,8 +1534,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             bResetRelease.TrySetResult();
             responses.TryComplete();
             await JoinAllForTeardownAsync(service,
-                ("assignment body A", executionA),
-                ("assignment body B", executionB),
+                ("assignment execution A", executionA),
+                ("assignment reporting A", reportingA),
+                ("assignment execution B", executionB),
+                ("assignment reporting B", reportingB),
                 ("loop", loop));
             TryDelete(root);
         }
@@ -1324,50 +1894,107 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     }
 
     /// <summary>
-    /// The non-cancellation body-fault diagnostic inside <c>DrainAssignmentAsync</c> is guarded.
-    /// The assignment body faults on its Ready write, then a matching cancel drains that already
-    /// faulted ORIGINAL execution while <c>Console.Error</c> throws specifically for the drain
-    /// diagnostic. The source must still be disposed and ownership must still clear; a following
-    /// probe is consumed by the still-live loop, proving the matching handler completed.
+    /// A FAILED READY WRITE IS A REPORTING FAULT THAT CHANGES NOTHING ABOUT THE RETAINED RESULT,
+    /// and the drain's guarded diagnostic still completes the ownership transition.
+    /// <para>
+    /// The assignment runs the REAL executor to a full Completed result and writes its Complete;
+    /// its single Ready write then FAILS. The test captures the EXACT retained
+    /// <see cref="TaskResult"/> instance before the fault and compares that same instance after
+    /// it, so the evidence cannot be lost once ownership is cleared:
+    /// <list type="bullet">
+    ///   <item><description>the retained instance is IDENTICAL before and after the Ready fault,
+    ///   with its full payload intact (<see cref="AssertFullResult"/>);</description></item>
+    ///   <item><description>the Complete payload on the wire is byte-for-byte the pre-existing
+    ///   mapping of that result (<see cref="AssertWirePayload"/>);</description></item>
+    ///   <item><description>the EXECUTION task completed SUCCESSFULLY — a transport fault belongs
+    ///   to REPORTING only — while the reporting task carries the ORIGINAL failure;</description></item>
+    ///   <item><description>after the matching-cancel drain there is exactly ONE execution, ONE
+    ///   Complete attempt and ONE Ready attempt: a failed Ready consumes the claim and is NEVER
+    ///   retried, by the report or by the cancel handler.</description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// The matching cancel drains that already-faulted ORIGINAL report while <c>Console.Error</c>
+    /// throws specifically for the drain diagnostic: the source must still be disposed and
+    /// ownership must still clear, and a following probe consumed by the still-live loop proves the
+    /// matching handler completed.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task MatchingCancel_BodyFaultDiagnosticThrows_StillDisposesSourceAndClearsOwnership()
     {
-        var runner = new GatedPromptRunner();
-        var service = BuildService(runner);
-
+        const string taskId = "task-ready-fault";
+        var runner = new RetentionRunner(LongOutput);
+        var readyFault = new BodyReadyWriteFailureException("injected body Ready failure");
+        var requests = new RetentionRequestStream(
+            readyTermination: index => index == 0 ? readyFault : null);
         var responses = new ChannelResponseReader();
-        var requests = new RecordingRequestStream();
-        var bodyFault = new BodyReadyWriteFailureException("injected body Ready failure");
-        requests.FailNextReadyWrite = bodyFault;
-        var stream = BuildStream(requests, responses);
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
 
+        var stream = BuildStream(requests, responses);
         var connection = TestConnectionFactory.Attach(service, "worker-1", stream, service.TestProvisioner);
         var loop = InvokeProcessMessagesWith(service, connection, TestContext.Current.CancellationToken);
+
         var originalErr = Console.Error;
         var drainDiagnosticFailure = new BodyDiagnosticFailureException("injected drain diagnostic failure");
         var throwingWriter = new MarkerThrowingErrorWriter(
             "Task drain observed a fault", new StringWriter(), drainDiagnosticFailure);
+
+        // Hoisted so the finally joins EVERY original task it started, even after a failure.
+        Task? execution = null;
+        Task? reporting = null;
         try
         {
-            responses.Push(Assignment("task-A"));
-            await runner.PromptStarted("task-A").WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             responses.Push(Probe("installed"));
             await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             var ownerCts = GetOwnerCts(service);
-            var execution = GetActiveExecution(service);
-            runner.Release("task-A");
+            var readyClaim = GetOwnerReadyClaim(service);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
 
-            var propagatedBodyFault = await Assert.ThrowsAsync<BodyReadyWriteFailureException>(
-                () => execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.Same(bodyFault, propagatedBodyFault);
+            // Run the REAL executor to a full Completed result and hold its Complete write.
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // CAPTURE THE EXACT RETAINED INSTANCE — before the Ready fault, while ownership holds.
+            var retainedBeforeFault = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            AssertWirePayload(requests.Completes[0].Complete, taskId, RetainedOutcome.Completed);
+
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+
+            // THE READY-WRITE FAULT IS THE REPORT'S, not the execution's.
+            var propagatedReadyFault = await Assert.ThrowsAsync<BodyReadyWriteFailureException>(
+                () => reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(readyFault, propagatedReadyFault);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                execution.IsCompletedSuccessfully,
+                "A failing Ready write is a reporting fault and must never fault the execution task.");
+
+            // THE RETAINED RESULT SURVIVES THE REPORTING FAULT — the IDENTICAL instance, intact.
+            Assert.Same(retainedBeforeFault, GetRetainedResult(service));
+            AssertFullResult(retainedBeforeFault, taskId, RetainedOutcome.Completed);
+
+            // ONE execution, ONE Complete attempt, ONE Ready attempt — the failed Ready consumed
+            // the claim and was never retried.
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
+            Assert.Single(requests.Completes);
             Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
             Assert.Null(Record.Exception(() => _ = ownerCts.Token));
 
             // Only the DrainAssignmentAsync diagnostic is degraded from this point onward.
             Console.SetError(throwingWriter);
-            responses.Push(MatchingCancel("task-A"));
+            responses.Push(MatchingCancel(taskId));
             responses.Push(Probe("after-drain"));
             await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
@@ -1377,6 +2004,17 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
             Assert.False(connection.IsRetired, "A guarded diagnostic failure must not terminate the loop.");
 
+            // AFTER THE DRAIN the counts are still exactly one apiece: the cancel handler found the
+            // claim consumed and never retried the failed Ready, and nothing re-executed.
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
+
+            // The captured instance is STILL the full, unchanged result even after ownership was
+            // cleared — the evidence was retained in a local, not read back from the slot.
+            AssertFullResult(retainedBeforeFault, taskId, RetainedOutcome.Completed);
+
             responses.TryComplete();
             await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
         }
@@ -1384,8 +2022,13 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         {
             Console.SetError(originalErr);
             runner.ReleaseAll();
+            requests.ReleaseAll();
             responses.TryComplete();
-            await JoinAllForTeardownAsync(service, ("loop", loop));
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+            TryDelete(root);
         }
     }
 
@@ -1444,6 +2087,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         // Hoisted so the finally joins EVERY original task it started, even after a failure.
         Task? bodyExecution = null;
+        Task? bodyReporting = null;
         try
         {
             // The sink throws ONLY for the body's own failure line, so every other sanitized report
@@ -1459,9 +2103,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // so it never reached its Ready claim.
             var execution = GetActiveExecution(service);
             bodyExecution = execution;
+            var reporting = GetActiveReporting(service);
+            bodyReporting = reporting;
             var bodyFault = await Assert.ThrowsAsync<BodyDiagnosticFailureException>(
                 () => execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
             Assert.Same(bodyDiagnosticFailure, bodyFault);
+
+            // The report OBSERVES that producer fault and terminates successfully: an empty holder
+            // means no Complete is fabricated and the Ready claim is left for the cancel handler.
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(reporting.IsCompletedSuccessfully);
 
             // NON-VACUITY: inspect the owner's actual Ready claim, not merely the writer count.
             // The body left it untouched, so the matching-cancel handler owns the one attempt below.
@@ -1506,6 +2157,20 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 nameof(AssignmentCancellationCallbackException), diagnostics, StringComparison.Ordinal);
             Assert.DoesNotContain(readyWriteFailure.GetType().Name, diagnostics, StringComparison.Ordinal);
             Assert.DoesNotContain(armed.CallbackFailure.Message, diagnostics, StringComparison.Ordinal);
+
+            // THE EXECUTION JOIN REALLY RAN, AND ONLY IT. The EXECUTION task faulted with its own
+            // diagnostic failure, and the drain's EXECUTION join reports that in sanitized form.
+            // The REPORTING task merely OBSERVED that fault — it never re-raises a producer
+            // exception — so it completed SUCCESSFULLY and its join contributes no report.
+            //
+            // EXACT COUNT, not mere presence: a reporting task that re-raised the observed
+            // producer exception would make the drain log this line TWICE, which a `Contains`
+            // check alone would happily accept.
+            Assert.True(
+                reporting.IsCompletedSuccessfully,
+                "Reporting must OBSERVE the producer fault and complete successfully — never re-raise it.");
+            Assert.Equal(1, CountOccurrences(diagnostics, "Task drain observed a fault"));
+            Assert.Equal(1, CountOccurrences(diagnostics, nameof(BodyDiagnosticFailureException)));
         }
         finally
         {
@@ -1513,7 +2178,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             runner.ReleaseAll();
             responses.TryComplete();
             armed?.DisposeRegistration();
-            await JoinAllForTeardownAsync(service, ("assignment body", bodyExecution), ("loop", loop));
+            await JoinAllForTeardownAsync(service,
+                ("assignment body", bodyExecution),
+                ("assignment reporting", bodyReporting),
+                ("loop", loop));
         }
     }
 
@@ -2043,6 +2711,18 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         return (Task)active.GetType().GetProperty("Execution")!.GetValue(active)!;
     }
 
+    /// <summary>
+    /// The ACTIVE owner's CONNECTION-BOUND REPORTING task — the second ORIGINAL task an assignment
+    /// owns. It is what a held, failed or cancelled Complete/Ready write blocks, and it is joined
+    /// alongside the execution by every ownership transition.
+    /// </summary>
+    private static Task GetActiveReporting(WorkerService service)
+    {
+        var active = GetActiveAssignment(service)
+            ?? throw new Xunit.Sdk.XunitException("Expected an active assignment owner.");
+        return (Task)active.GetType().GetProperty("Reporting")!.GetValue(active)!;
+    }
+
     private static TaskResult? GetRetainedResult(WorkerService service)
     {
         var active = GetActiveAssignment(service);
@@ -2070,6 +2750,25 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     private static int GetReadyClaimState(object readyClaim) =>
         (int)readyClaim.GetType().GetField("_claimed", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(readyClaim)!;
+
+    /// <summary>
+    /// Counts NON-OVERLAPPING occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.
+    /// Used where mere presence is not enough — a duplicated diagnostic (for example a producer
+    /// exception reported by BOTH drain joins because reporting wrongly re-raised it) must fail,
+    /// and a <c>Contains</c> assertion would pass for it.
+    /// </summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = haystack.IndexOf(needle, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            count++;
+            index = haystack.IndexOf(needle, index + needle.Length, StringComparison.Ordinal);
+        }
+
+        return count;
+    }
 
     /// <summary>
     /// Flattens an exception (including <see cref="AggregateException"/> wrappers) so an assertion
@@ -2211,7 +2910,18 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// Captures every Complete/Ready and gates each occurrence independently.  A Complete failure
     /// is thrown only after the message has entered and the test releases its gate.
     /// </summary>
-    private sealed class RetentionRequestStream(Func<int, Exception?>? completeTermination = null)
+    /// <param name="completeTermination">
+    /// Per-index injected failure for a <c>TaskComplete</c> write, applied after its gate released.
+    /// </param>
+    /// <param name="readyTermination">
+    /// Per-index injected failure for a <c>WorkerReady</c> write, applied AFTER the message was
+    /// recorded and AFTER its gate released — so the ATTEMPT still counts and a test can prove the
+    /// write really was issued and is NEVER retried. Models a Ready write that fails on the
+    /// REPORTING task's own single attempt.
+    /// </param>
+    private sealed class RetentionRequestStream(
+        Func<int, Exception?>? completeTermination = null,
+        Func<int, Exception?>? readyTermination = null)
         : IClientStreamWriter<WorkerMessage>
     {
         private readonly object _gate = new();
@@ -2226,6 +2936,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         internal IReadOnlyList<WorkerMessage> Completes
         {
             get { lock (_gate) return [.. _completes]; }
+        }
+
+        /// <summary>How many <c>WorkerReady</c> writes have been ENTERED so far.</summary>
+        internal int ReadyCount
+        {
+            get { lock (_gate) return _readies.Count; }
         }
 
         public WriteOptions? WriteOptions { get; set; }
@@ -2262,9 +2978,10 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             {
                 TaskCompletionSource entered;
                 TaskCompletionSource release;
+                int index;
                 lock (_gate)
                 {
-                    var index = _readies.Count;
+                    index = _readies.Count;
                     _readies.Add(message.Clone());
                     entered = Slot(_readyEntered, index);
                     release = Slot(_readyRelease, index);
@@ -2272,6 +2989,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 }
                 entered.TrySetResult();
                 await release.Task.WaitAsync(ct);
+
+                // The ATTEMPT is recorded above BEFORE the injected failure applies, so a test can
+                // prove the write really was issued — and that it is never retried.
+                if (readyTermination?.Invoke(index) is { } readyError)
+                    throw readyError;
             }
         }
 
@@ -2410,6 +3132,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         internal Func<Task?>? ExecutionProbe { get; set; }
 
         /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Reporting</c> — the SECOND original task
+        /// an assignment owns — or <c>null</c> when the slot is empty. Recorded at the same
+        /// boundaries as the execution, so teardown joins BOTH owned tasks and a report still
+        /// parked in a transport write can never be missed.
+        /// </summary>
+        internal Func<Task?>? ReportingProbe { get; set; }
+
+        /// <summary>
         /// Whether an execution was admitted AFTER <see cref="SealRecording"/>. Teardown re-drains
         /// while this keeps flipping, so a body admitted concurrently with the seal is joined
         /// rather than missed.
@@ -2449,23 +3179,29 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
 
         /// <summary>
-        /// Records the REAL enclosing execution currently installed, if any. Idempotent by
-        /// reference: an execution observed at several boundaries is stored once.
+        /// Records the REAL enclosing execution AND its connection-bound reporting task, if any.
+        /// Idempotent by reference: a task observed at several boundaries is stored once.
         /// </summary>
         private void RecordCurrentExecution()
         {
-            if (ExecutionProbe?.Invoke() is not { } execution)
+            RecordOwnedTask(ExecutionProbe?.Invoke());
+            RecordOwnedTask(ReportingProbe?.Invoke());
+        }
+
+        private void RecordOwnedTask(Task? owned)
+        {
+            if (owned is null)
                 return;
 
             lock (_gate)
             {
                 foreach (var recorded in _assignmentExecutions)
                 {
-                    if (ReferenceEquals(recorded, execution))
+                    if (ReferenceEquals(recorded, owned))
                         return;
                 }
 
-                _assignmentExecutions.Add(execution);
+                _assignmentExecutions.Add(owned);
                 if (_sealed)
                     _recordedSinceSeal = true;
             }
@@ -2681,18 +3417,20 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             existing.DisposeAsync().AsTask().GetAwaiter().GetResult();
         field.SetValue(service, runner);
 
-        // INSTALL THE REAL-EXECUTION PROBE. The double calls it at the production boundaries it
-        // already observes, so it records the enclosing ActiveAssignment.Execution (the Task.Run
-        // body) rather than a prompt-return surrogate. Teardown joins those recorded executions,
-        // which is what makes an orphaned-but-live body impossible to miss after a detached drain
-        // clears the ownership slot.
+        // INSTALL THE REAL-TASK PROBES. The double calls them at the production boundaries it
+        // already observes, so it records BOTH enclosing owned tasks — the ActiveAssignment's
+        // Execution (the Task.Run body) and its connection-bound Reporting — rather than a
+        // prompt-return surrogate. Teardown joins those recorded tasks, which is what makes an
+        // orphaned-but-live execution OR a report still parked in a write impossible to miss.
         switch (runner)
         {
             case RetentionRunner retention:
                 retention.ExecutionProbe = () => TryGetActiveExecution(service);
+                retention.ReportingProbe = () => TryGetActiveReporting(service);
                 break;
             case GatedPromptRunner gated:
                 gated.ExecutionProbe = () => TryGetActiveExecution(service);
+                gated.ReportingProbe = () => TryGetActiveReporting(service);
                 break;
             default:
                 break;
@@ -2711,6 +3449,18 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         return active is null
             ? null
             : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
+    }
+
+    /// <summary>
+    /// The service's CURRENT <c>ActiveAssignment.Reporting</c>, or <c>null</c> when the ownership
+    /// slot is empty. Observation only.
+    /// </summary>
+    private static Task? TryGetActiveReporting(WorkerService service)
+    {
+        var active = GetActiveAssignment(service);
+        return active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Reporting")!.GetValue(active);
     }
 
     private static AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> BuildStream(
@@ -2807,15 +3557,22 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         foreach (var execution in RecordedExecutions())
             AddProducer("recorded assignment execution", execution);
 
-        // Capture any assignment body that started before the test reached its explicit local
-        // assignment. This closes assertion-failure windows without relying on the loop to be the
-        // body's only join owner.
+        // Capture any assignment task that started before the test reached its explicit local
+        // assignment. BOTH owned tasks are taken — an execution can be terminal while its report is
+        // still parked in a transport write. This closes assertion-failure windows without relying
+        // on the loop to be their only join owner.
         var active = GetActiveAssignment(service);
         var activeExecution = active is null
             ? null
             : (Task?)active.GetType().GetProperty("Execution")!.GetValue(active);
         if (activeExecution is not null)
             AddProducer("active assignment body", activeExecution);
+
+        var activeReporting = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Reporting")!.GetValue(active);
+        if (activeReporting is not null)
+            AddProducer("active assignment reporting", activeReporting);
 
         foreach (var (name, producer) in producers)
         {
@@ -2825,7 +3582,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
         // The loop may have started an assignment from an already-buffered message after the first
         // snapshot. Re-snapshot after all listed joins were attempted and independently join that
-        // late body too; one timeout never prevents this second observation.
+        // late assignment's BOTH tasks too; one timeout never prevents this second observation.
         active = GetActiveAssignment(service);
         var lateActiveExecution = active is null
             ? null
@@ -2834,6 +3591,15 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             && AddProducer("late active assignment body", lateActiveExecution))
         {
             await JoinOneAsync("late active assignment body", lateActiveExecution);
+        }
+
+        var lateActiveReporting = active is null
+            ? null
+            : (Task?)active.GetType().GetProperty("Reporting")!.GetValue(active);
+        if (lateActiveReporting is not null
+            && AddProducer("late active assignment reporting", lateActiveReporting))
+        {
+            await JoinOneAsync("late active assignment reporting", lateActiveReporting);
         }
 
         // THE CLOSURE HANDSHAKE. Seal the runner's recording, then drain to a FIXPOINT: join
@@ -3061,6 +3827,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         /// </summary>
         internal Func<Task?>? ExecutionProbe { get; set; }
 
+        /// <summary>
+        /// Reads the service's CURRENT <c>ActiveAssignment.Reporting</c> — the SECOND original task
+        /// an assignment owns — or <c>null</c> when the slot is empty.
+        /// </summary>
+        internal Func<Task?>? ReportingProbe { get; set; }
+
         /// <summary>Whether an execution was admitted AFTER <see cref="SealRecording"/>.</summary>
         internal bool RecordedSinceSeal
         {
@@ -3093,22 +3865,29 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         }
 
         /// <summary>
-        /// Records the REAL enclosing execution currently installed, if any. Idempotent by reference.
+        /// Records the REAL enclosing execution AND its reporting task, if any. Idempotent by
+        /// reference.
         /// </summary>
         private void RecordCurrentExecution()
         {
-            if (ExecutionProbe?.Invoke() is not { } execution)
+            RecordOwnedTask(ExecutionProbe?.Invoke());
+            RecordOwnedTask(ReportingProbe?.Invoke());
+        }
+
+        private void RecordOwnedTask(Task? owned)
+        {
+            if (owned is null)
                 return;
 
             lock (_gate)
             {
                 foreach (var recorded in _assignmentExecutions)
                 {
-                    if (ReferenceEquals(recorded, execution))
+                    if (ReferenceEquals(recorded, owned))
                         return;
                 }
 
-                _assignmentExecutions.Add(execution);
+                _assignmentExecutions.Add(owned);
                 if (_sealed)
                     _recordedSinceSeal = true;
             }

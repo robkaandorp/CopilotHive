@@ -806,10 +806,23 @@ public sealed class WorkerService(
         }
     }
 
-    /// <summary>Tracks one assignment's identity, in-flight execution, cancellation scope, Ready claim and terminal result.</summary>
+    /// <summary>
+    /// Tracks one assignment's identity, its in-flight EXECUTION, its separately owned
+    /// connection-bound REPORTING, its cancellation scope, its Ready claim and its terminal result.
+    /// </summary>
+    /// <remarks>
+    /// TWO OWNED TASKS, ONE OWNER. Execution is the work itself (provisioning, preparation, the
+    /// executor and the retention of its result); reporting is everything that has to travel over
+    /// THIS connection's stream (the Complete write and the single Ready attempt). They are
+    /// separated so a held, failed or cancelled transport write can no longer keep the execution
+    /// task itself running. The owner keeps BOTH ORIGINAL tasks, and every ownership transition
+    /// (replacement, matching cancel, teardown) joins BOTH before the CTS is disposed and the slot
+    /// is cleared — neither task is ever abandoned.
+    /// </remarks>
     private sealed class ActiveAssignment(
         string taskId,
         Task execution,
+        Task reporting,
         CancellationTokenSource cts,
         ReadyClaim readyClaim,
         TerminalResultHolder terminalResult)
@@ -821,8 +834,21 @@ public sealed class WorkerService(
         /// </summary>
         public string TaskId { get; } = taskId;
 
-        /// <summary>The running task body.</summary>
+        /// <summary>
+        /// The running EXECUTION task: provisioning, config-repo preparation, the executor itself,
+        /// the retention of the exact terminal result and the execution-owned seam cleanup. It
+        /// performs NO completion and NO Ready write, so it can reach termination while a transport
+        /// write is still blocked.
+        /// </summary>
         public Task Execution { get; } = execution;
+
+        /// <summary>
+        /// The CONNECTION-BOUND REPORTING task. It awaits the ORIGINAL <see cref="Execution"/>,
+        /// consumes the already-retained result for the Complete mapping and write, and makes the
+        /// assignment's single Ready attempt through the shared claim. A blocked or failing write
+        /// holds only THIS task.
+        /// </summary>
+        public Task Reporting { get; } = reporting;
 
         /// <summary>Cancellation source scoped to this assignment.</summary>
         public CancellationTokenSource Cts { get; } = cts;
@@ -846,36 +872,39 @@ public sealed class WorkerService(
     // (<see cref="ProcessMessagesAsync"/>) is the SOLE transition authority: the slot is
     // installed, drained and cleared only through the ownership helpers below, never
     // from any background caller, heartbeat or bridge method. Clearing always happens
-    // AFTER the corresponding <see cref="DrainAssignmentAsync"/> has returned, so the
+    // AFTER the corresponding <see cref="DrainAssignmentAsync"/> has returned — i.e.
+    // after BOTH the assignment's execution and its reporting have been joined — so the
     // slot never reads as empty while an assignment is still unwinding. A completed
     // assignment stays RETAINED — clearing happens on replacement, on a matching cancel,
-    // or on the loop's teardown, never on body completion.
+    // or on the loop's teardown, never on task completion.
 
     /// <summary>
-    /// The retained assignment for this connection: the running (or already-finished) task
-    /// body, its assignment-scoped CTS and its single-flight Ready claim. <c>null</c> only
-    /// before the first install and after an ownership clear, and empty again after a
-    /// successful loop teardown.
+    /// The retained assignment for this connection: the running (or already-finished) execution
+    /// task, its connection-bound reporting task, its assignment-scoped CTS and its single-flight
+    /// Ready claim. <c>null</c> only before the first install and after an ownership clear, and
+    /// empty again after a successful loop teardown.
     /// </summary>
     private ActiveAssignment? _activeAssignment;
 
     /// <summary>
-    /// Ownership transition — INSTALL. Called after the execution task has been OBTAINED from
-    /// <c>Task.Run</c>, so only fully constructed state (task ID, body, CTS, Ready claim) is
-    /// ever published; the body closures capture the assignment-local values, not this slot.
+    /// Ownership transition — INSTALL. Called after BOTH original tasks have been OBTAINED (the
+    /// execution from <c>Task.Run</c> and the reporting from its own async invocation), so only
+    /// fully constructed state (task ID, both tasks, CTS, Ready claim, result holder) is ever
+    /// published; those tasks capture the assignment-local values, not this slot.
     /// </summary>
     private void InstallActiveAssignment(ActiveAssignment assignment) => _activeAssignment = assignment;
 
     /// <summary>
-    /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits the retained body
-    /// WITHOUT cancelling it (its Ready already flowed, so it is finished or finishing),
-    /// disposes its CTS, and only then clears the slot.
+    /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits BOTH the retained execution
+    /// and its reporting WITHOUT cancelling them (their Ready already flowed, so they are finished
+    /// or finishing), disposes the CTS, and only then clears the slot.
     /// </summary>
     /// <remarks>
-    /// The clear happens ONLY after the drain returned — i.e. after the body joined and its CTS
-    /// disposal was attempted — so a replacement never installs its own assignment while the
-    /// original body is still running. With <c>cancelFirst: false</c> there is no cancellation
-    /// callback to fail, so nothing is deferred here.
+    /// The clear happens ONLY after the drain returned — i.e. after BOTH original tasks joined and
+    /// the CTS disposal was attempted — so a replacement never installs its own assignment, nor
+    /// resets the shared runner, while the original execution or its report is still running. With
+    /// <c>cancelFirst: false</c> there is no cancellation callback to fail, so nothing is deferred
+    /// here.
     /// </remarks>
     private async Task DrainRetainedForReplacementAsync()
     {
@@ -887,8 +916,8 @@ public sealed class WorkerService(
     }
 
     /// <summary>
-    /// Ownership transition — MATCHING-CANCEL clear. Cancels and drains the retained
-    /// assignment, disposes its CTS, and only then clears the slot. Returns the drained
+    /// Ownership transition — MATCHING-CANCEL clear. Requests assignment cancellation FIRST, drains
+    /// BOTH original tasks, disposes the CTS, and only then clears the slot. Returns the drained
     /// assignment (so the caller can still consult its single-flight Ready claim) together with
     /// any DEFERRED cancellation-cleanup failure for the caller to propagate AFTER its own
     /// cleanup.
@@ -917,8 +946,8 @@ public sealed class WorkerService(
     /// cancellation failure is handled by the caller AFTER its own heartbeat-state cleanup.
     /// </summary>
     /// <remarks>
-    /// The ownership slot is cleared here — after the body joined and its CTS disposal was
-    /// attempted — so a deferred cancellation failure can never leave the slot occupied for a
+    /// The ownership slot is cleared here — after BOTH original tasks joined and the CTS disposal
+    /// was attempted — so a deferred cancellation failure can never leave the slot occupied for a
     /// subsequent loop invocation.
     /// </remarks>
     private async Task<Exception?> DrainRetainedForTeardownAsync()
@@ -1023,10 +1052,11 @@ public sealed class WorkerService(
                         // await cannot starve a previous task of its ToolResponse.
                         if (_activeAssignment is not null)
                         {
-                            // Await WITHOUT cancelling: single-flight Ready means a new assignment
-                            // only follows a Ready this assignment already emitted, so the body is
-                            // finished or finishing. Cancelling here would abort work that the
-                            // orchestrator still expects to complete.
+                            // Await BOTH original tasks WITHOUT cancelling: single-flight Ready
+                            // means a new assignment only follows a Ready this assignment already
+                            // emitted, so its execution and its report are finished or finishing.
+                            // Cancelling here would abort work that the orchestrator still expects
+                            // to complete.
                             await DrainRetainedForReplacementAsync();
                         }
 
@@ -1046,10 +1076,10 @@ public sealed class WorkerService(
                         var taskCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
                         // The Ready claim, the CTS and the terminal-result holder are created
-                        // BEFORE the body starts, so the body never observes a half-initialised
+                        // BEFORE either task starts, so neither ever observes a half-initialised
                         // assignment. (Capturing a variable assigned after Task.Run would race
                         // with the body's first statement — and so would reading the ownership
-                        // slot, which is only installed once Task.Run has returned the body.)
+                        // slot, which is only installed once both tasks have been obtained.)
                         var readyClaim = new ReadyClaim();
                         var bodyCts = taskCts;
                         var terminalResult = new TerminalResultHolder();
@@ -1057,9 +1087,15 @@ public sealed class WorkerService(
                         // Run task execution concurrently so message loop can process
                         // ToolCallResponse messages from the orchestrator during execution.
                         //
+                        // THE EXECUTION TASK IS THE WORK ONLY: provisioning, config-repo
+                        // preparation, the executor itself, the retention of the exact terminal
+                        // result and the execution-owned seam cleanup. It performs NO Complete and
+                        // NO Ready write, so a held, failed or cancelled transport write can no
+                        // longer keep the execution itself running.
+                        //
                         // The body captures the EXPECTED CONNECTION OBJECT — never independently
-                        // mutable stream / client / identity values — so its provisioning, its
-                        // session RPCs and its completion write all belong to this registration.
+                        // mutable stream / client / identity values — so its provisioning and its
+                        // session RPCs belong to this registration.
                         var execution = Task.Run(async () =>
                         {
                             try
@@ -1072,9 +1108,8 @@ public sealed class WorkerService(
                                 {
                                     var legacyExecutor = new TaskExecutor(
                                         _agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
-                                    await ExecuteAndReportAsync(
-                                        legacyExecutor, domainTask, connection,
-                                        terminalResult, bodyCts.Token, ct);
+                                    await ExecuteAssignmentAsync(
+                                        legacyExecutor, domainTask, terminalResult, bodyCts.Token);
                                 }
                                 else
                                 {
@@ -1089,6 +1124,8 @@ public sealed class WorkerService(
                                     // STEPS 3-4 — the askpass helper and the seam that owns it.
                                     // The seam is a per-assignment LOCAL: WorkerService owns it,
                                     // and this `using` encloses the executor's whole lifetime.
+                                    // Its disposal is EXECUTION-owned cleanup, so it completes
+                                    // with the execution rather than waiting on any transport.
                                     using var seam = CreateConfigRepoSeam(provisioner);
 
                                     // STEP 5 — probe / clone / agents directory, BEFORE the
@@ -1100,9 +1137,8 @@ public sealed class WorkerService(
                                     var executor = new TaskExecutor(
                                         _agentRunner, this, gitOperations: null, sessionClient: this,
                                         configRepoDir: _configRepoDir, configRepoSeam: seam);
-                                    await ExecuteAndReportAsync(
-                                        executor, domainTask, connection,
-                                        terminalResult, bodyCts.Token, ct);
+                                    await ExecuteAssignmentAsync(
+                                        executor, domainTask, terminalResult, bodyCts.Token);
                                 }
                             }
                             catch (OperationCanceledException) { }
@@ -1112,21 +1148,23 @@ public sealed class WorkerService(
                                 // payloads can echo provisioned configuration (tokens, API keys).
                                 _log.Error($"Task execution failed [{SafeExceptionLog.Describe(ex)}]");
                             }
-                            finally
-                            {
-                                _currentTaskId = null;
-                                _currentRole = null;
-                            }
-
-                            // Single-flight: only emitted if the cancel handler has not already
-                            // claimed Ready for this same assignment.
-                            if (readyClaim.TryClaim())
-                                await SendWorkerReady(connection, ct);
                         }, ct);
 
+                        // THE CONNECTION-BOUND REPORTING TASK, started from the ORIGINAL execution
+                        // task and the assignment-local values this handler already holds — it
+                        // never discovers its inputs through the ownership slot (which is only
+                        // installed below) and never re-reads the published connection. No extra
+                        // Task.Run is needed: the async method's own state machine is the task, and
+                        // it OBSERVES a producer that was cancelled before its body ever started
+                        // (a cancellation-skippable continuation would silently skip it instead).
+                        var reporting = ReportAssignmentAsync(
+                            execution, domainTask, connection, terminalResult, readyClaim, ct);
+
+                        // BOTH ORIGINAL TASKS are obtained BEFORE the fully constructed owner is
+                        // published, so the slot never exposes a half-built assignment.
                         InstallActiveAssignment(
                             new ActiveAssignment(
-                                domainTask.TaskId, execution, taskCts, readyClaim, terminalResult));
+                                domainTask.TaskId, execution, reporting, taskCts, readyClaim, terminalResult));
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.Cancel:
@@ -1236,12 +1274,12 @@ public sealed class WorkerService(
 
             // Stream shutdown must not leave a task running: Program disposes the runner right
             // after this returns, and a still-running turn holds the client lifecycle lease.
-            // Cancel then drain so the runner is quiescent before disposal. The ownership
-            // slot must be empty after successful loop cleanup.
+            // Cancel then drain BOTH the execution and its reporting, so the runner is quiescent
+            // before disposal. The ownership slot must be empty after successful loop cleanup.
             //
             // A deferred cancellation-cleanup failure is held until AFTER the ownership clear, the
             // heartbeat-state cleanup and retirement below, so a throwing cancellation callback can
-            // never skip any of them (nor the join of the body itself).
+            // never skip any of them (nor either of the two joins).
             var teardownDrainFailure = _activeAssignment is not null
                 ? await DrainRetainedForTeardownAsync()
                 : null;
@@ -1249,7 +1287,7 @@ public sealed class WorkerService(
             _currentTaskId = null;
             _currentRole = null;
 
-            // RETIRE ACCESS only AFTER the drain above. A body draining behind an EOF or a reader
+            // RETIRE ACCESS only AFTER the drain above. A report draining behind an EOF or a reader
             // failure with a LIVE token therefore still got its single Ready attempt; from here on,
             // any NEW operation on this connection fails disconnected instead of starting transport.
             connection.Retire();
@@ -1258,30 +1296,33 @@ public sealed class WorkerService(
             // cancelled read, a handler failure), that primary is what surfaces and the secondary
             // cancellation-cleanup failure is reported through guarded sanitized logging ONLY — a
             // logger failure can never replace the real failure. Without a primary, the deferred
-            // failure propagates now, AFTER the clear, the retirement and the join above.
+            // failure propagates now, AFTER the clear, the retirement and BOTH joins above.
             PropagateOrReport(
                 teardownDrainFailure, primaryFailure, TaskCancellationFailedMessage);
         }
     }
 
     /// <summary>
-    /// Waits for an assignment's body to finish, optionally cancelling it first, then disposes its
-    /// <see cref="CancellationTokenSource"/>. Never throws for cancellation — the whole point is
-    /// to reach a quiescent state.
+    /// Waits for BOTH of an assignment's ORIGINAL tasks — its EXECUTION and its connection-bound
+    /// REPORTING — to finish, optionally cancelling the assignment first, then disposes its
+    /// <see cref="CancellationTokenSource"/>. Never throws for cancellation: the whole point is to
+    /// reach a quiescent state.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A THROWING CANCELLATION CALLBACK IS CAPTURED, not allowed to escape: it is returned to the
-    /// caller (to be re-raised <em>after</em> the joins and the resource cleanup) instead of
-    /// skipping <c>await assignment.Execution</c> and <c>Cts.Dispose()</c>. The body is still
-    /// awaited to termination with no caller token — a caller token can never make the join vacuous
-    /// — and the deferred failure is never converted into a fabricated successful cancellation.
+    /// BOTH JOINS ALWAYS HAPPEN, in that order, WITHOUT a caller token — a caller token can never
+    /// make either join vacuous, and neither task is ever abandoned. An EXECUTION fault cannot skip
+    /// the REPORTING join (it is captured, exactly as before) and neither can a throwing
+    /// cancellation callback: that failure is CAPTURED and returned to the caller, to be re-raised
+    /// <em>after</em> both joins and the disposal below, rather than skipping them.
     /// </para>
     /// <para>
-    /// Ordinary cancellation tolerance and the sanitized treatment of body faults are unchanged:
-    /// an <see cref="OperationCanceledException"/> from the body is expected, and any other body
-    /// fault is reported in sanitized form (guarded, so a diagnostic can never skip the disposal
-    /// below) rather than propagating into the message loop or teardown path.
+    /// Ordinary cancellation tolerance and the sanitized treatment of task faults are unchanged for
+    /// both tasks: an <see cref="OperationCanceledException"/> is expected, and any other fault is
+    /// reported in sanitized form (guarded, so a diagnostic can never skip the remaining join or
+    /// the disposal) rather than propagating into the message loop or teardown path. A producer
+    /// exception the reporting task merely OBSERVED is not re-raised there, so it is reported here
+    /// exactly once — from the execution join — and never twice.
     /// </para>
     /// </remarks>
     /// <param name="assignment">The assignment to drain.</param>
@@ -1295,87 +1336,185 @@ public sealed class WorkerService(
     /// </returns>
     private async Task<Exception?> DrainAssignmentAsync(ActiveAssignment assignment, bool cancelFirst)
     {
-        // CAPTURE FIRST: a callback failure must not bypass the join and the disposal below.
+        // CAPTURE FIRST: a callback failure must not bypass either join or the disposal below.
         var deferredCancellationFailure = cancelFirst
             ? await CaptureCancellationFailureAsync(assignment.Cts)
             : null;
 
-        try
-        {
-            await assignment.Execution;
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected: this is how a cancelled body unwinds.
-        }
-        catch (Exception ex)
-        {
-            // The body already sanitizes and logs its own failures; this is a last-resort guard so
-            // draining never propagates a task fault into the message loop or teardown path.
-            TryLogSanitized("Task drain observed a fault", ex);
-        }
+        // The EXECUTION first, then the REPORTING that awaits it — each captured, so neither a
+        // fault nor a guarded diagnostic can skip what follows.
+        ReportIfPresent(
+            await CaptureJoinFailureAsync(assignment.Execution), DrainObservedFaultMessage);
+        ReportIfPresent(
+            await CaptureJoinFailureAsync(assignment.Reporting), DrainObservedFaultMessage);
 
-        // Disposal is attempted AFTER the join and runs even when a deferred cancellation failure
+        // Disposal is attempted AFTER both joins and runs even when a deferred cancellation failure
         // is waiting to propagate — the deferred failure surfaces only once resources are released.
         assignment.Cts.Dispose();
 
         return deferredCancellationFailure;
     }
 
+    /// <summary>The sanitized report message for a fault observed while draining an assignment.</summary>
+    private const string DrainObservedFaultMessage = "Task drain observed a fault";
+
     #region Assignment execution and config-repo preparation
 
     /// <summary>
-    /// Runs one assignment through an executor, RETAINS its terminal result under the assignment
-    /// owner, and reports that result upstream. Shared by BOTH dispatch forms (the legacy,
-    /// seam-free executor and the seam-carrying one) so the two can never drift apart in what they
-    /// retain, write or log.
+    /// EXECUTION ONLY — runs one assignment through an executor and RETAINS its terminal result
+    /// under the assignment owner. Shared by BOTH dispatch forms (the legacy, seam-free executor
+    /// and the seam-carrying one) so the two can never drift apart in what they retain.
     /// </summary>
     /// <remarks>
-    /// The produced result is separated from its connection-bound reporting: the EXACT complete
-    /// domain <c>TaskResult</c> the executor returned is published into the assignment-local holder
-    /// ONCE, before any payload mapping and before any transport await, and the send then consumes
-    /// what is already retained. A blocked gate, a failed or cancelled completion write therefore
-    /// changes nothing about retention — the result is neither truncated nor replaced by a
-    /// synthesized transport-failure result, and execution is never retried. Completed, Failed and
-    /// Cancelled results are retained alike. If setup or execution throws before a result exists,
-    /// the holder stays EMPTY rather than carrying a fabricated completion, and the exception
-    /// propagates to the body's existing handlers unchanged.
+    /// NOTHING HERE TOUCHES THE CONNECTION. The EXACT complete domain <c>TaskResult</c> the
+    /// executor returned is published into the assignment-local holder ONCE, before any payload
+    /// mapping and before any transport await; the connection-bound reporting
+    /// (<see cref="ReportAssignmentAsync"/>) then merely consumes what is already retained. That
+    /// separation is what keeps a blocked, failed or cancelled completion write from holding — or
+    /// changing the outcome of — the execution itself: the result is neither truncated nor replaced
+    /// by a synthesized transport-failure result, and execution is never retried. Completed, Failed
+    /// and Cancelled results are retained alike. If setup or execution throws before a result
+    /// exists, the holder stays EMPTY rather than carrying a fabricated completion, and the
+    /// exception propagates to the execution task's existing handlers unchanged.
     /// </remarks>
     /// <param name="executor">The executor to run — already fully constructed.</param>
     /// <param name="task">The domain task.</param>
-    /// <param name="connection">
-    /// The EXPECTED connection this assignment belongs to. The completion write consumes THIS
-    /// object's stream and identity, so a completion can never be reported on a different
-    /// registration than the one the assignment arrived on.
-    /// </param>
     /// <param name="terminalResult">
     /// The assignment-local holder this execution publishes its terminal result into. Passed in by
-    /// the body's closure — never discovered through the ownership slot, which may not yet hold
-    /// this assignment when the body starts.
+    /// the execution task's closure — never discovered through the ownership slot, which may not
+    /// yet hold this assignment when the execution starts.
     /// </param>
     /// <param name="bodyToken">The ASSIGNMENT's token, which cancels the execution itself.</param>
-    /// <param name="streamToken">The STREAM's token, used for the completion write.</param>
-    private async Task ExecuteAndReportAsync(
+    private static async Task ExecuteAssignmentAsync(
         TaskExecutor executor,
         WorkTask task,
-        WorkerConnection connection,
         TerminalResultHolder terminalResult,
-        CancellationToken bodyToken,
-        CancellationToken streamToken)
+        CancellationToken bodyToken)
     {
         var result = await executor.ExecuteAsync(task, bodyToken);
 
-        // RETAIN FIRST — the exact, complete result, before mapping and before the send can block
-        // or fail. Everything below is reporting of an already-retained result.
+        // RETAIN — the exact, complete result, before any mapping and before any transport exists.
         terminalResult.Publish(result);
+    }
 
-        await SendAsync(connection, new WorkerMessage
+    /// <summary>
+    /// CONNECTION-BOUND REPORTING for ONE assignment: it awaits the ORIGINAL execution task,
+    /// consumes the already-retained terminal result for the Complete mapping, write and
+    /// completion diagnostic, clears the heartbeat's task state, and makes the assignment's SINGLE
+    /// <c>WorkerReady</c> attempt through the shared claim.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ASSIGNMENT-LOCAL INPUTS ONLY. Every value it needs — the ORIGINAL execution task, the domain
+    /// task, the EXPECTED connection, the holder and the Ready claim — is passed in by the
+    /// assignment handler that created them. Nothing is discovered through the ownership slot and
+    /// nothing is re-read from the published connection, so a report can never be retargeted to a
+    /// later registration.
+    /// </para>
+    /// <para>
+    /// THE PRODUCER JOIN IS UNCONDITIONAL. The execution task is awaited directly (never through a
+    /// cancellation-skippable continuation), so a producer that was CANCELLED BEFORE ITS BODY EVER
+    /// STARTED is still observed here. A producer that did not reach termination normally — a
+    /// cancelled start, or an exception that escaped its own sanitized handler (for example a
+    /// throwing diagnostic) — leaves the holder empty: no Complete is fabricated, and the Ready
+    /// claim stays UNCONSUMED so a matching cancel can still emit the single Ready. That is exactly
+    /// the pre-split policy, in which such an escape also skipped the claim. The producer's own
+    /// failure evidence stays on the execution task and is reported by the drain that joins it;
+    /// reporting neither re-raises nor duplicates it.
+    /// </para>
+    /// <para>
+    /// TRANSPORT FAILURES BELONG HERE. A failed or cancelled Complete write keeps the existing
+    /// sanitized handling and never overwrites, truncates or discards the retained result; a failed
+    /// Ready CONSUMES the claim and is never retried. Both are faults of THIS task only — the
+    /// execution task has long since terminated.
+    /// </para>
+    /// </remarks>
+    /// <param name="execution">The ORIGINAL execution task this report belongs to.</param>
+    /// <param name="task">The domain task (its ID is used for the completion diagnostic).</param>
+    /// <param name="connection">
+    /// The EXPECTED connection this assignment belongs to. The Complete and Ready writes consume
+    /// THIS object's stream and identity, so a report can never be written on a different
+    /// registration than the one the assignment arrived on.
+    /// </param>
+    /// <param name="terminalResult">The assignment-local holder carrying the retained result.</param>
+    /// <param name="readyClaim">The assignment's shared single-flight Ready claim.</param>
+    /// <param name="streamToken">The STREAM's token, used for the Complete and Ready writes.</param>
+    private async Task ReportAssignmentAsync(
+        Task execution,
+        WorkTask task,
+        WorkerConnection connection,
+        TerminalResultHolder terminalResult,
+        ReadyClaim readyClaim,
+        CancellationToken streamToken)
+    {
+        var executionTerminatedNormally = false;
+        try
         {
-            WorkerId = connection.AssignedId,
-            Complete = GrpcMapper.ToGrpc(result),
-        }, streamToken);
+            executionTerminatedNormally = await ObserveExecutionAsync(execution);
 
-        _log.Info($"Task {task.TaskId} completed ({result.Status})");
+            // CONSUME what is already retained. An empty holder (a producer that failed before a
+            // result existed) reports nothing at all rather than fabricating a completion.
+            if (executionTerminatedNormally && terminalResult.Result is { } result)
+            {
+                await SendAsync(connection, new WorkerMessage
+                {
+                    WorkerId = connection.AssignedId,
+                    Complete = GrpcMapper.ToGrpc(result),
+                }, streamToken);
+
+                _log.Info($"Task {task.TaskId} completed ({result.Status})");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // Sanitized: the completion write crosses the gRPC boundary, whose status details can
+            // echo provisioned configuration back to the worker.
+            _log.Error($"Task execution failed [{SafeExceptionLog.Describe(ex)}]");
+        }
+        finally
+        {
+            // THE EXISTING LOGICAL POINT: after completion reporting, before the single Ready.
+            _currentTaskId = null;
+            _currentRole = null;
+        }
+
+        // Single-flight: only emitted if the cancel handler has not already claimed Ready for this
+        // same assignment. A failed write consumes the claim and is never retried.
+        if (executionTerminatedNormally && readyClaim.TryClaim())
+            await SendWorkerReady(connection, streamToken);
+    }
+
+    /// <summary>
+    /// Joins the ORIGINAL execution task to termination, WITHOUT a caller token, and reports
+    /// whether it terminated NORMALLY.
+    /// </summary>
+    /// <remarks>
+    /// A cancellation (including a producer cancelled before its body ever started) and any
+    /// exception that escaped the execution's own sanitized handler are OBSERVED here — never
+    /// re-raised — so the execution task keeps its evidence for the drain that joins it, and this
+    /// report can still run its heartbeat-state cleanup. The <c>false</c> result is what suppresses
+    /// a fabricated Complete and leaves the Ready claim unconsumed.
+    /// </remarks>
+    /// <param name="execution">The ORIGINAL execution task.</param>
+    /// <returns><c>true</c> when the execution completed normally; otherwise <c>false</c>.</returns>
+    private static async Task<bool> ObserveExecutionAsync(Task execution)
+    {
+        try
+        {
+            await execution;
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: this is how a cancelled producer unwinds (including a pre-start cancel).
+            return false;
+        }
+        catch (Exception)
+        {
+            // Observed, never re-raised: the execution task itself carries the evidence.
+            return false;
+        }
     }
 
     /// <summary>
