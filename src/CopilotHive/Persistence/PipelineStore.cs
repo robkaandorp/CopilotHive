@@ -91,9 +91,15 @@ public sealed class PipelineStore : IAsyncDisposable
     private readonly ILogger<PipelineStore> _logger;
 
     /// <summary>
-    /// THE DISPOSAL SEAM for the factory-owned contexts — used by
-    /// <see cref="SaveAdmissionWithPointer(GoalPipeline, string)"/>, <see cref="ClearActiveTaskIdIfMatches"/> and
-    /// <see cref="CommitAdmissionOwnership"/>. When
+    /// THE DISPOSAL SEAM for the factory-owned contexts, used by the admission/ownership
+    /// TRANSACTION paths that resolve a per-operation context AND dispose it through this seam:
+    /// the admission route (<c>SaveAdmissionWithPointer</c>, both forms, which share one transaction
+    /// body), the ownership-transaction family that commits a detached ownership candidate or its
+    /// durable inverse (<see cref="CommitAdmissionOwnership"/> and
+    /// <c>CommitPendingAdmissionRollback</c>, through their shared scaffolding), and the
+    /// ownership-checked pointer clear <see cref="ClearActiveTaskIdIfMatches"/>. It is deliberately
+    /// NOT the disposal point of every context-resolving operation: the ordinary saves and reads here
+    /// dispose a factory-owned context directly, without this seam. When
     /// installed, it SUBSTITUTES the fallible
     /// dispose operation (<see cref="CopilotHiveDbContext"/> is sealed, so its
     /// <c>Dispose</c> cannot be overridden and EF never closes an externally supplied
@@ -163,18 +169,60 @@ public sealed class PipelineStore : IAsyncDisposable
     }
 
     /// <summary>Insert or replace the full pipeline state.</summary>
+    /// <remarks>
+    /// <para>
+    /// THE CONVERSATION-REPLACEMENT OWNERSHIP CONTRACT. Conversation replacement stages through
+    /// <c>SaveConversationCore</c>, which DELETES the goal's durable entries and ADDS the pipeline's
+    /// own. From the instant that replacement is ATTEMPTED, this operation OWNS the target goal's
+    /// conversation tracking scope: a failure cleanup DISCARDS all tracked
+    /// <see cref="ConversationEntryEntity"/> state for that goal — the CALLER's already-pending edits
+    /// for that same goal INCLUDED — and does NOT restore a previous caller unit of work. Other
+    /// goals' conversations and every other entity type and pending value are untouched, and a
+    /// cross-goal reassignment of tracked conversation entities is outside the supported scope.
+    /// Preserving same-goal preexisting caller edits would need an EF snapshot/restore framework,
+    /// which is deliberately NOT built here.
+    /// </para>
+    /// <para>
+    /// THE CLEANUP ITSELF is a targeted EF tracking detach only — no SQL, no conversation reload, no
+    /// <c>SaveChanges</c> and no whole-tracker clear. It is TRACKING HYGIENE, not durable rollback: it
+    /// does not claim that a thrown <c>SaveChanges</c> left the database unchanged.
+    /// </para>
+    /// </remarks>
     public void SavePipeline(GoalPipeline pipeline)
     {
         var (db, ownsContext) = ResolveDbContext();
+
+        // THE ATTEMPT FLAG, set BEFORE the staging call so a throw from INSIDE SaveConversationCore
+        // (a partial staging: deletes already tracked, maybe an addition too) is covered as well.
+        var conversationReplacementAttempted = false;
         try
         {
             UpsertPipelineCore(db, pipeline);
+            conversationReplacementAttempted = true;
             SaveConversationCore(db, pipeline);
             db.SaveChanges();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to save pipeline for goal {GoalId}", pipeline.GoalId);
+            // THE CONVERSATION-SCOPE CLEANUP, independent of the diagnostics below: only a BORROWED
+            // (caller-owned) context survives this call, so only there can rejected conversation
+            // tracking be flushed later; and only once replacement was ATTEMPTED can any of the
+            // goal's conversation tracking be this operation's to discard.
+            if (!ownsContext && conversationReplacementAttempted)
+                OnConversationReplacementFailure(db, pipeline.GoalId, ex);
+
+            // THE GUARDED DIAGNOSTIC: the emit is wrapped locally so a throwing ILogger can never
+            // replace the primary exception bare-thrown on the next line — the level, template,
+            // arguments and the EXACT exception object are unchanged.
+            try
+            {
+                _logger.LogError(ex, "Failed to save pipeline for goal {GoalId}", pipeline.GoalId);
+            }
+            catch
+            {
+                // SILENT swallow — the primary exception stays authoritative.
+            }
+
             throw;
         }
         finally
@@ -243,6 +291,19 @@ public sealed class PipelineStore : IAsyncDisposable
     /// <c>SaveChanges</c> does NOT by itself prove a rollback: after-commit/provider uncertainty is
     /// the existing limitation.
     /// </para>
+    /// <para>
+    /// THE CONVERSATION-REPLACEMENT OWNERSHIP CONTRACT is the legacy full save's, verbatim: once
+    /// conversation replacement is ATTEMPTED, this operation OWNS the target goal's conversation
+    /// tracking scope, and a failure cleanup DISCARDS all tracked
+    /// <see cref="ConversationEntryEntity"/> state for that goal — the CALLER's already-pending
+    /// same-goal edits INCLUDED — without restoring a previous caller unit of work. Other goals'
+    /// conversations and every other entity type and pending value are untouched; cross-goal
+    /// reassignment of tracked conversation entities is outside the supported scope. Because the
+    /// context is BORROWED here rather than factory-owned, this is precisely the route where
+    /// rejected conversation tracking would otherwise outlive the failed call. It is tracking
+    /// hygiene only — no SQL, no reload, no <c>SaveChanges</c>, no whole-tracker clear — and it runs
+    /// BEFORE the pipeline checkpoint hook, which keeps its own cleanup unchanged.
+    /// </para>
     /// </remarks>
     /// <param name="pipeline">The pipeline whose row receives the ordinary fields and the checkpoint.</param>
     /// <param name="ownership">The detached ownership capture supplying BOTH columns.</param>
@@ -256,14 +317,28 @@ public sealed class PipelineStore : IAsyncDisposable
         var checkpoint = FreezeOwnershipCheckpoint(pipeline, ownership);
 
         var (db, ownsContext) = ResolveDbContext();
+
+        // THE ATTEMPT FLAG, set BEFORE the staging call so a throw from INSIDE SaveConversationCore
+        // (a partial staging: deletes already tracked, maybe an addition too) is covered as well.
+        var conversationReplacementAttempted = false;
         try
         {
             UpsertPipelineCore(db, pipeline, activeTaskIdOverride: null, checkpoint);
+            conversationReplacementAttempted = true;
             SaveConversationCore(db, pipeline);
             db.SaveChanges();
         }
         catch (Exception ex)
         {
+            // THE CONVERSATION-SCOPE CLEANUP — run INDEPENDENTLY and FIRST, ahead of the pipeline
+            // checkpoint hook below, which keeps its pointer/blob hygiene exactly as it was. Same
+            // contract as the legacy overload: only a borrowed context, and only once replacement
+            // was attempted, so rejected conversation tracking cannot be flushed by a LATER state-only
+            // save on this same caller-owned context. Tracking hygiene only — no SQL, no reload, no
+            // SaveChanges, no whole-tracker clear.
+            if (!ownsContext && conversationReplacementAttempted)
+                OnConversationReplacementFailure(db, pipeline.GoalId, ex);
+
             // THE BORROWED-CONTEXT HYGIENE: a failed row write must not leave a half-staged
             // checkpoint in the tracker, where a LATER legacy save on the same caller-owned context
             // could flush the rejected blob. The affected entry is detached, which DISCARDS its
@@ -413,6 +488,72 @@ public sealed class PipelineStore : IAsyncDisposable
             // Best-effort hygiene: the diagnostic must never replace the primary failure.
             BestEffortWarning(
                 "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker cleanup did not complete: {Message}",
+                goalId, CleanupMessageOrPlaceholder(cleanupEx));
+        }
+    }
+
+    /// <summary>
+    /// THE CONVERSATION-SCOPE HYGIENE on a failed FULL save: EVERY tracked
+    /// <see cref="ConversationEntryEntity"/> whose CURRENT <c>GoalId</c> equals the target goal is
+    /// detached, so the rejected replacement cannot be flushed by a later state-only save on the same
+    /// borrowed context.
+    /// <para>
+    /// WHY IT IS NEEDED: conversation replacement deletes the goal's durable entries and adds the
+    /// pipeline's own. On the direct (caller-owned) context path those mutations stay tracked after a
+    /// failed <c>SaveChanges</c> — and a following <see cref="SavePipelineState(GoalPipeline)"/> on the
+    /// SAME context issues its own <c>SaveChanges</c>, which would flush every one of them even though
+    /// it never asked for a conversation write.
+    /// </para>
+    /// <para>
+    /// WHAT IT DISCARDS: the whole goal-scoped conversation unit of work — Added, Deleted, Modified
+    /// and Unchanged entries, temporary-key additions included — because the operation that attempted
+    /// the replacement owns that scope. A caller's own already-pending edit for the SAME goal is
+    /// discarded too, and no previous caller unit of work is restored: this is a DELIBERATE narrow
+    /// ownership transfer, not an EF snapshot/restore. Every OTHER goal's conversation and every other
+    /// entity type and pending value is left tracked and untouched. The filter compares the entity's
+    /// CURRENT <c>GoalId</c> ordinally; neither <c>GoalId</c> nor <c>Seq</c> is assumed to be the
+    /// entity key.
+    /// </para>
+    /// <para>
+    /// WHAT IT DOES NOT DO: no SQL, no conversation reload, no <c>SaveChanges</c> and no
+    /// whole-<c>ChangeTracker</c> clear. Tracking hygiene only — so it makes no durable-rollback claim:
+    /// a thrown <c>SaveChanges</c> may still have committed something underneath, and nothing here
+    /// undoes an after-commit effect.
+    /// </para>
+    /// <para>
+    /// GUARDED AND NEVER MASKING: the whole step is wrapped, so a cleanup fault degrades to a warning
+    /// that reports the context as SUSPECT — not safely reusable — and the PRIMARY exception keeps
+    /// propagating unchanged.
+    /// </para>
+    /// </summary>
+    /// <param name="db">The borrowed context whose full save failed.</param>
+    /// <param name="goalId">The goal whose conversation tracking scope is discarded.</param>
+    /// <param name="primary">The failure being preserved (its message is logged only).</param>
+    private void OnConversationReplacementFailure(CopilotHiveDbContext db, string goalId, Exception primary)
+    {
+        try
+        {
+            // The tracker is materialised ONCE and every matching entry detached in ANY state —
+            // Added/Deleted/Modified/Unchanged, temporary-key additions included — because the goal's
+            // conversation scope belongs to the failed operation while the replacement was attempted.
+            var entries = db.ChangeTracker.Entries<ConversationEntryEntity>()
+                .Where(e => string.Equals(e.Entity.GoalId, goalId, StringComparison.Ordinal))
+                .ToList();
+
+            foreach (var entry in entries)
+                db.Entry(entry.Entity).State = EntityState.Detached;
+
+            // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper, so a
+            // throwing ILogger degrades to silence rather than escaping the caller's failure path.
+            BestEffortWarning(
+                "WorkSlotIntegrity: full-save-conversation-cleanup goal={GoalId} — the rejected conversation replacement's tracker hygiene completed ({PrimaryMessage})",
+                goalId, CleanupMessageOrPlaceholder(primary));
+        }
+        catch (Exception cleanupEx)
+        {
+            // Best-effort hygiene: the diagnostic must never replace the primary failure.
+            BestEffortWarning(
+                "WorkSlotIntegrity: full-save-conversation-cleanup goal={GoalId} — the rejected conversation replacement's tracker cleanup did not complete; the context state is SUSPECT and its further usability is NOT guaranteed: {Message}",
                 goalId, CleanupMessageOrPlaceholder(cleanupEx));
         }
     }
