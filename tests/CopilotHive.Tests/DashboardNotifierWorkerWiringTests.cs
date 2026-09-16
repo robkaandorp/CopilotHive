@@ -5,11 +5,14 @@ using CopilotHive.Dashboard;
 using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
+using CopilotHive.Persistence;
 using CopilotHive.Services;
 using CopilotHive.Shared.Grpc;
 using CopilotHive.Workers;
 
 using Grpc.Core;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
@@ -41,7 +44,7 @@ public sealed class DashboardNotifierWorkerWiringTests
     }
 
     private static (HiveOrchestratorService service, WorkerPool pool, TaskQueue queue, int[] count)
-        CreateService(DashboardNotifier notifier)
+        CreateService(DashboardNotifier notifier, WorkerCompletionRecorder? recorder = null)
     {
         var pool = new WorkerPool();
         var taskQueue = new TaskQueue();
@@ -67,9 +70,124 @@ public sealed class DashboardNotifierWorkerWiringTests
             completionNotifier,
             dispatcher,
             NullLogger<HiveOrchestratorService>.Instance,
-            dashboardNotifier: notifier);
+            dashboardNotifier: notifier,
+            completionRecorder: recorder);
 
         return (service, pool, taskQueue, counter);
+    }
+
+    /// <summary>
+    /// THE REAL COMPLETION-RECEIPT STORES over a private in-memory SQLite database, plus the REAL
+    /// <see cref="WorkerCompletionRecorder"/> over them — the valid recorder injection a vector needs
+    /// when its completion must actually be ACCEPTED.
+    /// </summary>
+    /// <remarks>
+    /// A SMALL FIXTURE, NOT A SECOND HARNESS: there is no transport, no stream and no ledger here.
+    /// The anchor connection must stay open for the test's lifetime — an in-memory SQLite database is
+    /// destroyed when its last connection closes — so the caller disposes the returned instance.
+    /// </remarks>
+    private sealed class RecorderFixture : IDisposable
+    {
+        private readonly SqliteConnection _connection;
+
+        public RecorderFixture()
+        {
+            _connection = new SqliteConnection("Data Source=:memory:");
+            _connection.Open();
+
+            var options = new DbContextOptionsBuilder<CopilotHiveDbContext>()
+                .UseSqlite(_connection)
+                .Options;
+
+            using (var bootstrap = new CopilotHiveDbContext(options))
+                bootstrap.Database.EnsureCreated();
+
+            AssignmentStore = new WorkerAssignmentContextStore(
+                new SharedDbContextFactory(_connection, options),
+                NullLogger<WorkerAssignmentContextStore>.Instance);
+            ReceiptStore = new CompletionReceiptStore(
+                new SharedDbContextFactory(_connection, options),
+                NullLogger<CompletionReceiptStore>.Instance);
+            Recorder = new WorkerCompletionRecorder(AssignmentStore, ReceiptStore);
+        }
+
+        public WorkerAssignmentContextStore AssignmentStore { get; }
+
+        public CompletionReceiptStore ReceiptStore { get; }
+
+        public WorkerCompletionRecorder Recorder { get; }
+
+        /// <summary>
+        /// Records the assignment context the completion recorder requires, using the ONE phase whose
+        /// existing mapping produces <paramref name="role"/>.
+        /// </summary>
+        public void RecordContext(
+            string taskId, string goalId, string workerId, WorkerRole role, int iteration = 1)
+        {
+            var phase = role switch
+            {
+                WorkerRole.Coder => GoalPhase.Coding,
+                WorkerRole.Tester => GoalPhase.Testing,
+                WorkerRole.Reviewer => GoalPhase.Review,
+                WorkerRole.DocWriter => GoalPhase.DocWriting,
+                WorkerRole.Improver => GoalPhase.Improve,
+                _ => throw new InvalidOperationException(
+                    $"Worker role '{role}' has no worker-backed phase mapping."),
+            };
+
+            var context = new WorkerAssignmentContext(
+                goalId, workerId, role, new WorkSlot(taskId, new WorkSlotPosition(iteration, phase, 1), 1), "m");
+
+            var write = AssignmentStore.InsertOnce(context);
+            Assert.Equal(WorkerAssignmentWriteStatus.Recorded, write.Status);
+        }
+
+        public void Dispose() => _connection.Dispose();
+    }
+
+    /// <summary>
+    /// Records a STORED assignment context for an actually-queued task through a REAL insert-once
+    /// store: the completion recorder's agreement rule requires a stored context whose goal, worker
+    /// and role match the completing task and the pinned worker. The phase is the ONE worker-backed
+    /// phase whose existing mapping produces the task's role; an unmappable role is a fixture bug and
+    /// throws rather than guessing.
+    /// </summary>
+    /// <param name="assignmentStore">The harness's REAL assignment-context store.</param>
+    /// <param name="task">The queued task whose delivery is being recorded.</param>
+    /// <param name="workerId">The pinned worker the assignment is recorded for.</param>
+    /// <param name="iteration">The pipeline iteration the recorded position names.</param>
+    /// <returns>The recorded context, for assertions.</returns>
+    private static WorkerAssignmentContext RecordAssignmentContext(
+        WorkerAssignmentContextStore assignmentStore,
+        WorkTask task,
+        string workerId,
+        int iteration)
+    {
+        var phase = task.Role switch
+        {
+            WorkerRole.Coder => GoalPhase.Coding,
+            WorkerRole.Tester => GoalPhase.Testing,
+            WorkerRole.Reviewer => GoalPhase.Review,
+            WorkerRole.DocWriter => GoalPhase.DocWriting,
+            WorkerRole.Improver => GoalPhase.Improve,
+            _ => throw new InvalidOperationException(
+                $"Worker role '{task.Role}' has no worker-backed phase mapping."),
+        };
+
+        var context = new WorkerAssignmentContext(
+            task.GoalId,
+            workerId,
+            task.Role,
+            new WorkSlot(task.TaskId, new WorkSlotPosition(iteration, phase, 1), 1),
+            task.Model);
+
+        var write = assignmentStore.InsertOnce(context);
+        Assert.True(
+            write.Status is WorkerAssignmentWriteStatus.Recorded
+                or WorkerAssignmentWriteStatus.AlreadyRecorded,
+            $"the assignment context for '{task.TaskId}' could not be recorded ({write.Status})");
+
+        return context;
     }
 
     // ── Register ──────────────────────────────────────────────────────────────
@@ -898,12 +1016,19 @@ public sealed class DashboardNotifierWorkerWiringTests
     }
 
     // ── HandleTaskComplete → 1 (criterion 17) ────────────────────────────────
-
+    /// <summary>
+    /// An ACCEPTED completion notifies the dashboard exactly once. The completion is only accepted
+    /// when its receipt could be retained, so this fixture records a GENUINE assignment context for
+    /// the completing task and injects the REAL recorder over the REAL stores — the valid setup the
+    /// recording step requires. The one notification asserted below is therefore the completion's
+    /// own, not a refusal that happens to look identical.
+    /// </summary>
     [Fact]
     public void HandleTaskComplete_NotifiesOnce()
     {
         var notifier = new DashboardNotifier();
-        var (service, pool, queue, count) = CreateService(notifier);
+        using var recording = new RecorderFixture();
+        var (service, pool, queue, count) = CreateService(notifier, recording.Recorder);
 
         var worker = pool.RegisterWorker("w-tc", []);
         var task = new WorkTask
@@ -919,6 +1044,7 @@ public sealed class DashboardNotifierWorkerWiringTests
         queue.Enqueue(task);
         var dequeued = queue.TryDequeue(WorkerRole.Unspecified)!;
         service.ApplyTaskAssignment(worker, dequeued);
+        recording.RecordContext("tc-1", "g1", "w-tc", WorkerRole.Coder);
         count[0] = 0;
 
         var complete = new CopilotHive.Shared.Grpc.TaskComplete
@@ -933,6 +1059,10 @@ public sealed class DashboardNotifierWorkerWiringTests
             .GetMethod("HandleTaskComplete", BindingFlags.NonPublic | BindingFlags.Instance)!;
         method.Invoke(service, [worker, complete]);
 
+        // THE RELEASE REALLY HAPPENED — so the notification below is the completion's own.
+        Assert.False(worker.IsBusy);
+        Assert.Null(queue.GetActiveTask("tc-1"));
+        Assert.NotNull(recording.ReceiptStore.Load("tc-1"));
         Assert.Equal(1, count[0]);
     }
 
@@ -1156,9 +1286,15 @@ public sealed class DashboardNotifierWorkerWiringTests
             // transport state ONLY, so the DOMAIN duplicate protection is the thing under test.
             harness.ReestablishTransportOwnership(taskA);
 
-            // ── THE DUPLICATE: same task id, DIFFERENT output ────────────────────────────
+            // ── THE DUPLICATE: same task id, the SAME returned evidence ───────────────────
+            // THE EVIDENCE IS DELIBERATELY IDENTICAL. The receipt slice retains the completion's
+            // evidence BEFORE the release, so a duplicate carrying DIFFERENT evidence is a genuine
+            // receipt Conflict that the transport refuses — and this vector exists to exercise the
+            // DOMAIN's duplicate protection, which only ever runs on a completion the transport
+            // accepted. An IDENTICAL duplicate settles AlreadyStored and continues, which is exactly
+            // the sanctioned path for a repeat while ownership is still held.
             await harness.DeliverCompletionAsync(
-                taskA, output: "DUPLICATE-RAW-OUTPUT", summary: "DUPLICATE-SUMMARY");
+                taskA, output: "A-RAW-OUTPUT", summary: "A-SUMMARY");
 
             // NOTHING of the successor's state moved. The OUTPUT is asserted first and the
             // POINTER second: these are the two halves of the deleted transport block, and each
@@ -1193,6 +1329,7 @@ public sealed class DashboardNotifierWorkerWiringTests
         finally
         {
             await harness.StopAsync(throwOnCleanupFailure: bodySucceeded);
+            harness.DisposeRecorderStores();
         }
     }
 
@@ -1267,8 +1404,14 @@ public sealed class DashboardNotifierWorkerWiringTests
             harness.ReestablishTransportOwnership(taskA);
 
             // ── THE DUPLICATE, delivered inside the window and awaited to REJECTION ───────
+            // THE EVIDENCE IS DELIBERATELY IDENTICAL to the first delivery's. The receipt slice
+            // retains the completion's evidence BEFORE the release, so a duplicate carrying
+            // DIFFERENT evidence is a genuine receipt Conflict that the transport refuses — and
+            // then the DOMAIN registered-slot guard this vector exists to pin would never be
+            // reached. Identical evidence settles AlreadyStored and continues to the domain, which
+            // is exactly the sanctioned path for a repeat while ownership is still held.
             await harness.DeliverCompletionAsync(
-                taskA, output: "DUPLICATE-RAW-OUTPUT", summary: "DUPLICATE-SUMMARY");
+                taskA, output: "A-RAW-OUTPUT", summary: "A-SUMMARY");
 
             // The registered-slot duplicate protection refused it: no output write (the
             // admitted copy sits behind the admission), no pointer change, no slot movement,
@@ -1290,6 +1433,7 @@ public sealed class DashboardNotifierWorkerWiringTests
         finally
         {
             await harness.StopAsync(throwOnCleanupFailure: bodySucceeded);
+            harness.DisposeRecorderStores();
         }
     }
 
@@ -1332,6 +1476,7 @@ public sealed class DashboardNotifierWorkerWiringTests
         finally
         {
             await harness.StopAsync(throwOnCleanupFailure: bodySucceeded);
+            harness.DisposeRecorderStores();
         }
     }
 
@@ -1356,7 +1501,38 @@ public sealed class DashboardNotifierWorkerWiringTests
     /// </summary>
     private sealed class RealTransportHarness
     {
-        private readonly ConcurrentDictionary<string, TaskCompletionSource> _deliveries = new();
+        /// <summary>
+        /// THE PER-DELIVERY LEDGER, keyed by a strictly monotonic sequence number — never by the
+        /// output text. An IDENTICAL duplicate carries the SAME output by design, so an output-keyed
+        /// ledger could not register it at all and would silently mis-attribute its completion.
+        /// </summary>
+        private readonly ConcurrentDictionary<long, DeliveryRegistration> _deliveries = new();
+
+        private long _deliverySequence;
+
+        /// <summary>
+        /// One registered delivery: the output it will carry, its completion signal, and the
+        /// CLAIM FLAG that marks it as attributed. The registration is NEVER removed from the
+        /// ledger — <see cref="StopAsync"/> must be able to drain every delivery whose domain
+        /// handler is still outstanding, including one the test body never awaited.
+        /// </summary>
+        private sealed class DeliveryRegistration(string output, TaskCompletionSource completion)
+        {
+            private int _claimed;
+
+            /// <summary>The output text the emitted result must match.</summary>
+            public string Output { get; } = output;
+
+            /// <summary>The completion signal this delivery settles.</summary>
+            public TaskCompletionSource Completion { get; } = completion;
+
+            /// <summary>
+            /// Claims this registration EXACTLY ONCE. A second claim attempt on an
+            /// already-attributed registration returns <c>false</c>, which is what keeps an
+            /// IDENTICAL duplicate from being attributed to its predecessor's registration.
+            /// </summary>
+            public bool TryClaim() => Interlocked.Exchange(ref _claimed, 1) == 0;
+        }
 
         public required HiveOrchestratorService Service { get; init; }
         public required GoalPipelineManager PipelineManager { get; init; }
@@ -1373,6 +1549,9 @@ public sealed class DashboardNotifierWorkerWiringTests
         public required TaskQueue Queue { get; init; }
         public required ChannelStreamReader Reader { get; init; }
         public required Task StreamTask { get; init; }
+
+        /// <summary>The REAL recorder's stores, owned by this harness for the test's lifetime.</summary>
+        public required RecorderFixture Recording { get; init; }
 
         public static async Task<RealTransportHarness> CreateAsync(bool withBrain = true)
         {
@@ -1426,13 +1605,20 @@ public sealed class DashboardNotifierWorkerWiringTests
                 withBrain ? brain : null,
                 config);
 
+            // THE REAL COMPLETION-RECEIPT STORES over a private in-memory SQLite database, and the
+            // REAL recorder built from them. Without a recorder the transport would FAIL CLOSED on
+            // every incoming completion, so these vectors would never reach the domain chain they
+            // exist to exercise.
+            var recording = new RecorderFixture();
+
             var service = new HiveOrchestratorService(
                 pool,
                 taskQueue,
                 pipelineManager,
                 transportNotifier,
                 dispatcher,
-                NullLogger<HiveOrchestratorService>.Instance);
+                NullLogger<HiveOrchestratorService>.Instance,
+                completionRecorder: recording.Recorder);
 
             var pipeline = pipelineManager.CreatePipeline(goal, maxRetries: 3);
             var plan = IterationPlan.Default();
@@ -1440,16 +1626,23 @@ public sealed class DashboardNotifierWorkerWiringTests
             pipeline.StateMachine.StartIteration(plan.Phases);
             pipeline.AdvanceTo(GoalPhase.Coding);
 
+            const string workerId = "transport-worker";
+            var worker = pool.RegisterWorker(workerId, []);
+
             var dispatched = new List<string>();
             var dispatchedTasks = new ConcurrentDictionary<string, WorkTask>();
             taskQueue.OnEnqueue = t =>
             {
                 dispatched.Add(t.TaskId);
                 dispatchedTasks[t.TaskId] = t;
-            };
 
-            const string workerId = "transport-worker";
-            var worker = pool.RegisterWorker(workerId, []);
+                // THE RECORDED ASSIGNMENT for EVERY queued task — A, each successor and any
+                // re-dispatch — through the harness's REAL insert-once store. The eager send is
+                // deliberately unconfigured in this harness (the gateway has no publisher), so
+                // without this the transport's completion recorder would refuse EVERY delivery and
+                // the domain chain these vectors exist to exercise would never be reached.
+                RecordAssignmentContext(recording.AssignmentStore, t, workerId, iteration: 1);
+            };
 
             var reader = new ChannelStreamReader();
             var streamTask = service.WorkStream(reader, new MockStreamWriter(), MockContext());
@@ -1469,21 +1662,28 @@ public sealed class DashboardNotifierWorkerWiringTests
                 Queue = taskQueue,
                 Reader = reader,
                 StreamTask = streamTask,
+                Recording = recording,
             };
 
-            // THE SOLE SUBSCRIBER: it awaits the REAL dispatcher completion handler and only
-            // then completes this delivery's TCS. Exceptions propagate to the awaiting test.
+            // THE SOLE SUBSCRIBER: it CLAIMS the earliest still-pending delivery registration whose
+            // output matches the emitted result, awaits the REAL dispatcher completion handler and
+            // only then completes that registration's TCS. Claiming in sequence order is what lets
+            // an IDENTICAL duplicate be registered at all — an output-keyed lookup could not tell
+            // the two apart.
             transportNotifier.OnTaskCompleted += async result =>
             {
-                var delivery = harness._deliveries[result.Output];
+                var delivery = harness.Claim(result.Output);
+                if (delivery is null)
+                    return;
+
                 try
                 {
                     await harness.Dispatcher.HandleTaskCompletionAsync(result);
-                    delivery.TrySetResult();
+                    delivery.Completion.TrySetResult();
                 }
                 catch (Exception ex)
                 {
-                    delivery.TrySetException(ex);
+                    delivery.Completion.TrySetException(ex);
                     throw;
                 }
             };
@@ -1506,13 +1706,22 @@ public sealed class DashboardNotifierWorkerWiringTests
 
             var taskId = Pipeline.ActiveTaskId;
             Assert.NotNull(taskId);
+
+            // THE RECORDED ASSIGNMENT already exists: the queue's OnEnqueue hook records one for
+            // EVERY queued task through the harness's REAL insert-once store, so the transport's
+            // completion recorder agreement rule is satisfied by real state rather than by a fixture
+            // shortcut. Asserted here so a fixture that lost the hook fails loudly.
+            Assert.True(
+                Recording.AssignmentStore.Load(taskId!) is not null,
+                $"no assignment context was recorded for the dispatched task '{taskId}'");
             return taskId!;
         }
 
         /// <summary>
         /// Pushes a completion onto the worker stream and returns the task that completes when
-        /// this delivery's DOMAIN handling has finished. The per-delivery key is the output
-        /// text, so overlapping deliveries for the SAME task id stay unambiguous.
+        /// this delivery's DOMAIN handling has finished. The registration is keyed by a MONOTONIC
+        /// sequence number, so overlapping OR IDENTICAL deliveries for the same task id stay
+        /// unambiguous.
         /// </summary>
         /// <remarks>
         /// EVERY delivery issued here is registered in <c>_deliveries</c> and is therefore
@@ -1522,7 +1731,10 @@ public sealed class DashboardNotifierWorkerWiringTests
         public Task BeginCompletionDelivery(string taskId, string output, string summary)
         {
             var delivery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            Assert.True(_deliveries.TryAdd(output, delivery), "Delivery outputs must be unique");
+            var sequence = Interlocked.Increment(ref _deliverySequence);
+            Assert.True(
+                _deliveries.TryAdd(sequence, new DeliveryRegistration(output, delivery)),
+                "Delivery sequence numbers must be unique");
 
             Reader.Push(new WorkerMessage
             {
@@ -1544,6 +1756,31 @@ public sealed class DashboardNotifierWorkerWiringTests
         public Task DeliverCompletionAsync(string taskId, string output, string summary) =>
             BeginCompletionDelivery(taskId, output, summary)
                 .WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+        /// <summary>
+        /// CLAIMS the earliest still-pending delivery registration whose output equals
+        /// <paramref name="output"/>, removing it from the ledger. Returns <c>null</c> when no such
+        /// registration is pending, so an unexpected emission is never mis-attributed to a later
+        /// delivery.
+        /// </summary>
+        /// <param name="output">The output text the emitted result carries.</param>
+        /// <returns>The claimed registration, or <c>null</c>.</returns>
+        private DeliveryRegistration? Claim(string output)
+        {
+            foreach (var key in _deliveries.Keys.OrderBy(k => k))
+            {
+                if (!_deliveries.TryGetValue(key, out var registration)
+                    || !string.Equals(registration.Output, output, StringComparison.Ordinal)
+                    || !registration.TryClaim())
+                {
+                    continue;
+                }
+
+                return registration;
+            }
+
+            return null;
+        }
 
         /// <summary>
         /// Re-establishes the TRANSPORT-LEVEL ownership the bounded completion guard requires for
@@ -1624,30 +1861,47 @@ public sealed class DashboardNotifierWorkerWiringTests
 
             // (3) THE DETACHED DELIVERIES. Awaiting the per-delivery TCS is what makes the
             // domain handler's completion observable — the stream never exposes it.
-            foreach (var (output, delivery) in _deliveries)
+            foreach (var (sequence, delivery) in _deliveries.OrderBy(entry => entry.Key))
             {
                 try
                 {
-                    await delivery.Task.WaitAsync(BoundedWait, CancellationToken.None);
+                    await delivery.Completion.Task.WaitAsync(BoundedWait, CancellationToken.None);
                 }
                 catch (TimeoutException ex)
                 {
                     cleanupFailures.Add(new TimeoutException(
-                        $"The domain handler for delivery '{output}' did not finish within the bound.", ex));
+                        $"The domain handler for delivery #{sequence} ('{delivery.Output}') did not " +
+                        "finish within the bound.", ex));
                 }
                 catch (Exception ex)
                 {
                     // The handler faulted. Observe it — never leave it as an unobserved fault.
                     cleanupFailures.Add(new InvalidOperationException(
-                        $"The domain handler for delivery '{output}' faulted.", ex));
+                        $"The domain handler for delivery #{sequence} ('{delivery.Output}') faulted.", ex));
                 }
             }
 
             if (throwOnCleanupFailure && cleanupFailures.Count > 0)
                 throw new AggregateException("Transport harness cleanup failed.", cleanupFailures);
         }
-    }
 
+        /// <summary>
+        /// Releases the harness's own recorder stores. Kept OUT of <see cref="StopAsync"/>'s
+        /// failure accounting on purpose: the stores' lifetime is not one of the observations those
+        /// vectors make, so a disposal failure must never masquerade as one.
+        /// </summary>
+        public void DisposeRecorderStores()
+        {
+            try
+            {
+                Recording.Dispose();
+            }
+            catch
+            {
+                // Best-effort — a leftover fixture must never fail a test.
+            }
+        }
+    }
     /// <summary>
     /// In-memory <see cref="IAsyncStreamReader{T}"/> backed by an unbounded channel: the test
     /// pushes messages whenever it likes and ends the stream with <see cref="Complete"/>.

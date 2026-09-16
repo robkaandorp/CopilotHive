@@ -27,13 +27,27 @@ public sealed class HiveOrchestratorService(
     IEventBus? eventBus = null,
     UserService? userService = null,
     ConfigRepoManager? configRepoManager = null,
-    IWorkerAssignmentPublisher? assignmentPublisher = null) : HiveOrchestrator.HiveOrchestratorBase
+    IWorkerAssignmentPublisher? assignmentPublisher = null,
+    IWorkerCompletionRecorder? completionRecorder = null) : HiveOrchestrator.HiveOrchestratorBase
 {
     private readonly DashboardNotifier? _dashboardNotifier = dashboardNotifier;
     private readonly IIssueStore? _issueStore = issueStore;
     private readonly IEventBus? _eventBus = eventBus;
     private readonly UserService? _userService = userService;
     private readonly ConfigRepoManager? _configRepoManager = configRepoManager;
+
+    /// <summary>
+    /// THE MANDATORY COMPLETION-RECEIPT RECORDER. Optional in the constructor signature only so
+    /// unrelated fixtures that never deliver a completion keep compiling; the production container
+    /// always supplies it.
+    /// <para>
+    /// IT IS NOT A FALL-BACK-TO-UNRECORDED SWITCH. When it is absent an INCOMING COMPLETION FAILS
+    /// CLOSED (see <see cref="LogCompletionNotRecorded"/>): the completion is retained on the worker
+    /// and nothing is released, because a completion whose evidence was never retained is exactly what
+    /// this slice exists to prevent.
+    /// </para>
+    /// </summary>
+    private readonly IWorkerCompletionRecorder? _completionRecorder = completionRecorder;
 
     /// <summary>
     /// THE MANDATORY READY-SEND RECORDER. Optional in the constructor signature only so unrelated
@@ -1063,6 +1077,60 @@ public sealed class HiveOrchestratorService(
             return;
         }
 
+        // ══ THE COMPLETION-RECEIPT RECORDING ═════════════════════════════════════════════════
+        // The receipt is retained AFTER the ownership validation and the boundary mapping/model
+        // selection above, and BEFORE the checked release below, so a release can never happen for a
+        // completion whose durable evidence was not confirmed.
+        //
+        // WHAT IS RECORDED IS EVIDENCE, NOT PROGRESS. A confirmed retention is NOT a phase
+        // advancement, NOT an acknowledgement and NOT a replay permission: the admitted domain path
+        // (TaskCompletionService's guards and the PipelineDriver it drives) owns every pipeline
+        // mutation, exactly as before.
+        //
+        // NO PIPELINE PRECONDITION: the recorder never consults a pipeline. Logical cancellation may
+        // remove the pipeline while valid transport ownership remains, so requiring one here would
+        // discard the evidence this slice exists to retain.
+        //
+        // ONLY A NORMAL RETURN FROM THE RECORDER PERMITS THE RELEASE. Every other outcome — a
+        // missing recorder (fail CLOSED, never the old unrecorded path), a missing or mismatched
+        // stored context, a Conflict, an unconfirmed write, a codec/read/query failure, or any
+        // unexpected throw — returns LOCALLY from this handler: no release, no queue removal, no
+        // dashboard success notification and no completion notification. This stream is NOT unwound.
+        //
+        // A RECEIPT STORED BY A PREVIOUS INVOCATION IS NEVER DELETED, COMPENSATED OR REBOUND here,
+        // and nothing is retried or read back after a write uncertainty.
+        try
+        {
+            if (_completionRecorder is null)
+            {
+                // FAIL CLOSED. There is deliberately NO fallback to the old unrecorded completion
+                // path: a completion whose evidence was never retained is exactly what must not be
+                // released either.
+                throw WorkerCompletionRecordingException.MissingRecorder();
+            }
+
+            // The ACTIVE task validated above and the ALREADY-MAPPED result are handed over as-is:
+            // the recorder derives the receipt's identity from the STORED assignment context and the
+            // result's own selected model, never from a second, independently derived value.
+            _completionRecorder.Record(worker.Id, activeTask, result);
+        }
+        catch (WorkerCompletionRecordingException refusal)
+        {
+            LogCompletionNotRecorded(worker.Id, complete.TaskId, refusal.Reason.ToString(), refusal);
+
+            // RETURN NORMALLY: the pinned worker, the active task, the busy state and this stream are
+            // deliberately retained. The worker keeps owning the completion until the existing
+            // timeout policy or worker recovery reclaims it — logical cancellation does not.
+            return;
+        }
+        catch (Exception unexpected)
+        {
+            // FAIL CLOSED FOR ANY OTHER THROW TOO: only a normal return is a confirmed retention, so
+            // an unexpected failure is a refusal rather than a reason to release without evidence.
+            LogCompletionNotRecorded(worker.Id, complete.TaskId, unexpected.GetType().Name, unexpected);
+            return;
+        }
+
         // ══ THE CHECKED RELEASE ══════════════════════════════════════════════════════════════
         // Re-validated at the mutation point: a refusal releases nothing, removes nothing and
         // notifies nothing.
@@ -1091,6 +1159,48 @@ public sealed class HiveOrchestratorService(
                 logger.LogError(ex, "Error in task completion handler for {TaskId}", complete.TaskId);
             }
         });
+    }
+
+    /// <summary>
+    /// THE GUARDED COMPLETION-RECORDING DIAGNOSTIC: a completion whose receipt was NOT confirmed, so
+    /// the completion was retained on the worker and nothing was released, removed or notified.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE WARNING IS GUARDED. The whole diagnostic — the reason text, the
+    /// <see cref="Exception.Message"/> read and the logger call INCLUDED — sits inside its own
+    /// no-throw guard, so a logger (or a message getter) that itself throws cannot escape and unwind
+    /// the worker's stream. The recording refusal is the authoritative outcome here; the diagnostic
+    /// must never replace it.
+    /// </para>
+    /// <para>
+    /// THE DISPOSITION WORDING IS CANONICAL and is emitted, with the task and the worker, for every
+    /// refusal family: a missing recorder, a missing or mismatched stored context, a Conflict, an
+    /// unconfirmed write and any store read/codec/query failure. It tells the operator the
+    /// truth this slice is about — logical cancellation alone does NOT release the transport hold.
+    /// </para>
+    /// </remarks>
+    /// <param name="workerId">The pinned worker whose completion was not recorded.</param>
+    /// <param name="taskId">The completing task's identifier.</param>
+    /// <param name="reason">The refusal family (or the unexpected exception's type name).</param>
+    /// <param name="failure">The refusal; its exact message is included as evidence.</param>
+    private void LogCompletionNotRecorded(string workerId, string taskId, string reason, Exception failure)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} task {TaskId}: completion retained on worker; receipt not confirmed; " +
+                "logical cancellation alone does not release transport ownership (reason={Reason}) — " +
+                "{Detail}",
+                workerId,
+                taskId,
+                reason,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
     }
 
     /// <summary>
