@@ -44,13 +44,16 @@ namespace CopilotHive.Persistence;
 /// uncertainty handler wraps the INSERT call alone, so those errors cannot be swallowed by it.
 /// </para>
 /// <para>
-/// SCOPE, HONESTLY. <see cref="CompletionReceiptWriteStatus.Stored"/> is EVIDENCE RETENTION ONLY:
-/// it is not durable worker authorization, it does not prove the worker owned the attempt, and it
-/// does not advance a phase. This slice has NO production DI registration and NO production callers.
-/// There is no enumeration, no processed marker, no receipt deletion, no registry claim, no pointer
-/// release, no acknowledgement/replay and no lifetime cleanup — deliberate pipeline-reset task-id
-/// reuse is a later integration concern, and the store performs no hidden reconciliation of any
-/// kind: a caller that saw <see cref="CompletionReceiptWriteStatus.Indeterminate"/> owns the retry.
+/// SCOPE, HONESTLY. <see cref="CompletionReceiptStore"/> is factory-backed, constructed from
+/// <see cref="IDbContextFactory{CopilotHiveDbContext}"/>, and registered in production DI. It is
+/// used by <c>WorkerCompletionRecorder</c> on the completion path, BEFORE the checked transport
+/// release in <c>HiveOrchestratorService.HandleTaskComplete</c>. Stored evidence is EVIDENCE
+/// RETENTION ONLY: it is not processed pipeline advancement, worker authorization, or an acknowledgement;
+/// <see cref="CompletionReceiptWriteStatus.AlreadyStored"/> is NOT a processed marker. This store has
+/// no enumeration, no processed marker, no receipt deletion, no registry claim, no pointer release, no
+/// acknowledgement/replay and no lifetime cleanup — deliberate pipeline-reset task-id reuse is a later
+/// integration concern, and it performs no hidden reconciliation of any kind: a caller that saw
+/// <see cref="CompletionReceiptWriteStatus.Indeterminate"/> owns the retry.
 /// </para>
 /// </summary>
 internal sealed class CompletionReceiptStore

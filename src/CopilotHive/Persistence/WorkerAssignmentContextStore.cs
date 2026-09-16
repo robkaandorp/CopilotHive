@@ -61,9 +61,11 @@ namespace CopilotHive.Persistence;
 /// <see cref="WorkerAssignmentWriteStatus.Conflict"/> — a refusal, never a rebind.
 /// </para>
 /// <para>
-/// SCOPE. This slice has NO production DI registration and NO production callers, and it performs no
-/// delivery, authorization, retry or reconciliation of any kind: a caller that saw
-/// <see cref="WorkerAssignmentWriteStatus.Indeterminate"/> owns the retry.
+/// SCOPE. <see cref="WorkerAssignmentContextStore"/> is registered in production DI and is used by
+/// <see cref="WorkerAssignmentPublisher"/> before Ready/eager assignment publication; its rows are
+/// loaded by <see cref="WorkerCompletionRecorder"/>. A recorded row records the server's INTENDED
+/// assignment context — it is NOT proof of delivery, current authorization, worker liveness, or
+/// completion processing. The store itself does not publish, retry, or reconcile.
 /// </para>
 /// </summary>
 internal sealed class WorkerAssignmentContextStore
