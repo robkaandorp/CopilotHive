@@ -8,7 +8,10 @@ using Grpc.Net.Client;
 using Microsoft.Extensions.AI;
 
 using System.Reflection;
+using System.Text.Json;
 using System.Threading.Channels;
+
+using SharpCoder;
 
 using DomainWorkerRole = CopilotHive.Workers.WorkerRole;
 using GrpcWorkerRole = CopilotHive.Shared.Grpc.WorkerRole;
@@ -1186,6 +1189,553 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // (9) Connection-bound assignment dependencies: binding, sessions, retirement.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// BINDING, NOT AFTER-THE-FACT LOOKUP. The dependency the REAL assignment setup installs on the
+    /// real <see cref="TaskExecutor"/> (captured through the runner's <c>SetToolBridge</c> seam) is
+    /// exercised against ALL FIVE bridge operations after the service's publication moved to a
+    /// SECOND connection BEFORE the first bridge operation started. Every call must travel over the
+    /// CAPTURED connection A — exact writer, worker ID, task ID, arguments and response — and the B
+    /// connection's writer must record ZERO writes.
+    /// <para>
+    /// REMOVAL-PROOFNESS: handing the service itself to the executor (the pre-adapter shape) makes
+    /// every bridge call resolve the CURRENT published connection, so after the publication change
+    /// each call would appear on B's writer and the exact-A-value and zero-B-traffic assertions
+    /// fail by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task AssignmentBridgeDependency_BoundToCapturedConnection_AllFiveOperationsUseAWithZeroBTraffic_AfterRepublishBeforeFirstOperation()
+    {
+        const string assignedIdA = "worker-binding-a";
+        var requestsA = new RecordingToolRequestStream();
+        var responsesA = new ChannelResponseReader();
+        var requestsB = new RecordingToolRequestStream();
+        var responsesB = new ChannelResponseReader();
+
+        var runner = new BridgeCapturingRunner();
+
+        using var service = NewService(runner);
+
+        // A is the connection the assignment arrives on; B is never published to the loop.
+        var connectionA = BuildConnection(
+            assignedIdA, requestsA, responsesA, invoker: null);
+        service.PublishConnection(connectionA);
+        var connectionB = BuildConnection(
+            "worker-binding-b", requestsB, responsesB, invoker: null);
+
+        var loop = InvokeLoop(service, connectionA, TestContext.Current.CancellationToken);
+        Task<IToolCallBridge>? captureWait = null;
+        try
+        {
+            var assignment = Assignment("task-binding");
+            responsesA.Push(assignment);
+
+            // The executor's assignment setup calls SetToolBridge on the runner with THE adapter
+            // instance the real TaskExecutor construction produced. This is the exact dependency
+            // production installed — not a hand-built stand-in.
+            captureWait = runner.Captured.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var bridge = await captureWait;
+
+            // Wait for the prompt to start so the assignment body is genuinely parked on the
+            // runner, then move the service's publication to B BEFORE any bridge operation runs.
+            await runner.PromptStarted("task-binding")
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(0, requestsA.WriteCount);
+            Assert.Equal(0, requestsB.WriteCount);
+            service.PublishConnection(connectionB);
+
+            // ── The FIVE bridge operations, through the CAPTURED dependency only. ──
+
+            // 1. report_progress (fire-and-forget).
+            await bridge.ReportProgressAsync("task-binding", "binding-status", "binding details",
+                    TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var progress = await requestsA.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerMessage.PayloadOneofCase.ToolRequest, progress.PayloadCase);
+            Assert.Equal("report_progress", progress.ToolRequest.ToolName);
+            Assert.Equal("task-binding", progress.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, progress.WorkerId);
+            Assert.Equal("""{"status":"binding-status","details":"binding details"}""",
+                progress.ToolRequest.ArgumentsJson);
+
+            // 2. report_narrative (fire-and-forget).
+            await bridge.ReportNarrativeAsync("task-binding", "the narrative",
+                    TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var narrative = await requestsA.WaitForWriteAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal("report_narrative", narrative.ToolRequest.ToolName);
+            Assert.Equal("task-binding", narrative.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, narrative.WorkerId);
+            Assert.Equal("""{"narrative":"the narrative"}""",
+                narrative.ToolRequest.ArgumentsJson);
+
+            // 3. request_clarification (response-bearing, resolved through A's own loop). The
+            //    TASK ID is asserted EXACTLY, and so is the returned payload — a wrong task ID or
+            //    an altered response payload fails here rather than passing a substring probe.
+            var clarification = bridge.RequestClarificationAsync(
+                "task-binding", "why?", TestContext.Current.CancellationToken);
+            var clarificationWrite = await requestsA.WaitForWriteAsync(
+                2, TestContext.Current.CancellationToken);
+            Assert.Equal("request_clarification", clarificationWrite.ToolRequest.ToolName);
+            Assert.Equal("task-binding", clarificationWrite.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, clarificationWrite.WorkerId);
+            Assert.Equal("""{"question":"why?"}""",
+                clarificationWrite.ToolRequest.ArgumentsJson);
+            Assert.True(connectionA.TryCompleteToolResponse(new ToolCallResponse
+            {
+                RequestId = clarificationWrite.ToolRequest.RequestId,
+                Success = true,
+                ResultJson = """{"clarification":"from-A"}""",
+            }));
+            Assert.Equal(
+                """{"clarification":"from-A"}""",
+                await clarification.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // 4. get_goal (response-bearing).
+            var goal = bridge.GetGoalAsync("task-binding", "goal-binding",
+                TestContext.Current.CancellationToken);
+            var goalWrite = await requestsA.WaitForWriteAsync(3, TestContext.Current.CancellationToken);
+            Assert.Equal("get_goal", goalWrite.ToolRequest.ToolName);
+            Assert.Equal("task-binding", goalWrite.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, goalWrite.WorkerId);
+            Assert.Equal("""{"goal_id":"goal-binding"}""",
+                goalWrite.ToolRequest.ArgumentsJson);
+            Assert.True(connectionA.TryCompleteToolResponse(new ToolCallResponse
+            {
+                RequestId = goalWrite.ToolRequest.RequestId,
+                Success = true,
+                ResultJson = """{"goal":"A-goal"}""",
+            }));
+            Assert.Equal("""{"goal":"A-goal"}""",
+                await goal.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // 5. raise_issue (response-bearing, error conversion unchanged).
+            var issue = bridge.RaiseIssueAsync(
+                "task-binding", "bug", "title", "desc", "high",
+                TestContext.Current.CancellationToken);
+            var issueWrite = await requestsA.WaitForWriteAsync(4, TestContext.Current.CancellationToken);
+            Assert.Equal("raise_issue", issueWrite.ToolRequest.ToolName);
+            Assert.Equal("task-binding", issueWrite.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, issueWrite.WorkerId);
+            Assert.Equal(
+                """{"type":"bug","title":"title","description":"desc","severity":"high"}""",
+                issueWrite.ToolRequest.ArgumentsJson);
+            Assert.True(connectionA.TryCompleteToolResponse(new ToolCallResponse
+            {
+                RequestId = issueWrite.ToolRequest.RequestId,
+                Success = false,
+                Error = "orchestrator refused",
+            }));
+            Assert.Equal(
+                "Error: orchestrator refused",
+                await issue.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+
+            // EXACTLY the five writes above reached A — no resend and no extra traffic.
+            Assert.Equal(5, requestsA.WriteCount);
+
+            // ZERO B traffic: the publication change and all five operations moved NOTHING to B.
+            Assert.Equal(0, requestsB.WriteCount);
+            Assert.Equal(0, connectionB.PendingToolResponseCount);
+        }
+        finally
+        {
+            connectionA.EndToolResponses();
+            connectionB.EndToolResponses();
+            runner.ReleaseAll();
+            responsesA.TryComplete();
+            responsesB.TryComplete();
+            await JoinAllForCleanupAsync(
+                (captureWait, nameof(captureWait)), (loop, nameof(loop)));
+        }
+    }
+
+    /// <summary>
+    /// SESSION LOAD/SAVE BINDING. The executor's REAL session load and save (driven through the
+    /// real <see cref="TaskExecutor"/> with a session-carrying assignment) resolve the CAPTURED
+    /// dependency's distinct A/B clients. The service's publication moves to B AFTER the load but
+    /// BEFORE the save; NEITHER call may move to B: the load's session ID and the saved JSON reach
+    /// exactly A's invoker, and B's invoker saw no session RPC.
+    /// </summary>
+    [Fact]
+    public async Task AssignmentSessionLoadAndSave_BoundToCapturedConnection_StayOnAWhenPublicationMovesBetweenLoadAndSave()
+    {
+        const string sessionId = "goal-session:coder";
+        var invokerA = new RecordingSessionInvoker();
+        var invokerB = new RecordingSessionInvoker();
+
+        // The EXACT payload A serves, and the EXACT payload the executor must save back: the
+        // executor deserializes what it loaded and re-serializes the runner's retained session
+        // with the same options, so the saved bytes are fully determined here.
+        var loadedJson = JsonSerializer.Serialize(
+            AgentSession.Create("binding-loaded"), AIJsonUtilities.DefaultOptions);
+        var expectedSavedJson = JsonSerializer.Serialize(
+            JsonSerializer.Deserialize<AgentSession>(loadedJson, AIJsonUtilities.DefaultOptions),
+            AIJsonUtilities.DefaultOptions);
+        invokerA.SessionToReturn = new GetSessionResponse { Found = true, SessionJson = loadedJson };
+
+        var runner = new BridgeCapturingRunner();
+        using var service = NewService(runner);
+
+        var requestsA = new RecordingToolRequestStream();
+        var requestsB = new RecordingToolRequestStream();
+        var responsesA = new ChannelResponseReader();
+        var responsesB = new ChannelResponseReader();
+        var connectionA = BuildConnection("worker-session-a", requestsA, responsesA, invokerA);
+        var connectionB = BuildConnection("worker-session-b", requestsB, responsesB, invokerB);
+        service.PublishConnection(connectionA);
+
+        var loop = InvokeLoop(service, connectionA, TestContext.Current.CancellationToken);
+        try
+        {
+            responsesA.Push(SessionAssignment("task-session", sessionId));
+
+            // LOAD: the executor's own session load reached A's invoker with the exact ID.
+            await invokerA.AwaitAsync("load", TestContext.Current.CancellationToken);
+            Assert.Equal(1, invokerA.LoadCount);
+            Assert.Equal(sessionId, invokerA.LastLoadSessionId);
+            Assert.Equal(0, invokerB.LoadCount);
+
+            // The prompt starts (the executor is genuinely mid-execution with the loaded session).
+            await runner.PromptStarted("task-session")
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Publication moves to B while the executor's session SAVE has not happened yet —
+            // strictly after the load, strictly before the save. Deterministic, no timing.
+            service.PublishConnection(connectionB);
+
+            // The prompt returns, so the executor performs its save — on the CAPTURED dependency.
+            runner.ReleaseAll();
+            await invokerA.AwaitAsync("save", TestContext.Current.CancellationToken);
+
+            // The Complete write can only begin after ExecuteAsync returned, so all executor-owned
+            // session saves have finished by this point; the save-count assertion below is final,
+            // not an early snapshot taken while execution could still issue a duplicate.
+            var complete = await requestsA.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerMessage.PayloadOneofCase.Complete, complete.PayloadCase);
+
+            // A saw the exact session ID and the EXACT saved JSON — byte for byte, so a
+            // malformed, truncated or extra-field payload fails here.
+            Assert.Equal(sessionId, invokerA.LastSaveSessionId);
+            Assert.Equal(expectedSavedJson, invokerA.LastSavedJson);
+
+            // ...and the saved payload really is the session A served (not an empty/fresh one).
+            var savedSession = JsonSerializer.Deserialize<AgentSession>(
+                invokerA.LastSavedJson!, AIJsonUtilities.DefaultOptions);
+            Assert.Equal("binding-loaded", savedSession!.SessionId);
+
+            // EXACTLY ONE save on A — no duplicate, no retry, no second write of the session.
+            Assert.Equal(1, invokerA.SaveCount);
+            Assert.Equal(1, invokerA.LoadCount);
+
+            // B saw NOTHING: neither the load nor the save moved to the newly published connection.
+            Assert.Equal(0, invokerB.LoadCount);
+            Assert.Equal(0, invokerB.SaveCount);
+            Assert.Equal(0, requestsB.WriteCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            responsesA.TryComplete();
+            responsesB.TryComplete();
+            await JoinAllForCleanupAsync((loop, nameof(loop)));
+        }
+    }
+
+    /// <summary>
+    /// RETIRED-A REJECTION, THROUGH THE REAL CAPTURED ADAPTER. A REAL assignment runs on A, its
+    /// executor-installed dependency is captured through the runner's <c>SetToolBridge</c> seam,
+    /// publication moves to B, and A is then RETIRED. Every category invoked through that retained
+    /// A-bound dependency — response-bearing, fire-and-forget and unary session — fails with the
+    /// EXISTING <see cref="WorkerConnection.DisconnectedMessage"/> and starts NO transport: A's
+    /// writer never moved, A's invoker issued no RPC, and B saw nothing at all.
+    /// <para>
+    /// REMOVAL-PROOFNESS: the assertions are non-vacuous because the operations genuinely run
+    /// through the production adapter. If the adapter fell back to the CURRENT published
+    /// connection, the calls would succeed on B and the disconnected-error and zero-B assertions
+    /// would fail by name; if the retirement check were dropped, A's writer/invoker counts would
+    /// move instead of staying at zero.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task RetiredAssignmentDependency_RejectsWithDisconnectedError_AndStartsNoTransport()
+    {
+        var invokerA = new RecordingSessionInvoker();
+        var invokerB = new RecordingSessionInvoker();
+        var requestsA = new RecordingToolRequestStream();
+        var requestsB = new RecordingToolRequestStream();
+        var responsesA = new ChannelResponseReader();
+        var responsesB = new ChannelResponseReader();
+
+        var runner = new BridgeCapturingRunner();
+        using var service = NewService(runner);
+
+        var connectionA = BuildConnection("worker-retired-a", requestsA, responsesA, invokerA);
+        var connectionB = BuildConnection("worker-retired-b", requestsB, responsesB, invokerB);
+        service.PublishConnection(connectionA);
+
+        var loop = InvokeLoop(service, connectionA, TestContext.Current.CancellationToken);
+        Task<IToolCallBridge>? captureWait = null;
+        try
+        {
+            responsesA.Push(Assignment("task-retired"));
+
+            // THE REAL executor-installed dependency for this assignment.
+            captureWait = runner.Captured.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var bridge = await captureWait;
+            var sessions = Assert.IsAssignableFrom<ISessionClient>(bridge);
+
+            await runner.PromptStarted("task-retired")
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Publication moves to B, and A is RETIRED while the assignment still holds its
+            // dependency. Both transitions happen before any operation is attempted.
+            service.PublishConnection(connectionB);
+            connectionA.Retire();
+
+            // No setup/reporting write has happened: the transport baseline is EXACTLY zero,
+            // not merely an arbitrary count that the rejected calls must leave unchanged.
+            Assert.Equal(0, requestsA.WriteCount);
+
+            // RESPONSE-BEARING through the retained A-bound adapter.
+            await ExpectDisconnectedAsync(
+                () => bridge.RequestClarificationAsync(
+                    "task-retired", "why?", TestContext.Current.CancellationToken),
+                "request_clarification");
+
+            await ExpectDisconnectedAsync(
+                () => bridge.GetGoalAsync(
+                    "task-retired", "goal-retired", TestContext.Current.CancellationToken),
+                "get_goal");
+
+            await ExpectDisconnectedAsync(
+                () => bridge.RaiseIssueAsync(
+                    "task-retired", "bug", "t", "d", "low", TestContext.Current.CancellationToken),
+                "raise_issue");
+
+            // FIRE-AND-FORGET through the same retained adapter: rejected at the post-gate
+            // retirement check, so nothing is written either.
+            await ExpectDisconnectedAsync(
+                () => bridge.ReportProgressAsync(
+                    "task-retired", "running", "after retirement", TestContext.Current.CancellationToken),
+                "report_progress");
+
+            await ExpectDisconnectedAsync(
+                () => bridge.ReportNarrativeAsync(
+                    "task-retired", "after retirement", TestContext.Current.CancellationToken),
+                "report_narrative");
+
+            // UNARY SESSIONS through the same retained adapter: checked access rejects before
+            // the RPC is issued.
+            await ExpectDisconnectedAsync(
+                () => sessions.GetSessionAsync("goal-retired:coder", TestContext.Current.CancellationToken),
+                "GetSession");
+
+            await ExpectDisconnectedAsync(
+                () => sessions.SaveSessionAsync(
+                    "goal-retired:coder", "{}", TestContext.Current.CancellationToken),
+                "SaveSession");
+
+            // NO TRANSPORT ANYWHERE. A's writer remains EXACTLY empty, A's invoker issued no
+            // unary RPC, and B — the newly published connection — saw nothing.
+            Assert.Equal(0, requestsA.WriteCount);
+            Assert.Equal(0, invokerA.LoadCount);
+            Assert.Equal(0, invokerA.SaveCount);
+            Assert.Equal(0, requestsB.WriteCount);
+            Assert.Equal(0, invokerB.LoadCount);
+            Assert.Equal(0, invokerB.SaveCount);
+            Assert.Equal(0, connectionB.PendingToolResponseCount);
+            Assert.True(connectionA.IsRetired);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            connectionA.EndToolResponses();
+            connectionB.EndToolResponses();
+            responsesA.TryComplete();
+            responsesB.TryComplete();
+            await JoinAllForCleanupAsync(
+                (captureWait, nameof(captureWait)), (loop, nameof(loop)));
+        }
+    }
+
+    /// <summary>
+    /// <c>EndToolResponses</c> ALONE IS NOT RETIREMENT — proved through the REAL captured
+    /// assignment dependency. A REAL assignment runs on A, its executor-installed dependency is
+    /// captured, publication moves to B, and ONLY A's response lifetime is closed. Through that
+    /// retained A-bound dependency: the three response-bearing calls fail with the EXISTING
+    /// disconnected error and write nothing, while progress/narrative STILL write on A and the
+    /// unary <c>GetSession</c>/<c>SaveSession</c> STILL reach A's client with their exact
+    /// arguments. B sees zero traffic throughout.
+    /// <para>
+    /// This is the DISTINCTION test: under retirement (see
+    /// <see cref="RetiredAssignmentDependency_RejectsWithDisconnectedError_AndStartsNoTransport"/>)
+    /// every category is rejected, so collapsing closure into retirement would fail the
+    /// progress/narrative/session assertions here by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task EndToolResponsesOnly_ResponseBearingFailsWhileProgressNarrativeAndSessionsStillWork()
+    {
+        const string assignedIdA = "worker-closure-a";
+        var invokerA = new RecordingSessionInvoker();
+        var invokerB = new RecordingSessionInvoker();
+
+        var storedJson = JsonSerializer.Serialize(
+            AgentSession.Create("closure-session"), AIJsonUtilities.DefaultOptions);
+        invokerA.SessionToReturn = new GetSessionResponse { Found = true, SessionJson = storedJson };
+
+        var requestsA = new RecordingToolRequestStream();
+        var requestsB = new RecordingToolRequestStream();
+        var responsesA = new ChannelResponseReader();
+        var responsesB = new ChannelResponseReader();
+
+        var runner = new BridgeCapturingRunner();
+        using var service = NewService(runner);
+
+        var connectionA = BuildConnection(assignedIdA, requestsA, responsesA, invokerA);
+        var connectionB = BuildConnection("worker-closure-b", requestsB, responsesB, invokerB);
+        service.PublishConnection(connectionA);
+
+        var loop = InvokeLoop(service, connectionA, TestContext.Current.CancellationToken);
+        Task<IToolCallBridge>? captureWait = null;
+        try
+        {
+            responsesA.Push(Assignment("task-closure"));
+
+            captureWait = runner.Captured.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var bridge = await captureWait;
+            var sessions = Assert.IsAssignableFrom<ISessionClient>(bridge);
+
+            await runner.PromptStarted("task-closure")
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Publication moves to B; then ONLY A's response lifetime closes. A itself stays
+            // USABLE — it is never retired here.
+            service.PublishConnection(connectionB);
+            connectionA.EndToolResponses();
+            Assert.False(connectionA.IsRetired);
+
+            // ── RESPONSE-BEARING: rejected at registration, BEFORE anything is written. ──
+            Assert.Equal(0, requestsA.WriteCount);
+
+            await ExpectDisconnectedAsync(
+                () => bridge.RequestClarificationAsync(
+                    "task-closure", "why?", TestContext.Current.CancellationToken),
+                "request_clarification");
+
+            await ExpectDisconnectedAsync(
+                () => bridge.GetGoalAsync(
+                    "task-closure", "goal-closure", TestContext.Current.CancellationToken),
+                "get_goal");
+
+            await ExpectDisconnectedAsync(
+                () => bridge.RaiseIssueAsync(
+                    "task-closure", "bug", "t", "d", "low", TestContext.Current.CancellationToken),
+                "raise_issue");
+
+            // Not one of the three rejected calls wrote anything, on A or on B.
+            Assert.Equal(0, requestsA.WriteCount);
+            Assert.Equal(0, requestsB.WriteCount);
+
+            // ── PROGRESS / NARRATIVE: STILL permitted, still on A. Each await is BOUNDED, so a
+            //    dependency that instead wrote on B (or parked) fails by name rather than hanging.
+            await bridge.ReportProgressAsync(
+                    "task-closure", "running", "still alive", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await bridge.ReportNarrativeAsync(
+                    "task-closure", "closure narrative", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var progress = await requestsA.WaitForWriteAsync(0, TestContext.Current.CancellationToken);
+            var narrative = await requestsA.WaitForWriteAsync(1, TestContext.Current.CancellationToken);
+            Assert.Equal("report_progress", progress.ToolRequest.ToolName);
+            Assert.Equal("task-closure", progress.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, progress.WorkerId);
+            Assert.Equal("""{"status":"running","details":"still alive"}""",
+                progress.ToolRequest.ArgumentsJson);
+            Assert.Equal("report_narrative", narrative.ToolRequest.ToolName);
+            Assert.Equal("task-closure", narrative.ToolRequest.TaskId);
+            Assert.Equal(assignedIdA, narrative.WorkerId);
+            Assert.Equal("""{"narrative":"closure narrative"}""",
+                narrative.ToolRequest.ArgumentsJson);
+
+            // ── UNARY SESSIONS: STILL reach A's own client, with exact arguments. ──
+            var loaded = await sessions
+                .GetSessionAsync("goal-closure:coder", TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(storedJson, loaded);
+            Assert.Equal(1, invokerA.LoadCount);
+            Assert.Equal("goal-closure:coder", invokerA.LastLoadSessionId);
+
+            var saveJson = JsonSerializer.Serialize(
+                AgentSession.Create("closure-save"), AIJsonUtilities.DefaultOptions);
+            await sessions
+                .SaveSessionAsync("goal-closure:coder", saveJson, TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, invokerA.SaveCount);
+            Assert.Equal("goal-closure:coder", invokerA.LastSaveSessionId);
+            Assert.Equal(saveJson, invokerA.LastSavedJson);
+
+            // EXACTLY the two permitted writes reached A; B saw nothing at all.
+            Assert.Equal(2, requestsA.WriteCount);
+            Assert.Equal(0, requestsB.WriteCount);
+            Assert.Equal(0, invokerB.LoadCount);
+            Assert.Equal(0, invokerB.SaveCount);
+            Assert.Equal(0, connectionB.PendingToolResponseCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            connectionA.EndToolResponses();
+            connectionB.EndToolResponses();
+            responsesA.TryComplete();
+            responsesB.TryComplete();
+            await JoinAllForCleanupAsync(
+                (captureWait, nameof(captureWait)), (loop, nameof(loop)));
+        }
+    }
+
+    /// <summary>
+    /// Asserts that <paramref name="operation"/> fails with the EXISTING disconnected error,
+    /// BOUNDED by the failsafe so a regression that leaves the call pending forever fails BY NAME
+    /// instead of hanging the run.
+    /// </summary>
+    /// <remarks>
+    /// The bound matters here: a dependency that resolved the CURRENT published connection instead
+    /// of its captured one would not throw at all — it would register a response wait on the newly
+    /// published connection and park indefinitely. Awaiting the raw task would then hang; awaiting
+    /// it through this helper produces a named failure that identifies the operation.
+    /// </remarks>
+    /// <param name="operation">The operation to invoke through the dependency under test.</param>
+    /// <param name="name">The operation's name, used in the bound-expiry diagnostic.</param>
+    private static async Task ExpectDisconnectedAsync(Func<Task> operation, string name)
+    {
+        var call = operation();
+
+        try
+        {
+            await call.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert.Equal(WorkerConnection.DisconnectedMessage, ex.Message);
+            return;
+        }
+        catch (TimeoutException ex) when (!call.IsCompleted)
+        {
+            throw new TimeoutException(
+                $"'{name}' neither failed nor completed within {Failsafe}: the dependency did not "
+                    + "reject on its captured connection, so the disconnected contract did not hold.",
+                ex);
+        }
+
+        Assert.Fail($"'{name}' completed successfully, but the disconnected error was required.");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Harness.
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -1263,6 +1813,20 @@ public sealed class WorkerConnectionToolCallLifetimeTests
             GoalDescription = "exercise the tool-response lifetime",
             Prompt = "ask the orchestrator",
             Role = GrpcWorkerRole.Coder,
+        },
+    };
+
+    /// <summary>An assignment carrying a session ID, so the executor performs a real session load and save.</summary>
+    private static OrchestratorMessage SessionAssignment(string taskId, string sessionId) => new()
+    {
+        Assignment = new TaskAssignment
+        {
+            TaskId = taskId,
+            GoalId = "goal-session-binding",
+            GoalDescription = "exercise the connection-bound session dependency",
+            Prompt = "resume the session",
+            Role = GrpcWorkerRole.Coder,
+            SessionId = sessionId,
         },
     };
 
@@ -1444,8 +2008,12 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     /// Records every request write and lets a test await a specific write deterministically. Uses the
     /// shared base's explicit cancellable-write implementation, since production writes with the live
     /// stream token.
+    /// <para>
+    /// Shared with <see cref="WorkerServiceAssignmentConnectionBindingTests"/>, which drives the
+    /// PROVISIONED executor branch through this same writer seam.
+    /// </para>
     /// </summary>
-    private sealed class RecordingToolRequestStream : FakeClientStreamWriter<WorkerMessage>
+    internal sealed class RecordingToolRequestStream : FakeClientStreamWriter<WorkerMessage>
     {
         private readonly object _gate = new();
         private readonly List<WorkerMessage> _writes = [];
@@ -1984,6 +2552,234 @@ public sealed class WorkerConnectionToolCallLifetimeTests
         public async Task ResetSessionAsync(
             string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
             => await Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// A <see cref="CallInvoker"/> answering ONLY the session RPCs, recording the exact session ID
+    /// and saved JSON each call carried, with a deterministic gate that can HOLD the next save
+    /// until the test releases it (used to move the service's publication between load and save).
+    /// </summary>
+    internal sealed class RecordingSessionInvoker : CallInvoker
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, TaskCompletionSource> _signals = [];
+        private int _loadCount;
+        private int _saveCount;
+        private string? _lastLoadSessionId;
+        private string? _lastSaveSessionId;
+        private string? _lastSavedJson;
+
+        /// <summary>The response the NEXT load returns.</summary>
+        internal GetSessionResponse? SessionToReturn { get; set; }
+
+        /// <summary>
+        /// When non-null, the save parks on this source's cancellation before returning, so a test
+        /// can prove the publication change happened BETWEEN the load and the save.
+        /// </summary>
+        internal CancellationTokenSource? HoldNextSave { get; set; }
+
+        internal int LoadCount { get { lock (_gate) return _loadCount; } }
+        internal int SaveCount { get { lock (_gate) return _saveCount; } }
+        internal string? LastLoadSessionId { get { lock (_gate) return _lastLoadSessionId; } }
+        internal string? LastSaveSessionId { get { lock (_gate) return _lastSaveSessionId; } }
+        internal string? LastSavedJson { get { lock (_gate) return _lastSavedJson; } }
+
+        private void Signal(string name)
+        {
+            lock (_gate)
+            {
+                if (!_signals.TryGetValue(name, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _signals[name] = tcs;
+                }
+                tcs.TrySetResult();
+            }
+        }
+
+        /// <summary>
+        /// Completes when the named signal has fired (creating the source on first use), bounded by
+        /// the failsafe — the deterministic gate for "the load/save reached this invoker".
+        /// </summary>
+        internal Task AwaitAsync(string name, CancellationToken ct)
+        {
+            Task task;
+            lock (_gate)
+            {
+                if (!_signals.TryGetValue(name, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _signals[name] = tcs;
+                }
+                task = tcs.Task;
+            }
+
+            return task.WaitAsync(Failsafe, ct);
+        }
+
+        public override TResponse BlockingUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected blocking call {method.FullName}.");
+
+        public override AsyncUnaryCall<TResponse> AsyncUnaryCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request)
+        {
+            object GetSession()
+            {
+                Interlocked.Increment(ref _loadCount);
+                lock (_gate) _lastLoadSessionId = (request as GetSessionRequest)?.SessionId;
+                Signal("load");
+                var payload = SessionToReturn ?? new GetSessionResponse { Found = false };
+                return payload;
+            }
+
+            async Task<object> SaveSession()
+            {
+                Interlocked.Increment(ref _saveCount);
+                lock (_gate)
+                {
+                    _lastSaveSessionId = (request as SaveSessionRequest)?.SessionId;
+                    _lastSavedJson = (request as SaveSessionRequest)?.SessionJson;
+                }
+                Signal("save");
+
+                // The HOLD: the returned Task parks until the test releases it, so the publication
+                // change can land strictly between load and save.
+                if (HoldNextSave is not null)
+                {
+                    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    using var reg = HoldNextSave.Token.Register(() => release.TrySetResult());
+                    await release.Task;
+                }
+
+                return new SaveSessionResponse { Success = true };
+            }
+
+            return method.FullName switch
+            {
+                "/copilothive.HiveOrchestrator/GetSession" => new AsyncUnaryCall<TResponse>(
+                    Task.FromResult((TResponse)GetSession()), Task.FromResult(new Metadata()),
+                    () => new Status(StatusCode.OK, string.Empty), () => new Metadata(), () => { }),
+                "/copilothive.HiveOrchestrator/SaveSession" => new AsyncUnaryCall<TResponse>(
+                    SaveSession().ContinueWith(t => (TResponse)t.Result, TaskScheduler.Default),
+                    Task.FromResult(new Metadata()),
+                    () => new Status(StatusCode.OK, string.Empty), () => new Metadata(), () => { }),
+                _ => throw new NotSupportedException($"Unexpected unary call {method.FullName}."),
+            };
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options, TRequest request) =>
+            throw new NotSupportedException($"Unexpected server-streaming call {method.FullName}.");
+        public override AsyncClientStreamingCall<TRequest, TResponse> AsyncClientStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected client-streaming call {method.FullName}.");
+        public override AsyncDuplexStreamingCall<TRequest, TResponse> AsyncDuplexStreamingCall<TRequest, TResponse>(
+            Method<TRequest, TResponse> method, string? host, CallOptions options) =>
+            throw new NotSupportedException($"Unexpected duplex call {method.FullName}.");
+    }
+
+    /// <summary>
+    /// THE SHARED ASSIGNMENT-BINDING OBSERVATION RUNNER. It records the bridge dependency the REAL
+    /// assignment setup installed on the executor (<c>SetToolBridge</c>), retains whatever session
+    /// the executor loaded (so the executor's own save serializes real JSON), signals when its
+    /// prompt starts — keyed by the task ID the executor set — and PARKS there until released.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The park is what gives every binding test its deterministic window: the assignment body is
+    /// genuinely mid-execution and still owns its dependency, so the test can move the service's
+    /// publication to a second connection and then exercise the RETAINED dependency. Nothing here
+    /// is a stand-in for the collaborator under test — the captured object IS the dependency the
+    /// real <see cref="TaskExecutor"/> construction received.
+    /// </para>
+    /// <para>
+    /// Shared with <see cref="WorkerServiceAssignmentConnectionBindingTests"/>, which drives the
+    /// PROVISIONED executor branch through the same observation points.
+    /// </para>
+    /// </remarks>
+    internal sealed class BridgeCapturingRunner : IAgentRunner
+    {
+        private readonly TaskCompletionSource<IToolCallBridge> _captured =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly object _gate = new();
+        private readonly Dictionary<string, TaskCompletionSource> _started = [];
+        private readonly Dictionary<string, TaskCompletionSource> _release = [];
+        private object? _session;
+        private string? _currentTaskId;
+
+        /// <summary>
+        /// The dependency the REAL assignment setup installed, completed at the executor's own
+        /// <c>SetToolBridge</c> call. A <c>null</c> install is a production regression, so it is
+        /// surfaced as a failure rather than silently captured.
+        /// </summary>
+        internal Task<IToolCallBridge> Captured => _captured.Task;
+
+        private TaskCompletionSource Slot(Dictionary<string, TaskCompletionSource> map, string key)
+        {
+            lock (_gate)
+            {
+                if (!map.TryGetValue(key, out var tcs))
+                {
+                    tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    map[key] = tcs;
+                }
+                return tcs;
+            }
+        }
+
+        /// <summary>Completes once the executor's prompt for <paramref name="taskId"/> has started.</summary>
+        internal Task PromptStarted(string taskId) => Slot(_started, taskId).Task;
+
+        /// <summary>Teardown failsafe: releases every gate a parked prompt could hold.</summary>
+        internal void ReleaseAll()
+        {
+            lock (_gate)
+            {
+                foreach (var tcs in _started.Values) tcs.TrySetResult();
+                foreach (var tcs in _release.Values) tcs.TrySetResult();
+            }
+        }
+
+        public void SetToolBridge(IToolCallBridge? bridge) =>
+            _captured.TrySetResult(bridge ?? throw new InvalidOperationException(
+                "The assignment setup must install a non-null bridge dependency."));
+
+        public void SetCurrentTaskId(string? taskId) => Volatile.Write(ref _currentTaskId, taskId);
+
+        public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
+        {
+            // The task ID the EXECUTOR set for this assignment — never a hardcoded literal, so the
+            // gate always belongs to the assignment actually running.
+            var id = Volatile.Read(ref _currentTaskId)
+                ?? throw new InvalidOperationException(
+                    "The executor must set the current task ID before prompting.");
+
+            Slot(_started, id).TrySetResult();
+            await Slot(_release, id).Task.WaitAsync(ct);
+            return "binding-runner output";
+        }
+
+        public TestResultReport? LastTestReport => null;
+        public WorkerReport? LastWorkerReport => null;
+        public void ClearTestReport() { }
+        public void ClearWorkerReport() { }
+        public void SetCurrentGoalId(string? goalId) { }
+        public void SetTesterReport(string? report) { }
+        public void SetCustomAgent(DomainWorkerRole role, string agentsMdContent) { }
+        public void SetSession(object? session) => _session = session;
+        public object? GetSession() => _session;
+        public void SetMaxContextTokens(int maxTokens) { }
+        public int GetContextUsagePercent() => 0;
+        public void SetCompactionModel(string? model) { }
+        public void SetCompactionMaxTokens(int? maxTokens) { }
+        public void SetSubAgentModels(IReadOnlyList<SubAgentModelDto> models) { }
+        public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
+        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
+            => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

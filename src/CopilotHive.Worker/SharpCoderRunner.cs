@@ -1036,21 +1036,43 @@ public sealed class SharpCoderRunner : IAgentRunner
     /// the drain in <c>WorkerService.ProcessMessagesAsync</c> blocked forever while this runner
     /// still held the full-turn client lease — deadlocking teardown and preventing disposal.
     /// </para>
+    /// <para>
+    /// CONSTRUCTION-TIME CONTEXT. The five bridge-backed tools close over the bridge, task ID and
+    /// goal ID captured HERE, not over the mutable runner fields. A tool set is built once per turn
+    /// (see <c>RunPromptTurnAsync</c>), so its tools belong to the assignment this call was made for
+    /// even if the runner's fields are later repointed at another assignment.
+    /// </para>
     /// </summary>
     /// <param name="ct">The assignment's cancellation token, forwarded to every bridge call.</param>
     private IList<AITool> BuildCustomTools(CancellationToken ct)
     {
         var tools = new List<AITool>();
 
-        if (_toolBridge != null)
+        // CONSTRUCTION-TIME BINDING. The bridge and the assignment IDs are MUTABLE runner state that
+        // the next assignment overwrites (<see cref="SetToolBridge"/>, <see cref="SetCurrentTaskId"/>,
+        // <see cref="SetCurrentGoalId"/>). Reading the fields from inside a delegate would therefore
+        // re-read whichever assignment is current WHEN the tool is INVOKED, silently retargeting a
+        // retained tool built for assignment A onto assignment B's bridge and IDs. Capturing them into
+        // locals HERE — before the guard and before the delegates are created — closes over THIS
+        // turn's context instead, so an already-built tool stays bound to the assignment it was built
+        // for, while a later built set uses that turn's own values.
+        //
+        // The captured BRIDGE value (not the field) is used for both the guard and the delegates: a
+        // later SetToolBridge(null) must not be able to null out the dependency of a tool that was
+        // already constructed against a live bridge.
+        var bridge = _toolBridge;
+        var taskId = _currentTaskId;
+        var goalId = _currentGoalId;
+
+        if (bridge != null)
         {
             tools.Add(AIFunctionFactory.Create(
                 async ([Description("Short status summary")] string status,
                        [Description("Detailed progress explanation")] string details) =>
                 {
-                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    if (string.IsNullOrEmpty(taskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: report_progress({status})");
-                    await _toolBridge.ReportProgressAsync(_currentTaskId, status, details, ct);
+                    await bridge.ReportProgressAsync(taskId, status, details, ct);
                     return "Progress reported.";
                 },
                 "report_progress",
@@ -1060,9 +1082,9 @@ public sealed class SharpCoderRunner : IAgentRunner
             tools.Add(AIFunctionFactory.Create(
                 async ([Description("2-5 sentence narrative of what you tried, what worked, what you struggled with, and why")] string narrative) =>
                 {
-                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    if (string.IsNullOrEmpty(taskId)) return "Error: Task ID not set.";
                     _log.Info("Tool call: report_narrative()");
-                    await _toolBridge.ReportNarrativeAsync(_currentTaskId, narrative, ct);
+                    await bridge.ReportNarrativeAsync(taskId, narrative, ct);
                     return "Narrative recorded.";
                 },
                 "report_narrative",
@@ -1072,9 +1094,9 @@ public sealed class SharpCoderRunner : IAgentRunner
             tools.Add(AIFunctionFactory.Create(
                 async ([Description("The question to ask the orchestrator")] string question) =>
                 {
-                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    if (string.IsNullOrEmpty(taskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: request_clarification({question})");
-                    var response = await _toolBridge.RequestClarificationAsync(_currentTaskId, question, ct);
+                    var response = await bridge.RequestClarificationAsync(taskId, question, ct);
                     return response;
                 },
                 "request_clarification",
@@ -1084,10 +1106,10 @@ public sealed class SharpCoderRunner : IAgentRunner
             tools.Add(AIFunctionFactory.Create(
                 async () =>
                 {
-                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
-                    if (string.IsNullOrEmpty(_currentGoalId)) return "Error: Goal ID not set.";
+                    if (string.IsNullOrEmpty(taskId)) return "Error: Task ID not set.";
+                    if (string.IsNullOrEmpty(goalId)) return "Error: Goal ID not set.";
                     _log.Info($"Tool call: get_goal()");
-                    var response = await _toolBridge.GetGoalAsync(_currentTaskId, _currentGoalId, ct);
+                    var response = await bridge.GetGoalAsync(taskId, goalId, ct);
                     return response;
                 },
                 "get_goal",
@@ -1100,9 +1122,9 @@ public sealed class SharpCoderRunner : IAgentRunner
                        [Description("Detailed description of the issue")] string description,
                        [Description("Severity: low, medium, high (default: low)")] string? severity = null) =>
                 {
-                    if (string.IsNullOrEmpty(_currentTaskId)) return "Error: Task ID not set.";
+                    if (string.IsNullOrEmpty(taskId)) return "Error: Task ID not set.";
                     _log.Info($"Tool call: raise_issue({type}: {title})");
-                    var response = await _toolBridge.RaiseIssueAsync(_currentTaskId, type, title, description, severity ?? "low", ct);
+                    var response = await bridge.RaiseIssueAsync(taskId, type, title, description, severity ?? "low", ct);
                     return response;
                 },
                 "raise_issue",

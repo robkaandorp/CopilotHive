@@ -1084,6 +1084,15 @@ public sealed class WorkerService(
                         var bodyCts = taskCts;
                         var terminalResult = new TerminalResultHolder();
 
+                        // THE CONNECTION-BOUND DEPENDENCY PAIR for this assignment. Built from the
+                        // assignment's EXPECTED connection BEFORE either task starts, and the SAME
+                        // instance is handed to BOTH the bridge slot and the session-client slot of
+                        // BOTH executor construction branches below. The executor therefore never
+                        // receives this service: a bridge or session call it makes resolves the
+                        // assignment's OWN connection (or fails with the existing disconnected error
+                        // once that connection retires) rather than whatever is published later.
+                        var connectionBound = new ConnectionBoundDependencies(this, connection);
+
                         // Run task execution concurrently so message loop can process
                         // ToolCallResponse messages from the orchestrator during execution.
                         //
@@ -1107,7 +1116,8 @@ public sealed class WorkerService(
                                 if (provisioner is null)
                                 {
                                     var legacyExecutor = new TaskExecutor(
-                                        _agentRunner, this, sessionClient: this, configRepoDir: _configRepoDir);
+                                        _agentRunner, connectionBound, sessionClient: connectionBound,
+                                        configRepoDir: _configRepoDir);
                                     await ExecuteAssignmentAsync(
                                         legacyExecutor, domainTask, terminalResult, bodyCts.Token);
                                 }
@@ -1135,8 +1145,9 @@ public sealed class WorkerService(
                                     // STEP 6 — the executor is constructed LAST and receives the
                                     // caller-owned seam; it never disposes it.
                                     var executor = new TaskExecutor(
-                                        _agentRunner, this, gitOperations: null, sessionClient: this,
-                                        configRepoDir: _configRepoDir, configRepoSeam: seam);
+                                        _agentRunner, connectionBound, gitOperations: null,
+                                        sessionClient: connectionBound, configRepoDir: _configRepoDir,
+                                        configRepoSeam: seam);
                                     await ExecuteAssignmentAsync(
                                         executor, domainTask, terminalResult, bodyCts.Token);
                                 }
@@ -1693,13 +1704,80 @@ public sealed class WorkerService(
 
     #endregion
 
+    /// <summary>
+    /// THE IMPLICIT-REBINDING FIX: the ONE small adapter an assignment's executor is given for BOTH
+    /// its tool-call bridge and its session client, BOUND to the assignment's EXPECTED connection.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The public <see cref="IToolCallBridge"/> / <see cref="ISessionClient"/> members
+    /// of <see cref="WorkerService"/> resolve the CURRENT published connection when they are invoked.
+    /// Handing the service itself to an executor therefore leaves every bridge or session call it
+    /// makes bound to nothing in particular: a call made after a later connection was published would
+    /// silently retarget onto that newer registration, pairing one assignment's work with another
+    /// connection's stream, identity or client. This adapter captures the expected connection ONCE at
+    /// construction — BEFORE execution starts — and every member simply forwards to the service's
+    /// SHARED connection-taking implementation with THAT captured connection. There is no worker-ID
+    /// lookup and no fallback to a newer published connection anywhere in it.
+    /// </para>
+    /// <para>
+    /// ONE INSTANCE, TWO SLOTS. The same object implements both interfaces, so the two dependencies an
+    /// assignment's executor receives are the same captured binding rather than two independently
+    /// resolved ones — they can never disagree about which connection the assignment belongs to.
+    /// </para>
+    /// <para>
+    /// It performs NO buffering, retry, replay or synthesis, and it adds NO policy of its own: a
+    /// retired captured connection fails with the EXISTING disconnected error (raised by the checked
+    /// access inside the shared implementation, not here), a <c>null</c>/successful session outcome is
+    /// passed through verbatim, and the caller's token is forwarded unchanged. It is deliberately NOT
+    /// exposed: it is created per assignment inside the message loop and never published.
+    /// </para>
+    /// </remarks>
+    private sealed class ConnectionBoundDependencies(WorkerService service, WorkerConnection connection)
+        : IToolCallBridge, ISessionClient
+    {
+        /// <inheritdoc/>
+        public Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct) =>
+            service.RequestClarificationOnConnectionAsync(connection, taskId, question, ct);
+
+        /// <inheritdoc/>
+        public Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct) =>
+            service.ReportProgressOnConnectionAsync(connection, taskId, status, details, ct);
+
+        /// <inheritdoc/>
+        public Task ReportNarrativeAsync(string taskId, string narrative, CancellationToken ct) =>
+            service.ReportNarrativeOnConnectionAsync(connection, taskId, narrative, ct);
+
+        /// <inheritdoc/>
+        public Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct) =>
+            service.GetGoalOnConnectionAsync(connection, taskId, goalId, ct);
+
+        /// <inheritdoc/>
+        public Task<string> RaiseIssueAsync(
+            string taskId, string type, string title, string description, string severity, CancellationToken ct) =>
+            service.RaiseIssueOnConnectionAsync(connection, taskId, type, title, description, severity, ct);
+
+        /// <inheritdoc/>
+        public Task<string?> GetSessionAsync(string sessionId, CancellationToken ct) =>
+            service.GetSessionOnConnectionAsync(connection, sessionId, ct);
+
+        /// <inheritdoc/>
+        public Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct) =>
+            service.SaveSessionOnConnectionAsync(connection, sessionId, sessionJson, ct);
+    }
+
     #region IToolCallBridge
 
+    // PUBLIC FACADES OVER THE SHARED, CONNECTION-TAKING IMPLEMENTATION. These members resolve the
+    // CURRENT published connection exactly as before (the checked <see cref="RequireConnection"/>,
+    // whose disconnected error surfaces on the returned task because these methods are async) and
+    // then delegate to the ONE implementation below with that connection. The connection-bound
+    // adapter that assignments actually receive calls the SAME implementation, but with the
+    // connection it CAPTURED, so the two surfaces can never drift apart.
+
     /// <inheritdoc/>
-    public Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct) =>
-        SendResponseBearingToolCallAsync(
-            taskId, "request_clarification",
-            System.Text.Json.JsonSerializer.Serialize(new { question }), ct);
+    public async Task<string> RequestClarificationAsync(string taskId, string question, CancellationToken ct) =>
+        await RequestClarificationOnConnectionAsync(RequireConnection(), taskId, question, ct);
 
     /// <inheritdoc/>
     public async Task ReportProgressAsync(string taskId, string status, string details, CancellationToken ct)
@@ -1707,9 +1785,7 @@ public sealed class WorkerService(
         // FIRE-AND-FORGET: no response is awaited, so this takes NO response-lifetime check and
         // registers nothing. It still snapshots ONE connection and writes on it.
         var connection = RequireConnection();
-        await SendToolCallRequest(
-            connection, NewRequestId(), taskId, "report_progress",
-            System.Text.Json.JsonSerializer.Serialize(new { status, details }), ct);
+        await ReportProgressOnConnectionAsync(connection, taskId, status, details, ct);
     }
 
     /// <inheritdoc/>
@@ -1717,41 +1793,88 @@ public sealed class WorkerService(
     {
         // FIRE-AND-FORGET: see ReportProgressAsync.
         var connection = RequireConnection();
-        await SendToolCallRequest(
-            connection, NewRequestId(), taskId, "report_narrative",
-            System.Text.Json.JsonSerializer.Serialize(new { narrative }), ct);
+        await ReportNarrativeOnConnectionAsync(connection, taskId, narrative, ct);
     }
 
     /// <inheritdoc/>
-    public Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct) =>
-        SendResponseBearingToolCallAsync(
-            taskId, "get_goal",
-            System.Text.Json.JsonSerializer.Serialize(new { goal_id = goalId }), ct);
+    public async Task<string> GetGoalAsync(string taskId, string goalId, CancellationToken ct) =>
+        await GetGoalOnConnectionAsync(RequireConnection(), taskId, goalId, ct);
 
     /// <inheritdoc/>
-    public Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct) =>
-        SendResponseBearingToolCallAsync(
-            taskId, "raise_issue",
-            System.Text.Json.JsonSerializer.Serialize(new { type, title, description, severity }), ct);
+    public async Task<string> RaiseIssueAsync(string taskId, string type, string title, string description, string severity, CancellationToken ct) =>
+        await RaiseIssueOnConnectionAsync(RequireConnection(), taskId, type, title, description, severity, ct);
 
     /// <summary>A fresh request ID for one tool call.</summary>
     private static string NewRequestId() => Guid.NewGuid().ToString("N");
 
     /// <summary>
-    /// THE ONE RESPONSE-BEARING BRIDGE HELPER: snapshots ONE connection, REGISTERS the pending
-    /// response ON THAT SAME connection, sends the request on it, awaits the genuine server
-    /// response and converts it to the bridge's string result.
+    /// THE <c>request_clarification</c> IMPLEMENTATION, bound to the connection PASSED IN. The wire
+    /// tool name and the serialized arguments live HERE, so every caller — the public facade above
+    /// and the connection-bound adapter — sends byte-identical requests.
+    /// </summary>
+    private Task<string> RequestClarificationOnConnectionAsync(
+        WorkerConnection connection, string taskId, string question, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            connection, taskId, "request_clarification",
+            System.Text.Json.JsonSerializer.Serialize(new { question }), ct);
+
+    /// <summary>
+    /// THE <c>get_goal</c> IMPLEMENTATION, bound to the connection PASSED IN.
+    /// </summary>
+    private Task<string> GetGoalOnConnectionAsync(
+        WorkerConnection connection, string taskId, string goalId, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            connection, taskId, "get_goal",
+            System.Text.Json.JsonSerializer.Serialize(new { goal_id = goalId }), ct);
+
+    /// <summary>
+    /// THE <c>raise_issue</c> IMPLEMENTATION, bound to the connection PASSED IN.
+    /// </summary>
+    private Task<string> RaiseIssueOnConnectionAsync(
+        WorkerConnection connection, string taskId, string type, string title, string description,
+        string severity, CancellationToken ct) =>
+        SendResponseBearingToolCallAsync(
+            connection, taskId, "raise_issue",
+            System.Text.Json.JsonSerializer.Serialize(new { type, title, description, severity }), ct);
+
+    /// <summary>
+    /// THE <c>report_progress</c> IMPLEMENTATION, bound to the connection PASSED IN. FIRE-AND-FORGET:
+    /// it registers NO response and awaits only its write.
+    /// </summary>
+    private Task ReportProgressOnConnectionAsync(
+        WorkerConnection connection, string taskId, string status, string details, CancellationToken ct) =>
+        SendToolCallRequest(
+            connection, NewRequestId(), taskId, "report_progress",
+            System.Text.Json.JsonSerializer.Serialize(new { status, details }), ct);
+
+    /// <summary>
+    /// THE <c>report_narrative</c> IMPLEMENTATION, bound to the connection PASSED IN. FIRE-AND-FORGET:
+    /// see <see cref="ReportProgressOnConnectionAsync"/>.
+    /// </summary>
+    private Task ReportNarrativeOnConnectionAsync(
+        WorkerConnection connection, string taskId, string narrative, CancellationToken ct) =>
+        SendToolCallRequest(
+            connection, NewRequestId(), taskId, "report_narrative",
+            System.Text.Json.JsonSerializer.Serialize(new { narrative }), ct);
+
+    /// <summary>
+    /// THE ONE RESPONSE-BEARING BRIDGE HELPER: REGISTERS the pending response ON THE GIVEN
+    /// connection, sends the request on it, awaits the genuine server response and converts it to
+    /// the bridge's string result.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// SNAPSHOT ONCE, BEFORE REGISTRATION. The connection is captured before the pending entry
-    /// exists, and every later step — registration, the request write, the removal — uses that SAME
-    /// object, so registration and sending can never re-read a different
-    /// <c>CurrentConnection</c>. Both the identity and the writer come from that one snapshot, so
-    /// they cannot disagree.
+    /// THE CONNECTION IS A PARAMETER, NEVER A FIELD READ. Every step — registration, the request
+    /// write, the caller-cancellation registration and the removal — uses the SAME object the
+    /// caller handed in, so registration and sending can never re-read a different
+    /// <c>CurrentConnection</c>. The public facade passes the connection it just resolved through
+    /// <see cref="RequireConnection"/>; the connection-bound adapter passes the connection its
+    /// assignment CAPTURED, which is what makes a retained assignment's calls unable to retarget to
+    /// a newer published connection.
     /// </para>
     /// <para>
-    /// The not-connected error is unchanged and still raised before any wait. Registration itself is
+    /// The not-connected error is unchanged: a facade caller observes it from
+    /// <see cref="RequireConnection"/> before the first await. Registration itself is
     /// checked against the connection's response lifetime, so a call whose response could no longer
     /// be delivered fails with the EXISTING disconnected error BEFORE anything is written.
     /// </para>
@@ -1763,18 +1886,18 @@ public sealed class WorkerService(
     /// UNKNOWN, and re-sending could duplicate a remote effect.
     /// </para>
     /// </remarks>
+    /// <param name="connection">The expected connection this call belongs to.</param>
     /// <param name="taskId">The task this tool call belongs to.</param>
     /// <param name="toolName">The wire tool name.</param>
     /// <param name="argsJson">The serialized tool arguments.</param>
     /// <param name="ct">The CALLER's token, which cancels this request.</param>
     private async Task<string> SendResponseBearingToolCallAsync(
-        string taskId, string toolName, string argsJson, CancellationToken ct)
+        WorkerConnection connection, string taskId, string toolName, string argsJson, CancellationToken ct)
     {
-        var connection = RequireConnection();
         var requestId = NewRequestId();
 
-        // REGISTER FIRST, on the SAME snapshot. A closed response lifetime (or a retired connection)
-        // throws the EXISTING disconnected error here, before any transport is attempted.
+        // REGISTER FIRST, on the connection PASSED IN. A closed response lifetime (or a retired
+        // connection) throws the EXISTING disconnected error here, before any transport is attempted.
         var responseTask = connection.RegisterToolResponse(requestId);
 
         // CALLER CANCELLATION still cancels THIS request, using THIS caller's token, and removes the
@@ -1865,6 +1988,11 @@ public sealed class WorkerService(
 
     #region Session management
 
+    // PUBLIC FACADES OVER THE SHARED, CONNECTION-TAKING IMPLEMENTATION — see the same note on the
+    // IToolCallBridge region above. Both facades resolve the CURRENT published connection with the
+    // checked <see cref="RequireConnection"/> exactly as before and delegate with it; the
+    // connection-bound adapter calls the SAME helpers with the connection it CAPTURED.
+
     /// <summary>
     /// Retrieves a persisted session from the orchestrator for the given session ID.
     /// Uses the gRPC channel directly (not the bidirectional stream).
@@ -1875,13 +2003,34 @@ public sealed class WorkerService(
     /// The session JSON if found, or <c>null</c> if no session exists for the given ID.
     /// </returns>
     /// <remarks>
-    /// The connection is snapshotted ONCE and its client used for the whole call, so the RPC can
-    /// never straddle two registrations. Checked access rejects a retired connection before the RPC
-    /// starts; an RPC already under way keeps its captured client, token and outcome.
+    /// The connection is resolved ONCE and its client used for the whole call, so the RPC can never
+    /// straddle two registrations. Checked access rejects a retired connection before the RPC starts;
+    /// an RPC already under way keeps its captured client, token and outcome.
     /// </remarks>
-    public async Task<string?> GetSessionAsync(string sessionId, CancellationToken ct)
+    public async Task<string?> GetSessionAsync(string sessionId, CancellationToken ct) =>
+        await GetSessionOnConnectionAsync(RequireConnection(), sessionId, ct);
+
+    /// <summary>
+    /// Persists a session to the orchestrator for the given session ID.
+    /// Uses the gRPC channel directly (not the bidirectional stream).
+    /// </summary>
+    /// <param name="sessionId">The session identifier in format "goalId:roleName".</param>
+    /// <param name="sessionJson">The serialised session JSON to persist.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <remarks>Resolve-once and checked access exactly as in <see cref="GetSessionAsync"/>.</remarks>
+    public async Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct) =>
+        await SaveSessionOnConnectionAsync(RequireConnection(), sessionId, sessionJson, ct);
+
+    /// <summary>
+    /// THE session-load IMPLEMENTATION, bound to the connection PASSED IN. Checked access is taken on
+    /// that connection's <c>Client</c> BEFORE the RPC is issued, so a retired connection fails with
+    /// the EXISTING disconnected error without starting transport; the found/<c>null</c> mapping and
+    /// the caller's token forwarding are unchanged.
+    /// </summary>
+    private async Task<string?> GetSessionOnConnectionAsync(
+        WorkerConnection connection, string sessionId, CancellationToken ct)
     {
-        var client = RequireConnection().Client;
+        var client = connection.EnsureUsable().Client;
 
         var response = await client.GetSessionAsync(
             new GetSessionRequest { SessionId = sessionId },
@@ -1891,16 +2040,13 @@ public sealed class WorkerService(
     }
 
     /// <summary>
-    /// Persists a session to the orchestrator for the given session ID.
-    /// Uses the gRPC channel directly (not the bidirectional stream).
+    /// THE session-save IMPLEMENTATION, bound to the connection PASSED IN — checked access and token
+    /// forwarding exactly as in <see cref="GetSessionOnConnectionAsync"/>.
     /// </summary>
-    /// <param name="sessionId">The session identifier in format "goalId:roleName".</param>
-    /// <param name="sessionJson">The serialised session JSON to persist.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <remarks>Snapshot-once and checked access exactly as in <see cref="GetSessionAsync"/>.</remarks>
-    public async Task SaveSessionAsync(string sessionId, string sessionJson, CancellationToken ct)
+    private async Task SaveSessionOnConnectionAsync(
+        WorkerConnection connection, string sessionId, string sessionJson, CancellationToken ct)
     {
-        var client = RequireConnection().Client;
+        var client = connection.EnsureUsable().Client;
 
         await client.SaveSessionAsync(
             new SaveSessionRequest { SessionId = sessionId, SessionJson = sessionJson },
