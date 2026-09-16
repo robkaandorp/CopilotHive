@@ -275,6 +275,93 @@ public sealed class WorkerRedactionIntegrationTests
     }
 
     /// <summary>
+    /// STRUCTURAL REGRESSION for the returned-outcome handling in the worker entry point: the
+    /// outcome consumed after the attempt loop's catch region is the value the awaited
+    /// <see cref="WorkerService.RunAsync"/> genuinely returned, the handling sits AFTER every
+    /// retry-governing catch, and both diagnostics it writes are guarded.
+    /// <para>
+    /// THE REVIEWER MAJOR this pins: iteration 1 emitted the returned-outcome handling — including
+    /// a <c>Console.WriteLine</c> — before <c>break</c> and INSIDE the catch region whose
+    /// <c>IOException</c> branch retries. A closed redirected stdout throws
+    /// <see cref="IOException"/> from <c>Console</c>, so a clean-EOF outcome could be converted
+    /// into a fresh connection attempt — a clean-EOF reconnect. The structure below makes that
+    /// misrouting impossible: the catch classification only ever sees exceptions raised inside the
+    /// covered region (RunAsync, disposal), and every diagnostic the returned-outcome path writes is
+    /// best-effort, so a degraded sink can neither create an attempt nor change the exit code nor
+    /// reach the runtime unhandled.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void WorkerProgram_ReturnedOutcomeHandling_IsOutsideRetryGoverningCatches()
+    {
+        var programPath = Path.Combine(FindRepoRoot(), "src", "CopilotHive.Worker", "Program.cs");
+        Assert.True(File.Exists(programPath), $"Worker Program.cs not found at '{programPath}'.");
+        var source = File.ReadAllText(programPath).ReplaceLineEndings("\n");
+
+        // The REAL result of the run is captured INSIDE the covered region and nothing else happens
+        // there: the outcome is merely captured, so no diagnostic of ours can ever be classified as
+        // a connection failure.
+        const string OutcomeCapture = "completedOutcome = await service.RunAsync(cts.Token);";
+        // Disposal stays in a finally INSIDE the try whose sanitized catches redact its faults.
+        const string DisposalInFinally = "service.Dispose();";
+        // A returned outcome unconditionally stops the loop; a thrown failure leaves the outcome
+        // null and simply retries.
+        const string NullOutcomeContinues = "if (completedOutcome is not { } outcome)\n        continue;";
+        const string CleanExitBreak = "    break;\n}\nreturn 0;";
+        // Both diagnostics the returned-outcome path emits are guarded writes, never raw Console.
+        const string WorkStreamEndedDiagnostic =
+            "WriteBestEffort(Console.Out, \"[Worker] Work stream ended; the worker is exiting.\");";
+        const string BestEffortHelper = "static void WriteBestEffort(TextWriter writer, string message)";
+
+        foreach (var fragment in new[]
+                 {
+                     OutcomeCapture, DisposalInFinally, NullOutcomeContinues,
+                     CleanExitBreak, WorkStreamEndedDiagnostic, BestEffortHelper,
+                 })
+        {
+            Assert.True(
+                CountOccurrences(source, fragment) == 1,
+                $"Expected exactly one worker Program.cs occurrence of '{fragment}'.");
+        }
+
+        // ORDER: the outcome is captured before disposal (the finally), and the disposal — the last
+        // statement inside the covered region — is followed by the catch handlers BEFORE any
+        // returned-outcome handling. The handling's first observable statement therefore appears
+        // AFTER the final fatal catch, i.e. outside every retry-governing catch.
+        Assert.True(
+            source.IndexOf(OutcomeCapture, StringComparison.Ordinal)
+            < source.IndexOf(DisposalInFinally, StringComparison.Ordinal),
+            "The awaited outcome must be captured before service disposal runs.");
+
+        var catchRegionStart = source.IndexOf(
+            "catch (OperationCanceledException)", StringComparison.Ordinal);
+        var finalFatalCatch = source.IndexOf(
+            "catch (Exception ex)\n    {\n        // All other exceptions are fatal",
+            StringComparison.Ordinal);
+        var outcomeHandlingStart = source.IndexOf(NullOutcomeContinues, StringComparison.Ordinal);
+        Assert.True(
+            catchRegionStart >= 0 && finalFatalCatch > catchRegionStart,
+            "The sanitized catch region must exist after the covered try/finally.");
+        Assert.True(
+            outcomeHandlingStart > finalFatalCatch,
+            "Returned-outcome handling must come AFTER the final fatal catch: a throwing diagnostic "
+            + "there can never be classified as a connection failure and retried.");
+
+        // A returned outcome always stops the loop with the SAME exit code as before: the break is
+        // reached for both known outcomes, and the WorkStreamEnded write cannot reroute the loop.
+        Assert.True(
+            source.IndexOf(WorkStreamEndedDiagnostic, StringComparison.Ordinal)
+            < source.IndexOf(CleanExitBreak, StringComparison.Ordinal),
+            "The WorkStreamEnded diagnostic must precede the unconditional loop exit.");
+
+        // The guarded helper swallows everything: a degraded stdout/stderr can neither escape to the
+        // runtime nor alter the control flow the outcome dictates.
+        var helperBody = source[source.IndexOf(BestEffortHelper, StringComparison.Ordinal)..];
+        Assert.Contains("try", helperBody, StringComparison.Ordinal);
+        Assert.Contains("catch (Exception)", helperBody, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Launches the actual compiled worker entry point and forces its real fatal catch with a
     /// malformed orchestrator URI. The fatal stderr line must contain only the safe exception
     /// classification, never the raw UriFormatException message, and the process must exit with
@@ -348,6 +435,41 @@ public sealed class WorkerRedactionIntegrationTests
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>Counts non-overlapping ordinal occurrences of a fragment in the source.</summary>
+    private static int CountOccurrences(string source, string fragment)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = source.IndexOf(fragment, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += fragment.Length;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Finds the repository root by locating the solution file next to the source tree — the same
+    /// discovery the orchestrator-side Program.cs structural tests use.
+    /// </summary>
+    private static string FindRepoRoot()
+    {
+        var dir = AppContext.BaseDirectory;
+        while (dir is not null
+            && !Directory.GetFiles(dir, "*.slnx").Any()
+            && !Directory.Exists(Path.Combine(dir, "src", "CopilotHive")))
+        {
+            dir = Directory.GetParent(dir)?.FullName;
+        }
+
+        Assert.NotNull(dir);
+        Assert.True(
+            Directory.Exists(Path.Combine(dir, "src", "CopilotHive.Worker")),
+            $"Repository root not found from {AppContext.BaseDirectory}");
+        return dir;
+    }
 
     /// <summary>
     /// Builds a real <see cref="WorkerService"/> whose agent runner throws on disposal, by
