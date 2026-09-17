@@ -2322,7 +2322,30 @@ public sealed class TaskExecutor(
 
         if (!pullResult.Success)
         {
-            _log.Error($"git pull failed: {RenderForLog(pullResult.SanitizedError)}");
+            // A FAILED post-commit pull needs BOTH streams. The fetch/transport failure normally
+            // arrives on stderr while the conflict and affected-path details arrive on stdout;
+            // reporting only the stderr-derived field dropped the stdout evidence from the
+            // retained phase diagnostics. Each field is therefore rendered through RenderForLog
+            // SEPARATELY (URL redaction, then control-character sanitation) — never on the
+            // already-joined string — and only then joined with fixed framing, so both streams
+            // get the same protection. The seam-returned fields are used AS-IS: its
+            // resolved-credential literal redaction is never bypassed, and the legacy route's
+            // raw trimmed stderr / raw stdout gets the same treatment. A stream that is empty or
+            // whitespace (RenderForLog trims) contributes NO labelled segment, so the stage, the
+            // exit code and the push-not-attempted explanation survive every combination of
+            // empty streams. No prefix-length cap is applied: the useful conflict/path/fetch
+            // text is preserved.
+            var pullStdout = RenderForLog(pullResult.Stdout);
+            var pullStderr = RenderForLog(pullResult.SanitizedError);
+            List<string> pullEvidence = [];
+            if (pullStdout.Length > 0)
+                pullEvidence.Add($"stdout: {pullStdout}");
+            if (pullStderr.Length > 0)
+                pullEvidence.Add($"stderr: {pullStderr}");
+            var pullDiagnostics = string.Join(" | ", pullEvidence);
+            var pullDetail = pullDiagnostics.Length == 0 ? string.Empty : $": {pullDiagnostics}";
+
+            _log.Error($"git pull failed (exit {pullResult.ExitCode}){pullDetail}");
             // Abort any in-progress merge (best effort). Whatever happens to the abort —
             // success, failure, or a thrown error — push is NEVER attempted afterwards.
             try
@@ -2343,7 +2366,7 @@ public sealed class TaskExecutor(
 
             return new ConfigRepoPublication(
                 stagedSummary,
-                $"git pull failed (exit {pullResult.ExitCode}): {RenderForLog(pullResult.SanitizedError)} — push not attempted after the failed pull");
+                $"git pull failed (exit {pullResult.ExitCode}){pullDetail} — push not attempted after the failed pull");
         }
 
         // ── Publication-HEAD resolution (the EXACT publication evidence) ─────────

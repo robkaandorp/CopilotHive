@@ -640,6 +640,146 @@ public sealed class TaskExecutorRedactionTests : IDisposable
         Assert.Contains($"From {RedactedUrl}", AllOutput);
     }
 
+    // ── The failed post-commit pull's BOTH-streams diagnostic ─────────────────
+
+    /// <summary>
+    /// The failed post-commit pull now reports BOTH result streams through the same redaction
+    /// boundary. On the LEGACY route TaskExecutor receives RAW trimmed stderr and RAW stdout, so
+    /// neither field may be assumed pre-sanitized: a credential-bearing URL (and a Unicode line
+    /// separator) in EITHER stream must be redacted and control-sanitized, keeping the rendered
+    /// diagnostic on a SINGLE line with no forged extra log line.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_Improver_ConfigRepoFailedPullLog_BothStreamsAreCredentialFree()
+    {
+        var configRepo = CreateConfigRepoDir();
+        var git = new FakeGit
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, "agents/coder.agents.md\0", string.Empty),
+                // The transport failure is on stderr; the conflict detail is on stdout.
+                "pull --no-rebase" => (
+                    1,
+                    $"CONFLICT (content): Merge conflict in agents/coder.agents.md from {CredentialUrl}\u2028"
+                        + "conflict-detail-after-separator",
+                    $"fatal: unable to access '{CredentialUrl}/': 403\u2029forged-pull-line"),
+                _ => null,
+            },
+        };
+        var executor = new TaskExecutor(
+            new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
+
+        var result = await executor.ExecuteAsync(
+            BuildImproverTask(), TestContext.Current.CancellationToken);
+
+        // BOTH streams reach the immediate worker log, each with its provenance label.
+        var line = FindLine(AllOutput, "git pull failed");
+        Assert.Contains("stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md from", line);
+        Assert.Contains("stderr: fatal: unable to access", line);
+        Assert.Contains($"{RedactedUrl}", line);
+
+        // Control characters in BOTH streams are neutralized. The proof is that the text
+        // FOLLOWING each stream's separator stays on the SAME captured line as the diagnostic:
+        // an unsanitized U+2028/U+2029 would break the line and push these tails onto forged
+        // lines of their own.
+        Assert.Contains("conflict-detail-after-separator", line);
+        Assert.Contains("forged-pull-line", line);
+        Assert.DoesNotContain(
+            SplitLines(AllOutput), l => l.Trim() == "forged-pull-line");
+        Assert.DoesNotContain(
+            SplitLines(AllOutput), l => l.Trim() == "conflict-detail-after-separator");
+
+        // The credential never reaches the log or the persisted task result.
+        Assert.DoesNotContain(Token, AllOutput);
+        Assert.DoesNotContain("x-access-token", AllOutput);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics!.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+
+        // ── The RETAINED sinks: Metrics.Issues and the returned Output ────────
+        // Console capture proves nothing about what is persisted, so BOTH streams are asserted
+        // DIRECTLY on the isolated failure issue and on the composed Output.
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git pull failed"));
+        foreach (var retained in new[] { issue, result.Output })
+        {
+            // Both labelled stream segments are RETAINED…
+            Assert.Contains("stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md from", retained);
+            Assert.Contains("stderr: fatal: unable to access", retained);
+            // …including the text that FOLLOWED each stream's control character, so neither
+            // stream is truncated at its separator.
+            Assert.Contains("conflict-detail-after-separator", retained);
+            Assert.Contains("forged-pull-line", retained);
+            // The original control characters themselves are GONE from both streams.
+            Assert.DoesNotContain('\u2028', retained);
+            Assert.DoesNotContain('\u2029', retained);
+            // No credential and no userinfo — and the REDACTED URL shape survives instead.
+            Assert.DoesNotContain(Token, retained);
+            Assert.DoesNotContain("x-access-token", retained);
+            Assert.Contains(RedactedUrl, retained);
+        }
+
+        Assert.Contains("(exit 1)", issue);
+        Assert.Contains("push not attempted after the failed pull", issue);
+        // The isolated issue is the exact text composed into Output, after the preserved agent
+        // evidence.
+        Assert.Contains(issue, result.Output);
+        Assert.StartsWith("agent output\n\n[Config Repo Git Failure]", result.Output);
+    }
+
+    /// <summary>
+    /// A failed post-commit pull whose streams are both EMPTY keeps the stage, the exit code and
+    /// the push-not-attempted explanation — empty streams never erase the retained evidence.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_Improver_ConfigRepoFailedPull_EmptyStreamsKeepTheStageEvidence()
+    {
+        var configRepo = CreateConfigRepoDir();
+        var git = new FakeGit
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, "agents/coder.agents.md\0", string.Empty),
+                "pull --no-rebase" => (1, string.Empty, "   "),
+                _ => null,
+            },
+        };
+        var executor = new TaskExecutor(
+            new StubAgentRunner(), gitOperations: git, configRepoDir: configRepo);
+
+        var result = await executor.ExecuteAsync(
+            BuildImproverTask(), TestContext.Current.CancellationToken);
+
+        var line = FindLine(AllOutput, "git pull failed");
+        Assert.Contains("git pull failed (exit 1)", line);
+        Assert.DoesNotContain("stdout:", line);
+        Assert.DoesNotContain("stderr:", line);
+
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains("git pull failed (exit 1)", issue);
+        Assert.Contains("push not attempted after the failed pull", issue);
+        // The same no-erasure diagnostic travels in the returned Output, after the preserved
+        // agent evidence.
+        Assert.Contains(issue, result.Output);
+        Assert.StartsWith("agent output\n\n[Config Repo Git Failure]", result.Output);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.False(result.GitStatus!.Pushed);
+    }
+
+    /// <summary>
+    /// Splits captured console output on EVERY line-breaking convention, so a forged line
+    /// surfaces as its own entry rather than hiding inside a matched line.
+    /// </summary>
+    private static string[] SplitLines(string output) =>
+        output.Split(['\n', '\r', '\u0085', '\u2028', '\u2029']);
+
+    private static string FindLine(string output, string needle)
+    {
+        var line = Array.Find(SplitLines(output), l => l.Contains(needle, StringComparison.Ordinal));
+        Assert.NotNull(line);
+        return line!;
+    }
+
     // ── Functional data is never mutated ──────────────────────────────────────
 
     /// <summary>

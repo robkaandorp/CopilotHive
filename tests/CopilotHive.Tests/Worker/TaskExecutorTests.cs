@@ -3280,7 +3280,11 @@ public sealed class TaskExecutorTests
                 .. ConfigRepoPreparationFakes.SeamCleanupLaunches,
             ]);
 
-        Assert.Contains("git pull failed: merge conflict", FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
+        // The failed pull's diagnostics carry BOTH streams with provenance labels; here stdout is
+        // empty, so only the stderr segment is present — labelled as such.
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict",
+            FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
 
         // TRUTHFUL PUBLICATION: failed pull → Failed outcome, FAIL verdict, no Pushed claim.
         Assert.Equal(TaskOutcome.Failed, result.Status);
@@ -3289,6 +3293,22 @@ public sealed class TaskExecutorTests
         Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
         Assert.Equal(1, result.GitStatus.FilesChanged);
         Assert.Contains(result.Metrics.Issues, i => i.Contains("git pull failed (exit 1)") && i.Contains("push not attempted"));
+        // The SAME provenance-LABELLED diagnostic must survive into the RETAINED sinks, not just
+        // the immediate log: a mutant that labels only the log and retains an unlabeled reason
+        // fails here.
+        var reason = Assert.Single(result.Metrics.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict — push not attempted after the failed pull",
+            reason, StringComparison.Ordinal);
+        Assert.Contains(reason, result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict",
+            result.Output, StringComparison.Ordinal);
+        // The stdout stream is EMPTY in this variant, so neither retained sink may invent a
+        // stdout segment or label.
+        Assert.DoesNotContain("stdout:", reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("stdout:", result.Output, StringComparison.Ordinal);
+        Assert.StartsWith("Mock agent response", result.Output, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -3354,6 +3374,400 @@ public sealed class TaskExecutorTests
         Assert.False(result.GitStatus!.Pushed);
     }
 
+    // ── Failed post-commit pull: BOTH streams reach the retained diagnostics ──
+    //
+    // A failed post-commit pull reports BOTH result fields in the immediate worker error log
+    // and in the returned ConfigRepoPublication failure reason. For a real failed pull the
+    // fetch/transport failure arrives on stderr while the conflict and affected-path details
+    // arrive on stdout; the diagnostic therefore labels each stream that is present
+    // (`stdout: …` / `stderr: …`) and joins them with fixed framing. Each field is rendered
+    // through RenderForLog SEPARATELY before joining, so both streams get the same URL
+    // redaction then control-character sanitation. Empty streams contribute no segment, which
+    // keeps the stage, the exit code and the push-not-attempted clause in place.
+
+    /// <summary>
+    /// SEAM path, STDOUT-ONLY failed pull (empty stderr): the conflict/path detail that used to
+    /// be dropped is now retained, labelled as stdout, with no empty stderr segment.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_StdoutOnlyConflict_IsRetainedAndLabelled()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        const string Conflict =
+            "CONFLICT (content): Merge conflict in agents/coder.agents.md\n"
+            + "Auto-merging agents/coder.agents.md";
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                // The conflict detail lives on stdout; stderr is empty.
+                ["pull", "--no-rebase", ..] => new GitProcessResult(1, Conflict, ""),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+        var agentRunner = new MockAgentRunner();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-pull-stdout-only", configRepoDir, seam, fake, git, agentRunner: agentRunner);
+
+        // The IMMEDIATE worker error log carries the stdout conflict detail.
+        var logLine = FindLine(stderr, "git pull failed");
+        Assert.Contains(
+            "git pull failed (exit 1): stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md",
+            logLine, StringComparison.Ordinal);
+        // The embedded newline was sanitized, so the stdout tail stays on the SAME captured line
+        // as the diagnostic instead of forging a line of its own.
+        Assert.Contains("Auto-merging agents/coder.agents.md", logLine, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SplitLines(stderr), l => l.Trim() == "Auto-merging agents/coder.agents.md");
+        // The stderr stream is EMPTY, so no stderr segment appears anywhere in the capture.
+        Assert.DoesNotContain(
+            SplitLines(stderr), l => l.Contains("stderr:", StringComparison.Ordinal));
+
+        // The RETURNED failure reason carries the SAME diagnostic plus the retained clauses.
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains("(exit 1)", issue, StringComparison.Ordinal);
+        Assert.Contains("stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md", issue, StringComparison.Ordinal);
+        // The retained reason keeps the post-newline stdout tail too, control-sanitized: the
+        // rendered field is one line, so the whole stream survives in the persisted sink.
+        Assert.Contains("Auto-merging agents/coder.agents.md", issue, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', issue);
+        Assert.DoesNotContain("stderr:", issue, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            "stdout: CONFLICT (content): Merge conflict in agents/coder.agents.md",
+            result.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("stderr:", result.Output, StringComparison.Ordinal);
+        // The agent's own multi-line evidence precedes the appended diagnostic, VERBATIM.
+        Assert.StartsWith(
+            "Mock agent response\n\n[Config Repo Git Failure]",
+            result.Output, StringComparison.Ordinal);
+
+        // Truthful publication; the staged diagnostics and the abort attempt are unchanged.
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus.ChangedFiles);
+        Assert.Contains(fake.Launched, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    /// <summary>
+    /// Both streams present with distinct provenance: a fetch-style stderr AND a conflict-detail
+    /// stdout must BOTH survive, in a fixed order, in the log and in the failure reason. Neither
+    /// stream replaces the other.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_BothStreams_AreRetainedWithProvenance()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        const string ConflictingPath = "CONFLICT (content): Merge conflict in agents/tester.agents.md";
+        const string FetchFailure = "fatal: unable to read from remote";
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/tester.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(2, ConflictingPath, FetchFailure),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-pull-both", configRepoDir, seam, fake, git);
+
+        var expected = $"git pull failed (exit 2): stdout: {ConflictingPath} | stderr: {FetchFailure}";
+        var logLine = FindLine(stderr, "git pull failed");
+        Assert.Contains(expected, logLine, StringComparison.Ordinal);
+        // The stdout segment precedes the stderr segment exactly once each.
+        Assert.Equal(1, CountOccurrences(logLine, "stdout: "));
+        Assert.Equal(1, CountOccurrences(logLine, "stderr: "));
+        Assert.True(
+            logLine.IndexOf("stdout: ", StringComparison.Ordinal)
+                < logLine.IndexOf("stderr: ", StringComparison.Ordinal),
+            "the fixed framing puts stdout before stderr");
+
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains(expected, issue, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+        // The same both-streams diagnostic travels in the returned Output as well.
+        Assert.Contains(expected, result.Output, StringComparison.Ordinal);
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    /// <summary>
+    /// BOTH streams empty/whitespace: neither stream erases the stage, the exit code or the
+    /// existing push-not-attempted explanation. No provenance labels are invented for absent
+    /// streams.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \t  ")]
+    public async Task Improver_SeamPath_FailedPull_EmptyStreams_KeepStageExitAndClause(string blank)
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(1, blank, blank),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, _, stderr) = await RunImproverWithSeamAsync(
+            $"improver-seam-pull-blank-{blank.Length}", configRepoDir, seam, fake, git);
+
+        var logLine = FindLine(stderr, "git pull failed");
+        Assert.Contains("git pull failed (exit 1)", logLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("stdout:", logLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("stderr:", logLine, StringComparison.Ordinal);
+
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains("git pull failed (exit 1)", issue, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+        // The same no-erasure diagnostic travels in the returned Output as well.
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics.Verdict);
+        Assert.Equal(["agents/coder.agents.md"], result.GitStatus!.ChangedFiles);
+        // The established best-effort abort still runs; push still never does.
+        Assert.Contains(fake.Launched, t => t is ["merge", "--abort"]);
+        Assert.DoesNotContain(fake.Launched, t => t is ["push", ..]);
+    }
+
+    /// <summary>
+    /// LEGACY path stdout-only failed pull: the legacy route hands TaskExecutor RAW trimmed
+    /// stderr and RAW stdout, so the new sink must render BOTH fields itself — the stdout
+    /// conflict detail survives here too, labelled as stdout.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_FailedPull_StdoutOnlyConflict_IsRetainedAndLabelled()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        const string Conflict = "CONFLICT (content): Merge conflict in agents/coder.agents.md";
+
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/coder.agents.md"), ""),
+                "pull --no-rebase" => (1, Conflict, ""),
+                _ => null,
+            },
+        };
+
+        var (result, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-pull-stdout-only", configRepoDir, git,
+            agentRunner: new MockAgentRunner());
+
+        Assert.Contains(
+            $"git pull failed (exit 1): stdout: {Conflict}",
+            FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
+
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains($"stdout: {Conflict}", issue, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+        // The same diagnostic travels in the returned Output, after the preserved agent evidence.
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+        Assert.StartsWith(
+            "Mock agent response\n\n[Config Repo Git Failure]",
+            result.Output, StringComparison.Ordinal);
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics.Verdict);
+        Assert.Contains("merge --abort", git.GitCommands);
+        Assert.DoesNotContain("push", git.GitCommands);
+    }
+
+    /// <summary>
+    /// LEGACY path BOTH-streams failed pull: the raw stdout conflict detail AND the raw fetch
+    /// stderr BOTH survive with their provenance labels, in fixed order, in the immediate log
+    /// and in the returned failure reason — neither stream replaces the other, and the
+    /// established abort/no-push behavior is unchanged.
+    /// </summary>
+    [Fact]
+    public async Task Improver_LegacyPath_FailedPull_BothStreams_AreRetainedWithProvenance()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        const string ConflictingPath = "CONFLICT (content): Merge conflict in agents/tester.agents.md";
+        const string FetchFailure = "fatal: unable to read from remote";
+
+        var git = new MockGitOperations
+        {
+            GitCommandResponder = args => args switch
+            {
+                "diff --cached --name-only -z" => (0, StagedOutput("agents/tester.agents.md"), ""),
+                "pull --no-rebase" => (2, ConflictingPath, FetchFailure),
+                _ => null,
+            },
+        };
+
+        var (result, _, stderr) = await RunImproverLegacyAsync(
+            "improver-legacy-pull-both", configRepoDir, git,
+            agentRunner: new MockAgentRunner
+            {
+                // Agent evidence legitimately spans MULTIPLE lines; the diagnostic assertions
+                // below are scoped to the newly constructed text, never to the whole payload.
+                PromptResponder = static (_, _, _) => Task.FromResult(
+                    "Multi-line improvement notes:\n- lesson one\n- lesson two"),
+            });
+
+        var expected = $"git pull failed (exit 2): stdout: {ConflictingPath} | stderr: {FetchFailure}";
+        var logLine = FindLine(stderr, "git pull failed");
+        Assert.Contains(expected, logLine, StringComparison.Ordinal);
+        // Exactly one labelled segment per stream, stdout first.
+        Assert.Equal(1, CountOccurrences(logLine, "stdout: "));
+        Assert.Equal(1, CountOccurrences(logLine, "stderr: "));
+        Assert.True(
+            logLine.IndexOf("stdout: ", StringComparison.Ordinal)
+                < logLine.IndexOf("stderr: ", StringComparison.Ordinal),
+            "the fixed framing puts stdout before stderr");
+
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains(expected, issue, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+        // The same diagnostic travels in the returned Output, after the preserved agent evidence.
+        Assert.Contains(expected, result.Output, StringComparison.Ordinal);
+        // The multi-line agent evidence is preserved VERBATIM ahead of the appended diagnostic —
+        // the diagnostic is never a replacement for the evidence, and no single-line payload is
+        // required.
+        Assert.StartsWith(
+            "Multi-line improvement notes:\n- lesson one\n- lesson two\n\n[Config Repo Git Failure]",
+            result.Output, StringComparison.Ordinal);
+        Assert.True(
+            result.Output.IndexOf("lesson two", StringComparison.Ordinal)
+                < result.Output.IndexOf(expected, StringComparison.Ordinal),
+            "the preserved agent evidence precedes the appended diagnostic");
+
+        Assert.Equal(TaskOutcome.Failed, result.Status);
+        Assert.Equal("FAIL", result.Metrics.Verdict);
+        Assert.False(result.GitStatus!.Pushed);
+        Assert.Equal(["agents/tester.agents.md"], result.GitStatus.ChangedFiles);
+        // The established best-effort abort still runs; push still never does.
+        Assert.Contains("merge --abort", git.GitCommands);
+        Assert.DoesNotContain("push", git.GitCommands);
+    }
+
+    /// <summary>Counts the non-overlapping occurrences of <paramref name="needle"/>.</summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// SEAM path, ELIGIBLE transport — the resolved-credential LITERAL redaction must survive the
+    /// new BOTH-streams sink. The seam replaces every ordinal occurrence of the resolved
+    /// credential in Stdout and SanitizedError; TaskExecutor's new diagnostic renders those
+    /// fields (never a pre-joined string), so the literal can neither reappear nor bypass the
+    /// redaction, and a credential-bearing URL in EITHER stream is redacted too. Both streams
+    /// also carry a Unicode line separator, which the shared sanitation must neutralize: the
+    /// rendered diagnostic stays on ONE line and no forged log line appears.
+    /// </summary>
+    [Fact]
+    public async Task Improver_SeamPath_FailedPull_EligibleRoute_BothStreamsRedactedAndSanitized()
+    {
+        using var marker = EnsureConfigRepoMarker(out var configRepoDir);
+
+        const string CredentialUrl =
+            "https://x-access-token:ghp_inline_secret@github.com/org/config-repo.git";
+        var fake = new SeamProcessRunnerFake
+        {
+            Responder = tokens => tokens switch
+            {
+                ["diff", ..] => new GitProcessResult(0, StagedOutput("agents/coder.agents.md"), ""),
+                ["pull", "--no-rebase", ..] => new GitProcessResult(
+                    1,
+                    $"CONFLICT in agents/coder.agents.md from {CredentialUrl}"
+                        + $"\u2028credential={SeamCredential}",
+                    $"fatal: unable to access '{CredentialUrl}/': token {SeamCredential}"
+                        + "\u2029forged-stderr-line"),
+                _ => null,
+            },
+        };
+        using var seam = CreateConfigRepoSeam(configRepoDir);
+        var git = new MockGitOperations();
+
+        var (result, stdout, stderr) = await RunImproverWithSeamAsync(
+            "improver-seam-pull-redaction", configRepoDir, seam, fake, git);
+
+        var all = stdout + stderr;
+        var logLine = FindLine(stderr, "git pull failed");
+
+        // BOTH streams are present and labelled in the immediate log…
+        Assert.Contains("stdout: CONFLICT in agents/coder.agents.md from", logLine, StringComparison.Ordinal);
+        Assert.Contains("stderr: fatal: unable to access", logLine, StringComparison.Ordinal);
+
+        // …and the control characters in BOTH streams are neutralized. The proof is that the
+        // text FOLLOWING each stream's separator stays on the SAME captured line as the
+        // diagnostic: if either stream skipped sanitation, U+2028/U+2029 would break the line
+        // and these tails would land on a forged line of their own instead.
+        Assert.Contains("credential=[redacted]", logLine, StringComparison.Ordinal);
+        Assert.Contains("forged-stderr-line", logLine, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SplitLines(all), l => l.Trim() == "forged-stderr-line");
+        Assert.DoesNotContain(
+            SplitLines(all), l => l.Trim() == "credential=[redacted]");
+
+        // The resolved credential LITERAL and the credential-bearing URL are gone everywhere.
+        Assert.DoesNotContain(SeamCredential, all, StringComparison.Ordinal);
+        Assert.DoesNotContain("ghp_inline_secret", all, StringComparison.Ordinal);
+        Assert.DoesNotContain("x-access-token", all, StringComparison.Ordinal);
+        Assert.Contains("https://github.com/org/config-repo.git", logLine, StringComparison.Ordinal);
+
+        // ── The RETAINED sinks: Metrics.Issues and the returned Output ────────
+        // Console capture alone proves nothing about what is persisted, so both streams are
+        // asserted DIRECTLY on the isolated failure issue and on the composed Output.
+        var issue = Assert.Single(result.Metrics!.Issues, i => i.Contains("git pull failed"));
+        foreach (var retained in new[] { issue, result.Output })
+        {
+            // Both labelled stream segments are RETAINED…
+            Assert.Contains("stdout: CONFLICT in agents/coder.agents.md from", retained, StringComparison.Ordinal);
+            Assert.Contains("stderr: fatal: unable to access", retained, StringComparison.Ordinal);
+            // …including the text that FOLLOWED each stream's control character, so neither
+            // stream is truncated at its separator.
+            Assert.Contains("credential=[redacted]", retained, StringComparison.Ordinal);
+            Assert.Contains("forged-stderr-line", retained, StringComparison.Ordinal);
+            // The original control characters themselves are GONE from both streams.
+            Assert.DoesNotContain('\u2028', retained);
+            Assert.DoesNotContain('\u2029', retained);
+            // No credential, no userinfo — and the REDACTED URL shape survives instead.
+            Assert.DoesNotContain(SeamCredential, retained, StringComparison.Ordinal);
+            Assert.DoesNotContain("ghp_inline_secret", retained, StringComparison.Ordinal);
+            Assert.DoesNotContain("x-access-token", retained, StringComparison.Ordinal);
+            Assert.Contains("https://github.com/org/config-repo.git", retained, StringComparison.Ordinal);
+        }
+
+        // The isolated issue is the exact text composed into Output.
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+        Assert.Contains("push not attempted after the failed pull", issue, StringComparison.Ordinal);
+    }
+
     // ── (b) The LEGACY path (public constructor) ─────────────────────────────
 
     /// <summary>
@@ -3410,9 +3824,15 @@ public sealed class TaskExecutorTests
             },
         };
 
-        var (result, _, _) = await RunImproverLegacyAsync(
+        var (result, _, stderr) = await RunImproverLegacyAsync(
             "improver-legacy-abort", configRepoDir, git,
             agentRunner: new MockAgentRunner());
+
+        // The stderr-only variant keeps its provenance label; empty stdout invents no segment.
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict",
+            FindLine(stderr, "git pull failed"), StringComparison.Ordinal);
+        Assert.DoesNotContain("stdout:", stderr, StringComparison.Ordinal);
 
         Assert.Equal(
             [
@@ -3431,6 +3851,21 @@ public sealed class TaskExecutorTests
         Assert.Equal(TaskOutcome.Failed, result.Status);
         Assert.Equal("FAIL", result.Metrics!.Verdict);
         Assert.False(result.GitStatus!.Pushed);
+
+        // The RETAINED sinks carry the SAME provenance-labelled diagnostic, not merely the
+        // stage/exit wording: labelling only the immediate log fails here.
+        var issue = Assert.Single(result.Metrics.Issues, i => i.Contains("git pull failed"));
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict — push not attempted after the failed pull",
+            issue, StringComparison.Ordinal);
+        Assert.Contains(issue, result.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            "git pull failed (exit 1): stderr: merge conflict",
+            result.Output, StringComparison.Ordinal);
+        // The stdout stream is EMPTY here, so no stdout segment or label may appear in either
+        // retained sink.
+        Assert.DoesNotContain("stdout:", issue, StringComparison.Ordinal);
+        Assert.DoesNotContain("stdout:", result.Output, StringComparison.Ordinal);
     }
 
     /// <summary>
