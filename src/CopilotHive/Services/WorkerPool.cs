@@ -79,7 +79,8 @@ public sealed class WorkerPool : IWorkerPool
     /// <param name="capabilities">Capabilities advertised by the worker.</param>
     /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
     public ConnectedWorker RegisterWorker(string id, string[] capabilities) =>
-        RegisterWorker(id, capabilities, requestCompletionReceiptAck: false);
+        RegisterWorker(
+            id, capabilities, requestCompletionReceiptAck: false, completionReceiptAckEnabled: false);
 
     /// <summary>
     /// Registers a new worker carrying the requested completion-receipt negotiation fact, and
@@ -87,10 +88,10 @@ public sealed class WorkerPool : IWorkerPool
     /// already registered.
     /// </summary>
     /// <remarks>
-    /// THE FLAG IS PUBLISHED WITH THE INSTANCE, never written afterwards: the
-    /// <see cref="ConnectedWorker"/> is fully constructed — requested flag included — BEFORE
-    /// <c>TryAdd</c> makes it visible to any other thread, so a registered worker is never
-    /// observable with an undecided request.
+    /// THE EXISTING THREE-ARGUMENT CALLER, PRESERVED: it can express the request but not the
+    /// orchestrator's ANSWER to it, so the instance it registers is left at the DISABLED default
+    /// for <see cref="ConnectedWorker.CompletionReceiptAckEnabled"/> — the conservative choice, as
+    /// an unanswered request is never enablement.
     /// </remarks>
     /// <param name="id">Unique identifier for the worker.</param>
     /// <param name="capabilities">Capabilities advertised by the worker.</param>
@@ -100,7 +101,37 @@ public sealed class WorkerPool : IWorkerPool
     /// </param>
     /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
     internal ConnectedWorker RegisterWorker(
-        string id, string[] capabilities, bool requestCompletionReceiptAck)
+        string id, string[] capabilities, bool requestCompletionReceiptAck) =>
+        RegisterWorker(
+            id, capabilities, requestCompletionReceiptAck, completionReceiptAckEnabled: false);
+
+    /// <summary>
+    /// Registers a new worker carrying BOTH per-registration negotiation facts — what the worker
+    /// requested and what the orchestrator decided to enable — and returns the created
+    /// <see cref="ConnectedWorker"/>. Throws if a worker with the same ID is already registered.
+    /// </summary>
+    /// <remarks>
+    /// THE TWO FACTS ARE PUBLISHED WITH THE INSTANCE, never written afterwards: the
+    /// <see cref="ConnectedWorker"/> is fully constructed — requested flag AND enablement decision
+    /// included — BEFORE <c>TryAdd</c> makes it visible to any other thread, so a registered worker
+    /// is never observable with either fact undecided.
+    /// </remarks>
+    /// <param name="id">Unique identifier for the worker.</param>
+    /// <param name="capabilities">Capabilities advertised by the worker.</param>
+    /// <param name="requestCompletionReceiptAck">
+    /// Whether the worker requested durable completion-receipt acknowledgement. A request, never an
+    /// enablement.
+    /// </param>
+    /// <param name="completionReceiptAckEnabled">
+    /// The orchestrator's decision to acknowledge this registration's completions. Only the
+    /// registration path that answered the request may pass <c>true</c>.
+    /// </param>
+    /// <returns>The newly created <see cref="ConnectedWorker"/>.</returns>
+    internal ConnectedWorker RegisterWorker(
+        string id,
+        string[] capabilities,
+        bool requestCompletionReceiptAck,
+        bool completionReceiptAckEnabled)
     {
         var worker = new ConnectedWorker
         {
@@ -108,6 +139,7 @@ public sealed class WorkerPool : IWorkerPool
             Role = WorkerRole.Unspecified,
             Capabilities = capabilities,
             RequestCompletionReceiptAck = requestCompletionReceiptAck,
+            CompletionReceiptAckEnabled = completionReceiptAckEnabled,
         };
 
         if (!_workers.TryAdd(id, worker))

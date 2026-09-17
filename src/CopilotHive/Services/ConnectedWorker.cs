@@ -25,6 +25,24 @@ public sealed class ConnectedWorker
     /// <see cref="Capabilities"/>. An absent wire field decodes to <c>false</c>.
     /// </summary>
     public bool RequestCompletionReceiptAck { get; init; }
+    /// <summary>
+    /// THE IMMUTABLE PER-REGISTRATION ENABLEMENT DECISION, separate from
+    /// <see cref="RequestCompletionReceiptAck"/>: whether the orchestrator will publish durable
+    /// completion-receipt acknowledgements on THIS instance's stream.
+    /// <para>
+    /// A REQUEST IS NOT ENABLEMENT. This is <c>true</c> only for an ACCEPTED registration that
+    /// explicitly requested the acknowledgement AND was answered by an orchestrator that had a
+    /// completion recorder configured at registration time. It is never inferred from
+    /// <see cref="Capabilities"/>, from the model or from any version, and it is decided BEFORE the
+    /// pool publishes the instance, so no consumer can observe a registered worker whose enablement
+    /// is not yet settled.
+    /// </para>
+    /// <para>
+    /// IT AUTHORISES NOTHING BY ITSELF: an enabled instance still has to complete a task through the
+    /// ordinary validated release before any acknowledgement becomes eligible.
+    /// </para>
+    /// </summary>
+    public bool CompletionReceiptAckEnabled { get; init; }
     /// <summary>Whether the worker is currently executing a task.</summary>
     public bool IsBusy { get; set; }
     /// <summary>Identifier of the task the worker is currently executing, or <c>null</c> when idle.</summary>
@@ -79,6 +97,25 @@ public sealed class ConnectedWorker
     public bool IsWorkStreamAttached => Volatile.Read(ref _workStreamAttached) == 1;
 
     /// <summary>
+    /// THE WORKSTREAM-LOCAL ACKNOWLEDGEMENT STATE OF THIS INSTANCE.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT LIVES HERE, HONESTLY: an instance is EXCLUSIVELY attached to at most one WorkStream
+    /// (see <see cref="TryAttachWorkStream"/>, whose claim is one-way and never reused), and normal
+    /// teardown removes the instance from the pool — so a worker that re-registers, and therefore
+    /// gets a new stream, gets a NEW instance and FRESH state here. That makes this state
+    /// stream-local in practice without inventing a per-stream registry.
+    /// </para>
+    /// <para>
+    /// IT IS BOUNDED STATE, NOT A CACHE: exactly one task id is retained (the most recent completion
+    /// whose durable evidence was confirmed AND whose checked release succeeded). It is never
+    /// history, never replay authorization and never reconnect state.
+    /// </para>
+    /// </remarks>
+    internal WorkStreamCompletionAckState AckState { get; } = new();
+
+    /// <summary>
     /// The orchestrator writes messages here; the worker's stream reads from it.
     /// </summary>
     public Channel<OrchestratorMessage> MessageChannel { get; } =
@@ -87,4 +124,61 @@ public sealed class ConnectedWorker
             SingleReader = true,
             SingleWriter = false,
         });
+}
+
+/// <summary>
+/// THE BOUNDED, WORKSTREAM-LOCAL ACKNOWLEDGEMENT ELIGIBILITY OF ONE ATTACHED INSTANCE: at most ONE
+/// task id — the most recent completion whose durable evidence was confirmed and whose checked
+/// release SUCCEEDED.
+/// </summary>
+/// <remarks>
+/// <para>
+/// WHAT ADVANCES IT: only an ORDINARY completion that passed every validated ownership check, was
+/// RECORDED first, and then had its checked release APPLIED. A mapping failure, a recording refusal
+/// and a refused checked release all leave it exactly as it was — no eligibility is ever created by
+/// a failure.
+/// </para>
+/// <para>
+/// IT IS DELIBERATELY JUST ONE OPAQUE ID. It is not a history, not a receipt cache, not a retry
+/// budget and not a reconnect/resume authorization: the id is stored so a later duplicate attempt on
+/// the SAME stream can be answered from retained evidence, and the slot simply advances on the next
+/// successful ordinary completion.
+/// </para>
+/// <para>
+/// THREADING: the WorkStream read loop handles messages strictly sequentially, so the ordinary
+/// completion path is single-threaded here. The lock nevertheless makes the read/write pair atomic
+/// for any observer, because the value is read on paths that must not tear against a concurrent
+/// advance.
+/// </para>
+/// </remarks>
+internal sealed class WorkStreamCompletionAckState
+{
+    private readonly Lock _gate = new();
+    private string? _latestEligibleTaskId;
+
+    /// <summary>
+    /// The most recent task id made acknowledgement-eligible by a successful ordinary completion, or
+    /// <c>null</c> when no ordinary completion has been released on this stream yet.
+    /// </summary>
+    internal string? LatestEligibleTaskId
+    {
+        get
+        {
+            lock (_gate)
+                return _latestEligibleTaskId;
+        }
+    }
+
+    /// <summary>
+    /// Advances the single latest-eligible slot to <paramref name="taskId"/>, REPLACING any previous
+    /// id rather than accumulating one.
+    /// </summary>
+    /// <param name="taskId">The opaque task id of the just-released completion. Never blank.</param>
+    internal void AdvanceLatestEligible(string taskId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(taskId);
+
+        lock (_gate)
+            _latestEligibleTaskId = taskId;
+    }
 }

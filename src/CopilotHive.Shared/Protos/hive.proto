@@ -71,8 +71,9 @@ message RegisterResponse {
   string assigned_worker_id = 3;  // Server may reassign ID
 
   // The orchestrator's answer to RegisterRequest.request_completion_receipt_ack. A request is
-  // never enablement: default/false is the only value an orchestrator without the live ACK may
-  // send, and an old orchestrator sends no field at all — which parses as false.
+  // never enablement: this is true ONLY for an ACCEPTED registration that explicitly requested it
+  // AND was answered by an orchestrator with a configured completion recorder. Every other shape
+  // is default/false, so an old orchestrator that sends no field at all parses as false.
   bool completion_receipt_ack_enabled = 4;
 }
 
@@ -115,13 +116,14 @@ message OrchestratorMessage {
 
 // The orchestration->worker acknowledgement of a durably retained completion receipt.
 //
-// WHAT IT WILL MEAN (when it is eventually emitted): the orchestrator durably RETAINED the exact
-// completion evidence of the task named by `task_id`. It does NOT mean the completion was
-// processed, that a phase advanced, that transport ownership was released, or that anything was
-// recovered or replayed.
+// WHAT IT MEANS: the orchestrator durably RETAINED the exact completion evidence of the task named
+// by `task_id`. It does NOT mean the completion was processed, that a phase advanced, that transport
+// ownership was released, or that anything was recovered or replayed.
 //
-// IT IS DEFINED HERE AND DELIBERATELY NEVER EMITTED YET: no orchestrator path publishes it in this
-// stage, and nothing may advertise CompletionReceiptAck support while that remains true.
+// IT IS EMITTED ONLY FOR A REGISTRATION THAT NEGOTIATED IT: the orchestrator publishes it on an
+// enabled worker's own stream, after an ordinary completion whose evidence was confirmed AND whose
+// checked release succeeded. A registration that never asked, or was answered with
+// `completion_receipt_ack_enabled = false`, receives none.
 message CompletionReceiptAck {
   // The opaque task identity the acknowledgement is about. It is an opaque ordinal string that
   // must be echoed VERBATIM and NEVER parsed, split, normalized or interpreted.

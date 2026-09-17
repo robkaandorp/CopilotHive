@@ -1866,8 +1866,9 @@ public sealed class WorkerPoolTests
     #region RegisterWorker — requested completion-receipt ACK
 
     /// <summary>
-    /// THE EXISTING TWO-ARGUMENT CALLERS DEFAULT TO NO REQUEST. Every caller that cannot express a
-    /// negotiation request registers a worker that asked for nothing.
+    /// THE EXISTING TWO-ARGUMENT CALLERS DEFAULT TO NO REQUEST AND NO ENABLEMENT. Every caller that
+    /// cannot express a negotiation registers a worker that asked for nothing and was answered
+    /// nothing — the conservative default on both facts.
     /// </summary>
     [Fact]
     public void RegisterWorker_TwoArgumentCaller_DefaultsRequestedAckToFalse()
@@ -1877,7 +1878,9 @@ public sealed class WorkerPoolTests
         var worker = pool.RegisterWorker("w-no-request", []);
 
         Assert.False(worker.RequestCompletionReceiptAck);
+        Assert.False(worker.CompletionReceiptAckEnabled);
         Assert.False(pool.GetWorker("w-no-request")!.RequestCompletionReceiptAck);
+        Assert.False(pool.GetWorker("w-no-request")!.CompletionReceiptAckEnabled);
     }
 
     /// <summary>
@@ -1885,6 +1888,11 @@ public sealed class WorkerPoolTests
     /// published: the returned worker — the very instance the pool holds — already carries the
     /// correct value, so no observer can ever see an undecided request.
     /// </summary>
+    /// <remarks>
+    /// THE EXISTING THREE-ARGUMENT OVERLOAD CANNOT EXPRESS THE ANSWER, so it leaves the enablement at
+    /// the DISABLED default: an unanswered request is never enablement, and the only caller that may
+    /// set it is the registration path that actually answered it.
+    /// </remarks>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -1895,27 +1903,112 @@ public sealed class WorkerPoolTests
         var worker = pool.RegisterWorker("w-explicit", [], requested);
 
         Assert.Equal(requested, worker.RequestCompletionReceiptAck);
+        Assert.False(worker.CompletionReceiptAckEnabled);
         Assert.Same(worker, pool.GetWorker("w-explicit"));
         Assert.Equal(requested, pool.GetWorker("w-explicit")!.RequestCompletionReceiptAck);
+        Assert.False(pool.GetWorker("w-explicit")!.CompletionReceiptAckEnabled);
     }
 
     /// <summary>
-    /// A DUPLICATE registration is still rejected AND leaves the original instance — including the
-    /// fact it registered with — completely untouched. The second, conflicting request changes
+    /// THE TWO FACTS ARE INDEPENDENT AND BOTH DECIDED BEFORE PUBLICATION. Every combination is
+    /// retained on the returned instance — which IS the published one — so a request can be recorded
+    /// without being enabled, and no observer can see either fact undecided.
+    /// </summary>
+    /// <param name="requested">Whether the worker asked for the acknowledgement.</param>
+    /// <param name="enabled">The orchestrator's decision to acknowledge this registration.</param>
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    public void RegisterWorker_NegotiatedFacts_AreBothRetainedOnThePublishedInstance(
+        bool requested, bool enabled)
+    {
+        var pool = CreatePool();
+
+        var worker = pool.RegisterWorker(
+            "w-negotiated", [], requestCompletionReceiptAck: requested, completionReceiptAckEnabled: enabled);
+
+        Assert.Equal(requested, worker.RequestCompletionReceiptAck);
+        Assert.Equal(enabled, worker.CompletionReceiptAckEnabled);
+        Assert.Same(worker, pool.GetWorker("w-negotiated"));
+
+        var published = pool.GetWorker("w-negotiated")!;
+        Assert.Equal(requested, published.RequestCompletionReceiptAck);
+        Assert.Equal(enabled, published.CompletionReceiptAckEnabled);
+    }
+
+    /// <summary>
+    /// A DUPLICATE registration is still rejected AND leaves the original instance — including BOTH
+    /// facts it registered with — completely untouched. The second, conflicting request changes
     /// nothing.
     /// </summary>
     [Fact]
     public void RegisterWorker_Duplicate_IsRejectedAndDoesNotRebindTheRequestedFact()
     {
         var pool = CreatePool();
-        var original = pool.RegisterWorker("w-dup-request", [], requestCompletionReceiptAck: true);
+        var original = pool.RegisterWorker(
+            "w-dup-request", [], requestCompletionReceiptAck: true, completionReceiptAckEnabled: true);
 
         Assert.Throws<InvalidOperationException>(
-            () => pool.RegisterWorker("w-dup-request", [], requestCompletionReceiptAck: false));
+            () => pool.RegisterWorker(
+                "w-dup-request", [], requestCompletionReceiptAck: false, completionReceiptAckEnabled: false));
 
         Assert.Same(original, pool.GetWorker("w-dup-request"));
         Assert.True(original.RequestCompletionReceiptAck);
+        Assert.True(original.CompletionReceiptAckEnabled);
         Assert.Equal(1, pool.ConnectedWorkerCount);
+    }
+
+    /// <summary>
+    /// AN INSTANCE CONSTRUCTED DIRECTLY — the fixture shape some tests use — DEFAULTS BOTH FACTS TO
+    /// DISABLED, so a hand-built worker can never be mistaken for an enabled registration.
+    /// </summary>
+    [Fact]
+    public void ConnectedWorker_DirectConstruction_DefaultsBothNegotiatedFactsToFalse()
+    {
+        var worker = new ConnectedWorker
+        {
+            Id = "w-direct",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+
+        Assert.False(worker.RequestCompletionReceiptAck);
+        Assert.False(worker.CompletionReceiptAckEnabled);
+        Assert.Null(worker.AckState.LatestEligibleTaskId);
+    }
+
+    /// <summary>
+    /// THE LATEST-ELIGIBLE SLOT HOLDS EXACTLY ONE ID: advancing it REPLACES the previous task rather
+    /// than accumulating one, and the state is per instance.
+    /// </summary>
+    [Fact]
+    public void AckState_Advance_KeepsOnlyTheLatestTaskId()
+    {
+        var first = new ConnectedWorker
+        {
+            Id = "w-ack-state-1",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+        var second = new ConnectedWorker
+        {
+            Id = "w-ack-state-2",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+
+        Assert.Null(first.AckState.LatestEligibleTaskId);
+
+        first.AckState.AdvanceLatestEligible("task-one");
+        Assert.Equal("task-one", first.AckState.LatestEligibleTaskId);
+
+        first.AckState.AdvanceLatestEligible("task-two");
+        Assert.Equal("task-two", first.AckState.LatestEligibleTaskId);
+
+        // The other instance has its own slot.
+        Assert.Null(second.AckState.LatestEligibleTaskId);
     }
 
     #endregion

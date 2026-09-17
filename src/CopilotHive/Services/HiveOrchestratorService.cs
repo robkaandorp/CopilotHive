@@ -70,6 +70,34 @@ public sealed class HiveOrchestratorService(
     /// <summary>Clock used for heartbeat throttling. Overridable for tests.</summary>
     internal Func<DateTime> _now = () => DateTime.UtcNow;
 
+    /// <summary>
+    /// THE WINDOW BETWEEN THE COMPLETE ARM'S ACTIVITY DECISION AND ITS HANDLER CALL, made observable
+    /// so a test can mutate ownership INSIDE the real <see cref="WorkStream"/> boundary.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The property under test is that ONE classification drives BOTH the activity
+    /// refresh and the handler's routing. That is only provable by changing ownership strictly between
+    /// those two statements while the SAME inbound message is in flight — and the read loop is
+    /// synchronous there, so no amount of external scheduling can land a mutation in that gap. This
+    /// hook is the smallest thing that makes the gap addressable without restructuring the arm.
+    /// </para>
+    /// <para>
+    /// IT IS NOT A BEHAVIOUR. It is <c>null</c> in production and in every fixture that does not
+    /// explicitly install one, so the arm is EXACTLY the classification, the conditional refresh and
+    /// the handler call — the null-conditional invoke compiles to a branch that is never taken. It
+    /// carries no state, returns nothing, decides nothing, and is read once per delivery at the point
+    /// it documents. It is emphatically NOT a writer abstraction, a timer, retry machinery or an
+    /// outbox, and it can neither change the carried routing value nor any ACK/slot/notification
+    /// semantics: everything it could touch is re-validated by the guards that follow it.
+    /// </para>
+    /// <para>
+    /// A HOOK THAT THROWS FAULTS THE STREAM, deliberately. It is test-only, so a fault is a test bug
+    /// that must be loud rather than swallowed into the transport's ordinary refusal paths.
+    /// </para>
+    /// </remarks>
+    internal Action<ConnectedWorker, string>? _afterCompletionActivityDecisionForTest;
+
     /// <summary>Maximum number of tracked heartbeat entries before the oldest is evicted.</summary>
     internal int MaxHeartbeatEntries { get; set; } = 200;
 
@@ -112,6 +140,24 @@ public sealed class HiveOrchestratorService(
         /// </summary>
         public const string WorkStreamAlreadyAttached =
             "the worker instance is already attached to an existing WorkStream";
+
+        /// <summary>
+        /// A completion arrived from a registration that NEGOTIATED completion-receipt
+        /// acknowledgements but carried no model presence at all. An enabled registration must report
+        /// the model it was assigned, so an absent field is refused locally rather than being
+        /// silently answered from the volatile queue.
+        /// </summary>
+        public const string ModelPresenceRequired =
+            "the completion carries no model presence, which this registration's negotiated " +
+            "receipt acknowledgement requires";
+
+        /// <summary>
+        /// The duplicate's latest eligible task is STILL HELD — it is active in the queue, or the
+        /// pinned instance is still executing it — so the recheck refused and nothing was
+        /// acknowledged.
+        /// </summary>
+        public const string LatestEligibleTaskStillHeld =
+            "the latest eligible task is still active in the queue or still held by the pinned worker";
     }
 
 
@@ -119,14 +165,24 @@ public sealed class HiveOrchestratorService(
     /// Registers a worker with the orchestrator and assigns it an ID.
     /// </summary>
     /// <remarks>
-    /// THE COMPLETION-RECEIPT NEGOTIATION IS RECORD-ONLY IN THIS STAGE. The worker's request is
-    /// recorded as an immutable per-registration fact (see
-    /// <see cref="ConnectedWorker.RequestCompletionReceiptAck"/>), and EVERY reply — accepted,
-    /// rejected, requested or not — reports <c>completion_receipt_ack_enabled = false</c>. A request
-    /// is NOT enablement: no orchestrator path emits a
-    /// <see cref="CompletionReceiptAck"/> yet, so advertising <c>true</c> would promise durable
-    /// retention this build cannot deliver. Support is never inferred from the worker's
-    /// capabilities, model or version.
+    /// <para>
+    /// THE COMPLETION-RECEIPT ACK IS NEGOTIATED, CONSERVATIVELY. The worker's request is recorded as
+    /// an immutable per-registration fact (see <see cref="ConnectedWorker.RequestCompletionReceiptAck"/>)
+    /// and the orchestrator's ANSWER is recorded as a SECOND, separate immutable fact (see
+    /// <see cref="ConnectedWorker.CompletionReceiptAckEnabled"/>), decided BEFORE the pool publishes
+    /// the instance.
+    /// </para>
+    /// <para>
+    /// ACK IS ENABLED ONLY FOR AN ACCEPTED REGISTRATION THAT EXPLICITLY REQUESTED IT <em>AND</em> WAS
+    /// ANSWERED BY AN ORCHESTRATOR WITH A CONFIGURED COMPLETION RECORDER. Every other shape stays
+    /// DISABLED: a missing/false request, an absent recorder, and any rejected duplicate reply. Support
+    /// is never inferred from the worker's capabilities, model or version, and a rejected duplicate
+    /// changes nothing on the instance already registered.
+    /// </para>
+    /// <para>
+    /// THE REPLY IS BUILT FROM THE EXACT RETURNED REGISTRATION INSTANCE, never from a later lookup, so
+    /// the answer a worker is told can never disagree with the instance the pool actually published.
+    /// </para>
     /// </remarks>
     /// <param name="request">Registration request containing the worker's role and capabilities.</param>
     /// <param name="context">Server call context.</param>
@@ -139,8 +195,15 @@ public sealed class HiveOrchestratorService(
 
         try
         {
-            workerPool.RegisterWorker(
-                workerId, [.. request.Capabilities], request.RequestCompletionReceiptAck);
+            // THE ENABLEMENT DECISION, taken from the REQUEST and the orchestrator's OWN capability —
+            // nothing else. The recorder must be configured here, at registration time, because it is
+            // the recorder that retains the evidence an acknowledgement would be about.
+            var requested = request.RequestCompletionReceiptAck;
+            var ackEnabled = requested && _completionRecorder is not null;
+
+            var registered = workerPool.RegisterWorker(
+                workerId, [.. request.Capabilities], requested, ackEnabled);
+
             logger.LogInformation("Worker registered: {WorkerId}", workerId);
 
             lock (_heartbeatLock)
@@ -150,17 +213,21 @@ public sealed class HiveOrchestratorService(
 
             _dashboardNotifier?.NotifyStateChanged();
 
+            // THE REPLY COMES FROM THE REGISTERED INSTANCE ITSELF.
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = true,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
-                CompletionReceiptAckEnabled = false,
+                CompletionReceiptAckEnabled = registered.CompletionReceiptAckEnabled,
             });
         }
         catch (InvalidOperationException)
         {
             logger.LogWarning("Registration rejected — duplicate worker ID: {WorkerId}", workerId);
+
+            // A REJECTED DUPLICATE ADVERTISES NOTHING: the instance already registered is untouched,
+            // so this reply is DISABLED regardless of what the duplicate asked for.
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = false,
@@ -227,7 +294,30 @@ public sealed class HiveOrchestratorService(
                         }
 
                         var msg = await workerRef.MessageChannel.Reader.ReadAsync(ct);
-                        await responseStream.WriteAsync(msg, ct);
+                        try
+                        {
+                            await responseStream.WriteAsync(msg, ct);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // REAL CALLER/SERVER CANCELLATION keeps its existing meaning and is
+                            // handled by the pump's own outer catch below — never by the
+                            // acknowledgement-specific guard.
+                            throw;
+                        }
+                        catch (Exception ex) when (msg.PayloadCase
+                            == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck)
+                        {
+                            // AN ACKNOWLEDGEMENT-SPECIFIC RESPONSE WRITE FAILURE IS ISOLATED: the
+                            // failure of an advisory acknowledgement must not tear down the worker's
+                            // stream or discard the messages queued behind it. It is reported in a
+                            // guarded diagnostic and the pump continues with the next message.
+                            //
+                            // WHAT THIS DOES NOT CLAIM: a genuinely broken connection is not
+                            // recovered by this. The next write will fail too, and the general
+                            // stream semantics remain exactly what they were.
+                            LogReceiptAckWriteFailed(ex, workerRef.Id, msg.CompletionReceiptAck);
+                        }
                     }
                 }
                 catch (OperationCanceledException) { }
@@ -290,8 +380,33 @@ public sealed class HiveOrchestratorService(
                         break;
 
                     case WorkerMessage.PayloadOneofCase.Complete:
-                        workerPool.TouchActivity(pinnedWorker.Id);
-                        HandleTaskComplete(pinnedWorker, message.Complete);
+                        // ── ONE CLASSIFICATION, COMPUTED ONCE, USED FOR BOTH DECISIONS ──────────
+                        // The activity decision and the handler's routing MUST NOT be able to
+                        // disagree, so they are driven by a SINGLE observation taken here and CARRIED
+                        // into the handler. Re-observing mutable ownership in the handler would leave
+                        // a window in which a re-dispatch between the two observations could make the
+                        // loop suppress the activity refresh for a delivery the handler then treats as
+                        // ordinary — or, far worse, let an OLD duplicate be processed as the newly
+                        // re-dispatched task's completion and release/notify that new assignment.
+                        //
+                        // A DUPLICATE ATTEMPT ON THE STREAM'S LATEST ELIGIBLE TASK IS NOT ACTIVITY.
+                        // It is about an OLD, no-longer-held task, so refreshing the pinned worker's
+                        // activity clock for it would extend a SUCCESSOR's inactivity-derived lifetime
+                        // on behalf of work that worker is not doing. Every other completion — a
+                        // genuinely held or RE-DISPATCHED task included — keeps the existing refresh.
+                        var completionRouting =
+                            ClassifyCompletionDelivery(pinnedWorker, message.Complete.TaskId);
+
+                        if (!completionRouting.IsLatestEligibleDuplicate)
+                            workerPool.TouchActivity(pinnedWorker.Id);
+
+                        // THE WINDOW ITSELF, OBSERVABLE. Null in production (the default), so this is
+                        // exactly the path above followed by the handler call below — see the field's
+                        // own documentation for why it exists and what it may not do.
+                        _afterCompletionActivityDecisionForTest?.Invoke(
+                            pinnedWorker, message.Complete.TaskId);
+
+                        HandleClassifiedTaskComplete(pinnedWorker, message.Complete, completionRouting);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.ToolRequest:
@@ -1102,7 +1217,47 @@ public sealed class HiveOrchestratorService(
         }
     }
 
-    private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete)
+    /// <summary>
+    /// Handles one incoming completion, classifying the delivery ONCE and then routing on that single
+    /// decision.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE ENTRY POINT FOR A CALLER THAT DID NOT ALREADY CLASSIFY — it exists so a direct
+    /// invocation still goes through exactly one classification. The <c>WorkStream</c> read loop does
+    /// NOT use it: the loop must classify BEFORE deciding the activity refresh, so it calls
+    /// <see cref="HandleClassifiedTaskComplete"/> with the decision it already made. There is never
+    /// more than one classification per delivery on either route.
+    /// </remarks>
+    /// <param name="worker">The pinned instance the completion was delivered on.</param>
+    /// <param name="complete">The completion payload.</param>
+    private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete) =>
+        HandleClassifiedTaskComplete(
+            worker, complete, ClassifyCompletionDelivery(worker, complete.TaskId));
+
+    /// <summary>
+    /// Handles one incoming completion, routed by the PER-DELIVERY classification the read loop
+    /// already computed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE ROUTING DECISION IS CARRIED, NOT RE-DERIVED. <paramref name="routing"/> holds both the
+    /// single ownership observation this delivery was classified from and the duplicate/ordinary
+    /// answer itself, so the handler's branch selection is IDENTICAL to the one the loop used for its
+    /// activity decision. Re-observing here would reopen exactly the divergence this parameter exists
+    /// to close.
+    /// </para>
+    /// <para>
+    /// THE CARRIED OBSERVATION IS NOT A SUBSTITUTE FOR THE LATER GUARDS. It is a point-in-time read,
+    /// so every mutation this handler performs is still made through a CHECKED operation that
+    /// re-validates at the mutation point: <see cref="ApplyTaskCompletion"/> for the release, and the
+    /// duplicate branch's own post-read recheck before any acknowledgement.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The pinned instance the completion was delivered on.</param>
+    /// <param name="complete">The completion payload.</param>
+    /// <param name="routing">The per-delivery classification and the observation it was made from.</param>
+    private void HandleClassifiedTaskComplete(
+        ConnectedWorker worker, TaskComplete complete, CompletionDeliveryRouting routing)
     {
         // ══ THE OWNERSHIP VALIDATION, BEFORE ANY CLEANUP OR NOTIFICATION ═════════════════════
         // A completion is only acted on when BOTH authorities still agree that THIS stream's
@@ -1113,11 +1268,37 @@ public sealed class HiveOrchestratorService(
         //       worker.
         // Anything else — a missing entry, a foreign owner, a stale/duplicate delivery — returns
         // here, so no successor's assignment is ever released on its behalf.
-        if (!workerPool.TryGetWorkerSnapshot(worker.Id, out var observed)
-            || !ReferenceEquals(observed.Worker, worker))
+        //
+        // THE SNAPSHOT IS THE CLASSIFICATION'S OWN, carried in rather than taken again: one
+        // observation decides the activity refresh, the branch routing and these gates.
+        if (!routing.ObservationValid)
         {
             LogCompletionIgnored(
                 worker.Id, complete.TaskId, OwnershipRefusalReasons.PinnedInstanceReplaced);
+            return;
+        }
+
+        var observed = routing.Observed;
+
+        // ══ THE SAME-STREAM DUPLICATE RE-ACKNOWLEDGEMENT ═════════════════════════════════════
+        // A duplicate delivery of the stream's ONE latest eligible completion is answered from the
+        // RETAINED evidence instead of being processed again. It is a strictly READ-ONLY branch:
+        // no Record, no release, no queue removal, no pipeline mutation, no dashboard success
+        // notification, no completion notification — and it NEVER falls through into the ordinary
+        // completion path below.
+        //
+        // ONLY THE STILL-CURRENT CLAIMED PINNED INSTANCE OF AN ENABLED NEGOTIATION MAY ENTER: the
+        // classification was made against the same pinned-instance check above, and a disabled
+        // registration (an existing/legacy worker) is refused without even reading its slot. A fresh
+        // or replacement registration is a DIFFERENT instance with a null slot, so it can never be
+        // authorized by its predecessor's evidence.
+        //
+        // THE TASK MUST BE ORDINAL-EXACT AGAINST THE SLOT, and MUST NO LONGER BE HELD — see
+        // CompletionDeliveryRouting. Every other name, and every genuinely re-dispatched task, takes
+        // the ORDINARY path below.
+        if (routing.IsLatestEligibleDuplicate)
+        {
+            HandleLatestEligibleDuplicate(worker, complete);
             return;
         }
 
@@ -1160,6 +1341,24 @@ public sealed class HiveOrchestratorService(
         //     disagrees. An explicit wire value is never overwritten by the volatile queue.
         //   * HasModel == false → a legacy sender. Fall back to the queue's active task model.
         // Absence is never inferred from empty/whitespace content.
+        //
+        // ── THE ENABLED-REGISTRATION MODEL REQUIREMENT ───────────────────────────────────────
+        // A registration that NEGOTIATED completion-receipt acknowledgements must report the model
+        // it was assigned, because the durable evidence an acknowledgement is about carries that
+        // model. For such a registration an ABSENT field is a guarded LOCAL refusal, taken BEFORE
+        // the receipt is recorded and therefore before any acknowledgement could become eligible:
+        // nothing is released, removed, notified or acknowledged. A PRESENT-EMPTY or whitespace value
+        // is still perfectly valid — presence, not content, is what is required.
+        //
+        // A DISABLED registration keeps the original legacy behaviour exactly: the absent field
+        // falls back to the validated active task's model.
+        if (worker.CompletionReceiptAckEnabled && !complete.HasModel)
+        {
+            LogCompletionIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.ModelPresenceRequired);
+            return;
+        }
+
         var completedTaskModel = complete.HasModel ? complete.Model : activeTask.Model;
         logger.LogInformation("Task {TaskId} completed by {WorkerId}: {Status} (model={Model})",
             complete.TaskId, worker.Id, complete.Status,
@@ -1254,6 +1453,28 @@ public sealed class HiveOrchestratorService(
         // pre-admission write here could clear a SUCCESSOR's live pointer and overwrite its phase
         // output on behalf of a duplicate completion that admission subsequently rejects.
 
+        // ══ THE ACKNOWLEDGEMENT ELIGIBILITY ═══════════════════════════════════════════════════
+        // THE CONSERVATIVE EMISSION BOUNDARY: only a confirmed Record FOLLOWED BY an APPLIED checked
+        // release reaches here, so only such a completion can create eligibility. A mapping failure,
+        // a recording refusal and a refused checked release all returned above, so none of them
+        // creates eligibility and none of them emits an acknowledgement.
+        //
+        // THE SLOT IS SET BEFORE THE ENQUEUE, deliberately: the eligibility fact must exist even if
+        // the best-effort publication below fails, because it is state about what happened, not about
+        // what could be delivered.
+        //
+        // A DISABLED registration stores nothing and acknowledges nothing. This is what keeps an
+        // existing (legacy) worker's runtime completely unchanged.
+        if (worker.CompletionReceiptAckEnabled)
+        {
+            worker.AckState.AdvanceLatestEligible(complete.TaskId);
+
+            // THE BEST-EFFORT ACKNOWLEDGEMENT. Its failure is ISOLATED: it must never suppress the
+            // ordinary dashboard/downstream notification below, must never undo the release that
+            // already happened, and must never cause another Record or notification.
+            TryPublishCompletionReceiptAck(worker, complete.TaskId);
+        }
+
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {
@@ -1326,6 +1547,437 @@ public sealed class HiveOrchestratorService(
                 "the stream are retained and no completion was notified — {Detail}",
                 workerId,
                 taskId,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE ONE ENTRY CLASSIFICATION of a single completion delivery: whether it is a duplicate of the
+    /// stream's latest eligible task, decided ONCE from ONE lock-consistent ownership observation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT IS COMPUTED EXACTLY ONCE PER DELIVERY, in the read loop, and then CARRIED to the completion
+    /// handler. That is the whole point of the type: the activity decision and
+    /// the routing decision consume the SAME value, so they cannot diverge. Re-deriving the answer in
+    /// the handler would reopen a window in which a re-dispatch landing between the two observations
+    /// makes the loop suppress the activity refresh for a delivery the handler then processes as an
+    /// ordinary completion — releasing and notifying the NEW assignment on the strength of an OLD
+    /// duplicate.
+    /// </para>
+    /// <para>
+    /// ALL FOUR FACTS MUST HOLD for <see cref="IsLatestEligibleDuplicate"/>, and the last two are what
+    /// keep a GENUINELY LIVE completion on the ordinary path:
+    /// </para>
+    /// <list type="number">
+    ///   <item><description>the pinned instance's negotiation is ENABLED — a legacy registration is
+    ///     never routed here;</description></item>
+    ///   <item><description>the submitted id is ORDINAL-EXACT against the single latest eligible task
+    ///     id, so only that one task can ever reach a confirmation read;</description></item>
+    ///   <item><description>the worker is NOT currently executing that task; and</description></item>
+    ///   <item><description>that task has NO active queue entry any more.</description></item>
+    /// </list>
+    /// <para>
+    /// IT IS PER DELIVERY AND NEVER OUTLIVES IT. The value is created for one message, passed by value
+    /// to that message's handler call, and discarded; nothing stores it, so it cannot leak across
+    /// deliveries or widen a later one.
+    /// </para>
+    /// <para>
+    /// IT IS AN OBSERVATION, NOT AN AUTHORIZATION. It mutates nothing and publishes nothing, and the
+    /// branch it selects still performs every one of its own guards — including the POST-READ recheck,
+    /// which answers the DIFFERENT question of whether ownership changed while the confirmation read
+    /// was in flight.
+    /// </para>
+    /// </remarks>
+    /// <param name="Observed">
+    /// The lock-consistent ownership observation the classification was made from, reused by the
+    /// handler so it never re-observes mutable state for this delivery.
+    /// </param>
+    /// <param name="ObservationValid">
+    /// Whether <paramref name="Observed"/> is meaningful: <c>false</c> when no worker was registered
+    /// under the id, or the registered instance was no longer the pinned one, at classification time.
+    /// </param>
+    /// <param name="IsLatestEligibleDuplicate">
+    /// Whether this delivery is a duplicate of the latest eligible, no-longer-held task — the single
+    /// fact that drives BOTH the activity suppression and the handler's routing.
+    /// </param>
+    private readonly record struct CompletionDeliveryRouting(
+        WorkerOwnershipSnapshot Observed,
+        bool ObservationValid,
+        bool IsLatestEligibleDuplicate);
+
+    /// <summary>
+    /// Classifies ONE completion delivery from a SINGLE ownership observation, producing the decision
+    /// the read loop and the completion handler both consume.
+    /// </summary>
+    /// <remarks>
+    /// THE OBSERVATION IS TAKEN HERE AND ONLY HERE for this delivery. It is returned alongside the
+    /// decision precisely so the handler can validate and route from the same instant rather than
+    /// taking a second, potentially different, look at mutable ownership.
+    /// </remarks>
+    /// <param name="pinned">The instance the stream is pinned to.</param>
+    /// <param name="taskId">The task id the completion names.</param>
+    /// <returns>The per-delivery routing decision and the observation it was made from.</returns>
+    private CompletionDeliveryRouting ClassifyCompletionDelivery(
+        ConnectedWorker pinned, string taskId)
+    {
+        if (!workerPool.TryGetWorkerSnapshot(pinned.Id, out var observed)
+            || !ReferenceEquals(observed.Worker, pinned))
+        {
+            // GONE OR REPLACED (ABA). There is nothing to classify: the handler refuses the delivery
+            // on this same observation, and an invalid observation is never a duplicate, so the
+            // activity refresh follows the ordinary path.
+            return new CompletionDeliveryRouting(observed, ObservationValid: false, IsLatestEligibleDuplicate: false);
+        }
+
+        return new CompletionDeliveryRouting(
+            observed,
+            ObservationValid: true,
+            IsLatestEligibleDuplicate: IsLatestEligibleDuplicate(pinned, taskId, observed));
+    }
+
+    /// <summary>
+    /// THE DUPLICATE ENTRY CONDITION, evaluated against a caller-supplied lock-consistent ownership
+    /// observation. See <see cref="CompletionDeliveryRouting"/> for the four facts and why the
+    /// not-held ones are part of the ENTRY condition rather than only of the post-read recheck.
+    /// </summary>
+    /// <param name="pinned">The instance the stream is pinned to.</param>
+    /// <param name="taskId">The task id the completion names.</param>
+    /// <param name="observed">The caller's lock-consistent ownership observation of that instance.</param>
+    /// <returns><c>true</c> when the delivery is a duplicate of the latest eligible, no-longer-held task.</returns>
+    private bool IsLatestEligibleDuplicate(
+        ConnectedWorker pinned, string taskId, WorkerOwnershipSnapshot observed)
+    {
+        if (!pinned.CompletionReceiptAckEnabled)
+            return false;
+
+        var latestEligible = pinned.AckState.LatestEligibleTaskId;
+        if (latestEligible is null
+            || !string.Equals(latestEligible, taskId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // ── THE INITIAL NOT-HELD GATE ─────────────────────────────────────────────────────────
+        // The worker must not be executing this very task, and the queue must no longer hold an
+        // active entry for it. A DIFFERENT successor being busy is irrelevant — that is the ordinary
+        // shape a duplicate arrives in.
+        //
+        // A latest-eligible id that has been RE-DISPATCHED is a live assignment again, and the
+        // completion that follows it is a REAL completion that must be RECORDED and RELEASED.
+        // Entering the read-only branch for it would compare it against the OLD retained receipt and
+        // discard it — silently swallowing a completion the worker genuinely produced.
+        if (string.Equals(observed.CurrentTaskId, taskId, StringComparison.Ordinal))
+            return false;
+
+        return taskQueue.GetActiveTask(taskId) is null;
+    }
+
+    /// <summary>
+    /// THE SAME-STREAM DUPLICATE RE-ACKNOWLEDGEMENT: answers a repeated delivery of this stream's ONE
+    /// latest eligible completion from the RETAINED evidence, without processing anything again.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT IS, HONESTLY. It is a BOUNDED re-acknowledgement of exactly one task: the id stored on
+    /// the pinned instance by the most recent ordinary completion whose evidence was confirmed and
+    /// whose checked release succeeded. It is NOT a one-retransmission limit, NOT a history cache, NOT
+    /// reconnect/resume authorization and NOT a stored-receipt replay service — the slot holds one id
+    /// and advances only on the next successfully released ordinary completion, and a failed duplicate
+    /// attempt never clears or advances it.
+    /// </para>
+    /// <para>
+    /// ITS ENTRY CONDITION IS <see cref="IsLatestEligibleDuplicate"/>, which has ALREADY established —
+    /// before this method is called and therefore before any mapping or confirmation read — that the
+    /// negotiation is enabled, that the id is ordinal-exact against the single slot, and that the task
+    /// is NO LONGER HELD (not the worker's current task and no active queue entry). A re-dispatched,
+    /// genuinely live task therefore never reaches this method at all.
+    /// </para>
+    /// <para>
+    /// THE ORDER IS THE CONTRACT, and every step is a refusal that emits nothing:
+    /// </para>
+    /// <list type="number">
+    ///   <item><description>EXPLICIT MODEL PRESENCE is required, exactly as for the ordinary enabled
+    ///     path. The mapping is the SAME boundary mapper, so the supplied evidence is mapped
+    ///     faithfully — and nothing is ever filled in from the queue, from the worker's current model,
+    ///     or from the retained row. An unknown wire status is a malformed input and is handled
+    ///     locally.</description></item>
+    ///   <item><description><see cref="IWorkerCompletionRecorder.ConfirmStoredReceipt"/> is the ONLY
+    ///     AUTHORIZATION. <c>true</c> alone permits another acknowledgement; <c>false</c> and every
+    ///     refusal exception produce none. Nothing is written, released or notified either
+    ///     way.</description></item>
+    ///   <item><description>THE ELIGIBILITY IS RECHECKED AFTER THE READ, before the enqueue. This is a
+    ///     SECOND gate with a DIFFERENT job from the entry condition: the entry gate asked whether the
+    ///     task was already held when the delivery arrived, while this one asks whether the ownership
+    ///     CHANGED WHILE THE READ WAS IN FLIGHT. The pinned instance must still be the one registered
+    ///     under its id — a replacement registered during the read must never be answered on its
+    ///     predecessor's evidence — and the old task must still be unheld. A DIFFERENT successor being
+    ///     busy is fine: that is the ordinary shape this branch exists for.</description></item>
+    /// </list>
+    /// <para>
+    /// THE READ IS NOT REFRESHED AS ACTIVITY for the successor's task: this method deliberately never
+    /// calls <c>TouchActivity</c>, because the duplicate is about an OLD task and must not extend a
+    /// successor's inactivity-derived lifetime.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The pinned instance the duplicate was delivered on.</param>
+    /// <param name="complete">The duplicate completion payload.</param>
+    private void HandleLatestEligibleDuplicate(ConnectedWorker worker, TaskComplete complete)
+    {
+        // ── (1) EXPLICIT MODEL PRESENCE, required exactly as on the ordinary enabled path ──────
+        if (!complete.HasModel)
+        {
+            LogReceiptAckDuplicateIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.ModelPresenceRequired);
+            return;
+        }
+
+        // ── (2) THE SUPPLIED EVIDENCE IS MAPPED, AND NOTHING ELSE IS SUBSTITUTED ───────────────
+        // The SAME boundary mapper is reused, and the result carries the payload's own explicitly
+        // present model verbatim. There is deliberately NO fallback to the queue's model, to the
+        // worker's current model, or to the retained row's result: a comparison against substituted
+        // evidence would be no comparison at all. An unknown wire status is malformed input and is
+        // handled locally, exactly like a mapping failure on the ordinary path.
+        TaskResult evidence;
+        try
+        {
+            evidence = GrpcMapper.ToDomain(complete) with { Model = complete.Model };
+        }
+        catch (Exception ex)
+        {
+            LogCompletionMappingFailed(worker.Id, complete.TaskId, ex);
+            return;
+        }
+
+        // ── (3) THE READ-ONLY CONFIRMATION IS THE ONLY AUTHORIZATION ───────────────────────────
+        bool confirmed;
+        try
+        {
+            if (_completionRecorder is null)
+            {
+                // No recorder means nothing that could have retained evidence, so nothing can be
+                // confirmed. This is a local refusal, never a fall-through into the ordinary path.
+                LogReceiptAckDuplicateIgnored(
+                    worker.Id, complete.TaskId, nameof(WorkerCompletionRecordingFailureReason.MissingRecorder));
+                return;
+            }
+
+            confirmed = _completionRecorder.ConfirmStoredReceipt(worker.Id, complete.TaskId, evidence);
+        }
+        catch (WorkerCompletionRecordingException refusal)
+        {
+            LogReceiptAckDuplicateIgnored(worker.Id, complete.TaskId, refusal.Reason.ToString());
+            return;
+        }
+        catch (Exception unexpected)
+        {
+            LogReceiptAckDuplicateIgnored(worker.Id, complete.TaskId, unexpected.GetType().Name);
+            return;
+        }
+
+        if (!confirmed)
+        {
+            // The retained evidence does NOT match this completion, so it is not acknowledged. No
+            // Conflict or Indeterminate is fabricated for a read-only operation, and nothing is
+            // re-recorded in the hope of making a later attempt succeed.
+            LogReceiptAckDuplicateIgnored(
+                worker.Id, complete.TaskId, nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
+            return;
+        }
+
+        // ── (4) THE ELIGIBILITY RECHECK, AFTER THE READ AND BEFORE THE ENQUEUE ─────────────────
+        // A SECOND gate, answering a DIFFERENT question from the entry condition. The entry gate
+        // already proved the task was not held when the delivery arrived; this one proves the
+        // ownership did not CHANGE while the confirmation read was in flight:
+        //   (a) the pinned instance is still the one registered under its id — an ABA replacement
+        //       that landed during the confirmation read must NOT be answered on behalf of the
+        //       instance whose completion was confirmed; and
+        //   (b) the old task is STILL not held — no active queue entry AND not the worker's current
+        //       task. A DIFFERENT successor being busy is irrelevant.
+        if (!workerPool.TryGetWorkerSnapshot(worker.Id, out var current)
+            || !ReferenceEquals(current.Worker, worker))
+        {
+            LogReceiptAckDuplicateIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.PinnedInstanceReplaced);
+            return;
+        }
+
+        if (taskQueue.GetActiveTask(complete.TaskId) is not null
+            || string.Equals(current.CurrentTaskId, complete.TaskId, StringComparison.Ordinal))
+        {
+            LogReceiptAckDuplicateIgnored(
+                worker.Id, complete.TaskId, OwnershipRefusalReasons.LatestEligibleTaskStillHeld);
+            return;
+        }
+
+        // ── (5) THE ACKNOWLEDGEMENT, THROUGH THE SAME EXISTING CHANNEL — BEST EFFORT ───────────
+        // The identity is echoed verbatim and the publication shares the exact guarded path the
+        // ordinary completion uses. Nothing else happens: no Record, no release, no queue removal, no
+        // pipeline mutation, no dashboard success notification and no completion notification.
+        //
+        // THE SUCCESS LINE IS EMITTED ONLY WHEN THE MESSAGE WAS ACTUALLY QUEUED, and it says QUEUED:
+        // queue acceptance is not delivery, and a lost enqueue already has its own guarded diagnostic.
+        if (TryPublishCompletionReceiptAck(worker, complete.TaskId))
+        {
+            logger.LogInformation(
+                "Worker {WorkerId}: latest eligible completion re-acknowledgement queued for task {TaskId}",
+                worker.Id,
+                complete.TaskId);
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED DUPLICATE-REFUSAL DIAGNOSTIC: a duplicate delivery of the stream's latest eligible
+    /// completion was refused, so no re-acknowledgement was published and nothing was processed again.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED, like every other refusal diagnostic: the whole log call sits inside its own no-throw
+    /// guard, so a throwing logger can never turn a local refusal into an escaping exception that
+    /// would unwind the worker's stream.
+    /// </remarks>
+    /// <param name="workerId">The pinned worker that delivered the duplicate.</param>
+    /// <param name="taskId">The opaque task id the duplicate named.</param>
+    /// <param name="reason">Why the duplicate was refused.</param>
+    private void LogReceiptAckDuplicateIgnored(string workerId, string taskId, string reason)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} duplicate completion for latest eligible task {TaskId} ignored: " +
+                "{Reason}; no acknowledgement was published and nothing was released, removed, " +
+                "recorded or notified",
+                workerId,
+                taskId,
+                reason);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// PUBLISHES ONE COMPLETION-RECEIPT ACKNOWLEDGEMENT through the PINNED INSTANCE'S OWN EXISTING
+    /// message channel — the single channel the stream's own pump already forwards from. No new
+    /// writer, no direct gRPC write, no timer, no retry and no durable outbox.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE IDENTITY IS ECHOED VERBATIM: the exact opaque task id and the exact pinned worker id, with
+    /// no trimming, splitting, parsing or normalization of either.
+    /// </para>
+    /// <para>
+    /// IT IS BEST-EFFORT AND FULLY ISOLATED. A closed channel, a full/broken channel or a throwing
+    /// channel writer is caught here, reported in a guarded diagnostic and swallowed: the ordinary
+    /// dashboard/downstream notification of the SAME completion still runs, the release that was
+    /// already applied is not undone, and nothing is recorded or notified a second time.
+    /// </para>
+    /// <para>
+    /// QUEUE SUCCESS IS NOT PROOF OF DELIVERY. A successful <c>TryWrite</c> says only that the message
+    /// was queued for the pump; the worker may never consume it, so no delivery is ever claimed here.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The pinned instance whose channel the acknowledgement travels on.</param>
+    /// <param name="taskId">The opaque task id of the just-released completion.</param>
+    /// <returns>
+    /// <c>true</c> when the message was QUEUED on the instance's channel; <c>false</c> when the channel
+    /// refused it or the enqueue threw. It is NOT a delivery claim in either direction.
+    /// </returns>
+    private bool TryPublishCompletionReceiptAck(ConnectedWorker worker, string taskId)
+    {
+        try
+        {
+            var ack = new OrchestratorMessage
+            {
+                CompletionReceiptAck = new CompletionReceiptAck
+                {
+                    TaskId = taskId,
+                    WorkerId = worker.Id,
+                },
+            };
+
+            if (worker.MessageChannel.Writer.TryWrite(ack))
+                return true;
+
+            LogReceiptAckNotQueued(null, worker.Id, taskId);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // THE ENQUEUE FAILURE IS ISOLATED: nothing about the ordinary completion path changes
+            // because an advisory acknowledgement could not be queued.
+            LogReceiptAckNotQueued(ex, worker.Id, taskId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED ACKNOWLEDGEMENT-ENQUEUE DIAGNOSTIC: the acknowledgement could not be queued on the
+    /// pinned instance's channel, so nothing was published for it.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED like every other diagnostic on a refusal path, and for the same reason: the whole log
+    /// call sits inside its own no-throw guard, so a throwing logger can never turn a lost
+    /// acknowledgement into an escaping exception that would unwind the completion handler — or, on
+    /// the pump path, the worker's stream.
+    /// </remarks>
+    /// <param name="failure">The enqueue failure, or <c>null</c> when the channel simply refused the write.</param>
+    /// <param name="workerId">The pinned worker the acknowledgement was addressed to.</param>
+    /// <param name="taskId">The opaque task id the acknowledgement was about.</param>
+    private void LogReceiptAckNotQueued(Exception? failure, string workerId, string taskId)
+    {
+        try
+        {
+            if (failure is null)
+            {
+                logger.LogWarning(
+                    "Worker {WorkerId}: completion-receipt acknowledgement for task {TaskId} was " +
+                    "not queued; the completion itself is unaffected and no delivery is claimed",
+                    workerId,
+                    taskId);
+                return;
+            }
+
+            logger.LogWarning(
+                "Worker {WorkerId}: completion-receipt acknowledgement for task {TaskId} could not " +
+                "be queued; the completion itself is unaffected and no delivery is claimed — {Detail}",
+                workerId,
+                taskId,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED ACKNOWLEDGEMENT-WRITE DIAGNOSTIC for the pump: forwarding an
+    /// acknowledgement to the response writer failed, so it was dropped while the pump carried on.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED, so a throwing logger cannot convert an isolated acknowledgement-write failure into a
+    /// faulted stream. NO RECOVERY IS CLAIMED: a genuinely broken connection is not repaired by this,
+    /// and the general stream teardown is deliberately unchanged.
+    /// </remarks>
+    /// <param name="failure">The response write failure; its message is included as evidence.</param>
+    /// <param name="workerId">The pinned worker whose stream was being written to.</param>
+    /// <param name="ack">The acknowledgement that could not be forwarded.</param>
+    private void LogReceiptAckWriteFailed(
+        Exception failure, string workerId, CompletionReceiptAck? ack)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId}: completion-receipt acknowledgement for task {TaskId} could not " +
+                "be written to the worker's stream and was dropped; a broken connection is not " +
+                "recovered here — {Detail}",
+                workerId,
+                ack?.TaskId ?? "(unknown)",
                 MessageOrPlaceholder(failure));
         }
         catch

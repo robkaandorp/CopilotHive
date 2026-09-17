@@ -1544,57 +1544,426 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // (N) STAGE 1 OF THE ACK PROTOCOL — NOTHING IS EMITTED
+    // (N) THE NEGOTIATED ACKNOWLEDGEMENT — EMISSION, IDENTITY AND REFUSALS
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE STAGE-1 NO-EMISSION INVARIANT, on an ACCEPTED completion whose worker asked for the ACK:
-    /// the reply to the registration reports it DISABLED, and the completion path publishes NO
-    /// <see cref="CompletionReceiptAck"/> on the worker's stream — the message is DEFINED but never
-    /// emitted.
+    /// THE ORDINARY ENABLED COMPLETION, END TO END: a worker that NEGOTIATED the acknowledgement
+    /// through the REAL registration RPC completes a task with a PRESENT model, and the
+    /// acknowledgement is observed AT THE WRITER — forwarded by the production pump — carrying the
+    /// exact opaque task and pinned worker identities, while the durable receipt for that same task
+    /// is already readable and the ordinary release/notification happened exactly once.
     /// </summary>
     /// <remarks>
-    /// THE OBSERVATION POINT IS THE gRPC WRITER the real pump forwards to, so this sees exactly what
-    /// the worker would have received. A request that was recorded in the pool is therefore proven
-    /// NOT to have become a publication.
+    /// THE IDENTITY IS OPAQUE ON PURPOSE: the task id carries spaces, a slash and a non-breaking
+    /// space. Nothing between production and the writer may parse, split, trim or normalize it, so an
+    /// echo that \"looks right\" after normalization fails here.
     /// </remarks>
     [Fact]
-    public async Task RequestedReceiptAck_AcceptedCompletion_PublishesNoAcknowledgement()
+    public async Task EnabledCompletion_Accepted_PublishesAcknowledgementWithExactIdentityAndDurableReceipt()
     {
+        const string opaqueTaskId = "  ord/ack-1 \u00a0";
+
         var h = Harness.CreateWithRequestedCompletionReceiptAck();
         await RunAsync(h, async () =>
         {
-            // The registration fact really was recorded — so the absence below is a real refusal to
-            // emit, not a request that never reached the pool.
+            // THE NEGOTIATION REALLY HAPPENED IN PRODUCTION: the request was recorded and the
+            // registration REPLY enabled the acknowledgement, and the published instance agrees.
             Assert.True(h.Worker.RequestCompletionReceiptAck);
+            Assert.True(h.Worker.CompletionReceiptAckEnabled);
 
-            h.Assign("task-ack-absent", model: "assigned-model");
+            h.Assign(opaqueTaskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
 
-            // THE OBSERVATION POINT IS PROVEN LIVE BEFORE the absence is asserted: the pump really
-            // forwards what the worker's channel is given, so a silent pump cannot make the
-            // no-acknowledgement assertion pass vacuously.
-            await h.AssertPumpObservationIsLiveAsync();
+            // The acknowledgement is awaited at the writer BEFORE the completion is pushed, so the
+            // observation can never miss the publication.
+            var acknowledgement = h.AwaitAcknowledgementAsync();
 
-            var result = await h.CompleteAndAwaitDownstreamAsync("task-ack-absent");
-            Assert.Equal("task-ack-absent", result.TaskId);
+            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
+                opaqueTaskId, "assigned-model");
 
-            AssertNoAcknowledgementPublished(h);
+            var ack = await acknowledgement;
+            Assert.Equal(opaqueTaskId, ack.TaskId);
+            Assert.Equal(WorkerId, ack.WorkerId);
 
-            // The completion itself was still accepted in full: the worker was released and the
-            // real downstream chain ran. Stage 1 withholds the ACK, nothing else.
+            // …and the identity is not merely equal by accident: the lengths match too, so no
+            // trimming happened on either leg.
+            Assert.Equal(opaqueTaskId.Length, ack.TaskId.Length);
+
+            // THE ORDINARY COMPLETION HAPPENED EXACTLY ONCE.
+            Assert.Equal(opaqueTaskId, result.TaskId);
             Assert.False(h.Worker.IsBusy);
             Assert.Null(h.Worker.CurrentTaskId);
-            Assert.Equal(1, h.DownstreamHandledCount("task-ack-absent"));
+            Assert.Null(h.Queue.GetActiveTask(opaqueTaskId));
+            Assert.Equal(1, h.DownstreamHandledCount(opaqueTaskId));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
+
+            // EXACTLY ONE acknowledgement was forwarded for this completion.
+            Assert.Single(
+                h.Writer.Messages,
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
+
+            // THE EVIDENCE THE ACKNOWLEDGEMENT IS ABOUT IS ALREADY DURABLE — read through a freshly
+            // constructed store, after the whole handler returned.
+            var receipt = h.ReadReceipt(opaqueTaskId);
+            Assert.NotNull(receipt);
+            Assert.Equal(opaqueTaskId, receipt!.Receipt.Slot.TaskId);
+            Assert.Equal(WorkerId, receipt.Receipt.WorkerId);
+            Assert.Equal("assigned-model", receipt.Receipt.Result.Model);
+
+            // THE ONE LATEST-ELIGIBLE SLOT now names this task — the eligibility fact the second
+            // round will consume for a same-stream duplicate attempt.
+            Assert.Equal(opaqueTaskId, h.Worker.AckState.LatestEligibleTaskId);
         });
     }
 
     /// <summary>
-    /// EVERY completion shape leaves the stream free of an acknowledgement — the REFUSED ones too.
-    /// A guard that returned early must not have emitted an ACK on its way out, and a refusal must
-    /// not fabricate one either.
+    /// A LEGACY (DISABLED) REGISTRATION'S RUNTIME IS UNCHANGED: it publishes NO acknowledgement even
+    /// though its completion is fully accepted, and its ABSENT model still falls back to the
+    /// validated active task — the pre-negotiation behaviour, preserved exactly.
     /// </summary>
     [Fact]
-    public async Task RequestedReceiptAck_RefusedCompletion_PublishesNoAcknowledgement()
+    public async Task DisabledCompletion_Accepted_PublishesNoAcknowledgementAndKeepsAbsentModelFallback()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            Assert.False(h.Worker.RequestCompletionReceiptAck);
+            Assert.False(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Assign("task-ack-legacy", model: "queue-model");
+            h.ResetDashboardNotifications();
+
+            // NO model is sent: the legacy sender shape.
+            var result = await h.CompleteAndAwaitDownstreamAsync("task-ack-legacy");
+            Assert.Equal("queue-model", result.Model);
+
+            // THE COMPLETION IS ACCEPTED IN FULL, with nothing acknowledged.
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Queue.GetActiveTask("task-ack-legacy"));
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-legacy"));
+            await h.AssertNoAcknowledgementAsync();
+
+            // The legacy path stores no eligibility either.
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+        });
+    }
+
+    /// <summary>
+    /// AN ENABLED REGISTRATION'S ABSENT MODEL IS A GUARDED LOCAL REFUSAL: the completion is retained
+    /// — no release, no queue removal, no dashboard success notification, no completion notification,
+    /// no receipt and no acknowledgement — and the handler RETURNS normally, so the stream survives
+    /// and the following Ready is still refused by the existing active-assignment guard.
+    /// </summary>
+    [Fact]
+    public async Task EnabledCompletion_AbsentModel_IsRefusedLocallyWithNothingReleasedOrNotified()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            Assert.True(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Assign("task-ack-no-model", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            await h.CompleteAndAwaitIgnoredAsync(
+                "task-ack-no-model", HiveOrchestratorService.OwnershipRefusalReasons.ModelPresenceRequired);
+
+            // NOTHING WAS RELEASED, REMOVED, RECORDED OR NOTIFIED.
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-ack-no-model", h.Worker.CurrentTaskId);
+            Assert.Equal("assigned-model", h.Worker.CurrentModel);
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-no-model"));
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-ack-no-model"));
+            Assert.Null(h.ReadReceipt("task-ack-no-model"));
+
+            // NO ELIGIBILITY was created, and nothing was acknowledged — observed through a LIVE
+            // pump, so the absence cannot be a stalled pump hiding a published acknowledgement.
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertNoAcknowledgementAsync();
+            Assert.False(h.StreamEnded, "the model-presence refusal must not unwind the worker's stream");
+
+            // THE FOLLOWING READY IS STILL IGNORED: the task is still active in the queue.
+            await h.ReadyAndAwaitIgnoredAsync();
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-ack-no-model", h.Worker.CurrentTaskId);
+        });
+    }
+
+    /// <summary>
+    /// PRESENCE, NOT CONTENT: an EXPLICIT empty and an EXPLICIT whitespace model are both perfectly
+    /// valid for an enabled registration. Each is used VERBATIM — never replaced by the queue's model
+    /// — the completion is accepted, and the acknowledgement is published.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE CELL THAT DISTINGUISHES \"presence\" FROM \"non-empty\": a gate that tested the
+    /// value instead of <c>HasModel</c> would refuse both of these.
+    /// </remarks>
+    /// <param name="wireModel">The explicitly present model value, preserved verbatim.</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task EnabledCompletion_PresentEmptyOrWhitespaceModel_IsAcceptedVerbatim(string wireModel)
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-empty-model", model: "queue-model");
+            h.ResetDashboardNotifications();
+
+            var acknowledgement = h.AwaitAcknowledgementAsync();
+
+            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
+                "task-ack-empty-model", wireModel);
+
+            // THE EXPLICIT VALUE WINS OVER THE QUEUE, verbatim.
+            Assert.Equal(wireModel, result.Model);
+
+            var ack = await acknowledgement;
+            Assert.Equal("task-ack-empty-model", ack.TaskId);
+            Assert.Equal(WorkerId, ack.WorkerId);
+
+            Assert.False(h.Worker.IsBusy);
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-empty-model"));
+            Assert.Equal(1, h.DashboardNotifications);
+
+            var receipt = h.ReadReceipt("task-ack-empty-model");
+            Assert.NotNull(receipt);
+            Assert.Equal(wireModel, receipt!.Receipt.Result.Model);
+        });
+    }
+
+    /// <summary>
+    /// A MAPPING FAILURE CREATES NO ELIGIBILITY AND NO ACKNOWLEDGEMENT, even on an enabled
+    /// registration: the unmappable status is refused locally, the receipt is never written, the
+    /// worker keeps its task, and the stream survives.
+    /// </summary>
+    [Fact]
+    public async Task EnabledCompletion_MappingFailure_CreatesNoEligibilityAndNoAcknowledgement()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-unmappable", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            // A PRESENT model, so the refusal really is the mapping and not the presence gate.
+            await h.CompleteAndAwaitMappingFailureWithPresentModelAsync(
+                "task-ack-unmappable", (CopilotHive.Shared.Grpc.TaskStatus)9999);
+
+            Assert.True(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-unmappable"));
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-ack-unmappable"));
+            Assert.Null(h.ReadReceipt("task-ack-unmappable"));
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertNoAcknowledgementAsync();
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// A RECORDING REFUSAL CREATES NO ELIGIBILITY AND NO ACKNOWLEDGEMENT: with no stored assignment
+    /// context the real recorder refuses, so nothing is released, nothing is notified and nothing is
+    /// acknowledged — the emission boundary really is AFTER the confirmed record.
+    /// </summary>
+    [Fact]
+    public async Task EnabledCompletion_RecordingRefusal_CreatesNoEligibilityAndNoAcknowledgement()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            // OWNERSHIP WITHOUT A RECORDED ASSIGNMENT CONTEXT, established directly.
+            h.Pool.MarkBusy(WorkerId, "task-ack-unrecorded");
+            h.Worker.Role = DomainWorkerRole.Coder;
+            h.Worker.CurrentModel = "assigned-model";
+            h.Queue.Activate(h.BuildTask("task-ack-unrecorded", "assigned-model"), WorkerId);
+            h.ResetDashboardNotifications();
+
+            await h.CompleteAndAwaitNotRecordedWithPresentModelAsync(
+                "task-ack-unrecorded",
+                nameof(WorkerCompletionRecordingFailureReason.InvalidContext));
+
+            Assert.True(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-unrecorded"));
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Null(h.ReadReceipt("task-ack-unrecorded"));
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertNoAcknowledgementAsync();
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// A REFUSED CHECKED RELEASE CREATES NO ELIGIBILITY AND NO ACKNOWLEDGEMENT, even though the
+    /// receipt WAS recorded: the ownership is invalidated inside the recording call, so the release
+    /// is refused afterwards and the acknowledgement is never emitted.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE VECTOR THAT PINS THE CONSERVATIVE EMISSION BOUNDARY. A mutant that published the
+    /// acknowledgement as soon as the record succeeded — ignoring the release outcome — would emit
+    /// one here, and this vector would catch it.
+    /// </remarks>
+    [Fact]
+    public async Task EnabledCompletion_RefusedCheckedRelease_CreatesNoEligibilityAndNoAcknowledgement()
+    {
+        var h = Harness.CreateWithOwnershipMutationAfterRecordAndRequestedAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-refused-release", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            h.RecorderHook!.AfterRecord = () => h.Pool.MarkIdle(WorkerId);
+
+            await h.CompleteAndAwaitCheckedReleaseRefusedWithPresentModelAsync(
+                "task-ack-refused-release");
+
+            // THE RECORDER REALLY RAN — the refusal is genuinely POST-record.
+            Assert.Equal(1, h.RecorderHook.RecordCount);
+            Assert.NotNull(h.ReadReceipt("task-ack-refused-release"));
+
+            // …AND THE REFUSED RELEASE STILL CREATED NOTHING.
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-refused-release"));
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount("task-ack-refused-release"));
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertNoAcknowledgementAsync();
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// A FAILED ACKNOWLEDGEMENT ENQUEUE LOSES NOTHING: with the pinned instance's channel already
+    /// completed, the acknowledgement cannot be queued — yet the completion is still released, the
+    /// durable receipt still exists, the dashboard and the REAL downstream chain are still notified
+    /// exactly once, and the guarded diagnostic that reports the lost acknowledgement cannot unwind
+    /// the completion handler even when the logger itself throws on it.
+    /// </summary>
+    /// <remarks>
+    /// THE CHANNEL IS CLOSED BEFORE THE COMPLETION ON PURPOSE: that is the one deterministic way to
+    /// make <c>TryWrite</c> refuse without racing the pump. The pump's own exit is a pre-existing
+    /// consequence of a closed channel and is not what is asserted here — the assertion is that the
+    /// COMPLETION is unaffected.
+    /// </remarks>
+    [Fact]
+    public async Task EnabledCompletion_FailedAcknowledgementEnqueue_LosesNoAcceptedCompletion()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-enqueue-fail", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            // THE ENQUEUE CANNOT SUCCEED, and the diagnostic that reports it THROWS when written.
+            Assert.True(h.Worker.MessageChannel.Writer.TryComplete());
+            h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckNotQueued);
+
+            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
+                "task-ack-enqueue-fail", "assigned-model");
+
+            // THE DIAGNOSTIC REALLY RAN AND REALLY THREW — yet it escaped nowhere.
+            Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReceiptAckNotQueued, StringComparison.Ordinal)
+                     && m.Contains("task-ack-enqueue-fail", StringComparison.Ordinal)
+                     && m.Contains(WorkerId, StringComparison.Ordinal));
+
+            // THE ACCEPTED COMPLETION SURVIVED COMPLETELY.
+            Assert.Equal("task-ack-enqueue-fail", result.TaskId);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Null(h.Queue.GetActiveTask("task-ack-enqueue-fail"));
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-enqueue-fail"));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
+
+            // THE EVIDENCE IS STILL DURABLE, and the eligibility slot was still advanced BEFORE the
+            // failed enqueue — the fact is about what happened, not about what could be delivered.
+            Assert.NotNull(h.ReadReceipt("task-ack-enqueue-fail"));
+            Assert.Equal("task-ack-enqueue-fail", h.Worker.AckState.LatestEligibleTaskId);
+
+            // NOTHING WAS CONSUMED: the pump never forwarded an acknowledgement (the channel was
+            // closed), and no second record, release or notification happened.
+            AssertNoAcknowledgementPublished(h);
+            Assert.False(h.StreamEnded, "a lost acknowledgement must not end the worker's stream");
+        });
+    }
+
+    /// <summary>
+    /// A ONE-SHOT ACTUAL ACK WRITER FAULT IS ISOLATED IN THE PUMP: the real response writer throws for
+    /// the acknowledgement exactly once, the failure is reported in a guarded diagnostic that cannot
+    /// escape even when the logger throws on it, and the pump CARRIES ON — proven by observing a later
+    /// message forwarded to the same writer.
+    /// </summary>
+    /// <remarks>
+    /// WHY ONE SHOT. A permanently throwing writer would make the pump unusable for everything, so the
+    /// vector could not tell \"the acknowledgement write failed\" from \"the stream is dead\" — and the
+    /// contract here is precisely that only the acknowledgement is isolated.
+    /// </remarks>
+    [Fact]
+    public async Task EnabledCompletion_OneShotAcknowledgementWriterFault_IsIsolatedAndLosesNothing()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-write-fault", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            var writerFault = new InvalidOperationException("the response writer threw SENTINEL");
+            h.ArmOneShotAcknowledgementWriteFault(writerFault);
+
+            // THE DIAGNOSTIC THAT REPORTS IT ALSO THROWS, so the isolation is proven on both legs.
+            h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckWriteFailed);
+
+            // A FRESH WAITER FOR THE PUMP'S OWN DIAGNOSTIC, allocated BEFORE the completion is
+            // pushed: the acknowledgement is forwarded asynchronously by the pump, so the failure is
+            // observed where production reports it rather than inferred from a later state read.
+            var writeFailed = h.ServiceLogger.WaitFor(ProductionLogFragments.ReceiptAckWriteFailed);
+
+            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
+                "task-ack-write-fault", "assigned-model");
+
+            await writeFailed.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE WRITE WAS REALLY ATTEMPTED and really faulted.
+            Assert.Equal(1, h.AcknowledgementWriteAttempts);
+            Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+            Assert.Contains(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.ReceiptAckWriteFailed, StringComparison.Ordinal)
+                     && m.Contains("task-ack-write-fault", StringComparison.Ordinal));
+
+            // THE ACCEPTED COMPLETION IS INTACT.
+            Assert.Equal("task-ack-write-fault", result.TaskId);
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Queue.GetActiveTask("task-ack-write-fault"));
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-write-fault"));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
+            Assert.NotNull(h.ReadReceipt("task-ack-write-fault"));
+
+            // THE FAULTED ACKNOWLEDGEMENT was never recorded at the writer…
+            AssertNoAcknowledgementPublished(h);
+
+            // ── THE PUMP SURVIVED THE FAULT ──────────────────────────────────────────────────
+            // A later message is really forwarded to the SAME writer, which is only possible if the
+            // pump carried on rather than treating the acknowledgement fault as terminal.
+            await h.AssertPumpObservationIsLiveAsync();
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// THE ACKNOWLEDGEMENT IS ADVISORY, NOT A DELIVERY CLAIM: its presence or absence never changes
+    /// the transport ownership, and a refused completion still leaves the stream acknowledgement-free
+    /// even on an ENABLED registration.
+    /// </summary>
+    [Fact]
+    public async Task EnabledCompletion_RefusedCompletion_PublishesNoAcknowledgement()
     {
         var h = Harness.CreateWithRequestedCompletionReceiptAck();
         await RunAsync(h, async () =>
@@ -1611,11 +1980,102 @@ public sealed class CompletionTransportOwnershipTests
                 "task-ack-refused",
                 HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
 
-            // The assignment and the refusal both survive with no acknowledgement anywhere.
-            AssertNoAcknowledgementPublished(h);
+            // The assignment and the refusal both survive with no acknowledgement anywhere —
+            // observed through a LIVE pump, so a stalled pump cannot hide a published one.
+            await h.AssertNoAcknowledgementAsync();
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
             Assert.True(h.Worker.IsBusy);
             Assert.Equal("task-ack-own", h.Worker.CurrentTaskId);
             Assert.NotNull(h.Queue.GetActiveTask("task-ack-own"));
+        });
+    }
+
+    /// <summary>
+    /// THE LATEST-ELIGIBLE SLOT ADVANCES, ONE ID AT A TIME, ACROSS TWO ORDINARY COMPLETIONS, and each
+    /// completion carries its OWN acknowledgement — so the slot is a single latest id rather than an
+    /// accumulating history, and a disabled registration beside it stays silent.
+    /// </summary>
+    [Fact]
+    public async Task EnabledCompletion_TwoOrdinaryCompletions_PublishEachAckAndAdvanceTheSingleSlot()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            h.Assign("task-ack-first", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            var firstAck = h.AwaitAcknowledgementAsync();
+            await h.CompleteWithPresentModelAndAwaitDownstreamAsync("task-ack-first", "assigned-model");
+
+            var first = await firstAck;
+            Assert.Equal("task-ack-first", first.TaskId);
+            Assert.Equal(WorkerId, first.WorkerId);
+            Assert.Equal("task-ack-first", h.Worker.AckState.LatestEligibleTaskId);
+
+            // ── THE SECOND ORDINARY COMPLETION REPLACES THE SLOT ─────────────────────────────
+            h.Assign("task-ack-second", model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            var secondAck = h.AwaitAcknowledgementAsync();
+            await h.CompleteWithPresentModelAndAwaitDownstreamAsync("task-ack-second", "assigned-model");
+
+            var second = await secondAck;
+            Assert.Equal("task-ack-second", second.TaskId);
+            Assert.Equal(WorkerId, second.WorkerId);
+
+            // EXACTLY ONE ID IS RETAINED, and it is the LATEST one.
+            Assert.Equal("task-ack-second", h.Worker.AckState.LatestEligibleTaskId);
+
+            // BOTH completions were accepted and released exactly once, and both are durable.
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-first"));
+            Assert.Equal(1, h.DownstreamHandledCount("task-ack-second"));
+            Assert.Equal(1, h.DashboardNotifications);
+            Assert.NotNull(h.ReadReceipt("task-ack-first"));
+            Assert.NotNull(h.ReadReceipt("task-ack-second"));
+
+            // …and exactly two acknowledgements were forwarded, one per completion.
+            Assert.Equal(
+                2,
+                h.Writer.Messages.Count(
+                    m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck));
+        });
+    }
+
+    /// <summary>
+    /// A WORKER THAT REQUESTED THE ACKNOWLEDGEMENT BUT WAS ANSWERED BY AN ORCHESTRATOR WITH NO
+    /// COMPLETION RECORDER STAYS DISABLED, and the completion then fails CLOSED exactly as before:
+    /// the failure is the RECORDER's, not the negotiation's, so this is genuinely the
+    /// missing-recorder cell rather than an ACK refusal.
+    /// </summary>
+    [Fact]
+    public async Task RequestedAckWithoutRecorder_IsDisabledAndTheCompletionFailsClosed()
+    {
+        var h = Harness.CreateWithoutCompletionRecorderAndRequestedAck();
+        await RunAsync(h, async () =>
+        {
+            // THE REQUEST WAS RECORDED, THE ANSWER WAS NOT ENABLEMENT.
+            Assert.True(h.Worker.RequestCompletionReceiptAck);
+            Assert.False(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Pool.MarkBusy(WorkerId, "task-ack-no-recorder");
+            h.Worker.Role = DomainWorkerRole.Coder;
+            h.Worker.CurrentModel = "assigned-model";
+            h.Queue.Activate(h.BuildTask("task-ack-no-recorder", "assigned-model"), WorkerId);
+            h.ResetDashboardNotifications();
+
+            // A PRESENT model, so the refusal is provably the missing recorder and not the disabled
+            // registration's own (non-existent) presence requirement.
+            await h.CompleteAndAwaitNotRecordedWithPresentModelAsync(
+                "task-ack-no-recorder",
+                nameof(WorkerCompletionRecordingFailureReason.MissingRecorder));
+
+            Assert.True(h.Worker.IsBusy);
+            Assert.NotNull(h.Queue.GetActiveTask("task-ack-no-recorder"));
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Null(h.ReadReceipt("task-ack-no-recorder"));
+            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertNoAcknowledgementAsync();
+            Assert.False(h.StreamEnded);
         });
     }
 
@@ -2136,15 +2596,35 @@ public sealed class CompletionTransportOwnershipTests
         public static Harness Create() => CreateCore(withPublishedAssignmentSupport: false, dbPath: null);
 
         /// <summary>
-        /// Creates a harness whose worker REGISTERED WITH THE COMPLETION-RECEIPT REQUEST SET — the
-        /// registration shape the stage-1 no-emission invariant must hold for. Everything else is
-        /// the plain harness.
+        /// Creates a harness whose worker reached the pool through the REAL <see cref="HiveOrchestratorService.Register"/>
+        /// RPC carrying the completion-receipt REQUEST — so the instance's enablement is genuinely
+        /// NEGOTIATED BY PRODUCTION and not set by the fixture. Everything else is the plain harness.
         /// </summary>
+        /// <remarks>
+        /// THE ROUTE MATTERS. Registering through the RPC is what makes it possible to assert that the
+        /// registration REPLY and the PUBLISHED INSTANCE agree — the registration path constructs the
+        /// answer from the instance it actually registered, and this factory proves both sides here
+        /// before any stream is opened.
+        /// </remarks>
         public static Harness CreateWithRequestedCompletionReceiptAck() =>
             CreateCore(
                 withPublishedAssignmentSupport: false,
                 dbPath: null,
-                requestCompletionReceiptAck: true);
+                requestCompletionReceiptAck: true,
+                registerThroughRealRpc: true);
+
+        /// <summary>
+        /// Creates a harness whose worker REQUESTED the acknowledgement but whose service has NO
+        /// completion recorder configured at all — the negotiation cell that must stay DISABLED no
+        /// matter what was asked for.
+        /// </summary>
+        public static Harness CreateWithoutCompletionRecorderAndRequestedAck() =>
+            CreateCore(
+                withPublishedAssignmentSupport: false,
+                dbPath: null,
+                withRecorder: false,
+                requestCompletionReceiptAck: true,
+                registerThroughRealRpc: true);
 
         /// <summary>
         /// Creates a harness WITH the published-assignment support the sequence vector needs: a
@@ -2188,13 +2668,29 @@ public sealed class CompletionTransportOwnershipTests
                 withRecorder: true,
                 withOwnershipMutationHook: true);
 
+        /// <summary>
+        /// The SAME post-record mutation seam for an ENABLED registration: the worker negotiated the
+        /// acknowledgement through the REAL registration RPC, so a refused checked release can be
+        /// proven to create NO acknowledgement eligibility.
+        /// </summary>
+        public static Harness CreateWithOwnershipMutationAfterRecordAndRequestedAck() =>
+            CreateCore(
+                withPublishedAssignmentSupport: false,
+                dbPath: null,
+                interceptors: null,
+                withRecorder: true,
+                withOwnershipMutationHook: true,
+                requestCompletionReceiptAck: true,
+                registerThroughRealRpc: true);
+
         private static Harness CreateCore(
             bool withPublishedAssignmentSupport,
             string? dbPath,
             IInterceptor[]? interceptors = null,
             bool withRecorder = true,
             bool withOwnershipMutationHook = false,
-            bool requestCompletionReceiptAck = false)
+            bool requestCompletionReceiptAck = false,
+            bool registerThroughRealRpc = false)
         {
             var pool = new WorkerPool();
             var queue = new TaskQueue();
@@ -2285,8 +2781,42 @@ public sealed class CompletionTransportOwnershipTests
                 assignmentPublisher: assignmentPublisher,
                 completionRecorder: completionRecorder);
 
-            var worker = pool.RegisterWorker(
-                WorkerId, [], requestCompletionReceiptAck: requestCompletionReceiptAck);
+            // THE WORKER'S REGISTRATION. Two routes, and the difference is the point:
+            //   * the LEGACY route builds the instance directly, with the request left absent. That is
+            //     exactly what an existing worker does, and it is what keeps every vector that is not
+            //     about negotiation on the unchanged legacy runtime.
+            //   * the NEGOTIATED route goes through the REAL Register RPC, so the instance's
+            //     enablement is PRODUCTION's answer to the request rather than a fixture decision.
+            ConnectedWorker worker;
+            if (registerThroughRealRpc)
+            {
+                var registration = service.Register(
+                    new RegisterRequest
+                    {
+                        WorkerId = WorkerId,
+                        RequestCompletionReceiptAck = requestCompletionReceiptAck,
+                    },
+                    MockContext()).GetAwaiter().GetResult();
+
+                Assert.True(registration.Accepted);
+                Assert.Equal(requestCompletionReceiptAck && withRecorder, registration.CompletionReceiptAckEnabled);
+
+                worker = pool.GetWorker(WorkerId)
+                    ?? throw new InvalidOperationException(
+                        $"the registration RPC did not publish '{WorkerId}' in the pool.");
+                Assert.Equal(
+                    registration.CompletionReceiptAckEnabled, worker.CompletionReceiptAckEnabled);
+            }
+            else
+            {
+                worker = pool.RegisterWorker(
+                    WorkerId, [], requestCompletionReceiptAck: requestCompletionReceiptAck);
+
+                // A fixture-created instance is never ACK-enabled: enablement is the registration
+                // RPC's decision, and nothing else may manufacture it.
+                Assert.False(worker.CompletionReceiptAckEnabled);
+            }
+
             var reader = new ChannelStreamReader();
 
             // THE SINGLE CONSUMER OF THE WORKER'S CHANNEL IS THE PRODUCTION PUMP. Publication is
@@ -2879,6 +3409,97 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
+        /// Delivers a completion that an ENABLED registration must carry a model for — the field is
+        /// PRESENT with <paramref name="model"/> verbatim, so presence is satisfied even when the
+        /// value itself is empty or whitespace.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="model">The model value to carry, preserved verbatim.</param>
+        /// <returns>The domain result the transport emitted.</returns>
+        public Task<TaskResult> CompleteWithPresentModelAndAwaitDownstreamAsync(
+            string taskId, string model) =>
+            CompleteAndAwaitDownstreamAsync(taskId, model, modelPresent: true);
+
+        /// <summary>
+        /// The MODEL PRESENCE this harness's registration requires: an ENABLED registration must
+        /// carry the field, a DISABLED (legacy) one keeps the original absent-field behaviour.
+        /// </summary>
+        /// <returns><c>true</c> when the fixture must send an explicit model value.</returns>
+        private bool RequiresModelPresence => Worker.CompletionReceiptAckEnabled;
+
+        /// <summary>
+        /// Delivers an ORDINARY accepted completion on this harness's own registration shape,
+        /// awaiting the REAL downstream chain, and returns the domain result.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="model">The model value to send when presence is required.</param>
+        /// <returns>The domain result the transport emitted.</returns>
+        public Task<TaskResult> CompleteOrdinaryAsync(string taskId, string model = "assigned-model") =>
+            CompleteAndAwaitDownstreamAsync(
+                taskId,
+                model: RequiresModelPresence ? model : null,
+                modelPresent: RequiresModelPresence);
+
+        // ── THE ACKNOWLEDGEMENT OBSERVATION ──────────────────────────────────────────
+
+        /// <summary>
+        /// Waits for the NEXT acknowledgement the REAL pump forwards to the gRPC writer and returns
+        /// it, so the identity is read where the worker would have received it.
+        /// </summary>
+        /// <remarks>
+        /// THE OBSERVATION POINT IS THE WRITER, not the channel: the production pump is the channel's
+        /// only consumer, so reading the writer observes the publication AFTER the real pump forwarded
+        /// it rather than competing with it.
+        /// </remarks>
+        /// <returns>The forwarded acknowledgement.</returns>
+        public async Task<CompletionReceiptAck> AwaitAcknowledgementAsync()
+        {
+            var forwarded = Writer.WaitForMessage(
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck);
+
+            return (await forwarded.WaitAsync(
+                BoundedWait, TestContext.Current.CancellationToken)).CompletionReceiptAck;
+        }
+
+        /// <summary>
+        /// PROVES THE PUMP OBSERVATION IS LIVE and then asserts that NO acknowledgement was forwarded
+        /// for the worker, so the absence is a real refusal rather than a dead or silent pump.
+        /// </summary>
+        /// <remarks>
+        /// THE ORDER IS THE POINT: the handler barrier inside
+        /// <see cref="AssertPumpObservationIsLiveAsync"/> runs first, so the handler under test has
+        /// provably RETURNED before the absence is asserted — a publication that merely had not been
+        /// scheduled yet cannot masquerade as a refusal.
+        /// </remarks>
+        /// <returns>A task that completes once liveness and absence are both established.</returns>
+        public async Task AssertNoAcknowledgementAsync()
+        {
+            await AssertPumpObservationIsLiveAsync();
+            AssertNoAcknowledgementPublished(this);
+        }
+
+        /// <summary>
+        /// WAITS FOR THE RECORDED COMPLETION TO HAVE BEEN RELEASED AND NOTIFIED, then asserts the
+        /// stream carried no acknowledgement for it.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <returns>The domain result the transport emitted.</returns>
+        public async Task<TaskResult> CompleteExpectingNoAcknowledgementAsync(string taskId)
+        {
+            var result = await CompleteAndAwaitDownstreamAsync(taskId, modelPresent: false);
+            await AssertNoAcknowledgementAsync();
+            return result;
+        }
+
+        /// <summary>Arms a ONE-SHOT fault on the next acknowledgement forwarded to this writer.</summary>
+        /// <param name="failure">The exception the write must throw exactly once.</param>
+        public void ArmOneShotAcknowledgementWriteFault(Exception failure) =>
+            Writer.ArmOneShotAcknowledgementWriteFault(failure);
+
+        /// <summary>How many acknowledgement writes the writer was asked to perform.</summary>
+        public int AcknowledgementWriteAttempts => Writer.AcknowledgementWriteAttempts;
+
+        /// <summary>
         /// Delivers a completion and awaits the PRODUCTION IGNORED warning carrying
         /// <paramref name="expectedReason"/>, THEN the post-handler barrier.
         /// </summary>
@@ -2950,6 +3571,87 @@ public sealed class CompletionTransportOwnershipTests
             });
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
             await BarrierAsync();
+        }
+
+        /// <summary>
+        /// The SAME mapping-failure delivery with an EXPLICITLY PRESENT model, so the refusal is
+        /// provably the MAPPING rather than the enabled-registration model-presence gate.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="status">The wire status the mapper refuses.</param>
+        public async Task CompleteAndAwaitMappingFailureWithPresentModelAsync(
+            string taskId, CopilotHive.Shared.Grpc.TaskStatus status)
+        {
+            var signal = ServiceLogger.WaitFor(ProductionLogFragments.MappingFailed);
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Complete = BuildComplete(taskId, "assigned-model", true, status),
+            });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
+
+            // THE PRESENCE GATE DID NOT REFUSE: the handler reached the mapping step.
+            Assert.DoesNotContain(
+                ServiceLogger.Messages,
+                m => m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.ModelPresenceRequired,
+                         StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// The recording-refusal delivery with an EXPLICITLY PRESENT model, so the refusal is provably
+        /// the RECORDER's rather than the model-presence gate.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="expectedReason">The expected <see cref="WorkerCompletionRecordingFailureReason"/> name.</param>
+        public async Task CompleteAndAwaitNotRecordedWithPresentModelAsync(
+            string taskId, string expectedReason)
+        {
+            var signal = ServiceLogger.WaitFor(expectedReason);
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Complete = BuildComplete(
+                    taskId, "assigned-model", true, CopilotHive.Shared.Grpc.TaskStatus.Completed),
+            });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
+
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionNotRecorded, StringComparison.Ordinal)
+                     && m.Contains(expectedReason, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// The post-record CHECKED-RELEASE refusal delivery with an EXPLICITLY PRESENT model, so the
+        /// refusal is provably the release's and the enabled model requirement is satisfied.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        public async Task CompleteAndAwaitCheckedReleaseRefusedWithPresentModelAsync(string taskId)
+        {
+            var signal = ServiceLogger.WaitFor(
+                HiveOrchestratorService.OwnershipRefusalReasons.CheckedReleaseRefused);
+
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Complete = BuildComplete(
+                    taskId, "assigned-model", true, CopilotHive.Shared.Grpc.TaskStatus.Completed),
+            });
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
+
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.CheckedReleaseRefused,
+                         StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
         }
 
         /// <summary>
@@ -3643,6 +4345,18 @@ public sealed class CompletionTransportOwnershipTests
         public const string NoPipelineForTask = "No pipeline found for completed task";
 
         /// <summary>
+        /// The guarded acknowledgement-ENQUEUE diagnostic's stable fragment: the acknowledgement
+        /// could not be queued on the pinned instance's channel, so no delivery is claimed.
+        /// </summary>
+        public const string ReceiptAckNotQueued = "acknowledgement for task";
+
+        /// <summary>
+        /// The pump's guarded acknowledgement-WRITE diagnostic's stable fragment: forwarding an
+        /// acknowledgement to the response writer failed and it was dropped.
+        /// </summary>
+        public const string ReceiptAckWriteFailed = "could not be written to the worker's stream";
+
+        /// <summary>
         /// Whether a dispatcher log line is one of <c>TaskCompletionService</c>'s own
         /// completion-handling lines — i.e. the real downstream chain was entered.
         /// </summary>
@@ -3791,6 +4505,11 @@ public sealed class CompletionTransportOwnershipTests
         private readonly List<(Func<OrchestratorMessage, bool> Predicate, TaskCompletionSource<OrchestratorMessage> Signal)>
             _messageWaiters = [];
 
+        /// <summary>The one-shot fault the NEXT acknowledgement write throws, or <c>null</c>.</summary>
+        private Exception? _acknowledgementWriteFault;
+
+        private int _acknowledgementWriteAttempts;
+
         public WriteOptions? WriteOptions { get; set; }
 
         /// <summary>Every message the transport forwarded, in order.</summary>
@@ -3802,6 +4521,23 @@ public sealed class CompletionTransportOwnershipTests
                     return [.. _messages];
             }
         }
+
+        /// <summary>How many acknowledgement writes this writer was asked to perform.</summary>
+        public int AcknowledgementWriteAttempts => Volatile.Read(ref _acknowledgementWriteAttempts);
+
+        /// <summary>
+        /// Arms a ONE-SHOT fault: the NEXT acknowledgement handed to this writer throws
+        /// <paramref name="failure"/>, and every later write behaves normally.
+        /// </summary>
+        /// <remarks>
+        /// ONE SHOT, DELIBERATELY. A permanently throwing writer would make the pump fail on every
+        /// subsequent message too, so the vector could not distinguish \"the acknowledgement write
+        /// failed\" from \"the stream is now unusable\" — and the point of the vector is that the
+        /// failure is ISOLATED.
+        /// </remarks>
+        /// <param name="failure">The exception the next acknowledgement write must throw.</param>
+        public void ArmOneShotAcknowledgementWriteFault(Exception failure) =>
+            _acknowledgementWriteFault = failure;
 
         /// <summary>
         /// A FRESH signal completed by the NEXT forwarded message satisfying
@@ -3833,6 +4569,18 @@ public sealed class CompletionTransportOwnershipTests
 
         private Task RecordAsync(OrchestratorMessage message)
         {
+            // THE ONE-SHOT ACKNOWLEDGEMENT WRITE FAULT. It is armed and consumed HERE, before the
+            // message is recorded, so a faulted write really means \"the writer threw\" and not
+            // \"the writer also recorded it\".
+            if (message.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck)
+            {
+                Interlocked.Increment(ref _acknowledgementWriteAttempts);
+
+                var armed = Interlocked.Exchange(ref _acknowledgementWriteFault, null);
+                if (armed is not null)
+                    throw armed;
+            }
+
             TaskCompletionSource<TaskAssignment>? waiter = null;
             List<TaskCompletionSource<OrchestratorMessage>> matched = [];
 
