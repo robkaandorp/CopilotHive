@@ -7,23 +7,26 @@ namespace CopilotHive.Services;
 /// <para>
 /// IT EXISTS SO A CALLER CAN DEPEND ON THE CAPABILITY rather than the concrete recorder — which is
 /// what lets a fixture substitute its own narrow implementation for injection. It deliberately
-/// carries ONE SYNCHRONOUS operation and no state: the caller supplies the pinned worker id, the
-/// VALIDATED active <see cref="WorkTask"/> and the already-mapped domain
-/// <see cref="TaskResult"/>.
+/// carries TWO SYNCHRONOUS operations and no state: the recording operation (the caller supplies the
+/// pinned worker id, the VALIDATED active <see cref="WorkTask"/> and the already-mapped domain
+/// <see cref="TaskResult"/>) and the STRICTLY READ-ONLY confirmation operation (the caller supplies
+/// the pinned worker id, the task id and the already-mapped <see cref="TaskResult"/>).
 /// </para>
 /// <para>
 /// A SUCCESSFUL RETURN MEANS CONFIRMED EVIDENCE RETENTION ONLY. It is not durable worker
 /// authorization, it is not an acknowledgement, it is not a replay permission and it does not mean
-/// the completion was processed or that a phase advanced. It says exactly one thing: the completion
-/// receipt for this validated task was retained (or was already retained identically) in durable
-/// storage.
+/// the completion was processed or that a phase advanced. For the recording operation it says
+/// exactly one thing: the completion receipt for this validated task was retained (or was already
+/// retained identically) in durable storage. For the confirmation operation a <c>true</c> answer
+/// says exactly one thing: matching evidence IS retained — nothing about authorization, processing,
+/// acknowledgement or replay eligibility.
 /// </para>
 /// <para>
 /// PUBLIC BY NECESSITY, NARROW BY DESIGN: <see cref="HiveOrchestratorService"/> is a PUBLIC type, so
 /// an appended constructor parameter cannot be an internal type (C# forbids the inconsistent
 /// accessibility). This interface is the widest thing that parameter may name, and it exposes
-/// nothing but the single record operation — the concrete recorder, the recording-failure type and
-/// both stores all remain internal.
+/// nothing but the record operation and the read-only confirmation operation — the concrete
+/// recorder, the recording-failure type and both stores all remain internal.
 /// </para>
 /// <para>
 /// THE CONCRETE RECORDER IS MANDATORY FOR INCOMING COMPLETIONS. <see cref="HiveOrchestratorService"/>
@@ -54,11 +57,46 @@ public interface IWorkerCompletionRecorder
     /// any of them.
     /// </exception>
     void Record(string workerId, WorkTask task, TaskResult result);
+
+    /// <summary>
+    /// THE STRICTLY READ-ONLY CONFIRMATION: reports whether durable evidence matching this
+    /// completion is already retained for the task id.
+    /// <para>
+    /// A DEFAULT, FAIL-CLOSED BODY IS REQUIRED. It returns <c>false</c> unconditionally and never
+    /// touches a store, so a record-only implementation (or a fake) keeps compiling and, when it
+    /// cannot confirm anything, answers "no matching evidence" rather than inventing a match. An
+    /// implementation that genuinely reads durable evidence overrides it.
+    /// </para>
+    /// <para>
+    /// A <c>true</c> RESULT PROVES MATCHING RETAINED EVIDENCE ONLY. It is not durable worker
+    /// authorization, not an acknowledgement, not a processing marker and not a replay permission:
+    /// the future caller independently enforces its own negotiated same-stream/latest-task
+    /// eligibility, and this method alone is never recovery authorization.
+    /// </para>
+    /// </summary>
+    /// <param name="workerId">The pinned worker id the completion was delivered by.</param>
+    /// <param name="taskId">The OPAQUE task id whose retained receipt is compared against.</param>
+    /// <param name="result">The already-mapped domain result; its model is preserved verbatim.</param>
+    /// <returns>
+    /// <c>true</c> only when a valid retained receipt for the task id has the same canonical
+    /// evidence as this completion; <c>false</c> for absence or a genuine difference.
+    /// </returns>
+    /// <exception cref="WorkerCompletionRecordingException">
+    /// <see cref="WorkerCompletionRecordingFailureReason.InvalidContext"/> (a null/blank identity, a
+    /// result/task id disagreement, or an unrepresentable candidate) or
+    /// <see cref="WorkerCompletionRecordingFailureReason.StoreError"/> (a read, materialization,
+    /// corruption or codec failure). Nothing is written for either, and no
+    /// <see cref="WorkerCompletionRecordingFailureReason.Conflict"/> or
+    /// <see cref="WorkerCompletionRecordingFailureReason.Indeterminate"/> is ever fabricated by a
+    /// read-only operation.
+    /// </exception>
+    bool ConfirmStoredReceipt(string workerId, string taskId, TaskResult result) => false;
 }
 
 /// <summary>
 /// THE COMPLETION-RECEIPT RECORDER — the single production path that retains the durable evidence of
-/// one RETURNED worker completion, from the STORED assignment context.
+/// one RETURNED worker completion, from the STORED assignment context, plus the STRICTLY READ-ONLY
+/// confirmation that reports whether matching evidence is already retained for a task id.
 /// <para>
 /// WHAT A RETAINED RECEIPT MEANS, HONESTLY, AND WHAT IT DOES NOT. It means the completion's evidence
 /// was written to durable storage for a task whose recorded assignment context agreed with the
@@ -72,6 +110,15 @@ public interface IWorkerCompletionRecorder
 /// <see cref="CompletionReceiptStore.InsertOnce"/> for the receipt. There is no new SQL, no second
 /// codec, no explicit transaction, no retry and no readback: a write outcome that did not confirm is
 /// reported exactly as the store reported it.
+/// </para>
+/// <para>
+/// THE CONFIRMATION IS READ-ONLY AND REUSES THE SAME STORE AND CODEC:
+/// <see cref="CompletionReceiptStore.Load"/> reads the retained receipt EXACTLY ONCE and the EXISTING
+/// <see cref="CompletionReceiptCodec"/> decides equality by comparing canonical texts ordinally. It
+/// issues no INSERT/UPDATE/DELETE and no <c>SaveChanges</c>, never calls
+/// <see cref="CompletionReceiptStore.InsertOnce"/>, never loads an assignment context and mutates
+/// neither the supplied nor the retained evidence. A <c>true</c> answer means matching retained
+/// evidence ONLY — the caller enforces its own negotiated eligibility.
 /// </para>
 /// <para>
 /// IDENTITY COMES FROM THE STORED CONTEXT, NEVER FROM TEXT. The receipt's goal, worker, role and the
@@ -261,6 +308,133 @@ internal sealed class WorkerCompletionRecorder : IWorkerCompletionRecorder
                 throw new InvalidOperationException(
                     $"WorkerCompletionRecorder: unhandled CompletionReceiptWriteStatus " +
                     $"'{write.Status}'.");
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// THE ORDER IS THE CONTRACT, exactly as for <see cref="Record"/>: the null-result guard, the
+    /// identity guards and the ORDINAL result/task agreement all run BEFORE the single store read, so
+    /// a caller bug or a disagreement never touches the database, and the read of the retained
+    /// receipt happens EXACTLY ONCE.
+    /// </remarks>
+    public bool ConfirmStoredReceipt(string workerId, string taskId, TaskResult result)
+    {
+        // ── (1) THE NULL GUARD. A null result names no completion at all, so there is nothing to
+        //        compare and no receipt to invent an answer for. ──
+        ArgumentNullException.ThrowIfNull(result);
+
+        // ── (2) THE IDENTITIES, ordinal and NEVER trimmed or normalized. A missing or blank
+        //        identity, and a result that names a different task than the opaque key, are
+        //        REFUSALS decided by this type's own comparison — never a rebind, never a repair. ──
+        if (string.IsNullOrWhiteSpace(workerId))
+        {
+            throw WorkerCompletionRecordingException.InvalidContext(
+                "the confirming worker id is missing");
+        }
+
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            throw WorkerCompletionRecordingException.InvalidContext(
+                "the task id to confirm is missing");
+        }
+
+        if (string.IsNullOrWhiteSpace(result.TaskId))
+        {
+            throw WorkerCompletionRecordingException.InvalidContext(
+                $"the completing result for task '{taskId}' carries no task id");
+        }
+
+        if (!string.Equals(result.TaskId, taskId, StringComparison.Ordinal))
+        {
+            throw WorkerCompletionRecordingException.InvalidContext(
+                $"the completing result names task '{result.TaskId}' but the confirmation is for " +
+                $"task '{taskId}'");
+        }
+
+        // ── (3) THE ONE READ of the retained receipt, by that SAME OPAQUE task id. Every failure the
+        //        store can produce — its acquisition, its read query, the payload materialization,
+        //        the row/payload identity check, the timestamp materialization — is a STORE error
+        //        retaining the EXACT caught exception. ──
+        CompletionReceiptReadResult? stored;
+        try
+        {
+            stored = _receiptStore.Load(taskId);
+        }
+        catch (Exception storeFailure)
+        {
+            throw WorkerCompletionRecordingException.StoreError(
+                $"reading the retained completion receipt for task '{taskId}' threw " +
+                $"({storeFailure.GetType().Name})",
+                storeFailure);
+        }
+
+        // ── (4) ABSENCE IS NOT A MATCH — and nothing else is ever reported as absence. ──
+        if (stored is null)
+        {
+            return false;
+        }
+
+        var retained = stored.Receipt;
+
+        // ── (5) A RETAINED RECEIPT THAT NAMES A DIFFERENT WORKER OR TASK IS NOT A MATCH for this
+        //        completion. The worker cell is the genuinely reachable one (the caller's pinned worker
+        //        may differ from the retained row's); the task cell is a belt-and-braces ordinal
+        //        re-check of the row the store already proved carries this very task id. ──
+        if (!string.Equals(retained.Slot.TaskId, taskId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!string.Equals(retained.WorkerId, workerId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // ── (6) THE CANDIDATE, built from the RETAINED goal/worker/role and the FULL retained slot,
+        //        plus the mapped result EXACTLY as handed over — including an empty or whitespace
+        //        model, which is never replaced by the retained assignment's model. The existing
+        //        constructor remains the single validation authority; because the retained receipt is
+        //        already internally consistent and the result's task id has just been proved ordinal-
+        //        equal to the retained slot's, a refusal here is belt-and-braces against a future
+        //        change rather than a reachable state today. ──
+        CompletionReceipt candidate;
+        try
+        {
+            candidate = new CompletionReceipt(
+                retained.GoalId,
+                retained.WorkerId,
+                retained.Role,
+                retained.Slot,
+                result);
+        }
+        catch (Exception candidateValidation)
+        {
+            throw WorkerCompletionRecordingException.InvalidContext(
+                $"the completion receipt for task '{taskId}' failed its own validation " +
+                $"({candidateValidation.GetType().Name})",
+                candidateValidation);
+        }
+
+        // ── (7) THE ORDINAL CANONICAL COMPARISON, through the EXISTING codec. Full domain evidence
+        //        decides — ordered nested lists, nullable members and the iteration-start SHA
+        //        included. The first-stored instant is NOT part of the payload and NOT part of this
+        //        decision, and neither raw stored JSON formatting nor any object identity is ever
+        //        compared. A genuinely differing receipt is simply NOT a match, never a store
+        //        failure, and never a fabricated Conflict or Indeterminate. ──
+        try
+        {
+            return string.Equals(
+                CompletionReceiptCodec.Encode(retained),
+                CompletionReceiptCodec.Encode(candidate),
+                StringComparison.Ordinal);
+        }
+        catch (Exception codecFailure)
+        {
+            throw WorkerCompletionRecordingException.StoreError(
+                $"encoding the completion receipt for task '{taskId}' while confirming threw " +
+                $"({codecFailure.GetType().Name})",
+                codecFailure);
         }
     }
 }

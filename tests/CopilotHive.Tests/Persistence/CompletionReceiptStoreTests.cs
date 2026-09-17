@@ -1631,8 +1631,14 @@ public sealed class CompletionReceiptStoreTests : IDisposable
         }
     }
 
-    /// <summary>A factory whose acquisition always throws the pre-created sentinel.</summary>
-    private sealed class ReceiptThrowingContextFactory(Exception sentinel) : IDbContextFactory<CopilotHiveDbContext>
+    /// <summary>
+    /// A factory whose acquisition always throws the pre-created sentinel.
+    /// <para>
+    /// INTERNAL RATHER THAN PRIVATE, so the recorder fixture can reuse THIS exact helper for its
+    /// acquisition-fault vector instead of duplicating it.
+    /// </para>
+    /// </summary>
+    internal sealed class ReceiptThrowingContextFactory(Exception sentinel) : IDbContextFactory<CopilotHiveDbContext>
     {
         public CopilotHiveDbContext CreateDbContext() => throw sentinel;
     }
