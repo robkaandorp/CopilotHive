@@ -6,6 +6,7 @@ using CopilotHive.Git;
 using CopilotHive.Goals;
 using CopilotHive.Orchestration;
 using CopilotHive.Persistence;
+using CopilotHive.Persistence.Entities;
 using CopilotHive.Services;
 using CopilotHive.Workers;
 
@@ -67,23 +68,23 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
 
     // ═══════════════════════════════════ fixture plumbing ═══════════════════════════════════
 
-    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    private CopilotHiveDbContext CreateContext(params IInterceptor[] interceptors)
     {
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
         _connections.Add(connection);
 
         var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
-        if (interceptor is not null)
-            builder.AddInterceptors(interceptor);
+        if (interceptors.Length > 0)
+            builder.AddInterceptors(interceptors);
 
         var context = new CopilotHiveDbContext(builder.Options);
         _contexts.Add(context);
         return context;
     }
 
-    private PipelineStore CreateStore(IInterceptor? interceptor = null) =>
-        new(CreateContext(interceptor), NullLogger<PipelineStore>.Instance);
+    private PipelineStore CreateStore(params IInterceptor[] interceptors) =>
+        new(CreateContext(interceptors), NullLogger<PipelineStore>.Instance);
 
     /// <summary>A factory-created (store-OWNED) context per operation — the shape two concurrent saves need.</summary>
     private sealed class LiveCheckpointContextFactory(string connectionString, IInterceptor? interceptor)
@@ -790,6 +791,122 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
         Assert.Equal("Testing", RawScalar("SELECT phase FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
     }
 
+    /// <summary>
+    /// THE ADDED-PRINCIPAL BOUNDARY of the failed-checkpoint cleanup: when the failing save's
+    /// principal is Added (no durable row to reload), the cleanup keeps the EXISTING
+    /// rejection-DETACH — a blind reload of an Added entity can be a no-op that leaves the rejected
+    /// checkpoint insertable. So this case claims NEITHER dependent preservation NOR reusable
+    /// tracking: the tracker holds no flushable pipeline entry afterwards, the rejected pointer/blob
+    /// cannot be flushed by a later save, and no row is created.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: reloading EVERY tracked pipeline entry unconditionally makes the
+    /// Added principal's reload a no-op, leaving the rejected entry Added — the "no flushable entry"
+    /// assertion then fails, and the follow-up save would insert the rejected row.
+    /// </remarks>
+    [Fact]
+    public void SavePipeline_BorrowedContext_AddedPrincipal_FailedCheckpointIsDetachedNotReloaded()
+    {
+        const string goalId = "live-added-principal-goal";
+        var sentinel = new InvalidOperationException("added-principal-row-write-sentinel");
+
+        var interceptor = new OneShotPipelinesInsertThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        // A genuine registry slot (the production allocation API) plus the pointer: the rejected
+        // checkpoint really carries a blob AND a pointer, so "nothing was flushed" is meaningful.
+        var pipeline = NewPipeline(goalId);
+        AllocateTo(pipeline, "rejected-added-task", Pos(1, GoalPhase.Testing, 1), WorkSlotState.Pending);
+        pipeline.SetActiveTask("rejected-added-task");
+        var rejected = WorkSlotRegistryCodec.Encode(pipeline.CaptureRegistry());
+        Assert.Contains("rejected-added-task", rejected, StringComparison.Ordinal);
+
+        var thrown = Record.Exception(() => store.SavePipeline(pipeline, pipeline.CaptureAdmissionOwnership()));
+        Assert.NotNull(thrown);
+        Assert.Contains(sentinel, EnumerateChain(thrown!));
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        // NO FLUSHABLE PRINCIPAL REMAINS — and the rejected write left no row and no pointer.
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.State is EntityState.Added or EntityState.Modified);
+        Assert.Null(RawPointer(goalId));
+        Assert.Null(RawBlob(goalId));
+
+        // The rejected checkpoint cannot be flushed by a later save: the legacy state save creates
+        // the row legitimately, but its registry column stays the SQL NULL absence marker — the
+        // rejected blob (rejected-added-task included) never appears.
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        store.SavePipelineState(pipeline);
+        Assert.Equal("Testing", RawScalar("SELECT phase FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+        Assert.Null(RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE THROWING-RELOAD BOUNDARY, observed at the durable-blob level: the cleanup's own reload
+    /// SELECT is injected to fail after the row write failed. The targeted detach FALLBACK still
+    /// removes the rejected checkpoint from the SAME context, the ORIGINAL write exception stays
+    /// authoritative by identity, and the durable blob survives byte-for-byte.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATION THIS KILLS: letting the reload failure escape the cleanup (or skipping the
+    /// fallback) leaves the rejected checkpoint staged — the follow-up save would then flush the
+    /// rejected blob and the final byte-equality assertion fails.
+    /// </remarks>
+    [Fact]
+    public void SavePipeline_BorrowedContext_ReloadSelectFails_DetachFallbackKeepsTheDurableBlob()
+    {
+        const string goalId = "live-reload-fail-goal";
+        var writeSentinel = new InvalidOperationException("reload-fail-row-write-sentinel");
+        var selectSentinel = new InvalidOperationException("reload-fail-select-sentinel");
+
+        var seeding = new PipelineStore(CreateContext(), NullLogger<PipelineStore>.Instance);
+        var seed = NewPipeline(goalId);
+        seed.AdvanceTo(GoalPhase.Coding);
+        seeding.SavePipeline(seed);
+
+        var durableBlob = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+            [new WorkSlotView(new WorkSlot("durable-task", Pos(1, GoalPhase.Coding, 1), 1), WorkSlotState.Recorded)],
+            [new WorkSlotRegistryAttemptEntry(Pos(1, GoalPhase.Coding, 1), 1)]));
+        SeedBlob(goalId, durableBlob);
+
+        var write = new OneShotPipelinesUpdateThrowInterceptor(writeSentinel);
+        var select = new ArmablePipelinesSelectThrowInterceptor(selectSentinel);
+        var context = CreateContext(write, select);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        // The principal is loaded onto the borrowed context FIRST, so the first armed `pipelines`
+        // SELECT is the cleanup's reload; the row write is failed by the separate interceptor.
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+        select.Arm();
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-reload-task");
+
+        var thrown = Record.Exception(() => store.SavePipeline(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(writeSentinel, update.InnerException);
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => ReferenceEquals(e, selectSentinel));
+        Assert.Equal(1, select.ThrowCount);   // the reload really ran and really failed
+        Assert.Equal(1, write.ThrowCount);
+
+        // THE FALLBACK HELD: nothing flushable remains, and the durable blob is intact.
+        Assert.DoesNotContain(context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.State is EntityState.Added or EntityState.Modified);
+        Assert.Equal(durableBlob, RawBlob(goalId));
+
+        select.Disarm();
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        store.SavePipeline(pipeline);
+
+        Assert.Equal(durableBlob, RawBlob(goalId));
+        Assert.DoesNotContain("rejected-reload-task", RawBlob(goalId) ?? string.Empty, StringComparison.Ordinal);
+        Assert.Equal("Testing", RawScalar("SELECT phase FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+    }
+
     /// <summary>Every exception in the propagated chain, outermost first.</summary>
     private static IEnumerable<Exception> EnumerateChain(Exception exception)
     {
@@ -805,8 +922,8 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
     /// logger — so "nothing was ever logged" cannot pass this vector vacuously.
     /// <para>
     /// The ATTEMPTED diagnostics are pinned too, which is what makes the CLEANUP site's guard
-    /// observable: the cleanup must report its COMPLETION (its own write's throw is swallowed by that
-    /// guard), never a fabricated "cleanup did not complete".
+    /// observable: the cleanup must report its COMPLETION (its own diagnostic write's throw is
+    /// swallowed by that guard), never a fabricated cleanup-failure report.
     /// </para>
     /// </summary>
     private static void AssertDatabaseFailureRemainsAuthoritative(
@@ -821,11 +938,12 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
         Assert.True(logger.ThrowCount >= 1,
             "the failed save's diagnostic never reached the throwing logger — the guard would be vacuous");
 
-        // THE CLEANUP SITE'S GUARD: the hygiene COMPLETED (the tracker-detach work really ran and the
+        // THE CLEANUP SITE'S GUARD: the hygiene COMPLETED (the existing-row RELOAD really ran and the
         // completion diagnostic was attempted), and the throwing logger's write at that site was
         // swallowed by the guard rather than being mistaken for a cleanup fault.
         Assert.Contains(logger.Messages, m => m.Contains("tracker hygiene completed", StringComparison.Ordinal));
-        Assert.DoesNotContain(logger.Messages, m => m.Contains("cleanup did not complete", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, m => m.Contains("hygiene did not complete", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, m => m.Contains("reload failed", StringComparison.Ordinal));
         Assert.Contains(logger.Messages, m => m.Contains("the primary exception is rethrown unchanged", StringComparison.Ordinal));
     }
 
@@ -2006,6 +2124,111 @@ public sealed class LiveOwnershipCheckpointTests : IDisposable
 
         public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
             DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowIfTargeted(command);
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>
+    /// Throws a caller-supplied sentinel before the FIRST <c>INSERT … pipelines</c> executes, then
+    /// lets every later statement through — the seam for an <c>Added</c> principal's failed row write
+    /// (a fresh row is flushed as an INSERT, not an UPDATE). Both statement paths are hooked because
+    /// the provider may emit the INSERT through either.
+    /// </summary>
+    private sealed class OneShotPipelinesInsertThrowInterceptor(Exception sentinel) : DbCommandInterceptor
+    {
+        private int _fired;
+        private int _throwCount;
+
+        public int ThrowCount => Volatile.Read(ref _throwCount);
+
+        private void ThrowIfTargeted(DbCommand command)
+        {
+            var text = command.CommandText;
+            if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
+                return;
+            if (!text.TrimStart().StartsWith("INSERT", StringComparison.OrdinalIgnoreCase))
+                return;
+            if (Interlocked.CompareExchange(ref _fired, 1, 0) != 0)
+                return;
+
+            Interlocked.Increment(ref _throwCount);
+            throw sentinel;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowIfTargeted(command);
+            return ValueTask.FromResult(result);
+        }
+
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowIfTargeted(command);
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>
+    /// Throws a caller-supplied sentinel at EVERY <c>SELECT … FROM "pipelines"</c> read ONCE ARMED —
+    /// the cleanup-time RELOAD seam. Arming is explicit and happens only after the principal is
+    /// already tracked, so the interceptor cannot misfire on the pre-failure lookups.
+    /// </summary>
+    private sealed class ArmablePipelinesSelectThrowInterceptor(Exception sentinel) : DbCommandInterceptor
+    {
+        private volatile bool _armed;
+        private int _throwCount;
+
+        public int ThrowCount => Volatile.Read(ref _throwCount);
+
+        public void Arm() => _armed = true;
+
+        public void Disarm() => _armed = false;
+
+        private void ThrowIfTargeted(DbCommand command)
+        {
+            if (!_armed)
+                return;
+
+            var text = command.CommandText;
+            if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
+                return;
+            if (!text.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            Interlocked.Increment(ref _throwCount);
+            throw sentinel;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
             CancellationToken cancellationToken = default)
         {
             ThrowIfTargeted(command);

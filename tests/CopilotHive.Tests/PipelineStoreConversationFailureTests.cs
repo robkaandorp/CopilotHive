@@ -64,23 +64,26 @@ public sealed class PipelineStoreConversationFailureTests : IDisposable
 
     // ═════════════════════════════════════ fixture plumbing ═════════════════════════════════════
 
-    private CopilotHiveDbContext CreateContext(IInterceptor? interceptor = null)
+    private CopilotHiveDbContext CreateContext(params IInterceptor[] interceptors)
     {
         var connection = new SqliteConnection(_connectionString);
         connection.Open();
         _connections.Add(connection);
 
         var builder = new DbContextOptionsBuilder<CopilotHiveDbContext>().UseSqlite(connection);
-        if (interceptor is not null)
-            builder.AddInterceptors(interceptor);
+        if (interceptors.Length > 0)
+            builder.AddInterceptors(interceptors);
 
         var context = new CopilotHiveDbContext(builder.Options);
         _contexts.Add(context);
         return context;
     }
 
-    private PipelineStore CreateStore(IInterceptor? interceptor = null, ILogger<PipelineStore>? logger = null) =>
-        new(CreateContext(interceptor), logger ?? NullLogger<PipelineStore>.Instance);
+    private PipelineStore CreateStore(params IInterceptor[] interceptors) =>
+        new(CreateContext(interceptors), NullLogger<PipelineStore>.Instance);
+
+    private PipelineStore CreateStore(ILogger<PipelineStore> logger, params IInterceptor[] interceptors) =>
+        new(CreateContext(interceptors), logger);
 
     private static Goal NewGoal(string id) =>
         new() { Id = id, Description = "goal " + id, RepositoryNames = ["test-repo"] };
@@ -110,6 +113,54 @@ public sealed class PipelineStoreConversationFailureTests : IDisposable
         while (reader.Read())
             rows.Add((reader.GetInt64(0), reader.GetInt32(1), reader.GetString(2), reader.GetString(3)));
         return rows;
+    }
+
+    /// <summary>THE DURABLE REGISTRY BLOB the existing-row vectors seed and then preserve: a real
+    /// encoded payload naming a task the REJECTED writes never carry, so a leaked rejected blob is
+    /// detectable by content as well as by byte equality.</summary>
+    private static readonly string DurableBlob = WorkSlotRegistryCodec.Encode(new WorkSlotRegistrySnapshot(
+        [new WorkSlotView(new WorkSlot("state-only-durable-task", new WorkSlotPosition(1, GoalPhase.Coding, 1), 1),
+            WorkSlotState.Recorded)],
+        [new WorkSlotRegistryAttemptEntry(new WorkSlotPosition(1, GoalPhase.Coding, 1), 1)]));
+
+    /// <summary>Writes a RAW blob (and the durable description/pointer the existing-row vectors
+    /// assert against) directly onto the seeded row — no EF, no tracker.</summary>
+    private void SeedBlob(string goalId, string? blob)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE pipelines
+            SET work_slot_registry_json = $blob,
+                description = 'durable-description',
+                active_task_id = 'state-only-durable-task'
+            WHERE goal_id = $goal
+            """;
+        command.Parameters.AddWithValue("$goal", goalId);
+        command.Parameters.AddWithValue("$blob", (object?)blob ?? DBNull.Value);
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    /// <summary>Runs a raw non-query on the keeper connection (the out-of-band state change).</summary>
+    private void ExecuteOnKeeper(string sql)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>The raw <c>work_slot_registry_json</c> text, read through the keeper (no EF).</summary>
+    private string? RawBlob(string goalId) => RawScalar(
+        "SELECT work_slot_registry_json FROM pipelines WHERE goal_id = $goal", ("$goal", goalId));
+
+    /// <summary>The raw <c>pipelines</c> row count for a goal — the "the rejected insert never landed"
+    /// probe.</summary>
+    private long RawScalarCount(string goalId)
+    {
+        using var command = _keeper.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM pipelines WHERE goal_id = $goal";
+        command.Parameters.AddWithValue("$goal", goalId);
+        return (long)command.ExecuteScalar()!;
     }
 
     private string? RawScalar(string sql, params (string Name, object? Value)[] parameters)
@@ -824,13 +875,15 @@ public sealed class PipelineStoreConversationFailureTests : IDisposable
     /// pending conversation entry, so both the tracking probe and the flush probe fail.
     /// </para>
     /// <para>
-    /// THIS VECTOR IS SCOPED TO THE LEGACY ROUTE ON PURPOSE. The ownership-aware state-only route is
-    /// NOT covered here, because its failure path does reach the conversation entries — but not
-    /// through the cleanup this change introduces: that route's pre-existing
-    /// <c>OnCheckpointSaveFailure</c> detaches the tracked pipeline entry, and EF then cascades that
-    /// detach to the entry's tracked dependents. So the ownership-aware state-only route already had
-    /// that property before this change; asserting it here would be asserting a different, unrelated
-    /// behaviour. See the raised issue for the observation.
+    /// THIS VECTOR IS SCOPED TO THE LEGACY ROUTE ON PURPOSE, and pins ONE narrow boundary: the LEGACY
+    /// state-only failure path never runs the full-save conversation-scope cleanup. The
+    /// ownership-aware state-only path — whose failure DOES reach the checkpoint helper — is covered
+    /// separately by the <c>StateOnlySave_OwnershipRoute_*</c> vectors below. Those vectors now
+    /// describe the CURRENT reload-in-place behavior: the helper RELOADS an existing Unchanged/
+    /// Modified principal via <c>EntityEntry.Reload</c> on the same entry instead of detaching it, so
+    /// the caller's pending conversation work (and other dependents) is no longer cascaded away, and
+    /// they assert the same-object/Unchanged/flush outcome that behavior produces. The detach-cascade
+    /// this paragraph used to describe was the pre-change behavior, not the current one.
     /// </para>
     /// </remarks>
     [Fact]
@@ -877,43 +930,638 @@ public sealed class PipelineStoreConversationFailureTests : IDisposable
     }
 
     /// <summary>
-    /// THE SAME PROHIBITION on the OWNERSHIP-AWARE state-only route: whatever its pre-existing
-    /// pipeline-entry hygiene does, the NEW full-save conversation-scope cleanup must never run.
-    /// This test proves that narrow diagnostic boundary only; it deliberately makes no claim about
-    /// conversation-entry tracking after the pre-existing checkpoint cleanup.
+    /// THE REAL REPRODUCTION OF THE REPORTED DEFECT, on the OWNERSHIP-AWARE state-only route: an
+    /// EXISTING durable pipeline row is loaded onto the borrowed context (a HELD principal
+    /// reference), the caller stages its OWN same-goal conversation entry, and the checkpoint's
+    /// pre-commit row write fails. Because the cleanup RELOADS THE EXISTING TRACKED PIPELINE IN
+    /// PLACE instead of detaching/re-finding it, the SAME principal reference comes back Unchanged
+    /// with the DURABLE pointer/registry, the EXACT conversation object keeps its pending content
+    /// and Added state, and the EXACT outer EF exception was propagated.
     /// </summary>
     /// <remarks>
-    /// This pins the "do NOT add conversation cleanup to that shared helper" rule where it is
-    /// observable WITHOUT depending on the unrelated dependent-detachment cascade described on the
-    /// legacy vector above.
+    /// <para>
+    /// THE DEFECT THIS PINS, OBSERVED RATHER THAN ASSUMED: the previous cleanup detached the
+    /// principal, and EF's detach CASCADES to the principal's tracked dependents — the caller's
+    /// Added conversation work was detached with it, so the SAME instance assertion, the Added-state
+    /// assertion and the follow-up flush all fail (the probe run that established this is what the
+    /// transition probe below re-checks at runtime). Note that only some dependent states cascade;
+    /// the assertions here name the state that actually does, and the Modified/Deleted companions
+    /// below cover the states whose dependent tracking is retained.
+    /// </para>
+    /// <para>
+    /// THE TRANSITIONS ARE OBSERVED: the principal must be seen going Unchanged → Modified (the
+    /// rejected staging) and then back to Unchanged (the reload), and the conversation dependent must
+    /// NOT be seen transitioning to Detached — so a detach-based cleanup cannot satisfy this vector.
+    /// </para>
+    /// <para>
+    /// "STATE-ONLY" MEANS ONLY THAT THE ROUTE NEVER REPLACES THE CONVERSATION: its context-wide
+    /// <c>SaveChanges</c> flushes the caller's surviving pending conversation work on the following
+    /// successful save, which the final half of this vector proves.
+    /// </para>
     /// </remarks>
     [Fact]
-    public void StateOnlySave_OwnershipRoute_BorrowedContext_Failure_NeverRunsTheConversationCleanup()
+    public void StateOnlySave_OwnershipRoute_ExistingRowPreCommitFailure_PreservesHeldPrincipalAndCallerConversation()
     {
-        const string goalId = "conv-state-only-ownership-goal";
-        var sentinel = new InvalidOperationException("state-only-ownership-sentinel");
+        const string goalId = "conv-state-only-existing-row-goal";
+        var sentinel = new InvalidOperationException("state-only-existing-row-sentinel");
 
-        SeedPipelineWithConversation(goalId);
+        // The durable row AND its durable blob, seeded through a SEPARATE context.
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+        var durableConversation = ReadConversation(goalId);
+        SeedBlob(goalId, DurableBlob);
 
-        var context = CreateContext(new OneShotPipelinesDmlThrowInterceptor(sentinel));
-        var logger = new TestLogger<PipelineStore>();
-        var store = new PipelineStore(context, logger);
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
 
+        // THE HELD PRINCIPAL REFERENCE — the object the caller observes.
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+        principal!.Description = "caller-pending-description";
+        Assert.Equal(EntityState.Modified, context.Entry(principal).State);
+
+        // THE CALLER'S OWN same-goal conversation work, pending BEFORE the state save.
+        var callerEntry = new ConversationEntryEntity
+        {
+            GoalId = goalId,
+            Seq = 5,
+            Role = "user",
+            Content = "caller-pending-on-state-save",
+        };
+        context.ConversationEntries.Add(callerEntry);
+        context.ChangeTracker.DetectChanges();
+        Assert.Equal(EntityState.Added, context.Entry(callerEntry).State);
+
+        var principalTransitions = new List<(EntityState From, EntityState To)>();
+        var conversationDetaches = 0;
+        context.ChangeTracker.StateChanged += (_, args) =>
+        {
+            if (ReferenceEquals(args.Entry.Entity, principal))
+                principalTransitions.Add((args.OldState, args.NewState));
+            if (args.NewState == EntityState.Detached && args.Entry.Entity is ConversationEntryEntity)
+                Interlocked.Increment(ref conversationDetaches);
+        };
+
+        // The capture is taken off a pipeline carrying a NON-NULL pointer and a NON-EMPTY registry,
+        // so the rejected write genuinely had a pointer/registry to stage.
         var pipeline = NewPipeline(goalId);
-        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("state-only-rejected-task");
 
         var thrown = Record.Exception(
             () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
 
         Assert.NotNull(thrown);
+        // THE EXACT OUTER EF EXCEPTION, by identity: the DbUpdateException wrapping the injected
+        // sentinel, not the cleanup's own failure and not a re-created wrapper.
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(sentinel, update.InnerException);
+        Assert.Same(interceptor.SaveChangesFailure, update);
+        Assert.Equal(1, interceptor.ThrowCount);
 
-        // THE SHARED HELPER AND THE STATE-ONLY CATCH EMIT NEITHER CLEANUP DIAGNOSTIC: the new
-        // conversation-scope cleanup is a FULL-SAVE-ONLY step.
-        Assert.DoesNotContain(logger.LogEntries,
-            e => e.Message.Contains("full-save-conversation-cleanup", StringComparison.Ordinal));
-        // …and the checkpoint hygiene diagnostic that IS the state save's contract still appeared.
+        context.ChangeTracker.DetectChanges();
+
+        // ── THE SAME PRINCIPAL, UNCHANGED, CARRYING THE DURABLE POINTER/BLOB ──
+        Assert.Equal(EntityState.Unchanged, context.Entry(principal).State);
+        Assert.Same(principal, context.Pipelines.Find(goalId));   // not detached and re-found
+        Assert.Equal("state-only-durable-task", principal.ActiveTaskId);
+        Assert.Equal(DurableBlob, principal.WorkSlotRegistryJson);
+        Assert.Equal("durable-description", principal.Description);  // the pending scalar edit is discarded
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+
+        // ── THE EXACT CONVERSATION OBJECT, STILL PENDING AND STILL Added ──
+        Assert.Contains(
+            context.ChangeTracker.Entries<ConversationEntryEntity>(),
+            e => ReferenceEquals(e.Entity, callerEntry) && e.State == EntityState.Added);
+        Assert.Equal("caller-pending-on-state-save", callerEntry.Content);
+        Assert.Equal(0, Volatile.Read(ref conversationDetaches));
+
+        // ── THE TRANSITIONS REALLY HAPPENED (an observed defect, not an assumption) ──
+        // The principal sat Modified after the caller's pending edit, so the ONLY transition the
+        // cleanup can produce is Modified → Unchanged (the reload, read while the entry was still
+        // attached). A detach-based cleanup would show Modified → Detached instead, which is exactly
+        // the defect this vector pins — so BOTH halves are asserted, not just the absence of Detached.
+        Assert.Equal((EntityState.Modified, EntityState.Unchanged), Assert.Single(principalTransitions));
+        Assert.DoesNotContain(principalTransitions, t => t.To == EntityState.Detached);
+
+        // ── THE SURVIVING WORK REALLY FLUSHES on a plain SaveChanges, with NO re-tracking by the
+        //    test, while the restored durable pointer/blob stay exactly as they were. ──
+        context.SaveChanges();
+
+        var afterFlush = ReadConversation(goalId);
+        Assert.Equal("caller-pending-on-state-save", Assert.Single(afterFlush, r => r.Seq == 5).Content);
+        // The pre-existing durable entry is untouched by the surviving caller work.
+        Assert.Equal(durableConversation, afterFlush.Where(r => r.Seq == 0).ToList());
+        Assert.Equal("state-only-durable-task", RawScalar(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE MODIFIED/DELETED COMPANIONS: with an EXISTING principal (Unchanged), a caller conversation
+    /// entry already durable and now Modified keeps its pending value and its Modified property
+    /// metadata, and a durable entry marked Deleted stays Deleted — through the failed ownership-aware
+    /// state-only save — and the following plain <c>SaveChanges</c> lands the intended update and
+    /// delete. The durable pointer/blob are untouched by that flush.
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ExistingRow_ModifiedAndDeletedConversationWorkSurvives()
+    {
+        const string goalId = "conv-state-only-dep-states";
+        var sentinel = new InvalidOperationException("state-only-dep-states-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-0"), ("assistant", "durable-1"));
+        SeedBlob(goalId, DurableBlob);
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var durable = context.ConversationEntries.Where(e => e.GoalId == goalId).OrderBy(e => e.Seq).ToList();
+        var modified = durable[0];
+        var deleted = durable[1];
+        modified.Content = "modified-pending";
+        context.ConversationEntries.Remove(deleted);
+        var added = new ConversationEntryEntity
+        {
+            GoalId = goalId,
+            Seq = 9,
+            Role = "user",
+            Content = "added-pending",
+        };
+        context.ConversationEntries.Add(added);
+        context.ChangeTracker.DetectChanges();
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-dep-states-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        Assert.NotNull(thrown);
+        context.ChangeTracker.DetectChanges();
+
+        // THE PRINCIPAL IS RELOADED IN PLACE (the pre-existing row it must not be detached from).
+        Assert.Equal(EntityState.Unchanged, context.Entry(principal!).State);
+        Assert.Same(principal, context.Pipelines.Find(goalId));
+
+        // Every dependent keeps the EXACT object, state and pending property metadata.
+        Assert.Same(modified, context.ChangeTracker.Entries<ConversationEntryEntity>()
+            .Single(e => ReferenceEquals(e.Entity, modified)).Entity);
+        Assert.Equal(EntityState.Modified, context.Entry(modified).State);
+        Assert.Equal("modified-pending", modified.Content);
+        Assert.True(context.Entry(modified).Property(e => e.Content).IsModified);
+        Assert.Equal("durable-0", context.Entry(modified).Property(e => e.Content).OriginalValue);
+
+        Assert.Equal(EntityState.Deleted, context.Entry(deleted).State);
+        Assert.Equal(EntityState.Added, context.Entry(added).State);
+        Assert.True(context.Entry(added).Property(e => e.Id).IsTemporary);
+
+        // THE INTENDED WORK LANDS — no re-tracking by the test, just a plain SaveChanges.
+        context.SaveChanges();
+
+        var rows = ReadConversation(goalId);
+        Assert.Equal("modified-pending", Assert.Single(rows, r => r.Seq == 0).Content);
+        Assert.Equal("added-pending", Assert.Single(rows, r => r.Seq == 9).Content);
+        Assert.DoesNotContain(rows, r => r.Content == "durable-1");
+
+        // The restored durable pointer/blob are exactly the originals (the rejected checkpoint never
+        // reached a flush, and the surviving conversation work did not disturb the row).
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE LATER LEGACY SAVE DOES NOT FLUSH THE REJECTED CHECKPOINT REGISTRY. After the
+    /// ownership-aware state-only failure the principal is Unchanged at database truth, so a later
+    /// LEGACY state save on the SAME context cannot smuggle the rejected blob through.
+    /// </summary>
+    /// <remarks>
+    /// The legacy save legitimately writes ITS OWN current live pointer, so the assertion is scoped
+    /// to the ONE thing the rejected write would have changed: the registry blob stays the durable
+    /// one (it never contains the rejected task id).
+    /// </remarks>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ExistingRow_ThenLegacySave_DoesNotFlushTheRejectedRegistry()
+    {
+        const string goalId = "conv-state-only-then-legacy-goal";
+        var sentinel = new InvalidOperationException("state-only-then-legacy-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+        SeedBlob(goalId, DurableBlob);
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-legacy-task");
+        Assert.NotEqual(DurableBlob, WorkSlotRegistryCodec.Encode(pipeline.CaptureRegistry()));
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+        Assert.NotNull(thrown);
+        context.ChangeTracker.DetectChanges();
+        Assert.Equal(EntityState.Unchanged, context.Entry(principal!).State);
+
+        // THE LATER LEGACY SAVE, on the SAME borrowed context.
+        pipeline.AdvanceTo(GoalPhase.Testing);
+        store.SavePipelineState(pipeline);
+
+        Assert.Equal("Testing", RawScalar(
+            "SELECT phase FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+        Assert.DoesNotContain("rejected-legacy-task", RawBlob(goalId) ?? string.Empty, StringComparison.Ordinal);
+        Assert.Equal("durable-entry", Assert.Single(ReadConversation(goalId)).Content);
+    }
+
+    /// <summary>
+    /// THE BLAST RADIUS, on the EXISTING-ROW cleanup: a case-distinct OTHER goal's pending
+    /// conversation entry and an unrelated pending task-mapping row keep their state and values and
+    /// really flush afterwards, while the affected goal's principal is reloaded in place.
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ExistingRow_LeavesOtherGoalsAndUnrelatedWorkUntouched()
+    {
+        const string targetGoalId = "Conv-State-Only-Target";
+        const string caseVariantGoalId = "conv-state-only-target";
+        var sentinel = new InvalidOperationException("state-only-blast-sentinel");
+
+        SeedPipelineWithConversation(targetGoalId, ("user", "target-durable"));
+        SeedPipelineWithConversation(caseVariantGoalId);
+        SeedBlob(targetGoalId, DurableBlob);
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var store = new PipelineStore(context, NullLogger<PipelineStore>.Instance);
+
+        var caseVariantEntry = new ConversationEntryEntity
+        {
+            GoalId = caseVariantGoalId,
+            Seq = 0,
+            Role = "user",
+            Content = "case-variant-pending",
+        };
+        context.ConversationEntries.Add(caseVariantEntry);
+
+        var unrelatedMapping = new TaskMappingEntity { TaskId = "state-only-blast-task", GoalId = caseVariantGoalId };
+        context.TaskMappings.Add(unrelatedMapping);
+
+        var principal = context.Pipelines.Find(targetGoalId);
+        Assert.NotNull(principal);
+
+        var pipeline = NewPipeline(targetGoalId);
+        pipeline.SetActiveTask("rejected-blast-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+        Assert.NotNull(thrown);
+        context.ChangeTracker.DetectChanges();
+
+        // The affected principal is reloaded in place…
+        Assert.Equal(EntityState.Unchanged, context.Entry(principal!).State);
+        Assert.Same(principal, context.Pipelines.Find(targetGoalId));
+
+        // …while every unrelated pending entry is still tracked with its state intact.
+        Assert.Contains(
+            context.ChangeTracker.Entries<ConversationEntryEntity>(),
+            e => ReferenceEquals(e.Entity, caseVariantEntry) && e.State == EntityState.Added);
+        Assert.Contains(
+            context.ChangeTracker.Entries<TaskMappingEntity>(),
+            e => ReferenceEquals(e.Entity, unrelatedMapping) && e.State == EntityState.Added);
+
+        // …and really flushes on the next plain save.
+        context.SaveChanges();
+
+        Assert.Equal("case-variant-pending", Assert.Single(ReadConversation(caseVariantGoalId)).Content);
+        Assert.Equal(caseVariantGoalId, RawScalar(
+            "SELECT goal_id FROM task_mappings WHERE task_id = $task", ("$task", "state-only-blast-task")));
+        Assert.Equal(DurableBlob, RawBlob(targetGoalId));
+        Assert.Equal("target-durable", Assert.Single(ReadConversation(targetGoalId)).Content);
+    }
+
+    // ══════════ (9b) the existing-row cleanup's explicit safety boundaries ══════════
+
+    /// <summary>
+    /// THE ADDED-PRINCIPAL BOUNDARY: when the failing save's principal is Added (no durable row),
+    /// the cleanup keeps the EXISTING rejection-DETACH rather than a blind reload — a reload of an
+    /// Added entity with no row is a no-op that would leave the rejected checkpoint insertable, so
+    /// this path claims NO dependent preservation. The primary exception is still preserved and the
+    /// rejected checkpoint is gone from the tracker (a following plain save writes nothing).
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_AddedPrincipal_RejectedCheckpointDetachedAndNotFlushable()
+    {
+        const string goalId = "conv-state-only-added-principal-goal";
+        var sentinel = new InvalidOperationException("state-only-added-principal-sentinel");
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(context, logger);
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-added-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(sentinel, update.InnerException);
+
+        context.ChangeTracker.DetectChanges();
+        // THE REJECTION-DETACH: no pipeline entry survives in a flushable state…
+        Assert.DoesNotContain(
+            context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.State is EntityState.Added or EntityState.Modified);
+        // …and the cleanup reported COMPLETION (this is the detach path, not a fault).
         Assert.Contains(logger.LogEntries, e => e.Message.Contains(
-            "WorkSlotIntegrity: ownership-checkpoint-cleanup", StringComparison.Ordinal));
+            "tracker hygiene completed", StringComparison.Ordinal));
+
+        // A plain save cannot create the rejected row.
+        Assert.Null(Record.Exception(() => context.SaveChanges()));
+        Assert.Equal(0L, RawScalarCount(goalId));
+        Assert.Null(RawScalar(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+    }
+
+    /// <summary>
+    /// THE MISSING-DURABLE-ROW BOUNDARY, on the REAL cleanup: the row is deleted behind the tracker
+    /// before the failing save, so the reload finds nothing. EF detaches the principal itself, the
+    /// rejected checkpoint is never left insertable, and the diagnostic HONESTLY reports that no
+    /// preservation/reuse is claimed — never a successful-hygiene claim.
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_DisappearedDurableRow_ReportsNoPreservationClaim()
+    {
+        const string goalId = "conv-state-only-missing-row-goal";
+        var sentinel = new InvalidOperationException("state-only-missing-row-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(context, logger);
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        // The durable row disappears from under the tracker.
+        ExecuteOnKeeper("DELETE FROM pipelines WHERE goal_id = 'conv-state-only-missing-row-goal'");
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-missing-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(sentinel, update.InnerException);
+        Assert.Equal(1, interceptor.ThrowCount);
+
+        context.ChangeTracker.DetectChanges();
+        // EF detached the principal on the missing row — no flushable rejected checkpoint remains…
+        Assert.DoesNotContain(
+            context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.State is EntityState.Added or EntityState.Modified);
+
+        // …and the diagnostic says so HONESTLY.
+        Assert.Contains(logger.LogEntries, e => e.Message.Contains(
+            "reload found NO durable row", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(
+            "tracker hygiene completed", StringComparison.Ordinal));
+
+        // A plain save writes nothing for the vanished row and does not resurrect the checkpoint.
+        Assert.Null(Record.Exception(() => context.SaveChanges()));
+        Assert.Null(RawScalar(
+            "SELECT active_task_id FROM pipelines WHERE goal_id = $goal", ("$goal", goalId)));
+    }
+
+    /// <summary>
+    /// THE THROWING-RELOAD BOUNDARY: the cleanup's own reload SELECT is failed after the row write
+    /// failed. The targeted detach FALLBACK still removes the rejected checkpoint (so nothing can be
+    /// flushed later), the ORIGINAL write exception is propagated by identity, and the diagnostic
+    /// reports the reload failure WITHOUT claiming preservation or safe reuse.
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ReloadSelectFails_DetachFallbackHoldsAndReportsHonestly()
+    {
+        const string goalId = "conv-state-only-reload-fail-goal";
+        var writeSentinel = new InvalidOperationException("state-only-write-sentinel");
+        var selectSentinel = new InvalidOperationException("state-only-reload-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+        SeedBlob(goalId, DurableBlob);
+
+        var select = new ArmablePipelinesSelectThrowInterceptor(selectSentinel);
+        var write = new OneShotPipelinesDmlThrowInterceptor(writeSentinel);
+        var context = CreateContext(write, select);
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(context, logger);
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        // The principal is ALREADY tracked, so the first armed `pipelines` SELECT is the cleanup's
+        // reload; the separate one-shot interceptor fails the row write.
+        select.Arm();
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-reload-fail-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        // THE PRIMARY EXCEPTION IS PRESERVED, by identity — never the reload failure.
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(writeSentinel, update.InnerException);
+        Assert.Same(write.SaveChangesFailure, update);
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => ReferenceEquals(e, selectSentinel));
+        // THE RELOAD REALLY RAN AND REALLY FAILED (the fallback is not reached vacuously).
+        Assert.Equal(1, select.ThrowCount);
+        Assert.Equal(1, write.ThrowCount);
+
+        context.ChangeTracker.DetectChanges();
+        // THE FALLBACK HELD: the rejected checkpoint is off the tracker.
+        Assert.DoesNotContain(
+            context.ChangeTracker.Entries<PipelineEntity>(),
+            e => e.State is EntityState.Added or EntityState.Modified);
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+        // …and the diagnostic names the failed reload and denies the preservation claim.
+        var diagnostic = Assert.Single(logger.LogEntries, e => e.Message.Contains(
+            "the existing-row reload failed", StringComparison.Ordinal));
+        Assert.Contains("state-only-reload-sentinel", diagnostic.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(
+            "tracker hygiene completed", StringComparison.Ordinal));
+
+        // The rejected blob cannot be flushed by a later save; the durable row keeps its blob.
+        select.Disarm();   // the reload seam is one-shot in intent: the later save is not under test
+        store.SavePipelineState(pipeline);
+        Assert.Equal(DurableBlob, RawBlob(goalId));
+        Assert.DoesNotContain("rejected-reload-fail-task", RawBlob(goalId) ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE THROWING-LOGGER BOUNDARY ON THE RELOAD PATH: a logger that throws on EVERY armed write
+    /// cannot replace the primary exception (the diagnostics go through the file's existing no-throw
+    /// helper), and cannot turn a COMPLETED cleanup into the SUSPECT branch either.
+    /// </summary>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ExistingRow_ThrowingLogger_KeepsTheWriteExceptionAuthoritative()
+    {
+        const string goalId = "conv-state-only-throwing-logger-goal";
+        var sentinel = new InvalidOperationException("state-only-throwing-logger-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+        SeedBlob(goalId, DurableBlob);
+
+        var interceptor = new OneShotPipelinesDmlThrowInterceptor(sentinel);
+        var context = CreateContext(interceptor);
+        var logger = new ThrowingStoreLogger();
+        var store = new PipelineStore(context, logger);
+        logger.Arm();
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-throwing-logger-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(sentinel, update.InnerException);
+        Assert.Same(interceptor.SaveChangesFailure, update);
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => ReferenceEquals(e, logger.LoggerSentinel));
+
+        // The reload really ran (the principal is Unchanged at database truth), so the guard's
+        // silence did not skip the cleanup.
+        context.ChangeTracker.DetectChanges();
+        Assert.Equal(EntityState.Unchanged, context.Entry(principal!).State);
+        Assert.Same(principal, context.Pipelines.Find(goalId));
+    }
+
+    /// <summary>
+    /// THE DOUBLE-FAILURE BOUNDARY, on the REAL checkpoint cleanup: the cleanup's own reload SELECT
+    /// is failed AND its targeted detach FALLBACK is failed too (the <c>StateChanges</c> event throws
+    /// only when the TARGET <see cref="PipelineEntity"/> transitions to
+    /// <see cref="EntityState.Detached"/>). Both cleanup steps are swallowed by their own guards, so
+    /// the EXACT original row-write <see cref="DbUpdateException"/> still propagates by identity —
+    /// never the reload or detach fault — and the SUSPECT diagnostic reports that the failed
+    /// checkpoint's tracker hygiene did NOT complete, WITHOUT claiming preservation or safe reuse.
+    /// No successful-cleanup or preservation diagnostic may appear anywhere on this path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE FAULT INJECTION uses EF's own public <c>ChangeTracker.StateChanged</c> event — the same
+    /// mechanism the conversation-cleanup SUSPECT vector below uses — narrowed to a
+    /// <see cref="PipelineEntity"/> so the fault lands ONLY on the fallback detach of the principal
+    /// and can never misfire on a conversation dependent or on the preceding failed
+    /// <c>SaveChanges</c> (whose pipeline transition is to Unchanged, not Detached). No production
+    /// fault framework is added.
+    /// </para>
+    /// <para>
+    /// THE MUTATIONS THIS KILLS: (1) skipping the fallback detach after a failed reload leaves the
+    /// rejected checkpoint flushable — but that is the single-failure vector's job; THIS vector's
+    /// mutants are (2) letting the detach fault replace the primary exception (identity assertion
+    /// fails) and (3) emitting the COMPLETED or reload-failed diagnostic instead of the SUSPECT one
+    /// on the double-failure path (the diagnostic assertions fail). The thrown-fault counter proves
+    /// the detach really ran and really threw, so the vector is not vacuous.
+    /// </para>
+    /// <para>
+    /// THE HONEST LIMITATION (asserted, not glossed over): when BOTH cleanup steps fail, the
+    /// rejected tracking may still be staged — so this vector deliberately does NOT assert that a
+    /// later save cannot flush the rejected blob, and it asserts the SUSPECT report instead.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void StateOnlySave_OwnershipRoute_ReloadAndFallbackBothFail_ReportsSuspectAndPreservesOriginal()
+    {
+        const string goalId = "conv-state-only-double-fail-goal";
+        var writeSentinel = new InvalidOperationException("state-only-double-fail-write-sentinel");
+        var selectSentinel = new InvalidOperationException("state-only-double-fail-reload-sentinel");
+        var detachSentinel = new InvalidOperationException("state-only-double-fail-detach-sentinel");
+
+        SeedPipelineWithConversation(goalId, ("user", "durable-entry"));
+        SeedBlob(goalId, DurableBlob);
+
+        var select = new ArmablePipelinesSelectThrowInterceptor(selectSentinel);
+        var write = new OneShotPipelinesDmlThrowInterceptor(writeSentinel);
+        var context = CreateContext(write, select);
+        var logger = new TestLogger<PipelineStore>();
+        var store = new PipelineStore(context, logger);
+
+        var principal = context.Pipelines.Find(goalId);
+        Assert.NotNull(principal);
+
+        // THE DOUBLE-FAILURE ARM: the reload SELECT fails (the armed interceptor) and the fallback
+        // DETACH fails (this StateChanged subscriber, PipelineEntity-only so a conversation
+        // dependent's detach — if any ran — could not carry the fault). The counter proves the
+        // fallback detach really executed and really threw.
+        var detachFaults = 0;
+        context.ChangeTracker.StateChanged += (_, args) =>
+        {
+            if (args.NewState == EntityState.Detached && args.Entry.Entity is PipelineEntity)
+            {
+                Interlocked.Increment(ref detachFaults);
+                throw detachSentinel;
+            }
+        };
+
+        // The principal is ALREADY tracked, so the first armed `pipelines` SELECT is the cleanup's
+        // reload; the separate one-shot interceptor fails the row write.
+        select.Arm();
+
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetActiveTask("rejected-double-fail-task");
+
+        var thrown = Record.Exception(
+            () => store.SavePipelineState(pipeline, pipeline.CaptureAdmissionOwnership()));
+
+        // THE FAULTS REALLY LANDED: the row write failed, the reload SELECT failed, and the fallback
+        // detach threw exactly once — the SUSPECT branch is reached for real, not vacuously.
+        Assert.Equal(1, write.ThrowCount);
+        Assert.Equal(1, select.ThrowCount);
+        Assert.Equal(1, Volatile.Read(ref detachFaults));
+
+        // THE PRIMARY EXCEPTION IS PRESERVED, BY IDENTITY — never the reload fault and never the
+        // detach fault.
+        Assert.NotNull(thrown);
+        var update = Assert.IsType<DbUpdateException>(thrown);
+        Assert.Same(writeSentinel, update.InnerException);
+        Assert.Same(write.SaveChangesFailure, update);
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => ReferenceEquals(e, selectSentinel));
+        Assert.DoesNotContain(EnumerateChain(thrown!), e => ReferenceEquals(e, detachSentinel));
+
+        // …and the SUSPECT diagnostic really named the failed checkpoint cleanup, carrying the
+        // DETACH fault's message (the fallback fault is the one that escalated this call).
+        var suspect = Assert.Single(logger.LogEntries, e => e.Message.Contains(
+            "ownership-checkpoint-cleanup", StringComparison.Ordinal));
+        Assert.Contains("tracker hygiene did not complete", suspect.Message, StringComparison.Ordinal);
+        Assert.Contains("SUSPECT", suspect.Message, StringComparison.Ordinal);
+        Assert.Contains(goalId, suspect.Message, StringComparison.Ordinal);
+        Assert.Contains("state-only-double-fail-detach-sentinel", suspect.Message, StringComparison.Ordinal);
+
+        // NO successful-cleanup or preservation claim anywhere on this path.
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(
+            "tracker hygiene completed", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(
+            "the existing-row reload failed", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.LogEntries, e => e.Message.Contains(
+            "reload found NO durable row", StringComparison.Ordinal));
+
+        // THE HONEST LIMITATION: with both cleanup steps faulted, the rejected tracking may still be
+        // staged — this vector asserts the SUSPECT report, NOT a non-leakage guarantee.
     }
 
     // ═══════════════════ (10) a failing cleanup reports the context SUSPECT ══════════════════════
@@ -1061,6 +1709,46 @@ public sealed class PipelineStoreConversationFailureTests : IDisposable
             if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
                 return;
             if (Interlocked.CompareExchange(ref _fired, 1, 0) != 0)
+                return;
+
+            Interlocked.Increment(ref _throwCount);
+            throw sentinel;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            ThrowIfTargeted(command);
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Throws the supplied sentinel at EVERY <c>SELECT … FROM "pipelines"</c> read ONCE ARMED — the
+    /// seam for the CLEANUP-TIME reload failure. Arming is explicit and happens only after the
+    /// principal is already tracked, so the interceptor cannot misfire on the pre-failure lookups
+    /// that come first.
+    /// </summary>
+    private sealed class ArmablePipelinesSelectThrowInterceptor(Exception sentinel) : DbCommandInterceptor
+    {
+        private volatile bool _armed;
+        private int _throwCount;
+
+        public int ThrowCount => Volatile.Read(ref _throwCount);
+
+        public void Arm() => _armed = true;
+
+        public void Disarm() => _armed = false;
+
+        private void ThrowIfTargeted(DbCommand command)
+        {
+            if (!_armed)
+                return;
+
+            var text = command.CommandText;
+            if (!text.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+                return;
+            if (!text.Contains("pipelines", StringComparison.OrdinalIgnoreCase))
                 return;
 
             Interlocked.Increment(ref _throwCount);

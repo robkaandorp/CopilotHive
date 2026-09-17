@@ -123,6 +123,14 @@ public sealed class PipelineStore : IAsyncDisposable
         "WorkSlotIntegrity: pointer-rollback-failure goal={GoalId} task={TaskId} — the persisted pointer's rollback failed; a restart may restore the stale pointer; the completion-protocol successor owns the durable reconciliation";
     private const string PointerRollbackCleanupTemplate =
         "WorkSlotIntegrity: pointer-rollback-cleanup goal={GoalId} task={TaskId} — the post-update cleanup failed; pointer-cleared={Cleared}; the context state is suspect";
+    private const string CheckpointCleanupCompletedTemplate =
+        "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker hygiene completed ({PrimaryMessage})";
+    private const string CheckpointCleanupReloadFailedTemplate =
+        "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the existing-row reload failed, so the rejected checkpoint entry was DETACHED instead; the context's safe reuse is SUSPECT and no conversation preservation is claimed: {Message}";
+    private const string CheckpointCleanupRowMissingTemplate =
+        "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the reload found NO durable row, so EF detached the principal; the rejected checkpoint cannot be flushed, but no dependent preservation and no reusable tracking are claimed: {Message}";
+    private const string CheckpointCleanupSuspectTemplate =
+        "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker hygiene did not complete; the context state is SUSPECT and its further usability is NOT guaranteed, so no safe reuse and no conversation preservation are claimed: {Message}";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -341,10 +349,11 @@ public sealed class PipelineStore : IAsyncDisposable
 
             // THE BORROWED-CONTEXT HYGIENE: a failed row write must not leave a half-staged
             // checkpoint in the tracker, where a LATER legacy save on the same caller-owned context
-            // could flush the rejected blob. The affected entry is detached, which DISCARDS its
-            // pending pointer/registry values; when it had a durable counterpart (Unchanged/Modified)
-            // it is reloaded through the tracker so the caller still observes that row exactly as
-            // before. The primary exception is preserved and rethrown verbatim.
+            // could flush the rejected blob. An Unchanged/Modified entry is reloaded IN PLACE, which
+            // discards its pending pointer/registry values for database truth without detaching the
+            // principal (so its pending conversation dependents are not lost); Added/Deleted entries,
+            // and any entry whose reload threw, are DETACHED — a fallback that makes no preservation
+            // claim. The primary exception is preserved and rethrown verbatim.
             OnCheckpointSaveFailure(db, pipeline.GoalId, ex);
             // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper, so
             // a throwing ILogger can never replace the row-write exception rethrown on the next line
@@ -439,20 +448,48 @@ public sealed class PipelineStore : IAsyncDisposable
 
     /// <summary>
     /// THE BORROWED-CONTEXT HYGIENE on a failed checkpoint row write: the affected goal's tracked
-    /// pipeline entry is put back into a state that CANNOT flush the rejected checkpoint later.
+    /// pipeline entries are put back into a state that CANNOT flush the rejected checkpoint later —
+    /// WHEN THAT HYGIENE ACTUALLY COMPLETES (the reload succeeded, or the targeted fallback detach
+    /// did). If BOTH the reload and its fallback fail, that guarantee does NOT hold: the rejected
+    /// tracking may still be staged, the context is reported SUSPECT, and no safe-reuse or
+    /// preservation claim is made.
     /// <para>
     /// WHY IT IS NEEDED: on the direct (test-owned) context path the pipeline entity stays tracked
     /// after a failed <c>SaveChanges</c>, still carrying the staged pointer/registry values. A
     /// subsequent LEGACY save on the SAME context (whose <c>Find</c> hands back that very tracked
-    /// copy) would then flush the rejected blob as a side effect of an unrelated write. Detaching
-    /// the entry discards its pending change, so the legacy path re-reads the durable row instead.
-    /// A reload (rather than a detach) is used when the failing write was the FIRST staging of the
-    /// row, so the caller still observes the pipeline through the tracker exactly as before.
+    /// copy) would then flush the rejected blob as a side effect of an unrelated write.
     /// </para>
     /// <para>
-    /// GUARDED AND NEVER MASKING: every step is wrapped, so a cleanup fault degrades to a warning
-    /// and the PRIMARY exception keeps propagating unchanged. This is a targeted, key-scoped fix —
-    /// deliberately NOT a general tracker-cleanup redesign.
+    /// AN EXISTING-ROW ENTRY IS RELOADED IN PLACE, NOT DETACHED AND RE-FOUND. An
+    /// Unchanged/Modified entry is refreshed through <c>EntityEntry.Reload</c> on THAT SAME entry:
+    /// a successful reload restores the principal's property AND original values from database
+    /// truth and leaves the entry Unchanged WITHOUT ever detaching it — so the dependents tracked
+    /// under it (the caller's pending conversation work included) need not be lost, and the caller
+    /// still observes the pipeline through the tracker. Neither <c>OriginalValues</c> nor a
+    /// pre-call in-memory snapshot is replayed: with the row in front of it, neither is necessarily
+    /// the durable pointer/blob baseline — the reload reads it. The entry is located by ORDINAL goal
+    /// identity and the enumeration is MATERIALISED BEFORE the first tracking change.
+    /// </para>
+    /// <para>
+    /// WHY THE OTHER STATES ARE NOT RELOADED. Unchanged/Modified does NOT by itself prove a durable
+    /// row exists, and Deleted does NOT prove one is absent. Added/Deleted entries therefore keep
+    /// the EXISTING rejection-DETACH (a blind reload of an Added entity with no row can be a no-op
+    /// that leaves the rejected checkpoint insertable), and a reload that finds NO row at all makes
+    /// EF detach the principal on its own — observed and reported, never dressed up as preservation.
+    /// Those paths promise NEITHER dependent preservation NOR reusable tracking: no principal is
+    /// reconstructed, no dependent is re-added and no temporary key is restored by hand — there is
+    /// deliberately no EF state ledger here.
+    /// </para>
+    /// <para>
+    /// GUARDED AND NEVER MASKING: a THROWING reload falls back to that same targeted detach under
+    /// its OWN guard, so a read failure does not simply leave the rejected pointer/registry staged.
+    /// Three honest outcomes are reported: a clean pass, a reload failure whose fallback DID remove
+    /// the rejected change (no safe reuse and no conversation preservation claimed — the durable row
+    /// was not restored), and a fault that could not be cleaned up at all (the SUSPECT/unconfirmed
+    /// branch, where unconditional non-leakage is not promised either). In every case the PRIMARY
+    /// exception keeps propagating unchanged. This is a targeted, key-scoped fix — deliberately NOT
+    /// a general tracker-cleanup redesign, with no <c>SaveChanges</c>, no write, no retry and no
+    /// compensation.
     /// </para>
     /// </summary>
     /// <param name="db">The context whose row write failed.</param>
@@ -462,32 +499,98 @@ public sealed class PipelineStore : IAsyncDisposable
     {
         try
         {
-            // Added/Deleted entries have no durable counterpart to reload: they are DISCARDED.
-            // An Unchanged/Modified entry is DETACHED and then reloaded through the tracker so the
-            // context keeps surfacing the durable row rather than the rejected in-flight copy —
-            // which is also why the failing write's own values are never re-inspected after the
-            // cleanup (an EF change-tracker entry's members can be unreliable once the write faulted,
-            // so this diagnostic deliberately reads none of them).
-            var reload = db.ChangeTracker.Entries<PipelineEntity>()
-                .Any(e => string.Equals(e.Entity.GoalId, goalId, StringComparison.Ordinal)
-                    && e.State is EntityState.Unchanged or EntityState.Modified);
+            // THE MATERIALISED LOOKUP: the loop below changes tracking, so the ordinal-goal matches
+            // are enumerated ONCE, up front.
+            var entries = db.ChangeTracker.Entries<PipelineEntity>()
+                .Where(e => string.Equals(e.Entity.GoalId, goalId, StringComparison.Ordinal))
+                .ToList();
 
-            DetachTrackedPipelinesForGoal(db, goalId);
-            if (reload)
-                db.Pipelines.Find(goalId);
+            // THE FIRST CLEANUP FAULT IS THE REPORTED ONE: a reload failure names the reload (the
+            // fallback it triggered must not overwrite that evidence), and only a fault whose
+            // fallback ALSO failed escalates to the unconfirmed/leak-possible diagnostic.
+            Exception? reloadFault = null;
+            Exception? unconfirmedFault = null;
 
-            // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper, so a
-            // throwing ILogger degrades to silence instead of turning a COMPLETED cleanup into the
-            // "cleanup did not complete" branch (and it can never escape the caller's failure path).
-            BestEffortWarning(
-                "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker hygiene completed ({PrimaryMessage})",
-                goalId, CleanupMessageOrPlaceholder(primary));
+            // THE MISSING-ROW LIMITATION: a reload with no durable row does not throw — EF simply
+            // DETACHES the principal. That is observed (the state transition), reported honestly,
+            // and never turned into a preservation claim.
+            var reloadFoundNoRow = false;
+
+            foreach (var entry in entries)
+            {
+                if (entry.State is EntityState.Unchanged or EntityState.Modified)
+                {
+                    // THE EXISTING-ROW PATH — THE SAME ENTRY, RELOADED IN PLACE. The reload makes it
+                    // Unchanged holding database truth without detaching the principal, so its
+                    // tracked dependents survive; pending scalar edits on the principal are
+                    // deliberately discarded to the durable row, exactly as the previous
+                    // detach/re-find intended.
+                    try
+                    {
+                        entry.Reload();
+                        if (entry.State == EntityState.Detached)
+                            reloadFoundNoRow = true;
+                        continue;
+                    }
+                    catch (Exception reloadEx)
+                    {
+                        reloadFault ??= reloadEx;
+                    }
+                }
+
+                // THE REJECTION-DETACH: Added/Deleted entries are DISCARDED (they are not reloaded —
+                // see the summary's boundary note), and a FAILED reload falls back here under this
+                // step's own guard, so the rejected pointer/registry cannot be flushed later.
+                try
+                {
+                    db.Entry(entry.Entity).State = EntityState.Detached;
+                }
+                catch (Exception detachEx)
+                {
+                    unconfirmedFault ??= detachEx;
+                }
+            }
+
+            if (reloadFault is null && unconfirmedFault is null && !reloadFoundNoRow)
+            {
+                // THE GUARDED DIAGNOSTIC: the emit goes through the file's existing no-throw helper,
+                // so a throwing ILogger degrades to silence instead of turning a COMPLETED cleanup
+                // into the SUSPECT branch (and it can never escape the caller's failure path).
+                BestEffortWarning(
+                    CheckpointCleanupCompletedTemplate,
+                    goalId, CleanupMessageOrPlaceholder(primary));
+            }
+            else if (unconfirmedFault is null && reloadFoundNoRow)
+            {
+                // THE MISSING ROW: the rejected checkpoint is not flushable (EF detached the
+                // principal itself), but the row the caller observed is GONE — so no dependent
+                // preservation and no reusable tracking are claimed.
+                BestEffortWarning(
+                    CheckpointCleanupRowMissingTemplate,
+                    goalId, CleanupMessageOrPlaceholder(primary));
+            }
+            else if (unconfirmedFault is null)
+            {
+                // THE FALLBACK HELD: the rejected change is off the tracker, but the context was not
+                // restored to the durable row the caller observed — so no reuse/preservation claim.
+                BestEffortWarning(
+                    CheckpointCleanupReloadFailedTemplate,
+                    goalId, CleanupMessageOrPlaceholder(reloadFault!));
+            }
+            else
+            {
+                // THE UNCONFIRMED CLEANUP: the rejected tracking itself may still be staged, so
+                // unconditional non-leakage is NOT promised either.
+                BestEffortWarning(
+                    CheckpointCleanupSuspectTemplate,
+                    goalId, CleanupMessageOrPlaceholder(unconfirmedFault));
+            }
         }
         catch (Exception cleanupEx)
         {
             // Best-effort hygiene: the diagnostic must never replace the primary failure.
             BestEffortWarning(
-                "WorkSlotIntegrity: ownership-checkpoint-cleanup goal={GoalId} — the failed checkpoint's tracker cleanup did not complete: {Message}",
+                CheckpointCleanupSuspectTemplate,
                 goalId, CleanupMessageOrPlaceholder(cleanupEx));
         }
     }
