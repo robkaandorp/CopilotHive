@@ -1230,45 +1230,82 @@ public sealed class GoalDispatcherStartupLogTests
 /// </summary>
 public sealed class GoalDispatcherDispatchLoggingTests
 {
+    /// <summary>
+    /// Minimal in-memory configuration for these operation-level tests:
+    /// <see cref="TestHelpers.FullReadyConfig"/> (the Brain model plus every broadcastable
+    /// role's model, so the all-or-nothing readiness gate passes) PLUS the single repository
+    /// the goals in this class reference. No real Git, network, or LLM access is involved.
+    /// </summary>
+    private static HiveConfigFile ReadyConfigWithRepo()
+    {
+        var config = TestHelpers.FullReadyConfig();
+        config.Repositories =
+        [
+            new RepositoryConfig { Name = "test-repo", Url = "https://github.com/test/test-repo", DefaultBranch = "main" },
+        ];
+        return config;
+    }
+
     [Fact]
     public async Task DispatchNextGoalAsync_LogsGoalPriority()
     {
         // Arrange
+        var ct = TestContext.Current.CancellationToken;
         var logger = new CollectingLogger<GoalDispatcher>();
-        var goal = new Goal { Id = "goal-priority-log-test", Description = "Priority logging test", Priority = GoalPriority.High };
+        var goal = new Goal
+        {
+            Id = "goal-priority-log-test",
+            Description = "Priority logging test",
+            Priority = GoalPriority.High,
+            Status = GoalStatus.Pending,
+            RepositoryNames = ["test-repo"],
+        };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
 
+        var pipelineManager = new GoalPipelineManager();
+        var taskQueue = new TaskQueue();
+
         var dispatcher = new GoalDispatcher(
             goalManager,
-            new GoalPipelineManager(),
-            new TaskQueue(),
+            pipelineManager,
+            taskQueue,
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             logger,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
             // A Brain and all broadcastable role models are required to pass the readiness gate.
             brain: new FakeDispatcherBrain(),
-            config: TestHelpers.FullReadyConfig(),
+            config: ReadyConfigWithRepo(),
             startupDelay: TimeSpan.Zero);
 
-        // Act - run the background service briefly so DispatchNextGoalAsync executes
-        using var cts = new CancellationTokenSource();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
-        var executeTask = dispatcher.StartAsync(linkedCts.Token);
-        await Task.Delay(200, TestContext.Current.CancellationToken);
-        cts.Cancel();
-        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
+        // Act — ONE awaited call to the real production dispatch entry point
+        // (GoalDispatchService.DispatchNextGoalAsync, reached via the dispatcher's private
+        // wrapper). There is NO background service, NO arbitrary delay, NO cancellation
+        // choreography and NO Task.WhenAny: the returned Task IS the dispatch, so awaiting it
+        // completes the whole operation and any escaped dispatch error surfaces here.
+        await GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(dispatcher, ct);
 
-        // Assert
-        Assert.Contains(logger.Logs, l => l.Message.Contains("High"));
+        // Assert — THE GOAL-SPECIFIC dispatch line carries the selected priority. Selecting the
+        // line by goal ID first means an unrelated line that merely happens to contain "High"
+        // can never satisfy this.
+        var dispatchLine = Assert.Single(logger.Logs, l =>
+            l.Message.Contains($"Dispatching goal '{goal.Id}'"));
+        Assert.Contains("(Priority=High)", dispatchLine.Message);
     }
 
     [Fact]
     public async Task DispatchNextGoalAsync_NotifiesDashboardOnce()
     {
-        var goal = new Goal { Id = "goal-dispatch-notify-test", Description = "Dispatch notify test", Status = GoalStatus.Pending };
+        var ct = TestContext.Current.CancellationToken;
+        var goal = new Goal
+        {
+            Id = "goal-dispatch-notify-test",
+            Description = "Dispatch notify test",
+            Status = GoalStatus.Pending,
+            RepositoryNames = ["test-repo"],
+        };
         var goalSource = new FakeGoalSource(goal);
         var goalManager = new GoalManager();
         goalManager.AddSource(goalSource);
@@ -1277,28 +1314,38 @@ public sealed class GoalDispatcherDispatchLoggingTests
         var notificationCount = 0;
         notifier.OnStateChanged += () => Interlocked.Increment(ref notificationCount);
 
+        var pipelineManager = new GoalPipelineManager();
+        var taskQueue = new TaskQueue();
+
         var dispatcher = new GoalDispatcher(
             goalManager,
-            new GoalPipelineManager(),
-            new TaskQueue(),
+            pipelineManager,
+            taskQueue,
             new GrpcWorkerGateway(new WorkerPool()),
             new TaskCompletionNotifier(),
             NullLogger<GoalDispatcher>.Instance,
             new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance),
-            // A Brain is required to plan the goal — without one, dispatch fails the goal
-            // and emits a second (failure) dashboard notification.
+            // A Brain IS required, but the failure mode differs from a planning failure: a
+            // missing Brain fails the readiness gate BEFORE goal selection, so no goal is
+            // consumed, no pipeline is created, and NO second (failure) dashboard
+            // notification is emitted.
             brain: new FakeDispatcherBrain(),
-            config: TestHelpers.FullReadyConfig(),
+            config: ReadyConfigWithRepo(),
             startupDelay: TimeSpan.Zero,
             dashboardNotifier: notifier);
 
-        using var cts = new CancellationTokenSource();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
-        var executeTask = dispatcher.StartAsync(linkedCts.Token);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
-        cts.Cancel();
-        await Task.WhenAny(executeTask, Task.Delay(1000, TestContext.Current.CancellationToken));
+        // Act — ONE awaited call to the real production dispatch entry point; no background
+        // service, no arbitrary delay, and no Task.WhenAny that could release the test before
+        // the dispatch actually ran.
+        await GoalDispatcherCancelTests.InvokeDispatchNextGoalAsync(dispatcher, ct);
 
+        // Assert — the dispatch genuinely completed: the goal was admitted and its pipeline
+        // exists. Without these, an early readiness-gate refusal (or an aborted dispatch) could
+        // satisfy a superficial notification observation.
+        Assert.Equal(GoalStatus.InProgress, goal.Status);
+        Assert.NotNull(pipelineManager.GetByGoalId(goal.Id));
+
+        // Assert — exactly one notification: not ">= 1", and not merely the first event.
         Assert.Equal(1, notificationCount);
     }
 }
