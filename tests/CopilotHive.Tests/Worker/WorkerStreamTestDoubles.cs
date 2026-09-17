@@ -26,6 +26,12 @@ namespace CopilotHive.Tests.Worker;
 /// A <c>null</c> provisioner leaves the connection WITHOUT one, which is what retains the LEGACY,
 /// seam-free executor branch for these fixtures; supplying one exercises the seam path.
 /// </para>
+/// <para>
+/// The NEGOTIATED completion-receipt ACK answer defaults to DISABLED, exactly as a connection built
+/// without one does in production, so every existing fixture keeps its previous behavior. A fixture
+/// that needs the enabled connection passes it explicitly — it is a captured registration fact, never
+/// something inferred from capabilities, version or model.
+/// </para>
 /// </remarks>
 internal static class TestConnectionFactory
 {
@@ -36,18 +42,39 @@ internal static class TestConnectionFactory
         WorkerService service,
         string assignedId,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        WorkerConfigProvisioner? provisioner = null)
+        WorkerConfigProvisioner? provisioner = null,
+        bool completionReceiptAckEnabled = false)
     {
         var connection = new WorkerConnection(
             assignedId,
             new HiveOrchestrator.HiveOrchestratorClient(Channel),
             stream,
             provisioner,
-            includeProductionProvisioner: false);
+            includeProductionProvisioner: false,
+            provisioningEnvironment: null,
+            completionReceiptAckEnabled: completionReceiptAckEnabled);
 
         service.PublishConnection(connection);
         return connection;
     }
+
+    /// <summary>
+    /// Builds — but does NOT publish — a second connection carrying the given negotiated answer. It
+    /// is used only to prove that a delivery belonging to a DIFFERENT connection object can never
+    /// confirm the retained assignment, even when every wire identity matches.
+    /// </summary>
+    internal static WorkerConnection CreateUnpublished(
+        string assignedId,
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        bool completionReceiptAckEnabled = false) =>
+        new(
+            assignedId,
+            new HiveOrchestrator.HiveOrchestratorClient(Channel),
+            stream,
+            provisionerOverride: null,
+            includeProductionProvisioner: false,
+            provisioningEnvironment: null,
+            completionReceiptAckEnabled: completionReceiptAckEnabled);
 }
 
 /// <summary>

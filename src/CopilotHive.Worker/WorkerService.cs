@@ -459,6 +459,11 @@ public sealed class WorkerService(
         var registerRequest = new RegisterRequest
         {
             WorkerId = workerId,
+
+            // ADDITIVE NEGOTIATION REQUEST — always asked for explicitly, never derived from the
+            // capabilities below, from the orchestrator version, or from any task's model. An old
+            // orchestrator simply ignores the field and answers with the default (disabled).
+            RequestCompletionReceiptAck = true,
         };
         registerRequest.Capabilities.AddRange(capabilities);
 
@@ -499,9 +504,15 @@ public sealed class WorkerService(
         //    object the attempt-construction path supplied — so the production provisioner's operator
         //    snapshot is the PROCESS's, not this attempt's. Nothing else is shared: the connection
         //    still owns its identity, client, stream and provisioner.
+        //
+        //    THE NEGOTIATED ACK ANSWER is captured here, from the ACCEPTED response's EXPLICIT field
+        //    and from nothing else, so it is a fixed fact of this connection BEFORE publication. An
+        //    absent or false answer leaves the connection disabled, and because the fact lives on the
+        //    connection object, a later sequential run retains nothing from this one.
         var connection = new WorkerConnection(
             assignedId, client, stream, provisionerOverride: TestProvisioner,
-            provisioningEnvironment: _provisioningEnvironment);
+            provisioningEnvironment: _provisioningEnvironment,
+            completionReceiptAckEnabled: registerResponse.CompletionReceiptAckEnabled);
 
         // 4. PUBLISH — only now that construction has fully succeeded, and BEFORE the initial Ready
         //    and before any assignment processing.
@@ -807,6 +818,75 @@ public sealed class WorkerService(
     }
 
     /// <summary>
+    /// The ASSIGNMENT-LOCAL completion-receipt tracker: the tiny two-transition latch that says
+    /// whether THIS assignment's single <c>Complete</c> attempt made an acknowledgement possible
+    /// (ARMED) and whether one has since been accepted (CONFIRMED).
+    /// <para>
+    /// IT IS NOT A HISTORY. There is exactly one of these per assignment, created before either
+    /// owned task starts and released by the EXISTING drain-then-clear ownership transition, so
+    /// nothing connection-global, no dictionary and no queue of past receipts exists. It holds no
+    /// completion payload: the EXACT <see cref="TaskResult"/> stays in its own
+    /// <see cref="TerminalResultHolder"/> and is never replaced, augmented or re-read from here.
+    /// </para>
+    /// <para>
+    /// TWO SEPARATE FACTS. Receipt confirmation says only that the orchestrator acknowledged
+    /// durably retaining this task's completion evidence. It is NOT "the local write succeeded":
+    /// an ACK that arrives while the Complete write is still pending latches here WITHOUT joining
+    /// that write, and a write that later fails or is cancelled keeps its own existing outcome.
+    /// </para>
+    /// <para>
+    /// The publication is a single <see cref="Interlocked"/> transition — the reporter arms, the
+    /// reader acknowledges — so there is no waiting task, no timer, no service and no generalized
+    /// protocol framework behind it. Nothing here ever waits for an acknowledgement: retention
+    /// until ACK is NOT a postcondition of this slice, and a delayed ACK that arrives after the
+    /// existing ownership clear is simply ignored.
+    /// </para>
+    /// </summary>
+    /// <param name="owner">
+    /// The connection this assignment arrived on. An acknowledgement delivered on any OTHER
+    /// connection (a successor registration, a second sequential loop) can never confirm it.
+    /// </param>
+    private sealed class CompletionReceiptTracker(WorkerConnection owner)
+    {
+        /// <summary>No Complete attempt has armed this assignment; no acknowledgement is expected.</summary>
+        private const int Unarmed = 0;
+
+        /// <summary>The single Complete attempt for an exact mapped result is about to be written.</summary>
+        private const int Armed = 1;
+
+        /// <summary>A matching acknowledgement has been accepted. Terminal.</summary>
+        private const int Confirmed = 2;
+
+        private int _state = Unarmed;
+
+        /// <summary>The connection this assignment — and therefore this receipt — belongs to.</summary>
+        public WorkerConnection Owner { get; } = owner;
+
+        /// <summary>Whether a Complete attempt has made an acknowledgement possible for this assignment.</summary>
+        public bool IsArmed => Volatile.Read(ref _state) != Unarmed;
+
+        /// <summary>Whether a matching acknowledgement has been accepted for this assignment.</summary>
+        public bool IsConfirmed => Volatile.Read(ref _state) == Confirmed;
+
+        /// <summary>
+        /// ARMS this assignment. Called ONLY on an ENABLED connection, ONLY once the exact produced
+        /// result has been mapped, and ONLY immediately before the single existing Complete send.
+        /// Idempotent, and never able to undo a confirmation that already landed.
+        /// </summary>
+        public void Arm() => Interlocked.CompareExchange(ref _state, Armed, Unarmed);
+
+        /// <summary>
+        /// ACCEPTS one acknowledgement delivered on <paramref name="deliveringConnection"/>.
+        /// Returns <c>true</c> for the FIRST accepted receipt only: a duplicate, or an ACK for an
+        /// assignment that was never armed, or one delivered on a different connection, changes
+        /// nothing and returns <c>false</c>.
+        /// </summary>
+        public bool TryConfirm(WorkerConnection deliveringConnection) =>
+            ReferenceEquals(Owner, deliveringConnection)
+            && Interlocked.CompareExchange(ref _state, Confirmed, Armed) == Armed;
+    }
+
+    /// <summary>
     /// Tracks one assignment's identity, its in-flight EXECUTION, its separately owned
     /// connection-bound REPORTING, its cancellation scope, its Ready claim and its terminal result.
     /// </summary>
@@ -825,7 +905,8 @@ public sealed class WorkerService(
         Task reporting,
         CancellationTokenSource cts,
         ReadyClaim readyClaim,
-        TerminalResultHolder terminalResult)
+        TerminalResultHolder terminalResult,
+        CompletionReceiptTracker receipt)
     {
         /// <summary>
         /// The assignment's task ID. A <c>CancelTask</c> is only applied when its
@@ -864,6 +945,16 @@ public sealed class WorkerService(
         /// ownership transition retains the result for exactly the assignment's own lifetime.
         /// </summary>
         public TerminalResultHolder TerminalResult { get; } = terminalResult;
+
+        /// <summary>
+        /// The assignment-local completion-receipt tracker. Like the result holder it is created
+        /// BEFORE either owned task starts and captured directly by the reporting flow's closure,
+        /// so the reporter never has to discover it through the ownership slot; it is carried here
+        /// as well so the reader — the only other participant — can reach the SAME object through
+        /// this assignment's eventual owner, and so the EXISTING drain-then-clear transition
+        /// releases it with the rest of the assignment.
+        /// </summary>
+        public CompletionReceiptTracker Receipt { get; } = receipt;
     }
 
     // ── Assignment ownership slot ───────────────────────────────────────────────
@@ -1084,6 +1175,12 @@ public sealed class WorkerService(
                         var bodyCts = taskCts;
                         var terminalResult = new TerminalResultHolder();
 
+                        // THE ASSIGNMENT-LOCAL RECEIPT TRACKER, bound to THIS connection and created
+                        // alongside the result holder — before either owned task starts, so it is
+                        // reachable by the reporting flow (through its closure) and by its eventual
+                        // owner (installed below) before any execution or reporting can run.
+                        var receipt = new CompletionReceiptTracker(connection);
+
                         // THE CONNECTION-BOUND DEPENDENCY PAIR for this assignment. Built from the
                         // assignment's EXPECTED connection BEFORE either task starts, and the SAME
                         // instance is handed to BOTH the bridge slot and the session-client slot of
@@ -1169,13 +1266,14 @@ public sealed class WorkerService(
                         // it OBSERVES a producer that was cancelled before its body ever started
                         // (a cancellation-skippable continuation would silently skip it instead).
                         var reporting = ReportAssignmentAsync(
-                            execution, domainTask, connection, terminalResult, readyClaim, ct);
+                            execution, domainTask, connection, terminalResult, readyClaim, receipt, ct);
 
                         // BOTH ORIGINAL TASKS are obtained BEFORE the fully constructed owner is
                         // published, so the slot never exposes a half-built assignment.
                         InstallActiveAssignment(
                             new ActiveAssignment(
-                                domainTask.TaskId, execution, reporting, taskCts, readyClaim, terminalResult));
+                                domainTask.TaskId, execution, reporting, taskCts, readyClaim,
+                                terminalResult, receipt));
                         break;
 
                     case OrchestratorMessage.PayloadOneofCase.Cancel:
@@ -1260,6 +1358,10 @@ public sealed class WorkerService(
                             _log.Debug($"Received ToolCallResponse for untracked request: {response.RequestId}");
                         break;
 
+                    case OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck:
+                        HandleCompletionReceiptAck(connection, message.CompletionReceiptAck);
+                        break;
+
                     case OrchestratorMessage.PayloadOneofCase.None:
                         break;
                 }
@@ -1310,6 +1412,81 @@ public sealed class WorkerService(
             // failure propagates now, AFTER the clear, the retirement and BOTH joins above.
             PropagateOrReport(
                 teardownDrainFailure, primaryFailure, TaskCancellationFailedMessage);
+        }
+    }
+
+    /// <summary>The GUARDED diagnostic emitted once for the FIRST accepted receipt acknowledgement.</summary>
+    private const string ReceiptConfirmedMessage = "Completion receipt confirmed by orchestrator for task";
+
+    /// <summary>
+    /// THE COMPLETION-RECEIPT ACK CASE. It records — idempotently, on the assignment the loop still
+    /// retains — that the orchestrator acknowledged durably retaining that task's completion
+    /// evidence, and does nothing else whatsoever.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ACCEPTANCE IS NARROW. The acknowledgement is applied ONLY when this loop's connection
+    /// negotiated the feature, the retained assignment belongs to THIS ORIGINAL connection, that
+    /// assignment was ARMED by its single Complete attempt, and BOTH identities match EXACTLY and
+    /// ORDINALLY: the wire <c>TaskId</c> against the retained assignment's task ID and the wire
+    /// <c>WorkerId</c> against this connection's assigned identity. Nothing is parsed, trimmed,
+    /// normalized or case-folded, and an acknowledgement is NEVER inferred from a completed write,
+    /// a <c>Ready</c>, or the arrival of a successor assignment.
+    /// </para>
+    /// <para>
+    /// EVERYTHING ELSE IS UNTOUCHED. It never clears the retained result or the ownership slot,
+    /// never cancels or joins execution or reporting, never resets the runner, never sends a Ready
+    /// and never resends a Complete. In particular an acknowledgement that arrives while the actual
+    /// Complete write is STILL PENDING is simply latched: the write keeps its own send permit, its
+    /// own outcome and its own owner. Receipt confirmation and local write success stay SEPARATE
+    /// facts, so an early ACK can never convert a later failed or cancelled write into a success.
+    /// </para>
+    /// <para>
+    /// A duplicate, a wrong task, a wrong worker, an unarmed or already-cleared assignment, a
+    /// disabled connection and a delivery that belongs to a previous connection are all no-ops:
+    /// none of them may confirm some OTHER assignment. Because the wire acknowledgement carries no
+    /// generation nonce, this is deliberately NOT a claim of assignment-generation safety when a
+    /// task ID and worker ID are deliberately reused — identity matching is all the protocol
+    /// affords.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">The ORIGINAL connection this loop was started for.</param>
+    /// <param name="ack">The acknowledgement exactly as received.</param>
+    private void HandleCompletionReceiptAck(WorkerConnection connection, CompletionReceiptAck ack)
+    {
+        // NEGOTIATION FIRST: a connection that was not answered "enabled" expects none of these.
+        if (!connection.CompletionReceiptAckEnabled)
+            return;
+
+        // The retained assignment is the only place a receipt can land. A cleared slot (a delayed
+        // acknowledgement after the existing ownership clear) is ignored — this slice makes no
+        // cross-stream or post-replacement retention promise.
+        if (_activeAssignment is not { } assignment)
+            return;
+
+        // ORDINAL-EXACT identities, used verbatim. No parsing, no trimming, no normalization.
+        if (!string.Equals(assignment.TaskId, ack.TaskId, StringComparison.Ordinal)
+            || !string.Equals(connection.AssignedId, ack.WorkerId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // ARMED + SAME ORIGINAL CONNECTION, decided by the tracker's single atomic transition. It
+        // returns true for the FIRST accepted receipt only, so duplicates change nothing.
+        if (!assignment.Receipt.TryConfirm(connection))
+            return;
+
+        // ONE GUARDED DIAGNOSTIC, for the first accepted receipt only. It states RETENTION of the
+        // completion evidence and nothing more — not processing, not phase advancement, not that
+        // the local transport write succeeded — and it carries no completion payload, no
+        // provisioned value and no exception text.
+        try
+        {
+            _log.Info($"{ReceiptConfirmedMessage} {assignment.TaskId}");
+        }
+        catch
+        {
+            // A diagnostic must never affect the loop's outcome.
         }
     }
 
@@ -1449,6 +1626,13 @@ public sealed class WorkerService(
     /// </param>
     /// <param name="terminalResult">The assignment-local holder carrying the retained result.</param>
     /// <param name="readyClaim">The assignment's shared single-flight Ready claim.</param>
+    /// <param name="receipt">
+    /// The assignment-local receipt tracker. It is ARMED only here, only on an ENABLED connection,
+    /// only once an exact produced result has been mapped, and only immediately before the single
+    /// existing Complete send — never for an absent result, a failed mapping, or a merely installed
+    /// or running assignment. Reporting NEVER awaits an acknowledgement: arming is a synchronous
+    /// publication and the send below is unchanged.
+    /// </param>
     /// <param name="streamToken">The STREAM's token, used for the Complete and Ready writes.</param>
     private async Task ReportAssignmentAsync(
         Task execution,
@@ -1456,6 +1640,7 @@ public sealed class WorkerService(
         WorkerConnection connection,
         TerminalResultHolder terminalResult,
         ReadyClaim readyClaim,
+        CompletionReceiptTracker receipt,
         CancellationToken streamToken)
     {
         var executionTerminatedNormally = false;
@@ -1467,10 +1652,21 @@ public sealed class WorkerService(
             // result existed) reports nothing at all rather than fabricating a completion.
             if (executionTerminatedNormally && terminalResult.Result is { } result)
             {
+                // THE MAPPING FIRST: a mapping that throws leaves the assignment UNARMED, exactly
+                // like an absent result does.
+                var completion = GrpcMapper.ToGrpc(result);
+
+                // ARM — on the ENABLED connection only, with the exact mapped result in hand and
+                // the single Complete attempt about to invoke the EXISTING send. Nothing waits on
+                // it: an acknowledgement that arrives while the write below is still pending is
+                // latched by the reader without touching this task, the send permit or the owner.
+                if (connection.CompletionReceiptAckEnabled)
+                    receipt.Arm();
+
                 await SendAsync(connection, new WorkerMessage
                 {
                     WorkerId = connection.AssignedId,
-                    Complete = GrpcMapper.ToGrpc(result),
+                    Complete = completion,
                 }, streamToken);
 
                 _log.Info($"Task {task.TaskId} completed ({result.Status})");

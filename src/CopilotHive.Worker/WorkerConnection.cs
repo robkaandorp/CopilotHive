@@ -84,13 +84,20 @@ internal sealed class WorkerConnection
     /// provisioned-variable tracking are shared: this connection's identity, client, stream and
     /// provisioner all stay its own.
     /// </param>
+    /// <param name="completionReceiptAckEnabled">
+    /// THE NEGOTIATED ANSWER for THIS registration, captured from the ACCEPTED
+    /// <c>RegisterResponse</c> BEFORE this connection is published. It defaults to DISABLED, so an
+    /// absent or <c>false</c> answer — and every existing caller that does not supply it — keeps a
+    /// connection that expects no acknowledgement at all.
+    /// </param>
     internal WorkerConnection(
         string assignedId,
         HiveOrchestrator.HiveOrchestratorClient client,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         WorkerConfigProvisioner? provisionerOverride = null,
         bool includeProductionProvisioner = true,
-        WorkerProvisioningEnvironment? provisioningEnvironment = null)
+        WorkerProvisioningEnvironment? provisioningEnvironment = null,
+        bool completionReceiptAckEnabled = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(assignedId);
         ArgumentNullException.ThrowIfNull(client);
@@ -99,6 +106,7 @@ internal sealed class WorkerConnection
         AssignedId = assignedId;
         Client = client;
         Stream = stream;
+        CompletionReceiptAckEnabled = completionReceiptAckEnabled;
         Provisioner = provisionerOverride
             ?? (includeProductionProvisioner
                 ? CreateProductionProvisioner(provisioningEnvironment)
@@ -119,6 +127,24 @@ internal sealed class WorkerConnection
 
     /// <summary>The duplex work stream opened for this registration.</summary>
     internal AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> Stream { get; }
+
+    /// <summary>
+    /// THE NEGOTIATED COMPLETION-RECEIPT ACK FACT for THIS registration — an IMMUTABLE per-connection
+    /// value captured from the ACCEPTED <c>RegisterResponse</c>'s explicit answer before publication.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It is NEVER inferred: not from the protocol/orchestrator version, not from the advertised
+    /// capabilities, and not from a task's model. An absent or <c>false</c> answer leaves it
+    /// <c>false</c>, which is also the default for every connection built without one.
+    /// </para>
+    /// <para>
+    /// Because it belongs to THIS object and connections are never revived, a sequential run's new
+    /// connection carries only its OWN negotiated answer: an enabled connection followed by a
+    /// disabled one retains nothing from its predecessor.
+    /// </para>
+    /// </remarks>
+    internal bool CompletionReceiptAckEnabled { get; }
 
     /// <summary>
     /// The provisioner associated with this connection, or <c>null</c> for a connection built

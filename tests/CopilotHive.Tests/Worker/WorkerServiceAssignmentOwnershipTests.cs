@@ -1182,8 +1182,16 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             var holderType = serviceType.GetNestedType(
                 "TerminalResultHolder", BindingFlags.NonPublic)!;
             var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+            var receiptType = serviceType.GetNestedType(
+                "CompletionReceiptTracker", BindingFlags.NonPublic)!;
             var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
             var ready = Activator.CreateInstance(readyType, nonPublic: true)!;
+            var receipt = Activator.CreateInstance(
+                receiptType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args: [connection],
+                culture: null)!;
             var domainTask = GrpcMapper.ToDomain(ResultAssignment(taskId).Assignment);
 
             serviceType.GetField("_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -1202,6 +1210,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                     connection,
                     holder,
                     ready,
+                    receipt,
                     CancellationToken.None,
                 ])!;
 
@@ -1214,6 +1223,14 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.Equal(0, Volatile.Read(ref bodyEntries));
             Assert.Null(holderType.GetProperty("Result")!.GetValue(holder));
             Assert.Equal(0, GetReadyClaimState(ready));
+
+            // NO RESULT, NO ARMING. A producer that never produced a result leaves the receipt
+            // unarmed, so no acknowledgement could ever be accepted for it.
+            Assert.False(
+                GetReceiptArmed(receipt),
+                "An absent result must leave the completion receipt unarmed.");
+            Assert.False(GetReceiptConfirmed(receipt));
+
             Assert.Empty(requests.Completes);
             Assert.Equal(0, requests.ReadyCount);
             Assert.Null(GetHeartbeatTaskId(service));
@@ -1223,6 +1240,96 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             connection.Retire();
             requests.ReleaseAll();
             responses.TryComplete();
+            service.Dispose();
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// A terminal result that cannot be mapped never arms receipt eligibility. This invokes the real
+    /// reporting flow with a completed original producer and an assignment-local holder containing
+    /// an otherwise complete result whose deliberately invalid status makes the production mapper
+    /// throw. Ready retains its legacy single attempt, while no Complete or ACK eligibility appears.
+    /// </summary>
+    [Fact]
+    public async Task FailedCompletionMapping_LeavesReceiptUnarmedAndStillAttemptsLegacyReady()
+    {
+        const string taskId = "task-unmappable-result";
+        const string payloadSecret = "completion-payload-must-not-enter-diagnostic";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var service = BuildService(runner, root);
+        var stream = BuildStream(requests, responses);
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", stream, service.TestProvisioner, completionReceiptAckEnabled: true);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        Task? reporting = null;
+        try
+        {
+            Console.SetError(stdErr);
+
+            var serviceType = typeof(WorkerService);
+            var holderType = serviceType.GetNestedType(
+                "TerminalResultHolder", BindingFlags.NonPublic)!;
+            var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+            var receiptType = serviceType.GetNestedType(
+                "CompletionReceiptTracker", BindingFlags.NonPublic)!;
+            var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+            var ready = Activator.CreateInstance(readyType, nonPublic: true)!;
+            var receipt = Activator.CreateInstance(
+                receiptType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args: [connection],
+                culture: null)!;
+            var domainTask = GrpcMapper.ToDomain(ResultAssignment(taskId).Assignment);
+            var unmappable = new TaskResult
+            {
+                TaskId = taskId,
+                Status = (TaskOutcome)int.MaxValue,
+                Output = payloadSecret,
+                Model = domainTask.Model,
+            };
+            holderType.GetMethod("Publish")!.Invoke(holder, [unmappable]);
+
+            reporting = (Task)serviceType.GetMethod(
+                    "ReportAssignmentAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(service, [
+                    Task.CompletedTask,
+                    domainTask,
+                    connection,
+                    holder,
+                    ready,
+                    receipt,
+                    CancellationToken.None,
+                ])!;
+
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Same(unmappable, holderType.GetProperty("Result")!.GetValue(holder));
+            Assert.False(GetReceiptArmed(receipt));
+            Assert.False(GetReceiptConfirmed(receipt));
+            Assert.Empty(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.DoesNotContain(payloadSecret, stdErr.ToString(), StringComparison.Ordinal);
+
+            requests.ReleaseReady(0);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(reporting.IsCompletedSuccessfully);
+            Assert.Equal(1, GetReadyClaimState(ready));
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            requests.ReleaseAll();
+            responses.TryComplete();
+            if (reporting is not null)
+                await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            connection.Retire();
             service.Dispose();
             TryDelete(root);
         }
@@ -2338,6 +2445,1015 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         AlreadyClaimedByBody,
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Negotiated completion-receipt ACK — reader and reporting.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>The EXACT guarded diagnostic production emits for the first accepted receipt.</summary>
+    private const string ReceiptConfirmedLog = "Completion receipt confirmed by orchestrator for task";
+
+    /// <summary>
+    /// THE EARLY ACK, over BOTH executor branches and every terminal result. The assignment runs the
+    /// REAL executor to a full Completed, Failed or Cancelled result, its single Complete write is
+    /// HELD inside the fake, and the acknowledgement
+    /// arrives on the ENABLED connection WHILE that write is still pending.
+    /// <para>
+    /// The acknowledgement is LATCHED and nothing else moves: the Complete write is neither joined
+    /// nor finished, the send permit is still held by it, the owner is untouched, the EXACT retained
+    /// <see cref="TaskResult"/> instance is unchanged, and no extra Complete, Ready, execution or
+    /// runner reset happens. Only then is the write released, and the ordinary Complete/Ready
+    /// sequence finishes exactly as before.
+    /// </para>
+    /// <para>
+    /// ARMING IS NOT INSTALLATION. Before the executor produced a result the assignment is installed
+    /// and running yet UNARMED, so the acknowledgement delivered at that point confirms nothing —
+    /// which is what distinguishes arming at the Complete attempt from arming at install.
+    /// </para>
+    /// <para>
+    /// The ACK is delivered through the REAL reader, and a FOLLOWING probe message is the barrier:
+    /// the loop is sequential, so consuming the probe proves the ACK's own handler already ran. A
+    /// delivery gate alone would not.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false, RetainedOutcome.Completed)]
+    [InlineData(false, RetainedOutcome.Failed)]
+    [InlineData(false, RetainedOutcome.Cancelled)]
+    [InlineData(true, RetainedOutcome.Completed)]
+    [InlineData(true, RetainedOutcome.Failed)]
+    [InlineData(true, RetainedOutcome.Cancelled)]
+    public async Task EarlyReceiptAck_BothExecutorBranchesAndAllResults_LatchesWithoutTouchingHeldCompleteWrite(
+        bool provisioned,
+        RetainedOutcome outcome)
+    {
+        var taskId = $"task-ack-{(provisioned ? "provisioned" : "legacy")}-{outcome}";
+        var runner = new RetentionRunner(id => outcome == RetainedOutcome.Failed
+            ? throw new RetentionInjectedFailureException(
+                new RpcException(new Status(StatusCode.ResourceExhausted, InjectedFailureSecret)))
+            : LongOutput(id));
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        using var processRunner = InstallHealthyGit(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+        ProvisionerHarness? provisionerHarness = null;
+        if (provisioned)
+        {
+            provisionerHarness = new ProvisionerHarness(EligibleConfigUrl, "ghp_retention");
+            service.TestProvisioner = provisionerHarness.Provisioner;
+        }
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            Assert.Same(connection, GetReceiptOwnerConnection(receipt));
+
+            // AN INSTALLED, RUNNING ASSIGNMENT IS NOT ARMED. An ACK delivered now confirms nothing.
+            Assert.False(GetReceiptArmed(receipt), "A merely installed/running assignment must not be armed.");
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("ack-before-result"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(GetReceiptConfirmed(receipt), "An ACK before the result/arming must not confirm.");
+            Assert.False(GetReceiptArmed(receipt));
+
+            // Produce the real result and HOLD the single Complete write. Cancelled is generated by
+            // the assignment's own token so it traverses TaskExecutor's real cancellation boundary.
+            if (outcome == RetainedOutcome.Cancelled)
+                await CancelOwnerTokenAsync(service);
+            else
+                runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var retained = AssertFullRetainedResult(service, taskId, outcome);
+            AssertWirePayload(requests.Completes[0].Complete, taskId, outcome);
+            Assert.Equal(provisioned ? 1 : 0, provisionerHarness?.FetchCount ?? 0);
+
+            // ARMED — the exact result was mapped and the single Complete attempt is in flight.
+            Assert.True(GetReceiptArmed(receipt), "The single Complete attempt must arm the receipt.");
+            Assert.False(GetReceiptConfirmed(receipt));
+
+            var execution = GetActiveExecution(service);
+            var reporting = GetActiveReporting(service);
+            Assert.True(execution.IsCompleted);
+            Assert.False(reporting.IsCompleted, "Reporting must be held inside the gated Complete write.");
+            Assert.Equal(0, GetSendGate(service).CurrentCount);
+
+            // THE EARLY ACK, while the write is still pending.
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("ack-while-gated"));
+            await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(GetReceiptConfirmed(receipt), "A matching ACK must record receipt confirmation.");
+
+            // ...and NOTHING else moved: the write is still parked, the permit still held, the
+            // owner and the exact retained instance unchanged, no extra send and no re-execution.
+            Assert.False(
+                reporting.IsCompleted,
+                "An ACK must not join or finish the pending Complete write.");
+            Assert.Equal(0, GetSendGate(service).CurrentCount);
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.Same(execution, GetActiveExecution(service));
+            Assert.Same(reporting, GetActiveReporting(service));
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.Single(requests.Completes);
+            Assert.Equal(0, requests.ReadyCount);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
+            Assert.Equal(1, runner.ResetCount);
+
+            // The ordinary sequence then proceeds untouched.
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(reporting.IsCompletedSuccessfully);
+            Assert.Same(retained, GetRetainedResult(service));
+            AssertFullResult(retained, taskId, outcome);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.True(GetReceiptConfirmed(receipt));
+
+            // EXACTLY ONE concise diagnostic, and its complete line claims receipt confirmation only.
+            // Exact-line equality excludes completion payloads, provisioned values, exception text,
+            // transport-write success, processing, and phase-advancement claims in one assertion.
+            var log = stdOut.ToString();
+            var receiptLines = log.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+                .Where(line => line.Contains(ReceiptConfirmedLog, StringComparison.Ordinal))
+                .ToArray();
+            Assert.Equal([$"[Worker] {ReceiptConfirmedLog} {taskId}"], receiptLines);
+            Assert.DoesNotContain("TRAILING-EVIDENCE", log, StringComparison.Ordinal);
+            Assert.DoesNotContain("ghp_retention", log, StringComparison.Ordinal);
+            Assert.DoesNotContain(InjectedFailureSecret, log, StringComparison.Ordinal);
+
+            responses.Push(MatchingCancel(taskId));
+            responses.Push(Probe("after-clear"));
+            await responses.Consumed(8).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetActiveAssignment(service));
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// AN EARLY ACK NEVER CONVERTS A LATER FAILED OR CANCELLED COMPLETE WRITE INTO A SUCCESS.
+    /// Receipt confirmation and local write success are SEPARATE facts.
+    /// <para>
+    /// The acknowledgement is latched while the Complete write is still pending; that write then
+    /// terminates with its injected transport outcome. Failure keeps its sanitized diagnostic while
+    /// cancellation keeps its cancellation handling; neither is retried or re-runs execution, and
+    /// the receipt stays confirmed with the identical retained result throughout.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(CompleteTermination.Failure)]
+    [InlineData(CompleteTermination.Cancellation)]
+    public async Task EarlyReceiptAck_ThenTerminatedCompleteWrite_KeepsWriteOutcomeSeparateFromConfirmation(
+        CompleteTermination termination)
+    {
+        var taskId = $"task-ack-then-{termination.ToString().ToLowerInvariant()}-write";
+        Exception writeTermination = termination switch
+        {
+            CompleteTermination.Failure => new InvalidOperationException("injected Complete write failure"),
+            CompleteTermination.Cancellation => new OperationCanceledException("injected Complete write cancellation"),
+            _ => throw new InvalidOperationException($"Unknown termination: {termination}"),
+        };
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream(index => index == 0 ? writeTermination : null);
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        var stdOut = new StringWriter();
+        var stdErr = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+            Console.SetError(stdErr);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            var execution = GetActiveExecution(service);
+            var reporting = GetActiveReporting(service);
+
+            // THE ACK LANDS FIRST, while the write that is about to fail is still pending.
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("ack-before-failure"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.False(reporting.IsCompleted);
+
+            // ...and now the write FAILS or CANCELS according to the current cell.
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE WRITE OUTCOME KEPT ITS EXISTING TREATMENT. Ordinary failure emits the sanitized
+            // report; cancellation is swallowed by the dedicated cancellation catch. Neither raw
+            // transport message is logged and neither outcome is converted by the confirmed ACK.
+            if (termination == CompleteTermination.Failure)
+                Assert.Contains("Task execution failed", stdErr.ToString(), StringComparison.Ordinal);
+            else
+                Assert.DoesNotContain("Task execution failed", stdErr.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(writeTermination.Message, stdErr.ToString(), StringComparison.Ordinal);
+
+            // No resend, no re-execution, the identical retained instance, and the receipt is still
+            // confirmed — two separate facts that never merged.
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
+            Assert.Same(retained, GetRetainedResult(service));
+            AssertFullResult(retained, taskId, RetainedOutcome.Completed);
+            Assert.True(execution.IsCompletedSuccessfully);
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.Equal(1, CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// The identity/negotiation vectors an acknowledgement can arrive with. Each differs from the
+    /// accepted shape in EXACTLY ONE respect, so no cell can pass for the wrong reason.
+    /// </summary>
+    public enum AckVector
+    {
+        /// <summary>A task ID that is not the retained assignment's — ordinally different.</summary>
+        WrongTaskId,
+
+        /// <summary>The retained task ID with surrounding whitespace: IDs are never trimmed.</summary>
+        UntrimmedTaskId,
+
+        /// <summary>The retained task ID in a different case: comparison stays ordinal and case-sensitive.</summary>
+        CaseFoldedTaskId,
+
+        /// <summary>A worker ID that is not this connection's assigned identity.</summary>
+        WrongWorkerId,
+
+        /// <summary>The connection's assigned identity with whitespace: IDs are never trimmed.</summary>
+        UntrimmedWorkerId,
+
+        /// <summary>The connection's assigned identity in a different case: never normalized.</summary>
+        CaseFoldedWorkerId,
+
+        /// <summary>Both identities match, but the connection negotiated NO acknowledgements.</summary>
+        DisabledConnection,
+    }
+
+    /// <summary>
+    /// NON-MATCHING DELIVERIES CONFIRM NOTHING. Each vector is delivered through the REAL reader
+    /// against an ARMED assignment whose Complete write already succeeded, and each must leave the
+    /// receipt unconfirmed — and must never confirm some other assignment, since there is exactly
+    /// one and it stays unconfirmed. IDs are matched ordinally and verbatim: neither trimming nor
+    /// case folding is performed.
+    /// <para>
+    /// NON-VACUITY: every cell then delivers the CORRECT acknowledgement on the same enabled loop
+    /// (or, for the disabled cell, asserts the assignment was never armed at all), so a cell can
+    /// never pass merely because acknowledgement processing is broken everywhere.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(AckVector.WrongTaskId)]
+    [InlineData(AckVector.UntrimmedTaskId)]
+    [InlineData(AckVector.CaseFoldedTaskId)]
+    [InlineData(AckVector.WrongWorkerId)]
+    [InlineData(AckVector.UntrimmedWorkerId)]
+    [InlineData(AckVector.CaseFoldedWorkerId)]
+    [InlineData(AckVector.DisabledConnection)]
+    public async Task ReceiptAck_NonMatchingVector_DoesNotConfirm(AckVector vector)
+    {
+        var taskId = $"task-vector-{vector}";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var enabled = vector != AckVector.DisabledConnection;
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, enabled, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE ARMING PREMISE. An enabled connection armed at its Complete attempt; a DISABLED
+            // one never arms at all, which is itself the vector under test.
+            Assert.Equal(enabled, GetReceiptArmed(receipt));
+
+            var ack = vector switch
+            {
+                AckVector.WrongTaskId => ReceiptAck(taskId + "-other", connection.AssignedId),
+                AckVector.UntrimmedTaskId => ReceiptAck(" " + taskId + " ", connection.AssignedId),
+                AckVector.CaseFoldedTaskId => ReceiptAck(taskId.ToUpperInvariant(), connection.AssignedId),
+                AckVector.WrongWorkerId => ReceiptAck(taskId, connection.AssignedId + "-other"),
+                AckVector.UntrimmedWorkerId => ReceiptAck(taskId, " " + connection.AssignedId + " "),
+                AckVector.CaseFoldedWorkerId => ReceiptAck(taskId, connection.AssignedId.ToUpperInvariant()),
+                AckVector.DisabledConnection => ReceiptAck(taskId, connection.AssignedId),
+                _ => throw new InvalidOperationException($"Unknown vector: {vector}"),
+            };
+
+            responses.Push(ack);
+            responses.Push(Probe("after-vector"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(
+                GetReceiptConfirmed(receipt),
+                $"The {vector} delivery must not record receipt confirmation.");
+            Assert.DoesNotContain(ReceiptConfirmedLog, stdOut.ToString(), StringComparison.Ordinal);
+
+            // Nothing else moved either: no resend, no extra Ready, no re-execution, same result.
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.NotNull(GetActiveAssignment(service));
+
+            // NON-VACUITY for the enabled cells: the CORRECT delivery on this very loop confirms.
+            if (enabled)
+            {
+                responses.Push(ReceiptAck(taskId, connection.AssignedId));
+                responses.Push(Probe("after-correct"));
+                await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.True(GetReceiptConfirmed(receipt));
+                Assert.Equal(1, CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+            }
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// THE READER'S NEGOTIATION GATE, EXERCISED AGAINST AN ARMED ASSIGNMENT.
+    /// <para>
+    /// A DISABLED connection never arms through reporting, so the vector matrix's disabled cell
+    /// alone cannot show that the reader itself refuses. Here the assignment is armed through the
+    /// tracker's OWN production transition and a fully matching acknowledgement is then delivered
+    /// through the REAL reader on the DISABLED connection: it must still confirm nothing.
+    /// </para>
+    /// <para>
+    /// NON-VACUITY, on the same delivery path: a second loop over an ENABLED connection, armed the
+    /// same way with the same identities, DOES confirm — so the only difference between the two
+    /// outcomes is the negotiated answer the reader consults.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ArmedAssignmentOnConnection_ReceiptAckAcceptedOnlyWhenNegotiationEnabled(bool ackEnabled)
+    {
+        var taskId = $"task-reader-gate-{ackEnabled}";
+        var runner = new GatedPromptRunner();
+        var service = BuildService(runner);
+
+        var responses = new ChannelResponseReader();
+        var requests = new RecordingRequestStream();
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            responses.Push(Assignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            Assert.False(GetReceiptArmed(receipt));
+
+            // ARM through the tracker's OWN production transition, so BOTH cells face an armed
+            // assignment and the ONLY difference is the connection's negotiated answer.
+            ArmReceiptDirectly(receipt);
+            Assert.True(GetReceiptArmed(receipt));
+
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("after-ack"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(ackEnabled, GetReceiptConfirmed(receipt));
+            Assert.Equal(
+                ackEnabled ? 1 : 0,
+                CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+
+            // Neither cell touched anything else: the assignment is still installed and running.
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.Equal(taskId, GetActiveTaskId(service));
+            Assert.False(
+                GetActiveExecution(service).IsCompleted,
+                "The assignment must still be running — an ACK never cancels or advances it.");
+            Assert.Equal(0, requests.ReadyCount);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// A NO-OWNER ACKNOWLEDGEMENT IS FORGOTTEN, while duplicate acknowledgements for the later armed
+    /// assignment are idempotent: the receipt stays confirmed, exactly ONE guarded diagnostic is
+    /// emitted (the FIRST accepted receipt only), and no Complete, Ready or execution is repeated.
+    /// </summary>
+    [Fact]
+    public async Task NoOwnerThenDuplicateReceiptAcks_DoNotPreconfirmAndLogOnce()
+    {
+        const string taskId = "task-duplicate-ack";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            // NO OWNER: a matching-looking acknowledgement cannot be remembered globally and later
+            // applied to an assignment that has not even arrived yet. The following probe proves the
+            // real reader completed this no-owner handler before the assignment is delivered.
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("ack-with-no-owner"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetActiveAssignment(service));
+            Assert.DoesNotContain(ReceiptConfirmedLog, stdOut.ToString(), StringComparison.Ordinal);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            Assert.False(
+                GetReceiptConfirmed(receipt),
+                "An ACK received with no owner must not pre-confirm a later assignment.");
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("after-duplicates"));
+            await responses.Consumed(8).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.Equal(1, CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+            Assert.Equal(1, runner.PromptCount);
+            Assert.Same(retained, GetRetainedResult(service));
+            AssertFullResult(retained, taskId, RetainedOutcome.Completed);
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// THE RECEIPT DIAGNOSTIC IS GUARDED. A sink that throws specifically for the first accepted
+    /// receipt line cannot fault the reader or undo confirmation: a following-message barrier is
+    /// processed, ownership/result/Ready/Complete state stays unchanged, and a duplicate does not
+    /// retry the failed diagnostic. Removing the production guard makes the reader fault before the
+    /// first probe and this test fails by name.
+    /// </summary>
+    [Fact]
+    public async Task FirstReceiptAck_WhenDiagnosticSinkThrows_ConfirmationAndReaderContinue()
+    {
+        const string taskId = "task-receipt-log-failure";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var forwarded = new StringWriter();
+        var throwingWriter = new MarkerThrowingErrorWriter(
+            ReceiptConfirmedLog,
+            forwarded,
+            new InvalidOperationException("injected receipt diagnostic failure"));
+        try
+        {
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            var reporting = GetActiveReporting(service);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Console.SetOut(throwingWriter);
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("after-throwing-diagnostic"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.Equal(1, throwingWriter.WriteAttempts);
+            Assert.False(loop.IsCompleted);
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.Same(reporting, GetActiveReporting(service));
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+
+            // The first acceptance consumed the state transition before logging. A duplicate is a
+            // no-op and must not retry even the failed diagnostic.
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("after-duplicate"));
+            await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, throwingWriter.WriteAttempts);
+            Assert.True(GetReceiptConfirmed(receipt));
+
+            Console.SetOut(originalOut);
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// A DELIVERY THAT BELONGS TO ANOTHER CONNECTION CONFIRMS NOTHING, even when both wire
+    /// identities match exactly and that other connection is itself enabled.
+    /// <para>
+    /// The message loop always hands its OWN connection to the acknowledgement handler, so a
+    /// previous-connection delivery is not producible through the reader. This drives the SAME
+    /// production handler with the only input that differs — the delivering connection — and then
+    /// proves non-vacuity by delivering the identical acknowledgement through the REAL loop, which
+    /// does confirm.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ReceiptAckFromPreviousConnection_DoesNotConfirmRetainedAssignment()
+    {
+        const string taskId = "task-foreign-connection";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        // A DIFFERENT connection object with the SAME assigned identity and the SAME negotiated
+        // answer — deliberately never published, so it can only stand in for a previous one.
+        var otherStream = BuildStream(new RetentionRequestStream(), new ChannelResponseReader());
+        var previousConnection = TestConnectionFactory.CreateUnpublished(
+            connection.AssignedId, otherStream, completionReceiptAckEnabled: true);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptArmed(receipt));
+
+            // THE FOREIGN DELIVERY — identical identities, identical negotiation, other object.
+            Assert.NotSame(connection, previousConnection);
+            Assert.Equal(connection.AssignedId, previousConnection.AssignedId);
+            InvokeReceiptAckOnConnection(
+                service,
+                previousConnection,
+                new CompletionReceiptAck { TaskId = taskId, WorkerId = previousConnection.AssignedId });
+
+            Assert.False(
+                GetReceiptConfirmed(receipt),
+                "A delivery bound to a previous connection must not confirm this assignment.");
+            Assert.DoesNotContain(ReceiptConfirmedLog, stdOut.ToString(), StringComparison.Ordinal);
+
+            // NON-VACUITY: the identical acknowledgement on THIS connection's real loop confirms.
+            responses.Push(ReceiptAck(taskId, connection.AssignedId));
+            responses.Push(Probe("after-own"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.Equal(1, CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// AN ORDINARY COMPLETION WITH NO ACKNOWLEDGEMENT KEEPS THE LEGACY BEHAVIOR EXACTLY. On an
+    /// ENABLED connection whose orchestrator simply never acknowledges, the Complete and the single
+    /// Ready flow as before, the owner and its exact result stay retained, the receipt is armed but
+    /// UNCONFIRMED, and the matching cancel performs the same drain-and-clear with no duplicate
+    /// Ready. Reporting never awaited anything.
+    /// </summary>
+    [Fact]
+    public async Task OrdinaryCompleteWithoutAck_RetainsLegacyReadyAndOwnershipBehavior()
+    {
+        const string taskId = "task-no-ack";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (_, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            var readyClaim = GetOwnerReadyClaim(service);
+            runner.Release(taskId);
+
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retained = AssertFullRetainedResult(service, taskId, RetainedOutcome.Completed);
+            AssertWirePayload(requests.Completes[0].Complete, taskId, RetainedOutcome.Completed);
+            requests.ReleaseComplete(0);
+
+            // REPORTING NEVER AWAITS AN ACK: it advances to its single Ready with none delivered.
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(GetReceiptArmed(receipt));
+            Assert.False(GetReceiptConfirmed(receipt));
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
+            Assert.Single(requests.Completes);
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.DoesNotContain(ReceiptConfirmedLog, stdOut.ToString(), StringComparison.Ordinal);
+
+            // The matching cancel drains and clears exactly as before — no duplicate Ready.
+            responses.Push(MatchingCancel(taskId));
+            responses.Push(Probe("after-clear"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Equal(1, requests.ReadyCount);
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, runner.ExecutionEntryCount);
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// A LEGITIMATE SUCCESSOR ARRIVING BEFORE THE OLD ACKNOWLEDGEMENT continues through the
+    /// EXISTING replacement path: no new ACK wait, no rejection, no hang. The old acknowledgement
+    /// then arrives after the ownership clear and is IGNORED — it must never confirm the successor,
+    /// which is still running and unarmed. This slice makes no retention-until-ACK promise.
+    /// </summary>
+    [Fact]
+    public async Task SuccessorBeforeOldReceiptAck_ProceedsThroughReplacementAndNeverConfirmsSuccessor()
+    {
+        const string taskA = "task-old-ack";
+        const string taskB = "task-successor";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var stdOut = new StringWriter();
+        try
+        {
+            Console.SetOut(stdOut);
+
+            // A runs to completion — armed, never acknowledged.
+            responses.Push(ResultAssignment(taskA));
+            await runner.PromptStarted(taskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("A-installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receiptA = GetOwnerReceipt(service);
+            var executionA = GetActiveExecution(service);
+            var reportingA = GetActiveReporting(service);
+            runner.Release(taskA);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptArmed(receiptA));
+            Assert.False(GetReceiptConfirmed(receiptA));
+
+            // THE SUCCESSOR ARRIVES FIRST. It must flow through the existing replacement path
+            // without waiting for A's acknowledgement and without being rejected.
+            responses.Push(ResultAssignment(taskB));
+            await runner.PromptStarted(taskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("B-installed"));
+            await responses.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.True(executionA.IsCompleted, "A's original execution must have been joined by the replacement drain.");
+            Assert.True(reportingA.IsCompleted, "A's original report must have been joined by the replacement drain.");
+            Assert.Equal(taskB, GetActiveTaskId(service));
+
+            var receiptB = GetOwnerReceipt(service);
+            Assert.NotSame(receiptA, receiptB);
+            Assert.False(GetReceiptArmed(receiptB), "The still-running successor must not be armed.");
+
+            // A'S OLD ACKNOWLEDGEMENT, after the ownership clear: ignored entirely.
+            responses.Push(ReceiptAck(taskA, connection.AssignedId));
+            responses.Push(Probe("after-old-ack"));
+            await responses.Consumed(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(GetReceiptConfirmed(receiptA), "A delayed ACK after the ownership clear confirms nothing.");
+            Assert.False(GetReceiptConfirmed(receiptB), "An ACK for A must never confirm the successor B.");
+            Assert.DoesNotContain(ReceiptConfirmedLog, stdOut.ToString(), StringComparison.Ordinal);
+
+            // B is untouched: still running, still installed, exactly one Complete so far (A's).
+            Assert.Equal(taskB, GetActiveTaskId(service));
+            Assert.False(runner.PromptCompleted(taskB));
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+
+            // B then finishes and can be acknowledged in its OWN right.
+            runner.Release(taskB);
+            await requests.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseComplete(1);
+            await requests.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(1);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            responses.Push(ReceiptAck(taskB, connection.AssignedId));
+            responses.Push(Probe("after-B-ack"));
+            await responses.Consumed(8).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptConfirmed(receiptB));
+            Assert.Equal(1, CountOccurrences(stdOut.ToString(), ReceiptConfirmedLog));
+            Assert.Equal(2, runner.ExecutionEntryCount);
+
+            responses.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
+    /// <summary>
+    /// TEARDOWN ADDS NO ACK WAIT. With an ARMED but never-acknowledged assignment retained, the
+    /// reader reaches EOF (or the loop token is cancelled): the loop completes within the existing
+    /// bounded join, the ownership slot clears, the heartbeat state clears and the connection
+    /// retires — there is no new waiter to close on disconnect.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ArmedButUnacknowledgedAssignment_EofOrCancel_AddsNoTeardownWait(bool cancelInsteadOfEof)
+    {
+        var taskId = $"task-teardown-{(cancelInsteadOfEof ? "cancel" : "eof")}";
+        var runner = new RetentionRunner(LongOutput);
+        var requests = new RetentionRequestStream();
+        var responses = new ChannelResponseReader();
+        var root = CreateRetentionRoot();
+        var configRepoDir = Path.Combine(root, "config-repo");
+        Directory.CreateDirectory(configRepoDir);
+        var service = BuildService(runner, configRepoDir);
+
+        using var loopCts = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        var stream = BuildStream(requests, responses);
+        var (connection, loop) = StartNegotiatedLoop(
+            service, stream, ackEnabled: true, loopCts.Token);
+
+        try
+        {
+            responses.Push(ResultAssignment(taskId));
+            await runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            responses.Push(Probe("installed"));
+            await responses.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var receipt = GetOwnerReceipt(service);
+            runner.Release(taskId);
+            await requests.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseComplete(0);
+            await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            requests.ReleaseReady(0);
+            await GetActiveReporting(service).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // ARMED, NEVER ACKNOWLEDGED — the state a new ACK wait would deadlock teardown on.
+            Assert.True(GetReceiptArmed(receipt));
+            Assert.False(GetReceiptConfirmed(receipt));
+
+            if (cancelInsteadOfEof)
+            {
+                await loopCts.CancelAsync();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                    () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            }
+            else
+            {
+                responses.TryComplete();
+                await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            // The existing teardown sequencing is intact; nothing waited for an acknowledgement.
+            Assert.Equal(0, GetSlotOccupancy(service));
+            Assert.Null(GetHeartbeatTaskId(service));
+            Assert.True(connection.IsRetired);
+            Assert.False(GetReceiptConfirmed(receipt));
+            Assert.Single(requests.Completes);
+            Assert.Equal(1, requests.ReadyCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            requests.ReleaseAll();
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, ("loop", loop));
+            TryDelete(root);
+        }
+    }
+
     /// <summary>
     /// A diagnostic sink that throws for lines containing a MARKER and forwards everything else to
     /// an inner writer. It models a partially degraded <c>Console.Error</c>: the one failure line
@@ -2750,6 +3866,85 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     private static int GetReadyClaimState(object readyClaim) =>
         (int)readyClaim.GetType().GetField("_claimed", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(readyClaim)!;
+
+    // ── Completion-receipt ACK observation seam ───────────────────────────────
+    //
+    // The receipt state is read through the SAME reflection technique every other owner-local
+    // value in this fixture uses (the retained result, the Ready claim, the CTS). Production
+    // deliberately exposes no public getter for it.
+
+    /// <summary>The ACTIVE owner's assignment-local completion-receipt tracker.</summary>
+    private static object GetOwnerReceipt(WorkerService service)
+    {
+        var active = GetActiveAssignment(service)
+            ?? throw new Xunit.Sdk.XunitException("Expected an active assignment owner.");
+        return active.GetType().GetProperty("Receipt")!.GetValue(active)!;
+    }
+
+    private static bool GetReceiptArmed(object receipt) =>
+        (bool)receipt.GetType().GetProperty("IsArmed")!.GetValue(receipt)!;
+
+    private static bool GetReceiptConfirmed(object receipt) =>
+        (bool)receipt.GetType().GetProperty("IsConfirmed")!.GetValue(receipt)!;
+
+    /// <summary>
+    /// Invokes the tracker's OWN production <c>Arm</c> transition — the identical call the reporting
+    /// flow makes immediately before its single Complete send.
+    /// </summary>
+    /// <remarks>
+    /// It exists for ONE vector: a DISABLED connection never arms through reporting, so without this
+    /// the reader's negotiation gate could not be exercised against an ARMED assignment and its
+    /// removal would be unobservable. Nothing else in the fixture uses it.
+    /// </remarks>
+    private static void ArmReceiptDirectly(object receipt) =>
+        receipt.GetType().GetMethod("Arm")!.Invoke(receipt, null);
+
+    /// <summary>The connection the ACTIVE owner's receipt tracker is bound to.</summary>
+    private static WorkerConnection GetReceiptOwnerConnection(object receipt) =>
+        (WorkerConnection)receipt.GetType().GetProperty("Owner")!.GetValue(receipt)!;
+
+    /// <summary>The production send gate (observation only — never mutated).</summary>
+    private static SemaphoreSlim GetSendGate(WorkerService service) =>
+        (SemaphoreSlim)typeof(WorkerService)
+            .GetField("_sendGate", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(service)!;
+
+    /// <summary>One orchestrator-to-worker completion-receipt acknowledgement, verbatim.</summary>
+    private static OrchestratorMessage ReceiptAck(string taskId, string workerId) => new()
+    {
+        CompletionReceiptAck = new CompletionReceiptAck { TaskId = taskId, WorkerId = workerId },
+    };
+
+    /// <summary>
+    /// Invokes the REAL <c>HandleCompletionReceiptAck</c> with an explicitly supplied connection.
+    /// </summary>
+    /// <remarks>
+    /// Used ONLY for the FOREIGN-CONNECTION vector. The message loop always passes the connection
+    /// it was started for, so a delivery bound to a DIFFERENT (for example previous) connection
+    /// object is not producible through the loop; this drives the same production method the loop's
+    /// <c>CompletionReceiptAck</c> case calls, with the only input that differs.
+    /// </remarks>
+    private static void InvokeReceiptAckOnConnection(
+        WorkerService service, WorkerConnection connection, CompletionReceiptAck ack) =>
+        typeof(WorkerService).GetMethod(
+            "HandleCompletionReceiptAck", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, [connection, ack]);
+
+    /// <summary>
+    /// Attaches a connection carrying an explicit NEGOTIATED ACK answer and starts the REAL message
+    /// loop on it — the same publication + direct-loop pattern every other fixture here uses.
+    /// </summary>
+    private static (WorkerConnection Connection, Task Loop) StartNegotiatedLoop(
+        WorkerService service,
+        AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
+        bool ackEnabled,
+        CancellationToken ct,
+        string assignedId = "worker-1")
+    {
+        var connection = TestConnectionFactory.Attach(
+            service, assignedId, stream, service.TestProvisioner, ackEnabled);
+        return (connection, InvokeProcessMessagesWith(service, connection, ct));
+    }
 
     /// <summary>
     /// Counts NON-OVERLAPPING occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.

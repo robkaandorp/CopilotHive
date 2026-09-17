@@ -395,6 +395,304 @@ public sealed class WorkerConnectionLifecycleTests
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // (1a) The REAL RunAsync flow — negotiated completion-receipt ACK.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE OUTGOING NEGOTIATION REQUEST AND THE CAPTURED ANSWER, over the REAL
+    /// <see cref="WorkerService.RunAsync"/>.
+    /// <para>
+    /// The production register request must ASK for completion-receipt ACKs explicitly. The
+    /// orchestrator's ANSWER — parameterized over enabled and disabled — is then captured onto the
+    /// connection that gets published, together with the existing assigned-ID fallback. The answer
+    /// is the only source: it is never inferred from the orchestrator version, the advertised
+    /// capabilities, or the assignment's model.
+    /// </para>
+    /// <para>
+    /// PUBLICATION ORDER is observed at the initial Ready's own write, so "captured before
+    /// publication" is a real ordering claim: the connection visible at that instant already carries
+    /// the negotiated answer.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true, "", LocalWorkerId)]
+    [InlineData(true, AssignedWorkerId, AssignedWorkerId)]
+    [InlineData(false, AssignedWorkerId, AssignedWorkerId)]
+    public async Task RunAsync_RequestsCompletionReceiptAck_AndCapturesAcceptedAnswerBeforePublication(
+        bool enabledByOrchestrator,
+        string assignedWorkerIdFromOrchestrator,
+        string expectedAssignedId)
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = assignedWorkerIdFromOrchestrator,
+            OrchestratorVersion = "test",
+            CompletionReceiptAckEnabled = enabledByOrchestrator,
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+
+        // Observed INSIDE the initial Ready write: the negotiated answer already on the published
+        // connection AT that instant, so capture-before-publication is an ordering claim.
+        bool? negotiatedAtFirstWrite = null;
+        requests.OnWrite = _ =>
+            negotiatedAtFirstWrite ??= GetPublishedConnection(service)?.CompletionReceiptAckEnabled;
+
+        var stream = BuildRunStream(requests, responses, () => { });
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+
+            // THE OUTGOING REQUEST — a clone of what production actually sent.
+            var sent = Assert.IsType<RegisterRequest>(invoker.LastRegisterRequest);
+            Assert.True(
+                sent.RequestCompletionReceiptAck,
+                "The production registration must explicitly request completion-receipt ACKs.");
+            Assert.Equal(LocalWorkerId, sent.WorkerId);
+
+            // THE CAPTURED ANSWER, on the connection that was published.
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.Equal(enabledByOrchestrator, connection.CompletionReceiptAckEnabled);
+            Assert.Equal(expectedAssignedId, connection.AssignedId);
+            Assert.Equal(expectedAssignedId, requests.Writes[0].WorkerId);
+
+            // ...and it was ALREADY on the connection when the initial Ready was written.
+            Assert.Equal(enabledByOrchestrator, negotiatedAtFirstWrite);
+
+            responses.TryComplete();
+            var outcome = await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerRunOutcome.WorkStreamEnded, outcome);
+        }
+        finally
+        {
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// AN ABSENT ANSWER STAYS DISABLED. An orchestrator that never sets the field at all (an old
+    /// one, parsing as the proto default) leaves the published connection disabled even though the
+    /// worker asked — a REQUEST is never an ENABLEMENT.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_AcceptedRegistrationWithoutAnswer_LeavesConnectionDisabled()
+    {
+        // Accepted, with an orchestrator version and capabilities-shaped inputs but NO answer field.
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+            OrchestratorVersion = "99.99.99",
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = BuildRunStream(requests, responses, () => { });
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+
+            Assert.True(invoker.LastRegisterRequest!.RequestCompletionReceiptAck);
+
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.False(
+                connection.CompletionReceiptAckEnabled,
+                "An absent answer must leave the connection disabled — a request is not an enablement.");
+
+            responses.TryComplete();
+            await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// A REJECTED REGISTRATION OPENS AND PUBLISHES NOTHING even when the orchestrator's response
+    /// carries <c>completion_receipt_ack_enabled = true</c>: no stream, no connection, no captured
+    /// negotiation fact. The request still asked — the rejection is what stops everything else.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_RejectedRegistrationWithEnabledAnswer_PublishesNothing()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = false,
+            CompletionReceiptAckEnabled = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var streamOpened = 0;
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        try
+        {
+            service.CallInvokerFactory = () => invoker;
+            service.WorkStreamFactory = (_, _) =>
+            {
+                Interlocked.Increment(ref streamOpened);
+                throw new InvalidOperationException("No stream may be opened for a rejected registration.");
+            };
+
+            var outcome = await service.RunAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerRunOutcome.RegistrationRejected, outcome);
+
+            Assert.True(invoker.LastRegisterRequest!.RequestCompletionReceiptAck);
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(0, streamOpened);
+            Assert.Null(runner.ConfigProvisioner);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
+    }
+
+    /// <summary>
+    /// SEQUENTIAL ISOLATION. Run 1 is answered ENABLED, run 2 (same service instance) is answered
+    /// DISABLED: the second run's published connection must be a different object carrying its OWN
+    /// disabled answer, retaining NOTHING from the first. The first connection — retired and
+    /// unpublished — keeps its own captured fact, which proves the value is per-connection and not
+    /// service-global state that merely happened to be overwritten.
+    /// </summary>
+    [Fact]
+    public async Task SequentialRuns_EnabledThenDisabled_RetainNoNegotiationFromPreviousConnection()
+    {
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var firstResponses = new ChannelResponseReader();
+        var secondResponses = new ChannelResponseReader();
+        Task<WorkerRunOutcome>? firstRun = null;
+        Task<WorkerRunOutcome>? secondRun = null;
+        WorkerConnection? firstConnection = null;
+
+        try
+        {
+            // RUN 1 — answered ENABLED.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = true,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, firstResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                firstRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+
+                firstConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.True(firstConnection.CompletionReceiptAckEnabled);
+
+                firstResponses.TryComplete();
+                await firstRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Null(GetPublishedConnection(service));
+            }
+
+            // RUN 2 — answered DISABLED, on the SAME service instance.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = false,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, secondResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                secondRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForWriteCountAsync(1, TestContext.Current.CancellationToken);
+
+                var secondConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.NotSame(firstConnection, secondConnection);
+                Assert.False(
+                    secondConnection.CompletionReceiptAckEnabled,
+                    "A sequential run must retain NO negotiation fact from its predecessor.");
+
+                // The request was still made on run 2 — only the ANSWER differed.
+                Assert.True(invoker.LastRegisterRequest!.RequestCompletionReceiptAck);
+
+                secondResponses.TryComplete();
+                await secondRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            // The retired predecessor keeps its OWN fact: the value is per-connection, not global.
+            Assert.True(firstConnection!.IsRetired);
+            Assert.True(firstConnection.CompletionReceiptAckEnabled);
+        }
+        finally
+        {
+            firstResponses.TryComplete();
+            secondResponses.TryComplete();
+            await JoinAllForTeardownAsync(
+                service, ("first RunAsync", firstRun), ("second RunAsync", secondRun));
+        }
+    }
+
+    /// <summary>
+    /// THE PRODUCTION CONSTRUCTOR'S OPTIONAL ACK ARGUMENT defaults to disabled. This calls the old
+    /// constructor shape directly (without naming or passing the new argument), so changing that
+    /// default would fail while old callers and direct-loop fixtures remain source-compatible.
+    /// </summary>
+    [Fact]
+    public void WorkerConnection_OmittedReceiptAckArgument_DefaultsDisabled()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        using var stream = BuildRunStream(requests, responses, () => { });
+        var connection = new WorkerConnection(
+            AssignedWorkerId,
+            new HiveOrchestrator.HiveOrchestratorClient(invoker),
+            stream,
+            provisionerOverride: null,
+            includeProductionProvisioner: false);
+
+        try
+        {
+            Assert.False(connection.CompletionReceiptAckEnabled);
+        }
+        finally
+        {
+            connection.Retire();
+            responses.TryComplete();
+        }
+    }
+
     /// <summary>
     /// THE CAPTURED RUNNER CALLBACK IS RETIREMENT-GATED EVEN WITH AN OVERRIDE PROVISIONER INSTALLED.
     /// <para>
@@ -405,6 +703,7 @@ public sealed class WorkerConnectionLifecycleTests
     /// rejection, and its call count proves the underlying provisioner never started.
     /// </para>
     /// </summary>
+
     [Fact]
     public async Task CapturedRunnerCallback_WithOverrideProvisioner_FailsDisconnectedAfterRetirement()
     {
@@ -3366,6 +3665,7 @@ public sealed class WorkerConnectionLifecycleTests
         private int _saveSessionCalls;
         private int _heartbeatCalls;
         private string? _lastRegisterWorkerId;
+        private RegisterRequest? _lastRegisterRequest;
         private string? _lastWorkerConfigWorkerId;
         private string? _lastGetSessionId;
         private string? _lastSaveSessionId;
@@ -3389,6 +3689,12 @@ public sealed class WorkerConnectionLifecycleTests
         internal int HeartbeatCalls => Volatile.Read(ref _heartbeatCalls);
 
         internal string? LastRegisterWorkerId => Volatile.Read(ref _lastRegisterWorkerId);
+
+        /// <summary>
+        /// A CLONE of the exact <see cref="RegisterRequest"/> the production run sent, so a test can
+        /// assert the OUTGOING negotiation request rather than any value it supplied itself.
+        /// </summary>
+        internal RegisterRequest? LastRegisterRequest => Volatile.Read(ref _lastRegisterRequest);
         internal string? LastWorkerConfigWorkerId => Volatile.Read(ref _lastWorkerConfigWorkerId);
         internal string? LastGetSessionId => Volatile.Read(ref _lastGetSessionId);
         internal string? LastSaveSessionId => Volatile.Read(ref _lastSaveSessionId);
@@ -3428,6 +3734,7 @@ public sealed class WorkerConnectionLifecycleTests
         {
             Interlocked.Increment(ref _registerCalls);
             Volatile.Write(ref _lastRegisterWorkerId, (request as RegisterRequest)?.WorkerId);
+            Volatile.Write(ref _lastRegisterRequest, (request as RegisterRequest)?.Clone());
             return registerResponse;
         }
 
