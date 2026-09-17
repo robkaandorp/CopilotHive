@@ -674,7 +674,6 @@ public sealed class CompletionReceiptAckTests
         await AckHarness.RunAsync(h, async () =>
         {
             await h.CompleteOrdinaryAsync(taskId);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
             Assert.Equal(1, h.AcknowledgedCount(taskId));
 
             // THE ORDINARY PATH DID NOT READ THE RETAINED EVIDENCE — and a successor is now busy on a
@@ -703,10 +702,18 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
             Assert.NotNull(h.Queue.GetActiveTask("task-dup-successor"));
             Assert.Null(h.Queue.GetActiveTask(taskId));
+
+            // THE STREAM'S LATEST ELIGIBILITY IS UNCHANGED, proven through the protocol it
+            // authorizes: yet another identical duplicate on THIS SAME live stream is still
+            // re-acknowledged, which only the retained latest id can permit.
+            // (the probe's own Progress barrier legitimately refreshes activity, so the successor
+            // fingerprint above is deliberately NOT re-compared after it — its ownership is.)
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 3);
+            Assert.True(h.Worker.IsBusy);
+            Assert.Equal("task-dup-successor", h.Worker.CurrentTaskId);
         });
     }
     /// <summary>
@@ -742,14 +749,17 @@ public sealed class CompletionReceiptAckTests
             // NO NEW ACKNOWLEDGEMENT — the ordinary completion's own remains the only one.
             Assert.Equal(1, h.AcknowledgedCount(taskId));
 
-            // THE SLOT IS UNTOUCHED: still the same latest id, never cleared and never advanced.
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
-
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
             Assert.NotNull(h.Queue.GetActiveTask("task-dup-changed-successor"));
+
+            // THE STREAM'S LATEST ELIGIBILITY IS UNTOUCHED: never cleared, never advanced. Proven
+            // by a following MATCHING duplicate on the same live stream, which is re-acknowledged —
+            // impossible if the mismatched attempt had cleared or moved the retained latest id.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
+            Assert.Equal(0, h.Recorder.RecordCalls);
         });
     }
 
@@ -777,14 +787,15 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(1, h.Recorder.ConfirmCalls);
             Assert.Equal(0, h.Recorder.RecordCalls);
             Assert.Equal(1, h.AcknowledgedCount(taskId));
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
 
             // ── (2) THE IDENTICAL RE-SEND STILL SUCCEEDS ─────────────────────────────────────
+            // THIS IS THE ELIGIBILITY PROOF ITSELF: the re-acknowledgement is only reachable while
+            // the stream's retained latest id still names this task, so a failed attempt that had
+            // cleared it would send this delivery down the ordinary path instead.
             await h.DuplicateAndAwaitReAckAsync(taskId, "assigned-model");
             Assert.Equal(2, h.Recorder.ConfirmCalls);
             Assert.Equal(0, h.Recorder.RecordCalls);
             Assert.Equal(2, h.AcknowledgedCount(taskId));
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
 
             // ── (3) THE SUCCESSOR IS STILL UNTOUCHED BY EITHER ATTEMPT ───────────────────────
             Assert.Equal(0, h.DashboardNotifications);
@@ -836,12 +847,16 @@ public sealed class CompletionReceiptAckTests
             // NO ACKNOWLEDGEMENT, NO RE-RECORD, NO RELEASE, NO NOTIFICATION, NO SLOT CHANGE.
             Assert.Equal(1, h.AcknowledgedCount(taskId));
             Assert.Equal(0, h.Recorder.RecordCalls);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
             Assert.False(h.StreamEnded);
+
+            // THE ELIGIBILITY SURVIVED THE READ FAILURE: the injected fault is one-shot, so the
+            // next identical duplicate reaches the REAL confirmation and is re-acknowledged — which
+            // only the stream's still-retained latest id permits.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -859,7 +874,7 @@ public sealed class CompletionReceiptAckTests
             // THE LATEST ELIGIBLE SLOT IS REAL AND POPULATED, so the refusal below is genuine
             // discrimination rather than a fixture with no eligible task at all.
             await h.CompleteOrdinaryAsync("task-arb-latest");
-            Assert.Equal("task-arb-latest", h.Worker.AckState.LatestEligibleTaskId);
+            Assert.Equal(1, h.AcknowledgedCount("task-arb-latest"));
             Assert.Equal(0, h.Recorder.ConfirmCalls);
 
             // The worker is idle now, so the ordinary path refuses on the busy/current-task cell.
@@ -875,9 +890,15 @@ public sealed class CompletionReceiptAckTests
                 ("task-arb-historical", 0), ("task-arb-latest", 1));
             Assert.Equal(0, h.Recorder.ConfirmCalls);
             Assert.Equal(0, h.AcknowledgedCount("task-arb-historical"));
-            Assert.Equal("task-arb-latest", h.Worker.AckState.LatestEligibleTaskId);
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
+
+            // THE REAL LATEST ELIGIBILITY IS STILL THE ORIGINAL ONE: the historical name neither
+            // replaced it nor cleared it, proven by the latest task's own duplicate still being
+            // re-acknowledged on this same live stream.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(
+                "task-arb-latest", expectedAcknowledgementsAfter: 2);
+            Assert.Equal(0, h.AcknowledgedCount("task-arb-historical"));
         });
     }
 
@@ -898,10 +919,10 @@ public sealed class CompletionReceiptAckTests
         await AckHarness.RunAsync(h, async () =>
         {
             await h.CompleteOrdinaryAsync("task-older-first");
-            Assert.Equal("task-older-first", h.Worker.AckState.LatestEligibleTaskId);
+            Assert.Equal(1, h.AcknowledgedCount("task-older-first"));
 
             await h.CompleteOrdinaryAsync("task-older-second");
-            Assert.Equal("task-older-second", h.Worker.AckState.LatestEligibleTaskId);
+            Assert.Equal(1, h.AcknowledgedCount("task-older-second"));
 
             // BOTH receipts really are retained — the refusal is about ELIGIBILITY, not about missing
             // evidence.
@@ -922,7 +943,13 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.Recorder.ConfirmCalls);
             Assert.Equal(1, h.AcknowledgedCount("task-older-first"));
             Assert.Equal(1, h.AcknowledgedCount("task-older-second"));
-            Assert.Equal("task-older-second", h.Worker.AckState.LatestEligibleTaskId);
+
+            // THE ADVANCE IS PROVEN FROM BOTH SIDES, LIVE. The OLDER id got no read and no
+            // re-acknowledgement above — and the SECOND one, which the advance moved the single
+            // holder to, still IS re-acknowledged on this very stream.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(
+                "task-older-second", expectedAcknowledgementsAfter: 2);
+            Assert.Equal(1, h.AcknowledgedCount("task-older-first"));
         });
     }
 
@@ -941,8 +968,7 @@ public sealed class CompletionReceiptAckTests
 
             await h.CompleteOrdinaryWithoutAckAsync("task-disabled-dup");
 
-            // A DISABLED REGISTRATION STORES NO ELIGIBILITY AND PUBLISHES NO ACKNOWLEDGEMENT.
-            Assert.Null(h.Worker.AckState.LatestEligibleTaskId);
+            // A DISABLED REGISTRATION CREATES NO ELIGIBILITY AND PUBLISHES NO ACKNOWLEDGEMENT.
             Assert.Equal(0, h.AcknowledgedCount("task-disabled-dup"));
             h.ResetObservations();
 
@@ -960,27 +986,30 @@ public sealed class CompletionReceiptAckTests
     }
 
     /// <summary>
-    /// THE DISABLED REGISTRATION IS REFUSED AT ENTRY EVEN IF ITS SLOT WERE POPULATED — which is the
-    /// ONLY way to isolate the negotiation gate, so the slot is SEEDED DIRECTLY here and the seed is
-    /// stated rather than pretended away.
+    /// THE DISABLED REGISTRATION IS REFUSED AT ENTRY EVEN IF ITS ELIGIBILITY HOLDER WERE POPULATED —
+    /// which is the ONLY way to isolate the negotiation gate, so a TEST-OWNED holder is SEEDED here
+    /// and the seed is stated rather than pretended away.
     /// </summary>
     /// <remarks>
     /// <para>
     /// WHY THE SEED IS NECESSARY, HONESTLY. Through production paths a disabled registration can never
-    /// acquire a latest-eligible id, because the ordinary completion advances the slot only for an
+    /// acquire a latest-eligible id, because the ordinary completion advances the holder only for an
     /// ENABLED registration. So the two gates are normally redundant, and a mutant that dropped the
-    /// negotiation check would still pass every other vector in this file. Seeding the slot makes the
+    /// negotiation check would still pass every other vector in this file. Seeding a holder makes the
     /// negotiation check the ONLY thing that can refuse this delivery, which is exactly what makes the
     /// vector discriminating.
     /// </para>
     /// <para>
-    /// THE SEED IS NOT PRODUCTION STATE: it is the test asserting a gate, and it changes nothing about
-    /// what the disabled registration's own runtime does — the vector's remaining assertions show the
-    /// delivery is still refused with no read, no acknowledgement and no processing.
+    /// THE SEEDED HOLDER IS EXPLICITLY THE TEST'S OWN, AND IT IS SEPARATE. Production's holder belongs
+    /// to one live <c>WorkStream</c> invocation and is unreachable from here by construction, so this
+    /// vector constructs its own and hands it to a DIRECT handler call. It is never presented as a
+    /// live RPC's local, and it changes nothing about what the disabled registration's own runtime
+    /// does — the remaining assertions show the delivery is still refused with no read, no
+    /// acknowledgement and no processing.
     /// </para>
     /// </remarks>
     [Fact]
-    public async Task Duplicate_DisabledRegistrationWithASeededSlot_IsStillRefusedAtEntry()
+    public async Task Duplicate_DisabledRegistrationWithASeededHolder_IsStillRefusedAtEntry()
     {
         const string taskId = "task-dup-disabled-seeded";
 
@@ -989,9 +1018,11 @@ public sealed class CompletionReceiptAckTests
         {
             Assert.False(h.Worker.CompletionReceiptAckEnabled);
 
-            // THE SEED: the one thing a disabled registration can never do through production.
-            h.Worker.AckState.AdvanceLatestEligible(taskId);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+            // THE SEED, ON A TEST-OWNED HOLDER: the one thing a disabled registration can never do
+            // through production.
+            var seededState = new WorkStreamCompletionAckState();
+            seededState.AdvanceLatestEligible(taskId);
+            Assert.Equal(taskId, seededState.LatestEligibleTaskId);
 
             h.AssignSuccessor("task-dup-disabled-seeded-successor", "successor-model");
             h.ResetObservations();
@@ -1000,7 +1031,7 @@ public sealed class CompletionReceiptAckTests
             // timing out on a channel nobody drains yet.
             await h.PinPumpAsync();
 
-            h.InvokeDuplicateDirectly(h.Worker, taskId, "assigned-model", output: null);
+            h.InvokeDuplicateDirectly(h.Worker, taskId, "assigned-model", output: null, seededState);
 
             // THE NEGOTIATION GATE REFUSED: no read at all, and the delivery was treated as an
             // ordinary un-owned completion by the validated ownership checks.
@@ -1015,8 +1046,9 @@ public sealed class CompletionReceiptAckTests
                 m => m.Contains(ProductionLogFragments.DuplicateIgnored, StringComparison.Ordinal));
 
             // THE LEDGER IS RE-READ THROUGH A LIVE PUMP: the direct call's return proves the handler
-            // finished, and the probe proves the pump drained — the seeded slot authorized nothing.
+            // finished, and the probe proves the pump drained — the seeded holder authorized nothing.
             await h.AssertNoNewAcknowledgementThroughALivePumpAsync((taskId, 0));
+            Assert.Equal(taskId, seededState.LatestEligibleTaskId);
 
             // THE SUCCESSOR IS UNTOUCHED.
             Assert.True(h.Worker.IsBusy);
@@ -1026,31 +1058,159 @@ public sealed class CompletionReceiptAckTests
     }
 
     /// <summary>
-    /// A FRESH / REPLACEMENT REGISTRATION GETS NO CONFIRMATION READ AND NO RE-ACKNOWLEDGEMENT: a new
-    /// instance under the same id starts with a NULL slot, so its predecessor's retained evidence can
-    /// never authorize it — there is nothing to read against.
+    /// A FRESH STREAM UNDER THE SAME WORKER ID INHERITS NOTHING: after an eligible completion on the
+    /// FIRST stream, a REPLACEMENT registers under the SAME id, opens a REAL new <c>WorkStream</c> on
+    /// the SAME service with the SAME retained receipt stores, and delivers the OLD completion — which
+    /// gets ZERO confirmation reads, NO acknowledgement and mutates nothing.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE EVIDENCE IS GENUINELY THERE, which is what makes the refusal discriminating. The durable
+    /// receipt for the old task is still retained in the SAME stores the new stream's service reads,
+    /// and the delivery carries the SAME model — so a re-acknowledgement would succeed if anything at
+    /// all carried the predecessor stream's eligibility across. The isolation is asserted by a real
+    /// behavioural absence (no read, no ack, nothing released, nothing notified), never by reading a
+    /// null property.
+    /// </para>
+    /// <para>
+    /// THE OLD COMPLETION TAKES THE ORDINARY PATH on the fresh stream and is refused by the existing
+    /// ownership validation, with the replacement's OWN successor assignment left completely intact.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task Duplicate_ReplacementRegistration_GetsNoConfirmationReadAndNoAck()
+    public async Task FreshStream_UnderTheSameWorkerId_InheritsNoEligibilityForTheOldCompletion()
     {
+        const string taskId = "task-replacement-dup";
+
         var h = AckHarness.Create();
         await AckHarness.RunAsync(h, async () =>
         {
-            await h.CompleteOrdinaryAsync("task-replacement-dup");
-            Assert.Equal("task-replacement-dup", h.Worker.AckState.LatestEligibleTaskId);
-            Assert.NotNull(h.Stores.ReceiptStore.Load("task-replacement-dup"));
+            // ── THE FIRST STREAM'S OWN ELIGIBLE COMPLETION ───────────────────────────────────
+            await h.CompleteOrdinaryAsync(taskId);
+            Assert.Equal(1, h.AcknowledgedCount(taskId));
+
+            // …and it really IS eligible on that stream: an identical duplicate is re-acknowledged.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
+
+            // THE RETAINED EVIDENCE SURVIVES THE REPLACEMENT — same stores, same service.
+            Assert.NotNull(h.Stores.ReceiptStore.Load(taskId));
             h.ResetObservations();
 
-            // THE REPLACEMENT, under the SAME worker id, with the SAME negotiated enablement.
+            // ── THE REPLACEMENT, under the SAME worker id and the SAME negotiated enablement ──
             var replacement = h.ReplacePinnedInstance();
-
             Assert.NotSame(h.Worker, replacement);
             Assert.True(replacement.CompletionReceiptAckEnabled);
 
-            // A FRESH SLOT, and no reading is performed against the predecessor's evidence.
-            Assert.Null(replacement.AckState.LatestEligibleTaskId);
+            // ── A REAL FRESH WorkStream FOR IT, on the SAME service ──────────────────────────
+            var freshStream = h.StartStream(replacement.Id);
+            await h.BarrierOnAsync(freshStream);
+            Assert.True(replacement.IsWorkStreamAttached);
+
+            // The replacement owns its OWN work, so a successor really exists to be disturbed.
+            h.AssignTaskTo(replacement, "task-replacement-successor", "successor-model");
+            h.ResetObservations();
+
+            // THE BASELINE, taken after the FIRST stream's own legitimate re-acknowledgement above,
+            // so the claim below is about what the FRESH stream did and nothing earlier.
+            var reAckedBefore =
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId);
+
+            // ── THE OLD COMPLETION, DELIVERED THROUGH THAT REAL FRESH STREAM ─────────────────
+            await h.CompleteAndAwaitOrdinaryRefusalOnAsync(
+                freshStream,
+                replacement,
+                taskId,
+                HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
+
+            // ZERO CONFIRMATION READS: the fresh stream's own holder never named this task, so the
+            // read-only branch was never entered at all.
             Assert.Equal(0, h.Recorder.ConfirmCalls);
             Assert.Equal(0, h.Recorder.RecordCalls);
+            Assert.Equal(
+                reAckedBefore,
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId));
+
+            // NO ACKNOWLEDGEMENT on the fresh stream — observed after ITS pump provably drained.
+            await h.AssertNoNewAcknowledgementThroughALivePumpOnAsync(
+                freshStream, replacement, (taskId, 0));
+
+            // NO SUCCESSOR MUTATION: the replacement still holds its own assignment, in both
+            // authorities, and nothing was released or notified.
+            Assert.True(replacement.IsBusy);
+            Assert.Equal("task-replacement-successor", replacement.CurrentTaskId);
+            Assert.NotNull(h.Queue.GetActiveTask("task-replacement-successor"));
+            Assert.Equal(0, h.DashboardNotifications);
+            Assert.Equal(0, h.TransportNotifications);
+        });
+    }
+
+    /// <summary>
+    /// TWO DISTINCT LIVE STREAMS ON THE SAME SERVICE RETAIN INDEPENDENT LATEST ELIGIBILITY: each
+    /// completes its OWN task and re-acknowledges ONLY that task, while the OTHER stream's task gets
+    /// no read and no acknowledgement from it.
+    /// </summary>
+    /// <remarks>
+    /// EACH STREAM IS A REAL <c>WorkStream</c> INVOCATION, so the eligibility exercised is genuinely
+    /// per invocation. Both share the service, the queue, the pool and the receipt stores — so the
+    /// cross-stream refusals below cannot be explained by missing evidence: the other stream's receipt
+    /// is durably retained and would confirm if anything at all were shared.
+    /// </remarks>
+    [Fact]
+    public async Task TwoLiveStreams_RetainIndependentLatestEligibility()
+    {
+        const string firstTaskId = "task-two-streams-first";
+        const string secondTaskId = "task-two-streams-second";
+
+        var h = AckHarness.Create();
+        await AckHarness.RunAsync(h, async () =>
+        {
+            // ── THE SECOND WORKER AND ITS OWN REAL STREAM ────────────────────────────────────
+            var secondWorker = h.RegisterAdditionalWorker("ack-duplicate-worker-2");
+            var secondStream = h.StartStream(secondWorker.Id);
+            await h.BarrierOnAsync(secondStream);
+            Assert.True(secondWorker.IsWorkStreamAttached);
+
+            // ── EACH STREAM COMPLETES ITS OWN TASK ───────────────────────────────────────────
+            await h.CompleteOrdinaryAsync(firstTaskId);
+            await h.CompleteOrdinaryOnAsync(secondStream, secondWorker, secondTaskId);
+
+            Assert.Equal(1, h.AcknowledgedCount(firstTaskId));
+            Assert.Equal(1, AckHarness.AcknowledgedCountOn(secondStream, secondTaskId));
+
+            // BOTH receipts are durably retained in the SHARED stores.
+            Assert.NotNull(h.Stores.ReceiptStore.Load(firstTaskId));
+            Assert.NotNull(h.Stores.ReceiptStore.Load(secondTaskId));
+            h.ResetObservations();
+
+            // ── EACH STREAM RE-ACKNOWLEDGES ONLY ITS OWN LATEST TASK ─────────────────────────
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(
+                firstTaskId, expectedAcknowledgementsAfter: 2);
+            await h.DuplicateAndAwaitReAckOnAsync(secondStream, secondWorker, secondTaskId);
+            Assert.Equal(2, AckHarness.AcknowledgedCountOn(secondStream, secondTaskId));
+
+            // ── AND NEITHER CAN ANSWER FOR THE OTHER'S TASK ──────────────────────────────────
+            var confirmationsBefore = h.Recorder.ConfirmCalls;
+
+            // The SECOND stream's worker is idle and its holder never named the FIRST task, so that
+            // delivery takes the ORDINARY path and is refused there — with no read at all.
+            await h.CompleteAndAwaitOrdinaryRefusalOnAsync(
+                secondStream,
+                secondWorker,
+                firstTaskId,
+                HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
+
+            // …and symmetrically for the FIRST stream against the SECOND stream's task.
+            await h.CompleteAndAwaitOrdinaryRefusalAsync(
+                secondTaskId,
+                HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask);
+
+            Assert.Equal(confirmationsBefore, h.Recorder.ConfirmCalls);
+            Assert.Equal(0, h.Recorder.RecordCalls);
+
+            // NOTHING CROSSED, observed after BOTH pumps provably drained.
+            await h.AssertNoNewAcknowledgementThroughALivePumpAsync((firstTaskId, 2), (secondTaskId, 0));
+            await h.AssertNoNewAcknowledgementThroughALivePumpOnAsync(
+                secondStream, secondWorker, (secondTaskId, 2), (firstTaskId, 0));
         });
     }
 
@@ -1082,7 +1242,13 @@ public sealed class CompletionReceiptAckTests
         var h = AckHarness.Create();
         await AckHarness.RunAsync(h, async () =>
         {
-            await h.CompleteOrdinaryDirectAsync(taskId);
+            // THE ONE TEST-OWNED HOLDER BOTH DIRECT CALLS SHARE. Production's holder belongs to a
+            // live WorkStream invocation; these are DIRECT handler calls, so the ordinary completion
+            // and the duplicate that follows it must be given the SAME caller-owned holder or the
+            // duplicate would have nothing to be a duplicate OF.
+            var directState = new WorkStreamCompletionAckState();
+
+            await h.CompleteOrdinaryDirectAsync(taskId, directState);
             h.AssignSuccessor("task-dup-aba-successor", "successor-model");
             Assert.Equal(1, h.AcknowledgedCount(taskId));
             h.ResetObservations();
@@ -1102,7 +1268,7 @@ public sealed class CompletionReceiptAckTests
             };
 
             // A DIRECT, SYNCHRONOUS call: it RETURNING is the post-handler barrier.
-            h.InvokeDuplicateDirectly(h.Worker, taskId, "assigned-model", output: null);
+            h.InvokeDuplicateDirectly(h.Worker, taskId, "assigned-model", output: null, directState);
 
             // THE READ REALLY SUCCEEDED AND THE RECHECK REALLY REFUSED.
             Assert.Equal(1, h.Recorder.ConfirmCalls);
@@ -1125,10 +1291,18 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
 
-            // THE REPLACEMENT WAS NEVER ANSWERED ON ITS PREDECESSOR'S EVIDENCE.
+            // THE REPLACEMENT WAS NEVER ANSWERED ON ITS PREDECESSOR'S EVIDENCE: the refusal named
+            // the pinned-instance guard above, and the ledger carries no acknowledgement beyond the
+            // ordinary completion's own.
             Assert.NotNull(replacement);
             Assert.True(replacement!.CompletionReceiptAckEnabled);
-            Assert.Null(replacement.AckState.LatestEligibleTaskId);
+            Assert.DoesNotContain(
+                h.ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.DuplicateReAcknowledged, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+            // THE CALLER'S OWN HOLDER WAS NEITHER ADVANCED NOR CLEARED by the refused duplicate.
+            Assert.Equal(taskId, directState.LatestEligibleTaskId);
         });
     }
 
@@ -1163,7 +1337,17 @@ public sealed class CompletionReceiptAckTests
         {
             await h.CompleteOrdinaryAsync(taskId);
             Assert.Equal(1, h.AcknowledgedCount(taskId));
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+
+            // THE ELIGIBILITY REALLY EXISTS FOR THIS TASK on this stream — so the vector below
+            // genuinely discriminates the HELD gate rather than an empty holder.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
+
+            // THE DUPLICATE-BRANCH DIAGNOSTIC BASELINE, taken AFTER that probe and BEFORE the
+            // delivery under test, so the "never entered the branch" claims below are about THIS
+            // delivery rather than about the probe that legitimately used the branch.
+            var ignoredBefore = h.DiagnosticCount(ProductionLogFragments.DuplicateIgnored, taskId);
+            var reAckedBefore =
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId);
 
             // THE TASK IS RE-DISPATCHED: active in the queue for this worker and busy in the pool —
             // a live assignment again, exactly as a genuine re-dispatch leaves it.
@@ -1179,15 +1363,15 @@ public sealed class CompletionReceiptAckTests
             // Progress message legitimately refreshes it and would mask a withheld refresh.
             var activityAtAcceptance = await h.CompleteHeldTaskOrdinarilyAsync(taskId);
 
-            // ── THE BRANCH WAS NEVER ENTERED ────────────────────────────────────────────────
-            // Not one confirmation read happened, so this delivery never reached the read-only path.
+            // ── THE BRANCH WAS NEVER ENTERED BY THIS DELIVERY ───────────────────────────────
+            // Not one confirmation read happened since the reset, so it never reached the read-only
+            // path — and neither duplicate diagnostic moved past its pre-delivery baseline.
             Assert.Equal(0, h.Recorder.ConfirmCalls);
-            Assert.DoesNotContain(
-                h.ServiceLogger.Messages,
-                m => m.Contains(ProductionLogFragments.DuplicateIgnored, StringComparison.Ordinal));
-            Assert.DoesNotContain(
-                h.ServiceLogger.Messages,
-                m => m.Contains(ProductionLogFragments.DuplicateReAcknowledged, StringComparison.Ordinal));
+            Assert.Equal(
+                ignoredBefore, h.DiagnosticCount(ProductionLogFragments.DuplicateIgnored, taskId));
+            Assert.Equal(
+                reAckedBefore,
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId));
 
             // ── IT WAS HANDLED ORDINARILY: recorded, released, removed and notified ──────────
             Assert.Equal(1, h.Recorder.RecordCalls);
@@ -1198,8 +1382,9 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(1, h.DashboardNotifications);
 
             // …and the ordinary path published its own acknowledgement, so the completion was not
-            // swallowed: the ledger now carries the first completion's ack and this one's.
-            Assert.Equal(2, h.AcknowledgedCount(taskId));
+            // swallowed: the ledger now carries the first completion's ack, the eligibility probe's
+            // re-acknowledgement, and this one's.
+            Assert.Equal(3, h.AcknowledgedCount(taskId));
 
             // ── THE ACTIVITY REFRESH WAS NOT WITHHELD ───────────────────────────────────────
             // The read loop's exemption must not apply to a genuinely held completion, or the
@@ -1286,12 +1471,17 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
 
             // The one-sided pre-existing state was not changed by the refused ordinary path.
             Assert.Equal(cell == 1, h.Worker.IsBusy);
             Assert.Equal(cell == 1 ? taskId : null, h.Worker.CurrentTaskId);
             Assert.Equal(cell == 0, h.Queue.GetActiveTask(taskId) is not null);
+
+            // THE ELIGIBILITY SURVIVED: once the one-sided hold is cleared, an identical duplicate
+            // is re-acknowledged again, so the refusal above really was the entry gate and not a
+            // lost or cleared latest id.
+            await h.AssertLatestEligibleSurvivedAndReAcknowledgesAfterReleaseAsync(
+                taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -1356,8 +1546,10 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(taskId, h.Worker.CurrentTaskId);
             Assert.NotNull(h.Queue.GetActiveTask(taskId));
 
-            // THE SLOT SURVIVES A FAILED DUPLICATE.
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+            // THE STREAM'S ELIGIBILITY SURVIVES A FAILED DUPLICATE: once the re-dispatch is undone,
+            // an identical duplicate is re-acknowledged again on this same live stream.
+            await h.AssertLatestEligibleSurvivedAndReAcknowledgesAfterReleaseAsync(
+                taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -1389,7 +1581,10 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+
+            // THE ELIGIBILITY SURVIVED THE MALFORMED DELIVERY: a well-formed identical duplicate is
+            // still re-acknowledged on this same live stream.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -1421,7 +1616,10 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.Recorder.RecordCalls);
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+
+            // THE ELIGIBILITY SURVIVED THE PRESENCE REFUSAL: a model-carrying identical duplicate is
+            // still re-acknowledged on this same live stream.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -1474,7 +1672,12 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.TasksEnqueued);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+
+            // THE WINNER'S OWN ELIGIBILITY IS UNTOUCHED by the loser: the winner's identical
+            // duplicate is still re-acknowledged on ITS live stream — and the loser's writer still
+            // carries nothing.
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
+            Assert.Empty(loser.Writer.Acknowledgements());
         });
     }
 
@@ -1525,9 +1728,16 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(0, h.Recorder.RecordCalls);
             Assert.Equal(0, h.DashboardNotifications);
             Assert.Equal(0, h.TransportNotifications);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
             Assert.Equal(successorBefore, h.SuccessorSnapshot());
             Assert.False(h.StreamEnded);
+
+            // THE FAILED ENQUEUE LEFT THE DUPLICATE ELIGIBLE FOR REAL CONFIRMATION: the next
+            // identical duplicate still ENTERS the read-only branch and performs a genuine
+            // confirmation read, refused only at the (still closed) channel. A cleared eligibility
+            // would have routed it down the ordinary path instead.
+            await h.AssertLatestEligibleStillReachesConfirmationDespiteLostEnqueueAsync(taskId);
+            Assert.Equal(0, h.Recorder.RecordCalls);
+            Assert.Equal(1, h.AcknowledgedCount(taskId));
         });
     }
 
@@ -1605,8 +1815,10 @@ public sealed class CompletionReceiptAckTests
             Assert.Equal(1, h.AcknowledgedCount(taskId));
             await h.AssertNoNewAcknowledgementThroughALivePumpAsync((taskId, 1));
 
-            // The slot survives a failed duplicate.
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+            // THE STREAM'S ELIGIBILITY SURVIVES A FAILED DUPLICATE: once the re-dispatch is undone,
+            // an identical duplicate is re-acknowledged again through the same live stream.
+            await h.AssertLatestEligibleSurvivedAndReAcknowledgesAfterReleaseAsync(
+                taskId, expectedAcknowledgementsAfter: 2);
         });
     }
 
@@ -1639,10 +1851,16 @@ public sealed class CompletionReceiptAckTests
         var h = AckHarness.Create();
         await AckHarness.RunAsync(h, async () =>
         {
-            // A FIRST ordinary completion populates the slot, so latest-ID equality holds below and
-            // the ONLY thing keeping this delivery off the duplicate branch is the held state.
+            // A FIRST ordinary completion populates this stream's holder, so latest-ID equality
+            // holds below and the ONLY thing keeping this delivery off the duplicate branch is the
+            // held state. The eligibility is proven LIVE — a duplicate right now IS re-acknowledged.
             await h.CompleteOrdinaryAsync(taskId);
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter: 2);
+
+            // THE BASELINE, taken after that probe and before the delivery under test.
+            var ignoredBefore = h.DiagnosticCount(ProductionLogFragments.DuplicateIgnored, taskId);
+            var reAckedBefore =
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId);
 
             // THE TASK IS HELD AGAIN WHEN THE DELIVERY IS CLASSIFIED — so the arm classifies it as
             // ORDINARY and refreshes the activity clock.
@@ -1665,12 +1883,11 @@ public sealed class CompletionReceiptAckTests
             // performed a confirmation read, which ONLY the duplicate branch does, and it emitted no
             // duplicate diagnostic of any kind.
             Assert.Equal(0, h.Recorder.ConfirmCalls);
-            Assert.DoesNotContain(
-                h.ServiceLogger.Messages,
-                m => m.Contains(ProductionLogFragments.DuplicateIgnored, StringComparison.Ordinal));
-            Assert.DoesNotContain(
-                h.ServiceLogger.Messages,
-                m => m.Contains(ProductionLogFragments.DuplicateReAcknowledged, StringComparison.Ordinal));
+            Assert.Equal(
+                ignoredBefore, h.DiagnosticCount(ProductionLogFragments.DuplicateIgnored, taskId));
+            Assert.Equal(
+                reAckedBefore,
+                h.DiagnosticCount(ProductionLogFragments.DuplicateReAcknowledged, taskId));
 
             // THE ORDINARY PATH RAN AND WAS REFUSED BY ITS OWN QUEUE-OWNERSHIP GATE. The carried
             // snapshot still says the worker is busy with this task — that is the whole point of
@@ -1686,9 +1903,10 @@ public sealed class CompletionReceiptAckTests
                      && m.Contains(taskId, StringComparison.Ordinal));
             Assert.Equal(0, h.Recorder.RecordCalls);
 
-            // NOTHING WAS ACKNOWLEDGED OR NOTIFIED by this delivery.
-            Assert.Equal(1, h.AcknowledgedCount(taskId));
-            await h.AssertNoNewAcknowledgementThroughALivePumpAsync((taskId, 1));
+            // NOTHING WAS ACKNOWLEDGED OR NOTIFIED by this delivery: the ledger still carries only
+            // the ordinary completion's own acknowledgement and the eligibility probe's.
+            Assert.Equal(2, h.AcknowledgedCount(taskId));
+            await h.AssertNoNewAcknowledgementThroughALivePumpAsync((taskId, 2));
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.DashboardNotifications);
         });
@@ -1728,7 +1946,10 @@ public sealed class CompletionReceiptAckTests
         Assert.Equal(1, CountOccurrences(body, "ClassifyCompletionDelivery("));
         Assert.Equal(
             1,
-            CountOccurrences(body, "var completionRouting =\n                            ClassifyCompletionDelivery("));
+            CountOccurrences(
+                body,
+                "var completionRouting = ClassifyCompletionDelivery(\n"
+                + "                            pinnedWorker, message.Complete.TaskId, completionAckState);"));
 
         // ── THE ACTIVITY DECISION IS CONTROLLED BY THAT EXACT LOCAL'S FIELD ─────────────────
         Assert.Contains(
@@ -1741,12 +1962,29 @@ public sealed class CompletionReceiptAckTests
 
         // ── THAT EXACT LOCAL IS THE HANDLER'S ROUTING ARGUMENT ─────────────────────────────
         Assert.Contains(
-            "HandleClassifiedTaskComplete(pinnedWorker, message.Complete, completionRouting);",
+            "HandleClassifiedTaskComplete(\n"
+            + "                            pinnedWorker, message.Complete, completionRouting, completionAckState);",
             body,
             StringComparison.Ordinal);
 
         // …and the loop never routes through the classifying entry point, which would re-observe.
         Assert.DoesNotContain("HandleTaskComplete(pinnedWorker", body, StringComparison.Ordinal);
+
+        // ── THE ELIGIBILITY HOLDER IS THE INVOCATION'S, NOT THE ARM'S ──────────────────────
+        // The arm NAMES the WorkStream invocation's one local in both expressions and allocates
+        // nothing of its own: a per-message allocation, a lazy fallback or a worker/service/static
+        // lookup would all have to appear here.
+        Assert.Equal(2, CountOccurrences(body, "completionAckState"));
+        foreach (var forbiddenHolderSource in new[]
+                 {
+                     "new WorkStreamCompletionAckState(",   // a per-message allocation
+                     "pinnedWorker.AckState",               // an attachment on the worker
+                     "_completionAckState",                 // a service field
+                     "??=",                                 // a lazy fallback
+                 })
+        {
+            Assert.DoesNotContain(forbiddenHolderSource, body, StringComparison.Ordinal);
+        }
 
         // ── NO INDEPENDENT OWNERSHIP RE-OBSERVATION ANYWHERE IN THE ARM ────────────────────
         // A second look at mutable ownership is exactly the divergence this arm exists to prevent.
@@ -1756,11 +1994,57 @@ public sealed class CompletionReceiptAckTests
                      "GetActiveTask",
                      "GetWorker(",
                      "IsLatestEligibleDuplicate(",   // the predicate itself, re-evaluated
-                     "ClassifyCompletionDelivery(pinnedWorker, message.Complete.TaskId).",
+                     "message.Complete.TaskId, completionAckState).",
                  })
         {
             Assert.DoesNotContain(reObservation, body, StringComparison.Ordinal);
         }
+
+        // ── THE HOLDER IS ALLOCATED EXACTLY ONCE, OUTSIDE THE READ LOOP ────────────────────
+        // It is a LOCAL of the WorkStream invocation: one allocation in the whole method, textually
+        // before the read loop the arm lives in, and no service field of that type anywhere.
+        var workStream = StripComments(source.Between(
+            "public override async Task WorkStream(", "public override Task<HeartbeatResponse> Heartbeat("));
+        Assert.Equal(
+            1, CountOccurrences(workStream, "var completionAckState = new WorkStreamCompletionAckState();"));
+        Assert.True(
+            workStream.IndexOf("var completionAckState = new WorkStreamCompletionAckState();", StringComparison.Ordinal)
+            < workStream.IndexOf("await foreach (var message in requestStream", StringComparison.Ordinal),
+            "the one latest-eligible holder must be allocated OUTSIDE the read loop.");
+        var uncommentedService = StripComments(source.Text);
+        Assert.DoesNotContain(
+            "WorkStreamCompletionAckState _", uncommentedService, StringComparison.Ordinal);
+        Assert.Equal(
+            1,
+            CountOccurrences(uncommentedService, "new WorkStreamCompletionAckState("));
+
+        // ── THE DIRECT-CALLER WRAPPER REQUIRES THE CALLER'S HOLDER ────────────────────────
+        // There is exactly ONE retained wrapper, no production caller of it, and its state argument
+        // is neither optional nor defaulted. That makes every reflective test caller state its own
+        // ownership explicitly instead of receiving an invisible per-call fallback.
+        var directWrappers = typeof(HiveOrchestratorService)
+            .GetMethods(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Where(method => method.Name == "HandleTaskComplete")
+            .ToArray();
+        var directWrapper = Assert.Single(directWrappers);
+        var directParameters = directWrapper.GetParameters();
+        Assert.Equal(3, directParameters.Length);
+        Assert.Equal(typeof(WorkStreamCompletionAckState), directParameters[2].ParameterType);
+        Assert.Equal("ackState", directParameters[2].Name);
+        Assert.False(directParameters[2].IsOptional);
+        Assert.False(directParameters[2].HasDefaultValue);
+        Assert.Equal(1, CountOccurrences(uncommentedService, "HandleTaskComplete("));
+
+        var directWrapperBody = StripComments(source.Between(
+            "private void HandleTaskComplete(",
+            "private void HandleClassifiedTaskComplete("));
+        Assert.DoesNotContain(
+            "new WorkStreamCompletionAckState(", directWrapperBody, StringComparison.Ordinal);
+        Assert.Contains(
+            "ClassifyCompletionDelivery(worker, complete.TaskId, ackState)",
+            directWrapperBody,
+            StringComparison.Ordinal);
+        Assert.Contains("ackState);", directWrapperBody, StringComparison.Ordinal);
 
         // ── AND THE CARRYING HANDLER DOES NOT RE-OBSERVE EITHER, BEFORE IT ROUTES ──────────
         var handlerEntry = StripComments(source.Between(
@@ -1847,9 +2131,6 @@ public sealed class CompletionReceiptAckTests
             // The post-read recheck saw the redispatch and refused, so nothing was published.
             Assert.Equal(1, h.AcknowledgedCount(taskId));
             await h.AssertNoNewAcknowledgementThroughALivePumpAsync((taskId, 1));
-
-            // The slot survives a failed duplicate.
-            Assert.Equal(taskId, h.Worker.AckState.LatestEligibleTaskId);
 
             // ── AND THE RE-DISPATCHED ASSIGNMENT IS STILL COMPLETABLE ORDINARILY ─────────────
             // It reuses the same opaque id, so the recorder settles AlreadyStored on the identical
@@ -2338,17 +2619,27 @@ public sealed class CompletionReceiptAckTests
         /// </summary>
         /// <param name="taskId">The task's identifier.</param>
         /// <param name="model">The task's assigned model.</param>
-        public void AssignTask(string taskId, string model)
+        public void AssignTask(string taskId, string model) =>
+            AssignTaskTo(Worker, taskId, model);
+
+        /// <summary>
+        /// The same production assignment path for ANY registered instance, so a second live worker
+        /// can own real work of its own on its own stream.
+        /// </summary>
+        /// <param name="worker">The instance that will own the task.</param>
+        /// <param name="taskId">The task's identifier.</param>
+        /// <param name="model">The task's assigned model.</param>
+        public void AssignTaskTo(ConnectedWorker worker, string taskId, string model)
         {
             var task = BuildTask(taskId, model);
             Queue.Enqueue(task);
             var dequeued = Queue.TryDequeue(DomainWorkerRole.Unspecified);
             Assert.NotNull(dequeued);
-            Service.ApplyTaskAssignment(Worker, dequeued!);
-            RecordContext(taskId);
+            Service.ApplyTaskAssignment(worker, dequeued!);
+            RecordContext(taskId, worker.Id);
 
-            Assert.True(Worker.IsBusy);
-            Assert.Equal(taskId, Worker.CurrentTaskId);
+            Assert.True(worker.IsBusy);
+            Assert.Equal(taskId, worker.CurrentTaskId);
         }
 
         /// <summary>Builds a completion payload with the requested model presence.</summary>
@@ -2444,8 +2735,15 @@ public sealed class CompletionReceiptAckTests
         /// meaningful.
         /// </remarks>
         /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="ackState">
+        /// The TEST-OWNED eligibility holder this direct call advances. It is explicitly NOT a live
+        /// RPC's local: production's holder belongs to one <c>WorkStream</c> invocation, and a direct
+        /// handler call is not that invocation — so the caller owns this one and must pass the SAME
+        /// instance to the duplicate that follows.
+        /// </param>
         /// <returns>A task that completes once the handler finished and the ack was forwarded.</returns>
-        public async Task CompleteOrdinaryDirectAsync(string taskId)
+        public async Task CompleteOrdinaryDirectAsync(
+            string taskId, WorkStreamCompletionAckState ackState)
         {
             await PinPumpAsync();
 
@@ -2461,7 +2759,8 @@ public sealed class CompletionReceiptAckTests
 
             try
             {
-                method!.Invoke(Service, [Worker, BuildDuplicate(taskId, "assigned-model", null)]);
+                method!.Invoke(
+                    Service, [Worker, BuildDuplicate(taskId, "assigned-model", null), ackState]);
             }
             catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
             {
@@ -2469,12 +2768,12 @@ public sealed class CompletionReceiptAckTests
                 throw;
             }
 
-            // THE ORDINARY PATH REALLY COMPLETED: released, recorded and acknowledged, with the slot
-            // naming this task and the acknowledgement already at the writer.
+            // THE ORDINARY PATH REALLY COMPLETED: released, recorded and acknowledged, with the
+            // CALLER'S OWN holder naming this task and the acknowledgement already at the writer.
             await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
             Assert.False(Worker.IsBusy);
             Assert.NotNull(Stores.ReceiptStore.Load(taskId));
-            Assert.Equal(taskId, Worker.AckState.LatestEligibleTaskId);
+            Assert.Equal(taskId, ackState.LatestEligibleTaskId);
         }
 
         /// <summary>
@@ -2871,8 +3170,16 @@ public sealed class CompletionReceiptAckTests
         /// <param name="taskId">The duplicated task's identifier.</param>
         /// <param name="model">The model the duplicate carries, or <c>null</c> for ABSENT.</param>
         /// <param name="output">The output to carry, or <c>null</c> for the default.</param>
+        /// <param name="ackState">
+        /// The TEST-OWNED eligibility holder this direct call is routed against — the SAME instance
+        /// the simulated ordinary completion advanced, when the vector simulates that sequence.
+        /// </param>
         public void InvokeDuplicateDirectly(
-            ConnectedWorker pinned, string taskId, string? model, string? output)
+            ConnectedWorker pinned,
+            string taskId,
+            string? model,
+            string? output,
+            WorkStreamCompletionAckState ackState)
         {
             var method = typeof(HiveOrchestratorService).GetMethod(
                 "HandleTaskComplete",
@@ -2881,7 +3188,7 @@ public sealed class CompletionReceiptAckTests
 
             try
             {
-                method!.Invoke(Service, [pinned, BuildDuplicate(taskId, model, output)]);
+                method!.Invoke(Service, [pinned, BuildDuplicate(taskId, model, output), ackState]);
             }
             catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
             {
@@ -3055,6 +3362,346 @@ public sealed class CompletionReceiptAckTests
             return handle;
         }
 
+        // ── THE LIVE ELIGIBILITY PROBES ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// THE LIVE PROOF THAT THIS STREAM'S OWN LATEST ELIGIBILITY STILL NAMES
+        /// <paramref name="taskId"/>: another identical duplicate is delivered through the REAL read
+        /// loop and must be RE-ACKNOWLEDGED, which ONLY the stream's retained latest id can authorize.
+        /// </summary>
+        /// <remarks>
+        /// IT IS A BEHAVIOURAL PROBE, NOT A STATE READ. The eligibility holder belongs to one
+        /// <c>WorkStream</c> invocation and is deliberately unreachable from here, so the property is
+        /// asserted the only honest way: by exercising the protocol the eligibility authorizes. A
+        /// regression that cleared, failed to advance or relocated the holder produces an ORDINARY
+        /// refusal here and the wait for the success line expires as a named failure.
+        /// </remarks>
+        /// <param name="taskId">The task the stream's latest eligibility must still name.</param>
+        /// <param name="expectedAcknowledgementsAfter">
+        /// The cumulative acknowledgement count for that task once this probe's own
+        /// re-acknowledgement has been forwarded.
+        /// </param>
+        /// <returns>A task that completes once the re-acknowledgement was observed at the writer.</returns>
+        public async Task AssertLatestEligibleStillReAcknowledgedAsync(
+            string taskId, int expectedAcknowledgementsAfter)
+        {
+            var acknowledged = ServiceLogger.WaitFor(ProductionLogFragments.DuplicateReAcknowledged);
+            var forwarded = Writer.WaitForMessage(
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck
+                     && string.Equals(
+                         m.CompletionReceiptAck.TaskId, taskId, StringComparison.Ordinal));
+
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = Worker.Id,
+                Complete = BuildDuplicate(taskId, "assigned-model", null),
+            });
+
+            await acknowledged.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            var message = await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(Worker.Id, message.CompletionReceiptAck.WorkerId);
+
+            await BarrierAsync();
+            Assert.Equal(expectedAcknowledgementsAfter, AcknowledgedCount(taskId));
+        }
+
+        /// <summary>
+        /// The SAME live probe for a task that is currently HELD AGAIN: the hold is released through
+        /// the pool and the queue FIRST — test-owned state, never a completion — because a held task
+        /// can never be classified as a duplicate at all, and then the probe runs unchanged.
+        /// </summary>
+        /// <param name="taskId">The task the stream's latest eligibility must still name.</param>
+        /// <param name="expectedAcknowledgementsAfter">The cumulative count after the probe.</param>
+        /// <returns>A task that completes once the re-acknowledgement was observed at the writer.</returns>
+        public async Task AssertLatestEligibleSurvivedAndReAcknowledgesAfterReleaseAsync(
+            string taskId, int expectedAcknowledgementsAfter)
+        {
+            ReleaseTask(taskId);
+            await AssertLatestEligibleStillReAcknowledgedAsync(taskId, expectedAcknowledgementsAfter);
+        }
+
+        /// <summary>
+        /// THE LIVE PROOF FOR A STREAM WHOSE CHANNEL CAN NO LONGER CARRY AN ACKNOWLEDGEMENT: the next
+        /// identical duplicate still ENTERS the read-only branch and performs its REAL confirmation
+        /// read, and is refused only at the enqueue.
+        /// </summary>
+        /// <remarks>
+        /// THE DISCRIMINATOR IS THE ROUTING. A stream whose eligibility had been cleared by the failed
+        /// enqueue would send this delivery down the ORDINARY path, where an idle-for-that-task worker
+        /// is refused by the busy gate — so the absence of that ordinary refusal, together with a REAL
+        /// additional confirmation read, is what proves the eligibility survived.
+        /// </remarks>
+        /// <param name="taskId">The task the stream's latest eligibility must still name.</param>
+        /// <returns>A task that completes once the refused enqueue was observed and the handler returned.</returns>
+        public async Task AssertLatestEligibleStillReachesConfirmationDespiteLostEnqueueAsync(string taskId)
+        {
+            var confirmationsBefore = Recorder.ConfirmCalls;
+            var notQueuedBefore = CountNotQueuedDiagnostics(taskId);
+
+            var notQueued = ServiceLogger.WaitFor(ProductionLogFragments.ReceiptAckNotQueued);
+
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = Worker.Id,
+                Complete = BuildDuplicate(taskId, "assigned-model", null),
+            });
+
+            await notQueued.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierAsync();
+
+            // THE READ-ONLY BRANCH REALLY RAN: one more genuine confirmation read, and one more
+            // guarded lost-enqueue diagnostic for this exact task.
+            Assert.Equal(confirmationsBefore + 1, Recorder.ConfirmCalls);
+            Assert.Equal(notQueuedBefore + 1, CountNotQueuedDiagnostics(taskId));
+
+            // …AND THE ORDINARY PATH WAS NEVER TAKEN for it, which is where a cleared eligibility
+            // would have sent it.
+            Assert.DoesNotContain(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(
+                         HiveOrchestratorService.OwnershipRefusalReasons.WorkerNotBusyWithTask,
+                         StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+        }
+
+        private int CountNotQueuedDiagnostics(string taskId) =>
+            ServiceLogger.Messages.Count(
+                m => m.Contains(ProductionLogFragments.ReceiptAckNotQueued, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+        // ── ADDITIONAL LIVE STREAMS AND LIVE WORKERS ────────────────────────────────────────
+
+        /// <summary>
+        /// Registers ANOTHER worker through the REAL registration RPC with the acknowledgement
+        /// NEGOTIATED, so a second genuinely enabled instance exists on the SAME service.
+        /// </summary>
+        /// <param name="workerId">The additional worker's id.</param>
+        /// <returns>The published instance.</returns>
+        public ConnectedWorker RegisterAdditionalWorker(string workerId)
+        {
+            var response = Service.Register(
+                new RegisterRequest { WorkerId = workerId, RequestCompletionReceiptAck = true },
+                MockContext()).GetAwaiter().GetResult();
+
+            Assert.True(response.Accepted);
+            Assert.True(response.CompletionReceiptAckEnabled);
+
+            var worker = Pool.GetWorker(workerId)
+                ?? throw new InvalidOperationException(
+                    $"the registration RPC did not publish '{workerId}'.");
+            Assert.True(worker.CompletionReceiptAckEnabled);
+            return worker;
+        }
+
+        /// <summary>
+        /// Opens ANOTHER REAL <c>WorkStream</c> on the SAME service, with its own request reader and
+        /// its own response writer, and retains it for the strict teardown.
+        /// </summary>
+        /// <remarks>
+        /// IT IS A GENUINE PRODUCTION INVOCATION, which is the whole point: the acknowledgement
+        /// eligibility it may build up belongs to THAT invocation, so anything this stream does — or
+        /// refuses to do — is evidence about a real stream rather than about a fixture's own state.
+        /// </remarks>
+        /// <param name="workerId">The worker id this stream's messages name.</param>
+        /// <returns>The retained handle.</returns>
+        public SecondStream StartStream(string workerId)
+        {
+            var reader = new ChannelStreamReader();
+            var writer = new DuplicateObservingWriter();
+            var producer = Service.WorkStream(reader, writer, MockContext());
+
+            var handle = new SecondStream(reader, writer, producer, workerId);
+            _extraStreams.Add(handle);
+            return handle;
+        }
+
+        /// <summary>
+        /// THE POST-HANDLER BARRIER FOR AN ADDITIONAL STREAM, identical in kind to
+        /// <see cref="BarrierAsync"/>: its uniquely tokened Progress line can only be logged once
+        /// that stream's previous handler RETURNED. Its first use also PINS the stream's instance.
+        /// </summary>
+        /// <param name="stream">The additional stream to advance.</param>
+        /// <returns>A task that completes once that stream demonstrably advanced.</returns>
+        public async Task BarrierOnAsync(SecondStream stream)
+        {
+            var token = $"ack-extra-barrier-{Interlocked.Increment(ref _barrierSequence)}";
+            var signal = ServiceLogger.WaitFor(token);
+
+            stream.Reader.Push(new WorkerMessage
+            {
+                WorkerId = stream.WorkerId,
+                Progress = new TaskProgress
+                {
+                    TaskId = "barrier",
+                    Status = CopilotHive.Shared.Grpc.TaskStatus.InProgress,
+                    Message = token,
+                },
+            });
+
+            try
+            {
+                await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException(
+                    $"POST-HANDLER BARRIER '{token}' was never reached on the additional stream for " +
+                    $"'{stream.WorkerId}': its read loop did not process the following message, so the " +
+                    "handler under test did NOT return normally.",
+                    ex);
+            }
+        }
+
+        /// <summary>
+        /// Runs ONE ordinary enabled completion ON AN ADDITIONAL LIVE STREAM, awaiting the
+        /// acknowledgement AT THAT STREAM'S OWN WRITER and then that stream's post-handler barrier.
+        /// </summary>
+        /// <param name="stream">The live stream the completion travels.</param>
+        /// <param name="worker">The instance that stream is pinned to.</param>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <returns>A task that completes once the handler returned and the ack was forwarded.</returns>
+        public async Task CompleteOrdinaryOnAsync(
+            SecondStream stream, ConnectedWorker worker, string taskId)
+        {
+            AssignTaskTo(worker, taskId, "assigned-model");
+
+            var forwarded = stream.Writer.WaitForMessage(
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck
+                     && string.Equals(
+                         m.CompletionReceiptAck.TaskId, taskId, StringComparison.Ordinal));
+
+            stream.Reader.Push(new WorkerMessage
+            {
+                WorkerId = worker.Id,
+                Complete = BuildDuplicate(taskId, "assigned-model", null),
+            });
+
+            await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierOnAsync(stream);
+
+            Assert.False(worker.IsBusy);
+            Assert.Null(Queue.GetActiveTask(taskId));
+        }
+
+        /// <summary>
+        /// Delivers a duplicate ON AN ADDITIONAL LIVE STREAM that the branch must RE-ACKNOWLEDGE,
+        /// observing the publication at THAT stream's own writer.
+        /// </summary>
+        /// <param name="stream">The live stream the duplicate travels.</param>
+        /// <param name="worker">The instance that stream is pinned to.</param>
+        /// <param name="taskId">The duplicated task's identifier.</param>
+        /// <returns>A task that completes once the re-acknowledgement was observed.</returns>
+        public async Task DuplicateAndAwaitReAckOnAsync(
+            SecondStream stream, ConnectedWorker worker, string taskId)
+        {
+            var forwarded = stream.Writer.WaitForMessage(
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck
+                     && string.Equals(
+                         m.CompletionReceiptAck.TaskId, taskId, StringComparison.Ordinal));
+
+            stream.Reader.Push(new WorkerMessage
+            {
+                WorkerId = worker.Id,
+                Complete = BuildDuplicate(taskId, "assigned-model", null),
+            });
+
+            var message = await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(worker.Id, message.CompletionReceiptAck.WorkerId);
+
+            await BarrierOnAsync(stream);
+        }
+
+        /// <summary>
+        /// Delivers a completion ON AN ADDITIONAL LIVE STREAM that the ORDINARY ownership guards must
+        /// refuse, then that stream's post-handler barrier — the shape a delivery takes when the
+        /// stream's OWN eligibility holder does not name the task.
+        /// </summary>
+        /// <param name="stream">The live stream the delivery travels.</param>
+        /// <param name="worker">The instance that stream is pinned to.</param>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="expectedReason">The ordinary guard reason the diagnostic must name.</param>
+        /// <returns>A task that completes once the refusal was observed and the handler returned.</returns>
+        public async Task CompleteAndAwaitOrdinaryRefusalOnAsync(
+            SecondStream stream, ConnectedWorker worker, string taskId, string expectedReason)
+        {
+            var signal = ServiceLogger.WaitFor(expectedReason);
+
+            stream.Reader.Push(new WorkerMessage
+            {
+                WorkerId = worker.Id,
+                Complete = BuildDuplicate(taskId, "assigned-model", null),
+            });
+
+            await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            await BarrierOnAsync(stream);
+
+            Assert.Contains(
+                ServiceLogger.Messages,
+                m => m.Contains(ProductionLogFragments.CompletionIgnored, StringComparison.Ordinal)
+                     && m.Contains(expectedReason, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal)
+                     && m.Contains(worker.Id, StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// THE PUMP OBSERVATION BARRIER FOR AN ADDITIONAL STREAM: proves that stream's production
+        /// pump is live by forwarding a uniquely tokened probe through the instance's OWN channel,
+        /// then asserts its writer carries no acknowledgement beyond the stated per-task counts.
+        /// </summary>
+        /// <param name="stream">The additional stream whose writer is observed.</param>
+        /// <param name="worker">The instance that stream is pinned to.</param>
+        /// <param name="expectedAcknowledgementsByTask">The exact per-task counts on that writer.</param>
+        /// <returns>A task that completes once that pump provably forwarded the probe.</returns>
+        public async Task AssertNoNewAcknowledgementThroughALivePumpOnAsync(
+            SecondStream stream,
+            ConnectedWorker worker,
+            params (string TaskId, int Count)[] expectedAcknowledgementsByTask)
+        {
+            var token = $"ack-extra-pump-live-{Interlocked.Increment(ref _barrierSequence)}";
+            var forwarded = stream.Writer.WaitForMessage(m => m.UpdateAgents?.Role == token);
+
+            Assert.True(
+                worker.MessageChannel.Writer.TryWrite(new OrchestratorMessage
+                {
+                    UpdateAgents = new UpdateAgents { Role = token },
+                }),
+                "the pump probe could not be queued; the pump observation would not be live.");
+
+            var observed = await forwarded.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.Equal(token, observed.UpdateAgents.Role);
+
+            foreach (var (taskId, count) in expectedAcknowledgementsByTask)
+                Assert.Equal(count, AcknowledgedCountOn(stream, taskId));
+        }
+
+        /// <summary>
+        /// How many DUPLICATE-BRANCH diagnostics of one kind name <paramref name="taskId"/> so far.
+        /// </summary>
+        /// <remarks>
+        /// A COUNT, NOT A PRESENCE CHECK, because the logger's history is CUMULATIVE. A vector that
+        /// legitimately exercised the duplicate branch earlier — for example to PROVE the stream's
+        /// eligibility before the case under test — would make a bare "was it ever emitted" assertion
+        /// permanently false. Comparing a baseline taken immediately before the delivery under test
+        /// against the count after it keeps the claim about THAT delivery.
+        /// </remarks>
+        /// <param name="fragment">The production fragment to count.</param>
+        /// <param name="taskId">The task the diagnostic must name.</param>
+        /// <returns>The number of matching messages logged so far.</returns>
+        public int DiagnosticCount(string fragment, string taskId) =>
+            ServiceLogger.Messages.Count(
+                m => m.Contains(fragment, StringComparison.Ordinal)
+                     && m.Contains(taskId, StringComparison.Ordinal));
+
+        /// <summary>How many acknowledgements a given stream's writer carries for a task id.</summary>
+        /// <param name="stream">The stream whose writer is inspected.</param>
+        /// <param name="taskId">The opaque task id the acknowledgement must name.</param>
+        /// <returns>The count of forwarded acknowledgements for that exact id on that stream.</returns>
+        public static int AcknowledgedCountOn(SecondStream stream, string taskId) =>
+            stream.Writer.Acknowledgements().Count(
+                a => string.Equals(a.TaskId, taskId, StringComparison.Ordinal));
+
         /// <summary>
         /// THE POST-HANDLER BARRIER: pushes a Progress message carrying a UNIQUE token and waits for
         /// <c>HandleTaskProgress</c>'s own production log line. Because the read loop is strictly
@@ -3129,35 +3776,61 @@ public sealed class CompletionReceiptAckTests
                     ex);
             }
 
+            // ── EVERY EXTRA PRODUCER IS COMPLETED AND JOINED, UNCONDITIONALLY ────────────────
+            // THE JOIN IS NEVER SKIPPED ON IsCompleted, and that is the whole point: a task is
+            // "completed" the instant it FAULTS too, so an `if (!IsCompleted)` guard fires exactly
+            // when a fault is already sitting there unobserved — silently exempting the one outcome
+            // this strict teardown exists to surface. Awaiting unconditionally is also cheap for an
+            // already-finished task, and it is what makes "every producer joined" literally true.
+            foreach (var extra in _extraStreams)
+            {
+                extra.Reader.Complete();
+
+                try
+                {
+                    await extra.Producer.WaitAsync(BoundedWait, CancellationToken.None);
+                }
+                catch (TimeoutException ex)
+                {
+                    failure ??= new TimeoutException(
+                        $"TEARDOWN LEAK: the additional WorkStream for '{extra.WorkerId}' did not " +
+                        $"terminate within {BoundedWait.TotalSeconds:F0}s — a live producer remains.",
+                        ex);
+                }
+                catch (Exception ex) when (extra.Producer.IsCompleted)
+                {
+                    failure ??= new InvalidOperationException(
+                        $"THE ADDITIONAL WORKSTREAM FOR '{extra.WorkerId}' TERMINATED WITH A FAULT. " +
+                        "A clean vector must leave every transport draining normally; a fault here " +
+                        "means a handler escaped instead of returning.",
+                        ex);
+                }
+                catch (Exception ex)
+                {
+                    failure ??= new InvalidOperationException(
+                        $"TEARDOWN LEAK: the additional WorkStream for '{extra.WorkerId}' is still " +
+                        "running after its join failed — a live producer remains.",
+                        ex);
+                }
+            }
+
+            // ── THE SHARED STORES ARE DISPOSED LAST, AFTER EVERY PRODUCER HAS STOPPED ────────
+            // Disposing them earlier would pull the database out from under a stream that is still
+            // live, so a producer could observe store failures caused purely by teardown order —
+            // and a retained producer would outlive the state it reads. Every join above has already
+            // completed (or been recorded as a failure) by the time this runs.
             try
             {
                 Stores.Dispose();
             }
             catch
             {
-                // Best-effort — a leftover fixture must never fail a test.
+                // Best-effort — a leftover fixture must never fail a test, and a disposal problem
+                // must never replace the assertion (or the join failure) the reviewer needs.
             }
 
-            foreach (var extra in _extraStreams)
-            {
-                extra.Reader.Complete();
-
-                if (!extra.Producer.IsCompleted)
-                {
-                    try
-                    {
-                        await extra.Producer.WaitAsync(BoundedWait, CancellationToken.None);
-                    }
-                    catch (Exception ex)
-                    {
-                        failure ??= new InvalidOperationException(
-                            "TEARDOWN LEAK: a second WorkStream is still running after its join " +
-                            "failed — a live producer remains.",
-                            ex);
-                    }
-                }
-            }
-
+            // THE FIRST FAILURE IS RETURNED, NEVER THROWN: RunAsync rethrows the vector's own
+            // primary assertion first, so cleanup can never mask it.
             return failure;
         }
 

@@ -1054,10 +1054,14 @@ public sealed class DashboardNotifierWorkerWiringTests
             Output = "done",
         };
 
-        // HandleTaskComplete is private; use reflection to invoke it
+        // HandleTaskComplete is private; use reflection to invoke it. It requires an EXPLICIT
+        // eligibility holder, so this vector supplies its OWN: the holder belongs to one WorkStream
+        // invocation, and this is a DIRECT handler call rather than a live RPC, so the state here is
+        // honestly the test's — never presented as a stream's local.
+        var ackState = new WorkStreamCompletionAckState();
         var method = typeof(HiveOrchestratorService)
             .GetMethod("HandleTaskComplete", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        method.Invoke(service, [worker, complete]);
+        method.Invoke(service, [worker, complete, ackState]);
 
         // THE RELEASE REALLY HAPPENED — so the notification below is the completion's own.
         Assert.False(worker.IsBusy);

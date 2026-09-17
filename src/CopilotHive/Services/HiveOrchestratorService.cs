@@ -273,6 +273,15 @@ public sealed class HiveOrchestratorService(
         // stream never treats the winner's worker as its own.
         ConnectedWorker? pinnedWorker = null;
 
+        // ── THE ONE LATEST-ELIGIBLE HOLDER OF THIS INVOCATION ────────────────────────────────
+        // A plain LOCAL of this WorkStream call, allocated ONCE outside the read loop and owned by
+        // nothing else: not a service field, not static state, not an attachment on the worker, not
+        // a dictionary keyed by anything, and never reallocated per message. Its lifetime is
+        // EXACTLY this invocation's, so a different stream — including a replacement registration's
+        // fresh stream under the same worker id — has its own, empty one and can never be answered
+        // from this stream's eligibility. It is passed EXPLICITLY into every consumer below.
+        var completionAckState = new WorkStreamCompletionAckState();
+
         try
         {
             // Use a linked token so we can cancel the channel reader when the stream closes
@@ -394,8 +403,8 @@ public sealed class HiveOrchestratorService(
                         // activity clock for it would extend a SUCCESSOR's inactivity-derived lifetime
                         // on behalf of work that worker is not doing. Every other completion — a
                         // genuinely held or RE-DISPATCHED task included — keeps the existing refresh.
-                        var completionRouting =
-                            ClassifyCompletionDelivery(pinnedWorker, message.Complete.TaskId);
+                        var completionRouting = ClassifyCompletionDelivery(
+                            pinnedWorker, message.Complete.TaskId, completionAckState);
 
                         if (!completionRouting.IsLatestEligibleDuplicate)
                             workerPool.TouchActivity(pinnedWorker.Id);
@@ -406,7 +415,8 @@ public sealed class HiveOrchestratorService(
                         _afterCompletionActivityDecisionForTest?.Invoke(
                             pinnedWorker, message.Complete.TaskId);
 
-                        HandleClassifiedTaskComplete(pinnedWorker, message.Complete, completionRouting);
+                        HandleClassifiedTaskComplete(
+                            pinnedWorker, message.Complete, completionRouting, completionAckState);
                         break;
 
                     case WorkerMessage.PayloadOneofCase.ToolRequest:
@@ -1222,17 +1232,30 @@ public sealed class HiveOrchestratorService(
     /// decision.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// THIS IS THE ENTRY POINT FOR A CALLER THAT DID NOT ALREADY CLASSIFY — it exists so a direct
     /// invocation still goes through exactly one classification. The <c>WorkStream</c> read loop does
     /// NOT use it: the loop must classify BEFORE deciding the activity refresh, so it calls
     /// <see cref="HandleClassifiedTaskComplete"/> with the decision it already made. There is never
     /// more than one classification per delivery on either route.
+    /// </para>
+    /// <para>
+    /// THE ELIGIBILITY HOLDER IS THE CALLER'S, ALWAYS EXPLICIT. There is deliberately no default, no
+    /// optional parameter and no allocation here: the holder belongs to ONE <c>WorkStream</c>
+    /// invocation, so a caller that is not that invocation must state which holder it owns rather
+    /// than being silently handed a fresh or shared one.
+    /// </para>
     /// </remarks>
     /// <param name="worker">The pinned instance the completion was delivered on.</param>
     /// <param name="complete">The completion payload.</param>
-    private void HandleTaskComplete(ConnectedWorker worker, TaskComplete complete) =>
+    /// <param name="ackState">The caller-owned latest-eligible holder this delivery is routed against.</param>
+    private void HandleTaskComplete(
+        ConnectedWorker worker, TaskComplete complete, WorkStreamCompletionAckState ackState) =>
         HandleClassifiedTaskComplete(
-            worker, complete, ClassifyCompletionDelivery(worker, complete.TaskId));
+            worker,
+            complete,
+            ClassifyCompletionDelivery(worker, complete.TaskId, ackState),
+            ackState);
 
     /// <summary>
     /// Handles one incoming completion, routed by the PER-DELIVERY classification the read loop
@@ -1256,8 +1279,15 @@ public sealed class HiveOrchestratorService(
     /// <param name="worker">The pinned instance the completion was delivered on.</param>
     /// <param name="complete">The completion payload.</param>
     /// <param name="routing">The per-delivery classification and the observation it was made from.</param>
+    /// <param name="ackState">
+    /// The caller-owned latest-eligible holder: the SAME one the classification was made against, so
+    /// the entry condition, the advance below and the duplicate branch all read one holder.
+    /// </param>
     private void HandleClassifiedTaskComplete(
-        ConnectedWorker worker, TaskComplete complete, CompletionDeliveryRouting routing)
+        ConnectedWorker worker,
+        TaskComplete complete,
+        CompletionDeliveryRouting routing,
+        WorkStreamCompletionAckState ackState)
     {
         // ══ THE OWNERSHIP VALIDATION, BEFORE ANY CLEANUP OR NOTIFICATION ═════════════════════
         // A completion is only acted on when BOTH authorities still agree that THIS stream's
@@ -1289,9 +1319,10 @@ public sealed class HiveOrchestratorService(
         //
         // ONLY THE STILL-CURRENT CLAIMED PINNED INSTANCE OF AN ENABLED NEGOTIATION MAY ENTER: the
         // classification was made against the same pinned-instance check above, and a disabled
-        // registration (an existing/legacy worker) is refused without even reading its slot. A fresh
-        // or replacement registration is a DIFFERENT instance with a null slot, so it can never be
-        // authorized by its predecessor's evidence.
+        // registration (an existing/legacy worker) is refused without even reading the holder. The
+        // holder belongs to ONE WorkStream invocation, so a fresh stream — including the one a
+        // replacement registration under the same id opens — starts with an EMPTY holder and can
+        // never be authorized by the earlier stream's evidence.
         //
         // THE TASK MUST BE ORDINAL-EXACT AGAINST THE SLOT, and MUST NO LONGER BE HELD — see
         // CompletionDeliveryRouting. Every other name, and every genuinely re-dispatched task, takes
@@ -1459,15 +1490,15 @@ public sealed class HiveOrchestratorService(
         // a recording refusal and a refused checked release all returned above, so none of them
         // creates eligibility and none of them emits an acknowledgement.
         //
-        // THE SLOT IS SET BEFORE THE ENQUEUE, deliberately: the eligibility fact must exist even if
-        // the best-effort publication below fails, because it is state about what happened, not about
-        // what could be delivered.
+        // THE CALLER'S HOLDER IS ADVANCED BEFORE THE ENQUEUE, deliberately: the eligibility fact must
+        // exist even if the best-effort publication below fails, because it is state about what
+        // happened, not about what could be delivered.
         //
         // A DISABLED registration stores nothing and acknowledges nothing. This is what keeps an
         // existing (legacy) worker's runtime completely unchanged.
         if (worker.CompletionReceiptAckEnabled)
         {
-            worker.AckState.AdvanceLatestEligible(complete.TaskId);
+            ackState.AdvanceLatestEligible(complete.TaskId);
 
             // THE BEST-EFFORT ACKNOWLEDGEMENT. Its failure is ISOLATED: it must never suppress the
             // ordinary dashboard/downstream notification below, must never undo the release that
@@ -1621,9 +1652,10 @@ public sealed class HiveOrchestratorService(
     /// </remarks>
     /// <param name="pinned">The instance the stream is pinned to.</param>
     /// <param name="taskId">The task id the completion names.</param>
+    /// <param name="ackState">The caller-owned latest-eligible holder the id is compared against.</param>
     /// <returns>The per-delivery routing decision and the observation it was made from.</returns>
     private CompletionDeliveryRouting ClassifyCompletionDelivery(
-        ConnectedWorker pinned, string taskId)
+        ConnectedWorker pinned, string taskId, WorkStreamCompletionAckState ackState)
     {
         if (!workerPool.TryGetWorkerSnapshot(pinned.Id, out var observed)
             || !ReferenceEquals(observed.Worker, pinned))
@@ -1637,7 +1669,7 @@ public sealed class HiveOrchestratorService(
         return new CompletionDeliveryRouting(
             observed,
             ObservationValid: true,
-            IsLatestEligibleDuplicate: IsLatestEligibleDuplicate(pinned, taskId, observed));
+            IsLatestEligibleDuplicate: IsLatestEligibleDuplicate(pinned, taskId, observed, ackState));
     }
 
     /// <summary>
@@ -1648,14 +1680,21 @@ public sealed class HiveOrchestratorService(
     /// <param name="pinned">The instance the stream is pinned to.</param>
     /// <param name="taskId">The task id the completion names.</param>
     /// <param name="observed">The caller's lock-consistent ownership observation of that instance.</param>
+    /// <param name="ackState">
+    /// The caller-owned latest-eligible holder — the ONE holder of the invocation this delivery
+    /// belongs to, never a shared or per-message one.
+    /// </param>
     /// <returns><c>true</c> when the delivery is a duplicate of the latest eligible, no-longer-held task.</returns>
     private bool IsLatestEligibleDuplicate(
-        ConnectedWorker pinned, string taskId, WorkerOwnershipSnapshot observed)
+        ConnectedWorker pinned,
+        string taskId,
+        WorkerOwnershipSnapshot observed,
+        WorkStreamCompletionAckState ackState)
     {
         if (!pinned.CompletionReceiptAckEnabled)
             return false;
 
-        var latestEligible = pinned.AckState.LatestEligibleTaskId;
+        var latestEligible = ackState.LatestEligibleTaskId;
         if (latestEligible is null
             || !string.Equals(latestEligible, taskId, StringComparison.Ordinal))
         {
@@ -1683,17 +1722,18 @@ public sealed class HiveOrchestratorService(
     /// </summary>
     /// <remarks>
     /// <para>
-    /// WHAT IT IS, HONESTLY. It is a BOUNDED re-acknowledgement of exactly one task: the id stored on
-    /// the pinned instance by the most recent ordinary completion whose evidence was confirmed and
-    /// whose checked release succeeded. It is NOT a one-retransmission limit, NOT a history cache, NOT
-    /// reconnect/resume authorization and NOT a stored-receipt replay service — the slot holds one id
-    /// and advances only on the next successfully released ordinary completion, and a failed duplicate
-    /// attempt never clears or advances it.
+    /// WHAT IT IS, HONESTLY. It is a BOUNDED re-acknowledgement of exactly one task: the id held by
+    /// THIS <c>WorkStream</c> invocation's own holder, put there by the most recent ordinary
+    /// completion whose evidence was confirmed and whose checked release succeeded. It is NOT a
+    /// one-retransmission limit, NOT a history cache, NOT reconnect/resume authorization and NOT a
+    /// stored-receipt replay service — the holder keeps one id and advances only on the next
+    /// successfully released ordinary completion, and a failed duplicate attempt never clears or
+    /// advances it.
     /// </para>
     /// <para>
     /// ITS ENTRY CONDITION IS <see cref="IsLatestEligibleDuplicate"/>, which has ALREADY established —
     /// before this method is called and therefore before any mapping or confirmation read — that the
-    /// negotiation is enabled, that the id is ordinal-exact against the single slot, and that the task
+    /// negotiation is enabled, that the id is ordinal-exact against the single holder, and that the task
     /// is NO LONGER HELD (not the worker's current task and no active queue entry). A re-dispatched,
     /// genuinely live task therefore never reaches this method at all.
     /// </para>
@@ -1986,6 +2026,72 @@ public sealed class HiveOrchestratorService(
         }
     }
 
+}
+
+/// <summary>
+/// THE BOUNDED ACKNOWLEDGEMENT ELIGIBILITY OF ONE <see cref="HiveOrchestratorService.WorkStream"/>
+/// INVOCATION: at most ONE task id — the most recent completion on THAT invocation whose durable
+/// evidence was confirmed and whose checked release SUCCEEDED.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ITS OWNER IS LITERALLY ONE <c>WorkStream</c> CALL. The instance is allocated as a LOCAL of that
+/// invocation, outside its read loop, and is passed EXPLICITLY to every consumer of the delivery it
+/// belongs to. It is not a field, not static state, not attached to a <see cref="ConnectedWorker"/>
+/// and not registered anywhere, so its lifetime is exactly the invocation's: a second stream — the
+/// losing attachment, a fresh stream after a re-registration under the same worker id, or a stream
+/// for any other worker — has its OWN, EMPTY holder and can never read this one. Nothing resets,
+/// reuses or transfers it; when the invocation returns, it is simply gone.
+/// </para>
+/// <para>
+/// WHAT ADVANCES IT: only an ORDINARY completion that passed every validated ownership check, was
+/// RECORDED first, and then had its checked release APPLIED. A mapping failure, a recording refusal
+/// and a refused checked release all leave it exactly as it was — no eligibility is ever created by
+/// a failure.
+/// </para>
+/// <para>
+/// IT IS DELIBERATELY JUST ONE OPAQUE ID. It is not a history, not a receipt cache, not a retry
+/// budget and not a reconnect/resume authorization: the id is stored so a later duplicate attempt on
+/// the SAME stream can be answered from retained evidence, and the holder simply advances on the next
+/// successful ordinary completion.
+/// </para>
+/// <para>
+/// THREADING: the WorkStream read loop handles messages strictly sequentially, so the ordinary
+/// completion path is single-threaded here. The lock nevertheless makes the read/write pair atomic
+/// for any observer, because the value is read on paths that must not tear against a concurrent
+/// advance.
+/// </para>
+/// </remarks>
+internal sealed class WorkStreamCompletionAckState
+{
+    private readonly Lock _gate = new();
+    private string? _latestEligibleTaskId;
+
+    /// <summary>
+    /// The most recent task id made acknowledgement-eligible by a successful ordinary completion on
+    /// the owning invocation, or <c>null</c> when no ordinary completion has been released on it yet.
+    /// </summary>
+    internal string? LatestEligibleTaskId
+    {
+        get
+        {
+            lock (_gate)
+                return _latestEligibleTaskId;
+        }
+    }
+
+    /// <summary>
+    /// Advances the single latest-eligible slot to <paramref name="taskId"/>, REPLACING any previous
+    /// id rather than accumulating one.
+    /// </summary>
+    /// <param name="taskId">The opaque task id of the just-released completion. Never blank.</param>
+    internal void AdvanceLatestEligible(string taskId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(taskId);
+
+        lock (_gate)
+            _latestEligibleTaskId = taskId;
+    }
 }
 
 /// <summary>

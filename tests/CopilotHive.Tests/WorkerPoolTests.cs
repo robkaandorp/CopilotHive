@@ -1976,39 +1976,34 @@ public sealed class WorkerPoolTests
 
         Assert.False(worker.RequestCompletionReceiptAck);
         Assert.False(worker.CompletionReceiptAckEnabled);
-        Assert.Null(worker.AckState.LatestEligibleTaskId);
     }
 
     /// <summary>
-    /// THE LATEST-ELIGIBLE SLOT HOLDS EXACTLY ONE ID: advancing it REPLACES the previous task rather
-    /// than accumulating one, and the state is per instance.
+    /// THE LATEST-ELIGIBLE HOLDER KEEPS EXACTLY ONE ID: advancing it REPLACES the previous task
+    /// rather than accumulating one, and two holders are completely independent.
     /// </summary>
+    /// <remarks>
+    /// THE HOLDER IS OWNED BY ONE <c>WorkStream</c> INVOCATION, never by a <see cref="ConnectedWorker"/>:
+    /// there is deliberately no worker property to read here, so this vector constructs the holders
+    /// the way production does — as plain instances — and the independence assertion is what a second
+    /// live stream (or a fresh stream after a re-registration) observes.
+    /// </remarks>
     [Fact]
-    public void AckState_Advance_KeepsOnlyTheLatestTaskId()
+    public void WorkStreamCompletionAckState_Advance_KeepsOnlyTheLatestTaskId()
     {
-        var first = new ConnectedWorker
-        {
-            Id = "w-ack-state-1",
-            Role = CopilotHive.Workers.WorkerRole.Unspecified,
-            Capabilities = [],
-        };
-        var second = new ConnectedWorker
-        {
-            Id = "w-ack-state-2",
-            Role = CopilotHive.Workers.WorkerRole.Unspecified,
-            Capabilities = [],
-        };
+        var first = new WorkStreamCompletionAckState();
+        var second = new WorkStreamCompletionAckState();
 
-        Assert.Null(first.AckState.LatestEligibleTaskId);
+        Assert.Null(first.LatestEligibleTaskId);
 
-        first.AckState.AdvanceLatestEligible("task-one");
-        Assert.Equal("task-one", first.AckState.LatestEligibleTaskId);
+        first.AdvanceLatestEligible("task-one");
+        Assert.Equal("task-one", first.LatestEligibleTaskId);
 
-        first.AckState.AdvanceLatestEligible("task-two");
-        Assert.Equal("task-two", first.AckState.LatestEligibleTaskId);
+        first.AdvanceLatestEligible("task-two");
+        Assert.Equal("task-two", first.LatestEligibleTaskId);
 
-        // The other instance has its own slot.
-        Assert.Null(second.AckState.LatestEligibleTaskId);
+        // The other holder — a different invocation's — has its own, still-empty slot.
+        Assert.Null(second.LatestEligibleTaskId);
     }
 
     #endregion
