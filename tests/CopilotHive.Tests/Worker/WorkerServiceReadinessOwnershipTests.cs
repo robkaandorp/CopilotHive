@@ -431,28 +431,47 @@ public sealed class WorkerServiceReadinessOwnershipTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// REPLACEMENT: the successor's handler may not reset the runner, start its body or install its
-    /// owner until ALL of the predecessor's owned tasks — INCLUDING its separately owned readiness
-    /// write — have been joined, and each assignment still produces EXACTLY ONE Ready.
+    /// REPLACEMENT AT THE ACTUAL CALL SITE: the successor's handler may not reset the runner, start
+    /// its body or install its owner until ALL of the predecessor's owned tasks — INCLUDING its
+    /// separately owned readiness write — have been joined by the handler's OWN
+    /// <c>await DrainRetainedForReplacementAsync()</c>. Each assignment still produces EXACTLY ONE
+    /// Ready.
     /// <para>
-    /// A POSITIVE IN-HANDLER RENDEZVOUS PRECEDES THE DESTRUCTIVE RELEASE. B's session reset is the
-    /// FIRST production step after the replacement drain, and this fixture signals from INSIDE that
-    /// reset (the runner's reset entry) while recording whether A's readiness write had already
-    /// completed at that exact instant. The test does NOT release A's write beforehand, so correct
-    /// code cannot have reached the reset at all; a drain that omitted or detached the readiness
-    /// join reaches it while A's write is still parked and records <c>false</c>, failing by name.
-    /// Only after those observations is A's write released.
+    /// WHY A DEQUEUE MILESTONE IS NOT ENOUGH, AND WHAT REPLACES IT. <c>Consumed</c> only proves a
+    /// message left the channel, so it cannot establish that B's handler has entered its pre-drain
+    /// window; on a legal schedule a mutant that omits or detaches the call-site drain could start
+    /// only after the test released A and still satisfy a dequeue-gated fixture. This fixture
+    /// therefore holds A's COMPLETE write instead, which keeps A's readiness eligibility UNPUBLISHED
+    /// while B is delivered. The loop consequently CANNOT settle A's readiness write in its
+    /// read/readiness race — there is nothing yet to settle — so the ONLY participant that can ever
+    /// start it is <c>DrainAssignmentAsync</c>, reached exclusively through the handler's call-site
+    /// drain, after that drain's own reporting join observed A's report publish the eligibility.
     /// </para>
     /// <para>
-    /// The LAST-INSTANT capture from inside A's held write adds the complementary proof: while that
-    /// write is alive, A must still own the slot and B must not have been installed or started.
+    /// THE POSITIVE IN-DRAIN RENDEZVOUS. A's readiness write ENTERING the writer is therefore
+    /// production-visible proof that B's handler advanced past dequeue INTO its pre-drain window and
+    /// is now parked inside the drain. The fixture awaits that entry — never a dequeue — before it
+    /// releases anything destructive, and only then takes its pre-release observations.
+    /// </para>
+    /// <para>
+    /// THE SCHEDULE-INDEPENDENT CALL-SITE DISCRIMINATOR. At B's reset entry — the FIRST production
+    /// step after the call-site drain — the fixture captures the OWNERSHIP SLOT on the handler's own
+    /// stack. A correct call site has <c>ClearActiveAssignment()</c>d A before returning, so the slot
+    /// reads EMPTY; a handler whose <c>await</c> was REMOVED runs the reset with A STILL INSTALLED,
+    /// and a DETACHED (<c>_ = ...</c>) drain likewise reaches the reset before its own continuation
+    /// could clear. Both mutants are rejected by name regardless of how the scheduler interleaves,
+    /// because the observation is taken inside production, not by a racing test continuation.
     /// </para>
     /// </summary>
     [Fact]
     public async Task Replacement_JoinsPredecessorReadinessWriteBeforeReset_EachAssignmentOneReady()
     {
         var runner = new GatedRunner();
-        var writer = new GatedWriter();
+
+        // HOLDING THE COMPLETE WRITE is what makes the rendezvous positive: A's report cannot reach
+        // the old ordinary-Ready point, so its eligibility stays unpublished and the loop can never
+        // settle A's readiness write on its own. Only the call-site drain can.
+        var writer = new GatedWriter { HoldCompletes = true };
         var reader = new ChannelResponseReader();
         var service = BuildService(runner);
 
@@ -469,32 +488,37 @@ public sealed class WorkerServiceReadinessOwnershipTests
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
 
-            // A's readiness write ENTERS and is HELD: its report has terminated, but the write has not.
-            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // A's COMPLETE write is HELD, so A's report has NOT reached the ordinary-Ready point.
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             executionA = GetActiveExecution(service);
             reportingA = GetActiveReporting(service);
-            readinessA = CaptureReadinessWrite(
-                service, "The loop must have started and retained A's readiness write.");
             var ownerA = GetActiveAssignment(service);
-            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var ordinaryReadyA = GetOwnerOrdinaryReady(service);
+            await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE IN-HANDLER RENDEZVOUS on B's path: the runner's reset entry is the FIRST production
-            // step after the replacement drain. It records, at that exact instant, whether A's
-            // readiness write was already complete.
-            var capturedReadinessA = readinessA;
+            // NON-VACUITY: nothing is settled and no readiness write exists, so a later entry can
+            // only have been produced by the drain.
+            Assert.False(reportingA.IsCompleted, "A's report must still be inside its held Complete write.");
+            Assert.False(IsOrdinaryReadySettled(ordinaryReadyA));
+            Assert.Null(GetRetainedReadinessWrite(service));
+            Assert.Equal(0, writer.ReadyCount);
+
+            // THE CALL-SITE DISCRIMINATOR, captured on production's own stack at B's reset entry —
+            // the FIRST production step after the handler's drain. Correct code has already cleared
+            // A; an omitted or detached drain still has A installed here.
             var bResetReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var aReadinessJoinedAtBReset = new TaskCompletionSource<bool>(
+            var slotAtBReset = new TaskCompletionSource<object?>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             runner.OnResetEntered = _ =>
             {
                 if (runner.ResetCount >= 2)
                 {
-                    aReadinessJoinedAtBReset.TrySetResult(capturedReadinessA.IsCompleted);
+                    slotAtBReset.TrySetResult(GetActiveAssignment(service));
                     bResetReached.TrySetResult();
                 }
             };
 
-            // THE LAST-INSTANT CAPTURE from inside A's held write.
+            // THE LAST-INSTANT CAPTURE from inside A's held readiness write.
             object? ownerAtWriteRelease = null;
             var bStartedAtWriteRelease = true;
             writer.OnReadyReleasing = index =>
@@ -505,11 +529,27 @@ public sealed class WorkerServiceReadinessOwnershipTests
                 bStartedAtWriteRelease = runner.HasPromptStarted(TaskB);
             };
 
-            // Deliver B while A's readiness write is still HELD.
+            // Deliver B while A's Complete — and therefore A's eligibility — is still held.
             reader.Push(ResultAssignment(TaskB));
-            await reader.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // PRE-RELEASE, with A's write still held: the replacement may not have progressed.
+            // Release A's Complete: A's report now publishes eligibility and terminates. The loop is
+            // NOT in its readiness race (it is inside B's handler), so the only settler is the drain.
+            writer.ReleaseComplete(0);
+
+            // THE POSITIVE IN-HANDLER RENDEZVOUS: A's readiness write ENTERING proves B's handler
+            // reached its pre-drain window and is parked inside the drain's readiness join. Nothing
+            // else can produce it — the loop cannot settle an eligibility that was unpublished when
+            // B was dispatched — so its absence IS the omitted/detached call-site drain.
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(0),
+                "A's readiness write never entered, so B's handler never reached the call-site "
+                + "drain: the handler's await DrainRetainedForReplacementAsync() was removed or "
+                + "detached, leaving A's readiness write unsettled and unjoined.");
+            readinessA = CaptureReadinessWrite(
+                service, "The replacement drain must have started and retained A's readiness write.");
+            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // PRE-RELEASE, with A's readiness write provably held INSIDE the call-site drain.
             Assert.False(readinessA.IsCompleted, "A's readiness write must still be held.");
             Assert.False(loop.IsCompleted, "The loop must not finish while A's readiness write is held.");
             Assert.Same(ownerA, GetActiveAssignment(service));
@@ -527,12 +567,11 @@ public sealed class WorkerServiceReadinessOwnershipTests
             writer.ReleaseReady(0);
             await readinessA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE RENDEZVOUS VERDICT, captured inside B's reset on production's own stack.
+            // THE CALL-SITE VERDICT: at B's reset the slot must already be EMPTY, which only the
+            // handler's own awaited drain can produce.
             await bResetReached.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            Assert.True(
-                await aReadinessJoinedAtBReset.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken),
-                "B's session reset ran before A's readiness write was joined — the replacement drain "
-                + "did not join the readiness write.");
+            Assert.Null(
+                await slotAtBReset.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
 
             // The held-write capture agrees: A still owned the slot and B had not started.
             Assert.Same(ownerA, ownerAtWriteRelease);
@@ -543,6 +582,8 @@ public sealed class WorkerServiceReadinessOwnershipTests
             await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(TaskB, GetActiveTaskId(service));
             runner.Release(TaskB);
+            await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            writer.ReleaseComplete(1);
 
             await writer.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             TrackReadinessWrite(GetRetainedReadinessWrite(service));
@@ -2178,6 +2219,28 @@ public sealed class WorkerServiceReadinessOwnershipTests
             }
 
             _startedReadinessWrites.Add(write);
+        }
+    }
+
+    /// <summary>
+    /// Awaits a PRODUCTION-VISIBLE rendezvous and converts a non-arrival into a NAMED, diagnostic
+    /// failure instead of a bare <see cref="TimeoutException"/>.
+    /// </summary>
+    /// <remarks>
+    /// A rendezvous that never arrives is the signature of a missing production step, not of a slow
+    /// machine: the fixture supplies every gate the correct path needs, so the only way the signal
+    /// can fail to appear is that production never reached the point that emits it. Reporting that
+    /// as the stated regression keeps a mutant's failure self-diagnosing rather than anonymous.
+    /// </remarks>
+    private static async Task AwaitRendezvousAsync(Task rendezvous, string because)
+    {
+        try
+        {
+            await rendezvous.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            throw new Xunit.Sdk.XunitException(because);
         }
     }
 
