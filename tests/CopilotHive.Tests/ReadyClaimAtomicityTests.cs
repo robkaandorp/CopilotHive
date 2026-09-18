@@ -49,11 +49,12 @@ public sealed class ReadyClaimAtomicityTests
         public required ConnectedWorker Worker { get; init; }
         public required CapturingLogger Logger { get; init; }
         public required RecordingPublisher Publisher { get; init; }
-        public int Notifications { get; set; }
-        public int NotifyCount => _notifyCount;
+
         private int _notifyCount;
 
-        private readonly List<string> _tempDirs = [];
+        public int NotifyCount => _notifyCount;
+
+        private string? _agentsPath;
 
         public static Fixture Create(
             CapturingLogger? logger = null,
@@ -79,15 +80,15 @@ public sealed class ReadyClaimAtomicityTests
             var publisher = new RecordingPublisher();
 
             AgentsManager? agentsManager = null;
+            string? agentsPath = null;
             if (withAgentsManager)
             {
-                var agentsPath = Path.Combine(
+                agentsPath = Path.Combine(
                     Path.GetTempPath(), $"copilothive-ready-claim-agents-{Guid.NewGuid():N}");
                 agentsManager = new AgentsManager(agentsPath);
                 File.WriteAllText(
                     Path.Combine(agentsPath, $"{WorkerRole.Coder.ToRoleName()}.agents.md"),
                     "coder guidance");
-                capturingLogger.TempDir = agentsPath;
             }
 
             var service = new HiveOrchestratorService(
@@ -111,6 +112,7 @@ public sealed class ReadyClaimAtomicityTests
                 Worker = worker,
                 Logger = capturingLogger,
                 Publisher = publisher,
+                _agentsPath = agentsPath,
             };
 
             notifier.OnStateChanged += () => Interlocked.Increment(ref fixture._notifyCount);
@@ -119,17 +121,17 @@ public sealed class ReadyClaimAtomicityTests
 
         public void Dispose()
         {
-            foreach (var dir in _tempDirs)
+            if (_agentsPath is null)
+                return;
+
+            try
             {
-                try
-                {
-                    if (Directory.Exists(dir))
-                        Directory.Delete(dir, recursive: true);
-                }
-                catch
-                {
-                    // Best-effort — a leftover temp directory must never fail a test.
-                }
+                if (Directory.Exists(_agentsPath))
+                    Directory.Delete(_agentsPath, recursive: true);
+            }
+            catch
+            {
+                // Best-effort — a leftover temp directory must never fail a test.
             }
         }
     }
@@ -205,8 +207,6 @@ public sealed class ReadyClaimAtomicityTests
         private readonly List<string> _messages = [];
 
         public bool ThrowOnAgentsMd { get; set; }
-
-        public string? TempDir { get; set; }
 
         public IReadOnlyList<string> Messages
         {
