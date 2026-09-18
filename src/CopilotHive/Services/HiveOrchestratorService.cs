@@ -1937,8 +1937,9 @@ public sealed class HiveOrchestratorService(
                 workerPool.ClearCompletionPublicationHold(worker);
         }
 
-        // THE ORDINARY DASHBOARD/DOWNSTREAM NOTIFICATION, AFTER the hold is finished: the
-        // notification path never runs while the instance is still withheld from selection.
+        // THE ORDINARY DASHBOARD/DOWNSTREAM NOTIFICATION, AFTER the SHORT publication hold is
+        // cleared. The longer readiness wait may still be installed at this point — it is cleared
+        // only by an accepted Ready — so this says nothing about selectability.
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {

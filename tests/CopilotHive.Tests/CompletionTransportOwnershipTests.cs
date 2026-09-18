@@ -2501,11 +2501,13 @@ public sealed class CompletionTransportOwnershipTests
     /// <see cref="WorkerAssignmentPublisher"/>, and is finally delivered through the REAL Ready route.
     /// </para>
     /// <para>
-    /// WHY EACH OBSERVATION IS DISCRIMINATING. The captured candidate is the pool's OWN earlier
-    /// selection, taken while A was genuinely selectable: it is exactly the stale observation the
-    /// dispatch transaction can hold, and the claim must still refuse it. Without the readiness wait,
-    /// that candidate would be claimed inside this vector's post-publication dispatch, so B would
-    /// become active, recorded and published before any Ready — every assertion below flips.
+    /// THE CAPTURED CANDIDATE IS TAKEN WHILE THE INSTANCE IS GENUINELY SELECTABLE — from the pool's
+    /// OWN <see cref="WorkerPool.GetIdleWorker"/>, BEFORE A is ever assigned and therefore long before
+    /// A's release installs the readiness wait. That is exactly the stale observation a dispatch
+    /// transaction can hold across a completion, and it is SUPPLIED TO THE PRODUCTION CLAIM
+    /// (<c>ApplyTaskAssignment</c> → <see cref="WorkerPool.TryClaimAndActivate"/>) rather than merely
+    /// identity-checked: without the wait that claim would succeed, so B would become active, busy,
+    /// role/model-written and recorded before any Ready — every assertion below flips.
     /// </para>
     /// </remarks>
     [Fact]
@@ -2522,6 +2524,14 @@ public sealed class CompletionTransportOwnershipTests
                 // THE SAME REAL PUBLISHER FEEDS BOTH ROUTES, so a passing vector cannot be one in
                 // which the successor's publication would fail closed for a missing publisher.
                 Assert.NotNull(h.AssignmentPublisher);
+
+                // ── THE EARLIER CANDIDATE, CAPTURED WHILE THE INSTANCE IS GENUINELY SELECTABLE ──
+                // Taken from the pool's own selection BEFORE anything is assigned: at this instant
+                // the worker is idle, unheld and not awaiting anything, so this really is a valid
+                // candidate a dispatcher could have carried into the delivery transaction.
+                var captured = h.Pool.GetIdleWorker();
+                Assert.Same(h.Worker, captured);
+                Assert.False(captured!.AwaitingWorkerReady);
 
                 // ── A: GENUINELY ASSIGNED, DELIVERED THROUGH THE REAL READY ROUTE ───────────────
                 const string taskA = "task-ready-gate-a";
@@ -2579,13 +2589,6 @@ public sealed class CompletionTransportOwnershipTests
                 Assert.Null(h.Queue.GetActiveTask(taskA));
                 Assert.NotNull(h.ReadReceipt(taskA));
 
-                // ── AN EARLIER CAPTURED CANDIDATE CANNOT BYPASS THE WAIT ────────────────────────
-                // The candidate is the pool's own earlier observation, so it is the genuine stale
-                // shape the dispatch transaction can hold across the completion.
-                var captured = h.Pool.GetWorker(WorkerId);
-                Assert.Same(h.Worker, captured);
-                Assert.Null(h.Pool.GetIdleWorker());
-
                 // ── B IS DISPATCHED FOR REAL WHILE NO READY HAS BEEN SENT ───────────────────────
                 await h.EagerDispatcher.DispatchToRole(
                     pipelineB, DomainWorkerRole.Coder, "do B", TestContext.Current.CancellationToken);
@@ -2599,6 +2602,8 @@ public sealed class CompletionTransportOwnershipTests
                 Assert.False(h.Worker.IsBusy);
                 Assert.Null(h.Worker.CurrentTaskId);
                 Assert.Null(h.Stores.AssignmentStore.Load(admittedB!));
+
+                // THE NEW-SELECTION REFUSAL: nothing is selectable at all.
                 Assert.Null(h.Pool.GetIdleWorker());
 
                 var pendingB = h.Queue.TryDequeueAny();
@@ -2611,14 +2616,46 @@ public sealed class CompletionTransportOwnershipTests
                     m => m.Assignment is not null
                          && string.Equals(m.Assignment.TaskId, admittedB, StringComparison.Ordinal));
 
+                // ── THE EARLIER CAPTURED CANDIDATE IS REFUSED BY THE PRODUCTION CLAIM ───────────
+                // The captured instance — valid when it was taken — is handed to the very claim the
+                // delivery transaction uses, with B's actual dequeued task. It must be refused, and
+                // the refusal must mutate NOTHING.
+                var roleBefore = h.Worker.Role;
+                var modelBefore = h.Worker.CurrentModel;
+                var startedBefore = h.Worker.CurrentTaskStartedAt;
+                var activityBefore = h.Worker.LastActivityAt;
+                h.ResetDashboardNotifications();
+
+                Assert.False(
+                    h.Service.ApplyTaskAssignment(captured, pendingB!),
+                    "the production claim accepted an earlier captured candidate that is awaiting its own Ready");
+
+                // ZERO PUBLICATION on the refusal: no activation, no busy fields, no role/model
+                // write, no assignment recorded, nothing forwarded and nothing notified.
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.False(h.Worker.IsBusy);
+                Assert.Null(h.Worker.CurrentTaskId);
+                Assert.Equal(startedBefore, h.Worker.CurrentTaskStartedAt);
+                Assert.Equal(activityBefore, h.Worker.LastActivityAt);
+                Assert.Equal(roleBefore, h.Worker.Role);
+                Assert.Equal(modelBefore, h.Worker.CurrentModel);
+                Assert.Null(h.Queue.GetActiveTask(admittedB!));
+                Assert.False(pendingB.Metadata.ContainsKey("assigned_worker"));
+                Assert.Null(h.Stores.AssignmentStore.Load(admittedB!));
+                Assert.Equal(0, h.DashboardNotifications);
+                Assert.DoesNotContain(
+                    h.Writer.Messages,
+                    m => m.Assignment is not null
+                         && string.Equals(m.Assignment.TaskId, admittedB, StringComparison.Ordinal));
+
                 // ── ONE READY CLAIMS, RECORDS AND PUBLISHES THE SUCCESSOR EXACTLY ONCE ──────────
-                h.Queue.Enqueue(pendingB!);
+                h.Queue.Enqueue(pendingB);
                 await h.ReadyAndAwaitAssignmentPublishedAsync(admittedB!);
 
                 Assert.False(h.Worker.AwaitingWorkerReady);
                 Assert.True(h.Worker.IsBusy);
                 Assert.Equal(admittedB, h.Worker.CurrentTaskId);
-                Assert.Equal(pendingB!.Model, h.Worker.CurrentModel);
+                Assert.Equal(pendingB.Model, h.Worker.CurrentModel);
                 Assert.Same(pendingB, h.Queue.GetActiveTask(admittedB!));
                 Assert.NotNull(h.Stores.AssignmentStore.Load(admittedB!));
                 Assert.Null(h.Queue.TryDequeueAny());
@@ -2667,69 +2704,174 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     /// <summary>
-    /// THE WAIT SURVIVES AN ISOLATED ONE-SHOT ACKNOWLEDGEMENT WRITE FAILURE, AND THE STREAM STAYS
-    /// USABLE: the acknowledgement never reaches the wire, the SHORT hold still ends, the instance
-    /// still waits for its own Ready, and the successor is delivered ONCE that Ready arrives.
+    /// THE WAIT SURVIVES AN ISOLATED ONE-SHOT ACKNOWLEDGEMENT WRITE FAILURE ON A STILL-USABLE
+    /// CHANNEL: the acknowledgement never reaches the wire, the SHORT hold still ends, and a
+    /// successor dispatched by the REAL eager path stays Pending, unrecorded and unpublished until
+    /// exactly ONE WorkerReady travels the real <c>WorkStream</c> — which then claims, records and
+    /// publishes it on that same live channel.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// THIS IS THE FAILURE THAT MUST NOT BUY SELECTABILITY. A missing acknowledgement is exactly the
     /// case the readiness wait exists for, so a fault there must leave the released instance withheld
     /// rather than silently handing it the next assignment — and it must not poison the stream, since
     /// the worker's own Ready is what releases it.
+    /// </para>
+    /// <para>
+    /// NO DIRECT POOL CALL STANDS IN FOR THE READY. Every refusal assertion below is made before any
+    /// Ready exists, and the release is driven by a real <c>WorkerReady</c> message pushed onto the
+    /// request stream — so a vector that skipped the streamed Ready would publish the successor too
+    /// early and fail the pre-Ready assertions.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task NegotiatedCompletion_AckWriteFailure_DoesNotGrantSelectability()
     {
-        var h = Harness.CreateWithRequestedCompletionReceiptAck();
-        await RunAsync(h, async () =>
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-ack-fault-{Guid.NewGuid():N}.db");
+
+        try
         {
-            const string taskId = "task-ready-gate-write-fault";
-            h.Assign(taskId, model: "assigned-model");
-            h.ResetDashboardNotifications();
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+            await RunAsync(h, async () =>
+            {
+                // The successor's delivery is a REAL publication, not a fail-closed refusal.
+                Assert.NotNull(h.AssignmentPublisher);
 
-            var writerFault = new InvalidOperationException("the response writer threw SENTINEL");
-            h.ArmOneShotAcknowledgementWriteFault(writerFault);
-            h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckWriteFailed);
+                // ── A: ASSIGNED AND DELIVERED THROUGH THE REAL READY ROUTE ─────────────────────
+                const string taskA = "task-ack-fault-a";
+                var goalA = new Goal { Id = "goal-ack-fault", Description = "ack write fault" };
+                h.Manager.CreatePipeline(goalA, maxRetries: 3);
+                h.GoalSource.Register(goalA);
+                var pipelineA = h.Manager.GetByGoalId(goalA.Id);
+                Assert.NotNull(pipelineA);
+                pipelineA!.AllocateAttemptAndRegisterSlot(taskA, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+                pipelineA.SetActiveTask(taskA);
+                h.Manager.RegisterTask(taskA, goalA.Id);
+                h.Queue.Enqueue(h.BuildTask(taskA, "assigned-model") with { GoalId = goalA.Id });
 
-            var writeFailed = h.ServiceLogger.WaitFor(ProductionLogFragments.ReceiptAckWriteFailed);
-            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+                await h.ReadyAndAwaitAssignmentPublishedAsync(taskA);
+                Assert.True(h.Worker.IsBusy);
+                Assert.Equal(taskA, h.Worker.CurrentTaskId);
+                h.ResetDashboardNotifications();
 
-            await writeFailed.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                // ── THE SUCCESSOR'S DISPATCHABLE SETUP ─────────────────────────────────────────
+                const string goalB = "goal-ack-fault-b";
+                var goal = new Goal
+                {
+                    Id = goalB,
+                    Description = "successor after a failed ack write",
+                    RepositoryNames = ["ownership-repo"],
+                };
+                h.Manager.CreatePipeline(goal, maxRetries: 3);
+                h.GoalSource.Register(goal);
+                var pipelineB = h.Manager.GetByGoalId(goalB);
+                Assert.NotNull(pipelineB);
+                pipelineB!.AdvanceTo(GoalPhase.Coding);
+                var plan = IterationPlan.Default(includeImprove: true);
+                pipelineB.SetPlan(plan);
+                pipelineB.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
 
-            // THE WRITE REALLY WAS ATTEMPTED AND REALLY FAULTED…
-            Assert.Equal(taskId, result.TaskId);
-            Assert.Equal(1, h.AcknowledgementWriteAttempts);
-            Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+                // ── THE ISOLATED ONE-SHOT RESPONSE-WRITE FAULT ─────────────────────────────────
+                var writerFault = new InvalidOperationException("the response writer threw SENTINEL");
+                h.ArmOneShotAcknowledgementWriteFault(writerFault);
+                h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckWriteFailed);
 
-            // ──…AND NO ACKNOWLEDGEMENT REACHED THE WORKER, WHICH IS WHY THE WAIT MUST HOLD ─────
-            AssertNoAcknowledgementPublished(h);
+                var writeFailed = h.ServiceLogger.WaitFor(ProductionLogFragments.ReceiptAckWriteFailed);
+                var downstreamA = h.DispatcherLogger.WaitFor(taskA);
 
-            // THE SHORT HOLD IS GONE; THE READINESS WAIT IS NOT — and neither is selectability.
-            Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.True(h.Worker.AwaitingWorkerReady);
-            h.AssertAwaitingItsOwnReadyAfterThePublication();
+                h.PushCompletion(taskA, "assigned-model", true, CopilotHive.Shared.Grpc.TaskStatus.Completed);
 
-            // THE COMPLETION ITSELF IS INTACT AND NOTIFIED EXACTLY ONCE.
-            Assert.Equal(1, h.DownstreamHandledCount(taskId));
-            Assert.Equal(1, h.TransportNotifications);
-            Assert.Equal(1, h.DashboardNotifications);
-            Assert.NotNull(h.ReadReceipt(taskId));
-            Assert.False(h.StreamEnded);
+                await writeFailed.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                await downstreamA.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                await h.BarrierAsync();
 
-            // ── THE STREAM IS STILL USABLE: the worker's NEXT completion+Ready sequence works ────
-            const string successor = "task-ready-gate-write-fault-successor";
-            h.Assign(successor, model: "assigned-model");
-            h.ResetDashboardNotifications();
+                // THE WRITE REALLY WAS ATTEMPTED AND REALLY FAULTED, and NO ACK reached the worker.
+                Assert.Equal(1, h.AcknowledgementWriteAttempts);
+                Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+                AssertNoAcknowledgementPublished(h);
 
-            var acknowledgement = h.AwaitAcknowledgementAsync();
-            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(successor, "assigned-model");
+                // THE CHANNEL IS STILL LIVE: the stream did not end on the isolated fault.
+                Assert.False(h.StreamEnded);
 
-            var ack = await acknowledgement;
-            Assert.Equal(successor, ack.TaskId);
-            Assert.False(h.Worker.CompletionPublicationPending);
-            h.AssertAwaitingItsOwnReadyAfterThePublication();
-            h.GrantReadinessAndAssertSelectable();
-        });
+                // THE COMPLETION ITSELF IS INTACT AND NOTIFIED EXACTLY ONCE.
+                Assert.Equal(1, h.DownstreamHandledCount(taskA));
+                Assert.Equal(1, h.TransportNotifications);
+                Assert.Equal(1, h.DashboardNotifications);
+                Assert.NotNull(h.ReadReceipt(taskA));
+
+                // THE SHORT HOLD IS GONE; THE READINESS WAIT IS NOT.
+                Assert.False(h.Worker.CompletionPublicationPending);
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.False(h.Worker.IsBusy);
+                Assert.Null(h.Worker.CurrentTaskId);
+
+                // ── B IS DISPATCHED FOR REAL, WITH NO READY SENT ───────────────────────────────
+                await h.EagerDispatcher.DispatchToRole(
+                    pipelineB, DomainWorkerRole.Coder, "do B", TestContext.Current.CancellationToken);
+
+                var admittedB = pipelineB.ActiveTaskId;
+                Assert.NotNull(admittedB);
+
+                // IT STAYS PENDING, UNRECORDED AND UNPUBLISHED — the failed acknowledgement bought
+                // no selectability at all.
+                Assert.Equal(goalB, h.Manager.GetByTaskId(admittedB!)!.GoalId);
+                Assert.Null(h.Queue.GetActiveTask(admittedB!));
+                Assert.Null(h.Stores.AssignmentStore.Load(admittedB!));
+                Assert.False(h.Worker.IsBusy);
+                Assert.Null(h.Worker.CurrentTaskId);
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.Null(h.Pool.GetIdleWorker());
+                Assert.DoesNotContain(
+                    h.Writer.Messages,
+                    m => m.Assignment is not null
+                         && string.Equals(m.Assignment.TaskId, admittedB, StringComparison.Ordinal));
+
+                // ── EXACTLY ONE STREAMED WorkerReady RELEASES IT, ON THE SAME LIVE CHANNEL ─────
+                var accepted = h.ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
+                var forwarded = h.Writer.WaitForAssignment();
+                h.PushReady();
+
+                await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                var assignment = await forwarded.WaitAsync(
+                    BoundedWait, TestContext.Current.CancellationToken);
+                Assert.Equal(admittedB, assignment.TaskId);
+
+                // THE SUCCESSOR IS CLAIMED, RECORDED AND PUBLISHED EXACTLY ONCE.
+                Assert.False(h.Worker.AwaitingWorkerReady);
+                Assert.True(h.Worker.IsBusy);
+                Assert.Equal(admittedB, h.Worker.CurrentTaskId);
+                Assert.NotNull(h.Queue.GetActiveTask(admittedB!));
+                Assert.NotNull(h.Stores.AssignmentStore.Load(admittedB!));
+                Assert.Null(h.Queue.TryDequeueAny());
+                Assert.Equal(
+                    1,
+                    h.Writer.Messages.Count(
+                        m => m.Assignment is not null
+                             && string.Equals(m.Assignment.TaskId, admittedB, StringComparison.Ordinal)));
+
+                // …and the acknowledgement that faulted was never retried onto the wire.
+                AssertNoAcknowledgementPublished(h);
+                Assert.Equal(1, h.AcknowledgementWriteAttempts);
+                Assert.False(h.StreamEnded);
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -3189,15 +3331,16 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// THE HOLD ENDS ON A FAILED ACKNOWLEDGEMENT ENQUEUE: a closed channel plus a throwing enqueue
-    /// diagnostic must lose neither the accepted completion nor the worker's selectability.
+    /// diagnostic must lose neither the accepted completion nor the end of the SHORT hold.
     /// </summary>
     /// <remarks>
     /// THE ENQUEUE ATTEMPT — NOT ITS DELIVERY — IS WHAT THE HOLD COVERS. This vector closes the
     /// channel so the <c>TryWrite</c> must fail, arms the diagnostic to throw, and then asserts the
-    /// hold is GONE, the completion is fully released and notified exactly once, the eligibility was
-    /// still advanced, and the worker is selectable again — i.e. the failed publication never strands
-    /// selection. The hold's PRESENCE inside the window is asserted first, so a vector that never
-    /// installed one cannot pass vacuously.
+    /// hold is GONE, the completion is fully released and notified exactly once, and the eligibility
+    /// was still advanced — i.e. the failed publication never strands the hold. The instance is NOT
+    /// selectable afterwards: the same release installed the longer readiness wait, which only an
+    /// accepted Ready clears. The hold's PRESENCE inside the window is asserted first, so a vector
+    /// that never installed one cannot pass vacuously.
     /// </remarks>
     [Fact]
     public async Task CompletionPublicationHold_EndsOnAFailedAcknowledgementEnqueue()
@@ -3328,7 +3471,8 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// DUPLICATE RE-ACKNOWLEDGEMENTS NEVER ACQUIRE OR CLEAR A HOLD: the read-only duplicate branch
-    /// performs no release, so no hold is installed, and the worker stays selectable throughout.
+    /// performs no release, so it neither installs a hold nor disturbs the one an ordinary completion
+    /// already finished — and it does not clear the readiness wait either.
     /// </summary>
     /// <remarks>
     /// IT PINS THE BOUNDARY BETWEEN THE TWO PATHS. A hold is a property of the ORDINARY negotiated
@@ -3484,8 +3628,9 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(0, h.DownstreamHandledCount(taskId));
             Assert.Equal(0, h.DashboardNotifications);
 
-            // ── THE STREAM AND THE POOL ARE NOT STRANDED: the worker is selectable, and an ordinary
-            //    completion still works afterwards, taking and ending its own hold.
+            // ── THE STREAM AND THE POOL ARE NOT STRANDED: an ordinary completion still works
+            //    afterwards, taking and ending its own hold. `Assign` drives the production-style
+            //    Ready first, which is what makes the withheld instance assignable again.
             h.Assign("task-hold-window-throws-next", model: "assigned-model");
             h.ResetDashboardNotifications();
             var acknowledgement = h.AwaitAcknowledgementAsync();
@@ -3503,8 +3648,9 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     /// <summary>
-    /// THE ORDINARY DASHBOARD NOTIFICATION HAPPENS AFTER THE HOLD IS FINISHED: at the instant the
-    /// notification's own observation runs, the instance is already selectable again.
+    /// THE ORDINARY DASHBOARD NOTIFICATION HAPPENS AFTER THE SHORT HOLD IS FINISHED: at the instant
+    /// the notification's own observation runs, the publication hold is already cleared (the longer
+    /// readiness wait may still remain).
     /// </summary>
     /// <remarks>
     /// THE ORDERING IS THE CONTRACT — "finish the hold BEFORE the ordinary dashboard/downstream
@@ -3537,12 +3683,13 @@ public sealed class CompletionTransportOwnershipTests
     /// <summary>
     /// THE COMPLETION-PUBLICATION HOLD IS TAKEN AND FINISHED AROUND EVERY ORDINARY NEGOTIATED
     /// COMPLETION'S PUBLICATION, and never outlives it: two successive completions each take their
-    /// own hold, each ends it, and the worker is selectable at the end.
+    /// own hold and each end it.
     /// </summary>
     /// <remarks>
     /// THIS IS THE SLICE'S OWN REPETITION CHECK: an accidental hold that outlives its publication — a
-    /// held instance that never becomes selectable again, or one whose second completion never takes
-    /// its own hold — is visible here without reading the other vectors.
+    /// held instance whose hold is never cleared, or one whose second completion never takes its own
+    /// hold — is visible here without reading the other vectors. Between the two completions the
+    /// instance is assignable only because <c>Assign</c> drives the production-style Ready first.
     /// </remarks>
     [Fact]
     public async Task CompletionPublicationHold_IsTakenAndFinishedForEachOrdinaryCompletion()
@@ -4882,11 +5029,18 @@ public sealed class CompletionTransportOwnershipTests
         /// path: the queue entry is activated for this worker and the pool is marked busy.
         /// </summary>
         /// <remarks>
+        /// <para>
+        /// IT DRIVES THE PRODUCTION-STYLE READY FIRST (<see cref="GrantReadiness"/>: snapshot +
+        /// <c>TryMarkIdleForReady</c>). An instance released by a previous negotiated completion is
+        /// awaiting its own Ready and the checked claim would refuse it, so this helper states that
+        /// Ready explicitly rather than assuming selectability. It is a no-op for an instance that is
+        /// not waiting, and the vectors that assert the wait itself never rely on it.
+        /// </para>
+        /// <para>
         /// THE ASSIGNMENT CONTEXT IS REALLY RECORDED TOO, through the PRODUCTION insert-once store
-        /// over the harness's REAL database. That is the valid-assignment setup the completion
-        /// recorder's STORED-context agreement rule requires: without a recorded context the
-        /// recorder refuses and the completion is retained, which is exactly what these ownership
-        /// vectors are not about.
+        /// over the harness's REAL database — the valid-assignment setup the completion recorder's
+        /// STORED-context agreement rule requires.
+        /// </para>
         /// </remarks>
         public void Assign(string taskId, string model)
         {
@@ -4907,20 +5061,17 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
-        /// THE READINESS the production delivery boundary requires before an instance may be
-        /// (re-)assigned: an ACK-enabled instance whose negotiated completion was released stays
-        /// unselectable — even once its short publication hold has ended — until its own accepted
-        /// Ready arrives, and the checked claim refuses it until then.
+        /// THE DIRECT-POOL READY the harness uses when a vector needs an instance released WITHOUT
+        /// exercising the stream: snapshot + <c>TryMarkIdleForReady</c>, exactly the checked idle the
+        /// production <c>HandleWorkerReady</c> performs, refusing on the same conditions.
         /// </summary>
         /// <remarks>
-        /// IT IS THE HARNESS'S OWN READY, driven through the REAL checked idle
-        /// (<c>TryMarkIdleForReady</c>) exactly as the production <c>HandleWorkerReady</c> drives it,
-        /// so a harness assignment after a released negotiated completion takes the same route the
-        /// worker's next Ready would. An instance that is not waiting is left untouched, so this
-        /// cannot mask the wait: the vectors that assert the wait itself keep asserting it directly.
+        /// IT IS NOT A SUBSTITUTE FOR A STREAMED <c>WorkerReady</c>. Vectors that must prove the real
+        /// end-to-end release push a Ready with <see cref="PushReady"/> instead; this helper exists
+        /// for setup (<see cref="Assign"/>) and for the explicitly-direct complement vector.
         /// </remarks>
         /// <param name="worker">The instance whose readiness is being established.</param>
-        /// <returns>The worker's own Ready outcome.</returns>
+        /// <returns>The checked idle's outcome.</returns>
         public bool GrantReadiness(ConnectedWorker worker) =>
             Pool.TryGetWorkerSnapshot(worker.Id, out var observed)
             && ReferenceEquals(observed.Worker, worker)
@@ -4928,16 +5079,13 @@ public sealed class CompletionTransportOwnershipTests
 
         /// <summary>
         /// WHAT A FINISHED NEGOTIATED PUBLICATION LEAVES BEHIND on an ACK-enabled instance: the SHORT
-        /// completion-publication hold is OVER, and the instance is STILL NOT SELECTABLE — not because
-        /// it is publishing anything, but because the release of its negotiated completion put it into
-        /// the instance-local wait for its OWN accepted Ready.
+        /// hold is over, yet the instance is still unselectable because the release put it into the
+        /// wait for its OWN accepted Ready.
         /// </summary>
         /// <remarks>
-        /// THE TWO FACTS ARE DELIBERATELY SEPARATED HERE. Asserting only "no hold" would let a mutant
-        /// that clears the hold silently re-open the eager-selection window; asserting only
-        /// "unselectable" would not say which fact withholds the instance. This pair — hold gone,
-        /// still awaiting Ready, and <see cref="WorkerPool.GetIdleWorker"/> returning nothing — is what
-        /// distinguishes the end of the publication from the end of the wait.
+        /// THE TWO FACTS ARE DELIBERATELY SEPARATED. Asserting only "no hold" would let a mutant that
+        /// clears the hold re-open the eager-selection window; asserting only "unselectable" would
+        /// not say which fact withholds the instance.
         /// </remarks>
         public void AssertAwaitingItsOwnReadyAfterThePublication()
         {
@@ -4955,10 +5103,10 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
-        /// THE OTHER HALF OF THE WAIT'S CONTRACT, ASSERTED THE SAME WAY: the instance's own accepted
-        /// Ready ends the wait, and ONLY then is the instance selectable again.
+        /// THE DIRECT-POOL COMPLEMENT of the wait's contract: the checked idle accepts, the wait ends
+        /// and only then is the instance selectable. Used by the explicitly-direct vector, never as a
+        /// stand-in for a streamed Ready.
         /// </summary>
-        /// <returns>A task-free observation of the post-Ready state.</returns>
         public void GrantReadinessAndAssertSelectable()
         {
             Assert.True(GrantReadiness(Worker), "the instance's own Ready was refused");
