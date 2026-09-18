@@ -134,6 +134,33 @@ public sealed class HiveOrchestratorService(
     /// </remarks>
     internal Action<ConnectedWorker, string>? _afterCompletionReleaseBeforeAckForTest;
 
+    /// <summary>
+    /// THE READY CLAIM'S OWN WINDOW: the instant AFTER the task has been dequeued and the caller's
+    /// cancellation has been observed, and BEFORE the pool's checked claim — with NO pool lock held.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The property under test is that a Ready whose candidate has gone stale in this
+    /// window cannot take ownership: the claim must refuse it and leave the ACTUAL dequeued task
+    /// pending exactly once while the competing owner stays untouched. That interval is otherwise
+    /// unaddressable from a test, because the stream's read loop is synchronous and nothing external
+    /// can schedule into it. This hook is the smallest thing that makes it reachable.
+    /// </para>
+    /// <para>
+    /// IT IS NOT A BEHAVIOUR. It is <c>null</c> in production and in every fixture that does not
+    /// install one, so the Ready path is EXACTLY the dequeue, the cancellation check, the claim and
+    /// then the guidance/publication — the null-conditional invoke compiles to a branch that is never
+    /// taken. It carries no state, returns nothing, decides nothing, performs no await, and runs
+    /// OUTSIDE any lock, so it can neither hold the pool's activity lock nor re-enter it. Everything
+    /// it could touch is re-validated by the claim that follows it.
+    /// </para>
+    /// <para>
+    /// A HOOK THAT THROWS FAULTS THE STREAM, deliberately: it is test-only, so a fault is a test bug
+    /// that must be loud rather than swallowed into the transport's ordinary refusal paths.
+    /// </para>
+    /// </remarks>
+    internal Action? OnBeforeReadyClaimForTest;
+
     /// <summary>Maximum number of tracked heartbeat entries before the oldest is evicted.</summary>
     internal int MaxHeartbeatEntries { get; set; } = 200;
 
@@ -169,6 +196,15 @@ public sealed class HiveOrchestratorService(
         /// <summary>The checked idle was refused at the mutation point.</summary>
         public const string ReadyCheckedIdleRefused =
             "the worker's ownership changed or is inconsistent; the checked idle was refused";
+
+        /// <summary>
+        /// The checked claim was REFUSED for this Ready's dequeued task: the pinned instance is gone
+        /// or replaced, is no longer idle with a null task, or is still holding its completion
+        /// publication. The task went back to the queue exactly once and nothing was published.
+        /// </summary>
+        public const string ReadyClaimRefused =
+            "the worker's ownership changed before the claim, or its completion publication is " +
+            "still in flight; no assignment was published";
 
         /// <summary>
         /// A SECOND stream tried to attach to an instance an earlier stream already claimed. The
@@ -671,18 +707,35 @@ public sealed class HiveOrchestratorService(
     }
 
     /// <summary>
-    /// Applies a task assignment to a worker: activates the task in the queue, marks the worker
-    /// busy, and sets <see cref="ConnectedWorker.CurrentModel"/> from the task's requested model.
+    /// Applies a task assignment to a worker through the pool's CHECKED CLAIM: the ACTUAL dequeued
+    /// task is activated in the queue and the CAPTURED instance is published busy with it — task id,
+    /// task start, activity clock, role and <see cref="ConnectedWorker.CurrentModel"/>, all in ONE
+    /// activity-lock span — or NOTHING is mutated at all.
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
-    /// <param name="worker">The worker that will execute the task.</param>
-    /// <param name="task">The task being assigned.</param>
-    internal void ApplyTaskAssignment(ConnectedWorker worker, WorkTask task)
+    /// <remarks>
+    /// <para>
+    /// THE RETURN VALUE IS THE CLAIM'S OWN OUTCOME and the ONLY thing that authorises the rest of a
+    /// Ready delivery. <c>false</c> means the claim was REFUSED — the instance was no longer the one
+    /// registered under its ID, was not idle, or was still holding its completion publication — and
+    /// nothing was activated, marked busy, published or notified on its behalf.
+    /// </para>
+    /// <para>
+    /// THE NOTIFICATION IS FOR AN ACCEPTED CLAIM ONLY, EXACTLY ONCE, AND OUTSIDE THE POOL LOCK: the
+    /// claim owns the activity lock and has already returned by the time this fires, so a dashboard
+    /// subscriber can never run while the pool is locked.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The exact instance the caller validated — the ONLY instance mutated.</param>
+    /// <param name="task">The task dequeued for this assignment.</param>
+    /// <returns><c>true</c> when the claim was taken; <c>false</c> when it was refused.</returns>
+    internal bool ApplyTaskAssignment(ConnectedWorker worker, WorkTask task)
     {
-        taskQueue.Activate(task, worker.Id);
-        workerPool.MarkBusy(worker.Id, task.TaskId);
-        worker.CurrentModel = task.Model;
+        if (!workerPool.TryClaimAndActivate(worker, task, taskQueue))
+            return false;
+
         _dashboardNotifier?.NotifyStateChanged();
+        return true;
     }
 
     /// <summary>
@@ -766,16 +819,80 @@ public sealed class HiveOrchestratorService(
         var task = taskQueue.TryDequeue(worker.Role);
         if (task is not null)
         {
-            // Set the worker's role from the task and send agents.md
+            // ── CALLER CANCELLATION, OBSERVED BEFORE THE CLAIM ───────────────────────────────
+            // The task is ALREADY OUT of the queue at this point, so a cancelled delivery puts the
+            // ACTUAL dequeued instance back EXACTLY ONCE and then propagates the ORIGINAL
+            // cancellation unchanged. Nothing is published, recorded, written or sent here, and no
+            // role is written — this delivery never acquired ownership.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                taskQueue.Enqueue(task);
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            // THE WINDOW ITSELF, OBSERVABLE. Null in production (the default), so this is exactly
+            // the dequeue cancellation check above followed by the claim below — see the field's own
+            // documentation for why it exists and what it may not do.
+            OnBeforeReadyClaimForTest?.Invoke();
+
+            // ── THE CHECKED CLAIM: THE ONE AND ONLY PUBLICATION POINT ────────────────────────
+            // Busy, task id, task start, activity clock, role, model AND the queue activation are
+            // all published inside the pool's single activity-lock span — or none of them are. The
+            // pre-claim role write and the unconditional ID-based busy marking are gone: a stale
+            // Ready candidate can no longer overwrite newer ownership or bypass a hold.
+            if (!workerPool.TryClaimAndActivate(worker, task, taskQueue))
+            {
+                // REFUSED. The instance is gone or replaced (ABA), is no longer idle with a null
+                // task, or is still holding its completion publication — so the ACTUAL dequeued
+                // task goes back EXACTLY ONCE and this Ready ends NORMALLY with NO publication, NO
+                // assignment recording, NO guidance send, NO admission/mapping/slot mutation and NO
+                // role write: a loser never writes Role.
+                //
+                // THE SINGLE INSERT IS THE WHOLE RECOVERY. TaskQueue.Enqueue inserts BEFORE it
+                // invokes its OnEnqueue hook, so there is deliberately NO retry and NO alternate
+                // recovery here: an exception from that hook propagates unchanged AFTER the insert.
+                // Nothing below may claim the task was not requeued — it was.
+                taskQueue.Enqueue(task);
+                LogReadyClaimRefused(worker, task);
+                return;
+            }
+
             var taskRoleName = task.Role.ToRoleName();
-            worker.Role = task.Role;
             logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
                 worker.Id, taskRoleName, task.TaskId);
 
-            if (agentsManager is not null)
-                await SendAgentsMdAsync(worker, task.Role, cancellationToken);
+            // THE ACCEPTED CLAIM IS WHAT THE DASHBOARD IS TOLD ABOUT — EXACTLY ONCE, and OUTSIDE any
+            // pool lock (the claim owns _activityLock and has already returned). A REFUSED claim
+            // notifies nothing: no assignment was published.
+            _dashboardNotifier?.NotifyStateChanged();
 
-            ApplyTaskAssignment(worker, task);
+            // ── POST-CLAIM GUIDANCE, BEST EFFORT FOR NON-CANCELLATION FAILURES ONLY ──────────
+            // The assignment is already claimed, so a guidance fault must never undo it and must
+            // never requeue the task. Caller cancellation is the ONE exception: it is propagated
+            // unchanged rather than contained as a best-effort failure.
+            if (agentsManager is not null)
+            {
+                try
+                {
+                    await SendAgentsMdAsync(worker, task.Role, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // THE CALLER'S CANCELLATION, PROPAGATED UNCHANGED — never swallowed as a
+                    // best-effort fault, and never a requeue: the claim stands.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    LogGuidanceBestEffortFailed(worker, task, ex);
+                }
+            }
+
+            // A HELPER THAT SWALLOWED THE CALLER'S CANCELLATION INTERNALLY MUST NOT TURN A
+            // CANCELLED DELIVERY INTO A PUBLISHED ASSIGNMENT, so the caller token is observed
+            // explicitly before publication. Post-claim cancellation never requeues.
+            cancellationToken.ThrowIfCancellationRequested();
+
             logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
             // THE READY-DRIVEN RECORDED PUBLICATION. The dequeue, the agents.md update and the
@@ -864,6 +981,69 @@ public sealed class HiveOrchestratorService(
                 worker.Id,
                 task.TaskId,
                 failure.Reason,
+                MessageOrPlaceholder(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED READY-CLAIM-REFUSAL DIAGNOSTIC: a Ready whose dequeued task could not be claimed,
+    /// so the task went back to the queue exactly once and no assignment was published.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// GUARDED like every other refusal diagnostic: the whole log call sits inside its own no-throw
+    /// guard, so a throwing logger can never replace the refusal outcome with an escaping exception.
+    /// </para>
+    /// <para>
+    /// THE WORDING IS DELIBERATELY EXPLICIT ABOUT THE REQUEUE. The task WAS put back — inserting
+    /// before its hook — so nothing here may imply the requeue did not happen, and no success or
+    /// assignment wording appears either.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The pinned worker whose claim was refused.</param>
+    /// <param name="task">The dequeued task that went back to the queue.</param>
+    private void LogReadyClaimRefused(ConnectedWorker worker, WorkTask task)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} task {TaskId}: claim refused; no assignment published; the task " +
+                "was requeued exactly once — {Reason}",
+                worker.Id,
+                task.TaskId,
+                OwnershipRefusalReasons.ReadyClaimRefused);
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED BEST-EFFORT GUIDANCE DIAGNOSTIC: a POST-CLAIM agents.md update failed for a
+    /// non-cancellation reason.
+    /// </summary>
+    /// <remarks>
+    /// GUARDED like every other diagnostic. The assignment is ALREADY claimed and is retained: this
+    /// warning records a degraded, best-effort step and can neither replace the claimed outcome nor
+    /// cause a requeue. Caller cancellation never reaches here — it is propagated unchanged.
+    /// </remarks>
+    /// <param name="worker">The pinned worker whose guidance update failed.</param>
+    /// <param name="task">The task it was already assigned.</param>
+    /// <param name="failure">The non-cancellation failure; its exact message is included.</param>
+    private void LogGuidanceBestEffortFailed(ConnectedWorker worker, WorkTask task, Exception failure)
+    {
+        try
+        {
+            logger.LogWarning(
+                "Worker {WorkerId} task {TaskId}: agents.md update failed after the assignment was " +
+                "claimed; continuing to publish the claimed assignment — {Detail}",
+                worker.Id,
+                task.TaskId,
                 MessageOrPlaceholder(failure));
         }
         catch

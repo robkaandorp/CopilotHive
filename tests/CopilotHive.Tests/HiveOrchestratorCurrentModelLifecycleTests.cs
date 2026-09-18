@@ -13,9 +13,10 @@ namespace CopilotHive.Tests;
 /// — model is cleared when the task completes (<c>ApplyTaskCompletion</c>).
 ///
 /// These tests call the real <see cref="HiveOrchestratorService.ApplyTaskAssignment"/> and
-/// <see cref="HiveOrchestratorService.ApplyTaskCompletion"/> internal methods, which are the
-/// same methods used by the private <c>HandleWorkerReady</c> and <c>HandleTaskComplete</c>
-/// handlers. Removing either assignment would cause these tests to fail.
+/// <see cref="HiveOrchestratorService.ApplyTaskCompletion"/> internal methods. Both now delegate to
+/// the SAME checked pool operations the private <c>HandleWorkerReady</c> and <c>HandleTaskComplete</c>
+/// handlers use — the assignment through the checked claim, the completion through the checked
+/// release — so removing either delegation would cause these tests to fail.
 /// </summary>
 public sealed class HiveOrchestratorCurrentModelLifecycleTests
 {
