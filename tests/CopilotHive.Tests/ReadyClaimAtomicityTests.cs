@@ -196,6 +196,13 @@ public sealed class ReadyClaimAtomicityTests
     {
         private readonly List<(ConnectedWorker Worker, WorkTask Task)> _calls = [];
 
+        /// <summary>
+        /// THE PUBLISHER FAULT SEAM, for the publisher-failure controls: when non-null, the next
+        /// (and every) invocation records its call and then faults with this EXACT exception, so a
+        /// vector chooses the failure kind without a new fixture type.
+        /// </summary>
+        public Exception? Failure { get; set; }
+
         public IReadOnlyList<(ConnectedWorker Worker, WorkTask Task)> Calls
         {
             get
@@ -208,9 +215,10 @@ public sealed class ReadyClaimAtomicityTests
         public Task PublishAsync(
             ConnectedWorker worker, WorkTask task, CancellationToken cancellationToken)
         {
+            var failure = Failure;
             lock (_calls)
                 _calls.Add((worker, task));
-            return Task.CompletedTask;
+            return failure is null ? Task.CompletedTask : Task.FromException(failure);
         }
     }
 
@@ -1075,6 +1083,306 @@ public sealed class ReadyClaimAtomicityTests
         Assert.Same(task, publishedTask);
         Assert.True(f.Worker.IsBusy);
         Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+    }
+
+    // ── the guarded post-claim Information emissions ──────────────────────────
+
+    /// <summary>The EXACT production wording of each guarded post-claim emission.</summary>
+    private const string AssignedRoleEmission =
+        "Worker {WorkerId} assigned role {Role} for task {TaskId}";
+
+    private const string AssigningEmission =
+        "Assigning task {TaskId} to worker {WorkerId}";
+
+    private const string PublishedEmission =
+        "Assignment published to worker {WorkerId} for task {TaskId}";
+
+    /// <summary>
+    /// THE THREE POST-CLAIM <see cref="LogLevel.Information"/> EMISSIONS ARE GUARDED: a logger that
+    /// throws on ANY ONE of them — with an ordinary fault or an OCE carrying the default or a
+    /// foreign token — cannot interrupt the ACCEPTED assignment. Each row witnesses that the
+    /// targeted emission WAS REACHED (the fixture logger records before invoking its throw factory),
+    /// that the handler COMPLETES, that the publication and notification happened exactly once with
+    /// the exact claimed instances, that the claim's retained state stands, that nothing was
+    /// requeued, and that a logging failure was never reported as a refusal.
+    /// </summary>
+    /// <param name="emission">The EXACT production wording of the targeted emission.</param>
+    /// <param name="faultKind">
+    /// <see cref="GuardedEmissionFaultKind.InvalidOperation"/>, an
+    /// <see cref="OperationCanceledException"/> with the default token, or one with a distinct LIVE
+    /// foreign token.
+    /// </param>
+    [Theory]
+    [InlineData(AssignedRoleEmission, GuardedEmissionFaultKind.InvalidOperation)]
+    [InlineData(AssignedRoleEmission, GuardedEmissionFaultKind.CancelledWithDefaultToken)]
+    [InlineData(AssignedRoleEmission, GuardedEmissionFaultKind.CancelledWithForeignToken)]
+    [InlineData(AssigningEmission, GuardedEmissionFaultKind.InvalidOperation)]
+    [InlineData(AssigningEmission, GuardedEmissionFaultKind.CancelledWithDefaultToken)]
+    [InlineData(AssigningEmission, GuardedEmissionFaultKind.CancelledWithForeignToken)]
+    [InlineData(PublishedEmission, GuardedEmissionFaultKind.InvalidOperation)]
+    [InlineData(PublishedEmission, GuardedEmissionFaultKind.CancelledWithDefaultToken)]
+    [InlineData(PublishedEmission, GuardedEmissionFaultKind.CancelledWithForeignToken)]
+    public async Task Ready_GuardedPostClaimEmission_LoggerFaultOnAnyEmissionIsContainedAndTheAssignmentCompletes(
+        string emission, GuardedEmissionFaultKind faultKind)
+    {
+        var f = Fixture.Create();
+        var task = BuildTask($"task-guarded-{faultKind}");
+        f.Queue.Enqueue(task);
+
+        // THE RENDERED FORM of the targeted emission, composed from the same template and arguments
+        // production passes. The throw factory receives RENDERED messages, so the factory must match
+        // this exact string — the match is equality, never a prefix or a Contains.
+        var rendered = emission switch
+        {
+            AssignedRoleEmission =>
+                $"Worker {f.Worker.Id} assigned role {task.Role.ToRoleName()} for task {task.TaskId}",
+            AssigningEmission => $"Assigning task {task.TaskId} to worker {f.Worker.Id}",
+            PublishedEmission =>
+                $"Assignment published to worker {f.Worker.Id} for task {task.TaskId}",
+            _ => throw new InvalidOperationException($"unhandled emission template: {emission}"),
+        };
+
+        // THE THROW FACTORY fails EXACTLY the targeted emission. THE FIXTURE LOGGER RECORDS THE
+        // ENTRY BEFORE INVOKING THIS FACTORY, so a recorded entry IS the positive witness that the
+        // emission was reached.
+        using var foreignCts = new CancellationTokenSource();
+        foreignCts.Cancel();
+        f.Logger.ThrowFactory = message =>
+            message == rendered ? GuardedEmissionFault(faultKind, foreignCts.Token) : null;
+
+        // MUST NOT THROW: the guard contains the logger's fault, whatever its kind.
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // THE TARGETED EMISSION REALLY WAS REACHED — exactly once, at Information level, with the
+        // exact rendered arguments.
+        var entry = Assert.Single(f.Logger.Entries, e => e.Message == rendered);
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.Contains(f.Worker.Id, entry.Message, StringComparison.Ordinal);
+        Assert.Contains(task.TaskId, entry.Message, StringComparison.Ordinal);
+
+        // THE WHOLE ASSIGNMENT COMPLETED: exactly ONE publisher invocation, the SAME worker instance
+        // and the SAME task instance the claim pinned.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+
+        // THE DASHBOARD NOTIFICATION FIRED EXACTLY ONCE for the accepted assignment.
+        Assert.Equal(1, f.NotifyCount);
+
+        // THE RETAINED STATE: the claim stands, the queue keeps the active entry, and nothing was
+        // requeued — a logging fault rolled nothing back.
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Null(f.Queue.TryDequeueAny());
+
+        // A LOGGING FAILURE IS NOT A REFUSAL: neither refusal wording may appear.
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("claim refused", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+    }
+
+    /// <summary>The fault kinds the guarded-emission matrix drives through the throw factory.</summary>
+    public enum GuardedEmissionFaultKind
+    {
+        InvalidOperation,
+        CancelledWithDefaultToken,
+        CancelledWithForeignToken,
+    }
+
+    /// <summary>
+    /// The EXACT exception a matrix cell's throw factory raises: the ordinary fault, or the OCE
+    /// shape — parameterless (the default token) or carrying a distinct LIVE foreign token.
+    /// </summary>
+    private static Exception GuardedEmissionFault(GuardedEmissionFaultKind kind, CancellationToken foreignToken) =>
+        kind switch
+        {
+            GuardedEmissionFaultKind.InvalidOperation =>
+                new InvalidOperationException("the logger refused to emit the guarded post-claim line"),
+            GuardedEmissionFaultKind.CancelledWithDefaultToken =>
+                new OperationCanceledException("logger cancellation with the default token"),
+            GuardedEmissionFaultKind.CancelledWithForeignToken =>
+                new OperationCanceledException(
+                    "logger cancellation with a foreign token", foreignToken),
+            _ => throw new InvalidOperationException($"unhandled fault kind: {kind}"),
+        };
+
+    /// <summary>
+    /// THE HEALTHY PATH STILL EMITS EACH OF THE THREE EMISSIONS, EXACTLY ONCE EACH, when the logger
+    /// does not throw: the guard changed the containment, not the emission itself.
+    /// </summary>
+    [Fact]
+    public async Task Ready_HealthyPath_EmitsEachOfTheThreePostClaimEmissionsExactlyOnce()
+    {
+        var f = Fixture.Create();
+        var task = BuildTask("task-healthy-emissions");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // EACH of the three emissions appeared EXACTLY ONCE, at Information level.
+        Assert.Equal(
+            1,
+            f.Logger.Entries.Count(e =>
+                e.Level == LogLevel.Information && e.Message == $"Worker {WorkerId} assigned role coder for task {task.TaskId}"));
+        Assert.Equal(
+            1,
+            f.Logger.Entries.Count(e =>
+                e.Level == LogLevel.Information && e.Message == $"Assigning task {task.TaskId} to worker {WorkerId}"));
+        Assert.Equal(
+            1,
+            f.Logger.Entries.Count(e =>
+                e.Level == LogLevel.Information
+                && e.Message == $"Assignment published to worker {WorkerId} for task {task.TaskId}"));
+
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.Equal(1, f.NotifyCount);
+    }
+
+    /// <summary>
+    /// THE GENUINE CALLER CANCELLATION STAYS PRIMARY THROUGH THE GUARDED EMISSIONS: cancelling a
+    /// REAL token inside the window (never a logger fake) still escapes as an
+    /// <see cref="OperationCanceledException"/> carrying the CALLER token, with NO publication and
+    /// NO requeue after the claim.
+    /// </summary>
+    /// <remarks>
+    /// THE GUIDANCE HELPER IS PRESENT so the cancelled delivery must pass through the guidance send,
+    /// the caller-token observation and BOTH remaining guarded emissions — every one of which must
+    /// stay contained behind the caller's cancellation, never replacing it. The accepted claim's own
+    /// dashboard notification is the legitimate one — exactly ONE.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_GenuineCallerCancellationInsideTheWindow_EscapesWithTheCallerTokenAndNoPublication()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        var task = BuildTask("task-genuine-cancellation");
+        f.Queue.Enqueue(task);
+
+        using var cts = new CancellationTokenSource();
+        // THE CANCELLATION LANDS INSIDE THE WINDOW — after the pre-claim check, before the claim.
+        f.Service.OnBeforeReadyClaimForTest = () => cts.Cancel();
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => InvokeReadyAsync(f.Service, f.Worker, cts.Token));
+
+        // THE CALLER'S TOKEN IS THE OUTCOME OF RECORD.
+        Assert.Equal(cts.Token, thrown.CancellationToken);
+
+        // NO PUBLICATION — and, after the claim, NO requeue either.
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Null(f.Queue.TryDequeueAny());
+
+        // THE CLAIM STANDS: post-claim cancellation rolls nothing back, and the claim's own
+        // dashboard notification is the exactly-ONE legitimate one.
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(1, f.NotifyCount);
+
+        // NO REFUSAL OR BLOCKED WORDING: a cancellation is neither.
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("claim refused", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A PUBLISHER FAILURE KEEPS ITS EXACT EXISTING HANDLING, and the <c>"Assignment published …"</c>
+    /// emission is NOT emitted for a publication that never completed.
+    /// </summary>
+    /// <param name="faultKind">
+    /// A recording REFUSAL (the handled blocked disposition, returning normally), an ordinary
+    /// publisher fault (propagates unchanged), or an OCE with a FOREIGN live token (propagates
+    /// unchanged) — each exactly the semantics today's catch shape gives it.
+    /// </param>
+    [Theory]
+    [InlineData(PublisherFaultKind.RecordingRefusal)]
+    [InlineData(PublisherFaultKind.OrdinaryFault)]
+    [InlineData(PublisherFaultKind.ForeignTokenCancellation)]
+    public async Task Ready_PublisherFailure_IsHandledExactlyAsTodayAndEmitsNoPublishedLine(
+        PublisherFaultKind faultKind)
+    {
+        var f = Fixture.Create();
+        var task = BuildTask($"task-publisher-fails-{faultKind}");
+        f.Queue.Enqueue(task);
+
+        // A DIFFERENT, LIVE cancellation source — never the caller's token, which stays LIVE so the
+        // handler reaches publication.
+        using var foreignCts = new CancellationTokenSource();
+        foreignCts.Cancel();
+        f.Publisher.Failure = faultKind switch
+        {
+            PublisherFaultKind.RecordingRefusal =>
+                WorkerAssignmentRecordingException.MissingPublisher(),
+            PublisherFaultKind.OrdinaryFault =>
+                new InvalidOperationException("the publisher refused the delivery"),
+            PublisherFaultKind.ForeignTokenCancellation =>
+                new OperationCanceledException(
+                    "the publisher's own cancellation, with a foreign token", foreignCts.Token),
+            _ => throw new InvalidOperationException($"unhandled publisher fault kind: {faultKind}"),
+        };
+
+        if (faultKind == PublisherFaultKind.RecordingRefusal)
+        {
+            // THE HANDLED DISPOSITION RETURNED NORMALLY — the recording refusal is caught.
+            await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+        }
+        else
+        {
+            // ESCAPES EXACTLY AS TODAY: neither an ordinary fault nor a foreign-token OCE is a
+            // recording refusal, so neither is caught — the original exception propagates.
+            var thrown = await Assert.ThrowsAnyAsync<Exception>(
+                () => InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken));
+
+            var expected = f.Publisher.Failure!;
+            Assert.Same(expected, thrown);
+        }
+
+        // THE PUBLISHER WAS INVOKED EXACTLY ONCE with the exact claimed instances — and its failure
+        // means the success line was NEVER emitted.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.DoesNotContain(
+            f.Logger.Messages,
+            m => m.Contains("Assignment published", StringComparison.Ordinal));
+
+        // THE DISPOSITION WORDING MATCHES THE PATH: a recording refusal is the handled blocked
+        // shape; an escaping fault reports no refusal either.
+        if (faultKind == PublisherFaultKind.RecordingRefusal)
+        {
+            Assert.Contains(
+                f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+        }
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("claim refused", StringComparison.Ordinal));
+
+        // NO REQUEUE on a failed publication; the claim — and its one legitimate pre-publication
+        // dashboard notification — is retained (publication happens AFTER the notification).
+        Assert.Null(f.Queue.TryDequeueAny());
+        Assert.Equal(1, f.NotifyCount);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+    }
+
+    /// <summary>The publisher-fault kinds the publication-failure controls drive.</summary>
+    public enum PublisherFaultKind
+    {
+        /// <summary>A recording refusal — the handled blocked disposition.</summary>
+        RecordingRefusal,
+
+        /// <summary>An ordinary fault, which propagates unchanged.</summary>
+        OrdinaryFault,
+
+        /// <summary>An OCE with a foreign live token, which propagates unchanged.</summary>
+        ForeignTokenCancellation,
     }
 
     // ── ApplyTaskAssignment ───────────────────────────────────────────────────
