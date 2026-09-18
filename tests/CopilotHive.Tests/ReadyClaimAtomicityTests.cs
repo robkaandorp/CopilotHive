@@ -786,6 +786,101 @@ public sealed class ReadyClaimAtomicityTests
             throw new InvalidOperationException("the message getter threw");
     }
 
+    /// <summary>
+    /// THE REFUSAL PATH'S HOOK CONTRACT IS UNCHANGED: a hook-thrown
+    /// <see cref="OperationCanceledException"/> on the REFUSAL path still propagates UNCHANGED —
+    /// the pre-claim path's containment is specific to the cancellation path, where the caller's
+    /// cancellation is primary. A refusal has no caller cancellation of record, so its hook failure
+    /// is the outcome there — with the same single insert and no publication.
+    /// </summary>
+    [Fact]
+    public async Task Ready_RefusalPath_HookCancellationPropagatesUnchanged()
+    {
+        var f = Fixture.Create();
+        var task = BuildTask("task-refusal-hook-oce");
+        f.Queue.Enqueue(task);
+
+        using var hookCts = new CancellationTokenSource();
+        hookCts.Cancel();
+        var hookFailure = new OperationCanceledException("the refusal hook's own cancellation", hookCts.Token);
+
+        // INSTALLED AFTER THE SETUP ENQUEUE, so only the refusal's requeue can invoke it.
+        f.Queue.OnEnqueue = _ => throw hookFailure;
+
+        f.Service.OnBeforeReadyClaimForTest = () => f.Pool.MarkBusy(WorkerId, "task-winner");
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken));
+
+        // THE HOOK'S OWN FAILURE IS THE OUTCOME HERE — the exact instance, its own token.
+        Assert.Same(hookFailure, thrown);
+        Assert.Equal(hookCts.Token, thrown.CancellationToken);
+
+        // THE INSERT ALREADY HAPPENED — exactly once, the same instance, and no retry.
+        Assert.Same(task, f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.TryDequeueAny());
+
+        // NO PUBLICATION, NO NOTIFICATION, AND THE WINNER IS UNTOUCHED.
+        Assert.Null(f.Queue.GetActiveTask(task.TaskId));
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Equal(0, f.NotifyCount);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal("task-winner", f.Worker.CurrentTaskId);
+    }
+
+    /// <summary>
+    /// THE FAILURE DETAIL IS BOUNDED AS WELL AS SANITIZED: a guidance failure whose message exceeds
+    /// the 512-character cap is TRUNCATED before it reaches the logger — the emitted line stays a
+    /// single sanitized line, carries the cap's truncation marker, and never floods the log with the
+    /// full untrusted payload.
+    /// </summary>
+    /// <remarks>
+    /// THE PAYLOAD IS CONTROL-CHARACTER-FREE ON PURPOSE: this vector isolates the LENGTH cap from
+    /// the sanitization property the other vectors already pin, so a fix that only shortened the
+    /// message without sanitizing would still fail those, and vice versa.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_GuidanceDiagnostic_OversizedFailureDetailIsTruncated()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        var oversized = "x" + new string('A', 600);
+        f.Logger.ThrowFactory = message =>
+            // BOTH of the send's log lines fail, so the send's own catch cannot contain the fault
+            // and the post-claim guidance warning is what renders it.
+            message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
+            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
+                ? new InvalidOperationException(oversized)
+                : null;
+
+        var task = BuildTask("task-guidance-oversized");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        var entry = Assert.Single(
+            f.Logger.Entries,
+            e => e.Message.Contains(
+                "agents.md update failed after the assignment was claimed", StringComparison.Ordinal));
+
+        // THE RAW PAYLOAD NEVER REACHED THE LOG UNSHORTENED — well past the cap, it is cut.
+        Assert.DoesNotContain(oversized, entry.Message, StringComparison.Ordinal);
+        Assert.True(
+            entry.Message.Length < 700,
+            $"the guidance diagnostic was not bounded: {entry.Message.Length} characters");
+
+        // THE TRUNCATION MARKER IS PRESENT, and the rendered line is still single and sanitized.
+        Assert.Contains("…(truncated)", entry.Message, StringComparison.Ordinal);
+        AssertSingleSanitizedLine(entry.Message);
+        Assert.Null(entry.Exception);
+
+        // THE PRIMARY OUTCOME IS UNTOUCHED: the claim stands and publication continued.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+    }
+
     // ── ApplyTaskAssignment ───────────────────────────────────────────────────
 
     /// <summary>
