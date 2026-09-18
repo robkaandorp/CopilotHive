@@ -187,18 +187,37 @@ public sealed class WorkerPool : IWorkerPool
     }
 
     /// <summary>
-    /// Returns the first idle worker. All workers are generic and accept any role.
+    /// Returns the first SELECTABLE idle worker: one that is idle and NOT holding a
+    /// completion publication. All workers are generic and accept any role.
     /// </summary>
-    /// <returns>An idle <see cref="ConnectedWorker"/>, or <c>null</c>.</returns>
+    /// <remarks>
+    /// <para>
+    /// THE TWO FACTS ARE READ UNDER THE SAME <c>_activityLock</c>, as ONE predicate — deliberately
+    /// not as two independent unlocked reads. Reading <see cref="ConnectedWorker.IsBusy"/> and the
+    /// completion-publication hold separately would let a candidate be selected on a stale pair of
+    /// reads, which is exactly the gap this predicate exists to close.
+    /// </para>
+    /// <para>
+    /// WHAT IT RETURNS IS STILL ONLY A CANDIDATE, NEVER A RESERVATION. The returned instance stays
+    /// live and may become busy, be removed or be replaced before the caller acts; a dispatcher that
+    /// already holds an older candidate may still busy it through the existing ID-based
+    /// <see cref="MarkBusy"/>. This method excludes only NEW selections of a worker whose
+    /// completion is still being published.
+    /// </para>
+    /// </remarks>
+    /// <returns>A selectable idle <see cref="ConnectedWorker"/>, or <c>null</c>.</returns>
     public ConnectedWorker? GetIdleWorker()
     {
-        foreach (var kvp in _workers)
+        lock (_activityLock)
         {
-            if (!kvp.Value.IsBusy)
-                return kvp.Value;
-        }
+            foreach (var kvp in _workers)
+            {
+                if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)
+                    return kvp.Value;
+            }
 
-        return null;
+            return null;
+        }
     }
 
     /// <summary>Returns a read-only snapshot of all currently registered workers.</summary>
@@ -298,6 +317,12 @@ public sealed class WorkerPool : IWorkerPool
     /// <summary>
     /// Marks the specified worker as idle, clearing its current task identifier.
     /// </summary>
+    /// <remarks>
+    /// IT NEVER TOUCHES THE COMPLETION-PUBLICATION HOLD. The ID-based reset is a separate
+    /// operation with separate callers (test helpers, recovery paths), so it must not be able to
+    /// silently end a publication a completion path is still performing — and, symmetrically, it
+    /// must not silently install one either.
+    /// </remarks>
     /// <param name="id">Identifier of the worker.</param>
     public void MarkIdle(string id)
     {
@@ -315,6 +340,14 @@ public sealed class WorkerPool : IWorkerPool
     /// idle/release operations, so a checked release can never drift from the ID-based reset.
     /// Callers must hold <c>_activityLock</c>.
     /// </summary>
+    /// <remarks>
+    /// THE HOLD IS DELIBERATELY NOT ONE OF THESE FIELDS. This reset describes ASSIGNMENT state
+    /// (busy, task, task start, role); the completion-publication hold describes an in-flight
+    /// PUBLICATION and is owned exclusively by the checked release that installs it and the single
+    /// clear operation that finishes it. Erasing it here would re-open the very selection window
+    /// the hold exists to close, on behalf of an operation that knows nothing about the
+    /// publication.
+    /// </remarks>
     /// <param name="worker">The captured worker instance to reset — never re-resolved by ID.</param>
     private static void ResetToIdleNoLock(ConnectedWorker worker)
     {
@@ -333,8 +366,9 @@ public sealed class WorkerPool : IWorkerPool
     /// <remarks>
     /// This is an OBSERVATION ONLY — it mutates nothing and it establishes no ownership. The
     /// returned instance stays live, so every acting caller must re-validate it through
-    /// <see cref="TryReleaseCompletedTask"/> or <see cref="TryMarkIdleForReady"/>, which re-check
-    /// the captured instance and task id under the same lock.
+    /// <see cref="TryReleaseCompletedTask"/> or
+    /// <see cref="TryMarkIdleForReady"/>, which re-check the captured instance and task id under the
+    /// same lock.
     /// </remarks>
     /// <param name="workerId">Identifier of the worker to observe.</param>
     /// <param name="snapshot">The snapshot, when a worker is registered under that ID.</param>
@@ -378,11 +412,62 @@ public sealed class WorkerPool : IWorkerPool
     /// SAME task id between an observation and this call. The reference/task checks here guard
     /// only this mutation; queue membership is a separate concurrent operation.
     /// </para>
+    /// <para>
+    /// THE EXISTING TWO-ARGUMENT ROUTE, PRESERVED: it installs NO completion-publication hold, so
+    /// every legacy/direct caller keeps the unchanged release semantics and — importantly — never
+    /// has unrelated selection state written on its behalf. It also deliberately leaves an
+    /// EXISTING hold untouched rather than erasing one it did not install.
+    /// </para>
     /// </remarks>
     /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
     /// <param name="expectedTaskId">The task the caller observed that instance executing.</param>
     /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
-    internal bool TryReleaseCompletedTask(ConnectedWorker expected, string expectedTaskId)
+    internal bool TryReleaseCompletedTask(ConnectedWorker expected, string expectedTaskId) =>
+        ReleaseCompletedTaskCore(expected, expectedTaskId, holdForCompletionPublication: false);
+
+    /// <summary>
+    /// THE COMPLETION-PUBLICATION ROUTE: THE SAME CHECKED RELEASE, plus the NARROW EXPLICIT OPT-IN of
+    /// the negotiated ordinary completion path — a SUCCESSFUL release also INSTALLS the instance's
+    /// completion-publication selection hold, in the SAME <c>_activityLock</c> span as the idle reset.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT IS A SEPARATE ROUTE AND WHY IT IS OPT-IN. Only the negotiated ordinary completion path
+    /// has an acknowledgement to publish after the release, so only that path has an interval in
+    /// which the worker is already idle but not yet done publishing. Installing the hold IN THE SAME
+    /// LOCK SPAN as the release is the whole point: there is then no instant at which the instance is
+    /// observable as idle-and-selectable, so no dispatcher can NEWLY SELECT it in that interval.
+    /// </para>
+    /// <para>
+    /// THE EXISTING <see cref="TryReleaseCompletedTask(ConnectedWorker, string)"/> CALLERS ARE
+    /// UNCHANGED AND UNAFFECTED: they install no hold, and — symmetrically — they never clear or
+    /// otherwise touch a hold this route installed on some other invocation's behalf.
+    /// </para>
+    /// <para>
+    /// A REFUSED RELEASE INSTALLS NOTHING: the hold exists only for a release this route applied.
+    /// The caller owns ending it through <see cref="ClearCompletionPublicationHold"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
+    /// <param name="expectedTaskId">The task the caller observed that instance executing.</param>
+    /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
+    internal bool TryReleaseCompletedTaskHoldingForPublication(
+        ConnectedWorker expected, string expectedTaskId) =>
+        ReleaseCompletedTaskCore(expected, expectedTaskId, holdForCompletionPublication: true);
+
+    /// <summary>
+    /// THE ONE CHECKED-RELEASE IMPLEMENTATION both release routes share, so neither can drift from
+    /// the other's validation or field set.
+    /// </summary>
+    /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
+    /// <param name="expectedTaskId">The task the caller observed that instance executing.</param>
+    /// <param name="holdForCompletionPublication">
+    /// Whether the caller is the negotiated ordinary completion path and will therefore publish an
+    /// acknowledgement after this release. <c>false</c> installs no hold.
+    /// </param>
+    /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
+    private bool ReleaseCompletedTaskCore(
+        ConnectedWorker expected, string expectedTaskId, bool holdForCompletionPublication)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(expectedTaskId);
@@ -402,6 +487,58 @@ public sealed class WorkerPool : IWorkerPool
             // THE MODEL IS CLEARED INSIDE THE CHECKED RELEASE, never afterwards: a later write
             // would land outside the ownership check and could clear a successor's model.
             expected.CurrentModel = null;
+
+            // THE HOLD IS INSTALLED IN THIS SAME LOCK SPAN — the release is applied and the
+            // instance is made unselectable as ONE observable step, so the "released but not yet
+            // publishing" interval never becomes visible to a new selection.
+            if (holdForCompletionPublication)
+                expected.BeginCompletionPublicationHold();
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// THE COMPLETION-PUBLICATION HOLD'S ONLY CLEARING OPERATION: clears
+    /// <see cref="ConnectedWorker.CompletionPublicationPending"/> on the EXACT instance the
+    /// publication belongs to, under <c>_activityLock</c>, and touches NOTHING else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT DELIBERATELY DOES NOT DO: no idle reset, no role/model/task write, no activity-clock
+    /// or heartbeat write, no queue or session operation, no dictionary change and — critically — no
+    /// mutation of an ABA REPLACEMENT. A replacement registered under the same ID during the
+    /// publication is not the instance whose publication is finishing, so it is left exactly as it
+    /// is. The whole operation is one flag write on one captured reference: no timeout, no retry
+    /// loop, no lease expiry, and no waiting for the queued acknowledgement to be written or
+    /// received. It is idempotent.
+    /// </para>
+    /// <para>
+    /// IT IS CALLED BY THE PUBLICATION PATH AND NOTHING ELSE. There is no timer, no reaper and no
+    /// background expiry: the caller that installed the hold is the caller that ends it, which is
+    /// why the hold can never outlive the publication attempt that created it.
+    /// </para>
+    /// </remarks>
+    /// <param name="expected">The exact instance whose publication is finishing.</param>
+    /// <returns>
+    /// <c>true</c> when the exact instance was still the one registered under its ID and its hold is
+    /// now cleared; <c>false</c> when nothing was mutated (a replacement, or no registered instance).
+    /// </returns>
+    internal bool ClearCompletionPublicationHold(ConnectedWorker expected)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+
+        lock (_activityLock)
+        {
+            if (!_workers.TryGetValue(expected.Id, out var registered))
+                return false;
+
+            // ABA: a replacement under the same ID keeps its own state; the finishing publication
+            // is about the captured instance only.
+            if (!ReferenceEquals(registered, expected))
+                return false;
+
+            expected.EndCompletionPublicationHold();
             return true;
         }
     }
@@ -443,6 +580,14 @@ public sealed class WorkerPool : IWorkerPool
 
         lock (_activityLock)
         {
+            // ── THE COMPLETION-PUBLICATION HOLD REFUSES THIS ENTIRE OPERATION ───────────────────
+            // A Ready that arrives while this instance's negotiated completion is still being
+            // published is a Ready for the interval this slice exists to protect: idling here would
+            // re-publish the very "released and selectable" state the hold suppresses. The refusal
+            // is taken BEFORE any shape check and mutates nothing.
+            if (expected.CompletionPublicationPending)
+                return false;
+
             if (!IsStillOwnedNoLock(expected, observed.CurrentTaskId))
                 return false;
 

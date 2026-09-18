@@ -2260,6 +2260,199 @@ public sealed class CompletionReceiptAckTests
     }
 
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  (4c) THE COMPLETION-PUBLICATION SELECTION HOLD'S ORDER AND SCOPE
+    //      (structural: the production completion path's statement order)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE COMPLETION PUBLICATION'S EXACT SHAPE, read off the production source: the release acquires
+    /// the hold only on the negotiated path, everything after the acquisition sits inside ONE
+    /// try/finally, the hold ends only for the invocation that acquired it, and the ordinary
+    /// notification follows the hold's end.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A STRUCTURAL VECTOR IS HONEST HERE. The properties it asserts are STATEMENT-ORDER
+    /// properties of one synchronous method — "is every operation after the acquisition inside the
+    /// guarded scope", "is the hold's end before the notification", "is the hold's end conditional on
+    /// having acquired one". Behavioural vectors (this suite and the transport ownership suite) prove
+    /// the effects; this one proves the SHAPE, so a future edit that hoists the clear out of the
+    /// finally, drops the opt-in gate or moves the notification inside the guarded scope fails loudly
+    /// rather than passing on a happy path.
+    /// </para>
+    /// <para>
+    /// IT IS NARROW: it names the exact identifiers it expects, so it cannot be satisfied by a
+    /// different arrangement that happens to contain the same words.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationHold_TheAcquisitionGateScopeAndOrderAreTheContract()
+    {
+        var source = ReadOrchestratorServiceSource();
+        var handler = StripComments(source.Between(
+            "private void HandleClassifiedTaskComplete(",
+            "private void LogCompletionNotRecorded("));
+
+        // ── (1) THE OPT-IN GATE: the hold is requested ONLY for a NEGOTIATED registration ───────
+        Assert.Contains(
+            "var holdForCompletionPublication = worker.CompletionReceiptAckEnabled;",
+            handler,
+            StringComparison.Ordinal);
+
+        // …and it selects between the two release routes on that exact condition: the holding route
+        // for the negotiated path, and the PRESERVED route for everything else.
+        Assert.Contains(
+            "var completionPublicationHeld = holdForCompletionPublication\n"
+            + "            ? workerPool.TryReleaseCompletedTaskHoldingForPublication(worker, complete.TaskId)\n"
+            + "            : ApplyTaskCompletion(worker, complete.TaskId);",
+            handler,
+            StringComparison.Ordinal);
+
+        // ── (2) THE RELEASE REFUSAL RETURNS BEFORE ANY HOLD END COULD RUN ──────────────────────
+        var refusalIndex = handler.IndexOf(
+            "OwnershipRefusalReasons.CheckedReleaseRefused", StringComparison.Ordinal);
+        Assert.True(refusalIndex >= 0, "the checked-release refusal reason is gone from the handler.");
+
+        // ── (3) ONE GUARDED SCOPE COVERS EVERY OPERATION AFTER THE ACQUISITION ─────────────────
+        var tryIndex = handler.IndexOf("        try\n", StringComparison.Ordinal);
+        Assert.True(tryIndex >= 0);
+        var queueRemovalIndex = handler.IndexOf(
+            "taskQueue.MarkComplete(complete.TaskId)", StringComparison.Ordinal);
+        var windowIndex = handler.IndexOf(
+            "_afterCompletionReleaseBeforeAckForTest?.Invoke(worker, complete.TaskId)",
+            StringComparison.Ordinal);
+        var eligibilityIndex = handler.IndexOf(
+            "ackState.AdvanceLatestEligible(complete.TaskId)", StringComparison.Ordinal);
+        var enqueueIndex = handler.IndexOf(
+            "TryPublishCompletionReceiptAck(worker, complete.TaskId)", StringComparison.Ordinal);
+        var finallyIndex = handler.IndexOf("        finally\n", StringComparison.Ordinal);
+        var clearIndex = handler.IndexOf(
+            "workerPool.ClearCompletionPublicationHold(worker);", StringComparison.Ordinal);
+        var notificationIndex = handler.IndexOf(
+            "_dashboardNotifier?.NotifyStateChanged();", StringComparison.Ordinal);
+
+        foreach (var (name, index) in new[]
+                 {
+                     ("the guarded scope's try", tryIndex),
+                     ("the active-queue removal", queueRemovalIndex),
+                     ("the post-release window", windowIndex),
+                     ("the eligibility advance", eligibilityIndex),
+                     ("the acknowledgement enqueue", enqueueIndex),
+                     ("the finally", finallyIndex),
+                     ("the hold's end", clearIndex),
+                     ("the dashboard notification", notificationIndex),
+                 })
+        {
+            Assert.True(index >= 0, $"{name} is missing from the completion publication.");
+        }
+
+        Assert.True(
+            tryIndex < queueRemovalIndex && queueRemovalIndex < windowIndex
+            && windowIndex < eligibilityIndex && eligibilityIndex < enqueueIndex
+            && enqueueIndex < finallyIndex && finallyIndex < clearIndex
+            && clearIndex < notificationIndex,
+            "the completion publication's order changed: the release, its guarded scope, the queue "
+            + "removal, the window, the eligibility, the enqueue, the hold's end and the ordinary "
+            + "notification must appear in exactly that order.");
+
+        // ── (4) THE HOLD'S END IS CONDITIONAL ON HAVING ACQUIRED ONE ───────────────────────────
+        // A refusal (or a legacy registration) must never clear a hold this invocation did not take.
+        var finallyBlock = handler[finallyIndex..clearIndex];
+        Assert.Contains(
+            "if (holdForCompletionPublication)",
+            finallyBlock,
+            StringComparison.Ordinal);
+
+        // ── (5) THE ORDINARY NOTIFICATION IS OUTSIDE THE GUARDED SCOPE ─────────────────────────
+        // A notification fault must not be able to reach the hold's end, and nothing is notified while
+        // the publication's scope is still open.
+        Assert.True(
+            notificationIndex > clearIndex,
+            "the ordinary dashboard notification must follow the end of the selection hold.");
+        var guardedScope = handler[tryIndex..finallyIndex];
+        Assert.DoesNotContain(
+            "_dashboardNotifier?.NotifyStateChanged", guardedScope, StringComparison.Ordinal);
+
+        // ── (6) NO DATABASE/LOGGER/CALLBACK WORK INSIDE THE RELEASE CALL ITSELF ────────────────
+        // The only calls the publication makes before the guarded scope are the two release routes;
+        // the pool owns the lock, so nothing held here can deadlock against a logger or a store.
+        Assert.Equal(1, CountOccurrences(handler, "TryReleaseCompletedTaskHoldingForPublication("));
+        Assert.Equal(1, CountOccurrences(handler, "ClearCompletionPublicationHold("));
+    }
+
+    /// <summary>
+    /// THE SELECTION HOLD'S TWO POOL-SIDE EFFECTS, read off the production source: the idle-selection
+    /// predicate is the COMBINED idle-and-not-held test evaluated under one lock, and the checked Ready
+    /// idle refuses while the hold is active.
+    /// </summary>
+    /// <remarks>
+    /// IT COMPLEMENTS THE BEHAVIOURAL WORKER-POOL VECTORS: they prove the effects, this one proves the
+    /// SHAPE — in particular that the two facts are read as ONE predicate rather than as two
+    /// independent unlocked reads, which is exactly the difference between a real exclusion and a
+    /// window.
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationHold_TheSelectionPredicateAndReadyRefusalAreTheContract()
+    {
+        var poolSource = ReadSourceFile("src/CopilotHive/Services/WorkerPool.cs");
+        var pool = new OrchestratorSource { Text = StripComments(poolSource) };
+
+        var selection = pool.Between(
+            "public ConnectedWorker? GetIdleWorker()", "public IReadOnlyList<ConnectedWorker> GetAllWorkers()");
+        Assert.Contains(
+            "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)",
+            selection,
+            StringComparison.Ordinal);
+        // …and the predicate is evaluated INSIDE the activity lock, so the two facts belong to one
+        // instant rather than two unlocked reads.
+        Assert.Contains("lock (_activityLock)", selection, StringComparison.Ordinal);
+        Assert.True(
+            selection.IndexOf("lock (_activityLock)", StringComparison.Ordinal)
+            < selection.IndexOf(
+                "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)",
+                StringComparison.Ordinal),
+            "the combined idle-and-not-held predicate must be evaluated under the activity lock.");
+
+        var ready = pool.Between(
+            "internal bool TryMarkIdleForReady(", "private bool IsStillOwnedNoLock(");
+        Assert.Contains(
+            "if (expected.CompletionPublicationPending)\n                return false;",
+            ready,
+            StringComparison.Ordinal);
+
+        // AND THE IDLE RESET DOES NOT ERASE THE HOLD: the shared field set is exactly the assignment
+        // fields.
+        var reset = pool.Between(
+            "private static void ResetToIdleNoLock(", "internal bool TryGetWorkerSnapshot(");
+        Assert.DoesNotContain("CompletionPublication", reset, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Loads a repository file by its repository-relative path, walking up from the test assembly to
+    /// the repository root. A MISSING FILE IS A LOUD FAILURE, never a silently skipped assertion.
+    /// </summary>
+    /// <param name="relative">The repository-relative path.</param>
+    /// <returns>The file's text.</returns>
+    private static string ReadSourceFile(string relative)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine(
+                directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+
+            directory = directory.Parent;
+        }
+
+        Assert.Fail(
+            $"'{relative}' was not found walking up from '{AppContext.BaseDirectory}'; the structural "
+            + "vector cannot be evaluated.");
+        return null!;
+    }
+
     /// <summary>
     /// THE PRODUCTION LOG FRAGMENTS these duplicate vectors synchronize on. Kept together so a wording
     /// change in production surfaces as one obvious edit rather than as scattered flaky waits.

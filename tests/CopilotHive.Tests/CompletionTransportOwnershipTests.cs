@@ -1,4 +1,5 @@
 using CopilotHive.Dashboard;
+using CopilotHive.Configuration;
 using CopilotHive.Goals;
 using CopilotHive.Git;
 using CopilotHive.Orchestration;
@@ -17,6 +18,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
+using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
 
 using Moq;
@@ -2244,6 +2246,677 @@ public sealed class CompletionTransportOwnershipTests
         });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // (N2) THE COMPLETION-PUBLICATION SELECTION HOLD — the interleaving
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE CORE INTERLEAVING REGRESSION: while a negotiated completion's acknowledgement is still
+    /// being published, an INDEPENDENTLY RUNNING real eager dispatch cannot NEWLY SELECT the
+    /// just-released worker, so no successor is assigned; once the publication finishes, the real
+    /// Ready route delivers it normally.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE CHAIN IS REAL THROUGHOUT. A is ACK-enabled through the production registration RPC and
+    /// holds a genuinely assigned, recorded task; the completion travels the real <c>WorkStream</c>
+    /// read loop; the pause is the production post-release/pre-acknowledgement hook (with NO pool lock
+    /// held); B is dispatched by a REAL <see cref="TaskDispatchService"/> over the SAME pool and queue,
+    /// using a REAL <see cref="GrpcWorkerGateway"/> handed the REAL
+    /// <see cref="WorkerAssignmentPublisher"/> — the same publisher the Ready route uses — so a
+    /// passing vector cannot be one in which eager publication was merely disabled.
+    /// </para>
+    /// <para>
+    /// WHAT IS ASSERTED AT THE PAUSE, and why each is discriminating: B's dispatch ran all the way to
+    /// the delivery transaction — it admitted its slot, claimed the pipeline pointer, committed its
+    /// mapping and enqueued B — and then found NO SELECTABLE WORKER, so B is neither active in the
+    /// queue nor recorded in the assignment-context store nor published to the channel, and
+    /// <see cref="WorkerPool.GetIdleWorker"/> returns nothing. WITHOUT the hold, the released worker is
+    /// idle at that instant, so the eager dispatch selects it, activates B, marks it busy and publishes
+    /// it — every one of those assertions flips.
+    /// </para>
+    /// <para>
+    /// THE ORDERING IS READ OFF THE SOLE RESPONSE-PUMP WRITER'S OWN LEDGER, not from a counter: ACK(A)
+    /// is recorded BEFORE Assignment(B), which is the whole property the slice exists to protect. A
+    /// vector in which the eager push had selected the released worker would have published B's
+    /// assignment in that window, i.e. at a different position in the same single ledger.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHeld_EagerDispatchCannotSelectTheReleasedWorker()
+    {
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-hold-eager-{Guid.NewGuid():N}.db");
+
+        try
+        {
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+
+            await RunAsync(h, async () =>
+            {
+                // THE SAME PUBLISHER FEEDS BOTH ROUTES — asserted, so this vector cannot pass because
+                // the eager send would fail closed for a missing publisher.
+                Assert.NotNull(h.AssignmentPublisher);
+
+                // ── A: GENUINELY ASSIGNED AND RECORDED, DELIVERED THROUGH THE REAL READY ROUTE ──
+                const string taskA = "task-hold-eager-a";
+                var goalA = new Goal { Id = "goal-hold-eager", Description = "held completion" };
+                h.Manager.CreatePipeline(goalA, maxRetries: 3);
+                h.GoalSource.Register(goalA);
+                var pipelineA = h.Manager.GetByGoalId(goalA.Id);
+                Assert.NotNull(pipelineA);
+
+                pipelineA!.AllocateAttemptAndRegisterSlot(taskA, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+                pipelineA.SetActiveTask(taskA);
+                h.Manager.RegisterTask(taskA, goalA.Id);
+                h.Queue.Enqueue(h.BuildTask(taskA, "assigned-model") with { GoalId = goalA.Id });
+
+                await h.ReadyAndAwaitAssignmentPublishedAsync(taskA);
+
+                Assert.True(h.Worker.IsBusy);
+                Assert.Equal(taskA, h.Worker.CurrentTaskId);
+                Assert.NotNull(h.Queue.GetActiveTask(taskA));
+                h.ResetDashboardNotifications();
+
+                // ── B: A DISTINCT, VALID PIPELINE READY FOR AN EAGER PUSH ──────────────────────
+                const string goalB = "goal-hold-eager-b";
+                var goal = new Goal
+                {
+                    Id = goalB,
+                    Description = "eager successor",
+                    RepositoryNames = ["ownership-repo"],
+                };
+                h.Manager.CreatePipeline(goal, maxRetries: 3);
+                h.GoalSource.Register(goal);
+                var pipelineB = h.Manager.GetByGoalId(goalB);
+                Assert.NotNull(pipelineB);
+                pipelineB!.AdvanceTo(GoalPhase.Coding);
+                var plan = IterationPlan.Default(includeImprove: true);
+                pipelineB.SetPlan(plan);
+                pipelineB.StateMachine.RestoreFromPlan(plan.Phases, GoalPhase.Coding);
+
+                // ── THE PAUSE: INSIDE THE REAL COMPLETION PUBLICATION, AFTER THE RELEASE ───────
+                var window = h.PauseInCompletionPublicationWindow();
+                var acknowledgementA = h.AwaitAcknowledgementAsync();
+                var downstreamA = h.DispatcherLogger.WaitFor(taskA);
+
+                try
+                {
+                    h.PushCompletion(taskA, "assigned-model", true, CopilotHive.Shared.Grpc.TaskStatus.Completed);
+
+                    await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                    // THE PRECONDITIONS OF THE WINDOW ARE PRODUCTION'S OWN: the release has been
+                    // applied (A is idle with no task and no model), its queue entry is gone, and the
+                    // hold is in force.
+                    Assert.Same(h.Worker, window.ObservedWorker);
+                    Assert.Equal(taskA, window.ObservedTaskId);
+                    Assert.False(h.Worker.IsBusy);
+                    Assert.Null(h.Worker.CurrentTaskId);
+                    Assert.Null(h.Worker.CurrentModel);
+                    Assert.Null(h.Queue.GetActiveTask(taskA));
+                    Assert.True(h.Worker.CompletionPublicationPending);
+                    Assert.Null(h.Pool.GetIdleWorker());
+
+                    // ── THE INDEPENDENT EAGER DISPATCH, AWAITED TO COMPLETION INSIDE THE WINDOW ──
+                    // It runs to completion: it admits B's slot, claims the pointer, commits the
+                    // mapping, enqueues B — and then finds NO selectable worker at the delivery
+                    // transaction's own first step.
+                    await h.EagerDispatcher.DispatchToRole(
+                        pipelineB, DomainWorkerRole.Coder, "do B", TestContext.Current.CancellationToken);
+
+                    var admittedB = pipelineB.ActiveTaskId;
+                    Assert.NotNull(admittedB);
+
+                    // B IS LEFT PENDING AND UNSETTLED:
+                    //   * its mapping was admitted, so the dispatch really reached the delivery
+                    //     transaction rather than being refused in the preparation…
+                    Assert.Equal(goalB, h.Manager.GetByTaskId(admittedB!)!.GoalId);
+                    //   * …it is NOT active in the queue…
+                    Assert.Null(h.Queue.GetActiveTask(admittedB!));
+                    //   * the worker is NOT busy with it…
+                    Assert.False(h.Worker.IsBusy);
+                    Assert.Null(h.Worker.CurrentTaskId);
+                    //   * NO assignment context was recorded for it…
+                    Assert.Null(h.Stores.AssignmentStore.Load(admittedB!));
+                    //   * and IT IS STILL PENDING in the queue, undequeued and undelivered.
+                    var pendingB = h.Queue.TryDequeueAny();
+                    Assert.NotNull(pendingB);
+                    Assert.Equal(admittedB, pendingB!.TaskId);
+
+                    // …and, still, NOTHING IS SELECTABLE.
+                    Assert.Null(h.Pool.GetIdleWorker());
+
+                    // THE SOLE RESPONSE-PUMP WRITER HAS FORWARDED NOTHING FOR B YET.
+                    Assert.DoesNotContain(
+                        h.Writer.Messages,
+                        m => m.Assignment is not null
+                             && string.Equals(m.Assignment.TaskId, admittedB, StringComparison.Ordinal));
+
+                    // ── THE PUBLICATION FINISHES, AND A'S OWN OUTCOMES ARE INTACT ──────────────
+                    h.ClearCompletionPublicationHook();
+                    window.Release();
+
+                    var ackA = await acknowledgementA;
+                    await downstreamA.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+                    await h.BarrierAsync();
+
+                    Assert.Equal(taskA, ackA.TaskId);
+                    Assert.Equal(WorkerId, ackA.WorkerId);
+                    Assert.False(h.Worker.CompletionPublicationPending);
+                    Assert.NotNull(h.ReadReceipt(taskA));
+                    Assert.Equal(1, h.DownstreamHandledCount(taskA));
+                    Assert.Equal(1, h.DashboardNotifications);
+
+                    // ── AND THE HOLD IS OVER: B IS NOW SELECTABLE AND DELIVERS ON READY ───────
+                    Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+                    var admittedBTaskId = pipelineB.ActiveTaskId!;
+                    h.Queue.Enqueue(pendingB!);
+                    await h.ReadyAndAwaitAssignmentPublishedAsync(admittedBTaskId);
+
+                    Assert.True(h.Worker.IsBusy);
+                    Assert.Equal(admittedBTaskId, h.Worker.CurrentTaskId);
+                    Assert.NotNull(h.Stores.AssignmentStore.Load(admittedBTaskId));
+
+                    // ── THE ORDERING, READ OFF THE ONE LEDGER THE REAL PUMP WRITES ─────────────
+                    // ACK(A) was recorded BEFORE Assignment(B): the release publication completed
+                    // before the successor's own assignment could be published at all.
+                    var messages = h.Writer.Messages;
+                    var ackIndex = IndexOfMessage(
+                        messages,
+                        m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck
+                             && string.Equals(
+                                 m.CompletionReceiptAck.TaskId, taskA, StringComparison.Ordinal));
+                    var assignmentIndex = IndexOfMessage(
+                        messages,
+                        m => m.Assignment is not null
+                             && string.Equals(m.Assignment.TaskId, admittedBTaskId, StringComparison.Ordinal));
+
+                    Assert.True(ackIndex >= 0, "the completion's acknowledgement was never forwarded");
+                    Assert.True(assignmentIndex >= 0, "the successor's assignment was never forwarded");
+                    Assert.True(
+                        ackIndex < assignmentIndex,
+                        "the successor's assignment was forwarded BEFORE the completion's acknowledgement");
+                }
+                finally
+                {
+                    // THE WINDOW IS ALWAYS RELEASED AND THE HOOK ALWAYS CLEARED, whatever happened.
+                    h.ClearCompletionPublicationHook();
+                    window.Release();
+                }
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
+    }
+
+    /// <summary>The index of the FIRST forwarded message satisfying <paramref name="predicate"/>.</summary>
+    /// <param name="messages">The forwarded ledger, in order.</param>
+    /// <param name="predicate">Selects the message of interest.</param>
+    /// <returns>The index, or <c>-1</c> when nothing matched.</returns>
+    private static int IndexOfMessage(
+        IReadOnlyList<OrchestratorMessage> messages, Func<OrchestratorMessage, bool> predicate)
+    {
+        for (var i = 0; i < messages.Count; i++)
+        {
+            if (predicate(messages[i]))
+                return i;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// A LEGACY (DISABLED) REGISTRATION'S COMPLETION INSTALLS NO HOLD: the released worker is
+    /// immediately selectable, and the eager dispatch therefore behaves exactly as it always did.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE OTHER HALF OF THE HOLD'S CONTRACT. The hold is the NEGOTIATED path's alone, so a
+    /// disabled registration must keep the unchanged legacy runtime — including leaving the just
+    /// released worker available for a new selection in the very interval the enabled path withholds
+    /// it. Asserting the hold IS set for the enabled registration (the interleaving vector above) and
+    /// NOT set here is what keeps the opt-in honest rather than decorative.
+    /// </remarks>
+    [Fact]
+    public async Task DisabledCompletion_InstallsNoHoldAndLeavesTheWorkerSelectableInTheWindow()
+    {
+        var h = Harness.Create();
+        await RunAsync(h, async () =>
+        {
+            Assert.False(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Assign("task-hold-disabled", model: "assigned-model");
+
+            var window = h.PauseInCompletionPublicationWindow();
+
+            try
+            {
+                h.PushCompletion("task-hold-disabled", null, false, CopilotHive.Shared.Grpc.TaskStatus.Completed);
+
+                await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                // THE RELEASE HAPPENED…
+                Assert.False(h.Worker.IsBusy);
+                Assert.Null(h.Queue.GetActiveTask("task-hold-disabled"));
+
+                // …AND NO HOLD EXISTS: the instance is selectable exactly as before this slice.
+                Assert.False(h.Worker.CompletionPublicationPending);
+                Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            }
+            finally
+            {
+                h.ClearCompletionPublicationHook();
+                window.Release();
+            }
+
+            await h.BarrierAsync();
+
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+        });
+    }
+
+    /// <summary>
+    /// A REFUSED CHECKED RELEASE ACQUIRES NO HOLD, and therefore clears none: the successor's
+    /// ownership survives untouched and the instance is never withheld on behalf of a completion that
+    /// was never applied.
+    /// </summary>
+    /// <remarks>
+    /// THE WINDOW HOOK IS DELIBERATELY NOT EXPECTED TO FIRE HERE: a refused release must never reach
+    /// the post-release window, so the observables are that the hook never fired AND no hold exists.
+    /// </remarks>
+    [Fact]
+    public async Task RefusedCheckedRelease_AcquiresAndClearsNoHold()
+    {
+        const string refusedTaskId = "task-hold-refuse-predecessor";
+
+        var h = Harness.CreateWithOwnershipMutationAfterRecordAndRequestedAck();
+        await RunAsync(h, async () =>
+        {
+            Assert.True(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Assign(refusedTaskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            // THE POST-RECORD OWNERSHIP MUTATION makes the CHECKED RELEASE itself the refusing guard:
+            // the recorded receipt is real and durable, and the release is then refused at the
+            // mutation point.
+            h.RecorderHook!.AfterRecord = () => h.Pool.MarkIdle(WorkerId);
+
+            var window = h.PauseInCompletionPublicationWindow();
+
+            try
+            {
+                await h.CompleteAndAwaitCheckedReleaseRefusedWithPresentModelAsync(refusedTaskId);
+
+                // THE POST-RELEASE WINDOW WAS NEVER ENTERED, so no hold existed to clear.
+                Assert.Equal(0, window.Invocations);
+                Assert.False(h.Worker.CompletionPublicationPending);
+
+                // THE REFUSAL'S OWN STATE: the task is still ACTIVE, the worker is not busy with it
+                // (the injected mutation idled it) and nothing was notified.
+                Assert.NotNull(h.Queue.GetActiveTask(refusedTaskId));
+                Assert.Equal(0, h.DashboardNotifications);
+                Assert.Equal(0, h.DownstreamHandledCount(refusedTaskId));
+
+                // NO HOLD IS INSTALLED: the instance is selectable, exactly as it became when the
+                // injected mutation idled it — the refused release neither withheld nor released it.
+                Assert.False(h.Worker.CompletionPublicationPending);
+                Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            }
+            finally
+            {
+                h.ClearCompletionPublicationHook();
+                window.Release();
+            }
+        });
+    }
+
+    /// <summary>
+    /// AN ABA REPLACEMENT REGISTERED DURING THE PUBLICATION IS LEFT UNTOUCHED BY THE HOLD'S END: the
+    /// finishing publication clears the flag on the EXACT instance it belongs to, never on whatever is
+    /// registered under the id at that instant.
+    /// </summary>
+    /// <remarks>
+    /// THE WINDOW IS THE DETERMINISTIC SEAM. The replacement is registered INSIDE the real
+    /// post-release window — with the completion-publication hold already installed on the original
+    /// instance — so the ordering "replacement lands, THEN the publication ends" is exact rather than
+    /// raced. The vector asserts the replacement keeps its own (unheld, busy) state, that the original
+    /// instance's flag is left alone by the clear, and that the stream's own handler still completes.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHoldEnd_LeavesAnAbaReplacementUntouched()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            Assert.True(h.Worker.CompletionReceiptAckEnabled);
+
+            const string taskId = "task-hold-aba-window";
+            h.Assign(taskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            var originalWorker = h.Worker;
+            ConnectedWorker? replacement = null;
+
+            var downstream = h.DispatcherLogger.WaitFor(taskId);
+            var window = h.PauseInCompletionPublicationWindow();
+
+            try
+            {
+                h.PushCompletion(taskId, "assigned-model", true);
+
+                await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                Assert.True(originalWorker.CompletionPublicationPending);
+
+                // ── THE REPLACEMENT LANDS INSIDE THE WINDOW ────────────────────────────────────
+                Assert.True(h.Pool.RemoveWorker(originalWorker));
+                replacement = h.Pool.RegisterWorker(WorkerId, []);
+                h.Pool.MarkBusy(WorkerId, taskId);
+                replacement.CurrentModel = "replacement-model";
+            }
+            finally
+            {
+                h.ClearCompletionPublicationHook();
+                window.Release();
+            }
+
+            // THE PUBLICATION FINISHES, AND ITS OWN OUTCOME IS INTACT — the ABA replacement does not
+            // stop the completion's ordinary notification.
+            await downstream.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE REPLACEMENT IS UNTOUCHED: not held, still busy with its own task and model.
+            Assert.NotNull(replacement);
+            Assert.False(replacement!.CompletionPublicationPending);
+            Assert.True(replacement.IsBusy);
+            Assert.Equal(taskId, replacement.CurrentTaskId);
+            Assert.Equal("replacement-model", replacement.CurrentModel);
+
+            // …AND THE ORIGINAL INSTANCE KEEPS ITS OWN HOLD: the finishing publication cleared the
+            // flag it installed, but the stale instance is no longer registered, so nothing of a
+            // DIFFERENT instance was mutated on its behalf.
+            Assert.True(originalWorker.CompletionPublicationPending);
+        });
+    }
+
+    /// <summary>
+    /// THE HOLD ENDS ON A FAILED ACKNOWLEDGEMENT ENQUEUE: a closed channel plus a throwing enqueue
+    /// diagnostic must lose neither the accepted completion nor the worker's selectability.
+    /// </summary>
+    /// <remarks>
+    /// THE ENQUEUE ATTEMPT — NOT ITS DELIVERY — IS WHAT THE HOLD COVERS. This vector closes the
+    /// channel so the <c>TryWrite</c> must fail, arms the diagnostic to throw, and then asserts the
+    /// hold is GONE, the completion is fully released and notified exactly once, the eligibility was
+    /// still advanced, and the worker is selectable again — i.e. the failed publication never strands
+    /// selection. The hold's PRESENCE inside the window is asserted first, so a vector that never
+    /// installed one cannot pass vacuously.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_EndsOnAFailedAcknowledgementEnqueue()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            const string taskId = "task-hold-enqueue-fail";
+            h.Assign(taskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            Assert.True(h.Worker.MessageChannel.Writer.TryComplete());
+            h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckNotQueued);
+
+            // THE REAL DOWNSTREAM CHAIN IS AWAITED SEPARATELY: the notification is fire-and-forget, so
+            // the barrier alone proves only that the handler returned.
+            var downstream = h.DispatcherLogger.WaitFor(taskId);
+
+            var window = h.PauseInCompletionPublicationWindow();
+            var heldInsideWindow = false;
+
+            try
+            {
+                h.PushCompletion(taskId, "assigned-model", true, CopilotHive.Shared.Grpc.TaskStatus.Completed);
+
+                await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                // THE HOLD IS IN FORCE DURING THE WINDOW, on the failed-enqueue path too.
+                heldInsideWindow = h.Worker.CompletionPublicationPending;
+                Assert.True(heldInsideWindow);
+                Assert.Null(h.Pool.GetIdleWorker());
+            }
+            finally
+            {
+                h.ClearCompletionPublicationHook();
+                window.Release();
+            }
+
+            await h.BarrierAsync();
+
+            // ── THE PUBLICATION ATTEMPT FAILED, AND THE HOLD STILL ENDED ──────────────────────
+            Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
+            Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            await downstream.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE ACCEPTED COMPLETION SURVIVED COMPLETELY — released once, notified once, durable.
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Null(h.Queue.GetActiveTask(taskId));
+            Assert.Equal(1, h.DownstreamHandledCount(taskId));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
+            Assert.NotNull(h.ReadReceipt(taskId));
+
+            // …AND THE ELIGIBILITY WAS STILL ADVANCED BEFORE THE FAILED ENQUEUE, proven LIVE.
+            await h.CompleteAndAwaitAcknowledgementNotQueuedAsync(taskId);
+            Assert.False(h.Worker.CompletionPublicationPending);
+        });
+    }
+
+    /// <summary>
+    /// A HELD/Faulted RESPONSE WRITE DOES NOT RETAIN THE SELECTION HOLD: the hold ends after the
+    /// enqueue ATTEMPT, not after delivery, so the worker is selectable again even though the
+    /// acknowledgement never reached the wire.
+    /// </summary>
+    /// <remarks>
+    /// THE PUMP-LEVEL FAULT IS DELIBERATELY CHOSEN. The channel write SUCCEEDS here; the failure is
+    /// the response writer's, which happens strictly after the handler returned and after the hold was
+    /// already ended. That is exactly the boundary the contract names: a held or failed response write
+    /// must never be interpreted as "still publishing", because the hold does not wait for the network
+    /// write or the worker's acknowledgement.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_IsNotRetainedByAResponseWriteFault()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            const string taskId = "task-hold-write-fault";
+            h.Assign(taskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            var writerFault = new InvalidOperationException("the response writer threw SENTINEL");
+            h.ArmOneShotAcknowledgementWriteFault(writerFault);
+            h.ServiceLogger.ArmThrowOnFragment(ProductionLogFragments.ReceiptAckWriteFailed);
+
+            var writeFailed = h.ServiceLogger.WaitFor(ProductionLogFragments.ReceiptAckWriteFailed);
+
+            var result = await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+
+            await writeFailed.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            // THE WRITE REALLY WAS ATTEMPTED AND REALLY FAULTED…
+            Assert.Equal(1, h.AcknowledgementWriteAttempts);
+            Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
+
+            // ──…AND THE HOLD IS GONE LONG BEFORE THAT, because it ends at the ENQUEUE ATTEMPT ──
+            Assert.Equal(taskId, result.TaskId);
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // THE ACCEPTED COMPLETION IS INTACT AND NOTIFIED EXACTLY ONCE.
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Queue.GetActiveTask(taskId));
+            Assert.Equal(1, h.DownstreamHandledCount(taskId));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
+            Assert.NotNull(h.ReadReceipt(taskId));
+            Assert.False(h.StreamEnded);
+        });
+    }
+
+    /// <summary>
+    /// DUPLICATE RE-ACKNOWLEDGEMENTS NEVER ACQUIRE OR CLEAR A HOLD: the read-only duplicate branch
+    /// performs no release, so no hold is installed, and the worker stays selectable throughout.
+    /// </summary>
+    /// <remarks>
+    /// IT PINS THE BOUNDARY BETWEEN THE TWO PATHS. A hold is a property of the ORDINARY negotiated
+    /// completion's publication — the duplicate branch publishes an acknowledgement too, but it
+    /// releases nothing, removes nothing and notifies nothing, so there is no "released but not yet
+    /// published" interval for it to cover. The single carried routing and the duplicate guards are
+    /// asserted unchanged alongside.
+    /// </remarks>
+    [Fact]
+    public async Task DuplicateReAcknowledgement_NeitherAcquiresNorClearsAHold()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            const string taskId = "task-hold-duplicate";
+            h.Assign(taskId, model: "assigned-model");
+
+            var acknowledgement = h.AwaitAcknowledgementAsync();
+            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+
+            var ack = await acknowledgement;
+            Assert.Equal(taskId, ack.TaskId);
+
+            // THE ORDINARY COMPLETION'S HOLD IS ALREADY OVER.
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // ── THE DUPLICATE, THROUGH THE REAL READ LOOP, WHILE THE WORKER IS TRULY IDLE ─────
+            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId);
+
+            // It neither acquired a hold (which would have withheld the worker) nor disturbed one.
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // …and the duplicate guards and the once-only ordinary behaviour are unchanged.
+            Assert.Equal(2, h.AcknowledgedCountFor(taskId));
+            Assert.Equal(1, h.DownstreamHandledCount(taskId));
+            Assert.Equal(1, h.TransportNotifications);
+        });
+    }
+
+    /// <summary>
+    /// THE ORDINARY DASHBOARD NOTIFICATION HAPPENS AFTER THE HOLD IS FINISHED: at the instant the
+    /// notification's own observation runs, the instance is already selectable again.
+    /// </summary>
+    /// <remarks>
+    /// THE ORDERING IS THE CONTRACT — "finish the hold BEFORE the ordinary dashboard/downstream
+    /// notification" — and this observation runs INSIDE the production notification chain, so its read
+    /// is the state at that exact instant rather than a later one. A regression that moved the hold's
+    /// end after the notification would observe the flag still set here.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_IsFinishedBeforeTheOrdinaryNotification()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            const string taskId = "task-hold-order";
+            h.Assign(taskId, model: "assigned-model");
+
+            bool? heldAtNotification = null;
+            h.ObserveAtNotification(() => heldAtNotification = h.Worker.CompletionPublicationPending);
+
+            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+
+            Assert.NotNull(heldAtNotification);
+            Assert.False(
+                heldAtNotification,
+                "the selection hold was still installed when the completion was notified");
+            Assert.False(h.Worker.CompletionPublicationPending);
+        });
+    }
+
+    /// <summary>
+    /// THE COMPLETION-PUBLICATION HOLD IS TAKEN AND FINISHED AROUND EVERY ORDINARY NEGOTIATED
+    /// COMPLETION'S PUBLICATION, and never outlives it: two successive completions each take their
+    /// own hold, each ends it, and the worker is selectable at the end.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE SLICE'S OWN REPETITION CHECK: an accidental hold that outlives its publication — a
+    /// held instance that never becomes selectable again, or one whose second completion never takes
+    /// its own hold — is visible here without reading the other vectors.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_IsTakenAndFinishedForEachOrdinaryCompletion()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            foreach (var taskId in new[] { "task-hold-lifecycle-a", "task-hold-lifecycle-b" })
+            {
+                h.Assign(taskId, model: "assigned-model");
+                h.ResetDashboardNotifications();
+
+                var acknowledgement = h.AwaitAcknowledgementAsync();
+                var window = h.PauseInCompletionPublicationWindow();
+                var heldInsideWindow = false;
+
+                try
+                {
+                    h.PushCompletion(taskId, "assigned-model", true);
+
+                    await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                    // THE HOLD IS IN FORCE FOR THIS PUBLICATION, AND THE RELEASE REALLY HAPPENED.
+                    heldInsideWindow = h.Worker.CompletionPublicationPending;
+                    Assert.True(heldInsideWindow);
+                    Assert.False(h.Worker.IsBusy);
+                    Assert.Null(h.Queue.GetActiveTask(taskId));
+                    Assert.Null(h.Pool.GetIdleWorker());
+                }
+                finally
+                {
+                    h.ClearCompletionPublicationHook();
+                    window.Release();
+                }
+
+                var ack = await acknowledgement;
+                Assert.Equal(taskId, ack.TaskId);
+                await h.BarrierAsync();
+
+                // EACH COMPLETION'S OWN HOLD IS GONE, AND THE INSTANCE IS SELECTABLE AGAIN.
+                Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
+                Assert.False(h.Worker.CompletionPublicationPending);
+                Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            }
+
+            // TWO COMPLETIONS, TWO HOLDS, TWO ACKNOWLEDGEMENTS — and the worker is not stranded.
+            Assert.Equal(2, h.Writer.Messages.Count(
+                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck));
+        });
+    }
+
     /// <summary>
     /// Asserts NO acknowledgement was forwarded to the worker: not as the new oneof case, and not as
     /// a stray message that happens to carry a <see cref="CompletionReceiptAck"/> payload.
@@ -2662,6 +3335,26 @@ public sealed class CompletionTransportOwnershipTests
         public required GoalPipelineManager Manager { get; init; }
 
         /// <summary>
+        /// THE REAL EAGER DISPATCHER, wired over the SAME pool, the SAME queue and the SAME gateway
+        /// the Ready route uses — so a vector can exercise the production eager push path exactly as
+        /// it runs while the completion publication is in flight.
+        /// </summary>
+        /// <remarks>
+        /// IT IS A SECOND, INDEPENDENT CONSUMER OF THE POOL, which is the whole point: the eager push
+        /// path consults <see cref="WorkerPool.GetIdleWorker"/> directly and therefore never sees the
+        /// stream-local eligibility holder or anything else that belongs to a <c>WorkStream</c>.
+        /// </remarks>
+        public required TaskDispatchService EagerDispatcher { get; init; }
+
+        /// <summary>
+        /// THE REAL PUBLISHER THE HARNESS BUILT, or <c>null</c> when published-assignment support was
+        /// not requested. Exposed so a vector can prove the SAME instance is handed to BOTH delivery
+        /// routes — a vector that ran with eager publication silently disabled would not be exercising
+        /// the eager push at all.
+        /// </summary>
+        public required IWorkerAssignmentPublisher? AssignmentPublisher { get; init; }
+
+        /// <summary>
         /// THE REAL RECORD/RECEIPT STORES the service's REAL completion recorder is built from —
         /// exposed for TEST OBSERVATION ONLY. The production path performs no readback.
         /// </summary>
@@ -2740,6 +3433,20 @@ public sealed class CompletionTransportOwnershipTests
         /// <summary>How many tasks the REAL queue accepted — the "did the pipeline advance" probe.</summary>
         public int TasksEnqueued => Volatile.Read(ref _tasksEnqueued);
 
+        /// <summary>
+        /// INSTALLS A ONE-SHOT OBSERVATION THAT RUNS INSIDE THE PRODUCTION NOTIFICATION CHAIN, so a
+        /// vector can read state AT the instant the completion was published rather than after it.
+        /// </summary>
+        /// <remarks>
+        /// IT IS THE FIRST SUBSCRIBER'S OWN CALLBACK, so it runs before the awaiting test is released
+        /// and inside production's <c>NotifyAsync</c> invocation. The observation is consumed once and
+        /// never affects anything: a throw from it is the fixture's own bug and propagates where the
+        /// vector can see it (this harness's notifier chain is the transport's, and the vector
+        /// observes only its own state).
+        /// </remarks>
+        /// <param name="observe">The observation to run at the notification instant.</param>
+        public void ObserveAtNotification(Action observe) => _observations.PendingObservation = observe;
+
         /// <summary>Whether the real stream task has terminated.</summary>
         public bool StreamEnded => StreamTask.IsCompleted;
 
@@ -2759,7 +3466,6 @@ public sealed class CompletionTransportOwnershipTests
                      && ProductionLogFragments.DownstreamEntered(m));
 
         public static Harness Create() => CreateCore(withPublishedAssignmentSupport: false, dbPath: null);
-
         /// <summary>
         /// Creates a harness whose worker reached the pool through the REAL <see cref="HiveOrchestratorService.Register"/>
         /// RPC carrying the completion-receipt REQUEST — so the instance's enablement is genuinely
@@ -2798,6 +3504,26 @@ public sealed class CompletionTransportOwnershipTests
         /// </summary>
         public static Harness CreateWithPublishedAssignmentSupport(string dbPath) =>
             CreateCore(withPublishedAssignmentSupport: true, dbPath);
+
+        /// <summary>
+        /// THE HARNESS THE INTERLEAVING REGRESSION NEEDS: an ACK-ENABLED registration (negotiated
+        /// through the REAL registration RPC) AND the published-assignment support both dispatch
+        /// routes require, over a REAL file-backed SQLite database.
+        /// </summary>
+        /// <remarks>
+        /// BOTH HALVES ARE LOAD-BEARING. The enablement makes the completion path actually publish an
+        /// acknowledgement (and therefore take the completion-publication hold), and the publisher —
+        /// wired into the ONE gateway BOTH routes share — makes the eager send able to publish for
+        /// real, so an ordering vector cannot pass merely because eager publication was disabled.
+        /// </remarks>
+        /// <param name="dbPath">The per-vector temporary database path.</param>
+        /// <returns>The live harness.</returns>
+        public static Harness CreateWithRequestedAckAndPublishedAssignmentSupport(string dbPath) =>
+            CreateCore(
+                withPublishedAssignmentSupport: true,
+                dbPath,
+                requestCompletionReceiptAck: true,
+                registerThroughRealRpc: true);
 
         /// <summary>
         /// Creates a harness whose completion-receipt store carries the supplied EF interceptors —
@@ -2883,16 +3609,6 @@ public sealed class CompletionTransportOwnershipTests
             var observations = new CompletionObservations();
             completionNotifier.OnTaskCompleted += observations.Record;
 
-            var dispatcherLogger = new SignallingLogger<GoalDispatcher>();
-            var dispatcher = new GoalDispatcher(
-                goalManager,
-                pipelineManager,
-                queue,
-                new GrpcWorkerGateway(pool),
-                completionNotifier,
-                dispatcherLogger,
-                new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
-
             // ── THE COMPLETION-RECEIPT STORES: REAL, over a REAL SQLite database ─────────────
             // The recorder is a REAL WorkerCompletionRecorder over these two REAL stores, so the
             // durability evidence every accepting vector points at is production-written.
@@ -2908,6 +3624,23 @@ public sealed class CompletionTransportOwnershipTests
                     pool,
                     recordStores.AssignmentStore);
             }
+
+            // ── ONE PUBLISHER, BOTH DELIVERY ROUTES ──────────────────────────────────────────
+            // The REAL publisher is handed to the service (the READY route) AND to the eager
+            // dispatcher's own gateway (the EAGER route). Wiring it into only one of the two would
+            // let an ordering vector pass because eager publication was DISABLED rather than because
+            // nothing was selected.
+            var eagerGateway = new GrpcWorkerGateway(pool, assignmentPublisher);
+
+            var dispatcherLogger = new SignallingLogger<GoalDispatcher>();
+            var dispatcher = new GoalDispatcher(
+                goalManager,
+                pipelineManager,
+                queue,
+                new GrpcWorkerGateway(pool),
+                completionNotifier,
+                dispatcherLogger,
+                new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
 
             var serviceLogger = new SignallingLogger<HiveOrchestratorService>();
 
@@ -2989,6 +3722,33 @@ public sealed class CompletionTransportOwnershipTests
             var writer = new SignallingStreamWriter();
             var streamTask = service.WorkStream(reader, writer, MockContext());
 
+            // ── THE REAL EAGER DISPATCHER: SAME POOL, SAME QUEUE, OWN GATEWAY ─────────────────
+            // Built exactly as production builds it (GoalDispatcher's own wiring shape), over the
+            // very pool and queue this harness's transport uses. Its gateway is handed the SAME real
+            // publisher, so an eager push can genuinely SELECT and PUBLISH here.
+            var eagerGoalManager = new GoalManager();
+            eagerGoalManager.AddSource(goalSource);
+
+            var eagerDispatcher = new TaskDispatchService(
+                queue,
+                eagerGateway,
+                new TaskBuilder(new BranchCoordinator()),
+                ConfigForEagerDispatch,
+                NullLogger<TaskDispatchService>.Instance,
+                pipelineManager,
+                new GoalLifecycleService(eagerGoalManager, NullLogger<GoalLifecycleService>.Instance),
+                new DispatcherMaintenance(
+                    pipelineManager,
+                    eagerGoalManager,
+                    queue,
+                    eagerGateway,
+                    brain: null,
+                    agentsManager: null,
+                    configRepo: null,
+                    new ConcurrentQueue<string>(),
+                    NullLogger<DispatcherMaintenance>.Instance,
+                    config: ConfigForEagerDispatch));
+
             var harness = new Harness(observations)
             {
                 Service = service,
@@ -3005,6 +3765,8 @@ public sealed class CompletionTransportOwnershipTests
                 StreamTask = streamTask,
                 Stores = recordStores,
                 RecorderHook = recorderHook,
+                EagerDispatcher = eagerDispatcher,
+                AssignmentPublisher = assignmentPublisher,
             };
 
             // THE DASHBOARD SIDE-EFFECT OBSERVATION: the REAL notifier's own state-changed event.
@@ -3022,6 +3784,27 @@ public sealed class CompletionTransportOwnershipTests
             queue.OnEnqueue = _ => Interlocked.Increment(ref harness._tasksEnqueued);
 
             return harness;
+        }
+
+        /// <summary>
+        /// THE MINIMAL CONFIGURATION the REAL eager dispatch path needs: one repository and one
+        /// configured coder model. It is configuration ONLY — the eager route's own refusal gate
+        /// resolves the model from it, and nothing about the hold or the transport reads it.
+        /// </summary>
+        private static HiveConfigFile ConfigForEagerDispatch
+        {
+            get
+            {
+                var config = new HiveConfigFile();
+                config.Repositories.Add(new RepositoryConfig
+                {
+                    Name = "ownership-repo",
+                    Url = "https://example.com/ownership-repo.git",
+                    DefaultBranch = "develop",
+                });
+                config.Workers["coder"] = new WorkerConfig { Model = "eager-model" };
+                return config;
+            }
         }
 
         /// <summary>
@@ -4042,6 +4825,152 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
+        /// THE POST-RELEASE, PRE-ACKNOWLEDGEMENT WINDOW, made deterministic: installs the
+        /// production hook that fires AFTER the checked release (and its active-queue removal) and
+        /// BEFORE the eligibility advance and the acknowledgement enqueue, with NO pool lock held.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// WHY THIS WINDOW AND NOT ANOTHER. The classification hook runs before the handler is
+        /// entered, so nothing has been released and no hold exists yet. A response-writer gate runs
+        /// after the acknowledgement has already been queued and forwarded. Neither can express "the
+        /// worker is released and held, and the acknowledgement is not yet enqueued", which is
+        /// exactly the interval the selection hold exists to cover.
+        /// </para>
+        /// <para>
+        /// THE HOOK DISARMS ITSELF AS IT FIRES, so it can never affect a later completion on the same
+        /// stream. The returned window is the fixture's handle for the coordination; the caller MUST
+        /// release it (and clear the hook) in a <c>finally</c>.
+        /// </para>
+        /// </remarks>
+        /// <returns>The window handle the vector coordinates through.</returns>
+        public PostReleaseWindow PauseInCompletionPublicationWindow()
+        {
+            var hookField = typeof(HiveOrchestratorService).GetField(
+                "_afterCompletionReleaseBeforeAckForTest",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.NotNull(hookField);
+
+            var window = new PostReleaseWindow();
+            Action<ConnectedWorker, string> hook = (pinned, deliveredTaskId) =>
+            {
+                hookField!.SetValue(Service, null);
+                window.Enter(pinned, deliveredTaskId);
+            };
+
+            hookField!.SetValue(Service, hook);
+            return window;
+        }
+
+        /// <summary>Clears the completion-publication window hook, whatever state it is in.</summary>
+        public void ClearCompletionPublicationHook()
+        {
+            var hookField = typeof(HiveOrchestratorService).GetField(
+                "_afterCompletionReleaseBeforeAckForTest",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            hookField?.SetValue(Service, null);
+        }
+
+        /// <summary>
+        /// PUSHES ONE COMPLETION THROUGH THE REAL <c>WorkStream</c> READ LOOP AND AWAITS THE
+        /// COMPLETION-PUBLICATION WINDOW, so a vector can act INSIDE the publication with the release
+        /// already applied, the active-queue entry already removed and the hold already installed.
+        /// </summary>
+        /// <remarks>
+        /// THE MESSAGE REALLY TRAVELS THE PRODUCTION ARM: classification, activity decision, the
+        /// handler's validation gates, the recorder and the checked release all run as production runs
+        /// them. The only test-owned element is the window hook, which observes and delays but decides
+        /// nothing — everything it could affect is re-validated by the guards that follow it.
+        /// </remarks>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="modelPresent">Whether the completion carries an explicit model.</param>
+        /// <param name="model">The model value to carry when presence is required.</param>
+        /// <returns>The window handle the caller must release (and whose hook it must clear).</returns>
+        public async Task<PostReleaseWindow> CompleteAndPauseInPublicationWindowAsync(
+            string taskId, string? model, bool modelPresent)
+        {
+            var window = PauseInCompletionPublicationWindow();
+
+            PushCompletion(taskId, model, modelPresent);
+
+            await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            return window;
+        }
+
+        /// <summary>
+        /// Pushes ONE completion for the pinned worker onto the real request stream, built through the
+        /// harness's own completion shape, so no vector has to reach the reader or the builder itself.
+        /// </summary>
+        /// <param name="taskId">The completing task's identifier.</param>
+        /// <param name="model">The model value to carry, or <c>null</c> for ABSENT.</param>
+        /// <param name="modelPresent">Whether the completion carries an explicit model.</param>
+        /// <param name="status">The wire status to carry.</param>
+        public void PushCompletion(
+            string taskId,
+            string? model,
+            bool modelPresent,
+            CopilotHive.Shared.Grpc.TaskStatus status = CopilotHive.Shared.Grpc.TaskStatus.Completed) =>
+            Reader.Push(new WorkerMessage
+            {
+                WorkerId = WorkerId,
+                Complete = BuildComplete(taskId, model, modelPresent, status),
+            });
+
+        /// <summary>
+        /// THE DETERMINISTIC HANDLE ON ONE COMPLETION-PUBLICATION WINDOW: the signal that the window
+        /// was entered, the release the fixture grants, and the exact instance/task the window was
+        /// entered with.
+        /// </summary>
+        /// <remarks>
+        /// A TIMED-OUT WAIT IS A LOUD FAILURE, never a silent continuation: a fixture that forgot to
+        /// release would otherwise let the completion publication hang and the vector would fail on
+        /// its own bound anyway; making the timeout explicit keeps the diagnosis in the window.
+        /// </remarks>
+        public sealed class PostReleaseWindow
+        {
+            private static readonly TimeSpan Bound = TimeSpan.FromSeconds(30);
+
+            private readonly System.Threading.ManualResetEventSlim _release = new(false);
+            private readonly TaskCompletionSource _entered =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            /// <summary>Completes once the window has been entered.</summary>
+            public Task Entered => _entered.Task;
+
+            /// <summary>How many times the hook fired.</summary>
+            public int Invocations { get; private set; }
+
+            /// <summary>The exact instance the completion was delivered on.</summary>
+            public ConnectedWorker? ObservedWorker { get; private set; }
+
+            /// <summary>The completing task's identifier.</summary>
+            public string? ObservedTaskId { get; private set; }
+
+            /// <summary>Whether the fixture released the window.</summary>
+            public bool WasReleased { get; private set; }
+
+            internal void Enter(ConnectedWorker worker, string taskId)
+            {
+                ObservedWorker = worker;
+                ObservedTaskId = taskId;
+                Invocations++;
+                _entered.TrySetResult();
+
+                if (!_release.Wait(Bound))
+                {
+                    throw new TimeoutException(
+                        $"the completion-publication window for task '{taskId}' was not released within " +
+                        $"{Bound.TotalSeconds:F0}s — the fixture never granted it.");
+                }
+
+                WasReleased = true;
+            }
+
+            /// <summary>Grants the window, letting the completion publication continue.</summary>
+            public void Release() => _release.Set();
+        }
+
+        /// <summary>
         /// The post-record CHECKED-RELEASE refusal delivery with an EXPLICITLY PRESENT model, so the
         /// refusal is provably the release's and the enabled model requirement is satisfied.
         /// </summary>
@@ -4590,6 +5519,17 @@ public sealed class CompletionTransportOwnershipTests
         /// </summary>
         public Func<string, CompletionReceiptReadResult?>? ReceiptProbe { get; set; }
 
+        /// <summary>
+        /// A ONE-SHOT observation the harness installs, run INSIDE this subscriber's own callback (and
+        /// therefore inside production's notification chain) and consumed exactly once.
+        /// </summary>
+        /// <remarks>
+        /// IT OBSERVES, IT DECIDES NOTHING: the callback is cleared as it fires, and nothing it does can
+        /// change the emitted result or the ordering the vector is measuring. It exists so a vector can
+        /// read state AT the notification instant instead of after it.
+        /// </remarks>
+        public Action? PendingObservation { get; set; }
+
         /// <summary>How many results the transport published on the shared notifier.</summary>
         public int Count => Volatile.Read(ref _count);
 
@@ -4616,6 +5556,13 @@ public sealed class CompletionTransportOwnershipTests
         public Task Record(TaskResult result)
         {
             Interlocked.Increment(ref _count);
+
+            // ── THE ONE-SHOT NOTIFICATION-INSTANT OBSERVATION, taken BEFORE the waiter is released ──
+            // Consumed exactly once, and it observes rather than decides: nothing it can do changes the
+            // emitted result.
+            var pendingObservation = PendingObservation;
+            PendingObservation = null;
+            pendingObservation?.Invoke();
 
             // ── THE NOTIFICATION-INSTANT PROBE, taken BEFORE the waiter is released ──────────
             // A throwing probe is captured, never propagated: this subscriber sits inside
