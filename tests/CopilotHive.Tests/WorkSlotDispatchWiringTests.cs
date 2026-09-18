@@ -18,8 +18,10 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
+using Grpc.Core;
 using System.Reflection;
 
+using GrpcMessage = CopilotHive.Shared.Grpc.OrchestratorMessage;
 using WorkerRole = CopilotHive.Workers.WorkerRole;
 
 namespace CopilotHive.Tests;
@@ -215,6 +217,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     private const string GoalId = "goal-wiring";
+    private static readonly TimeSpan BoundedWait = TimeSpan.FromSeconds(30);
 
     private static HiveConfigFile CreateConfig()
     {
@@ -3080,9 +3083,8 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// <summary>
     /// THE STAGE A STRANDING HOLE, closed: the agents-md gateway send FAILS and the maintenance
     /// class's own catch tries to log that failure — with a logger that THROWS. That nested throw
-    /// escapes the awaited stage A call at the worst instant (task dequeued, Role reassigned, NOT
-    /// yet activated, cancel-check not yet run), so without the boundary containment the dequeued
-    /// task is STRANDED by a pure diagnostic failure.
+    /// would otherwise escape after the task has been claimed. The helper's guarded diagnostic
+    /// contains that secondary failure, so the claimed task still proceeds to publication.
     /// </summary>
     /// <remarks>
     /// This is the vector the earlier guidance test could not reach: it used a non-throwing logger,
@@ -3204,7 +3206,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
     /// <summary>
     /// THE LOGGER-THROWN-OCE HOLE, CLOSED: an ORDINARY guidance failure whose maintenance
-    /// diagnostic throws an <see cref="OperationCanceledException"/> CARRYING THE NOW-CANCELLED
+    /// diagnostic throws an <see cref="OperationCanceledException"/> carrying the now-cancelled
     /// CALLER TOKEN must NOT be accepted as caller-cancellation evidence. The guarded emission
     /// contains it, so the dispatch reaches its own recheck and throws THAT — never the logger's
     /// instance.
@@ -3283,7 +3285,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// </para>
     /// </remarks>
     [Fact]
-    public async Task Delivery_CancelledBeforeCheck_RequeuesRestoresRoleLogsInOrderAndPropagates()
+    public async Task Delivery_CancelledBeforeClaim_RequeuesWithoutRoleWritesLogsInOrderAndPropagates()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
@@ -3354,7 +3356,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// A THROWING <see cref="TaskQueue.OnEnqueue"/> during the recovery's re-enqueue: the task IS
     /// already pending (Enqueue inserts BEFORE invoking the callback), the
     /// <c>delivery-rollback-failure step=re-enqueue</c> record is THE record, the guard line is NOT
-    /// emitted, the Role restore still runs, and the ORIGINAL cancellation is rethrown.
+    /// emitted, no worker field is written, and the CALLER cancellation is rethrown.
     /// </summary>
     /// <remarks>
     /// THE CANCELLATION TRIGGER is the gateway's stage-G gate, so the admission has already
@@ -3402,7 +3404,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             e.Message == DeliveryRollbackFailureMessage(GoalId, taskId, "re-enqueue") &&
             ReferenceEquals(e.Exception, sentinel));
 
-        // The remaining steps CONTINUED: the Role restore ran and the failure line was written.
+        // The remaining reporting CONTINUED and the worker role was never written at all.
         Assert.Equal(WorkerRole.Tester, worker.Role);
         Assert.Contains(logger.LogEntries, e =>
             e.LogLevel == LogLevel.Warning &&
@@ -3414,27 +3416,20 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Null(queue.GetActiveTask(taskId));
     }
 
-    // ── (f) THE ROLE RESTORE — the concurrent-mutation vector ────────────────
+    // ── (f) PRE-CLAIM CANCELLATION — concurrent role mutation survives ────────
 
     /// <summary>
-    /// THE CONCURRENT-MUTATION VECTOR: a third party re-assigns the worker's Role between the
-    /// delivery's assignment and the restore's compare, so the restore SKIPS — a live claim is
-    /// never overwritten.
+    /// A third party changes the candidate's role from the recovery's own enqueue callback. Because
+    /// eager performs NO pre-claim role write and NO obsolete restoration, that independent value
+    /// survives the cancellation recovery unchanged.
     /// </summary>
     /// <remarks>
-    /// The mutation is injected from the recovery's own enqueue callback, which runs strictly
-    /// between step (1) and step (3). The check-then-write is NOT atomic — this test pins the
-    /// common overwrite being avoided, which is exactly what the production comment claims, and
-    /// nothing more. The <c>step=role-model-restore</c> catch has NO runtime vector at all:
-    /// <see cref="ConnectedWorker.Role"/> is a plain auto-property on a sealed class, so that catch
-    /// is a CODE-REVIEW CRITERION (the belt-and-braces structure), not a testable path.
-    /// <para>
-    /// THE CANCELLATION TRIGGER is the gateway's stage-G gate — after the admission, at the
-    /// delivery boundary the recovery is defined at.
-    /// </para>
+    /// The mutation runs after the single requeue insert and before the recovery returns. This pins
+    /// the new restore-free behavior: no eager cleanup is allowed to write worker fields before a
+    /// successful checked claim.
     /// </remarks>
     [Fact]
-    public async Task Delivery_CancelledAfterConcurrentRoleReassignment_SkipsTheRestore()
+    public async Task Delivery_PreClaimCancellation_DoesNotOverwriteConcurrentRoleChange()
     {
         var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
         var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
@@ -3573,9 +3568,9 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     // ── (g) THE POST-DEQUEUE LOGGING BOUNDARY ────────────────────────────────
 
     /// <summary>
-    /// A logger that throws at the assigned-role record — the FIRST log call after the dequeue and
-    /// before the activation — must NOT strand the dequeued task: the logging guard swallows it and
-    /// the dispatch PROCEEDS to the delivery.
+    /// A logger that throws at the assigned-role record — immediately AFTER the checked claim — must
+    /// NOT derail the claimed task: the logging guard swallows it and the dispatch proceeds to
+    /// publication.
     /// </summary>
     [Fact]
     public async Task Delivery_LoggerThrowsAfterDequeue_IsSwallowedAndDeliveryProceeds()
@@ -4145,6 +4140,409 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // (14) THE REAL EAGER CHECKED-CLAIM CHAIN — deterministic interleavings
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// The complete real-chain race: eager has selected the worker and dequeued its Coder task, then
+    /// pauses at the gateway immediately before the real pool claim. A real Ready delivery claims the
+    /// same worker for the earlier valid Tester task. Eager subsequently loses without touching the
+    /// winner, and the exact refused task is later delivered successfully.
+    /// </summary>
+    [Fact]
+    public async Task EagerClaim_ReadyWinsInsidePreClaimWindow_OneWinnerAndRefusedWorkDeliversLater()
+    {
+        const string winnerGoalId = "goal-ready-winner";
+        const string loserGoalId = "goal-eager-loser";
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var queue = new TaskQueue();
+        var pool = new WorkerPool();
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var realGateway = new GrpcWorkerGateway(pool, recording.Publisher);
+        var gatedGateway = new GatedRealWorkerGateway(realGateway);
+
+        // Ready's DIFFERENT task is admitted first with no connected worker, hence remains pending.
+        var winnerGoal = CreateGoal(winnerGoalId);
+        var winnerPipeline = manager.CreatePipeline(winnerGoal);
+        Arrange(winnerPipeline, GoalPhase.Testing);
+        WorkTask? winnerTask = null;
+        queue.OnEnqueue = task =>
+        {
+            if (task.GoalId == winnerGoalId)
+                winnerTask ??= task;
+        };
+        await CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                workerGateway: gatedGateway, goal: winnerGoal)
+            .DispatchToRole(winnerPipeline, WorkerRole.Tester, "Test winner", TestContext.Current.CancellationToken);
+        Assert.NotNull(winnerTask);
+
+        var worker = pool.RegisterWorker("worker-real-chain", []);
+        worker.Role = WorkerRole.Tester;
+        var agents = CreateAgentsManager();
+        agents.UpdateAgentsMd(WorkerRole.Tester, "# tester winner guidance");
+        var readyService = CreateReadyService(manager, queue, pool, recording.Publisher, agents);
+
+        // The eager Coder task is admitted second. Role-aware dequeue skips the Tester task and takes
+        // this exact Coder task, after which the wrapped REAL gateway parks before forwarding claim.
+        var loserGoal = CreateGoal(loserGoalId);
+        var loserPipeline = manager.CreatePipeline(loserGoal);
+        Arrange(loserPipeline, GoalPhase.Coding);
+        WorkTask? loserTask = null;
+        queue.OnEnqueue = task =>
+        {
+            if (task.GoalId == loserGoalId)
+                loserTask ??= task;
+        };
+        using var claimGate = new SynchronousGatewayGate();
+        gatedGateway.BeforeClaim = claimGate;
+        var eager = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                    workerGateway: gatedGateway, goal: loserGoal, agentsManager: agents)
+                .DispatchToRole(loserPipeline, WorkerRole.Coder, "Code loser", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+        try
+        {
+            await claimGate.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.NotNull(loserTask);
+            Assert.False(worker.IsBusy);
+            Assert.Null(queue.GetActiveTask(loserTask!.TaskId));
+
+            // The real Ready handler consumes the other valid task and runs its real pool claim and
+            // real publisher before eager is allowed to continue.
+            await InvokeReadyAsync(readyService, worker, TestContext.Current.CancellationToken);
+            claimGate.Release();
+            await eager.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.True(worker.IsBusy);
+            Assert.Equal(winnerTask!.TaskId, worker.CurrentTaskId);
+            Assert.Equal(WorkerRole.Tester, worker.Role);
+            Assert.Equal("tester-model", worker.CurrentModel);
+            Assert.Same(winnerTask, queue.GetActiveTask(winnerTask.TaskId));
+            Assert.Null(queue.GetActiveTask(loserTask.TaskId));
+            Assert.Equal(worker.Id, winnerTask.Metadata["assigned_worker"]);
+            Assert.False(loserTask.Metadata.ContainsKey("assigned_worker"));
+
+            var winnerRow = recording.Store.Load(winnerTask.TaskId);
+            Assert.NotNull(winnerRow);
+            Assert.Equal(winnerGoalId, winnerRow!.Context.GoalId);
+            Assert.Equal(worker.Id, winnerRow.Context.WorkerId);
+            Assert.Equal(WorkerRole.Tester, winnerRow.Context.Role);
+            Assert.Null(recording.Store.Load(loserTask.TaskId));
+
+            var winnerMessages = DrainMessages(worker);
+            var winnerAssignment = Assert.Single(winnerMessages, m => m.Assignment is not null);
+            Assert.Equal(winnerTask.TaskId, winnerAssignment.Assignment.TaskId);
+            var winnerGuidance = Assert.Single(winnerMessages, m => m.UpdateAgents is not null);
+            Assert.Equal("tester", winnerGuidance.UpdateAgents.Role);
+            Assert.Equal("# tester winner guidance", winnerGuidance.UpdateAgents.AgentsMdContent);
+
+            // Eager never crossed either reference send boundary for the refused task.
+            Assert.Equal(0, gatedGateway.ReferenceGuidanceCalls);
+            Assert.Equal(0, gatedGateway.ReferenceTaskSendCalls);
+
+            // The ACTUAL loser is pending exactly once. Restore that one observed instance for the
+            // subsequent valid-delivery proof; no duplicate was present.
+            queue.OnEnqueue = null;
+            Assert.Same(loserTask, queue.TryDequeueAny());
+            Assert.Null(queue.TryDequeueAny());
+            queue.Enqueue(loserTask);
+
+            // Release the Ready winner, then a later ordinary eager trigger delivers the SAME refused
+            // object through the same real gateway/publisher chain.
+            Assert.True(pool.TryReleaseCompletedTask(worker, winnerTask.TaskId));
+            queue.MarkComplete(winnerTask.TaskId);
+            gatedGateway.BeforeClaim = null;
+
+            var laterGoal = CreateGoal("goal-later-trigger");
+            var laterPipeline = manager.CreatePipeline(laterGoal);
+            Arrange(laterPipeline, GoalPhase.Coding);
+            await CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                    workerGateway: gatedGateway, goal: laterGoal, agentsManager: agents)
+                .DispatchToRole(laterPipeline, WorkerRole.Coder, "Trigger later delivery",
+                    TestContext.Current.CancellationToken);
+
+            Assert.Same(loserTask, queue.GetActiveTask(loserTask.TaskId));
+            Assert.Equal(loserTask.TaskId, worker.CurrentTaskId);
+            var loserRow = recording.Store.Load(loserTask.TaskId);
+            Assert.NotNull(loserRow);
+            Assert.Equal(loserGoalId, loserRow!.Context.GoalId);
+            Assert.Equal(worker.Id, loserRow.Context.WorkerId);
+            var laterMessages = DrainMessages(worker);
+            var laterAssignment = Assert.Single(laterMessages, m => m.Assignment is not null);
+            Assert.Equal(loserTask.TaskId, laterAssignment.Assignment.TaskId);
+            Assert.Equal(1, gatedGateway.ReferenceTaskSendCalls);
+            Assert.Same(worker, gatedGateway.LastTaskSendWorker);
+            Assert.Same(loserTask, gatedGateway.LastTaskSent);
+        }
+        finally
+        {
+            claimGate.Release();
+            await JoinWithoutMaskingAsync(eager);
+        }
+    }
+
+    /// <summary>A previously selected eager candidate reaches a real completion-publication hold.</summary>
+    [Fact]
+    public async Task EagerClaim_SelectedCandidateBecomesCompletionHeld_RefusesAndRequeuesExactTask()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var queue = new TaskQueue();
+        var pool = new WorkerPool();
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var realGateway = new GrpcWorkerGateway(pool, recording.Publisher);
+        var gatedGateway = new GatedRealWorkerGateway(realGateway);
+        var worker = pool.RegisterWorker("worker-completion-hold-eager", []);
+        worker.Role = WorkerRole.Reviewer;
+
+        var goal = CreateGoal("goal-completion-hold-eager");
+        var pipeline = manager.CreatePipeline(goal);
+        Arrange(pipeline, GoalPhase.Coding);
+        WorkTask? task = null;
+        queue.OnEnqueue = value => task ??= value;
+        using var gate = new SynchronousGatewayGate();
+        gatedGateway.BeforeClaim = gate;
+        var dispatch = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                    workerGateway: gatedGateway, goal: goal, agentsManager: CreateAgentsManager())
+                .DispatchToRole(pipeline, WorkerRole.Coder, "Code held", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+        try
+        {
+            await gate.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.NotNull(task);
+            pool.MarkBusy(worker.Id, "task-completing-before-eager-claim");
+            Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(
+                worker, "task-completing-before-eager-claim"));
+            Assert.True(worker.CompletionPublicationPending);
+
+            gate.Release();
+            await dispatch.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.True(worker.CompletionPublicationPending);
+            Assert.False(worker.IsBusy);
+            Assert.Null(worker.CurrentTaskId);
+            // The completion release itself resets assignment role to Unspecified; the refused eager
+            // claim must leave that held state unchanged.
+            Assert.Equal(WorkerRole.Unspecified, worker.Role);
+            Assert.Null(queue.GetActiveTask(task!.TaskId));
+            Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+            Assert.Same(task, queue.TryDequeueAny());
+            Assert.Null(queue.TryDequeueAny());
+            Assert.Null(recording.Store.Load(task.TaskId));
+            Assert.Equal(0, gatedGateway.ReferenceGuidanceCalls);
+            Assert.Equal(0, gatedGateway.ReferenceTaskSendCalls);
+            Assert.Empty(DrainMessages(worker));
+        }
+        finally
+        {
+            gate.Release();
+            await JoinWithoutMaskingAsync(dispatch);
+            pool.ClearCompletionPublicationHold(worker);
+        }
+    }
+
+    /// <summary>Two eager operations select the same candidate before either real claim runs.</summary>
+    [Fact]
+    public async Task EagerClaim_TwoEagerOperationsContend_ExactlyOnePublishesAndOtherRequeues()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var queue = new TaskQueue();
+        var pool = new WorkerPool();
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var realGateway = new GrpcWorkerGateway(pool, recording.Publisher);
+        var gatedGateway = new GatedRealWorkerGateway(realGateway);
+        var worker = pool.RegisterWorker("worker-eager-contention", []);
+
+        var firstGoal = CreateGoal("goal-eager-contention-a");
+        var secondGoal = CreateGoal("goal-eager-contention-b");
+        var firstPipeline = manager.CreatePipeline(firstGoal);
+        var secondPipeline = manager.CreatePipeline(secondGoal);
+        Arrange(firstPipeline, GoalPhase.Coding);
+        Arrange(secondPipeline, GoalPhase.Coding);
+        var admitted = new ConcurrentDictionary<string, WorkTask>(StringComparer.Ordinal);
+        queue.OnEnqueue = task => admitted.TryAdd(task.GoalId, task);
+
+        using var selectionGate = new SynchronousGatewayGate(expectedEntries: 2);
+        gatedGateway.AfterSelection = selectionGate;
+        var first = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(), gatedGateway, goal: firstGoal)
+                .DispatchToRole(firstPipeline, WorkerRole.Coder, "Code A", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        var second = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(), gatedGateway, goal: secondGoal)
+                .DispatchToRole(secondPipeline, WorkerRole.Coder, "Code B", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+        try
+        {
+            await selectionGate.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            selectionGate.Release();
+            await Task.WhenAll(first, second).WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.Equal(2, admitted.Count);
+            var winnerId = worker.CurrentTaskId;
+            Assert.NotNull(winnerId);
+            var winner = Assert.Single(admitted.Values, task => task.TaskId == winnerId);
+            var loser = Assert.Single(admitted.Values, task => task.TaskId != winnerId);
+
+            Assert.Same(winner, queue.GetActiveTask(winner.TaskId));
+            Assert.Null(queue.GetActiveTask(loser.TaskId));
+            Assert.Equal(worker.Id, winner.Metadata["assigned_worker"]);
+            Assert.False(loser.Metadata.ContainsKey("assigned_worker"));
+            Assert.NotNull(recording.Store.Load(winner.TaskId));
+            Assert.Null(recording.Store.Load(loser.TaskId));
+
+            var published = Assert.Single(DrainMessages(worker), message => message.Assignment is not null);
+            Assert.Equal(winner.TaskId, published.Assignment.TaskId);
+            Assert.Same(loser, queue.TryDequeueAny());
+            Assert.Null(queue.TryDequeueAny());
+            Assert.Equal(1, gatedGateway.ReferenceTaskSendCalls);
+            Assert.Equal(2, gatedGateway.ClaimCalls);
+        }
+        finally
+        {
+            selectionGate.Release();
+            await JoinWithoutMaskingAsync(first);
+            await JoinWithoutMaskingAsync(second);
+        }
+    }
+
+    /// <summary>Same-ID ABA before the checked claim refuses the stale candidate.</summary>
+    [Fact]
+    public async Task EagerClaim_SameIdReplacementBeforeClaim_ReplacementGetsNoMessagesAndTaskRequeues()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var queue = new TaskQueue();
+        var pool = new WorkerPool();
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var realGateway = new GrpcWorkerGateway(pool, recording.Publisher);
+        var gatedGateway = new GatedRealWorkerGateway(realGateway);
+        var stale = pool.RegisterWorker("worker-eager-aba-before", []);
+
+        var goal = CreateGoal("goal-eager-aba-before");
+        var pipeline = manager.CreatePipeline(goal);
+        Arrange(pipeline, GoalPhase.Coding);
+        WorkTask? task = null;
+        queue.OnEnqueue = value => task ??= value;
+        using var gate = new SynchronousGatewayGate();
+        gatedGateway.BeforeClaim = gate;
+        var dispatch = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                    gatedGateway, goal: goal, agentsManager: CreateAgentsManager())
+                .DispatchToRole(pipeline, WorkerRole.Coder, "Code ABA", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        ConnectedWorker? replacement = null;
+
+        try
+        {
+            await gate.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.True(pool.RemoveWorker(stale));
+            replacement = pool.RegisterWorker(stale.Id, []);
+            replacement.Role = WorkerRole.Reviewer;
+            replacement.CurrentModel = "replacement-before-model";
+
+            gate.Release();
+            await dispatch.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.NotNull(task);
+            Assert.Same(replacement, pool.GetWorker(stale.Id));
+            Assert.False(replacement.IsBusy);
+            Assert.Null(replacement.CurrentTaskId);
+            Assert.Equal(WorkerRole.Reviewer, replacement.Role);
+            Assert.Equal("replacement-before-model", replacement.CurrentModel);
+            Assert.Empty(DrainMessages(replacement));
+            Assert.Null(queue.GetActiveTask(task!.TaskId));
+            Assert.Same(task, queue.TryDequeueAny());
+            Assert.Null(queue.TryDequeueAny());
+            Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+            Assert.Null(recording.Store.Load(task.TaskId));
+            Assert.Equal(0, gatedGateway.ReferenceGuidanceCalls);
+            Assert.Equal(0, gatedGateway.ReferenceTaskSendCalls);
+        }
+        finally
+        {
+            gate.Release();
+            await JoinWithoutMaskingAsync(dispatch);
+        }
+    }
+
+    /// <summary>
+    /// Same-ID ABA after the real claim but before the reference assignment send never redirects
+    /// guidance or assignment to the replacement. No rollback or removed-instance delivery is claimed.
+    /// </summary>
+    [Fact]
+    public async Task EagerClaim_SameIdReplacementAfterClaimBeforeSend_ReplacementGetsNeitherMessage()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var queue = new TaskQueue();
+        var pool = new WorkerPool();
+        using var recording = EagerAssignmentRecording.Start(manager, pool);
+        var realGateway = new GrpcWorkerGateway(pool, recording.Publisher);
+        var gatedGateway = new GatedRealWorkerGateway(realGateway);
+        var stale = pool.RegisterWorker("worker-eager-aba-after", []);
+        var agents = CreateAgentsManager();
+
+        var goal = CreateGoal("goal-eager-aba-after");
+        var pipeline = manager.CreatePipeline(goal);
+        Arrange(pipeline, GoalPhase.Coding);
+        WorkTask? task = null;
+        queue.OnEnqueue = value => task ??= value;
+        using var sendGate = new SynchronousGatewayGate();
+        gatedGateway.BeforeReferenceTaskSend = sendGate;
+        var dispatch = Task.Factory.StartNew(
+            () => CreateService(manager, queue, new TestLogger<TaskDispatchService>(),
+                    gatedGateway, goal: goal, agentsManager: agents)
+                .DispatchToRole(pipeline, WorkerRole.Coder, "Code ABA", TestContext.Current.CancellationToken),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        ConnectedWorker? replacement = null;
+
+        try
+        {
+            await sendGate.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+            Assert.NotNull(task);
+            Assert.True(stale.IsBusy);
+            Assert.Equal(task!.TaskId, stale.CurrentTaskId);
+            Assert.Same(task, queue.GetActiveTask(task.TaskId));
+            Assert.Equal(1, gatedGateway.ReferenceGuidanceCalls);
+            Assert.Same(stale, gatedGateway.LastGuidanceWorker);
+
+            Assert.True(pool.RemoveWorker(stale));
+            replacement = pool.RegisterWorker(stale.Id, []);
+            replacement.Role = WorkerRole.Reviewer;
+            replacement.CurrentModel = "replacement-after-model";
+
+            sendGate.Release();
+            await dispatch.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+            Assert.Same(replacement, pool.GetWorker(stale.Id));
+            Assert.False(replacement.IsBusy);
+            Assert.Null(replacement.CurrentTaskId);
+            Assert.Equal(WorkerRole.Reviewer, replacement.Role);
+            Assert.Equal("replacement-after-model", replacement.CurrentModel);
+            Assert.Empty(DrainMessages(replacement));
+
+            // The removed pinned instance may retain its already-written guidance; it receives no
+            // assignment, and the publisher leaves no row after rejecting its stale identity.
+            var staleMessages = DrainMessages(stale);
+            Assert.Single(staleMessages, message => message.UpdateAgents is not null);
+            Assert.DoesNotContain(staleMessages, message => message.Assignment is not null);
+            Assert.Null(recording.Store.Load(task.TaskId));
+            Assert.Equal(1, gatedGateway.ReferenceTaskSendCalls);
+            Assert.Same(stale, gatedGateway.LastTaskSendWorker);
+            Assert.Same(task, gatedGateway.LastTaskSent);
+            Assert.Same(task, queue.GetActiveTask(task.TaskId));
+            Assert.Null(queue.TryDequeueAny());
+        }
+        finally
+        {
+            sendGate.Release();
+            await JoinWithoutMaskingAsync(dispatch);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // (12) FormatLogValue — exercised through reflection so the production
     //      helper can stay PRIVATE (acceptance criterion 3).
     // ═══════════════════════════════════════════════════════════════════════
@@ -4181,9 +4579,155 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Equal("Tester", InvokeFormatLogValue(WorkerRole.Tester));
     }
 
+    private static HiveOrchestratorService CreateReadyService(
+        GoalPipelineManager manager,
+        TaskQueue queue,
+        WorkerPool pool,
+        IWorkerAssignmentPublisher publisher,
+        AgentsManager? agentsManager = null)
+    {
+        var goalManager = new GoalManager();
+        var notifier = new TaskCompletionNotifier();
+        var gateway = new GrpcWorkerGateway(pool, publisher);
+        var dispatcher = new GoalDispatcher(
+            goalManager, manager, queue, gateway, notifier,
+            NullLogger<GoalDispatcher>.Instance,
+            new BrainRepoManager(Path.GetTempPath(), NullLogger<BrainRepoManager>.Instance));
+        return new HiveOrchestratorService(
+            pool, queue, manager, notifier, dispatcher,
+            NullLogger<HiveOrchestratorService>.Instance,
+            agentsManager: agentsManager,
+            assignmentPublisher: publisher);
+    }
+
+    private static async Task InvokeReadyAsync(
+        HiveOrchestratorService service, ConnectedWorker worker, CancellationToken ct)
+    {
+        var method = typeof(HiveOrchestratorService)
+            .GetMethod("HandleWorkerReady", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        await (Task)method!.Invoke(service, [worker, new NullGrpcStreamWriter(), ct])!;
+    }
+
+    private static IReadOnlyList<GrpcMessage> DrainMessages(ConnectedWorker worker)
+    {
+        var messages = new List<GrpcMessage>();
+        while (worker.MessageChannel.Reader.TryRead(out var message))
+            messages.Add(message);
+        return messages;
+    }
+
+    private static async Task JoinWithoutMaskingAsync(Task operation)
+    {
+        try
+        {
+            await operation.WaitAsync(BoundedWait, CancellationToken.None);
+        }
+        catch
+        {
+            // The assertion path owns the primary failure; cleanup only guarantees no live work.
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Test doubles
     // ═══════════════════════════════════════════════════════════════════════
+
+    private sealed class NullGrpcStreamWriter : IServerStreamWriter<GrpcMessage>
+    {
+        public WriteOptions? WriteOptions { get; set; }
+        public Task WriteAsync(GrpcMessage message) => Task.CompletedTask;
+        public Task WriteAsync(GrpcMessage message, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    /// <summary>A bounded synchronous rendezvous suitable for non-async gateway methods.</summary>
+    private sealed class SynchronousGatewayGate(int expectedEntries = 1) : IDisposable
+    {
+        private readonly TaskCompletionSource _entered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ManualResetEventSlim _release = new(initialState: false);
+        private int _entries;
+
+        public Task Entered => _entered.Task;
+
+        public void Enter()
+        {
+            if (Interlocked.Increment(ref _entries) == expectedEntries)
+                _entered.TrySetResult();
+            if (!_release.Wait(BoundedWait))
+                throw new TimeoutException("gateway gate was not released");
+        }
+
+        public void Release() => _release.Set();
+        public void Dispose() => _release.Dispose();
+    }
+
+    /// <summary>
+    /// Observes and gates the EXISTING gateway boundary while forwarding every operation to the real
+    /// gateway. It adds no production seam and no assignment behavior of its own.
+    /// </summary>
+    private sealed class GatedRealWorkerGateway(GrpcWorkerGateway inner) : IWorkerGateway
+    {
+        public SynchronousGatewayGate? AfterSelection { get; set; }
+        public SynchronousGatewayGate? BeforeClaim { get; set; }
+        private int _claimCalls;
+
+        public SynchronousGatewayGate? BeforeReferenceTaskSend { get; set; }
+        public int ClaimCalls => Volatile.Read(ref _claimCalls);
+        public int ReferenceGuidanceCalls { get; private set; }
+        public int ReferenceTaskSendCalls { get; private set; }
+        public ConnectedWorker? LastGuidanceWorker { get; private set; }
+        public ConnectedWorker? LastTaskSendWorker { get; private set; }
+        public WorkTask? LastTaskSent { get; private set; }
+
+        public ConnectedWorker? GetIdleWorker()
+        {
+            var selected = inner.GetIdleWorker();
+            if (selected is not null)
+                AfterSelection?.Enter();
+            return selected;
+        }
+
+        public bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue)
+        {
+            Interlocked.Increment(ref _claimCalls);
+            BeforeClaim?.Enter();
+            return inner.TryClaimAndActivate(expected, task, queue);
+        }
+
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(
+            ConnectedWorker worker, WorkTask task, CancellationToken ct = default)
+        {
+            ReferenceTaskSendCalls++;
+            LastTaskSendWorker = worker;
+            LastTaskSent = task;
+            BeforeReferenceTaskSend?.Enter();
+            return inner.SendTaskAsync(worker, task, ct);
+        }
+
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(
+            string workerId, WorkTask task, CancellationToken ct = default) =>
+            inner.SendTaskAsync(workerId, task, ct);
+
+        public Task SendAgentsUpdateAsync(
+            ConnectedWorker worker, string role, string content, CancellationToken ct = default)
+        {
+            ReferenceGuidanceCalls++;
+            LastGuidanceWorker = worker;
+            return inner.SendAgentsUpdateAsync(worker, role, content, ct);
+        }
+
+        public Task SendAgentsUpdateAsync(
+            string workerId, string role, string content, CancellationToken ct = default) =>
+            inner.SendAgentsUpdateAsync(workerId, role, content, ct);
+
+        public Task SendCancelAsync(
+            string workerId, string taskId, string reason, CancellationToken ct = default) =>
+            inner.SendCancelAsync(workerId, taskId, reason, ct);
+
+        public IReadOnlyList<ConnectedWorker> GetAllWorkers() => inner.GetAllWorkers();
+        public void MarkBusy(string workerId, string taskId) => inner.MarkBusy(workerId, taskId);
+    }
 
     /// <summary>Minimal goal source returning a single pre-configured goal.</summary>
     private sealed class WiringGoalSource : IGoalSource
@@ -4346,8 +4890,6 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>Number of idle-worker probes — the proof the delivery transaction was entered.</summary>
         public int IdleWorkerProbes { get; private set; }
 
-        public List<string> MarkedBusyTaskIds { get; } = [];
-
         /// <summary>The task ids this gateway ACCEPTED a checked claim for.</summary>
         public List<string> ClaimedTaskIds { get; } = [];
 
@@ -4389,7 +4931,7 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [_worker];
 
         /// <summary>UNUSED BY THE EAGER PATH — kept only because the interface declares it.</summary>
-        public void MarkBusy(string workerId, string taskId) => MarkedBusyTaskIds.Add(taskId);
+        public void MarkBusy(string workerId, string taskId) { }
 
         /// <summary>
         /// THE CHECKED CLAIM, mirroring <c>WorkerPool.TryClaimAndActivate</c>: an injected throw
