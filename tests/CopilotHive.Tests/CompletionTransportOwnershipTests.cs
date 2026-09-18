@@ -2826,6 +2826,126 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     /// <summary>
+    /// A THROW FROM A POST-ACQUISITION OPERATION STILL ENDS THE HOLD, EXACTLY: the publication's
+    /// <c>try/finally</c> genuinely covers every operation after the hold was acquired, so the
+    /// instance is selectable again even though the publication faulted — and the release that had
+    /// already been applied is preserved.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS THE MANDATORY "EVERY POST-ACQUISITION OPERATION IS PROTECTED" PROOF, and it is
+    /// behavioural rather than structural. The fault is raised from the post-release window — the
+    /// representative post-acquisition operation, sitting between the queue removal and the
+    /// eligibility advance — so a publication whose removal, hook, eligibility or enqueue had escaped
+    /// the guarded scope, or whose <c>finally</c> had been deleted, leaves the hold installed and
+    /// FAILS here.
+    /// </para>
+    /// <para>
+    /// THE DELIVERY IS DIRECT AND SYNCHRONOUS ON PURPOSE. <c>HandleTaskComplete</c> is invoked
+    /// directly so the production exception propagates INTO the vector (the read loop would otherwise
+    /// unwind the stream and the fault would be observed only as a dead producer). The call returning
+    /// by throwing is itself the post-handler barrier: everything the handler did is complete when the
+    /// exception surfaces.
+    /// </para>
+    /// <para>
+    /// WHAT IT DELIBERATELY DOES NOT CLAIM: no recovery, no retry and no notification is asserted for
+    /// the FAULTED publication — a throwing post-acquisition operation is a test-only fault, and the
+    /// contract is only that the hold ends, the release survives, and nothing extra is released or
+    /// notified.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_EndsWhenAPostAcquisitionOperationThrows()
+    {
+        var h = Harness.CreateWithRequestedCompletionReceiptAck();
+        await RunAsync(h, async () =>
+        {
+            const string taskId = "task-hold-window-throws";
+            Assert.True(h.Worker.CompletionReceiptAckEnabled);
+
+            h.Assign(taskId, model: "assigned-model");
+            h.ResetDashboardNotifications();
+
+            // THE PUMP IS PINNED FIRST, so a stray acknowledgement could actually be forwarded and
+            // the "nothing was published" assertion below is a real absence rather than an unbound pump.
+            await h.AssertPumpObservationIsLiveAsync();
+
+            var windowFault = new InvalidOperationException("the post-release window threw SENTINEL");
+            var heldInsideWindow = false;
+            var busyInsideWindow = true;
+            var queueEntryInsideWindow = true;
+            var windowRan = false;
+
+            h.ArmThrowingCompletionPublicationWindow(windowFault, (pinned, deliveredTaskId) =>
+            {
+                windowRan = true;
+                Assert.Same(h.Worker, pinned);
+                Assert.Equal(taskId, deliveredTaskId);
+
+                // THE STATE AT THE INSTANT OF THE FAULT: the release has been applied, the queue entry
+                // is gone, and the hold IS installed — so what follows is genuinely "the hold was held
+                // when the operation threw".
+                heldInsideWindow = pinned.CompletionPublicationPending;
+                busyInsideWindow = pinned.IsBusy;
+                queueEntryInsideWindow = h.Queue.GetActiveTask(deliveredTaskId) is not null;
+            });
+
+            // THE PRODUCTION EXCEPTION SURFACES HERE, unwrapped: the handler did not swallow it, which
+            // is what makes the finally's cleanup the only thing that could have ended the hold.
+            var thrown = Assert.Throws<InvalidOperationException>(
+                () => h.InvokeHandleTaskCompleteDirectly(
+                    h.Worker, taskId, new WorkStreamCompletionAckState(), model: "assigned-model"));
+            Assert.Same(windowFault, thrown);
+
+            // THE FAULT REALLY WAS RAISED FROM THE POST-ACQUISITION WINDOW, with the hold in force.
+            Assert.True(windowRan, "the post-release window never ran; the fault proved nothing");
+            Assert.True(
+                heldInsideWindow,
+                "the selection hold was not installed when the post-acquisition operation threw, so "
+                + "this vector could not prove the finally cleans it up");
+            Assert.False(busyInsideWindow, "the release had not been applied when the window ran");
+            Assert.False(queueEntryInsideWindow, "the queue removal had not run when the window ran");
+
+            // ── THE CONTRACT: THE HOLD IS ENDED, EXACTLY, DESPITE THE THROW ───────────────────
+            Assert.False(
+                h.Worker.CompletionPublicationPending,
+                "a throwing post-acquisition operation left the selection hold installed — the "
+                + "publication's try/finally does not cover every operation after the acquisition");
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // ── AND *ONLY* THE HOLD WAS CLEANED UP: the released completion is preserved ──────
+            Assert.False(h.Worker.IsBusy);
+            Assert.Null(h.Worker.CurrentTaskId);
+            Assert.Null(h.Worker.CurrentModel);
+            Assert.Null(h.Queue.GetActiveTask(taskId));
+
+            // THE EVIDENCE THE RELEASE WAS ABOUT IS STILL DURABLE — the fault did not undo the record.
+            Assert.NotNull(h.ReadReceipt(taskId));
+
+            // ── NOTHING EXTRA HAPPENED: the fault aborted the publication BEFORE the enqueue and
+            //    BEFORE the ordinary notification, so neither an acknowledgement nor a notification
+            //    was produced for it. This is the "no extra notification/release" half of the contract.
+            AssertNoAcknowledgementPublished(h);
+            Assert.Equal(0, h.TransportNotifications);
+            Assert.Equal(0, h.DownstreamHandledCount(taskId));
+            Assert.Equal(0, h.DashboardNotifications);
+
+            // ── THE STREAM AND THE POOL ARE NOT STRANDED: the worker is selectable, and an ordinary
+            //    completion still works afterwards, taking and ending its own hold.
+            h.Assign("task-hold-window-throws-next", model: "assigned-model");
+            var acknowledgement = h.AwaitAcknowledgementAsync();
+            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
+                "task-hold-window-throws-next", "assigned-model");
+
+            var ack = await acknowledgement;
+            Assert.Equal("task-hold-window-throws-next", ack.TaskId);
+            Assert.False(h.Worker.CompletionPublicationPending);
+            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            Assert.Equal(1, h.DownstreamHandledCount("task-hold-window-throws-next"));
+        });
+    }
+
+    /// <summary>
     /// THE ORDINARY DASHBOARD NOTIFICATION HAPPENS AFTER THE HOLD IS FINISHED: at the instant the
     /// notification's own observation runs, the instance is already selectable again.
     /// </summary>
@@ -5157,6 +5277,43 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
+        /// ARMS THE POST-RELEASE WINDOW TO THROW <paramref name="fault"/>, so a vector can prove the
+        /// publication's <c>try/finally</c> really covers EVERY post-acquisition operation.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT REUSES THE EXISTING HOOK, and it is the only way to inject a fault at exactly that
+        /// window: the queue removal, the eligibility advance and the enqueue are all production calls
+        /// with no injectable fault of their own on this path, so the hook is the representative
+        /// post-acquisition operation. The hook disarms itself as it fires, so a later delivery on the
+        /// same stream is unaffected.
+        /// </para>
+        /// <para>
+        /// THE FAULT IS RAISED *AFTER* THE STATE OBSERVATION, so the vector can record what the hold
+        /// and the release looked like at the instant the fault was raised rather than inferring it.
+        /// </para>
+        /// </remarks>
+        /// <param name="fault">The exception the window must throw exactly once.</param>
+        /// <param name="observe">Observation run inside the window, immediately before the throw.</param>
+        public void ArmThrowingCompletionPublicationWindow(
+            Exception fault, Action<ConnectedWorker, string> observe)
+        {
+            var hookField = typeof(HiveOrchestratorService).GetField(
+                "_afterCompletionReleaseBeforeAckForTest",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.NotNull(hookField);
+
+            Action<ConnectedWorker, string> hook = (pinned, deliveredTaskId) =>
+            {
+                hookField!.SetValue(Service, null);
+                observe(pinned, deliveredTaskId);
+                throw fault;
+            };
+
+            hookField!.SetValue(Service, hook);
+        }
+
+        /// <summary>
         /// Invokes the PRODUCTION <c>HandleTaskComplete</c> directly with a stale pinned instance,
         /// SIMULATING the TOCTOU window between <c>WorkStream</c>'s per-message pinned-instance
         /// check and its dispatch to this handler — a window a replacement re-registering under the
@@ -5181,28 +5338,35 @@ public sealed class CompletionTransportOwnershipTests
         /// The TEST-OWNED eligibility holder; a caller that simulates an ordinary completion and then
         /// a duplicate passes the SAME instance to both calls.
         /// </param>
+        /// <param name="model">
+        /// The model to carry, or <c>null</c> for an ABSENT field (the pre-existing default). An
+        /// ENABLED registration requires presence, so a vector that drives one states it here.
+        /// </param>
         public void InvokeHandleTaskCompleteDirectly(
-            ConnectedWorker pinned, string taskId, WorkStreamCompletionAckState ackState)
+            ConnectedWorker pinned,
+            string taskId,
+            WorkStreamCompletionAckState ackState,
+            string? model = null)
         {
             var method = typeof(HiveOrchestratorService).GetMethod(
                 "HandleTaskComplete",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             Assert.NotNull(method);
 
+            var complete = new GrpcTaskComplete
+            {
+                TaskId = taskId,
+                Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
+                Output = $"output-{taskId}",
+            };
+            if (model is not null)
+                complete.Model = model;
+
+            Assert.Equal(model is not null, complete.HasModel);
+
             try
             {
-                method!.Invoke(
-                    Service,
-                    [
-                        pinned,
-                        new GrpcTaskComplete
-                        {
-                            TaskId = taskId,
-                            Status = CopilotHive.Shared.Grpc.TaskStatus.Completed,
-                            Output = $"output-{taskId}",
-                        },
-                        ackState,
-                    ]);
+                method!.Invoke(Service, [pinned, complete, ackState]);
             }
             catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
             {
