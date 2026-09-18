@@ -94,6 +94,11 @@ public sealed class ConnectedWorker
     /// A read made outside that lock is an OBSERVATION ONLY and establishes nothing. The setter is
     /// private and the two mutation methods below are the pool's only entry points.
     /// </para>
+    /// <para>
+    /// ENDING THE HOLD IS NOT SELECTABILITY: an instance whose negotiated completion was released may
+    /// still be waiting for its own accepted Ready (<see cref="AwaitingWorkerReady"/>), which is a
+    /// separate fact on a separate interval.
+    /// </para>
     /// </remarks>
     internal bool CompletionPublicationPending { get; private set; }
 
@@ -118,6 +123,69 @@ public sealed class ConnectedWorker
     /// ONLY thing that happens when a publication finishes.
     /// </remarks>
     internal void EndCompletionPublicationHold() => CompletionPublicationPending = false;
+
+    /// <summary>
+    /// THE INSTANCE-LOCAL READINESS WAIT of THIS registration: <c>true</c> from the moment a
+    /// negotiated completion released this instance's transport ownership until this instance's own
+    /// accepted Ready arrives.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT IS FOR. A completion whose acknowledgement the registration negotiated ends this
+    /// instance's ownership of the completed task, but it does NOT establish that the worker has
+    /// consumed the outcome — the acknowledgement may still be in flight on the stream, or may never
+    /// have been received. Until the worker itself says it is ready again, this instance must not be
+    /// handed the next ordinary assignment. While this flag is set,
+    /// <see cref="WorkerPool.GetIdleWorker"/> never returns it and
+    /// <see cref="WorkerPool.TryClaimAndActivate"/> refuses it.
+    /// </para>
+    /// <para>
+    /// IT IS NEITHER THE PUBLICATION HOLD NOR AN ASSIGNMENT FACT. It is distinct from
+    /// <see cref="CompletionPublicationPending"/>, which covers only the short interval in which the
+    /// released instance's acknowledgement has not yet been queued; ending that hold does NOT end this
+    /// wait and does NOT make the instance selectable. It is likewise not
+    /// <see cref="IsBusy"/>/<see cref="CurrentTaskId"/>, which describe ASSIGNMENT state and are reset
+    /// by the idle resets below without touching this flag. It carries no task id, no deadline, no
+    /// retry, no owner and no history, and it is nothing more than a per-instance bit that belongs to
+    /// exactly this <see cref="ConnectedWorker"/> object.
+    /// </para>
+    /// <para>
+    /// ONLY <see cref="WorkerPool"/> MUTATES IT, AND ONLY INSIDE ITS ACTIVITY LOCK. It is INSTALLED in
+    /// the very lock span that applies the checked negotiated completion release, alongside the idle
+    /// reset and the publication hold, so the instance is never observable as released-and-selectable
+    /// in that span; it is CLEARED by the successfully validated
+    /// <see cref="WorkerPool.TryMarkIdleForReady"/> transition for the still-registered instance. No
+    /// other operation writes it — not the generic idle reset, not the legacy busy marking, not a
+    /// heartbeat, not the publication hold's clear, and not an acknowledgement outcome. A read made
+    /// outside the pool's activity lock is an OBSERVATION ONLY and establishes nothing. The setter is
+    /// private and the two mutation methods below are the pool's only entry points.
+    /// </para>
+    /// </remarks>
+    internal bool AwaitingWorkerReady { get; private set; }
+
+    /// <summary>
+    /// INSTALLS the instance-local readiness wait. Callers must hold the pool's activity lock; this
+    /// method itself takes no lock of its own.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE POOL'S MUTATION PRIMITIVE, NOT A PUBLIC SWITCH: the property's setter is private, so
+    /// the only way to set the wait is through this method, and the only caller is the checked
+    /// negotiated completion release's own lock span.
+    /// </remarks>
+    internal void BeginAwaitingWorkerReady() => AwaitingWorkerReady = true;
+
+    /// <summary>
+    /// CLEARS the instance-local readiness wait, touching NOTHING else on the instance. Callers must
+    /// hold the pool's activity lock.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE ONLY WAY THE WAIT ENDS: the pool calls it exclusively from the accepted
+    /// <see cref="WorkerPool.TryMarkIdleForReady"/> transition — i.e. when the worker itself said it
+    /// is ready. It is deliberately not reachable from any other path, so no timeout, lease,
+    /// removal, heartbeat, acknowledgement outcome or idle reset can silently make this instance
+    /// selectable again.
+    /// </remarks>
+    internal void EndAwaitingWorkerReady() => AwaitingWorkerReady = false;
 
     /// <summary>
     /// THE EXCLUSIVE, ONE-WAY WORKSTREAM ATTACHMENT CLAIM of this instance. <c>0</c> = unclaimed,

@@ -50,7 +50,9 @@ public sealed class WorkerPool : IWorkerPool
     /// Guards all reads and writes of mutable worker state: <see cref="ConnectedWorker.IsBusy"/>,
     /// <see cref="ConnectedWorker.CurrentTaskId"/>, <see cref="ConnectedWorker.CurrentTaskStartedAt"/>,
     /// <see cref="ConnectedWorker.LastActivityAt"/>, <see cref="ConnectedWorker.LastHeartbeat"/> and
-    /// <see cref="ConnectedWorker.ContextUsagePercent"/>.
+    /// <see cref="ConnectedWorker.ContextUsagePercent"/>, plus the two per-instance selection facts
+    /// <see cref="ConnectedWorker.CompletionPublicationPending"/> and
+    /// <see cref="ConnectedWorker.AwaitingWorkerReady"/>.
     /// <para>
     /// <see cref="ConcurrentDictionary{TKey,TValue}"/> only makes the dictionary itself thread-safe —
     /// it establishes no happens-before relationship for mutable fields on the stored values. Without
@@ -228,22 +230,26 @@ public sealed class WorkerPool : IWorkerPool
     }
 
     /// <summary>
-    /// Returns the first SELECTABLE idle worker: one that is idle and NOT holding a
-    /// completion publication. All workers are generic and accept any role.
+    /// Returns the first SELECTABLE idle worker: one that is idle, NOT holding a completion
+    /// publication and NOT awaiting its own accepted Ready. All workers are generic and accept any
+    /// role.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// THE TWO FACTS ARE READ UNDER THE SAME <c>_activityLock</c>, as ONE predicate — deliberately
-    /// not as two independent unlocked reads. Reading <see cref="ConnectedWorker.IsBusy"/> and the
-    /// completion-publication hold separately would let a candidate be selected on a stale pair of
-    /// reads, which is exactly the gap this predicate exists to close.
+    /// THE THREE FACTS ARE READ UNDER THE SAME <c>_activityLock</c>, as ONE predicate — deliberately
+    /// not as independent unlocked reads. Reading <see cref="ConnectedWorker.IsBusy"/>, the
+    /// completion-publication hold and the readiness wait separately would let a candidate be
+    /// selected on a stale combination of them, which is exactly the gap this predicate exists to
+    /// close.
     /// </para>
     /// <para>
     /// WHAT IT RETURNS IS STILL ONLY A CANDIDATE, NEVER A RESERVATION. The returned instance stays
-    /// live and may become busy, be removed or be replaced before the caller acts; a dispatcher that
-    /// already holds an older candidate may still busy it through the existing ID-based
-    /// <see cref="MarkBusy"/>. This method excludes only NEW selections of a worker whose
-    /// completion is still being published.
+    /// live and may become busy, be removed or be replaced before the caller acts. This method
+    /// excludes only NEW selections of a worker whose completion is still being published or whose
+    /// released instance has not yet sent its own Ready; the checked
+    /// <see cref="TryClaimAndActivate"/> re-applies the same exclusions at the mutation point, so an
+    /// earlier captured candidate cannot bypass them. The ID-based <see cref="MarkBusy"/> is the
+    /// separate, unchecked contract and is not affected.
     /// </para>
     /// </remarks>
     /// <returns>A selectable idle <see cref="ConnectedWorker"/>, or <c>null</c>.</returns>
@@ -253,7 +259,7 @@ public sealed class WorkerPool : IWorkerPool
         {
             foreach (var kvp in _workers)
             {
-                if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)
+                if (IsSelectableIdleNoLock(kvp.Value))
                     return kvp.Value;
             }
 
@@ -264,6 +270,32 @@ public sealed class WorkerPool : IWorkerPool
     /// <summary>Returns a read-only snapshot of all currently registered workers.</summary>
     public IReadOnlyList<ConnectedWorker> GetAllWorkers() =>
         _workers.Values.ToList().AsReadOnly();
+
+    /// <summary>
+    /// THE ONE SELECTABILITY PREDICATE the pool's two delivery boundaries share: <c>true</c> only for
+    /// an instance that is idle, holds no completion publication and is not awaiting its own accepted
+    /// Ready. Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT IS ONE EXPRESSION ON PURPOSE, and it is the reason <see cref="GetIdleWorker"/> and
+    /// <see cref="TryClaimAndActivate"/> can never disagree about what is selectable. Three
+    /// independent reads — whether they were unlocked, or merely separated by other statements — can
+    /// each observe a different instant, which is exactly how a stale candidate slips through one of
+    /// them.
+    /// </para>
+    /// <para>
+    /// IT IS AN OBSERVATION, NOT A RESERVATION, and it says nothing about assignment fields beyond
+    /// the idle shape: only the checked <see cref="TryClaimAndActivate"/> can turn a selectable
+    /// instance into an owner, and only under this same lock.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The instance to evaluate — never re-resolved by ID.</param>
+    /// <returns><c>true</c> only when the instance is currently selectable.</returns>
+    private static bool IsSelectableIdleNoLock(ConnectedWorker worker) =>
+        !worker.IsBusy
+        && !worker.CompletionPublicationPending
+        && !worker.AwaitingWorkerReady;
 
     /// <summary>
     /// Looks up a worker by its identifier.
@@ -381,10 +413,12 @@ public sealed class WorkerPool : IWorkerPool
     /// Marks the specified worker as idle, clearing its current task identifier.
     /// </summary>
     /// <remarks>
-    /// IT NEVER TOUCHES THE COMPLETION-PUBLICATION HOLD. The ID-based reset is a separate
-    /// operation with separate callers (test helpers, recovery paths), so it must not be able to
-    /// silently end a publication a completion path is still performing — and, symmetrically, it
-    /// must not silently install one either.
+    /// IT NEVER TOUCHES EITHER SELECTION FACT. The ID-based reset is a separate operation with
+    /// separate callers (test helpers, recovery paths), so it must not be able to silently end a
+    /// publication or a readiness wait that a completion path is still owning — and, symmetrically,
+    /// it must not silently install one either. Clearing the SHORT publication hold is not
+    /// selectability, and neither is this reset: an instance waiting for its own accepted Ready stays
+    /// unselectable across it.
     /// </remarks>
     /// <param name="id">Identifier of the worker.</param>
     public void MarkIdle(string id)
@@ -404,12 +438,12 @@ public sealed class WorkerPool : IWorkerPool
     /// Callers must hold <c>_activityLock</c>.
     /// </summary>
     /// <remarks>
-    /// THE HOLD IS DELIBERATELY NOT ONE OF THESE FIELDS. This reset describes ASSIGNMENT state
-    /// (busy, task, task start, role); the completion-publication hold describes an in-flight
-    /// PUBLICATION and is owned exclusively by the checked release that installs it and the single
-    /// clear operation that finishes it. Erasing it here would re-open the very selection window
-    /// the hold exists to close, on behalf of an operation that knows nothing about the
-    /// publication.
+    /// THE SELECTION FACTS ARE DELIBERATELY NOT ONE OF THESE FIELDS. This reset describes ASSIGNMENT
+    /// state (busy, task, task start, role); the completion-publication hold describes an in-flight
+    /// PUBLICATION and the readiness wait describes a released instance that has not yet sent its own
+    /// Ready. Both are owned exclusively by the operations that install and end them. Erasing either
+    /// here would re-open the very selection window it exists to close, on behalf of an operation that
+    /// knows nothing about it.
     /// </remarks>
     /// <param name="worker">The captured worker instance to reset — never re-resolved by ID.</param>
     private static void ResetToIdleNoLock(ConnectedWorker worker)
@@ -491,7 +525,9 @@ public sealed class WorkerPool : IWorkerPool
     /// <summary>
     /// THE COMPLETION-PUBLICATION ROUTE: THE SAME CHECKED RELEASE, plus the NARROW EXPLICIT OPT-IN of
     /// the negotiated ordinary completion path — a SUCCESSFUL release also INSTALLS the instance's
-    /// completion-publication selection hold, in the SAME <c>_activityLock</c> span as the idle reset.
+    /// completion-publication selection hold AND, when the caller's registration negotiated
+    /// acknowledgement (<see cref="ConnectedWorker.CompletionReceiptAckEnabled"/>), its
+    /// instance-local readiness wait, both in the SAME <c>_activityLock</c> span as the idle reset.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -502,13 +538,23 @@ public sealed class WorkerPool : IWorkerPool
     /// observable as idle-and-selectable, so no dispatcher can NEWLY SELECT it in that interval.
     /// </para>
     /// <para>
-    /// THE EXISTING <see cref="TryReleaseCompletedTask(ConnectedWorker, string)"/> CALLERS ARE
-    /// UNCHANGED AND UNAFFECTED: they install no hold, and — symmetrically — they never clear or
-    /// otherwise touch a hold this route installed on some other invocation's behalf.
+    /// THE READINESS WAIT IS THE LONGER, SEPARATE FACT, and it is installed only for an instance whose
+    /// registration is <see cref="ConnectedWorker.CompletionReceiptAckEnabled"/>: such an instance has
+    /// an acknowledgement that may still be in flight (or lost), so it may not be handed the next
+    /// assignment until it says so itself. Ending the short publication hold does not end this wait.
+    /// An ACK-disabled registration installs neither.
     /// </para>
     /// <para>
-    /// A REFUSED RELEASE INSTALLS NOTHING: the hold exists only for a release this route applied.
-    /// The caller owns ending it through <see cref="ClearCompletionPublicationHold"/>.
+    /// THE EXISTING <see cref="TryReleaseCompletedTask(ConnectedWorker, string)"/> CALLERS ARE
+    /// UNCHANGED AND UNAFFECTED: they install no hold and no wait, and — symmetrically — they never
+    /// clear or otherwise touch selection state this route installed on some other invocation's
+    /// behalf.
+    /// </para>
+    /// <para>
+    /// A REFUSED RELEASE INSTALLS NOTHING: the hold and the wait exist only for a release this route
+    /// applied. The caller owns ending the hold through
+    /// <see cref="ClearCompletionPublicationHold"/>; the wait ends only through an accepted
+    /// <see cref="TryMarkIdleForReady"/>.
     /// </para>
     /// </remarks>
     /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
@@ -526,7 +572,7 @@ public sealed class WorkerPool : IWorkerPool
     /// <param name="expectedTaskId">The task the caller observed that instance executing.</param>
     /// <param name="holdForCompletionPublication">
     /// Whether the caller is the negotiated ordinary completion path and will therefore publish an
-    /// acknowledgement after this release. <c>false</c> installs no hold.
+    /// acknowledgement after this release. <c>false</c> installs no hold and no readiness wait.
     /// </param>
     /// <returns><c>true</c> when the release was applied; <c>false</c> when it was refused.</returns>
     private bool ReleaseCompletedTaskCore(
@@ -556,6 +602,14 @@ public sealed class WorkerPool : IWorkerPool
             // publishing" interval never becomes visible to a new selection.
             if (holdForCompletionPublication)
                 expected.BeginCompletionPublicationHold();
+
+            // THE READINESS WAIT IS INSTALLED HERE TOO, for the same reason and on the same terms:
+            // a registration that negotiated acknowledgements has an outcome the worker may not
+            // have consumed, so it may not be re-assigned until it says it is ready. An
+            // ACK-disabled registration has no such acknowledgement and installs nothing, so the
+            // preserved route and the disabled negotiation keep the unchanged runtime.
+            if (holdForCompletionPublication && expected.CompletionReceiptAckEnabled)
+                expected.BeginAwaitingWorkerReady();
 
             return true;
         }
@@ -609,8 +663,10 @@ public sealed class WorkerPool : IWorkerPool
     /// <summary>
     /// THE CHECKED READY IDLE. Applies the idle reset to the instance the caller observed, under
     /// <c>_activityLock</c>, and only when the observation is still consistent at the mutation
-    /// point. <see cref="ConnectedWorker.CurrentModel"/> is deliberately NOT touched — the Ready
-    /// path's existing model behaviour is preserved.
+    /// point — and, on an otherwise ACCEPTED transition, CLEARS the instance's readiness wait, so an
+    /// accepted Ready is exactly what makes a released instance selectable again.
+    /// <see cref="ConnectedWorker.CurrentModel"/> is deliberately NOT touched — the Ready path's
+    /// existing model behaviour is preserved.
     /// </summary>
     /// <remarks>
     /// <para>THE THREE ACCEPTED SHAPES:</para>
@@ -628,6 +684,15 @@ public sealed class WorkerPool : IWorkerPool
     ///     "non-null task id but not busy" shape, which is refused WITHOUT releasing anything and
     ///     without writing a single assignment field.</description></item>
     /// </list>
+    /// <para>
+    /// A REFUSED READY CLEARS NOTHING AND BANKS NOTHING. The readiness wait is cleared ONLY on the
+    /// path that returns <c>true</c>, for the exact still-registered instance, so a Ready refused by
+    /// the still-installed publication hold, by a present queue entry, by a busy owner or by an ABA
+    /// replacement leaves the wait exactly as it was: the worker's next Ready must satisfy the same
+    /// checks, and a refused Ready can never be spent later. Removing an instance discards its wait
+    /// with it, so a replacement registered under the same ID starts with its own state and is never
+    /// affected by the old instance's Ready or completion finally.
+    /// </para>
     /// </remarks>
     /// <param name="observed">The caller's snapshot: the captured instance, its busy flag and its task.</param>
     /// <param name="queueEntryAbsent">
@@ -673,6 +738,12 @@ public sealed class WorkerPool : IWorkerPool
         {
             // Only the CAPTURED instance is mutated — never a replacement resolved by ID.
             ResetToIdleNoLock(worker);
+
+            // THE READINESS WAIT ENDS HERE AND NOWHERE ELSE: this is the accepted Ready transition
+            // for the still-registered instance, i.e. the released instance's own successor
+            // statement. It is cleared AFTER the reset, so the instance is never observable as
+            // still-waiting while already idle-and-selectable.
+            worker.EndAwaitingWorkerReady();
             return true;
         }
     }
@@ -701,17 +772,18 @@ public sealed class WorkerPool : IWorkerPool
     /// publication as ONE step under <c>_activityLock</c>.
     /// </summary>
     /// <remarks>
-    /// <para>THE THREE CHECKS, IN THIS ORDER, EACH REFUSING WITH ZERO MUTATION:</para>
+    /// <para>THE CHECKS, EACH REFUSING WITH ZERO MUTATION:</para>
     /// <list type="number">
     ///   <item><description>EXACT REGISTERED REFERENCE — the instance registered under
     ///     <see cref="ConnectedWorker.Id"/> must be <paramref name="expected"/> itself
     ///     (<c>ReferenceEquals</c>), so an ABA replacement registered under
     ///     the same ID is never mutated on the strength of the old instance's validation.</description></item>
-    ///   <item><description>IDLE/NULL-TASK SHAPE — <c>!IsBusy &amp;&amp; CurrentTaskId is null</c>;
-    ///     a busy worker, or the inconsistent busy-less-but-has-a-task shape, is refused.</description></item>
-    ///   <item><description>NOT HELD — <see cref="ConnectedWorker.CompletionPublicationPending"/>
-    ///     must be <c>false</c>, so a worker whose negotiated completion is still being published is
-    ///     never claimed.</description></item>
+    ///   <item><description>SELECTABLE IDLE — the instance's busy flag, its completion-publication
+    ///     hold and its readiness wait must ALL be clear, evaluated as the pool's single selectability
+    ///     predicate (<c>IsSelectableIdleNoLock</c>) rather than as separate reads. This is the same
+    ///     predicate <see cref="GetIdleWorker"/> selects on, re-applied at the mutation point, so a
+    ///     candidate captured before its release/completion became awaiting-Ready cannot be claimed
+    ///     on the strength of that stale observation.</description></item>
     /// </list>
     /// <para>
     /// A REFUSAL MUTATES NOTHING AT ALL: no worker field, no task metadata, no active-queue entry,
@@ -731,7 +803,8 @@ public sealed class WorkerPool : IWorkerPool
     /// recovery if the worker is removed after a successful claim.
     /// </para>
     /// <para>
-    /// ONLY THESE THINGS HAPPEN INSIDE THE LOCK: the three checks, the existing synchronous
+    /// ONLY THESE THINGS HAPPEN INSIDE THE LOCK: the reference check, the assignment-shape and
+    /// selectability checks, the existing synchronous
     /// <see cref="TaskQueue.Activate(WorkTask, string)"/> call and the busy-field / role / model
     /// publication. No callbacks or delegates, no database or channel operation, no logging, no
     /// notification, and no <c>await</c>.
@@ -754,12 +827,16 @@ public sealed class WorkerPool : IWorkerPool
                 || !ReferenceEquals(registered, expected))
                 return false;
 
-            // 2. IDLE/NULL-TASK SHAPE.
-            if (expected.IsBusy || expected.CurrentTaskId is not null)
+            // 2. IDLE/NULL-TASK SHAPE: the inconsistent "not busy but still carrying a task" shape is
+            // refused, and its stale task id survives rather than being silently overwritten.
+            if (expected.CurrentTaskId is not null)
                 return false;
 
-            // 3. NOT HELD.
-            if (expected.CompletionPublicationPending)
+            // 3. SELECTABLE IDLE — the SAME single predicate GetIdleWorker selects on: not busy, not
+            // holding a completion publication, and not awaiting the released instance's own accepted
+            // Ready. Evaluated here at the mutation point, so a candidate captured before either
+            // selection fact was installed is refused rather than trusted.
+            if (!IsSelectableIdleNoLock(expected))
                 return false;
 
             // The task becomes active and the worker becomes busy with it in the same lock span, so

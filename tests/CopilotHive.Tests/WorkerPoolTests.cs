@@ -2221,9 +2221,9 @@ public sealed class WorkerPoolTests
         Assert.True(selectionLockIndex >= 0, "the idle selection no longer takes the activity lock.");
         Assert.True(
             BraceScopedBody(selection, selectionLockIndex).Contains(
-                "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)",
+                "if (IsSelectableIdleNoLock(kvp.Value))",
                 StringComparison.Ordinal),
-            "the combined idle-and-not-held predicate must be evaluated INSIDE the activity lock's "
+            "the combined selectability predicate must be evaluated INSIDE the activity lock's "
             + "body, not merely somewhere after the lock keyword.");
     }
 
@@ -3106,6 +3106,560 @@ public sealed class WorkerPoolTests
         Assert.DoesNotContain("await ", lockBody, StringComparison.Ordinal);
         Assert.DoesNotContain("MessageChannel", lockBody, StringComparison.Ordinal);
         Assert.DoesNotContain("Invoke", lockBody, StringComparison.Ordinal);
+    }
+
+    #endregion
+
+    // ═══════════════════════════════════════════════════════════════════════
+    #region THE INSTANCE-LOCAL READINESS WAIT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Registers an ACK-ENABLED instance: the negotiated completion path's own shape.</summary>
+    /// <param name="pool">The pool to register into.</param>
+    /// <param name="id">The worker's identifier.</param>
+    /// <returns>The published instance.</returns>
+    private static ConnectedWorker RegisterAckEnabled(WorkerPool pool, string id) =>
+        pool.RegisterWorker(
+            id, [], requestCompletionReceiptAck: true, completionReceiptAckEnabled: true);
+
+    /// <summary>Registers an ACK-DISABLED instance that asked for the acknowledgement.</summary>
+    /// <param name="pool">The pool to register into.</param>
+    /// <param name="id">The worker's identifier.</param>
+    /// <returns>The published instance.</returns>
+    private static ConnectedWorker RegisterAckDisabled(WorkerPool pool, string id) =>
+        pool.RegisterWorker(
+            id, [], requestCompletionReceiptAck: true, completionReceiptAckEnabled: false);
+
+    /// <summary>
+    /// Produces the wait's OWN state without any Ready: an ACK-enabled instance whose negotiated
+    /// completion was released, with the SHORT publication hold already ended — so what remains
+    /// unselectable is the readiness wait alone.
+    /// </summary>
+    /// <param name="pool">The pool to register into.</param>
+    /// <param name="id">The worker's identifier.</param>
+    /// <param name="taskId">The task the instance completes through the negotiated route.</param>
+    /// <returns>The released, awaiting-Ready instance.</returns>
+    private static ConnectedWorker AwaitingReadyWorker(WorkerPool pool, string id, string taskId)
+    {
+        var worker = RegisterAckEnabled(pool, id);
+        pool.MarkBusy(id, taskId);
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, taskId));
+        Assert.True(worker.AwaitingWorkerReady);
+
+        // The short hold is ended here, so every assertion made on the returned instance is about
+        // the readiness wait rather than about the publication interval.
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+        Assert.True(worker.AwaitingWorkerReady);
+        return worker;
+    }
+
+    /// <summary>
+    /// A SUCCESSFUL NEGOTIATED COMPLETION RELEASE INSTALLS THE READINESS WAIT on an ACK-enabled
+    /// registration, in the same step as the idle reset and the publication hold.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE INSTALL VECTOR: with the installation removed, the released instance reports no wait
+    /// and becomes selectable the instant the short hold ends — exactly the eager-assignment gap this
+    /// round closes.
+    /// </remarks>
+    [Fact]
+    public void NegotiatedRelease_OfAnAckEnabledRegistration_InstallsTheReadinessWait()
+    {
+        var pool = CreatePool();
+        var worker = RegisterAckEnabled(pool, "w-ready-install");
+        pool.MarkBusy("w-ready-install", "task-ready-install");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-ready-install"));
+
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// AN ACK-DISABLED REGISTRATION INSTALLS NO WAIT, even through the negotiated route: it has no
+    /// acknowledgement whose consumption must be awaited, so its runtime is exactly what it was.
+    /// </summary>
+    [Fact]
+    public void NegotiatedRelease_OfAnAckDisabledRegistration_InstallsNoReadinessWait()
+    {
+        var pool = CreatePool();
+        var worker = RegisterAckDisabled(pool, "w-ready-disabled");
+        Assert.False(worker.CompletionReceiptAckEnabled);
+
+        pool.MarkBusy("w-ready-disabled", "task-ready-disabled");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-ready-disabled"));
+
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.False(worker.AwaitingWorkerReady);
+
+        // …and once its short hold ends it is selectable WITHOUT any Ready, as before.
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+        Assert.False(worker.AwaitingWorkerReady);
+        Assert.Same(worker, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// A REFUSED RELEASE INSTALLS NO WAIT on either route: the wait exists only for a release that was
+    /// actually applied.
+    /// </summary>
+    /// <param name="holdingRoute">Whether the refused call was made through the holding route.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void RefusedRelease_InstallsNoReadinessWait(bool holdingRoute)
+    {
+        var pool = CreatePool();
+        var worker = RegisterAckEnabled(pool, "w-ready-refused");
+        pool.MarkBusy("w-ready-refused", "task-ready-successor");
+
+        var applied = holdingRoute
+            ? pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-ready-predecessor")
+            : pool.TryReleaseCompletedTask(worker, "task-ready-predecessor");
+
+        Assert.False(applied);
+        Assert.False(worker.AwaitingWorkerReady);
+
+        // The successor's ownership is untouched, so the worker is still busy with it.
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-ready-successor", worker.CurrentTaskId);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE LEGACY TWO-ARGUMENT ROUTE INSTALLS NO WAIT — and, symmetrically, clears none it did not
+    /// install: the preserved route's instance stays selectable, exactly as before this round.
+    /// </summary>
+    [Fact]
+    public void LegacyReleaseRoute_InstallsNoReadinessWaitAndLeavesTheAckEnabledWorkerSelectable()
+    {
+        var pool = CreatePool();
+        var worker = RegisterAckEnabled(pool, "w-ready-legacy");
+        pool.MarkBusy("w-ready-legacy", "task-ready-legacy");
+
+        Assert.True(pool.TryReleaseCompletedTask(worker, "task-ready-legacy"));
+
+        Assert.False(worker.AwaitingWorkerReady);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Same(worker, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// AN AWAITING-READY INSTANCE IS NEVER HANDED OUT: the idle selection returns <c>null</c> while
+    /// the only registered worker is waiting, even though it is idle with no task and no hold.
+    /// </summary>
+    [Fact]
+    public void GetIdleWorker_ReturnsNullForAnAwaitingReadyInstance()
+    {
+        var pool = CreatePool();
+        var worker = AwaitingReadyWorker(pool, "w-ready-select", "task-ready-select");
+
+        Assert.False(worker.IsBusy);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE CHECKED CLAIM REFUSES AN AWAITING-READY INSTANCE AND MUTATES NOTHING: no queue activation,
+    /// no busy fields, no role/model write and no task metadata.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_RefusesAnAwaitingReadyInstanceAndMutatesNothing()
+    {
+        var pool = CreatePool();
+        var worker = AwaitingReadyWorker(pool, "w-ready-claim", "task-ready-claim");
+
+        var activityBefore = worker.LastActivityAt;
+        var startedBefore = worker.CurrentTaskStartedAt;
+        var roleBefore = worker.Role;
+        var modelBefore = worker.CurrentModel;
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-ready-claim-next");
+
+        Assert.False(pool.TryClaimAndActivate(worker, task, queue));
+
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Equal(startedBefore, worker.CurrentTaskStartedAt);
+        Assert.Equal(activityBefore, worker.LastActivityAt);
+        Assert.Equal(roleBefore, worker.Role);
+        Assert.Equal(modelBefore, worker.CurrentModel);
+        Assert.Null(queue.GetActiveTask("task-ready-claim-next"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>
+    /// A CANDIDATE CAPTURED BEFORE THE WAIT CANNOT BYPASS IT: the instance is genuinely selectable
+    /// when observed, the wait is installed afterwards, and the claim on that STALE candidate is
+    /// refused at the mutation point with zero mutation.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE WHOLE REASON THE CLAIM RE-EVALUATES THE PREDICATE UNDER THE LOCK: a dispatcher that
+    /// already holds an older candidate — here captured by the pool's own selection — must not be
+    /// able to hand an awaiting-Ready instance the next assignment on the strength of that
+    /// observation.
+    /// </remarks>
+    [Fact]
+    public void AStaleCandidateCapturedBeforeTheWait_CannotBypassIt()
+    {
+        var pool = CreatePool();
+        var worker = RegisterAckEnabled(pool, "w-ready-stale");
+
+        // (1) The instance really was selectable when the candidate was captured.
+        var candidate = pool.GetIdleWorker();
+        Assert.Same(worker, candidate);
+
+        // (2) The wait is installed AFTER that observation, through the production release route —
+        // and the SHORT publication hold that the same route also installed is then ended, so the
+        // only fact that can still refuse this candidate is the readiness wait itself.
+        pool.MarkBusy("w-ready-stale", "task-ready-stale");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-ready-stale"));
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+        Assert.False(worker.CompletionPublicationPending);
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-ready-stale-next");
+
+        // (3) The stale candidate is refused, and nothing at all is mutated.
+        Assert.False(pool.TryClaimAndActivate(candidate!, task, queue));
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Null(queue.GetActiveTask("task-ready-stale-next"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE WAIT OUTLIVES EVERY OPERATION THAT DOES NOT DESCRIBE READINESS: the ID-based
+    /// <c>MarkIdle</c>, the legacy <c>MarkBusy</c>, a heartbeat, stream activity, the publication
+    /// hold's own clear and the legacy release route all leave it in force — and so does the
+    /// ACK-DISABLED shape used by a sibling instance, which is per instance.
+    /// </summary>
+    [Fact]
+    public void TheReadinessWait_SurvivesEveryNonReadyOperationOnTheInstance()
+    {
+        var pool = CreatePool();
+        var worker = AwaitingReadyWorker(pool, "w-ready-survives", "task-ready-survives");
+
+        pool.MarkIdle("w-ready-survives");
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+
+        pool.MarkBusy("w-ready-survives", "task-ready-rebusied");
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+
+        // The legacy route is the ACK-DISABLED shape's release: it neither installs nor erases.
+        Assert.True(pool.TryReleaseCompletedTask(worker, "task-ready-rebusied"));
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+
+        pool.UpdateHeartbeat("w-ready-survives", contextUsagePercent: 37);
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+
+        pool.TouchActivity("w-ready-survives");
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.Null(pool.GetIdleWorker());
+
+        // Clearing the SHORT publication hold is not selectability either — asserted on an instance
+        // that still has that hold in force.
+        pool.MarkBusy("w-ready-survives", "task-ready-hold");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-ready-hold"));
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+
+        Assert.True(worker.AwaitingWorkerReady);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Null(pool.GetIdleWorker());
+
+        // A SIBLING with the ACK-DISABLED shape keeps its own (absent) wait, so the wait is per
+        // instance rather than a pool-wide switch.
+        var sibling = RegisterAckDisabled(pool, "w-ready-sibling");
+        pool.MarkBusy("w-ready-sibling", "task-ready-sibling");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(sibling, "task-ready-sibling"));
+        Assert.True(pool.ClearCompletionPublicationHold(sibling));
+
+        Assert.False(sibling.AwaitingWorkerReady);
+        Assert.True(worker.AwaitingWorkerReady);
+
+        // The sibling — not the waiting instance — is what the pool hands out.
+        Assert.Same(sibling, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// ONLY A SUCCESSFULLY VALIDATED READY CLEARS THE WAIT: the accepted idle/initial Ready ends it
+    /// and the instance becomes selectable immediately afterwards.
+    /// </summary>
+    [Fact]
+    public void AnAcceptedReady_ClearsTheWaitAndMakesTheInstanceSelectable()
+    {
+        var pool = CreatePool();
+        var worker = AwaitingReadyWorker(pool, "w-ready-accepted", "task-ready-accepted");
+
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-accepted", out var snapshot));
+        Assert.Same(worker, snapshot.Worker);
+        Assert.Null(snapshot.CurrentTaskId);
+        Assert.False(snapshot.IsBusy);
+
+        Assert.True(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+
+        Assert.False(worker.AwaitingWorkerReady);
+        Assert.False(worker.IsBusy);
+        Assert.Same(worker, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// A REFUSED READY NEITHER CLEARS THE WAIT NOR BANKS READINESS, in all four refusal shapes: the
+    /// publication hold still installed, a busy owner whose queue entry is still present, and a
+    /// replaced instance.
+    /// </summary>
+    /// <remarks>
+    /// EACH REFUSAL IS ASSERTED AGAINST ITS OWN REFUSING GUARD — the still-installed hold, the
+    /// present queue entry, the missing registration — so a vector cannot pass because some other
+    /// check happened to refuse first. In every case a LATER accepted Ready is required before the
+    /// instance is selectable, which is what makes the refusal non-banking rather than deferred.
+    /// </remarks>
+    [Fact]
+    public void ARefusedReady_NeitherClearsTheWaitNorBanksReadiness()
+    {
+        var pool = CreatePool();
+
+        // ── (1) REFUSED BY THE STILL-INSTALLED PUBLICATION HOLD ────────────────────────────────
+        var held = RegisterAckEnabled(pool, "w-ready-refused-hold");
+        pool.MarkBusy("w-ready-refused-hold", "task-ready-refused-hold");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(held, "task-ready-refused-hold"));
+        Assert.True(held.CompletionPublicationPending);
+
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-refused-hold", out var heldSnapshot));
+        Assert.False(pool.TryMarkIdleForReady(heldSnapshot, queueEntryAbsent: true));
+        Assert.True(held.AwaitingWorkerReady);
+        Assert.True(held.CompletionPublicationPending);
+
+        // Only AFTER the hold ends does the same Ready shape get accepted.
+        Assert.True(pool.ClearCompletionPublicationHold(held));
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-refused-hold", out var afterHold));
+        Assert.True(pool.TryMarkIdleForReady(afterHold, queueEntryAbsent: true));
+        Assert.False(held.AwaitingWorkerReady);
+
+        // ── (2) REFUSED BY A BUSY OWNER WHOSE QUEUE ENTRY IS STILL PRESENT ─────────────────────
+        var busy = AwaitingReadyWorker(pool, "w-ready-refused-busy", "task-ready-refused-busy");
+        pool.MarkBusy("w-ready-refused-busy", "task-ready-refused-busy-next");
+        var busyQueue = new TaskQueue();
+        busyQueue.Activate(ClaimTask("task-ready-refused-busy-next"), "w-ready-refused-busy");
+
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-refused-busy", out var busySnapshot));
+        Assert.Equal("task-ready-refused-busy-next", busySnapshot.CurrentTaskId);
+        Assert.True(busySnapshot.IsBusy);
+
+        Assert.False(pool.TryMarkIdleForReady(busySnapshot, queueEntryAbsent: false));
+        Assert.True(busy.AwaitingWorkerReady);
+        Assert.True(busy.IsBusy);
+        Assert.Equal("task-ready-refused-busy-next", busy.CurrentTaskId);
+
+        // ── (3) REFUSED FOR A REPLACED INSTANCE ───────────────────────────────────────────────
+        var stale = AwaitingReadyWorker(pool, "w-ready-refused-aba", "task-ready-refused-aba");
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-refused-aba", out var staleSnapshot));
+        Assert.True(pool.RemoveWorker(stale));
+
+        var replacement = RegisterAckEnabled(pool, "w-ready-refused-aba");
+        Assert.False(pool.TryMarkIdleForReady(staleSnapshot, queueEntryAbsent: true));
+
+        // The stale instance keeps its own wait; the replacement — which never released anything —
+        // has its own clean state and is NOT blocked by the old instance's Ready.
+        Assert.True(stale.AwaitingWorkerReady);
+        Assert.False(replacement.AwaitingWorkerReady);
+        Assert.Same(replacement, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// ABA: REMOVAL DISCARDS ONLY THAT INSTANCE. The old instance's completion finally (the hold's
+    /// clear) and its Ready must neither block nor clear a replacement registered under the same ID,
+    /// and the replacement is selectable without any Ready of its own.
+    /// </summary>
+    [Fact]
+    public void ABaReplacement_IsNeitherBlockedNorClearedByTheOldInstancesWait()
+    {
+        var pool = CreatePool();
+        var original = AwaitingReadyWorker(pool, "w-ready-aba", "task-ready-aba");
+
+        Assert.True(pool.RemoveWorker(original));
+        var replacement = RegisterAckEnabled(pool, "w-ready-aba");
+
+        // The replacement starts clean and selectable: it inherited nothing from the old instance.
+        Assert.False(replacement.AwaitingWorkerReady);
+        Assert.Same(replacement, pool.GetIdleWorker());
+
+        // The old instance's finishing publication and its Ready both refuse on the replacement's
+        // behalf, leaving the replacement's own state exactly as it was.
+        Assert.False(pool.ClearCompletionPublicationHold(original));
+        Assert.True(pool.TryGetWorkerSnapshot("w-ready-aba", out var replacementSnapshot));
+        pool.MarkBusy("w-ready-aba", "task-ready-aba-replacement");
+
+        Assert.False(pool.TryMarkIdleForReady(replacementSnapshot, queueEntryAbsent: true));
+        Assert.False(replacement.AwaitingWorkerReady);
+        Assert.True(replacement.IsBusy);
+        Assert.Equal("task-ready-aba-replacement", replacement.CurrentTaskId);
+
+        // The stale instance keeps its own wait: it was never registered when those calls ran.
+        Assert.True(original.AwaitingWorkerReady);
+    }
+
+    /// <summary>
+    /// INITIAL REGISTRATION REMAINS SELECTABLE WITHOUT ANY READY — this round is not a first-Ready
+    /// credit: a freshly registered instance has never released a negotiated completion, so it has
+    /// nothing to wait for.
+    /// </summary>
+    /// <param name="ackEnabled">Whether the registration negotiated the acknowledgement.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void InitialRegistration_IsSelectableWithoutAnyReady(bool ackEnabled)
+    {
+        var pool = CreatePool();
+        var worker = ackEnabled
+            ? RegisterAckEnabled(pool, "w-ready-initial")
+            : RegisterAckDisabled(pool, "w-ready-initial");
+
+        Assert.False(worker.AwaitingWorkerReady);
+        Assert.Same(worker, pool.GetIdleWorker());
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-ready-initial");
+        Assert.True(pool.TryClaimAndActivate(worker, task, queue));
+        Assert.True(worker.IsBusy);
+    }
+
+    /// <summary>
+    /// THE WAIT'S SHAPE, BOUND TO THE PRODUCTION SOURCE: it is installed inside the checked release's
+    /// own <c>_activityLock</c> body and gated on BOTH the negotiated route and the ACK enablement;
+    /// the single selectability predicate is the one expression both delivery boundaries evaluate —
+    /// each inside its own lock body; and the wait's only clearing site is the accepted Ready's own
+    /// transition, with neither the shared idle reset nor the hold's clear touching it.
+    /// </summary>
+    /// <remarks>
+    /// A POST-CONDITION CANNOT MAKE THESE CLAIMS. "Installed in the same lock span as the release"
+    /// and "cleared nowhere else" are SCOPE properties: an installation moved after the lock closes,
+    /// a second clearing site added to the idle reset, or a selectability check performed on
+    /// unlocked reads would each leave the behavioural vectors' observed state identical while
+    /// re-opening the window this round exists to close.
+    /// </remarks>
+    [Fact]
+    public void TheReadinessWait_IsInstalledInsideTheReleaseLockBodyAndClearedOnlyByTheAcceptedReady()
+    {
+        var pool = StripLineComments(ReadPoolSource());
+
+        // ── (1) THE INSTALLATION IS INSIDE THE CHECKED RELEASE'S OWN LOCK BODY, GATED ON BOTH ────
+        const string installation =
+            "if (holdForCompletionPublication && expected.CompletionReceiptAckEnabled)\n"
+            + "                expected.BeginAwaitingWorkerReady();";
+
+        var releaseStart = pool.IndexOf("private bool ReleaseCompletedTaskCore(", StringComparison.Ordinal);
+        Assert.True(releaseStart >= 0, "the shared checked-release implementation is gone.");
+        var releaseEnd = pool.IndexOf(
+            "internal bool ClearCompletionPublicationHold(", releaseStart, StringComparison.Ordinal);
+        Assert.True(releaseEnd > releaseStart, "the hold's clearing operation is gone.");
+        var release = pool[releaseStart..releaseEnd];
+
+        var releaseLockBody = BraceScopedBody(
+            release, release.IndexOf("lock (_activityLock)", StringComparison.Ordinal));
+
+        Assert.Contains(installation, release, StringComparison.Ordinal);
+        Assert.True(
+            releaseLockBody.Contains(installation, StringComparison.Ordinal),
+            "the readiness wait must be installed INSIDE the checked release's activity-lock body, "
+            + "so the release and the wait are ONE observable step with no selectable interval "
+            + "between them.");
+
+        // …exactly once, so the membership above cannot be satisfied by a copy inside the body while
+        // the live call sits outside it.
+        Assert.Equal(1, CountOf(release, "expected.BeginAwaitingWorkerReady();"));
+
+        // ── (2) THE WAIT'S ONLY CLEARING SITE IS THE ACCEPTED READY'S OWN TRANSITION ────────────
+        Assert.Equal(1, CountOf(pool, "EndAwaitingWorkerReady();"));
+
+        var readyStart = pool.IndexOf("internal bool TryMarkIdleForReady(", StringComparison.Ordinal);
+        Assert.True(readyStart >= 0, "the checked Ready idle is gone.");
+        var readyEnd = pool.IndexOf("private bool IsStillOwnedNoLock(", readyStart, StringComparison.Ordinal);
+        Assert.True(readyEnd > readyStart, "the ownership check is gone.");
+        var ready = pool[readyStart..readyEnd];
+
+        Assert.Contains("worker.EndAwaitingWorkerReady();", ready, StringComparison.Ordinal);
+
+        // THE CLEAR IS IN THE METHOD'S OWN ACCEPTED TRANSITION AND NOWHERE ELSE. Both accepted
+        // shapes of the checked Ready end in `Applied(expected)` — the local function that performs
+        // the reset and the clear — so binding the CALL SITES to the lock body binds the clear to
+        // the accepted transition: a clear reachable from a refusal or from outside the lock would
+        // show up as a third call site or as one outside the body.
+        var readyLockBody = BraceScopedBody(
+            ready, ready.IndexOf("lock (_activityLock)", StringComparison.Ordinal));
+        Assert.Equal(2, CountOf(ready, "Applied(expected)"));
+        Assert.Equal(2, CountOf(readyLockBody, "Applied(expected)"));
+        Assert.Contains("&& Applied(expected);", readyLockBody, StringComparison.Ordinal);
+        Assert.Contains("return Applied(expected);", readyLockBody, StringComparison.Ordinal);
+
+        // …and the local function really contains BOTH effects, the reset and the clear.
+        Assert.True(
+            ready.IndexOf("worker.EndAwaitingWorkerReady();", StringComparison.Ordinal)
+                > ready.IndexOf("ResetToIdleNoLock(worker);", StringComparison.Ordinal),
+            "the wait must be cleared AFTER the idle reset, so the instance is never observable as "
+            + "still-waiting while already idle-and-selectable.");
+
+        // ── (3) NEITHER THE IDLE RESET NOR THE HOLD'S CLEAR TOUCHES THE WAIT ────────────────────
+        var resetStart = pool.IndexOf("private static void ResetToIdleNoLock(", StringComparison.Ordinal);
+        Assert.True(resetStart >= 0, "the shared idle reset is gone.");
+        var resetEnd = pool.IndexOf("internal bool TryGetWorkerSnapshot(", resetStart, StringComparison.Ordinal);
+        Assert.True(resetEnd > resetStart, "the ownership observation is gone.");
+        Assert.DoesNotContain(
+            "AwaitingWorkerReady", pool[resetStart..resetEnd], StringComparison.Ordinal);
+
+        Assert.DoesNotContain(
+            "AwaitingWorkerReady", pool[releaseEnd..readyStart], StringComparison.Ordinal);
+
+        // ── (4) THE ONE SHARED PREDICATE, EVALUATED INSIDE EACH BOUNDARY'S OWN LOCK BODY ────────
+        var predicateStart = pool.IndexOf(
+            "private static bool IsSelectableIdleNoLock(", StringComparison.Ordinal);
+        Assert.True(predicateStart >= 0, "the shared selectability predicate is gone.");
+        var predicateEnd = pool.IndexOf("public ConnectedWorker? GetWorker(string id)", predicateStart, StringComparison.Ordinal);
+        Assert.True(predicateEnd > predicateStart, "the predicate's following member is gone.");
+        var predicate = pool[predicateStart..predicateEnd];
+
+        foreach (var fact in new[] { "!worker.IsBusy", "!worker.CompletionPublicationPending", "!worker.AwaitingWorkerReady" })
+            Assert.Contains(fact, predicate, StringComparison.Ordinal);
+
+        var selectionStart = pool.IndexOf("public ConnectedWorker? GetIdleWorker()", StringComparison.Ordinal);
+        Assert.True(selectionStart >= 0, "the idle selection is gone.");
+        var selectionEnd = pool.IndexOf(
+            "public IReadOnlyList<ConnectedWorker> GetAllWorkers()", selectionStart, StringComparison.Ordinal);
+        Assert.True(selectionEnd > selectionStart, "the idle selection's following member is gone.");
+        var selection = pool[selectionStart..selectionEnd];
+
+        Assert.Equal(1, CountOf(selection, "IsSelectableIdleNoLock("));
+        Assert.True(
+            BraceScopedBody(selection, selection.IndexOf("lock (_activityLock)", StringComparison.Ordinal))
+                .Contains("IsSelectableIdleNoLock(kvp.Value)", StringComparison.Ordinal),
+            "the idle selection must evaluate the shared selectability predicate INSIDE the "
+            + "activity lock's body.");
+
+        var claimStart = pool.IndexOf("internal bool TryClaimAndActivate(", StringComparison.Ordinal);
+        Assert.True(claimStart >= 0, "the checked claim is gone.");
+        var claimEnd = pool.IndexOf("public IReadOnlyList<ConnectedWorker> GetStaleWorkers(", claimStart, StringComparison.Ordinal);
+        Assert.True(claimEnd > claimStart, "the claim's following member is gone.");
+        var claim = pool[claimStart..claimEnd];
+
+        Assert.Equal(1, CountOf(claim, "IsSelectableIdleNoLock("));
+        Assert.True(
+            BraceScopedBody(claim, claim.IndexOf("lock (_activityLock)", StringComparison.Ordinal))
+                .Contains("IsSelectableIdleNoLock(expected)", StringComparison.Ordinal),
+            "the checked claim must re-evaluate the SAME predicate under the activity lock, so a "
+            + "stale candidate cannot bypass the wait.");
     }
 
     #endregion

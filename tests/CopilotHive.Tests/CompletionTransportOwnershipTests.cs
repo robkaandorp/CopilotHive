@@ -2408,8 +2408,11 @@ public sealed class CompletionTransportOwnershipTests
                     Assert.Equal(1, h.DownstreamHandledCount(taskA));
                     Assert.Equal(1, h.DashboardNotifications);
 
-                    // ── AND THE HOLD IS OVER: B IS NOW SELECTABLE AND DELIVERS ON READY ───────
-                    Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+                    // ── AND THE HOLD IS OVER, BUT THE ENABLED INSTANCE STILL WAITS FOR ITS OWN
+                    //    READY: A's successor is delivered only once that Ready arrives ──────────
+                    Assert.False(h.Worker.CompletionPublicationPending);
+                    Assert.True(h.Worker.AwaitingWorkerReady);
+                    Assert.Null(h.Pool.GetIdleWorker());
 
                     var admittedBTaskId = pipelineB.ActiveTaskId!;
                     h.Queue.Enqueue(pendingB!);
@@ -2710,7 +2713,11 @@ public sealed class CompletionTransportOwnershipTests
             Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
             Assert.True(h.ServiceLogger.ThrowCount > 0, "the armed diagnostic fault never fired");
             Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // THE SHORT HOLD ENDED AT THE ENQUEUE ATTEMPT — and, for this enabled registration, the
+            // release also installed the wait for the instance's OWN Ready, so selectability is still
+            // withheld (by that longer fact, not by the publication).
+            h.AssertAwaitingItsOwnReadyAfterThePublication();
 
             await downstream.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
 
@@ -2731,15 +2738,21 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// A HELD/Faulted RESPONSE WRITE DOES NOT RETAIN THE SELECTION HOLD: the hold ends after the
-    /// enqueue ATTEMPT, not after delivery, so the worker is selectable again even though the
-    /// acknowledgement never reached the wire.
+    /// enqueue ATTEMPT, not after delivery — even though the acknowledgement never reached the wire.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// THE PUMP-LEVEL FAULT IS DELIBERATELY CHOSEN. The channel write SUCCEEDS here; the failure is
     /// the response writer's, which happens strictly after the handler returned and after the hold was
     /// already ended. That is exactly the boundary the contract names: a held or failed response write
     /// must never be interpreted as "still publishing", because the hold does not wait for the network
     /// write or the worker's acknowledgement.
+    /// </para>
+    /// <para>
+    /// THE TWO WITHHOLDING FACTS ARE ASSERTED SEPARATELY. The short hold is gone; the longer wait for
+    /// the instance's own accepted Ready is what still withholds it. Collapsing the two would let a
+    /// mutant that silently cleared the wait pass as "the hold ended correctly".
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task CompletionPublicationHold_IsNotRetainedByAResponseWriteFault()
@@ -2768,7 +2781,10 @@ public sealed class CompletionTransportOwnershipTests
             // ──…AND THE HOLD IS GONE LONG BEFORE THAT, because it ends at the ENQUEUE ATTEMPT ──
             Assert.Equal(taskId, result.TaskId);
             Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // THE RELEASE ALSO PUT THIS ENABLED INSTANCE INTO ITS READINESS WAIT, so the end of the
+            // SHORT hold is not selectability: the instance is withheld until its own Ready.
+            h.AssertAwaitingItsOwnReadyAfterThePublication();
 
             // THE ACCEPTED COMPLETION IS INTACT AND NOTIFIED EXACTLY ONCE.
             Assert.False(h.Worker.IsBusy);
@@ -2807,16 +2823,19 @@ public sealed class CompletionTransportOwnershipTests
             var ack = await acknowledgement;
             Assert.Equal(taskId, ack.TaskId);
 
-            // THE ORDINARY COMPLETION'S HOLD IS ALREADY OVER.
-            Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            // THE ORDINARY COMPLETION'S HOLD IS ALREADY OVER — and, because this registration
+            // negotiated acknowledgements, the release put the instance into the wait for its OWN
+            // Ready, so the end of the hold is not selectability.
+            h.AssertAwaitingItsOwnReadyAfterThePublication();
 
             // ── THE DUPLICATE, THROUGH THE REAL READ LOOP, WHILE THE WORKER IS TRULY IDLE ─────
             await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId);
 
-            // It neither acquired a hold (which would have withheld the worker) nor disturbed one.
+            // It neither acquired a hold (which would have withheld the worker) nor disturbed one —
+            // and it did not end the readiness wait either: only the instance's OWN Ready does that.
             Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            Assert.True(h.Worker.AwaitingWorkerReady);
+            Assert.Null(h.Pool.GetIdleWorker());
 
             // …and the duplicate guards and the once-only ordinary behaviour are unchanged.
             Assert.Equal(2, h.AcknowledgedCountFor(taskId));
@@ -2827,9 +2846,10 @@ public sealed class CompletionTransportOwnershipTests
 
     /// <summary>
     /// A THROW FROM A POST-ACQUISITION OPERATION STILL ENDS THE HOLD, EXACTLY: the publication's
-    /// <c>try/finally</c> genuinely covers every operation after the hold was acquired, so the
-    /// instance is selectable again even though the publication faulted — and the release that had
-    /// already been applied is preserved.
+    /// <c>try/finally</c> genuinely covers every operation after the hold was acquired, so the SHORT
+    /// selection hold is over even though the publication faulted — and the release that had already
+    /// been applied is preserved. What still withholds the enabled instance afterwards is the
+    /// instance-local wait for its own Ready, not the publication.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -2912,7 +2932,10 @@ public sealed class CompletionTransportOwnershipTests
                 h.Worker.CompletionPublicationPending,
                 "a throwing post-acquisition operation left the selection hold installed — the "
                 + "publication's try/finally does not cover every operation after the acquisition");
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+
+            // THE RELEASE IS COMPLETE, AND THE ENABLED INSTANCE NOW WAITS FOR ITS OWN READY: the
+            // finally ended the SHORT hold, and nothing else could have made it selectable.
+            h.AssertAwaitingItsOwnReadyAfterThePublication();
 
             // ── AND *ONLY* THE HOLD WAS CLEANED UP: the released completion is preserved ──────
             Assert.False(h.Worker.IsBusy);
@@ -2943,7 +2966,7 @@ public sealed class CompletionTransportOwnershipTests
             var ack = await acknowledgement;
             Assert.Equal("task-hold-window-throws-next", ack.TaskId);
             Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+            h.AssertAwaitingItsOwnReadyAfterThePublication();
             Assert.Equal(1, h.DownstreamHandledCount("task-hold-window-throws-next"));
             Assert.Equal(1, h.TransportNotifications);
             Assert.Equal(1, h.DashboardNotifications);
@@ -3030,10 +3053,12 @@ public sealed class CompletionTransportOwnershipTests
                 Assert.Equal(taskId, ack.TaskId);
                 await h.BarrierAsync();
 
-                // EACH COMPLETION'S OWN HOLD IS GONE, AND THE INSTANCE IS SELECTABLE AGAIN.
+                // EACH COMPLETION'S OWN HOLD IS GONE — and the enabled instance is withheld by the
+                // LONGER fact instead: the wait for its own Ready, which its next Ready ends.
                 Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
                 Assert.False(h.Worker.CompletionPublicationPending);
-                Assert.Same(h.Worker, h.Pool.GetIdleWorker());
+                h.AssertAwaitingItsOwnReadyAfterThePublication();
+                h.GrantReadinessAndAssertSelectable();
             }
 
             // TWO COMPLETIONS, TWO HOLDS, TWO ACKNOWLEDGEMENTS — and the worker is not stranded.
@@ -4181,6 +4206,8 @@ public sealed class CompletionTransportOwnershipTests
         /// </remarks>
         public void Assign(string taskId, string model)
         {
+            GrantReadiness(Worker);
+
             var task = BuildTask(taskId, model);
             Queue.Enqueue(task);
             var dequeued = Queue.TryDequeue(DomainWorkerRole.Unspecified);
@@ -4193,6 +4220,66 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(taskId, Worker.CurrentTaskId);
             Assert.Equal(model, Worker.CurrentModel);
             Assert.NotNull(Queue.GetActiveTask(taskId));
+        }
+
+        /// <summary>
+        /// THE READINESS the production delivery boundary requires before an instance may be
+        /// (re-)assigned: an ACK-enabled instance whose negotiated completion was released stays
+        /// unselectable — even once its short publication hold has ended — until its own accepted
+        /// Ready arrives, and the checked claim refuses it until then.
+        /// </summary>
+        /// <remarks>
+        /// IT IS THE HARNESS'S OWN READY, driven through the REAL checked idle
+        /// (<c>TryMarkIdleForReady</c>) exactly as the production <c>HandleWorkerReady</c> drives it,
+        /// so a harness assignment after a released negotiated completion takes the same route the
+        /// worker's next Ready would. An instance that is not waiting is left untouched, so this
+        /// cannot mask the wait: the vectors that assert the wait itself keep asserting it directly.
+        /// </remarks>
+        /// <param name="worker">The instance whose readiness is being established.</param>
+        /// <returns>The worker's own Ready outcome.</returns>
+        public bool GrantReadiness(ConnectedWorker worker) =>
+            Pool.TryGetWorkerSnapshot(worker.Id, out var observed)
+            && ReferenceEquals(observed.Worker, worker)
+            && Pool.TryMarkIdleForReady(observed, queueEntryAbsent: true);
+
+        /// <summary>
+        /// WHAT A FINISHED NEGOTIATED PUBLICATION LEAVES BEHIND on an ACK-enabled instance: the SHORT
+        /// completion-publication hold is OVER, and the instance is STILL NOT SELECTABLE — not because
+        /// it is publishing anything, but because the release of its negotiated completion put it into
+        /// the instance-local wait for its OWN accepted Ready.
+        /// </summary>
+        /// <remarks>
+        /// THE TWO FACTS ARE DELIBERATELY SEPARATED HERE. Asserting only "no hold" would let a mutant
+        /// that clears the hold silently re-open the eager-selection window; asserting only
+        /// "unselectable" would not say which fact withholds the instance. This pair — hold gone,
+        /// still awaiting Ready, and <see cref="WorkerPool.GetIdleWorker"/> returning nothing — is what
+        /// distinguishes the end of the publication from the end of the wait.
+        /// </remarks>
+        public void AssertAwaitingItsOwnReadyAfterThePublication()
+        {
+            Assert.False(
+                Worker.CompletionPublicationPending,
+                "the short completion-publication hold outlived the publication that installed it");
+            Assert.True(
+                Worker.AwaitingWorkerReady,
+                "the released negotiated completion did not put the instance into the wait for its "
+                + "own accepted Ready");
+            Assert.False(Worker.IsBusy);
+            Assert.Null(Worker.CurrentTaskId);
+            Assert.Null(
+                Pool.GetIdleWorker());
+        }
+
+        /// <summary>
+        /// THE OTHER HALF OF THE WAIT'S CONTRACT, ASSERTED THE SAME WAY: the instance's own accepted
+        /// Ready ends the wait, and ONLY then is the instance selectable again.
+        /// </summary>
+        /// <returns>A task-free observation of the post-Ready state.</returns>
+        public void GrantReadinessAndAssertSelectable()
+        {
+            Assert.True(GrantReadiness(Worker), "the instance's own Ready was refused");
+            Assert.False(Worker.AwaitingWorkerReady);
+            Assert.Same(Worker, Pool.GetIdleWorker());
         }
 
         /// <summary>

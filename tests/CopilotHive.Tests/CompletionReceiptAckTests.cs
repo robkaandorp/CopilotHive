@@ -2461,8 +2461,11 @@ public sealed class CompletionReceiptAckTests
         var pool = new OrchestratorSource { Text = StripComments(poolSource) };
 
         // ── (1) THE COMBINED PREDICATE LIVES INSIDE GetIdleWorker's OWN LOCK BODY ──────────────
+        // The predicate is the pool's ONE selectability expression — idle, not publishing and not
+        // awaiting its own accepted Ready — evaluated as a single call so the three facts cannot be
+        // read at three different instants.
         const string combinedPredicate =
-            "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)";
+            "if (IsSelectableIdleNoLock(kvp.Value))";
 
         var selection = pool.Between(
             "public ConnectedWorker? GetIdleWorker()", "public IReadOnlyList<ConnectedWorker> GetAllWorkers()");
@@ -3019,6 +3022,8 @@ public sealed class CompletionReceiptAckTests
         /// <param name="model">The task's assigned model.</param>
         public void AssignTaskTo(ConnectedWorker worker, string taskId, string model)
         {
+            GrantReadiness(worker);
+
             var task = BuildTask(taskId, model);
             Queue.Enqueue(task);
             var dequeued = Queue.TryDequeue(DomainWorkerRole.Unspecified);
@@ -3029,6 +3034,31 @@ public sealed class CompletionReceiptAckTests
             Assert.True(worker.IsBusy);
             Assert.Equal(taskId, worker.CurrentTaskId);
         }
+
+        /// <summary>
+        /// THE READINESS the production delivery boundary requires before an instance may be
+        /// (re-)assigned: an instance whose negotiated completion was released waits for its own
+        /// accepted Ready, and the claim refuses it until then.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS THE HARNESS's OWN READY, not a state write: the Ready is driven through the REAL
+        /// checked idle (<c>TryMarkIdleForReady</c>) exactly as the production <c>HandleWorkerReady</c>
+        /// does — so a harness assignment after a released negotiated completion takes the same
+        /// route the worker's next Ready would.
+        /// </para>
+        /// <para>
+        /// A WORKER THAT IS NOT WAITING IS UNTOUCHED, so this cannot mask the wait: it is a no-op on
+        /// an instance that is already selectable, which is why the vectors that assert the wait
+        /// itself keep asserting it directly.
+        /// </para>
+        /// </remarks>
+        /// <param name="worker">The instance whose readiness is being established.</param>
+        /// <returns>The worker's own Ready outcome.</returns>
+        public bool GrantReadiness(ConnectedWorker worker) =>
+            Pool.TryGetWorkerSnapshot(worker.Id, out var observed)
+            && ReferenceEquals(observed.Worker, worker)
+            && Pool.TryMarkIdleForReady(observed, queueEntryAbsent: true);
 
         /// <summary>Builds a completion payload with the requested model presence.</summary>
         /// <param name="taskId">The completing task's identifier.</param>
