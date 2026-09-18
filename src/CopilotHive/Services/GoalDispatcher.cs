@@ -786,11 +786,40 @@ public sealed class GoalDispatcher : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to dispatch resumed goal '{GoalId}' — enqueuing for redispatch", goalId);
-                // CRITICAL: Clear ActiveTaskId before enqueuing — DrainRedispatchQueueAsync
-                // skips pipelines with non-null ActiveTaskId.
-                pipeline.ClearActiveTask();
-                _redispatchQueue.Enqueue(goalId);
+                // ── THE AMBIGUOUS RESUMED-DISPATCH FAILURE AND ITS ONE OBSERVATION ─────────────
+                // The dispatch admits work — and may already have PUBLISHED it — before it can
+                // throw, so nothing here may assume the pipeline was left idle. The pointer is
+                // therefore read EXACTLY ONCE, as the SOLE disposition input, and the queue
+                // decision is settled from that single read BEFORE any diagnostic runs.
+                var observedActiveTaskId = pipeline.ActiveTaskId;
+
+                if (observedActiveTaskId is null)
+                {
+                    // NULL OBSERVED POINTER — the dispatch failed without claiming the pipeline,
+                    // so the EXISTING enqueue-only recovery applies. The pointer is deliberately
+                    // NOT written first: this catch never writes the pointer on any path.
+                    _redispatchQueue.Enqueue(goalId);
+
+                    LogSafely(() => _logger.LogError(
+                        ex,
+                        "Failed to dispatch resumed goal '{GoalId}' — no active-task pointer was observed after the failure, so the goal is enqueued for redispatch",
+                        goalId));
+                }
+                else
+                {
+                    // NON-NULL OBSERVED POINTER — a surviving owner (this dispatch's admitted
+                    // task, or a newer one) holds the pointer. It is PRESERVED verbatim, never
+                    // reset to a reconstructed id, and NO redispatch is added for this catch:
+                    // admitted-but-pending and possibly-published work are both covered by the
+                    // retained ownership, and DrainRedispatchQueueAsync skips a pipeline with a
+                    // non-null pointer anyway. Nothing else is mutated here — no unregister, no
+                    // slot abandon, no worker/queue/assignment-row write, no counter reset and no
+                    // extra iteration consumed.
+                    LogSafely(() => _logger.LogError(
+                        ex,
+                        "Failed to dispatch resumed goal '{GoalId}' — the pipeline's active-task pointer '{ActiveTaskId}' survived the failure, so active ownership is RETAINED and the goal is NOT enqueued for redispatch",
+                        goalId, observedActiveTaskId));
+                }
             }
 
             _pipelineManager.PersistFull(pipeline);
@@ -1067,6 +1096,32 @@ public sealed class GoalDispatcher : BackgroundService
         }
 
         return PipelineHelpers.BuildSquashCommitMessage(pipeline.GoalId, pipeline.Description);
+    }
+
+    /// <summary>
+    /// Runs a diagnostic emission best-effort: a logging-provider failure is swallowed so it can
+    /// never affect the guarded operation.
+    /// </summary>
+    /// <remarks>
+    /// THE SCOPE IS DELIBERATELY LOCAL — the resumed-dispatch catch's disposition record only.
+    /// That catch has ALREADY settled its queue decision (and, on the retained-ownership path,
+    /// deliberately mutated nothing at all) before the record is emitted, and the caller's final
+    /// <c>_pipelineManager.PersistFull(pipeline)</c> still has to run. An unguarded emit there
+    /// would let a throwing provider skip that persistence, so the record goes through this
+    /// guard. This is NOT a service-wide logging audit: every other emission in this class keeps
+    /// its existing unguarded behavior.
+    /// </remarks>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never affect the guarded operation.
+        }
     }
 
 }

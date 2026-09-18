@@ -4775,16 +4775,26 @@ public sealed class GoalDispatcherResumeTests
         Assert.DoesNotContain(snapshot!.TaskMappings, m => m.TaskId == staleTaskId);
     }
 
+    /// <summary>
+    /// THE REVERSED DESTRUCTIVE EXPECTATION: a resumed-dispatch failure that happens AFTER the
+    /// pipeline's atomic active-task claim leaves a SURVIVING pointer — the delivered work is
+    /// active and may already have been published — so the catch must preserve it and must add NO
+    /// redispatch while the observed pointer is non-null.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL-PROOFNESS. The failure is injected at the worker-send step, i.e. after the claim,
+    /// the admission and the enqueue, via a gateway that hands back an idle worker, activates the
+    /// dequeued task and then throws on its send. The pre-fix catch cleared
+    /// <c>ActiveTaskId</c> and enqueued the goal unconditionally, so BOTH assertions below
+    /// (preserved verbatim pointer + no redispatch entry) fail on that code.
+    /// </remarks>
     [Fact]
-    public async Task ResumeGoalAsync_DispatchFailure_ClearsActiveTaskAndEnqueues()
+    public async Task ResumeGoalAsync_DispatchFailure_RetainsActiveTaskAndAddsNoRedispatch()
     {
         var goalStore = new ResumeFakeGoalStore();
         // Repo IS configured so ResolveRepositories and TaskBuilder.Build succeed and
-        // DispatchToRole reaches pipeline.SetActiveTask(...) → ActiveTaskId becomes non-null.
-        // The failure is injected LATER, at the worker-send step, via a gateway that hands back
-        // an idle worker but throws on SendTaskAsync. This proves the catch block's
-        // pipeline.ClearActiveTask() actually runs on a non-null ActiveTaskId — removing it
-        // would leave ActiveTaskId set and fail this test.
+        // DispatchToRole reaches the atomic active-task claim → ActiveTaskId becomes non-null.
+        // The failure is injected LATER, at the worker-send step.
         var goal = CreateFailedGoal("resume-dispatch-fail");
         await goalStore.CreateGoalAsync(goal, TestContext.Current.CancellationToken);
 
@@ -4798,21 +4808,29 @@ public sealed class GoalDispatcherResumeTests
 
         Assert.True(result);
 
-        // The gateway must have been asked to send (proving we got past SetActiveTask, which
-        // happens just before the send) and then thrown.
+        // The gateway must have been asked to send (proving we got past the claim, which happens
+        // just before the send) and then thrown.
         Assert.True(gateway.SendAttempted);
 
-        // ActiveTaskId must be cleared so DrainRedispatchQueueAsync will pick the pipeline up.
-        Assert.Null(pipeline.ActiveTaskId);
+        // THE SURVIVING OWNERSHIP IS PRESERVED VERBATIM — never cleared, never reconstructed.
+        var activeTaskId = pipeline.ActiveTaskId;
+        Assert.NotNull(activeTaskId);
+        Assert.Equal(activeTaskId, gateway.ActivatedTaskId);
         Assert.NotEqual(GoalPhase.Done, pipeline.Phase);
         Assert.NotEqual(GoalPhase.Failed, pipeline.Phase);
 
-        // The goal must be enqueued for redispatch.
+        // Its admission survives too: the in-memory mapping and the Pending slot still identify
+        // this pipeline and this task.
+        Assert.Same(pipeline, manager.GetByTaskId(activeTaskId!));
+        Assert.Equal(WorkSlotState.Pending, Assert.Single(pipeline.GetSlotsForTest()).State);
+
+        // NO redispatch was added for this catch: a non-null observed pointer never queues.
         var queueField = typeof(GoalDispatcher).GetField(
             "_redispatchQueue",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         var queue = (System.Collections.Concurrent.ConcurrentQueue<string>)queueField.GetValue(dispatcher)!;
-        Assert.Contains("resume-dispatch-fail", queue);
+        Assert.DoesNotContain("resume-dispatch-fail", queue);
+        Assert.Empty(queue);
     }
 }
 
@@ -5139,9 +5157,10 @@ file sealed class ControllableResumeGoalStore : IGoalStore
 }
 
 /// <summary>
-/// Worker gateway that always reports one idle worker but throws when a task is sent to it.
-/// This forces <c>DispatchToRole</c> to fail AFTER <c>pipeline.SetActiveTask(...)</c>, exercising
-/// the dispatch-failure catch that clears the active task and enqueues for redispatch.
+/// Worker gateway that always reports one idle worker, takes the checked claim for the dequeued
+/// task, and then throws when that task is sent. This forces <c>DispatchToRole</c> to fail AFTER
+/// the pipeline's atomic active-task claim, so the resumed-dispatch catch observes a SURVIVING
+/// non-null pointer.
 /// </summary>
 file sealed class ThrowingSendWorkerGateway : IWorkerGateway
 {
@@ -5154,6 +5173,9 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
 
     /// <summary>True once a send has been invoked.</summary>
     public bool SendAttempted { get; private set; }
+
+    /// <summary>The task the CHECKED CLAIM activated, or <c>null</c> before any claim.</summary>
+    public string? ActivatedTaskId { get; private set; }
 
     /// <summary>
     /// THE CHECKED CLAIM, mirroring the pool primitive's shape checks: a foreign instance and a
@@ -5169,19 +5191,20 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
         expected.CurrentTaskId = task.TaskId;
         expected.Role = task.Role;
         expected.CurrentModel = task.Model;
+        ActivatedTaskId = task.TaskId;
         return true;
     }
 
     public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
     {
         SendAttempted = true;
-        throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");
+        throw new InvalidOperationException("Simulated worker send failure after the active-task claim.");
     }
 
     public Task<WorkerTaskSendOutcome> SendTaskAsync(ConnectedWorker worker, WorkTask task, CancellationToken ct = default)
     {
         SendAttempted = true;
-        throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");
+        throw new InvalidOperationException("Simulated worker send failure after the active-task claim.");
     }
 
     public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
