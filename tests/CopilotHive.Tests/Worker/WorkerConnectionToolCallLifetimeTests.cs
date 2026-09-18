@@ -1699,6 +1699,69 @@ public sealed class WorkerConnectionToolCallLifetimeTests
     }
 
     /// <summary>
+    /// LOST-RELEASE REGRESSION for the shared test double <see cref="BridgeCapturingRunner"/> itself:
+    /// by the time it signals <c>PromptStarted(id)</c>, that task's RELEASE gate must ALREADY be
+    /// registered, so a <see cref="BridgeCapturingRunner.ReleaseAll"/> performed at the instant
+    /// between the started signal and the release await still frees the prompt.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE RACE WINDOW. <c>Slot</c> creates each gate lazily and <c>ReleaseAll</c> completes only the
+    /// gates present at the moment it runs. Publishing the started slot BEFORE the release gate was
+    /// created therefore opened a window in which a continuation woken by <c>PromptStarted(id)</c>
+    /// could run <c>ReleaseAll()</c> while this task's release gate did not exist yet: nothing was
+    /// completed for it, the gate created a moment later stayed parked, and the prompt never returned
+    /// — the reported session-save timeout symptom. The
+    /// <see cref="BridgeCapturingRunner.OnStartedSignalled"/> callback fires SYNCHRONOUSLY inside
+    /// exactly that window, so landing there is a property of the code under test rather than of any
+    /// schedule.
+    /// </para>
+    /// <para>
+    /// REMOVAL-PROOFNESS. The callback invokes the helper's OWN <c>ReleaseAll</c>, so this drives the
+    /// helper's REAL prompt path — not a mirrored reimplementation of its gates. Moving the
+    /// release-gate capture back after the started signal/callback (the pre-fix order) makes that
+    /// <c>ReleaseAll</c> find no gate for this task, so the prompt parks and the task-state assertion
+    /// below fails promptly BY NAME — no bound is waited on, and the parked prompt is then freed in
+    /// the <c>finally</c> rather than left hanging.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task BridgeCapturingRunner_ReleaseAllInsideTheStartedSignal_FreesThePrompt_ProvingTheReleaseGateIsRegisteredFirst()
+    {
+        var runner = new BridgeCapturingRunner();
+        runner.SetCurrentTaskId("task-lost-release");
+
+        // THE FORMER LOST-RELEASE WINDOW: this runs synchronously between the started signal and the
+        // release await — exactly where a continuation woken by PromptStarted would have run.
+        runner.OnStartedSignalled = runner.ReleaseAll;
+
+        var prompt = runner.SendPromptAsync("prompt", "work-dir", CancellationToken.None);
+        try
+        {
+            // FAIL PROMPTLY, ON TASK STATE. `SendPromptAsync` runs synchronously up to its release
+            // await, and with the capture-first order the very Task it awaits was already completed
+            // by the `ReleaseAll` the callback above invoked — so the prompt is terminal the moment
+            // this call returns. Under the pre-fix order the release gate is created only AFTER the
+            // callback, so nothing completed it and the prompt is still parked here: this assertion
+            // fails deterministically without waiting on any bound.
+            Assert.True(
+                prompt.IsCompletedSuccessfully,
+                "Releasing inside the started-signal window did not free the prompt: this task's "
+                    + "release gate was not registered before PromptStarted was signalled.");
+
+            Assert.Equal("binding-runner output", await prompt);
+        }
+        finally
+        {
+            // NEVER leave the prompt parked: release every gate, then join the ORIGINAL prompt Task
+            // (bounded purely as a safeguard, so a failed assertion above cannot mask a producer
+            // that is still running).
+            runner.ReleaseAll();
+            await JoinForCleanupAsync(prompt, nameof(prompt));
+        }
+    }
+
+    /// <summary>
     /// Asserts that <paramref name="operation"/> fails with the EXISTING disconnected error,
     /// BOUNDED by the failsafe so a regression that leaves the call pending forever fails BY NAME
     /// instead of hanging the run.
@@ -2749,6 +2812,14 @@ public sealed class WorkerConnectionToolCallLifetimeTests
 
         public void SetCurrentTaskId(string? taskId) => Volatile.Write(ref _currentTaskId, taskId);
 
+        /// <summary>
+        /// A <c>null</c>-by-default observation seam, inert in every other use of this double: it is
+        /// invoked SYNCHRONOUSLY inside <see cref="SendPromptAsync"/> immediately after the started
+        /// slot is signalled and before the release await, so a regression test can call
+        /// <see cref="ReleaseAll"/> at exactly the former lost-release window.
+        /// </summary>
+        internal Action? OnStartedSignalled { get; set; }
+
         public async Task<string> SendPromptAsync(string prompt, string workDir, CancellationToken ct)
         {
             // The task ID the EXECUTOR set for this assignment — never a hardcoded literal, so the
@@ -2757,8 +2828,23 @@ public sealed class WorkerConnectionToolCallLifetimeTests
                 ?? throw new InvalidOperationException(
                     "The executor must set the current task ID before prompting.");
 
+            // ORDERING: resolve (and thereby CREATE) this task's release gate BEFORE the started
+            // slot is published, and await that same captured Task instance below. `Slot` creates a
+            // gate lazily and `ReleaseAll` completes only the gates that already exist, so
+            // publishing `started` first left a window in which a continuation woken by
+            // `PromptStarted(id)` could run `ReleaseAll()` while this task's release gate did not
+            // exist yet: nothing was completed for it, the gate created a moment later stayed parked
+            // and the prompt never returned (the reported session-save timeout). With the capture
+            // first, observing `PromptStarted(id)` guarantees `ReleaseAll()` already finds this
+            // gate, even if the release await has not yet begun.
+            var releaseGate = Slot(_release, id).Task;
+
             Slot(_started, id).TrySetResult();
-            await Slot(_release, id).Task.WaitAsync(ct);
+
+            // The former lost-release window, exposed for the deterministic regression only.
+            OnStartedSignalled?.Invoke();
+
+            await releaseGate.WaitAsync(ct);
             return "binding-runner output";
         }
 
