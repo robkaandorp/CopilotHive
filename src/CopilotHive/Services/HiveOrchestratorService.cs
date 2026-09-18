@@ -1239,13 +1239,42 @@ public sealed class HiveOrchestratorService(
         }
         catch (Exception ex)
         {
-            // THE EXCEPTION OBJECT IS DELIBERATELY NOT LOGGED: the logger would render its raw
-            // message and stack, so untrusted text could forge log lines. Only the sanitized,
-            // bounded detail is emitted.
+            LogAgentsMdSendFailed(worker, ex);
+        }
+    }
+
+    /// <summary>
+    /// THE GUARDED AGENTS.MD SEND-FAILURE DIAGNOSTIC: the guidance send faulted, so a degraded,
+    /// best-effort line is emitted and NOTHING escapes this method because of it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE WHOLE EMISSION IS GUARDED — the sanitized detail construction AND the logger call. An
+    /// unguarded logger fault here would leave <see cref="SendAgentsMdAsync"/> and reach the Ready
+    /// path's caller-cancellation filter; a logger-thrown <see cref="OperationCanceledException"/>
+    /// (carrying a FOREIGN or default token) would then be rethrown in place of the caller's
+    /// cancellation, replacing its instance, token and message. The caller token observation that
+    /// follows the guidance step stays the only authority on that outcome.
+    /// </para>
+    /// <para>
+    /// THE EXCEPTION OBJECT IS DELIBERATELY NOT LOGGED: the logger would render its raw message and
+    /// stack, so untrusted text could forge log lines. Only the sanitized, bounded detail is emitted.
+    /// </para>
+    /// </remarks>
+    /// <param name="worker">The worker whose guidance send failed.</param>
+    /// <param name="failure">The send failure; only its sanitized message is included.</param>
+    private void LogAgentsMdSendFailed(ConnectedWorker worker, Exception failure)
+    {
+        try
+        {
             logger.LogWarning(
                 "Failed to send AGENTS.md to worker {WorkerId} — {Detail}",
                 worker.Id,
-                SanitizedFailureDetail(ex));
+                SanitizedFailureDetail(failure));
+        }
+        catch
+        {
+            // SILENT swallow — the diagnostic must never mask the handled disposition.
         }
     }
 

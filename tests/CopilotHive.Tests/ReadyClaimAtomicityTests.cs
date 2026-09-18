@@ -584,6 +584,13 @@ public sealed class ReadyClaimAtomicityTests
     /// the failure is contained with a sanitized diagnostic, and the ACCEPTED assignment still
     /// reaches the production publication point with the exact claimed instance.
     /// </summary>
+    /// <remarks>
+    /// RETARGETED ONTO THE SEND-FAILURE DIAGNOSTIC. This vector previously drove the OUTER guidance
+    /// warning by making BOTH of the send's log lines throw, which relied on the send-failure
+    /// diagnostic's exception ESCAPING <c>SendAgentsMdAsync</c> — the very defect now fixed by
+    /// guarding that emission. The contained failure is now reported by the send's own guarded
+    /// diagnostic, so that is what this vector asserts; the best-effort property is unchanged.
+    /// </remarks>
     [Fact]
     public async Task Ready_GuidanceFailureAfterTheClaim_IsContainedAndPublicationContinues()
     {
@@ -610,8 +617,7 @@ public sealed class ReadyClaimAtomicityTests
         // THE GUIDANCE FAILURE IS REPORTED AS A DEGRADED STEP — never as a refusal or a success.
         Assert.Contains(
             f.Logger.Messages,
-            m => m.Contains("agents.md update failed after the assignment was claimed",
-                StringComparison.Ordinal));
+            m => m.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
         Assert.DoesNotContain(
             f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
     }
@@ -690,13 +696,14 @@ public sealed class ReadyClaimAtomicityTests
     }
 
     /// <summary>
-    /// THE <c>LogGuidanceBestEffortFailed</c> DIAGNOSTIC IS SANITIZED AND CARRIES NO EXCEPTION
-    /// OBJECT, for a failure that ESCAPES the send helper entirely.
+    /// THE SEND-FAILURE DIAGNOSTIC IS SANITIZED AND CARRIES NO EXCEPTION OBJECT, for a failure whose
+    /// message is pure control-character payload.
     /// </summary>
     /// <remarks>
-    /// BOTH OF THE SEND'S LOG LINES FAIL HERE, so the send's own catch cannot contain the fault and
-    /// the post-claim guidance catch in the Ready path is what handles it — the exact path this
-    /// vector is about.
+    /// RETARGETED. This vector previously made BOTH send log lines throw so the fault would ESCAPE
+    /// into the outer guidance warning — the escape that was the defect. It now pins the same
+    /// sanitization contract on the guarded send-failure diagnostic that renders it, through the
+    /// SAME <c>SanitizedFailureDetail</c> helper.
     /// </remarks>
     [Fact]
     public async Task Ready_GuidanceFailure_IsLoggedSanitizedAndWithoutTheExceptionObject()
@@ -704,7 +711,6 @@ public sealed class ReadyClaimAtomicityTests
         var f = Fixture.Create(withAgentsManager: true);
         f.Logger.ThrowFactory = message =>
             message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
-            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
                 ? new InvalidOperationException(ControlCharacterPayload)
                 : null;
 
@@ -715,8 +721,7 @@ public sealed class ReadyClaimAtomicityTests
 
         var entry = Assert.Single(
             f.Logger.Entries,
-            e => e.Message.Contains(
-                "agents.md update failed after the assignment was claimed", StringComparison.Ordinal));
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
 
         Assert.Null(entry.Exception);
         AssertSingleSanitizedLine(entry.Message);
@@ -739,23 +744,27 @@ public sealed class ReadyClaimAtomicityTests
     }
 
     /// <summary>
-    /// THE NO-THROW GUARD SURVIVES SANITIZATION: neither a logger that throws ON the guidance
-    /// warning itself nor an exception whose <c>Message</c> getter throws can escape the guarded
+    /// THE NO-THROW GUARD SURVIVES SANITIZATION: neither a logger that throws ON the send-failure
+    /// diagnostic itself nor an exception whose <c>Message</c> getter throws can escape the guarded
     /// diagnostic or mask the primary outcome.
     /// </summary>
+    /// <remarks>
+    /// RETARGETED ONTO THE NEWLY GUARDED EMISSION. It used to prove the OUTER guidance warning's
+    /// guard by relying on the send-failure diagnostic escaping first; now it proves the SEND's own
+    /// guard directly — the fix under review — by making that very emission throw.
+    /// </remarks>
     [Fact]
     public async Task Ready_GuidanceDiagnostic_ThrowingLoggerAndMessageGetterCannotEscape()
     {
         var f = Fixture.Create(withAgentsManager: true);
         f.Logger.ThrowFactory = message =>
-            // The send's own two lines fail with an exception whose MESSAGE GETTER throws, so the
-            // guidance warning must render it through its no-throw read…
+            // The send fails with an exception whose MESSAGE GETTER throws, so the diagnostic must
+            // render it through its no-throw read…
             message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
-            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
                 ? new ThrowingMessageException()
-                // …and the guidance warning ITSELF then throws too.
-                : message.Contains("agents.md update failed", StringComparison.Ordinal)
-                    ? new InvalidOperationException("the guidance warning's logger threw")
+                // …and the send-failure diagnostic ITSELF then throws too.
+                : message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
+                    ? new InvalidOperationException("the send-failure warning's logger threw")
                     : null;
 
         var task = BuildTask("task-guidance-guard");
@@ -767,7 +776,7 @@ public sealed class ReadyClaimAtomicityTests
         // The guarded warning really was attempted (so the guard is what contained the throw)…
         var entry = Assert.Single(
             f.Logger.Entries,
-            e => e.Message.Contains("agents.md update failed", StringComparison.Ordinal));
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
         AssertSingleSanitizedLine(entry.Message);
         Assert.Null(entry.Exception);
 
@@ -777,6 +786,84 @@ public sealed class ReadyClaimAtomicityTests
         Assert.Same(task, publishedTask);
         Assert.True(f.Worker.IsBusy);
         Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+    }
+
+    /// <summary>
+    /// A LOGGER THAT THROWS AN <see cref="OperationCanceledException"/> WHILE EMITTING THE SEND-FAILURE
+    /// DIAGNOSTIC CANNOT BECOME THE OUTCOME. With the caller token already cancelled, an unguarded
+    /// emission would let the LOGGER's OCE leave <c>SendAgentsMdAsync</c>, match the Ready path's
+    /// broad caller-cancellation filter (which only tests that the caller token is requested) and be
+    /// rethrown in place of the caller's cancellation — carrying a FOREIGN token and message.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS WHAT THE GUARD BUYS. Contained, the send helper returns normally and the retained
+    /// explicit <c>ThrowIfCancellationRequested</c> observation is what produces the outcome, so the
+    /// CALLER token is authoritative. The claim is post-claim state and must survive intact.
+    /// </remarks>
+    /// <param name="useDefaultToken">
+    /// Whether the logger's OCE carries <see cref="CancellationToken.None"/> (the parameterless
+    /// shape) instead of a distinct live token.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Ready_SendFailureDiagnosticLoggerCancellation_NeverReplacesTheCallerCancellation(
+        bool useDefaultToken)
+    {
+        const string loggerMessage = "logger cancellation emitted while reporting the send failure";
+
+        var f = Fixture.Create(withAgentsManager: true);
+        var task = BuildTask($"task-send-diag-oce-{useDefaultToken}");
+        f.Queue.Enqueue(task);
+
+        // A DIFFERENT, LIVE cancellation source — never the caller's.
+        using var foreignCts = new CancellationTokenSource();
+        foreignCts.Cancel();
+
+        var loggerFailure = useDefaultToken
+            ? new OperationCanceledException(loggerMessage)
+            : new OperationCanceledException(loggerMessage, foreignCts.Token);
+
+        // ONLY the send-failure diagnostic fails, and it fails with a CANCELLATION.
+        f.Logger.ThrowFactory = message =>
+            message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
+                ? loggerFailure
+                : null;
+
+        using var callerCts = new CancellationTokenSource();
+
+        // THE CANCELLATION LANDS INSIDE THE WINDOW, so the claim succeeds first and the guidance
+        // send then fails on the cancelled token — driving the send-failure diagnostic.
+        f.Service.OnBeforeReadyClaimForTest = () => callerCts.Cancel();
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => InvokeReadyAsync(f.Service, f.Worker, callerCts.Token));
+
+        // (a)+(b) THE LOGGER'S OCE DID NOT ESCAPE: the outcome is the CALLER's cancellation, not the
+        // logger's instance, and it carries the CALLER token rather than the foreign one.
+        Assert.NotSame(loggerFailure, thrown);
+        Assert.Equal(callerCts.Token, thrown.CancellationToken);
+        Assert.NotEqual(foreignCts.Token, thrown.CancellationToken);
+
+        // (c) THE LOGGER'S MESSAGE DOES NOT LEAK into the propagated outcome.
+        Assert.DoesNotContain(loggerMessage, thrown.Message, StringComparison.Ordinal);
+
+        // The diagnostic really was attempted — otherwise the guard proves nothing.
+        Assert.Contains(
+            f.Logger.Entries,
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
+
+        // (d) THE CLAIM REMAINS ACTIVE: post-claim cancellation rolls nothing back.
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(f.Worker.Id, task.Metadata["assigned_worker"]);
+
+        // (e) NOTHING WAS REQUEUED AND NOTHING WAS PUBLISHED on this path.
+        Assert.Null(f.Queue.TryDequeueAny());
+        Assert.Empty(f.Publisher.Calls);
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("Assigning task", StringComparison.Ordinal));
     }
 
     /// <summary>An exception whose <c>Message</c> getter throws — the placeholder-read vector.</summary>
@@ -838,6 +925,11 @@ public sealed class ReadyClaimAtomicityTests
     /// THE PAYLOAD IS CONTROL-CHARACTER-FREE ON PURPOSE: this vector isolates the LENGTH cap from
     /// the sanitization property the other vectors already pin, so a fix that only shortened the
     /// message without sanitizing would still fail those, and vice versa.
+    /// <para>
+    /// RETARGETED onto the guarded send-failure diagnostic, which renders through the SAME
+    /// <c>SanitizedFailureDetail</c> helper; it previously depended on that diagnostic's throw
+    /// escaping into the outer guidance warning, which is the defect now fixed.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Ready_GuidanceDiagnostic_OversizedFailureDetailIsTruncated()
@@ -845,10 +937,7 @@ public sealed class ReadyClaimAtomicityTests
         var f = Fixture.Create(withAgentsManager: true);
         var oversized = "x" + new string('A', 600);
         f.Logger.ThrowFactory = message =>
-            // BOTH of the send's log lines fail, so the send's own catch cannot contain the fault
-            // and the post-claim guidance warning is what renders it.
             message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
-            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
                 ? new InvalidOperationException(oversized)
                 : null;
 
@@ -859,8 +948,7 @@ public sealed class ReadyClaimAtomicityTests
 
         var entry = Assert.Single(
             f.Logger.Entries,
-            e => e.Message.Contains(
-                "agents.md update failed after the assignment was claimed", StringComparison.Ordinal));
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
 
         // THE RAW PAYLOAD NEVER REACHED THE LOG UNSHORTENED — well past the cap, it is cut.
         Assert.DoesNotContain(oversized, entry.Message, StringComparison.Ordinal);
