@@ -2901,7 +2901,7 @@ public sealed class TaskDispatchServiceTests
     /// THE POST-RECORD FAULT AT THE GATEWAY BOUNDARY, over the REAL
     /// <see cref="WorkerAssignmentPublisher"/> and the REAL store: the completed channel makes the
     /// publisher's own post-record write throw, and the REAL
-    /// <see cref="GrpcWorkerGateway.SendTaskAsync"/> propagates that EXACT fault type instead of
+    /// <c>GrpcWorkerGateway.SendTaskAsync</c> propagates that EXACT fault type instead of
     /// reporting <see cref="WorkerTaskSendOutcome.Blocked"/> — while the row the publisher recorded
     /// stays.
     /// </summary>

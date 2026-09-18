@@ -145,6 +145,14 @@ internal sealed class DispatcherMaintenance
         LastAgentsSync = DateTime.UtcNow;
     }
 
+    /// <summary>
+    /// Sends the role's AGENTS.md to the EXACT supplied worker instance. Best-effort: a send failure
+    /// is logged and swallowed.
+    /// </summary>
+    /// <remarks>
+    /// THE REFERENCE OVERLOAD IS USED DELIBERATELY: the guidance goes to the instance the caller
+    /// selected, never to a replacement an ID lookup might resolve.
+    /// </remarks>
     public async Task SendAgentsMdToWorkerAsync(ConnectedWorker worker, WorkerRole role, CancellationToken ct)
     {
         if (_agentsManager is null) return;
@@ -154,7 +162,7 @@ internal sealed class DispatcherMaintenance
         var roleName = role.ToRoleName();
         try
         {
-            await _workerGateway.SendAgentsUpdateAsync(worker.Id, roleName, content, ct);
+            await _workerGateway.SendAgentsUpdateAsync(worker, roleName, content, ct);
         }
         catch (Exception ex)
         {
