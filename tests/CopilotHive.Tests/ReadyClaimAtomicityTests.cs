@@ -197,23 +197,47 @@ public sealed class ReadyClaimAtomicityTests
         }
     }
 
+    /// <summary>One captured log call, including the exception OBJECT the logger was handed.</summary>
+    /// <remarks>
+    /// THE EXCEPTION OBJECT IS PART OF THE OBSERVATION ON PURPOSE. A real logger renders a supplied
+    /// exception's raw <c>ToString()</c> (message AND stack) into its output, so "was an exception
+    /// object passed" is exactly the fact a sanitization vector must be able to assert.
+    /// </remarks>
+    private sealed record LogEntry(LogLevel Level, string Message, Exception? Exception);
+
     /// <summary>
     /// Records every logged message. <see cref="ThrowOnAgentsMd"/> makes the GUIDANCE step fail for a
     /// non-cancellation reason, which is what proves the post-claim guidance is best effort rather
-    /// than load-bearing.
+    /// than load-bearing; <see cref="ThrowFactory"/> is the finer-grained form that lets a vector
+    /// choose WHICH log line fails and WITH WHICH exception.
     /// </summary>
     private sealed class CapturingLogger : ILogger<HiveOrchestratorService>
     {
-        private readonly List<string> _messages = [];
+        private readonly List<LogEntry> _entries = [];
 
         public bool ThrowOnAgentsMd { get; set; }
+
+        /// <summary>
+        /// Returns the exception this logger must throw for the given rendered message, or
+        /// <c>null</c> to record it normally. Lets one vector fail exactly one log line.
+        /// </summary>
+        public Func<string, Exception?>? ThrowFactory { get; set; }
+
+        public IReadOnlyList<LogEntry> Entries
+        {
+            get
+            {
+                lock (_entries)
+                    return [.. _entries];
+            }
+        }
 
         public IReadOnlyList<string> Messages
         {
             get
             {
-                lock (_messages)
-                    return [.. _messages];
+                lock (_entries)
+                    return [.. _entries.Select(e => e.Message)];
             }
         }
 
@@ -229,13 +253,17 @@ public sealed class ReadyClaimAtomicityTests
             Func<TState, Exception?, string> formatter)
         {
             var message = formatter(state, exception);
-            lock (_messages)
-                _messages.Add(message);
+            lock (_entries)
+                _entries.Add(new LogEntry(logLevel, message, exception));
 
             // THE GUIDANCE FAILURE, deterministically: the upper-case production wording of the
             // agents.md send is what this logger refuses to emit.
             if (ThrowOnAgentsMd && message.Contains("AGENTS.md", StringComparison.Ordinal))
                 throw new InvalidOperationException("the logger refused to emit the AGENTS.md message");
+
+            var selected = ThrowFactory?.Invoke(message);
+            if (selected is not null)
+                throw selected;
         }
     }
 
@@ -454,6 +482,74 @@ public sealed class ReadyClaimAtomicityTests
         Assert.Equal(0, f.NotifyCount);
     }
 
+    /// <summary>
+    /// THE CANCELLATION STAYS PRIMARY EVEN WHEN THE ENQUEUE HOOK THROWS AN
+    /// <see cref="OperationCanceledException"/> OF ITS OWN. A hook OCE — carrying a FOREIGN token or
+    /// the default one — must NOT become the outcome: it is contained like any other hook fault
+    /// after the single insert, and the CALLER's cancellation (with the CALLER's token) is thrown.
+    /// </summary>
+    /// <remarks>
+    /// WHY THE EXISTING HOOK VECTOR CANNOT CATCH THIS. That one throws an
+    /// <see cref="InvalidOperationException"/>, which any <c>catch (Exception)</c> contains. Only an
+    /// OCE distinguishes "contain EVERY hook fault" from "rethrow a caught cancellation": with the
+    /// defective rethrow, the foreign token below escapes and this vector fails.
+    /// </remarks>
+    /// <param name="useDefaultToken">
+    /// Whether the hook's OCE carries <see cref="CancellationToken.None"/> (the parameterless
+    /// shape) instead of a distinct live token.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Ready_CancelledBeforeTheClaim_HookCancellationNeverReplacesTheCallerCancellation(
+        bool useDefaultToken)
+    {
+        var f = Fixture.Create();
+        var task = BuildTask($"task-hook-oce-{useDefaultToken}");
+        f.Queue.Enqueue(task);
+
+        // A DIFFERENT, LIVE cancellation source — never the caller's.
+        using var foreignCts = new CancellationTokenSource();
+        foreignCts.Cancel();
+
+        var hookFailure = useDefaultToken
+            ? new OperationCanceledException("hook cancellation with the default token")
+            : new OperationCanceledException(
+                "hook cancellation with a foreign token", foreignCts.Token);
+
+        // INSTALLED AFTER THE SETUP ENQUEUE, so only the requeue can invoke it.
+        f.Queue.OnEnqueue = _ => throw hookFailure;
+
+        using var callerCts = new CancellationTokenSource();
+        callerCts.Cancel();
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => InvokeReadyAsync(f.Service, f.Worker, callerCts.Token));
+
+        // THE CALLER'S CANCELLATION IS THE OUTCOME OF RECORD — not the hook's instance, not its
+        // token, and not its message.
+        Assert.NotSame(hookFailure, thrown);
+        Assert.Equal(callerCts.Token, thrown.CancellationToken);
+        Assert.NotEqual(foreignCts.Token, thrown.CancellationToken);
+        Assert.DoesNotContain("hook cancellation", thrown.Message, StringComparison.Ordinal);
+
+        // THE INSERT ALREADY HAPPENED — exactly once, the same instance, and no retry.
+        Assert.Same(task, f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.TryDequeueAny());
+
+        // NOTHING WAS PUBLISHED, RECORDED, NOTIFIED OR WRITTEN.
+        Assert.Null(f.Queue.GetActiveTask(task.TaskId));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Equal(0, f.NotifyCount);
+        Assert.False(f.Worker.IsBusy);
+        Assert.Null(f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerRole.Unspecified, f.Worker.Role);
+        Assert.Null(f.Worker.CurrentModel);
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("Assigning task", StringComparison.Ordinal));
+    }
+
     // ── the requeue hook and the guidance ─────────────────────────────────────
     /// <summary>
     /// THE REQUEUE INSERT HAPPENS BEFORE ITS HOOK, SO A THROWING HOOK PROPAGATES AFTER THE ONE AND
@@ -518,6 +614,176 @@ public sealed class ReadyClaimAtomicityTests
                 StringComparison.Ordinal));
         Assert.DoesNotContain(
             f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+    }
+
+    // ── the guidance diagnostics are sanitized ────────────────────────────────
+
+    /// <summary>
+    /// UNTRUSTED TEXT THAT WOULD FORGE LOG LINES: LF, CR, TAB, DEL and a C1 character, plus the
+    /// Unicode line separator. Every one of these is a character the boundary sanitizer replaces.
+    /// </summary>
+    private const string ControlCharacterPayload =
+        "boom\nFORGED level=Information Assignment published\r\tinjected\u007Fdel\u0085nel\u0090c1\u2028sep";
+
+    /// <summary>
+    /// Asserts a rendered log line carries NO character that could break it into several lines —
+    /// the property the boundary sanitizer exists to guarantee.
+    /// </summary>
+    private static void AssertSingleSanitizedLine(string rendered)
+    {
+        var offender = rendered.FirstOrDefault(LogSanitizer.IsLogUnsafe);
+        Assert.True(
+            offender == default,
+            $"the emitted log line carries the raw control character U+{(int)offender:X4}: '{rendered}'");
+
+        // The forged continuation cannot exist as its own line, because no line break survived.
+        Assert.DoesNotContain('\n', rendered);
+        Assert.DoesNotContain('\r', rendered);
+    }
+
+    /// <summary>
+    /// THE <c>SendAgentsMdAsync</c> FAILURE DIAGNOSTIC IS SANITIZED AND CARRIES NO EXCEPTION OBJECT:
+    /// a guidance send that fails with control-character text is reported as a single, bounded,
+    /// sanitized line, and the raw exception is never handed to the logger (which would render its
+    /// unsanitized message and stack).
+    /// </summary>
+    /// <remarks>
+    /// THE SEAM IS THE PRODUCTION SUCCESS LOG INSIDE THE SEND'S OWN <c>try</c>: failing it drives the
+    /// send's catch deterministically, with an exception whose message this vector controls.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_AgentsMdSendFailure_IsLoggedSanitizedAndWithoutTheExceptionObject()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        f.Logger.ThrowFactory = message =>
+            message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
+                ? new InvalidOperationException(ControlCharacterPayload)
+                : null;
+
+        var task = BuildTask("task-agentsmd-sanitized");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        var entry = Assert.Single(
+            f.Logger.Entries,
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
+
+        // (i) NO RAW EXCEPTION OBJECT: a logger handed one renders its unsanitized text and stack.
+        Assert.Null(entry.Exception);
+
+        // (ii) THE RENDERED LINE IS SANITIZED — the payload's own characters are gone…
+        AssertSingleSanitizedLine(entry.Message);
+        Assert.DoesNotContain(ControlCharacterPayload, entry.Message, StringComparison.Ordinal);
+        // …while the readable remainder still identifies the failure.
+        Assert.Contains("boom", entry.Message, StringComparison.Ordinal);
+        Assert.Contains(f.Worker.Id, entry.Message, StringComparison.Ordinal);
+
+        // (iii) THE FAILURE STAYED BEST EFFORT: the claim stands and publication continued with the
+        // EXACT claimed instance and the ACTUAL task.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Null(f.Queue.TryDequeueAny());
+    }
+
+    /// <summary>
+    /// THE <c>LogGuidanceBestEffortFailed</c> DIAGNOSTIC IS SANITIZED AND CARRIES NO EXCEPTION
+    /// OBJECT, for a failure that ESCAPES the send helper entirely.
+    /// </summary>
+    /// <remarks>
+    /// BOTH OF THE SEND'S LOG LINES FAIL HERE, so the send's own catch cannot contain the fault and
+    /// the post-claim guidance catch in the Ready path is what handles it — the exact path this
+    /// vector is about.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_GuidanceFailure_IsLoggedSanitizedAndWithoutTheExceptionObject()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        f.Logger.ThrowFactory = message =>
+            message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
+            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
+                ? new InvalidOperationException(ControlCharacterPayload)
+                : null;
+
+        var task = BuildTask("task-guidance-sanitized");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        var entry = Assert.Single(
+            f.Logger.Entries,
+            e => e.Message.Contains(
+                "agents.md update failed after the assignment was claimed", StringComparison.Ordinal));
+
+        Assert.Null(entry.Exception);
+        AssertSingleSanitizedLine(entry.Message);
+        Assert.DoesNotContain(ControlCharacterPayload, entry.Message, StringComparison.Ordinal);
+        Assert.Contains("boom", entry.Message, StringComparison.Ordinal);
+
+        // NO FORGED LINE: the injected text cannot masquerade as a separate published-assignment
+        // record, because the line break that would have created it is gone.
+        Assert.DoesNotContain(
+            f.Logger.Entries,
+            e => e.Message.StartsWith("FORGED", StringComparison.Ordinal));
+
+        // BEST EFFORT, UNCHANGED: the claim stands and publication continued on the exact instance.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(1, f.NotifyCount);
+    }
+
+    /// <summary>
+    /// THE NO-THROW GUARD SURVIVES SANITIZATION: neither a logger that throws ON the guidance
+    /// warning itself nor an exception whose <c>Message</c> getter throws can escape the guarded
+    /// diagnostic or mask the primary outcome.
+    /// </summary>
+    [Fact]
+    public async Task Ready_GuidanceDiagnostic_ThrowingLoggerAndMessageGetterCannotEscape()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        f.Logger.ThrowFactory = message =>
+            // The send's own two lines fail with an exception whose MESSAGE GETTER throws, so the
+            // guidance warning must render it through its no-throw read…
+            message.StartsWith("Sent AGENTS.md", StringComparison.Ordinal)
+            || message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal)
+                ? new ThrowingMessageException()
+                // …and the guidance warning ITSELF then throws too.
+                : message.Contains("agents.md update failed", StringComparison.Ordinal)
+                    ? new InvalidOperationException("the guidance warning's logger threw")
+                    : null;
+
+        var task = BuildTask("task-guidance-guard");
+        f.Queue.Enqueue(task);
+
+        // MUST NOT THROW: neither failure escapes the guarded diagnostic.
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // The guarded warning really was attempted (so the guard is what contained the throw)…
+        var entry = Assert.Single(
+            f.Logger.Entries,
+            e => e.Message.Contains("agents.md update failed", StringComparison.Ordinal));
+        AssertSingleSanitizedLine(entry.Message);
+        Assert.Null(entry.Exception);
+
+        // …and the PRIMARY OUTCOME is untouched: the claim stands and publication continued.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+    }
+
+    /// <summary>An exception whose <c>Message</c> getter throws — the placeholder-read vector.</summary>
+    private sealed class ThrowingMessageException : Exception
+    {
+        public override string Message =>
+            throw new InvalidOperationException("the message getter threw");
     }
 
     // ── ApplyTaskAssignment ───────────────────────────────────────────────────

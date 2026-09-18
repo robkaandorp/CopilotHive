@@ -833,17 +833,14 @@ public sealed class HiveOrchestratorService(
                 {
                     taskQueue.Enqueue(task);
                 }
-                catch (OperationCanceledException)
-                {
-                    // THE CAUGHT CANCELLATION IS RETHROWN UNCHANGED.
-                    throw;
-                }
                 catch (Exception)
                 {
-                    // A non-cancellation hook fault is CONTAINED: the caller's cancellation is this
-                    // path's primary outcome, and neither a hook nor a diagnostic may replace it.
+                    // EVERY hook fault is CONTAINED — an OperationCanceledException included. A hook's
+                    // exception (and its foreign or default token) must never become this path's
+                    // outcome: the caller's cancellation is primary and is thrown below instead.
                 }
 
+                // THE CALLER'S CANCELLATION IS THE OUTCOME OF RECORD, carrying the CALLER token.
                 throw new OperationCanceledException(cancellationToken);
             }
 
@@ -1048,10 +1045,15 @@ public sealed class HiveOrchestratorService(
     /// GUARDED like every other diagnostic. The assignment is ALREADY claimed and is retained: this
     /// warning records a degraded, best-effort step and can neither replace the claimed outcome nor
     /// cause a requeue. Caller cancellation never reaches here — it is propagated unchanged.
+    /// <para>
+    /// THE DETAIL IS SANITIZED AND BOUNDED (see <see cref="SanitizedFailureDetail"/>): the failure's
+    /// text is untrusted, so it is rendered through the shared control-character sanitizer rather
+    /// than passed — or logged as an exception OBJECT — straight to the logger.
+    /// </para>
     /// </remarks>
     /// <param name="worker">The pinned worker whose guidance update failed.</param>
     /// <param name="task">The task it was already assigned.</param>
-    /// <param name="failure">The non-cancellation failure; its exact message is included.</param>
+    /// <param name="failure">The non-cancellation failure; its sanitized message is included.</param>
     private void LogGuidanceBestEffortFailed(ConnectedWorker worker, WorkTask task, Exception failure)
     {
         try
@@ -1061,7 +1063,7 @@ public sealed class HiveOrchestratorService(
                 "claimed; continuing to publish the claimed assignment — {Detail}",
                 worker.Id,
                 task.TaskId,
-                MessageOrPlaceholder(failure));
+                SanitizedFailureDetail(failure));
         }
         catch
         {
@@ -1139,6 +1141,29 @@ public sealed class HiveOrchestratorService(
         }
     }
 
+    /// <summary>Upper bound on a rendered failure detail, so one exception cannot flood a log.</summary>
+    private const int MaxFailureDetailLength = 512;
+
+    /// <summary>
+    /// THE SANITIZED, BOUNDED RENDERING of an untrusted failure for a single-line log message:
+    /// <see cref="MessageOrPlaceholder"/>'s no-throw read, then
+    /// <see cref="LogSanitizer.SanitizeText"/>, then a length cap.
+    /// </summary>
+    /// <remarks>
+    /// EXCEPTION TEXT IS UNTRUSTED INPUT. It can carry newlines, CR, ESC, DEL or C1 characters that
+    /// would forge additional log lines, so the rendered detail — never the exception OBJECT, whose
+    /// message and stack the logger would render raw — is what reaches the logger.
+    /// </remarks>
+    /// <param name="failure">The failure to render.</param>
+    /// <returns>Single-line, bounded, control-character-free text.</returns>
+    private static string SanitizedFailureDetail(Exception failure)
+    {
+        var detail = LogSanitizer.SanitizeText(MessageOrPlaceholder(failure));
+        return detail.Length <= MaxFailureDetailLength
+            ? detail
+            : detail[..MaxFailureDetailLength] + "…(truncated)";
+    }
+
     /// <summary>
     /// THE GUARDED ALREADY-ATTACHED DIAGNOSTIC: a second WorkStream lost the exclusive attachment
     /// claim for an instance another stream already owns, so this stream is ending normally without
@@ -1214,7 +1239,13 @@ public sealed class HiveOrchestratorService(
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to send AGENTS.md to worker {WorkerId}", worker.Id);
+            // THE EXCEPTION OBJECT IS DELIBERATELY NOT LOGGED: the logger would render its raw
+            // message and stack, so untrusted text could forge log lines. Only the sanitized,
+            // bounded detail is emitted.
+            logger.LogWarning(
+                "Failed to send AGENTS.md to worker {WorkerId} — {Detail}",
+                worker.Id,
+                SanitizedFailureDetail(ex));
         }
     }
 
