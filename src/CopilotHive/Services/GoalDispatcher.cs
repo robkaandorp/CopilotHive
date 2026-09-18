@@ -795,9 +795,11 @@ public sealed class GoalDispatcher : BackgroundService
 
                 if (observedActiveTaskId is null)
                 {
-                    // NULL OBSERVED POINTER — the dispatch failed without claiming the pipeline,
-                    // so the EXISTING enqueue-only recovery applies. The pointer is deliberately
-                    // NOT written first: this catch never writes the pointer on any path.
+                    // no active-task pointer was observed, so the existing enqueue-only recovery
+                    // applies. A currently-null pointer is NOT a proof that no claim ever occurred
+                    // (an admission may have rolled back, and uncertain durable residue may
+                    // remain) — it is only the observation this disposition acts on. The pointer is
+                    // deliberately NOT written first: this catch never writes the pointer on any path.
                     _redispatchQueue.Enqueue(goalId);
 
                     LogSafely(() => _logger.LogError(

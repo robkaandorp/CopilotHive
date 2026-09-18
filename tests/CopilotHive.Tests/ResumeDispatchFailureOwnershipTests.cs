@@ -25,13 +25,31 @@ namespace CopilotHive.Tests;
 /// </summary>
 /// <remarks>
 /// <para>
-/// EVERY VECTOR HERE ENTERS THROUGH THE REAL BOUNDARY: <see cref="GoalDispatcher.ResumeGoalAsync"/>
-/// → <see cref="TaskDispatchService.DispatchToRole"/> → the REAL
-/// <see cref="GrpcWorkerGateway"/> → the REAL <see cref="WorkerPool"/>, with the REAL
+/// THE PUBLICATION VECTORS TRAVERSE THE FULL REAL CHAIN:
+/// <see cref="GoalDispatcher.ResumeGoalAsync"/> → <see cref="TaskDispatchService.DispatchToRole"/>
+/// → the REAL <see cref="GrpcWorkerGateway"/> → the REAL <see cref="WorkerPool"/>, with the REAL
 /// <see cref="WorkerAssignmentPublisher"/> and the REAL
 /// <see cref="WorkerAssignmentContextStore"/> over an in-memory SQLite database (the shared
-/// <see cref="EagerAssignmentRecording"/> wiring). The delivered assignment is therefore an
+/// <see cref="EagerAssignmentRecording"/> wiring). That claim covers the post-record channel-fault
+/// vector, the throw-after-real-publish vector, the cross-pipeline delivery vector, the branchless
+/// variant and the throwing-logger vector: for each of them the delivered assignment is an
 /// observable ROW plus an observable CHANNEL message, never a "send happened" flag.
+/// </para>
+/// <para>
+/// THE OTHER TWO ARE DELIBERATE STAGE-SPECIFIC VECTORS, and they are scoped honestly rather than
+/// claimed as full-chain:
+/// <list type="bullet">
+///   <item><description>THE PRE-ADMISSION VECTOR (missing model) necessarily stops INSIDE the
+///     dispatch preparation — before the work-slot capture, the claim, the admission, the enqueue
+///     and therefore before the gateway is reached at all. That is precisely the state it exists to
+///     pin: a genuinely null pointer with no slot and no mapping.</description></item>
+///   <item><description>THE PENDING-SELECTION VECTOR wraps the real gateway and throws AT the
+///     delivery's worker-selection stage, so selection is never forwarded to the real
+///     gateway/pool. Everything BEFORE that stage — the capture, the claim, the real
+///     <see cref="GoalPipelineManager.PersistAdmission"/> commit and the enqueue — is the real
+///     production path, which is what makes its admitted-but-pending assertions
+///     meaningful.</description></item>
+/// </list>
 /// </para>
 /// <para>
 /// THE DISCRIMINATION IS THE POINTER. The pre-fix catch cleared <c>ActiveTaskId</c> unconditionally
@@ -444,25 +462,44 @@ public sealed class ResumeDispatchFailureOwnershipTests
     /// <summary>
     /// THE LOCAL DIAGNOSTIC GUARD. The disposition record goes through a no-throw guard, so a
     /// logging provider that THROWS on the Error write can neither replace the retained-ownership
-    /// disposition nor skip the final <c>PersistFull</c> — the preserved pointer is still durably
-    /// written.
+    /// disposition nor skip the final <c>PersistFull</c>.
     /// </summary>
     /// <remarks>
-    /// THE THROWING PROVIDER IS PROVEN TO HAVE BEEN ASKED: the same logger records the entry before
-    /// throwing, so this vector fails if the guard is removed (the throw would escape the catch and
-    /// the fresh-store readback below would never see the retained pointer).
+    /// <para>
+    /// THE PERSISTENCE PROOF IS FULL-SAVE-ONLY, AND ITS NON-VACUITY IS MEASURED IN-TEST. The
+    /// admission's row write already commits the pointer, the registry, the phase, the plan and the
+    /// phase-log through the SAME <c>ApplyToEntity</c> path, so none of those can distinguish "the
+    /// final save ran" from "the admission ran". The durable CONVERSATION can: it is written only by
+    /// <c>PipelineStore.SaveConversationCore</c>, reached exclusively from the FULL-save overloads.
+    /// The Brain stub appends one post-planning <c>craft-prompt</c> entry (exactly as the real
+    /// <c>DistributedBrain</c> does), which happens AFTER the resume's recovery-boundary save, so the
+    /// ONLY writer that can make it durable is the final <c>PersistFull</c> AFTER the catch.
+    /// </para>
+    /// <para>
+    /// THE MID-CATCH BASELINE closes the vacuity hole directly: the throwing logger performs a FRESH
+    /// readback at the very moment the diagnostic is being emitted — i.e. after the admission commit
+    /// and before the final save — and that readback must NOT contain the marker. Deleting the final
+    /// <c>PersistFull</c> makes the post-return readback match that baseline and fails this test.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task ResumeDispatch_ThrowingLogger_StillRetainsOwnershipAndPersists()
     {
-        using var fixture = new ResumeOwnershipFixture();
+        const string marker = "resume-own-throwing-logger-post-planning-marker";
+        using var fixture = new ResumeOwnershipFixture(postPlanningConversationMarker: marker);
         const string goalId = "resume-own-throwing-logger";
         var goal = NewFailedGoal(goalId, "Review rejected the changes");
         fixture.GoalStore.AddGoal(goal);
         var pipeline = NewFailedPipeline(fixture.Manager, goal, branchBacked: true);
         var worker = fixture.Pool.RegisterWorker("worker-resume-logger", []);
 
-        var throwing = new ThrowingDispatcherLogger();
+        // THE MID-CATCH BASELINE: the throwing provider reads the durable conversation at the exact
+        // instant the disposition record is emitted — after the admission committed its row, before
+        // the final full save can have run.
+        var throwing = new ThrowingDispatcherLogger
+        {
+            OnEmit = () => fixture.ReadPersistedConversation(goalId),
+        };
         var dispatcher = fixture.BuildDispatcher(loggerOverride: throwing);
         dispatcher.BranchListerForTest = (_, _) => Task.FromResult(new List<string>());
 
@@ -476,6 +513,22 @@ public sealed class ResumeDispatchFailureOwnershipTests
         Assert.Equal(1, throwing.ThrowCount);
         var asked = Assert.Single(throwing.Emitted);
         Assert.Contains("active ownership is RETAINED", asked, StringComparison.Ordinal);
+
+        // THE BRAIN REALLY PRODUCED THE POST-PLANNING MARKER IN MEMORY (the assertion below is not
+        // vacuous for the trivial reason that nothing ever added it).
+        Assert.Contains(pipeline.Conversation, entry => entry.Content == marker);
+
+        // THE MID-CATCH BASELINE PROVES THE DISCRIMINATION: at diagnostic time the marker was NOT
+        // yet durable, so only a save AFTER the catch can make it durable.
+        Assert.NotNull(throwing.ObservedAtEmit);
+        Assert.DoesNotContain(throwing.ObservedAtEmit!, entry => entry.Content == marker);
+
+        // THE FINAL FULL SAVE RAN: a FRESH context/store instance now sees the post-planning entry,
+        // which no admission or state save could ever have written.
+        var persistedConversation = fixture.ReadPersistedConversation(goalId);
+        var persistedMarker = Assert.Single(persistedConversation, entry => entry.Content == marker);
+        Assert.Equal("assistant", persistedMarker.Role);
+        Assert.Equal("craft-prompt", persistedMarker.Purpose);
 
         // THE OWNERSHIP IS RETAINED AND STILL DURABLY WRITTEN — the throw did not skip the save.
         var activeTaskId = pipeline.ActiveTaskId;
@@ -498,7 +551,7 @@ public sealed class ResumeDispatchFailureOwnershipTests
         private readonly List<SqliteConnection> _connections = [];
         private readonly List<CopilotHiveDbContext> _contexts = [];
 
-        public ResumeOwnershipFixture(bool seedCoderModel = true)
+        public ResumeOwnershipFixture(bool seedCoderModel = true, string? postPlanningConversationMarker = null)
         {
             ConnectionString =
                 $"Data Source=file:memdb-resume-ownership-{Guid.NewGuid():N}?mode=memory&cache=shared";
@@ -510,6 +563,10 @@ public sealed class ResumeDispatchFailureOwnershipTests
             Manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
             Recording = EagerAssignmentRecording.Start(Manager, Pool);
             Gateway = new GrpcWorkerGateway(Pool, Recording.Publisher);
+            Brain = new ResumeOwnershipBrain
+            {
+                PostPlanningConversationMarker = postPlanningConversationMarker,
+            };
 
             var config = new HiveConfigFile
             {
@@ -543,7 +600,7 @@ public sealed class ResumeDispatchFailureOwnershipTests
 
         public TestLogger<GoalDispatcher> DispatcherLogger { get; } = new();
 
-        public ResumeOwnershipBrain Brain { get; } = new();
+        public ResumeOwnershipBrain Brain { get; }
 
         public GrpcWorkerGateway Gateway { get; }
 
@@ -595,6 +652,24 @@ public sealed class ResumeDispatchFailureOwnershipTests
         /// <summary>The FRESH-STORE readback of the persisted active-task pointer.</summary>
         public string? ReadPersistedPointer(string goalId) =>
             CreateStore().LoadPipeline(goalId)?.ActiveTaskId;
+
+        /// <summary>
+        /// THE FULL-SAVE-ONLY READBACK, through a NEW context and a NEW store instance: the durable
+        /// conversation entries for the goal.
+        /// </summary>
+        /// <remarks>
+        /// WHY THE CONVERSATION AND NOT THE POINTER/PHASE/PHASE-LOG. The admission's own row write
+        /// (<c>PipelineStore.SaveAdmissionWithPointer</c>) goes through the SAME
+        /// <c>UpsertPipelineCore</c>/<c>ApplyToEntity</c> pair as the ordinary saves, so it already
+        /// commits the pointer, the registry, the phase, the plan AND the phase-log BEFORE
+        /// publication — none of those can discriminate a missing final save. The durable
+        /// conversation is written ONLY by <c>SaveConversationCore</c>, which is called exclusively
+        /// from the two FULL-save overloads (<c>PersistFull</c>) and never from the admission route
+        /// or from <c>SavePipelineState</c>. A post-planning conversation entry is therefore a
+        /// durable observable that ONLY the final <c>PersistFull</c> after the catch can produce.
+        /// </remarks>
+        public IReadOnlyList<ConversationEntry> ReadPersistedConversation(string goalId) =>
+            CreateStore().LoadPipeline(goalId)?.Conversation ?? [];
 
         /// <summary>Drains everything currently pending from the queue.</summary>
         public IReadOnlyList<WorkTask> DrainPending()
@@ -842,8 +917,20 @@ public sealed class ResumeDispatchFailureOwnershipTests
     /// A dispatcher logger that RECORDS every Error entry's message and then THROWS — the
     /// logging-provider failure the catch's local diagnostic guard must contain.
     /// </summary>
+    /// <remarks>
+    /// <see cref="OnEmit"/> is the MID-CATCH OBSERVATION HOOK: it runs on the production stack frame
+    /// that is emitting the disposition record, i.e. strictly between the admission's own commit and
+    /// the final full save, so a fixture can capture the durable baseline the post-return readback
+    /// must differ from. Its result is stored, never asserted here.
+    /// </remarks>
     private sealed class ThrowingDispatcherLogger : ILogger<GoalDispatcher>
     {
+        /// <summary>Optional mid-emit durable observation, captured into <see cref="ObservedAtEmit"/>.</summary>
+        public Func<IReadOnlyList<ConversationEntry>>? OnEmit { get; init; }
+
+        /// <summary>What <see cref="OnEmit"/> saw while the diagnostic was being emitted.</summary>
+        public IReadOnlyList<ConversationEntry>? ObservedAtEmit { get; private set; }
+
         public List<string> Emitted { get; } = [];
 
         public int ThrowCount { get; private set; }
@@ -860,6 +947,7 @@ public sealed class ResumeDispatchFailureOwnershipTests
                 return;
 
             Emitted.Add(formatter(state, exception));
+            ObservedAtEmit ??= OnEmit?.Invoke();
             ThrowCount++;
             throw new InvalidOperationException("dispatcher-logger-sentinel");
         }
@@ -881,6 +969,21 @@ public sealed class ResumeDispatchFailureOwnershipTests
     /// <summary>Brain stub: inert successes plus a default (Coding-first) plan.</summary>
     private sealed class ResumeOwnershipBrain : IDistributedBrain
     {
+        /// <summary>
+        /// When set, <see cref="CraftPromptAsync"/> appends this entry to the pipeline's
+        /// conversation — exactly what the real <c>DistributedBrain.CraftPromptAsync</c> does
+        /// (<c>pipeline.Conversation.Add(new ConversationEntry("assistant", …, "craft-prompt"))</c>).
+        /// </summary>
+        /// <remarks>
+        /// IT IS THE FULL-SAVE-ONLY MARKER. Prompt crafting runs AFTER the resume's recovery-boundary
+        /// <c>PersistFull</c> and AFTER nothing else has saved, and the conversation reaches storage
+        /// ONLY through <c>PipelineStore.SaveConversationCore</c>, which is called by the full-save
+        /// overloads alone — never by <c>SaveAdmissionWithPointer</c> (the admission's row write) and
+        /// never by <c>SavePipelineState</c>. So a durable conversation entry proves the FINAL
+        /// <c>PersistFull</c> after the catch actually ran.
+        /// </remarks>
+        public string? PostPlanningConversationMarker { get; init; }
+
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public Task<PlanResult> PlanIterationAsync(
@@ -889,8 +992,16 @@ public sealed class ResumeDispatchFailureOwnershipTests
 
         public Task<PromptResult> CraftPromptAsync(
             GoalPipeline pipeline, GoalPhase phase, string? additionalContext = null,
-            CancellationToken ct = default) =>
-            Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+            CancellationToken ct = default)
+        {
+            if (PostPlanningConversationMarker is { } marker)
+            {
+                pipeline.Conversation.Add(
+                    new ConversationEntry("assistant", marker, pipeline.Iteration, "craft-prompt"));
+            }
+
+            return Task.FromResult(PromptResult.Success($"Work on {pipeline.Description} as {phase}"));
+        }
 
         public Task<string> SummarizeAndMergeAsync(GoalPipeline pipeline, CancellationToken ct = default) =>
             Task.FromResult("summary");
