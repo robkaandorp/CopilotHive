@@ -574,6 +574,107 @@ public sealed class WorkerServiceReadinessOwnershipTests
     }
 
     /// <summary>
+    /// THE REPLACEMENT TRANSITION ITSELF is synchronously driven to its first incomplete await after
+    /// A was installed through the real loop. With A's execution/report already terminal and its
+    /// readiness write HELD, the only legal incomplete await is that exact write's join. This closes
+    /// the scheduler gap in a message-dequeue-only replacement observation: a join-removal mutant
+    /// clears A before <see cref="InvokeReplacementDrain"/> even returns and fails every immediate
+    /// pre-release assertion by name.
+    /// </summary>
+    [Fact]
+    public async Task ReplacementTransition_HeldReadinessWriteIsJoinedBeforeOwnerClear()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? executionA = null;
+        Task? reportingA = null;
+        Task? readinessA = null;
+        var replacementDrain = Task.CompletedTask;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var ownerA = GetActiveAssignment(service);
+            var retainedA = GetRetainedResult(service);
+            var ownerCts = GetOwnerCts(service);
+            executionA = GetActiveExecution(service);
+            reportingA = GetActiveReporting(service);
+            readinessA = CaptureReadinessWrite(
+                service, "The loop must have retained A's separately owned readiness write.");
+            await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            object? ownerAtWriteRelease = null;
+            writer.OnReadyReleasing = index =>
+            {
+                if (index == 0)
+                    ownerAtWriteRelease = GetActiveAssignment(service);
+            };
+
+            // Async methods run synchronously to their first incomplete await. Cancellation is not
+            // requested, and both original-task joins are complete, so correct code can return from
+            // this call only after reaching A's HELD readiness-write join.
+            replacementDrain = InvokeReplacementDrain(service);
+
+            Assert.False(
+                replacementDrain.IsCompleted,
+                "Replacement must be parked on A's held readiness-write join.");
+            Assert.False(readinessA.IsCompleted, "A's readiness write must still be held.");
+            Assert.Same(ownerA, GetActiveAssignment(service));
+            Assert.Same(retainedA, GetRetainedResult(service));
+            Assert.False(connection.IsRetired);
+            Assert.Null(Record.Exception(() => _ = ownerCts.Token));
+
+            writer.ReleaseReady(0);
+            await readinessA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await replacementDrain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Same(ownerA, ownerAtWriteRelease);
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.False(connection.IsRetired);
+            Assert.Equal(1, writer.ReadyCount);
+
+            // The actual loop remains usable after the transition and installs B with independent
+            // execution/report/readiness ownership; no runner overlap or duplicate A Ready occurs.
+            reader.Push(ResultAssignment(TaskB));
+            await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskB);
+            await writer.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            TrackReadinessWrite(GetRetainedReadinessWrite(service));
+            writer.ReleaseReady(1);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(2, writer.ReadyCount);
+            Assert.Equal(1, runner.MaxConcurrentPrompts);
+        }
+        finally
+        {
+            writer.OnReadyReleasing = null;
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution A", executionA),
+                ("assignment reporting A", reportingA),
+                ("readiness write A", readinessA),
+                ("replacement drain", replacementDrain),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
     /// A MATCHING CANCEL THAT SETTLES READINESS ITSELF must still yield EXACTLY ONE Ready: the
     /// ownership transition settles the eligibility and joins the write it starts, and the cancel
     /// FALLBACK cannot duplicate it because the shared claim was consumed by that same settlement.
@@ -707,6 +808,111 @@ public sealed class WorkerServiceReadinessOwnershipTests
         {
             drainEnteredRegistration.Dispose();
             writer.OnReadyReleasing = null;
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// WHEN THE PENDING READ AND READINESS OBSERVATION ARE BOTH COMPLETE BEFORE THE REAL LOOP'S
+    /// <c>WhenAny</c>, the read wins because production lists and checks it first — and the losing
+    /// readiness fact remains available for the NEXT iteration, where it starts exactly one Ready.
+    /// <para>
+    /// THE TIE IS CONSTRUCTED INSIDE THE REAL READ PATH. From A's reset handler the fixture installs
+    /// a one-shot <see cref="ChannelResponseReader.BeforeNextRead"/> hook. On read #2 that hook uses
+    /// the slot's production publication member and enqueues a probe, then returns synchronously;
+    /// consequently both <c>pendingRead</c> and <c>readinessWait</c> are complete before
+    /// <c>Task.WhenAny</c> is evaluated. The Ready-entry hook records that read #3 was already armed,
+    /// proving the probe's handler path won first. If observation consumed the losing readiness fact,
+    /// Ready never enters; if readiness won the tie, its entry sees only two reads.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SimultaneouslyCompletedReadWins_AndLosingReadinessRemainsAvailable()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        var tiePrepared = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readyEntryCaptured = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readsAtReadyEntry = -1;
+        Task? execution = null;
+        Task? reporting = null;
+        Task? readinessWrite = null;
+        try
+        {
+            // Install the tie constructor from INSIDE A's handler. Read #1 already owns the
+            // assignment message; production starts read #2 only after this handler returns.
+            runner.OnResetEntered = _ =>
+            {
+                if (runner.ResetCount != 1)
+                    return;
+
+                reader.BeforeNextRead = () =>
+                {
+                    // Both facts become complete synchronously on the real read's stack, before
+                    // ReadNextMessageAsync returns its already-completed pendingRead to the loop.
+                    PublishOrdinaryReadyEligibility(GetOwnerOrdinaryReady(service));
+                    reader.Push(Probe("simultaneous-read-wins"));
+                    tiePrepared.TrySetResult();
+                    return Task.CompletedTask;
+                };
+            };
+
+            writer.OnReadyEntering = _ =>
+            {
+                readsAtReadyEntry = reader.ReadsStarted;
+                readyEntryCaptured.TrySetResult();
+            };
+
+            reader.Push(ResultAssignment(TaskA));
+            await tiePrepared.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await readyEntryCaptured.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            readinessWrite = CaptureReadinessWrite(
+                service, "The losing readiness fact must remain available for the next loop iteration.");
+
+            // Read #3 is armed only AFTER the probe from read #2 was dispatched. This is positive
+            // evidence that the completed read won the tie before the losing readiness fact settled.
+            Assert.Equal(3, readsAtReadyEntry);
+            Assert.Equal(3, reader.ReadsStarted);
+            Assert.True(reader.Consumed(2).IsCompleted);
+            Assert.False(readinessWrite.IsCompleted, "The one readiness write is genuinely held.");
+            Assert.Equal(1, writer.ReadyCount);
+
+            writer.ReleaseReady(0);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // Let the real execution/reporting path finish. Its later idempotent publication must not
+            // create another Ready after the losing fact was settled once.
+            runner.Release(TaskA);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+        }
+        finally
+        {
+            runner.OnResetEntered = null;
+            writer.OnReadyEntering = null;
             runner.ReleaseAll();
             writer.ReleaseAll();
             reader.TryComplete();
@@ -1003,6 +1209,7 @@ public sealed class WorkerServiceReadinessOwnershipTests
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
             var owner = GetActiveAssignment(service);
+            var ownerCts = GetOwnerCts(service);
 
             // THE LAST-INSTANT CAPTURE, recorded on the joiner's own stack while the write is alive.
             object? ownerAtWriteRelease = null;
@@ -1015,16 +1222,28 @@ public sealed class WorkerServiceReadinessOwnershipTests
                 retiredAtWriteRelease = connection.IsRetired;
             };
 
-            // Finish the work and reach EOF in the same breath, so the loop's exit and the report's
-            // termination race: the TEARDOWN drain is what settles and joins the write.
+            // Finish execution/reporting first so the ordinary readiness write is genuinely held.
+            // The matching-cancel race separately proves transition-side settlement; this test pins
+            // EOF's responsibility to JOIN an already-started write before clear/retirement.
             runner.Release(TaskA);
-            reader.TryComplete();
-
             await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             readinessWrite = CaptureReadinessWrite(
-                service, "Teardown must settle and start the assignment's readiness write.");
+                service, "The loop must retain the assignment's ordinary readiness write.");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // PRE-RELEASE, with the write still HELD: teardown may not have finished, cleared
+            // Pre-cancel the assignment source so teardown's cancellation phase is synchronous, then
+            // use response-lifetime closure as the positive rendezvous that EOF entered finally.
+            await ownerCts.CancelAsync();
+            var responseLifetime = connection.RegisterToolResponse("eof-drain-rendezvous");
+            reader.TryComplete();
+            var responseClosure = await Record.ExceptionAsync(
+                () => responseLifetime.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.NotNull(responseClosure);
+            Assert.IsNotType<TimeoutException>(responseClosure);
+
+            // PRE-RELEASE, with the write still HELD and EOF positively inside teardown: teardown may
+            // not have finished, cleared
             // ownership or retired the connection.
             Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
             Assert.False(
@@ -1066,6 +1285,91 @@ public sealed class WorkerServiceReadinessOwnershipTests
                 ("assignment execution", execution),
                 ("assignment reporting", reporting),
                 ("readiness write", readinessWrite),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// THE SHARED TEARDOWN TRANSITION (used by EOF and reader-fault cleanup) is driven directly after
+    /// the real loop installed A. With cancellation and both original-task joins already complete,
+    /// its only incomplete await is A's held readiness write. This makes the transition's join proof
+    /// independent of the scheduler that resumes an EOF/faulting read: a no-join mutant clears the
+    /// owner and completes before <see cref="InvokeTeardownDrain"/> returns.
+    /// </summary>
+    [Fact]
+    public async Task TeardownTransition_HeldReadinessWriteIsJoinedBeforeOwnerClear()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? execution = null;
+        Task? reporting = null;
+        Task? readinessWrite = null;
+        var teardownDrain = Task.CompletedTask;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var owner = GetActiveAssignment(service);
+            var retained = GetRetainedResult(service);
+            var ownerCts = GetOwnerCts(service);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            readinessWrite = CaptureReadinessWrite(
+                service, "The loop must retain the assignment's readiness write.");
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await ownerCts.CancelAsync();
+
+            object? ownerAtWriteRelease = null;
+            writer.OnReadyReleasing = _ => ownerAtWriteRelease = GetActiveAssignment(service);
+
+            teardownDrain = InvokeTeardownDrain(service);
+
+            // IMMEDIATE, schedule-independent PRE-RELEASE proof: all earlier transition work was
+            // synchronous, so correct code can return only from the held readiness-write await.
+            Assert.False(teardownDrain.IsCompleted, "Teardown must be parked on the held write.");
+            Assert.False(readinessWrite.IsCompleted);
+            Assert.Same(owner, GetActiveAssignment(service));
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.False(connection.IsRetired);
+            Assert.Null(Record.Exception(() => _ = ownerCts.Token));
+
+            writer.ReleaseReady(0);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await teardownDrain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Same(owner, ownerAtWriteRelease);
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Throws<ObjectDisposedException>(() => _ = ownerCts.Token);
+            Assert.False(connection.IsRetired, "The transition drains ownership; the loop owns retirement.");
+
+            // Let the actual loop perform the remaining EOF response-ending/retirement stages.
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(connection.IsRetired);
+            Assert.Equal(1, writer.ReadyCount);
+        }
+        finally
+        {
+            writer.OnReadyReleasing = null;
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
+                ("teardown drain", teardownDrain),
                 ("loop", loop));
         }
     }
@@ -1416,6 +1720,8 @@ public sealed class WorkerServiceReadinessOwnershipTests
             reporting = GetActiveReporting(service);
             var owner = GetActiveAssignment(service);
 
+            var ownerCts = GetOwnerCts(service);
+
             // THE LAST-INSTANT CAPTURE, recorded on the joiner's own stack while the write is alive.
             object? ownerAtWriteRelease = null;
             var loopAliveAtWriteRelease = false;
@@ -1435,10 +1741,24 @@ public sealed class WorkerServiceReadinessOwnershipTests
                 service, "The loop must have started and retained the assignment's readiness write.");
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // NOW the reader faults: a REAL loop primary, with the readiness write still in flight.
-            reader.ArmFault(original);
+            // Remove cancellation-dispatch scheduling from the proof: once the assignment source is
+            // already cancelled, teardown's CancelAsync and both terminal original-task joins are
+            // synchronous, so its FIRST incomplete await can only be this held readiness write.
+            await ownerCts.CancelAsync();
 
-            // PRE-RELEASE, with the write still HELD: the fault-driven teardown may not have
+            // EndToolResponses is the first operation in the reader-fault finally. A registered wait
+            // therefore gives a positive production rendezvous after the fault entered teardown;
+            // from that point correct code runs synchronously to the held-write await, while a
+            // no-join mutant clears/retires and completes before yielding.
+            var responseLifetime = connection.RegisterToolResponse("reader-fault-drain-rendezvous");
+            reader.ArmFault(original);
+            var responseClosure = await Record.ExceptionAsync(
+                () => responseLifetime.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.NotNull(responseClosure);
+            Assert.IsNotType<TimeoutException>(responseClosure);
+
+            // PRE-RELEASE, with the write still HELD and the loop POSITIVELY inside its teardown
+            // drain: the fault-driven teardown may not have
             // finished, cleared ownership or retired the connection.
             Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
             Assert.False(
@@ -1504,6 +1824,7 @@ public sealed class WorkerServiceReadinessOwnershipTests
         var originalErr = Console.Error;
         var stdErr = new StringWriter();
         CancellationTokenRegistration callbackRegistration = default;
+        CancellationTokenRegistration drainEnteredRegistration = default;
         Task? execution = null;
         Task? reporting = null;
         Task? readinessWrite = null;
@@ -1520,6 +1841,8 @@ public sealed class WorkerServiceReadinessOwnershipTests
             var ownerCts = GetOwnerCts(service);
             var callbackFailure = new ReadinessSentinelException("throwing callback");
             callbackRegistration = ownerCts.Token.Register(() => throw callbackFailure);
+            var drainEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            drainEnteredRegistration = ownerCts.Token.Register(() => drainEntered.TrySetResult());
 
             // THE LAST-INSTANT CAPTURE, recorded on the joiner's own stack while the write is alive.
             object? ownerAtWriteRelease = null;
@@ -1543,8 +1866,10 @@ public sealed class WorkerServiceReadinessOwnershipTests
             // never cancelled here, so the callback's exception cannot land on this test's thread: it
             // is CAPTURED by the drain and surfaced through the loop as the deferred failure.
             reader.TryComplete();
+            await drainEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // PRE-RELEASE, with the write still HELD: teardown may not finish, clear ownership or
+            // PRE-RELEASE, with the write still HELD and teardown POSITIVELY inside its drain:
+            // teardown may not finish, clear ownership or
             // retire while the readiness write it started is outstanding — not even when it is
             // already carrying a deferred cancellation-callback failure.
             Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
@@ -1590,6 +1915,7 @@ public sealed class WorkerServiceReadinessOwnershipTests
         {
             Console.SetError(originalErr);
             writer.OnReadyReleasing = null;
+            drainEnteredRegistration.Dispose();
             callbackRegistration.Dispose();
             runner.ReleaseAll();
             writer.ReleaseAll();
@@ -1750,6 +2076,25 @@ public sealed class WorkerServiceReadinessOwnershipTests
         var method = typeof(WorkerService).GetMethod(
             "ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
         return (Task)method.Invoke(service, [connection, ct])!;
+    }
+
+    /// <summary>
+    /// Invokes the exact ownership transition the assignment handler awaits before resetting and
+    /// installing a successor. Used only after A was installed through the actual message loop.
+    /// </summary>
+    private static Task InvokeReplacementDrain(WorkerService service)
+    {
+        var method = typeof(WorkerService).GetMethod(
+            "DrainRetainedForReplacementAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Task)method.Invoke(service, null)!;
+    }
+
+    /// <summary>The exact assignment drain/clear transition shared by EOF and reader-fault teardown.</summary>
+    private static Task InvokeTeardownDrain(WorkerService service)
+    {
+        var method = typeof(WorkerService).GetMethod(
+            "DrainRetainedForTeardownAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Task)method.Invoke(service, null)!;
     }
 
     private static object? GetActiveAssignment(WorkerService service) =>
