@@ -2892,9 +2892,10 @@ public sealed class CompletionTransportOwnershipTests
 
             // THE PRODUCTION EXCEPTION SURFACES HERE, unwrapped: the handler did not swallow it, which
             // is what makes the finally's cleanup the only thing that could have ended the hold.
+            var ackState = new WorkStreamCompletionAckState();
             var thrown = Assert.Throws<InvalidOperationException>(
                 () => h.InvokeHandleTaskCompleteDirectly(
-                    h.Worker, taskId, new WorkStreamCompletionAckState(), model: "assigned-model"));
+                    h.Worker, taskId, ackState, model: "assigned-model"));
             Assert.Same(windowFault, thrown);
 
             // THE FAULT REALLY WAS RAISED FROM THE POST-ACQUISITION WINDOW, with the hold in force.
@@ -2926,6 +2927,7 @@ public sealed class CompletionTransportOwnershipTests
             //    BEFORE the ordinary notification, so neither an acknowledgement nor a notification
             //    was produced for it. This is the "no extra notification/release" half of the contract.
             AssertNoAcknowledgementPublished(h);
+            Assert.Null(ackState.LatestEligibleTaskId);
             Assert.Equal(0, h.TransportNotifications);
             Assert.Equal(0, h.DownstreamHandledCount(taskId));
             Assert.Equal(0, h.DashboardNotifications);
@@ -2933,6 +2935,7 @@ public sealed class CompletionTransportOwnershipTests
             // ── THE STREAM AND THE POOL ARE NOT STRANDED: the worker is selectable, and an ordinary
             //    completion still works afterwards, taking and ending its own hold.
             h.Assign("task-hold-window-throws-next", model: "assigned-model");
+            h.ResetDashboardNotifications();
             var acknowledgement = h.AwaitAcknowledgementAsync();
             await h.CompleteWithPresentModelAndAwaitDownstreamAsync(
                 "task-hold-window-throws-next", "assigned-model");
@@ -2942,6 +2945,8 @@ public sealed class CompletionTransportOwnershipTests
             Assert.False(h.Worker.CompletionPublicationPending);
             Assert.Same(h.Worker, h.Pool.GetIdleWorker());
             Assert.Equal(1, h.DownstreamHandledCount("task-hold-window-throws-next"));
+            Assert.Equal(1, h.TransportNotifications);
+            Assert.Equal(1, h.DashboardNotifications);
         });
     }
 
