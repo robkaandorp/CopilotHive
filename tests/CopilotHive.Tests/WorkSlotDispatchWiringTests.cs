@@ -3085,11 +3085,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     /// task is STRANDED by a pure diagnostic failure.
     /// </summary>
     /// <remarks>
-    /// This is the vector the earlier stage A test could not reach: it used a non-throwing logger,
+    /// This is the vector the earlier guidance test could not reach: it used a non-throwing logger,
     /// and the post-dequeue boundary test configured no <c>AgentsManager</c>, so the maintenance
     /// path returned on empty content before ever reaching its logging catch. Here BOTH conditions
     /// hold at once — a real AgentsManager with content AND a failing gateway send AND a throwing
-    /// logger — which is exactly what makes the indirect path live.
+    /// logger — which is exactly what makes the indirect path live. The containment now lives in
+    /// the maintenance helper's own GUARDED emission, so the throw never reaches the dispatch.
     /// </remarks>
     [Fact]
     public async Task Delivery_AgentsMdFailurePathLoggerThrows_IsContainedAndTaskIsNotStranded()
@@ -3128,15 +3129,138 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Equal([taskId], gateway.SentTaskIds);
         Assert.NotNull(queue.GetActiveTask(taskId));
 
-        // (iii) It was NOT diverted into a requeue: nothing went back to pending and no recovery or
-        // failure record was written — only the POST-CLAIM best-effort guidance record.
+        // (iii) It was NOT diverted into a requeue, and NO delivery-level record was written at
+        // all: the maintenance helper's own GUARDED emission contains the throwing diagnostic, so
+        // nothing escapes into the dispatch's guidance catch to be re-reported.
         Assert.Empty(DrainPending(queue));
         Assert.DoesNotContain(
-            logger.SeenMessages, m => m.Contains("delivery-recovery", StringComparison.Ordinal));
+            logger.SeenMessages, m => m.Contains("delivery-", StringComparison.Ordinal));
+    }
+
+    // ── (b3) THE POST-CLAIM GUIDANCE CANCELLATION PROVENANCE ────────────────
+
+    /// <summary>
+    /// A GENUINE caller-token cancellation raised BY THE REFERENCE GUIDANCE SEND propagates as the
+    /// SAME INSTANCE: the maintenance helper no longer swallows it, so the dispatch never replaces
+    /// it with the later recheck's fresh exception. The claim STANDS — nothing is requeued,
+    /// restored or cleared — and no assignment is published.
+    /// </summary>
+    /// <remarks>
+    /// THE IDENTITY ASSERTION IS THE POINT. Swallowing the cancellation in the maintenance helper
+    /// (the pre-fix behaviour) still yields <em>an</em> OperationCanceledException from the recheck,
+    /// so only <c>Assert.Same</c> against the instance the gateway actually threw can distinguish
+    /// the two.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_GuidanceRaisesCallerCancellation_PropagatesTheSameInstanceAndKeepsTheClaim()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var logger = new TestLogger<TaskDispatchService>();
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        using var cts = new CancellationTokenSource();
+        // The guidance send cancels the CALLER's own source and throws by OBSERVING the handed
+        // token — so the cancellation is genuinely the caller's and is raised POST-CLAIM.
+        var gateway = new DeliveryWorkerGateway(worker) { CancelCallerTokenAtAgentsUpdate = cts };
+        var service = CreateService(
+            manager, queue, logger, workerGateway: gateway, agentsManager: CreateAgentsManager());
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        // THE REFERENCE OVERLOAD really ran, and the ID one never did.
+        Assert.Equal(1, gateway.ReferenceAgentsUpdateAttempts);
+        Assert.Equal(0, gateway.IdAgentsUpdateAttempts);
+        Assert.Same(worker, gateway.WorkerAtAgentsUpdate);
+
+        // THE EXACT INSTANCE SURVIVES end-to-end.
+        Assert.NotNull(gateway.ThrownAtAgentsUpdate);
+        Assert.Same(gateway.ThrownAtAgentsUpdate, thrown);
+        Assert.Equal(cts.Token, thrown.CancellationToken);
+
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
+
+        // THE CLAIM STANDS: nothing is requeued, restored or cleared, and nothing was published.
+        Assert.Equal([taskId], gateway.ClaimedTaskIds);
+        Assert.Empty(gateway.SentTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+        Assert.True(worker.IsBusy);
+        Assert.Equal(WorkerRole.Coder, worker.Role);
+        Assert.Equal("coder-model", worker.CurrentModel);
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
+        Assert.Equal(WorkSlotState.Pending, SingleSlot(pipeline).State);
+
+        // A genuine cancellation is NOT an ordinary best-effort guidance failure.
         Assert.DoesNotContain(
-            logger.SeenMessages, m => m.Contains("delivery-failure", StringComparison.Ordinal));
-        Assert.Contains(
-            logger.SeenMessages, m => m.Contains("delivery-guidance-failed", StringComparison.Ordinal));
+            logger.LogEntries, e => e.Message.Contains("delivery-guidance-failed", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            logger.LogEntries, e => e.Message.Contains("pushed to worker", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// THE LOGGER-THROWN-OCE HOLE, CLOSED: an ORDINARY guidance failure whose maintenance
+    /// diagnostic throws an <see cref="OperationCanceledException"/> CARRYING THE NOW-CANCELLED
+    /// CALLER TOKEN must NOT be accepted as caller-cancellation evidence. The guarded emission
+    /// contains it, so the dispatch reaches its own recheck and throws THAT — never the logger's
+    /// instance.
+    /// </summary>
+    /// <remarks>
+    /// The caller token is deliberately cancelled by the send, so the logger's fabricated exception
+    /// satisfies BOTH halves of the dispatch's token filter. Only the maintenance helper's guarded
+    /// emission can keep it from escaping, which is exactly what this vector pins.
+    /// </remarks>
+    [Fact]
+    public async Task Delivery_GuidanceDiagnosticThrowsCallerTokenCancellation_IsContainedAndNeverPropagated()
+    {
+        var manager = new GoalPipelineManager(CreateStore(), new TestLogger<GoalPipelineManager>());
+        var pipeline = manager.CreatePipeline(CreateGoal(GoalId));
+        Arrange(pipeline, GoalPhase.Coding);
+
+        var queue = new TaskQueue();
+        var worker = CreateIdleWorker(role: WorkerRole.Tester);
+        using var cts = new CancellationTokenSource();
+        // The guidance send cancels the caller's token AND fails with an ORDINARY exception, so the
+        // maintenance helper enters its diagnostic arm with the caller token already cancelled.
+        var gateway = new DeliveryWorkerGateway(worker)
+        {
+            CancelCallerTokenAtAgentsUpdate = cts,
+            AgentsUpdateThrows = new InvalidOperationException("agents-md-sentinel"),
+        };
+
+        // THE HOSTILE DIAGNOSTIC: the maintenance warning throws an OCE carrying the CALLER token —
+        // the exact shape the dispatch's filter would otherwise accept and propagate.
+        var loggerCancellation = new OperationCanceledException("logger-forged-cancellation", cts.Token);
+        var logger = new ThrowingOnMatchLogger<TaskDispatchService>(
+            m => m.StartsWith("Failed to send AGENTS.md to worker", StringComparison.Ordinal),
+            loggerCancellation);
+        var service = CreateService(
+            manager, queue, logger, workerGateway: gateway, agentsManager: CreateAgentsManager());
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.DispatchToRole(pipeline, WorkerRole.Coder, "Code it", cts.Token));
+
+        // The hostile diagnostic really ran and really threw the forged cancellation…
+        Assert.Equal(1, gateway.ReferenceAgentsUpdateAttempts);
+        Assert.True(logger.ThrewAtLeastOnce, "the maintenance diagnostic must actually have thrown");
+        // …and it was CONTAINED: the dispatch's OWN recheck produced the outcome, not the logger.
+        Assert.NotSame(loggerCancellation, thrown);
+        Assert.Equal(cts.Token, thrown.CancellationToken);
+
+        var taskId = SettledTaskId(pipeline);
+        AssertSuffixedTaskId(taskId, TaskIdPrefix(GoalId, WorkerRole.Coder));
+
+        // POST-CLAIM RETENTION is unchanged on this route too.
+        Assert.Equal([taskId], gateway.ClaimedTaskIds);
+        Assert.Empty(gateway.SentTaskIds);
+        Assert.NotNull(queue.GetActiveTask(taskId));
+        Assert.Empty(DrainPending(queue));
+        Assert.True(worker.IsBusy);
+        Assert.Equal(taskId, pipeline.ActiveTaskId);
     }
 
     // ── (c) + (d-normal) + (f-normal) THE CANCEL-CHECK REQUEUE, in order ─────
@@ -4186,8 +4310,23 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         /// <summary>The exception the send actually threw, for an identity assertion.</summary>
         public OperationCanceledException? ThrownAtSend { get; private set; }
 
-        /// <summary>When set, <c>SendAgentsUpdateAsync</c> throws it (stage A).</summary>
+        /// <summary>When set, <c>SendAgentsUpdateAsync</c> throws it (the guidance step).</summary>
         public Exception? AgentsUpdateThrows { get; init; }
+
+        /// <summary>
+        /// When set, the REFERENCE <c>SendAgentsUpdateAsync</c> CANCELS this source first. With no
+        /// <see cref="AgentsUpdateThrows"/> armed it then throws by OBSERVING the token it was
+        /// HANDED — a genuine caller-token cancellation raised BY THE GUIDANCE SEND. With an
+        /// ordinary throw armed, THAT takes precedence: the caller's token is cancelled but the
+        /// failure reaching the maintenance catch is an ORDINARY one.
+        /// </summary>
+        public CancellationTokenSource? CancelCallerTokenAtAgentsUpdate { get; init; }
+
+        /// <summary>The exact instance the guidance send threw, for an identity assertion.</summary>
+        public OperationCanceledException? ThrownAtAgentsUpdate { get; private set; }
+
+        /// <summary>The worker instance the REFERENCE guidance overload was handed.</summary>
+        public ConnectedWorker? WorkerAtAgentsUpdate { get; private set; }
 
         /// <summary>
         /// THE DELIVERY-BOUNDARY GATE. When set, <see cref="GetIdleWorker"/> — stage G, the FIRST
@@ -4217,8 +4356,14 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
 
         public List<string> SentTaskIds { get; } = [];
 
-        /// <summary>Number of agents-md sends attempted — the proof that stage A really ran.</summary>
-        public int AgentsUpdateAttempts { get; private set; }
+        /// <summary>Number of agents-md sends attempted through EITHER overload.</summary>
+        public int AgentsUpdateAttempts => IdAgentsUpdateAttempts + ReferenceAgentsUpdateAttempts;
+
+        /// <summary>Attempts through the ID overload — must stay 0 on the eager guidance path.</summary>
+        public int IdAgentsUpdateAttempts { get; private set; }
+
+        /// <summary>Attempts through the REFERENCE overload — the one the eager path must await.</summary>
+        public int ReferenceAgentsUpdateAttempts { get; private set; }
 
         /// <summary>
         /// THE DELIVERY-TIME OBSERVATION SEAM. When set, it is invoked from INSIDE
@@ -4322,16 +4467,81 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         public Task SendCancelAsync(string workerId, string taskId, string reason, CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        /// <summary>The ID overload, counted SEPARATELY so a test can prove it was NOT the one used.</summary>
         public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default)
         {
-            AgentsUpdateAttempts++;
+            IdAgentsUpdateAttempts++;
             return AgentsUpdateThrows is not null ? throw AgentsUpdateThrows : Task.CompletedTask;
         }
 
+        /// <summary>
+        /// THE REFERENCE OVERLOAD the eager guidance step must await. It records the exact instance
+        /// it was handed and can raise a GENUINE caller-token cancellation by observing the token.
+        /// </summary>
         public Task SendAgentsUpdateAsync(ConnectedWorker worker, string role, string content, CancellationToken ct = default)
         {
-            AgentsUpdateAttempts++;
-            return AgentsUpdateThrows is not null ? throw AgentsUpdateThrows : Task.CompletedTask;
+            ReferenceAgentsUpdateAttempts++;
+            WorkerAtAgentsUpdate = worker;
+
+            CancelCallerTokenAtAgentsUpdate?.Cancel();
+
+            if (AgentsUpdateThrows is not null)
+                throw AgentsUpdateThrows;
+
+            if (CancelCallerTokenAtAgentsUpdate is not null)
+            {
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException ex)
+                {
+                    ThrownAtAgentsUpdate = ex;
+                    throw;
+                }
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// A logger that throws A CALLER-SUPPLIED EXCEPTION INSTANCE for messages matching a predicate,
+    /// so a vector can forge a specific hostile failure (an <see cref="OperationCanceledException"/>
+    /// carrying the caller's own token) and then assert by IDENTITY that it never escaped.
+    /// </summary>
+    private sealed class ThrowingOnMatchLogger<T> : ILogger<T>
+    {
+        private readonly Func<string, bool> _shouldThrow;
+        private readonly Exception _failure;
+
+        public ThrowingOnMatchLogger(Func<string, bool> shouldThrow, Exception failure)
+        {
+            _shouldThrow = shouldThrow;
+            _failure = failure;
+        }
+
+        /// <summary>True once the throwing branch has actually been taken.</summary>
+        public bool ThrewAtLeastOnce { get; private set; }
+
+        /// <summary>Every message the logger was asked to emit, throwing ones included.</summary>
+        public List<(LogLevel LogLevel, string Message, Exception? Exception)> LogEntries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            LogEntries.Add((logLevel, message, exception));
+            if (!_shouldThrow(message))
+                return;
+
+            ThrewAtLeastOnce = true;
+            throw _failure;
         }
     }
 

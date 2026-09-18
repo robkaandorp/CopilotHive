@@ -685,12 +685,17 @@ internal sealed class TaskDispatchService
 
         // GUIDANCE — POST-CLAIM AND BEST-EFFORT. The assignment is already claimed, so an ordinary
         // guidance failure may never undo it, requeue anything or restore a field; it is recorded in
-        // a guarded diagnostic and the delivery continues. An ACTUAL CAUGHT CALLER cancellation is
-        // the one exception and propagates unchanged — and it must really be the caller's: the
-        // filter demands the exception's OWN token be the caller's AND that token be cancelled, so
-        // a logger-thrown OperationCanceledException carrying a foreign or default token stays a
-        // best-effort failure and never becomes caller-cancellation evidence. The explicit token
-        // observation below remains the authority either way.
+        // a guarded diagnostic and the delivery continues.
+        //
+        // THE ONE PROPAGATED OUTCOME IS THE CALLER'S OWN CANCELLATION, AND ITS PROVENANCE IS CLOSED
+        // AT THE SOURCE: SendAgentsMdToWorkerAsync contains every other outcome INCLUDING its own
+        // diagnostic (a guarded, no-throw emission), so the only exception that can reach this catch
+        // is the EXACT OperationCanceledException the reference guidance send itself raised. A
+        // logger-thrown OCE — even one carrying the now-cancelled caller token — can no longer
+        // escape that call at all, so it can never be accepted here as caller-cancellation evidence.
+        // The token filter below is the second, redundant gate on that same fact, and `throw;`
+        // preserves the caught INSTANCE so its identity survives end-to-end rather than being
+        // replaced by the recheck's fresh exception.
         try
         {
             await _maintenance.SendAgentsMdToWorkerAsync(idleWorker, deliveredRole, ct);
@@ -702,6 +707,8 @@ internal sealed class TaskDispatchService
         }
         catch (Exception ex)
         {
+            // GUARDED EMISSION (LogGuidanceBestEffortFailed routes through LogSafely), so this arm
+            // itself can never throw and turn a contained failure into an escaping exception.
             LogGuidanceBestEffortFailed(deliveredGoalId, deliveredTaskId, deliveryWorkerId, ex);
         }
 
