@@ -2691,4 +2691,422 @@ public sealed class WorkerPoolTests
     }
 
     #endregion
+
+    // ── TryClaimAndActivate ───────────────────────────────────────────────────
+
+    #region TryClaimAndActivate — the accepted claim
+
+    /// <summary>A minimal dequeued task carrying a distinguishable role and model.</summary>
+    private static WorkTask ClaimTask(string taskId, string model = "claim-model") => new()
+    {
+        TaskId = taskId,
+        GoalId = "goal-claim",
+        GoalDescription = "claim the worker",
+        Prompt = "do the work",
+        Role = CopilotHive.Workers.WorkerRole.Coder,
+        Model = model,
+        Repositories = [],
+    };
+
+    /// <summary>
+    /// THE ACCEPTED CLAIM PUBLISHES THE WHOLE ACTIVATION IN ONE STEP: the exact dequeued task becomes
+    /// the queue's active entry carrying this worker, and the CAPTURED instance becomes busy with it,
+    /// with one shared timestamp for both clocks and the task's role and model.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_IdleRegisteredInstance_TakesTheClaimAndPublishesEverything()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim", []);
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim");
+        queue.Enqueue(task);
+        var dequeued = queue.TryDequeueAny();
+        Assert.Same(task, dequeued);
+        var heartbeatBefore = worker.LastHeartbeat;
+
+        Assert.True(pool.TryClaimAndActivate(worker, dequeued!, queue));
+
+        // The worker instance itself.
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-claim", worker.CurrentTaskId);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Coder, worker.Role);
+        Assert.Equal("claim-model", worker.CurrentModel);
+        Assert.NotNull(worker.CurrentTaskStartedAt);
+        // ONE timestamp capture feeds both clocks.
+        Assert.Equal(worker.LastActivityAt, worker.CurrentTaskStartedAt!.Value);
+        // The claim touches no heartbeat and no context usage.
+        Assert.Equal(heartbeatBefore, worker.LastHeartbeat);
+        Assert.Equal(0, worker.ContextUsagePercent);
+
+        // The queue's active entry is the VERY task instance, tagged with this worker.
+        Assert.Same(task, queue.GetActiveTask("task-claim"));
+        Assert.Equal("w-claim", task.Metadata["assigned_worker"]);
+
+        // The claim really did take ownership: the instance is no longer selectable as idle.
+        Assert.Null(pool.GetIdleWorker());
+
+        // The captured timestamp is a FRESH capture, not a default value: it must fall within a
+        // narrow window around the call, without any sleep-based ordering.
+        var afterCall = DateTime.UtcNow;
+        Assert.InRange(worker.CurrentTaskStartedAt!.Value, afterCall.AddSeconds(-30), afterCall);
+    }
+
+    #endregion
+
+    #region TryClaimAndActivate — refusals mutate nothing
+
+    /// <summary>
+    /// A BUSY INSTANCE IS REFUSED: the successor's assignment survives, the queue gains no active
+    /// entry and the offered task's metadata is untouched.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_BusyInstance_IsRefusedAndMutatesNothing()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim-busy", []);
+        pool.MarkBusy("w-claim-busy", "task-predecessor");
+        worker.Role = CopilotHive.Workers.WorkerRole.Tester;
+        worker.CurrentModel = "predecessor-model";
+        var activityBefore = worker.LastActivityAt;
+        var startedBefore = worker.CurrentTaskStartedAt;
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim-busy");
+
+        Assert.False(pool.TryClaimAndActivate(worker, task, queue));
+
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-predecessor", worker.CurrentTaskId);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Tester, worker.Role);
+        Assert.Equal("predecessor-model", worker.CurrentModel);
+        Assert.Equal(activityBefore, worker.LastActivityAt);
+        Assert.Equal(startedBefore, worker.CurrentTaskStartedAt);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Null(queue.GetActiveTask("task-claim-busy"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>
+    /// THE INCONSISTENT SHAPE — not busy but still carrying a task id — is refused, and the stale task
+    /// id survives rather than being silently overwritten.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_NotBusyButCarryingATaskId_IsRefusedAndMutatesNothing()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim-odd", []);
+        worker.IsBusy = false;
+        worker.CurrentTaskId = "task-left-behind";
+        var roleBefore = worker.Role;
+        var modelBefore = worker.CurrentModel;
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim-odd");
+
+        Assert.False(pool.TryClaimAndActivate(worker, task, queue));
+
+        Assert.False(worker.IsBusy);
+        Assert.Equal("task-left-behind", worker.CurrentTaskId);
+        Assert.Equal(roleBefore, worker.Role);
+        Assert.Equal(modelBefore, worker.CurrentModel);
+        Assert.Null(worker.CurrentTaskStartedAt);
+        Assert.Null(queue.GetActiveTask("task-claim-odd"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>
+    /// A HELD INSTANCE IS REFUSED: the completion-publication hold outranks an incoming claim, and the
+    /// refusal leaves the hold, the queue and the task completely untouched.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_HeldForCompletionPublication_IsRefusedAndMutatesNothing()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim-held", []);
+        pool.MarkBusy("w-claim-held", "task-completing");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-completing"));
+        Assert.True(worker.CompletionPublicationPending);
+        var activityBefore = worker.LastActivityAt;
+        var startedBefore = worker.CurrentTaskStartedAt;
+        var roleBefore = worker.Role;
+        var modelBefore = worker.CurrentModel;
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim-held");
+
+        Assert.False(pool.TryClaimAndActivate(worker, task, queue));
+
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Equal(startedBefore, worker.CurrentTaskStartedAt);
+        Assert.Equal(activityBefore, worker.LastActivityAt);
+        Assert.Equal(roleBefore, worker.Role);
+        Assert.Equal(modelBefore, worker.CurrentModel);
+        Assert.Null(queue.GetActiveTask("task-claim-held"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>An instance the pool no longer registers at all is refused.</summary>
+    [Fact]
+    public void TryClaimAndActivate_UnregisteredInstance_IsRefused()
+    {
+        var pool = CreatePool();
+        var ghost = new ConnectedWorker
+        {
+            Id = "w-claim-ghost",
+            Role = CopilotHive.Workers.WorkerRole.Unspecified,
+            Capabilities = [],
+        };
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim-ghost");
+
+        Assert.False(pool.TryClaimAndActivate(ghost, task, queue));
+
+        Assert.False(ghost.IsBusy);
+        Assert.Null(ghost.CurrentTaskId);
+        Assert.Null(ghost.CurrentTaskStartedAt);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Unspecified, ghost.Role);
+        Assert.Null(ghost.CurrentModel);
+        Assert.False(ghost.CompletionPublicationPending);
+        Assert.Null(queue.GetActiveTask("task-claim-ghost"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>
+    /// ABA: after A is removed and B re-registers under the same ID, a claim on the stale instance A is
+    /// refused and B — the live owner of that ID — keeps its idle state, role and model untouched.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_AbaReplacement_StaleInstanceIsRefusedAndReplacementUntouched()
+    {
+        var pool = CreatePool();
+        var stale = pool.RegisterWorker("w-claim-aba", []);
+        Assert.True(pool.RemoveWorker(stale));
+        var replacement = pool.RegisterWorker("w-claim-aba", []);
+        replacement.Role = CopilotHive.Workers.WorkerRole.Reviewer;
+        replacement.CurrentModel = "replacement-model";
+
+        var queue = new TaskQueue();
+        var task = ClaimTask("task-claim-aba");
+
+        Assert.False(pool.TryClaimAndActivate(stale, task, queue));
+
+        Assert.False(stale.IsBusy);
+        Assert.Null(stale.CurrentTaskId);
+        Assert.Null(stale.CurrentTaskStartedAt);
+        Assert.False(replacement.IsBusy);
+        Assert.Null(replacement.CurrentTaskId);
+        Assert.Null(replacement.CurrentTaskStartedAt);
+        Assert.False(replacement.CompletionPublicationPending);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Reviewer, replacement.Role);
+        Assert.Equal("replacement-model", replacement.CurrentModel);
+        Assert.Null(queue.GetActiveTask("task-claim-aba"));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+    }
+
+    /// <summary>
+    /// TWO SIMULTANEOUS CLAIMS OF THE SAME INSTANCE HAVE EXACTLY ONE WINNER: the loser is refused by
+    /// the shape check and its own task never becomes active — the queue entry and the worker belong to
+    /// the winner only.
+    /// </summary>
+    [Fact]
+    public async Task TryClaimAndActivate_SimultaneousClaims_HaveExactlyOneWinner()
+    {
+        const int rounds = 100;
+
+        for (var round = 0; round < rounds; round++)
+        {
+            var pool = CreatePool();
+            var worker = pool.RegisterWorker($"w-claim-race-{round}", []);
+            var firstQueue = new TaskQueue();
+            var secondQueue = new TaskQueue();
+            var firstTask = ClaimTask($"task-claim-race-a-{round}", "model-a");
+            var secondTask = ClaimTask($"task-claim-race-b-{round}", "model-b");
+
+            var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var successes = 0;
+
+            var first = Task.Run(
+                () =>
+                {
+                    start.Task.GetAwaiter().GetResult();
+                    if (pool.TryClaimAndActivate(worker, firstTask, firstQueue))
+                        Interlocked.Increment(ref successes);
+                },
+                TestContext.Current.CancellationToken);
+            var second = Task.Run(
+                () =>
+                {
+                    start.Task.GetAwaiter().GetResult();
+                    if (pool.TryClaimAndActivate(worker, secondTask, secondQueue))
+                        Interlocked.Increment(ref successes);
+                },
+                TestContext.Current.CancellationToken);
+
+            // EVERY launched operation is joined before any assertion — no polling, no sleep, and
+            // nothing left running behind the test.
+            try
+            {
+                start.SetResult();
+                await Task.WhenAll(first, second);
+            }
+            finally
+            {
+                await Task.WhenAll(first, second);
+            }
+
+            Assert.Equal(1, successes);
+
+            // EXACTLY ONE of the two queues holds an active entry, and it is the one carrying the
+            // winning task's id — the loser's task was never activated and its metadata untouched.
+            var firstActive = firstQueue.GetActiveTask(firstTask.TaskId);
+            var secondActive = secondQueue.GetActiveTask(secondTask.TaskId);
+            Assert.True(
+                (firstActive is null) ^ (secondActive is null),
+                "exactly one claim may win, so exactly one task may be active.");
+
+            var winningTask = firstActive ?? secondActive;
+            Assert.Same(worker, pool.GetWorker(worker.Id));
+            Assert.True(worker.IsBusy);
+            Assert.Equal(winningTask!.TaskId, worker.CurrentTaskId);
+            Assert.Equal(winningTask.Model, worker.CurrentModel);
+            Assert.Equal("w-claim-race-" + round, winningTask.Metadata["assigned_worker"]);
+
+            var losingTask = firstActive is null ? firstTask : secondTask;
+            Assert.False(losingTask.Metadata.ContainsKey("assigned_worker"));
+        }
+    }
+
+    /// <summary>
+    /// TWO CLAIMS LAUNCHED ON DEDICATED THREADS THROUGH A NAMED BARRIER RACE FOR THE SAME WORKER:
+    /// exactly one wins, the loser's task metadata is untouched, and the winner's published state is
+    /// internally consistent (one shared timestamp, the winning task's role and model). No sleeps, no
+    /// polling — the barrier only makes BOTH threads contend before either returns.
+    /// </summary>
+    [Fact]
+    public void TryClaimAndActivate_DedicatedThreadsThroughBarrier_ProduceExactlyOneWinnerWithNoTornState()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-claim-thread-race", []);
+        var firstQueue = new TaskQueue();
+        var secondQueue = new TaskQueue();
+        var firstTask = ClaimTask("task-claim-race-thread-a", "thread-model-a");
+        var secondTask = ClaimTask("task-claim-race-thread-b", "thread-model-b");
+
+        // A two-participant barrier: neither thread proceeds into the claim until BOTH are running.
+        using var barrier = new Barrier(2);
+        var firstWon = false;
+        var secondWon = false;
+
+        var first = new Thread(() =>
+        {
+            barrier.SignalAndWait();
+            firstWon = pool.TryClaimAndActivate(worker, firstTask, firstQueue);
+        })
+        { IsBackground = true };
+        var second = new Thread(() =>
+        {
+            barrier.SignalAndWait();
+            secondWon = pool.TryClaimAndActivate(worker, secondTask, secondQueue);
+        })
+        { IsBackground = true };
+
+        try
+        {
+            first.Start();
+            second.Start();
+            // Join (no timeout, no polling): the test cannot observe state until both claims ended.
+            first.Join();
+            second.Join();
+        }
+        finally
+        {
+            if (first.IsAlive) first.Join();
+            if (second.IsAlive) second.Join();
+        }
+
+        // EXACTLY ONE WINNER — not zero, not two.
+        Assert.True(firstWon ^ secondWon, "exactly one claim must win the race.");
+
+        var winningQueue = firstWon ? firstQueue : secondQueue;
+        var winningTask = firstWon ? firstTask : secondTask;
+        var losingQueue = firstWon ? secondQueue : firstQueue;
+        var losingTask = firstWon ? secondTask : firstTask;
+
+        // THE WINNER'S PUBLISHED STATE IS COMPLETE AND UNTORN: the worker is busy with the winning
+        // task id only, the winning model, and one shared timestamp for both clocks.
+        Assert.True(worker.IsBusy);
+        Assert.Equal(winningTask.TaskId, worker.CurrentTaskId);
+        Assert.Equal(winningTask.Model, worker.CurrentModel);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Coder, worker.Role);
+        Assert.NotNull(worker.CurrentTaskStartedAt);
+        Assert.Equal(worker.CurrentTaskStartedAt, worker.LastActivityAt);
+
+        // The winning queue holds exactly the winning task, tagged with this worker.
+        Assert.Same(winningTask, winningQueue.GetActiveTask(winningTask.TaskId));
+        Assert.Equal("w-claim-thread-race", winningTask.Metadata["assigned_worker"]);
+
+        // THE LOSER'S ZERO-MUTATION STATE: its task was never activated, its metadata untouched, and
+        // the losing queue has no entry at all.
+        Assert.Null(losingQueue.GetActiveTask(losingTask.TaskId));
+        Assert.False(losingTask.Metadata.ContainsKey("assigned_worker"));
+        Assert.Equal(
+            firstWon ? "thread-model-a" : "thread-model-b",
+            worker.CurrentModel);
+    }
+
+    #endregion
+
+    #region TryClaimAndActivate — the atomic span, bound structurally
+
+    /// <summary>
+    /// EVERY MUTATING STATEMENT OF THE CLAIM IS INSIDE ITS SINGLE <c>lock (_activityLock)</c> BODY,
+    /// matched by BALANCED BRACES — including the queue activation — and no <c>await</c> appears in
+    /// that body at all.
+    /// </summary>
+    /// <remarks>
+    /// A post-condition cannot distinguish "the activation happened inside the lock" from "it happened
+    /// immediately after the lock closed"; only membership in the matched body can.
+    /// </remarks>
+    [Fact]
+    public void TryClaimAndActivate_MutationsAreInsideTheSingleActivityLockBody()
+    {
+        var pool = StripLineComments(ReadPoolSource());
+
+        var start = pool.IndexOf(
+            "internal bool TryClaimAndActivate(", StringComparison.Ordinal);
+        Assert.True(start >= 0, "the checked claim operation is gone.");
+        var end = pool.IndexOf("public IReadOnlyList<ConnectedWorker> GetStaleWorkers(", start, StringComparison.Ordinal);
+        Assert.True(end > start, "the operation's following member is gone.");
+        var claim = pool[start..end];
+
+        // EXACTLY ONE lock, so the membership below cannot be satisfied by a copy.
+        Assert.Equal(1, CountOf(claim, "lock (_activityLock)"));
+
+        var lockIndex = claim.IndexOf("lock (_activityLock)", StringComparison.Ordinal);
+        var lockBody = BraceScopedBody(claim, lockIndex);
+
+        foreach (var (name, statement) in new[]
+                 {
+                     ("the queue activation", "queue.Activate(task, expected.Id);"),
+                     ("the busy-field publication", "PublishBusyFieldsNoLock(expected, task.TaskId, DateTime.UtcNow);"),
+                     ("the role publication", "expected.Role = task.Role;"),
+                     ("the model publication", "expected.CurrentModel = task.Model;"),
+                 })
+        {
+            Assert.True(
+                lockBody.Contains(statement, StringComparison.Ordinal),
+                $"{name} is NOT inside the claim's activity-lock body.");
+        }
+
+        // AND THE LOCK HOLDS NOTHING ELSE THAT COULD BLOCK OR RE-ENTER: no await, no logging, no
+        // callback, no channel write.
+        Assert.DoesNotContain("await ", lockBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("MessageChannel", lockBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("Invoke", lockBody, StringComparison.Ordinal);
+    }
+
+    #endregion
 }

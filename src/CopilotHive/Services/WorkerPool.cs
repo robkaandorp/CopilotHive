@@ -59,10 +59,17 @@ public sealed class WorkerPool : IWorkerPool
     /// </para>
     /// <para>
     /// The lock also covers dictionary membership changes made on the strength of that state
-    /// (<see cref="TryRemoveTimedOutWorker"/> and <see cref="PurgeStaleWorkers"/>), so a worker is
-    /// never transiently absent from the pool while its state is being evaluated. A transient
-    /// absence would make <see cref="TouchActivity"/> silently drop a stream activity update and
-    /// let the following inactivity scan evict a worker that was, in fact, active.
+    /// (<see cref="RegisterWorker(string, string[])"/>, <see cref="RemoveWorker(string)"/>,
+    /// <see cref="RemoveWorker(ConnectedWorker)"/>, <see cref="TryRemoveTimedOutWorker"/> and
+    /// <see cref="PurgeStaleWorkers"/>), so a worker is never transiently absent from the pool while
+    /// its state is being evaluated. A transient absence would make <see cref="TouchActivity"/>
+    /// silently drop a stream activity update and let the following inactivity scan evict a worker
+    /// that was, in fact, active.
+    /// </para>
+    /// <para>
+    /// Membership and state share ONE lock, so the checked operations that both validate an
+    /// instance and then mutate it — <see cref="TryClaimAndActivate"/> above all — cannot have the
+    /// registration under that ID change between the two halves of their decision.
     /// </para>
     /// </summary>
     private readonly Lock _activityLock = new();
@@ -115,6 +122,11 @@ public sealed class WorkerPool : IWorkerPool
     /// <see cref="ConnectedWorker"/> is fully constructed — requested flag AND enablement decision
     /// included — BEFORE <c>TryAdd</c> makes it visible to any other thread, so a registered worker
     /// is never observable with either fact undecided.
+    /// <para>
+    /// The <c>TryAdd</c> happens under <c>_activityLock</c>, so the registration of an ID cannot
+    /// interleave with a checked operation that has already validated — or is in the middle of
+    /// mutating — the instance registered under that ID.
+    /// </para>
     /// </remarks>
     /// <param name="id">Unique identifier for the worker.</param>
     /// <param name="capabilities">Capabilities advertised by the worker.</param>
@@ -142,8 +154,14 @@ public sealed class WorkerPool : IWorkerPool
             CompletionReceiptAckEnabled = completionReceiptAckEnabled,
         };
 
-        if (!_workers.TryAdd(id, worker))
-            throw new InvalidOperationException($"Worker '{id}' is already registered.");
+        // The membership change is taken under the same lock as the state it will be evaluated
+        // against, so registration can never land between a checked operation's validation of the
+        // instance registered under this ID and that operation's mutation.
+        lock (_activityLock)
+        {
+            if (!_workers.TryAdd(id, worker))
+                throw new InvalidOperationException($"Worker '{id}' is already registered.");
+        }
 
         return worker;
     }
@@ -155,14 +173,26 @@ public sealed class WorkerPool : IWorkerPool
     /// NOT instance-safe: if a replacement worker has re-registered under the same ID (ABA),
     /// this removes the replacement. Use <see cref="RemoveWorker(ConnectedWorker)"/> for
     /// removal that may race with re-registration.
+    /// <para>
+    /// The <c>TryRemove</c> happens under <c>_activityLock</c> so membership cannot change between
+    /// a participating checked operation's validation and its mutation; only the channel
+    /// completion is performed outside the lock.
+    /// </para>
     /// </remarks>
     /// <param name="id">Identifier of the worker to remove.</param>
     /// <returns><c>true</c> if a worker with the ID was found and removed; <c>false</c> otherwise.</returns>
     public bool RemoveWorker(string id)
     {
-        if (!_workers.TryRemove(id, out var worker))
-            return false;
+        ConnectedWorker worker;
 
+        lock (_activityLock)
+        {
+            if (!_workers.TryRemove(id, out worker!))
+                return false;
+        }
+
+        // Complete the channel outside the lock: completion can resume the worker's stream reader
+        // inline, and no reader continuation should ever run while the activity lock is held.
         worker.MessageChannel.Writer.TryComplete();
         return true;
     }
@@ -172,6 +202,12 @@ public sealed class WorkerPool : IWorkerPool
     /// still registered under its ID. Instance-aware: a replacement instance registered
     /// under the same ID (ABA) is never removed by this call.
     /// </summary>
+    /// <remarks>
+    /// The ABA check and the <c>TryRemove</c> happen together under <c>_activityLock</c>, so the
+    /// exact instance validated is the one removed and membership cannot change between a
+    /// participating checked operation's validation and its mutation. Only the channel completion
+    /// is performed outside the lock.
+    /// </remarks>
     /// <param name="worker">The exact <see cref="ConnectedWorker"/> instance to remove.</param>
     /// <returns>
     /// <c>true</c> if the exact instance was found and removed (and its message channel
@@ -179,9 +215,14 @@ public sealed class WorkerPool : IWorkerPool
     /// </returns>
     public bool RemoveWorker(ConnectedWorker worker)
     {
-        if (!_workers.TryRemove(new KeyValuePair<string, ConnectedWorker>(worker.Id, worker)))
-            return false;
+        lock (_activityLock)
+        {
+            if (!_workers.TryRemove(new KeyValuePair<string, ConnectedWorker>(worker.Id, worker)))
+                return false;
+        }
 
+        // Complete the channel outside the lock: completion can resume the worker's stream reader
+        // inline, and no reader continuation should ever run while the activity lock is held.
         worker.MessageChannel.Writer.TryComplete();
         return true;
     }
@@ -267,6 +308,13 @@ public sealed class WorkerPool : IWorkerPool
     /// the new <see cref="ConnectedWorker.IsBusy"/>/<see cref="ConnectedWorker.CurrentTaskId"/>
     /// together with a stale <see cref="ConnectedWorker.LastActivityAt"/> from a previous task —
     /// which would make a freshly assigned worker look immediately timed out.
+    /// <para>
+    /// IT IS THE UNCONDITIONAL ID-BASED ROUTE, PRESERVED EXACTLY: it resolves the instance
+    /// registered under <paramref name="id"/> when it runs, performs no ownership or hold check, has
+    /// a <c>void</c> return and refuses nothing silently. An older candidate may therefore still be
+    /// busied through it after a checked claim has been taken elsewhere; that is a separate
+    /// contract, not something this method guards.
+    /// </para>
     /// </remarks>
     /// <param name="id">Identifier of the worker.</param>
     /// <param name="taskId">Identifier of the task the worker is executing.</param>
@@ -277,14 +325,29 @@ public sealed class WorkerPool : IWorkerPool
             if (!_workers.TryGetValue(id, out var worker))
                 return;
 
-            var now = DateTime.UtcNow;
-            // Reset the activity clock BEFORE publishing busy state so the worker is never
-            // observable as "busy with an old LastActivityAt".
-            worker.LastActivityAt = now;
-            worker.CurrentTaskStartedAt = now;
-            worker.CurrentTaskId = taskId;
-            worker.IsBusy = true;
+            PublishBusyFieldsNoLock(worker, taskId, DateTime.UtcNow);
         }
+    }
+
+    /// <summary>
+    /// THE ONE BUSY-FIELD FIELD SET, shared by <see cref="MarkBusy"/> and by the checked claim so the
+    /// two can never drift. Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    /// <remarks>
+    /// One caller-supplied timestamp is used for BOTH clocks, so a freshly claimed worker can never
+    /// be observable as busy with an older activity clock than task-start clock. The activity clock
+    /// is written BEFORE the busy flag, so the worker is never observable as "busy with an old
+    /// <see cref="ConnectedWorker.LastActivityAt"/>".
+    /// </remarks>
+    /// <param name="worker">The captured worker instance to mark busy — never re-resolved by ID.</param>
+    /// <param name="taskId">Identifier of the task the worker is executing.</param>
+    /// <param name="now">The single UTC timestamp used for both activity and task-start clocks.</param>
+    private static void PublishBusyFieldsNoLock(ConnectedWorker worker, string taskId, DateTime now)
+    {
+        worker.LastActivityAt = now;
+        worker.CurrentTaskStartedAt = now;
+        worker.CurrentTaskId = taskId;
+        worker.IsBusy = true;
     }
 
     /// <summary>
@@ -630,6 +693,85 @@ public sealed class WorkerPool : IWorkerPool
             return false;
 
         return string.Equals(expected.CurrentTaskId, expectedTaskId, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// THE CHECKED CLAIM-AND-ACTIVATE. Validates <paramref name="expected"/> and, only when the
+    /// validation holds at the mutation point, performs the queue activation and the busy-field
+    /// publication as ONE step under <c>_activityLock</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>THE THREE CHECKS, IN THIS ORDER, EACH REFUSING WITH ZERO MUTATION:</para>
+    /// <list type="number">
+    ///   <item><description>EXACT REGISTERED REFERENCE — the instance registered under
+    ///     <see cref="ConnectedWorker.Id"/> must be <paramref name="expected"/> itself
+    ///     (<c>ReferenceEquals</c>), so an ABA replacement registered under
+    ///     the same ID is never mutated on the strength of the old instance's validation.</description></item>
+    ///   <item><description>IDLE/NULL-TASK SHAPE — <c>!IsBusy &amp;&amp; CurrentTaskId is null</c>;
+    ///     a busy worker, or the inconsistent busy-less-but-has-a-task shape, is refused.</description></item>
+    ///   <item><description>NOT HELD — <see cref="ConnectedWorker.CompletionPublicationPending"/>
+    ///     must be <c>false</c>, so a worker whose negotiated completion is still being published is
+    ///     never claimed.</description></item>
+    /// </list>
+    /// <para>
+    /// A REFUSAL MUTATES NOTHING AT ALL: no worker field, no task metadata, no active-queue entry,
+    /// no notification. <c>false</c> means precisely "this caller did not win", not "something was
+    /// partially applied".
+    /// </para>
+    /// <para>
+    /// THE GUARANTEE IS RELATIVE TO PARTICIPATING POOL OPERATIONS. Registration and removal are
+    /// performed under this same lock, so membership cannot change between this validation and this
+    /// mutation, and two simultaneous claims of the same instance cannot both succeed.
+    /// </para>
+    /// <para>
+    /// THE EXPLICIT NON-GUARANTEES. It is NOT atomic with respect to queue observers — a caller that
+    /// inspected <see cref="TaskQueue"/> before calling is looking at a separate concurrent object —
+    /// nor with arbitrary external cleanup, nor with other UNCHECKED ID-based
+    /// <see cref="MarkBusy"/> callers, which may still busy the instance afterwards. It promises no
+    /// recovery if the worker is removed after a successful claim.
+    /// </para>
+    /// <para>
+    /// ONLY THESE THINGS HAPPEN INSIDE THE LOCK: the three checks, the existing synchronous
+    /// <see cref="TaskQueue.Activate(WorkTask, string)"/> call and the busy-field / role / model
+    /// publication. No callbacks or delegates, no database or channel operation, no logging, no
+    /// notification, and no <c>await</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="expected">The exact instance the caller validated — the ONLY instance mutated.</param>
+    /// <param name="task">The task dequeued for this claim.</param>
+    /// <param name="queue">The concrete queue the task was dequeued from.</param>
+    /// <returns><c>true</c> when the claim was taken; <c>false</c> when it was refused.</returns>
+    internal bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(task);
+        ArgumentNullException.ThrowIfNull(queue);
+
+        lock (_activityLock)
+        {
+            // 1. EXACT REGISTERED REFERENCE (ABA-safe).
+            if (!_workers.TryGetValue(expected.Id, out var registered)
+                || !ReferenceEquals(registered, expected))
+                return false;
+
+            // 2. IDLE/NULL-TASK SHAPE.
+            if (expected.IsBusy || expected.CurrentTaskId is not null)
+                return false;
+
+            // 3. NOT HELD.
+            if (expected.CompletionPublicationPending)
+                return false;
+
+            // The task becomes active and the worker becomes busy with it in the same lock span, so
+            // no participating pool operation can observe the worker as idle with the task already
+            // active, or select it between the two.
+            queue.Activate(task, expected.Id);
+            PublishBusyFieldsNoLock(expected, task.TaskId, DateTime.UtcNow);
+            expected.Role = task.Role;
+            expected.CurrentModel = task.Model;
+
+            return true;
+        }
     }
 
     /// <summary>

@@ -1096,7 +1096,8 @@ public sealed class DashboardNotifierWorkerWiringTests
             .GetMethod("HandleWorkerReady", BindingFlags.NonPublic | BindingFlags.Instance)!;
         await (Task)method.Invoke(service, [worker, new MockStreamWriter(), CancellationToken.None])!;
 
-        // Exactly 1 — from ApplyTaskAssignment, NOT from the idle else-branch
+        // Exactly 1 — from the ACCEPTED CLAIM's own notification in HandleWorkerReady, NOT from the
+        // idle else-branch.
         Assert.Equal(1, count[0]);
     }
 
