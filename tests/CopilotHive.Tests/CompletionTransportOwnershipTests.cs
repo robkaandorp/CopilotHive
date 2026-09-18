@@ -2928,48 +2928,86 @@ public sealed class CompletionTransportOwnershipTests
     /// <summary>
     /// A SAME-STREAM DUPLICATE RE-ACKNOWLEDGEMENT OBTAINS ITS MATCH WHILE THE WORKER WAITS, AND
     /// GRANTS NOTHING: the read-only branch neither clears the readiness wait nor repeats Record,
-    /// release, queue removal or notification.
+    /// release, queue removal or notification — only a real streamed Ready releases the instance.
     /// </summary>
     [Fact]
     public async Task DuplicateReAcknowledgement_WhileAwaitingReady_DoesNotGrantReadiness()
     {
-        var h = Harness.CreateWithRequestedCompletionReceiptAck();
-        await RunAsync(h, async () =>
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-dup-wait-{Guid.NewGuid():N}.db");
+
+        try
         {
-            const string taskId = "task-ready-gate-duplicate";
-            h.Assign(taskId, model: "assigned-model");
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+            await RunAsync(h, async () =>
+            {
+                const string taskId = "task-ready-gate-duplicate";
+                h.Assign(taskId, model: "assigned-model");
 
-            var acknowledgement = h.AwaitAcknowledgementAsync();
-            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+                var acknowledgement = h.AwaitAcknowledgementAsync();
+                await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
 
-            var ack = await acknowledgement;
-            Assert.Equal(taskId, ack.TaskId);
+                var ack = await acknowledgement;
+                Assert.Equal(taskId, ack.TaskId);
 
-            // THE COMPLETION IS FINISHED — hold ended, wait installed.
-            h.AssertAwaitingItsOwnReadyAfterThePublication();
-            var recordsBefore = h.Stores.ReceiptStore.Load(taskId);
-            Assert.NotNull(recordsBefore);
+                // THE COMPLETION IS FINISHED — hold ended, wait installed.
+                h.AssertAwaitingItsOwnReadyAfterThePublication();
+                var recordsBefore = h.Stores.ReceiptStore.Load(taskId);
+                Assert.NotNull(recordsBefore);
 
-            // ── THE DUPLICATE, THROUGH THE REAL READ LOOP, WHILE THE WORKER WAITS ──────────────
-            // Its re-acknowledgement is the LIVE proof that the stream's single latest-eligibility
-            // slot still names this task — the same slot a READY could clear.
-            await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId);
-            Assert.Equal(2, h.AcknowledgedCountFor(taskId));
+                // A SUCCESSOR IS PENDING, so "the duplicate granted nothing" is observable as an
+                // undelivered assignment rather than only as a flag read.
+                const string successor = "task-ready-gate-duplicate-successor";
+                h.EnqueuePendingSuccessor(successor, "goal-ready-gate-duplicate-successor");
 
-            // NOTHING WAS PROCESSED AGAIN: one downstream handling, one transport notification,
-            // and the retained receipt is the SAME evidence (not a second write).
-            Assert.Equal(1, h.DownstreamHandledCount(taskId));
-            Assert.Equal(1, h.TransportNotifications);
-            Assert.Null(h.Queue.GetActiveTask(taskId));
-            var recordsAfter = h.Stores.ReceiptStore.Load(taskId);
-            Assert.Equal(recordsBefore!.FirstStoredAtUtc, recordsAfter!.FirstStoredAtUtc);
+                // ── THE DUPLICATE, THROUGH THE REAL READ LOOP, WHILE THE WORKER WAITS ──────────
+                // Its re-acknowledgement is the LIVE proof that the stream's single latest-eligibility
+                // slot still names this task — the same slot a READY could clear.
+                await h.AssertLatestEligibleStillReAcknowledgedAsync(taskId);
+                Assert.Equal(2, h.AcknowledgedCountFor(taskId));
 
-            // ── AND THE READINESS WAIT IS UNTOUCHED: only a Ready releases the instance ─────────
-            Assert.False(h.Worker.CompletionPublicationPending);
-            Assert.True(h.Worker.AwaitingWorkerReady);
-            Assert.Null(h.Pool.GetIdleWorker());
-            h.GrantReadinessAndAssertSelectable();
-        });
+                // NOTHING WAS PROCESSED AGAIN: one downstream handling, one transport notification,
+                // and the retained receipt is the SAME evidence (not a second write).
+                Assert.Equal(1, h.DownstreamHandledCount(taskId));
+                Assert.Equal(1, h.TransportNotifications);
+                Assert.Null(h.Queue.GetActiveTask(taskId));
+                var recordsAfter = h.Stores.ReceiptStore.Load(taskId);
+                Assert.Equal(recordsBefore!.FirstStoredAtUtc, recordsAfter!.FirstStoredAtUtc);
+
+                // ── AND THE READINESS WAIT IS UNTOUCHED: only a Ready releases the instance ─────
+                Assert.False(h.Worker.CompletionPublicationPending);
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.Null(h.Pool.GetIdleWorker());
+
+                // The duplicate delivered nothing: the successor is still pending and unpublished.
+                Assert.Null(h.Queue.GetActiveTask(successor));
+                Assert.Null(h.Stores.AssignmentStore.Load(successor));
+                Assert.Equal(0, h.CountAssignmentsFor(successor));
+
+                // ── ONE REAL STREAMED READY RELEASES IT AND DELIVERS THE SUCCESSOR ONCE ────────
+                await h.ReadyAndAssertPendingSuccessorDeliveredOnceAsync(successor);
+
+                // …and the duplicate branch still never re-processed the completed task.
+                Assert.Equal(1, h.DownstreamHandledCount(taskId));
+                Assert.Equal(1, h.TransportNotifications);
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -2986,41 +3024,72 @@ public sealed class CompletionTransportOwnershipTests
     [Fact]
     public async Task IdleResetAndRefusedReady_DoNotBypassTheReadinessWait()
     {
-        var h = Harness.CreateWithRequestedCompletionReceiptAck();
-        await RunAsync(h, async () =>
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-bypass-{Guid.NewGuid():N}.db");
+
+        try
         {
-            const string taskId = "task-ready-gate-bypass";
-            h.Assign(taskId, model: "assigned-model");
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+            await RunAsync(h, async () =>
+            {
+                const string taskId = "task-ready-gate-bypass";
+                h.Assign(taskId, model: "assigned-model");
 
-            var acknowledgement = h.AwaitAcknowledgementAsync();
-            await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
-            Assert.Equal(taskId, (await acknowledgement).TaskId);
-            h.AssertAwaitingItsOwnReadyAfterThePublication();
+                var acknowledgement = h.AwaitAcknowledgementAsync();
+                await h.CompleteWithPresentModelAndAwaitDownstreamAsync(taskId, "assigned-model");
+                Assert.Equal(taskId, (await acknowledgement).TaskId);
+                h.AssertAwaitingItsOwnReadyAfterThePublication();
 
-            // ── (1) THE ID-BASED IDLE RESET TOUCHES NO SELECTION FACT ──────────────────────────
-            h.Pool.MarkIdle(WorkerId);
-            Assert.True(h.Worker.AwaitingWorkerReady);
-            Assert.Null(h.Pool.GetIdleWorker());
+                // A SUCCESSOR IS PENDING throughout, so every "granted nothing" claim below is an
+                // undelivered assignment rather than only a flag read.
+                const string successor = "task-ready-gate-bypass-successor";
+                h.EnqueuePendingSuccessor(successor, "goal-ready-gate-bypass-successor");
 
-            // ── (2) A READY REFUSED BY THE STILL-ACTIVE QUEUE ENTRY GRANTS NOTHING ─────────────
-            // The task is re-activated, which is exactly the shape the production handler refuses
-            // BEFORE any idle — so it can neither clear the wait nor hand out work.
-            h.Queue.Activate(h.BuildTask(taskId, "assigned-model"), WorkerId);
-            h.Pool.MarkBusy(WorkerId, taskId);
-            await h.ReadyAndAwaitIgnoredAsync();
+                // ── (1) THE ID-BASED IDLE RESET TOUCHES NO SELECTION FACT ──────────────────────
+                h.Pool.MarkIdle(WorkerId);
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.Null(h.Pool.GetIdleWorker());
+                Assert.Null(h.Queue.GetActiveTask(successor));
+                Assert.Equal(0, h.CountAssignmentsFor(successor));
 
-            Assert.True(h.Worker.AwaitingWorkerReady);
-            Assert.True(h.Worker.IsBusy);
-            Assert.Equal(taskId, h.Worker.CurrentTaskId);
+                // ── (2) A READY REFUSED BY THE STILL-ACTIVE QUEUE ENTRY GRANTS NOTHING ─────────
+                // The task is re-activated, which is exactly the shape the production handler refuses
+                // BEFORE any idle — so it can neither clear the wait nor hand out work.
+                h.Queue.Activate(h.BuildTask(taskId, "assigned-model"), WorkerId);
+                h.Pool.MarkBusy(WorkerId, taskId);
+                await h.ReadyAndAwaitIgnoredAsync();
 
-            // ── (3) ONLY A GENUINELY ACCEPTED READY RELEASES IT ────────────────────────────────
-            h.Queue.MarkComplete(taskId);
-            h.Pool.MarkIdle(WorkerId);
-            Assert.True(h.Worker.AwaitingWorkerReady);
-            Assert.Null(h.Pool.GetIdleWorker());
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.True(h.Worker.IsBusy);
+                Assert.Equal(taskId, h.Worker.CurrentTaskId);
+                Assert.Null(h.Queue.GetActiveTask(successor));
+                Assert.Equal(0, h.CountAssignmentsFor(successor));
 
-            h.GrantReadinessAndAssertSelectable();
-        });
+                // ── (3) ONLY A GENUINELY ACCEPTED, STREAMED READY RELEASES IT ──────────────────
+                h.Queue.MarkComplete(taskId);
+                h.Pool.MarkIdle(WorkerId);
+                Assert.True(h.Worker.AwaitingWorkerReady);
+                Assert.Null(h.Pool.GetIdleWorker());
+
+                await h.ReadyAndAssertPendingSuccessorDeliveredOnceAsync(successor);
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -3629,8 +3698,8 @@ public sealed class CompletionTransportOwnershipTests
             Assert.Equal(0, h.DashboardNotifications);
 
             // ── THE STREAM AND THE POOL ARE NOT STRANDED: an ordinary completion still works
-            //    afterwards, taking and ending its own hold. `Assign` drives the production-style
-            //    Ready first, which is what makes the withheld instance assignable again.
+            //    afterwards, taking and ending its own hold. The setup `Assign` re-establishes
+            //    ownership; the acceptance proof here is the SECOND completion, not that Ready.
             h.Assign("task-hold-window-throws-next", model: "assigned-model");
             h.ResetDashboardNotifications();
             var acknowledgement = h.AwaitAcknowledgementAsync();
@@ -3688,59 +3757,99 @@ public sealed class CompletionTransportOwnershipTests
     /// <remarks>
     /// THIS IS THE SLICE'S OWN REPETITION CHECK: an accidental hold that outlives its publication — a
     /// held instance whose hold is never cleared, or one whose second completion never takes its own
-    /// hold — is visible here without reading the other vectors. Between the two completions the
-    /// instance is assignable only because <c>Assign</c> drives the production-style Ready first.
+    /// hold — is visible here without reading the other vectors. Each round ends with a REAL streamed
+    /// Ready that delivers that round's pending successor, so the instance's return to service is
+    /// proved through the production path rather than by a pool call.
     /// </remarks>
     [Fact]
     public async Task CompletionPublicationHold_IsTakenAndFinishedForEachOrdinaryCompletion()
     {
-        var h = Harness.CreateWithRequestedCompletionReceiptAck();
-        await RunAsync(h, async () =>
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-hold-lifecycle-{Guid.NewGuid():N}.db");
+
+        try
         {
-            foreach (var taskId in new[] { "task-hold-lifecycle-a", "task-hold-lifecycle-b" })
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+            await RunAsync(h, async () =>
             {
-                h.Assign(taskId, model: "assigned-model");
-                h.ResetDashboardNotifications();
+                var round = 0;
+                foreach (var taskId in new[] { "task-hold-lifecycle-a", "task-hold-lifecycle-b" })
+                {
+                    // THE ROUND'S OWN ASSIGNMENT. The first round assigns directly; every later round
+                    // is already busy with the successor the previous round's streamed Ready
+                    // delivered, so its completion is the ordinary shape.
+                    if (round == 0)
+                        h.Assign(taskId, model: "assigned-model");
 
-                var acknowledgement = h.AwaitAcknowledgementAsync();
-                var window = h.PauseInCompletionPublicationWindow();
-                var heldInsideWindow = false;
+                    Assert.True(h.Worker.IsBusy);
+                    Assert.Equal(taskId, h.Worker.CurrentTaskId);
+                    h.ResetDashboardNotifications();
 
+                    var acknowledgement = h.AwaitAcknowledgementAsync();
+                    var window = h.PauseInCompletionPublicationWindow();
+                    var heldInsideWindow = false;
+
+                    try
+                    {
+                        h.PushCompletion(taskId, "assigned-model", true);
+
+                        await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                        // THE HOLD IS IN FORCE FOR THIS PUBLICATION, AND THE RELEASE REALLY HAPPENED.
+                        heldInsideWindow = h.Worker.CompletionPublicationPending;
+                        Assert.True(heldInsideWindow);
+                        Assert.False(h.Worker.IsBusy);
+                        Assert.Null(h.Queue.GetActiveTask(taskId));
+                        Assert.Null(h.Pool.GetIdleWorker());
+                    }
+                    finally
+                    {
+                        h.ClearCompletionPublicationHook();
+                        window.Release();
+                    }
+
+                    var ack = await acknowledgement;
+                    Assert.Equal(taskId, ack.TaskId);
+                    await h.BarrierAsync();
+
+                    // EACH COMPLETION'S OWN HOLD IS GONE — and the enabled instance is withheld by the
+                    // LONGER fact instead: the wait for its own Ready, which its next Ready ends.
+                    Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
+                    Assert.False(h.Worker.CompletionPublicationPending);
+                    h.AssertAwaitingItsOwnReadyAfterThePublication();
+
+                    // ── THE ROUND'S RETURN TO SERVICE IS A REAL STREAMED READY ─────────────────
+                    // Its successor is the NEXT round's task, so the following completion runs on
+                    // ownership this Ready genuinely established.
+                    round++;
+                    var successor = round < 2 ? "task-hold-lifecycle-b" : "task-hold-lifecycle-tail";
+                    h.EnqueuePendingSuccessor(
+                        successor, $"goal-hold-lifecycle-{round}", model: "assigned-model");
+
+                    await h.ReadyAndAssertPendingSuccessorDeliveredOnceAsync(successor);
+                }
+
+                // TWO COMPLETIONS, TWO HOLDS, TWO ACKNOWLEDGEMENTS — and the worker is not stranded.
+                Assert.Equal(2, h.Writer.Messages.Count(
+                    m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck));
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
                 try
                 {
-                    h.PushCompletion(taskId, "assigned-model", true);
-
-                    await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
-
-                    // THE HOLD IS IN FORCE FOR THIS PUBLICATION, AND THE RELEASE REALLY HAPPENED.
-                    heldInsideWindow = h.Worker.CompletionPublicationPending;
-                    Assert.True(heldInsideWindow);
-                    Assert.False(h.Worker.IsBusy);
-                    Assert.Null(h.Queue.GetActiveTask(taskId));
-                    Assert.Null(h.Pool.GetIdleWorker());
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
                 }
-                finally
+                catch
                 {
-                    h.ClearCompletionPublicationHook();
-                    window.Release();
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
                 }
-
-                var ack = await acknowledgement;
-                Assert.Equal(taskId, ack.TaskId);
-                await h.BarrierAsync();
-
-                // EACH COMPLETION'S OWN HOLD IS GONE — and the enabled instance is withheld by the
-                // LONGER fact instead: the wait for its own Ready, which its next Ready ends.
-                Assert.True(heldInsideWindow, "the hold was never observed inside the publication window");
-                Assert.False(h.Worker.CompletionPublicationPending);
-                h.AssertAwaitingItsOwnReadyAfterThePublication();
-                h.GrantReadinessAndAssertSelectable();
             }
-
-            // TWO COMPLETIONS, TWO HOLDS, TWO ACKNOWLEDGEMENTS — and the worker is not stranded.
-            Assert.Equal(2, h.Writer.Messages.Count(
-                m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck));
-        });
+        }
     }
 
     /// <summary>
@@ -5061,14 +5170,15 @@ public sealed class CompletionTransportOwnershipTests
         }
 
         /// <summary>
-        /// THE DIRECT-POOL READY the harness uses when a vector needs an instance released WITHOUT
-        /// exercising the stream: snapshot + <c>TryMarkIdleForReady</c>, exactly the checked idle the
+        /// THE DIRECT-POOL READY: snapshot + <c>TryMarkIdleForReady</c>, the checked idle the
         /// production <c>HandleWorkerReady</c> performs, refusing on the same conditions.
         /// </summary>
         /// <remarks>
-        /// IT IS NOT A SUBSTITUTE FOR A STREAMED <c>WorkerReady</c>. Vectors that must prove the real
-        /// end-to-end release push a Ready with <see cref="PushReady"/> instead; this helper exists
-        /// for setup (<see cref="Assign"/>) and for the explicitly-direct complement vector.
+        /// IT IS NOT A SUBSTITUTE FOR A STREAMED <c>WorkerReady</c> and is called from exactly two
+        /// places: <see cref="Assign"/> (fixture setup) and
+        /// <c>DirectConcurrentReady_WhileThePublicationIsPaused_IsRefusedAndGrantsNoReadiness</c>.
+        /// Every acceptance proof uses <see cref="ReadyAndAssertPendingSuccessorDeliveredOnceAsync"/>
+        /// or <see cref="ReadyAndAwaitAssignmentPublishedAsync"/>, which push a real Ready.
         /// </remarks>
         /// <param name="worker">The instance whose readiness is being established.</param>
         /// <returns>The checked idle's outcome.</returns>
@@ -5104,14 +5214,81 @@ public sealed class CompletionTransportOwnershipTests
 
         /// <summary>
         /// THE DIRECT-POOL COMPLEMENT of the wait's contract: the checked idle accepts, the wait ends
-        /// and only then is the instance selectable. Used by the explicitly-direct vector, never as a
-        /// stand-in for a streamed Ready.
+        /// and only then is the instance selectable. Its ONLY caller is
+        /// <c>DirectConcurrentReady_WhileThePublicationIsPaused_IsRefusedAndGrantsNoReadiness</c>,
+        /// where the direct call is the subject; it is never a stand-in for a streamed Ready.
         /// </summary>
         public void GrantReadinessAndAssertSelectable()
         {
             Assert.True(GrantReadiness(Worker), "the instance's own Ready was refused");
             Assert.False(Worker.AwaitingWorkerReady);
             Assert.Same(Worker, Pool.GetIdleWorker());
+        }
+
+        /// <summary>
+        /// THE STREAMED-READY ACCEPTANCE PROOF: with a successor already PENDING in the queue and the
+        /// instance still awaiting its own Ready, pushes exactly ONE real <c>WorkerReady</c> through
+        /// the WorkStream and awaits the production milestones — the Ready-accepted line and the
+        /// assignment forwarded by the real pump — then asserts the successor is claimed, recorded and
+        /// published exactly once.
+        /// </summary>
+        /// <remarks>
+        /// IT IS THE REAL PATH, NOT A POOL CALL: the release is driven only by the streamed message,
+        /// so a vector using this cannot pass if the wait were cleared by anything else, and it fails
+        /// outright if the Ready were replaced by a direct readiness transition.
+        /// </remarks>
+        /// <param name="successorTaskId">The pending successor the accepted Ready must deliver.</param>
+        public async Task ReadyAndAssertPendingSuccessorDeliveredOnceAsync(string successorTaskId)
+        {
+            // The preconditions this proof rests on: still waiting, nothing selectable, and the
+            // successor genuinely pending rather than already delivered.
+            Assert.True(Worker.AwaitingWorkerReady);
+            Assert.Null(Pool.GetIdleWorker());
+            Assert.Null(Queue.GetActiveTask(successorTaskId));
+
+            var forwardedBefore = CountAssignmentsFor(successorTaskId);
+
+            await ReadyAndAwaitAssignmentPublishedAsync(successorTaskId);
+
+            // THE STREAMED READY ENDED THE WAIT AND DELIVERED THE SUCCESSOR, exactly once.
+            Assert.False(Worker.AwaitingWorkerReady);
+            Assert.False(Worker.CompletionPublicationPending);
+            Assert.True(Worker.IsBusy);
+            Assert.Equal(successorTaskId, Worker.CurrentTaskId);
+            Assert.NotNull(Queue.GetActiveTask(successorTaskId));
+            Assert.NotNull(Stores.AssignmentStore.Load(successorTaskId));
+            Assert.Null(Queue.TryDequeueAny());
+            Assert.Equal(forwardedBefore + 1, CountAssignmentsFor(successorTaskId));
+        }
+
+        /// <summary>How many assignments for <paramref name="taskId"/> the real pump has forwarded.</summary>
+        /// <param name="taskId">The assignment's task id.</param>
+        /// <returns>The count on the writer's own ledger.</returns>
+        public int CountAssignmentsFor(string taskId) =>
+            Writer.Messages.Count(
+                m => m.Assignment is not null
+                     && string.Equals(m.Assignment.TaskId, taskId, StringComparison.Ordinal));
+
+        /// <summary>
+        /// Enqueues a successor the Ready route can genuinely deliver: a real pipeline with a Pending
+        /// slot at the active-task pointer, the task→goal mapping registered, and the task queued.
+        /// </summary>
+        /// <param name="taskId">The successor's task id.</param>
+        /// <param name="goalId">The goal the successor belongs to.</param>
+        /// <param name="model">The successor's model.</param>
+        public void EnqueuePendingSuccessor(string taskId, string goalId, string model = "successor-model")
+        {
+            var goal = new Goal { Id = goalId, Description = "pending successor" };
+            Manager.CreatePipeline(goal, maxRetries: 3);
+            GoalSource.Register(goal);
+
+            var pipeline = Manager.GetByGoalId(goalId);
+            Assert.NotNull(pipeline);
+            pipeline!.AllocateAttemptAndRegisterSlot(taskId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+            pipeline.SetActiveTask(taskId);
+            Manager.RegisterTask(taskId, goalId);
+
+            Queue.Enqueue(BuildTask(taskId, model) with { GoalId = goalId });
         }
 
         /// <summary>
@@ -6203,7 +6380,7 @@ public sealed class CompletionTransportOwnershipTests
         public async Task ReadyAndAwaitAcceptedAsync()
         {
             var signal = ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
-            Reader.Push(new WorkerMessage { WorkerId = WorkerId, Ready = new WorkerReady() });
+            PushReady();
             await signal.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
             await BarrierAsync();
         }
