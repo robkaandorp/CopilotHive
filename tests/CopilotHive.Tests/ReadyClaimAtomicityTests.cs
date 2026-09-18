@@ -76,7 +76,8 @@ public sealed class ReadyClaimAtomicityTests
         public static Fixture Create(
             CapturingLogger? logger = null,
             bool withAgentsManager = false,
-            bool withPublisher = true)
+            bool withPublisher = true,
+            bool ackEnabled = false)
         {
             var pool = new WorkerPool();
             var queue = new TaskQueue();
@@ -119,7 +120,8 @@ public sealed class ReadyClaimAtomicityTests
                 dashboardNotifier: notifier,
                 assignmentPublisher: withPublisher ? publisher : null);
 
-            var worker = pool.RegisterWorker(WorkerId, []);
+            var worker = pool.RegisterWorker(
+                WorkerId, [], requestCompletionReceiptAck: ackEnabled, completionReceiptAckEnabled: ackEnabled);
 
             var fixture = new Fixture
             {
@@ -405,6 +407,68 @@ public sealed class ReadyClaimAtomicityTests
         Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
         Assert.Equal(1, f.NotifyCount);
         Assert.Null(f.Queue.TryDequeueAny());
+    }
+
+    /// <summary>
+    /// THE READINESS WAIT GATES THE READY ROUTE TOO, AND ONE ACCEPTED READY IS ENOUGH: an
+    /// ACK-enabled instance whose negotiated completion was released — hold already cleared — is
+    /// refused by the checked claim, so the dequeued task goes back exactly once; the SAME task is
+    /// then delivered by ONE later Ready, which is what actually clears the wait.
+    /// </summary>
+    /// <remarks>
+    /// THE WINDOW IS REACHED THROUGH THE PRODUCTION HOOK, so the completion is installed INSIDE the
+    /// real post-dequeue/pre-claim interval the claim exists to close. It proves the readiness wait
+    /// refuses at the same boundary the publication hold does, and that the refusal is not itself a
+    /// deferred acceptance: a LATER Ready is genuinely required.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_WhileAwaitingTheInstancesOwnReady_RefusesThenDeliversOnTheNextReady()
+    {
+        var f = Fixture.Create(ackEnabled: true);
+        Assert.True(f.Worker.CompletionReceiptAckEnabled);
+
+        var task = BuildTask("task-awaiting-ready");
+        f.Queue.Enqueue(task);
+
+        // THE COMPLETION IS RELEASED THROUGH THE REAL HOLDING ROUTE INSIDE THE WINDOW, and its short
+        // publication hold is then cleared — so the ONLY fact withholding the instance is the
+        // readiness wait the same release installed.
+        f.Service.OnBeforeReadyClaimForTest = () =>
+        {
+            f.Pool.MarkBusy(WorkerId, "task-completing");
+            Assert.True(f.Pool.TryReleaseCompletedTaskHoldingForPublication(
+                f.Worker, "task-completing"));
+            Assert.True(f.Pool.ClearCompletionPublicationHold(f.Worker));
+        };
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // THE CLAIM REFUSED, THE TASK WENT BACK EXACTLY ONCE, AND NOTHING WAS PUBLISHED.
+        Assert.True(f.Worker.AwaitingWorkerReady);
+        Assert.False(f.Worker.CompletionPublicationPending);
+        Assert.False(f.Worker.IsBusy);
+        Assert.Null(f.Queue.GetActiveTask(task.TaskId));
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Equal(0, f.NotifyCount);
+
+        // The requeued instance is the VERY SAME one, and it is put back so the later Ready has
+        // something to deliver (TaskQueue exposes no count, so the peek must restore what it took).
+        Assert.Same(task, f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.TryDequeueAny());
+        f.Queue.Enqueue(task);
+
+        // ── ONE LATER READY — PRODUCTION SHAPE AGAIN — DELIVERS THE VERY SAME INSTANCE ────────
+        f.Service.OnBeforeReadyClaimForTest = null;
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.False(f.Worker.AwaitingWorkerReady);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(1, f.NotifyCount);
     }
 
     // ── caller cancellation ───────────────────────────────────────────────────

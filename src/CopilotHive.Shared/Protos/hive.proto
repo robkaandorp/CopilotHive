@@ -75,6 +75,21 @@ message RegisterResponse {
   // AND was answered by an orchestrator with a configured completion recorder. Every other shape
   // is default/false, so an old orchestrator that sends no field at all parses as false.
   bool completion_receipt_ack_enabled = 4;
+
+  // WHAT IT PROMISES: this registration's successful negotiated completion release puts the
+  // instance into an instance-local readiness wait, so the instance is not selectable for its next
+  // ordinary assignment until the worker sends an explicit Ready that the orchestrator ACCEPTS
+  // (a checked idle for the still-registered, no-longer-publishing instance). It is set from the
+  // registration instance's own enablement decision, for ACCEPTED replies only.
+  //
+  // WHAT IT DOES NOT PROMISE: it is NOT a confirmation that an acknowledgement was received, NOT a
+  // guarantee of reliable delivery, NOT a gate on the initial registration (a newly registered
+  // instance is selectable without any Ready), and NOT any form of recovery, replay or retention.
+  //
+  // A request-only field on the worker side does not exist: no worker consumption or ACK gating is
+  // added by this advertisement. An old orchestrator that omits the field parses it as false, and
+  // an older tracking-only worker that ignores it keeps sending its existing Ready unchanged.
+  bool completion_ready_required = 5;
 }
 
 // === Worker Roles (used only in TaskAssignment for per-task role) ===

@@ -254,6 +254,10 @@ public sealed class HiveOrchestratorService(
     /// <para>
     /// THE REPLY IS BUILT FROM THE EXACT RETURNED REGISTRATION INSTANCE, never from a later lookup, so
     /// the answer a worker is told can never disagree with the instance the pool actually published.
+    /// The same instance drives <see cref="RegisterResponse.CompletionReadyRequired"/>, which
+    /// advertises that this registration's NEXT ordinary assignment waits for an accepted Ready after
+    /// a successful negotiated completion release. It advertises that requirement only; it confirms no
+    /// acknowledgement, guarantees no delivery and gates no initial registration.
     /// </para>
     /// </remarks>
     /// <param name="request">Registration request containing the worker's role and capabilities.</param>
@@ -285,13 +289,17 @@ public sealed class HiveOrchestratorService(
 
             _dashboardNotifier?.NotifyStateChanged();
 
-            // THE REPLY COMES FROM THE REGISTERED INSTANCE ITSELF.
+            // THE REPLY COMES FROM THE REGISTERED INSTANCE ITSELF: the readiness advertisement is
+            // derived from the SAME instance's own enablement decision, never from a later lookup and
+            // never inferred from capabilities, the model or any version, so the two answers a worker
+            // is told can never disagree with the instance the pool actually published.
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = true,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
                 CompletionReceiptAckEnabled = registered.CompletionReceiptAckEnabled,
+                CompletionReadyRequired = registered.CompletionReceiptAckEnabled,
             });
         }
         catch (InvalidOperationException)
@@ -299,13 +307,15 @@ public sealed class HiveOrchestratorService(
             logger.LogWarning("Registration rejected — duplicate worker ID: {WorkerId}", workerId);
 
             // A REJECTED DUPLICATE ADVERTISES NOTHING: the instance already registered is untouched,
-            // so this reply is DISABLED regardless of what the duplicate asked for.
+            // so this reply is DISABLED — and advertises no readiness requirement — regardless of what
+            // the duplicate asked for.
             return Task.FromResult(new RegisterResponse
             {
                 Accepted = false,
                 OrchestratorVersion = VersionHelper.InformationalVersion,
                 AssignedWorkerId = workerId,
                 CompletionReceiptAckEnabled = false,
+                CompletionReadyRequired = false,
             });
         }
     }
@@ -1918,12 +1928,18 @@ public sealed class HiveOrchestratorService(
             // lock-guarded flag write — no timeout, no retry loop, no lease expiry — and it
             // deliberately does NOT wait for the acknowledgement to be written to the network or
             // acknowledged by the worker.
+            //
+            // IT ENDS THE SHORT PUBLICATION HOLD ONLY. The readiness wait the same release installed
+            // is a SEPARATE, LONGER fact and survives this finally: an enqueue refusal, an isolated
+            // response-write failure and a throwing diagnostic leave it installed, and only a live
+            // accepted Ready clears it.
             if (holdForCompletionPublication)
                 workerPool.ClearCompletionPublicationHold(worker);
         }
 
-        // THE ORDINARY DASHBOARD/DOWNSTREAM NOTIFICATION, AFTER the hold is finished: the
-        // notification path never runs while the instance is still withheld from selection.
+        // THE ORDINARY DASHBOARD/DOWNSTREAM NOTIFICATION, AFTER the SHORT publication hold is
+        // cleared. The longer readiness wait may still be installed at this point — it is cleared
+        // only by an accepted Ready — so this says nothing about selectability.
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {

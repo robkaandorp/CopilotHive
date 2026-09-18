@@ -59,9 +59,9 @@ public sealed class CompletionReceiptAckTests
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE NEW TAGS, AND ONLY THE NEW TAGS: field 4 on both registration messages and field 6 on
-    /// <see cref="OrchestratorMessage"/>. The pre-existing tags are asserted alongside them, so a
-    /// renumbering — not merely a collision — fails here.
+    /// THE NEW TAGS, AND ONLY THE NEW TAGS: field 4 on both registration messages, field 5 on
+    /// <see cref="RegisterResponse"/> and field 6 on <see cref="OrchestratorMessage"/>. The pre-existing
+    /// tags are asserted alongside them, so a renumbering — not merely a collision — fails here.
     /// </summary>
     [Fact]
     public void WireContract_NewFieldsUseTheirAdditiveTagsAndExistingTagsAreUnchanged()
@@ -69,6 +69,19 @@ public sealed class CompletionReceiptAckTests
         Assert.Equal(4, RegisterRequest.RequestCompletionReceiptAckFieldNumber);
         Assert.Equal(4, RegisterResponse.CompletionReceiptAckEnabledFieldNumber);
         Assert.Equal(6, OrchestratorMessage.CompletionReceiptAckFieldNumber);
+
+        // THE READINESS ADVERTISEMENT IS ADDITIVE TOO — a NEW tag on RegisterResponse, and it is
+        // neither a renumbering of field 4 nor a request-side field.
+        Assert.Equal(5, RegisterResponse.CompletionReadyRequiredFieldNumber);
+        Assert.DoesNotContain(
+            RegisterResponse.CompletionReadyRequiredFieldNumber,
+            new[]
+            {
+                RegisterResponse.AcceptedFieldNumber,
+                RegisterResponse.OrchestratorVersionFieldNumber,
+                RegisterResponse.AssignedWorkerIdFieldNumber,
+                RegisterResponse.CompletionReceiptAckEnabledFieldNumber,
+            });
 
         // The pre-existing registration/stream tags must not have moved.
         Assert.Equal(
@@ -169,6 +182,122 @@ public sealed class CompletionReceiptAckTests
         Assert.Equal("0.0.0-legacy", decoded.OrchestratorVersion);
         Assert.Equal("legacy-worker", decoded.AssignedWorkerId);
         Assert.False(decoded.CompletionReceiptAckEnabled);
+
+        // AN OLD ORCHESTRATOR OMITS THE READINESS ADVERTISEMENT TOO, and the omitted field parses as
+        // false — never as an implied requirement this server never stated.
+        Assert.False(decoded.CompletionReadyRequired);
+    }
+
+    /// <summary>
+    /// THE READINESS ADVERTISEMENT DEFAULTS TO FALSE AND ROUND-TRIPS: absent, explicit false and
+    /// explicit true are all carried exactly, so the field is a genuine per-registration answer
+    /// rather than a constant a receiver has to guess.
+    /// </summary>
+    [Fact]
+    public void RegisterResponse_CompletionReadyRequired_DefaultsToFalseAndRoundTrips()
+    {
+        var absent = new RegisterResponse { Accepted = true, AssignedWorkerId = "w" };
+        Assert.False(absent.CompletionReadyRequired);
+        Assert.False(
+            RegisterResponse.Parser.ParseFrom(absent.ToByteArray()).CompletionReadyRequired);
+
+        var falseDecoded = RegisterResponse.Parser.ParseFrom(
+            new RegisterResponse
+            {
+                Accepted = true,
+                CompletionReceiptAckEnabled = false,
+                CompletionReadyRequired = false,
+            }.ToByteArray());
+        Assert.False(falseDecoded.CompletionReadyRequired);
+        Assert.False(falseDecoded.CompletionReceiptAckEnabled);
+
+        var trueDecoded = RegisterResponse.Parser.ParseFrom(
+            new RegisterResponse
+            {
+                Accepted = true,
+                CompletionReceiptAckEnabled = true,
+                CompletionReadyRequired = true,
+            }.ToByteArray());
+        Assert.True(trueDecoded.CompletionReadyRequired);
+        Assert.True(trueDecoded.CompletionReceiptAckEnabled);
+
+        // THE TWO ANSWERS ARE INDEPENDENT FIELDS: the advertisement is not a re-encoding of the
+        // acknowledgement enablement, even though this server derives one from the other.
+        Assert.False(
+            RegisterResponse.Parser.ParseFrom(
+                new RegisterResponse { Accepted = true, CompletionReceiptAckEnabled = true }
+                    .ToByteArray())
+                .CompletionReadyRequired);
+    }
+
+    /// <summary>
+    /// THE ACCEPTED REPLY ADVERTISES READINESS EXACTLY WHEN THE REGISTRATION IT REGISTERED IS
+    /// ACK-ENABLED, for every negotiation cell: the value comes from the RETURNED instance's own
+    /// enablement decision, never from a later lookup and never inferred from the request,
+    /// capabilities, model or version.
+    /// </summary>
+    /// <remarks>
+    /// THE TWO ANSWERS ARE ASSERTED TOGETHER, and against the PUBLISHED instance, so a reply that
+    /// advertised readiness on its own (a field that lies about what will happen) or that disagreed
+    /// with the instance the pool actually holds would fail here.
+    /// </remarks>
+    /// <param name="requested">Whether the registration explicitly requested the acknowledgement.</param>
+    /// <param name="withRecorder">Whether the orchestrator has a completion recorder configured.</param>
+    /// <param name="expected">The expected value of BOTH answers for this negotiation cell.</param>
+    [Theory]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, false)]
+    public async Task Register_AcceptedReply_AdvertisesReadinessExactlyForAnEnabledInstance(
+        bool requested, bool withRecorder, bool expected)
+    {
+        var (service, pool) = CreateService(withRecorder: withRecorder);
+
+        var response = await service.Register(
+            new RegisterRequest { WorkerId = "w-advertised", RequestCompletionReceiptAck = requested },
+            MockContext());
+
+        Assert.True(response.Accepted);
+        Assert.Equal(expected, response.CompletionReceiptAckEnabled);
+        Assert.Equal(expected, response.CompletionReadyRequired);
+
+        var registered = pool.GetWorker("w-advertised");
+        Assert.NotNull(registered);
+        Assert.Equal(expected, registered!.CompletionReceiptAckEnabled);
+        Assert.Equal(registered.CompletionReceiptAckEnabled, response.CompletionReadyRequired);
+    }
+
+    /// <summary>
+    /// A REJECTED DUPLICATE REPLY ADVERTISES NOTHING: the readiness advertisement is false, exactly
+    /// like the acknowledgement enablement, whatever the duplicate asked for — the instance already
+    /// registered is untouched.
+    /// </summary>
+    [Fact]
+    public async Task Register_RejectedDuplicateReply_AdvertisesNoReadinessRequirement()
+    {
+        var (service, pool) = CreateService(withRecorder: true);
+
+        var first = await service.Register(
+            new RegisterRequest { WorkerId = "w-dup-advertised", RequestCompletionReceiptAck = true },
+            MockContext());
+        Assert.True(first.CompletionReadyRequired);
+
+        var original = pool.GetWorker("w-dup-advertised");
+        Assert.NotNull(original);
+
+        var duplicate = await service.Register(
+            new RegisterRequest { WorkerId = "w-dup-advertised", RequestCompletionReceiptAck = true },
+            MockContext());
+
+        Assert.False(duplicate.Accepted);
+        Assert.False(duplicate.CompletionReceiptAckEnabled);
+        Assert.False(
+            duplicate.CompletionReadyRequired,
+            "a rejected reply must never advertise a readiness requirement, whatever the duplicate asked for");
+
+        // The original instance is untouched, so the FIRST reply's advertisement still describes it.
+        Assert.Same(original, pool.GetWorker("w-dup-advertised"));
     }
 
     /// <summary>
@@ -2461,8 +2590,11 @@ public sealed class CompletionReceiptAckTests
         var pool = new OrchestratorSource { Text = StripComments(poolSource) };
 
         // ── (1) THE COMBINED PREDICATE LIVES INSIDE GetIdleWorker's OWN LOCK BODY ──────────────
+        // The predicate is the pool's ONE selectability expression — idle, not publishing and not
+        // awaiting its own accepted Ready — evaluated as a single call so the three facts cannot be
+        // read at three different instants.
         const string combinedPredicate =
-            "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)";
+            "if (IsSelectableIdleNoLock(kvp.Value))";
 
         var selection = pool.Between(
             "public ConnectedWorker? GetIdleWorker()", "public IReadOnlyList<ConnectedWorker> GetAllWorkers()");
@@ -3019,6 +3151,8 @@ public sealed class CompletionReceiptAckTests
         /// <param name="model">The task's assigned model.</param>
         public void AssignTaskTo(ConnectedWorker worker, string taskId, string model)
         {
+            GrantReadiness(worker);
+
             var task = BuildTask(taskId, model);
             Queue.Enqueue(task);
             var dequeued = Queue.TryDequeue(DomainWorkerRole.Unspecified);
@@ -3029,6 +3163,31 @@ public sealed class CompletionReceiptAckTests
             Assert.True(worker.IsBusy);
             Assert.Equal(taskId, worker.CurrentTaskId);
         }
+
+        /// <summary>
+        /// THE READINESS the production delivery boundary requires before an instance may be
+        /// (re-)assigned: an instance whose negotiated completion was released waits for its own
+        /// accepted Ready, and the claim refuses it until then.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// IT IS THE HARNESS's OWN READY, not a state write: the Ready is driven through the REAL
+        /// checked idle (<c>TryMarkIdleForReady</c>) exactly as the production <c>HandleWorkerReady</c>
+        /// does — so a harness assignment after a released negotiated completion takes the same
+        /// route the worker's next Ready would.
+        /// </para>
+        /// <para>
+        /// A WORKER THAT IS NOT WAITING IS UNTOUCHED, so this cannot mask the wait: it is a no-op on
+        /// an instance that is already selectable, which is why the vectors that assert the wait
+        /// itself keep asserting it directly.
+        /// </para>
+        /// </remarks>
+        /// <param name="worker">The instance whose readiness is being established.</param>
+        /// <returns>The worker's own Ready outcome.</returns>
+        public bool GrantReadiness(ConnectedWorker worker) =>
+            Pool.TryGetWorkerSnapshot(worker.Id, out var observed)
+            && ReferenceEquals(observed.Worker, worker)
+            && Pool.TryMarkIdleForReady(observed, queueEntryAbsent: true);
 
         /// <summary>Builds a completion payload with the requested model presence.</summary>
         /// <param name="taskId">The completing task's identifier.</param>

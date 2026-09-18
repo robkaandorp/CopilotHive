@@ -94,6 +94,11 @@ public sealed class ConnectedWorker
     /// A read made outside that lock is an OBSERVATION ONLY and establishes nothing. The setter is
     /// private and the two mutation methods below are the pool's only entry points.
     /// </para>
+    /// <para>
+    /// ENDING THE HOLD IS NOT SELECTABILITY: an instance whose negotiated completion was released may
+    /// still be waiting for its own accepted Ready (<see cref="AwaitingWorkerReady"/>), which is a
+    /// separate fact on a separate interval.
+    /// </para>
     /// </remarks>
     internal bool CompletionPublicationPending { get; private set; }
 
@@ -118,6 +123,32 @@ public sealed class ConnectedWorker
     /// ONLY thing that happens when a publication finishes.
     /// </remarks>
     internal void EndCompletionPublicationHold() => CompletionPublicationPending = false;
+
+    /// <summary>
+    /// THE INSTANCE-LOCAL READINESS WAIT: <c>true</c> from the moment a negotiated completion
+    /// released this instance until its own accepted Ready arrives. While set, the pool never selects
+    /// or claims this instance.
+    /// </summary>
+    /// <remarks>
+    /// It is distinct from <see cref="CompletionPublicationPending"/> (the short enqueue interval) and
+    /// from the assignment fields: ending the hold or resetting to idle leaves it set. It carries no
+    /// task id, deadline or owner. Only <see cref="WorkerPool"/> mutates it, inside its activity lock,
+    /// through the two methods below.
+    /// </remarks>
+    internal bool AwaitingWorkerReady { get; private set; }
+
+    /// <summary>
+    /// Installs the readiness wait. Callers must hold the pool's activity lock; the only caller is the
+    /// checked negotiated completion release's own lock span.
+    /// </summary>
+    internal void BeginAwaitingWorkerReady() => AwaitingWorkerReady = true;
+
+    /// <summary>
+    /// Clears the readiness wait, touching nothing else. Callers must hold the pool's activity lock;
+    /// the only caller is the accepted <see cref="WorkerPool.TryMarkIdleForReady"/> transition, so no
+    /// timeout, removal, heartbeat or idle reset can end the wait.
+    /// </summary>
+    internal void EndAwaitingWorkerReady() => AwaitingWorkerReady = false;
 
     /// <summary>
     /// THE EXCLUSIVE, ONE-WAY WORKSTREAM ATTACHMENT CLAIM of this instance. <c>0</c> = unclaimed,
