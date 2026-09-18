@@ -4322,9 +4322,24 @@ public sealed class CompletionReceiptAckTests
             var message = formatter(state, exception);
 
             List<TaskCompletionSource> matched = [];
+            var faulted = false;
             lock (_messages)
             {
                 _messages.Add(message);
+
+                // ARMED FAULTS ARE COUNTED BEFORE any waiter is released: a test that awaits the
+                // diagnostic's own signal must never observe a counter that has not yet been
+                // incremented. The THROW itself still happens after the waiters are released, so
+                // the production code really emitted the diagnostic and the FAULT is what its
+                // guard must survive.
+                foreach (var fragment in _armed.Keys)
+                {
+                    if (!message.Contains(fragment, StringComparison.Ordinal))
+                        continue;
+
+                    Interlocked.Increment(ref _throwCount);
+                    faulted = true;
+                }
 
                 for (var i = _waiters.Count - 1; i >= 0; i--)
                 {
@@ -4339,16 +4354,8 @@ public sealed class CompletionReceiptAckTests
             foreach (var signal in matched)
                 signal.TrySetResult();
 
-            // ARMED FAULTS FIRE AFTER the message was recorded and its waiters were released, so the
-            // production code really emitted the diagnostic and the FAULT is what its guard must survive.
-            foreach (var fragment in _armed.Keys)
-            {
-                if (!message.Contains(fragment, StringComparison.Ordinal))
-                    continue;
-
-                Interlocked.Increment(ref _throwCount);
+            if (faulted)
                 throw new InvalidOperationException("the logger itself threw SENTINEL");
-            }
         }
     }
 

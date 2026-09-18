@@ -5795,7 +5795,7 @@ public sealed class CompletionTransportOwnershipTests
         private readonly List<(string Fragment, TaskCompletionSource Signal)> _waiters = [];
 
         /// <summary>The message fragment whose emission must throw — armed by the diagnostic vector.</summary>
-        private string? _throwFragment;
+        private volatile string? _throwFragment;
 
         private int _throwCount;
 
@@ -5842,9 +5842,22 @@ public sealed class CompletionTransportOwnershipTests
             var message = formatter(state, exception);
 
             List<TaskCompletionSource> matched = [];
+            var faulted = false;
             lock (_messages)
             {
                 _messages.Add(message);
+
+                // THE ARMED DIAGNOSTIC FAULT IS COUNTED BEFORE any waiter is released: a test that
+                // awaits the diagnostic's own signal must never be able to run its continuation and
+                // observe a counter that has not yet been incremented. The THROW itself still happens
+                // after the waiters are released, so the production code under test really emitted
+                // the warning and the FAULT is what its guard has to survive.
+                var armed = _throwFragment;
+                if (armed is not null && message.Contains(armed, StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref _throwCount);
+                    faulted = true;
+                }
 
                 for (var i = _waiters.Count - 1; i >= 0; i--)
                 {
@@ -5859,15 +5872,8 @@ public sealed class CompletionTransportOwnershipTests
             foreach (var signal in matched)
                 signal.TrySetResult();
 
-            // THE ARMED DIAGNOSTIC FAULT fires AFTER the message was recorded and its waiters were
-            // released, so the production code under test really emitted the warning and the FAULT is
-            // what its guard has to survive.
-            var armed = _throwFragment;
-            if (armed is not null && message.Contains(armed, StringComparison.Ordinal))
-            {
-                Interlocked.Increment(ref _throwCount);
+            if (faulted)
                 throw LoggerSentinel;
-            }
         }
     }
 
