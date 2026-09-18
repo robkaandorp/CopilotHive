@@ -872,7 +872,12 @@ public sealed class HiveOrchestratorService(
             }
 
             var taskRoleName = task.Role.ToRoleName();
-            logger.LogInformation("Worker {WorkerId} assigned role {Role} for task {TaskId}",
+
+            // THE POST-CLAIM SUCCESS LINE IS GUARDED. The claim above is already published, so a
+            // throwing logger (or log provider) must not be able to interrupt the accepted assignment
+            // or skip the dashboard notification below.
+            LogInformationSafely(
+                "Worker {WorkerId} assigned role {Role} for task {TaskId}",
                 worker.Id, taskRoleName, task.TaskId);
 
             // THE ACCEPTED CLAIM IS WHAT THE DASHBOARD IS TOLD ABOUT — EXACTLY ONCE, and OUTSIDE any
@@ -907,7 +912,11 @@ public sealed class HiveOrchestratorService(
             // explicitly before publication. Post-claim cancellation never requeues.
             cancellationToken.ThrowIfCancellationRequested();
 
-            logger.LogInformation("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
+            // GUARDED LIKE THE OTHER TWO POST-CLAIM SUCCESS LINES: the caller-token observation above
+            // stays the ONLY authority on the cancellation outcome, and a logger-thrown
+            // OperationCanceledException (default or foreign token) can never be reinterpreted as
+            // this caller's cancellation.
+            LogInformationSafely("Assigning task {TaskId} to worker {WorkerId}", task.TaskId, worker.Id);
 
             // THE READY-DRIVEN RECORDED PUBLICATION. The dequeue, the agents.md update and the
             // activation/busy-marking above keep their existing order; ONLY the final raw channel
@@ -931,8 +940,11 @@ public sealed class HiveOrchestratorService(
                 await _assignmentPublisher.PublishAsync(worker, task, cancellationToken);
 
                 // A COMPLETED CHANNEL WRITE IS NOT PROOF OF RECEIPT — the worker may never consume
-                // it — so this line deliberately records intent, not delivery.
-                logger.LogInformation(
+                // it — so this line deliberately records intent, not delivery. The logger call ALONE
+                // is guarded: PublishAsync above has already returned, so its failure must not turn
+                // the completed publication into a failure (and must not emit this line when
+                // publication itself failed).
+                LogInformationSafely(
                     "Assignment published to worker {WorkerId} for task {TaskId}", worker.Id, task.TaskId);
             }
             catch (WorkerAssignmentRecordingException ex)
@@ -1162,6 +1174,41 @@ public sealed class HiveOrchestratorService(
         return detail.Length <= MaxFailureDetailLength
             ? detail
             : detail[..MaxFailureDetailLength] + "…(truncated)";
+    }
+
+    /// <summary>
+    /// THE GUARDED POST-CLAIM SUCCESS EMISSION: one <see cref="LogLevel.Information"/> line emitted
+    /// through a no-throw guard, so a logger (or log provider) that throws — including one that
+    /// throws an <see cref="OperationCanceledException"/> carrying the default or a foreign token —
+    /// can never interrupt an already-accepted assignment, skip its dashboard notification, skip the
+    /// publisher call, or turn a COMPLETED publication into a failure.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT GUARDS THE LOGGING CALL AND NOTHING ELSE. Every caller keeps its operational statements —
+    /// the claim, the notification, the guidance step, the caller-token observation, the publisher
+    /// null check and <c>PublishAsync</c> — OUTSIDE this guard, so an operational exception is never
+    /// swallowed merely because it happens near a log.
+    /// </para>
+    /// <para>
+    /// THE SWALLOW IS DELIBERATE AND TOTAL, <see cref="OperationCanceledException"/> INCLUDED: the
+    /// level, wording, argument values and order are unchanged from the unguarded emission, and a
+    /// logging fault must never be reinterpreted as caller cancellation — the caller token
+    /// observation in the Ready path stays the only authority on that outcome.
+    /// </para>
+    /// </remarks>
+    /// <param name="message">The unchanged message template of the guarded emission.</param>
+    /// <param name="args">The unchanged, in-order arguments of the guarded emission.</param>
+    private void LogInformationSafely(string message, params object?[] args)
+    {
+        try
+        {
+            logger.LogInformation(message, args);
+        }
+        catch
+        {
+            // SILENT swallow — a logging fault must never replace the accepted assignment's outcome.
+        }
     }
 
     /// <summary>
