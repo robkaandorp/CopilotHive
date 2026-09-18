@@ -424,6 +424,36 @@ public sealed class ReadyClaimAtomicityTests
         Assert.Empty(f.Publisher.Calls);
     }
 
+    /// <summary>
+    /// THE CANCELLATION STAYS PRIMARY ON ITS OWN PATH: a throwing enqueue hook cannot replace it,
+    /// because the insert already happened and a second insert would duplicate the task. The task is
+    /// back exactly once and the ORIGINAL cancellation is what escapes.
+    /// </summary>
+    [Fact]
+    public async Task Ready_CancelledBeforeTheClaim_EnqueueHookThrowDoesNotReplaceTheCancellation()
+    {
+        var f = Fixture.Create();
+        var task = BuildTask("task-cancelled-hook-throws");
+        f.Queue.Enqueue(task);
+
+        // INSTALLED AFTER THE SETUP ENQUEUE, so only the requeue can invoke it.
+        f.Queue.OnEnqueue = _ => throw new InvalidOperationException("the enqueue hook threw");
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => InvokeReadyAsync(f.Service, f.Worker, cts.Token));
+
+        Assert.Equal(cts.Token, thrown.CancellationToken);
+
+        // THE INSERT ALREADY HAPPENED — exactly once, and the same instance.
+        Assert.Same(task, f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.TryDequeueAny());
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Equal(0, f.NotifyCount);
+    }
+
     // ── the requeue hook and the guidance ─────────────────────────────────────
     /// <summary>
     /// THE REQUEUE INSERT HAPPENS BEFORE ITS HOOK, SO A THROWING HOOK PROPAGATES AFTER THE ONE AND

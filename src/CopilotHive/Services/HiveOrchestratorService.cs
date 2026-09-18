@@ -826,7 +826,24 @@ public sealed class HiveOrchestratorService(
             // role is written — this delivery never acquired ownership.
             if (cancellationToken.IsCancellationRequested)
             {
-                taskQueue.Enqueue(task);
+                // THE ONE INSERT IS ALREADY COMPLETE WHEN A HOOK FAULTS: Enqueue inserts BEFORE it
+                // invokes its hook, so a hook fault is post-insert and the task really is back in
+                // the queue. There is deliberately NO retry — a second insert would duplicate it.
+                try
+                {
+                    taskQueue.Enqueue(task);
+                }
+                catch (OperationCanceledException)
+                {
+                    // THE CAUGHT CANCELLATION IS RETHROWN UNCHANGED.
+                    throw;
+                }
+                catch (Exception)
+                {
+                    // A non-cancellation hook fault is CONTAINED: the caller's cancellation is this
+                    // path's primary outcome, and neither a hook nor a diagnostic may replace it.
+                }
+
                 throw new OperationCanceledException(cancellationToken);
             }
 
