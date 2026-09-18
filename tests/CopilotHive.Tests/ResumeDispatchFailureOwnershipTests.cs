@@ -32,8 +32,9 @@ namespace CopilotHive.Tests;
 /// <see cref="WorkerAssignmentContextStore"/> over an in-memory SQLite database (the shared
 /// <see cref="EagerAssignmentRecording"/> wiring). That claim covers the post-record channel-fault
 /// vector, the throw-after-real-publish vector, the cross-pipeline delivery vector, the branchless
-/// variant and the throwing-logger vector: for each of them the delivered assignment is an
-/// observable ROW plus an observable CHANNEL message, never a "send happened" flag.
+/// variant and the throwing-logger vector: each observes the REAL assignment row plus either the
+/// ACTUAL channel Assignment (successful-write vectors) or the ACTUAL post-record channel-write
+/// failure (completed-channel vectors), never a fake "send happened" flag.
 /// </para>
 /// <para>
 /// THE OTHER TWO ARE DELIBERATE STAGE-SPECIFIC VECTORS, and they are scoped honestly rather than
