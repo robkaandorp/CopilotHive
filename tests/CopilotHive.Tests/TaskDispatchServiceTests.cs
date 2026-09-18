@@ -2819,10 +2819,10 @@ public sealed class TaskDispatchServiceTests
     // ── DispatchToRole: the delegate-to-publisher boundary and the post-record fault ──
 
     /// <summary>
-    /// THE EXACT DELEGATION/COMPLETION BOUNDARY: the REAL <see cref="GrpcWorkerGateway"/> forwards the EXACT
-    /// pinned <see cref="ConnectedWorker"/> instance, the EXACT delivered <see cref="WorkTask"/>
-    /// instance and the caller's token to <see cref="IWorkerAssignmentPublisher.PublishAsync"/> — once
-    /// — and its own task stays INCOMPLETE until that call returns.
+    /// THE EXISTING ID-OVERLOAD DELEGATION/COMPLETION BOUNDARY: the REAL
+    /// <see cref="GrpcWorkerGateway"/> resolves the ID once, then forwards the exact resolved worker,
+    /// delivered task and caller token to <see cref="IWorkerAssignmentPublisher.PublishAsync"/> —
+    /// once — and its own task stays INCOMPLETE until that call returns.
     /// </summary>
     /// <remarks>
     /// THE BOUNDARY IS DRIVEN DIRECTLY, so the assertions are about the gateway's delegation contract
@@ -2898,10 +2898,110 @@ public sealed class TaskDispatchServiceTests
     }
 
     /// <summary>
+    /// THE REQUIRED REFERENCE OVERLOAD: even with a different same-ID instance registered in the
+    /// pool, the supplied worker/task/token are forwarded exactly and the gateway awaits the
+    /// publisher's completion.
+    /// </summary>
+    [Fact]
+    public async Task SendTaskAsync_ReferenceOverload_ForwardsSuppliedInstanceTaskTokenAndAwaitsCompletion()
+    {
+        var workerPool = new WorkerPool();
+        var replacement = workerPool.RegisterWorker("worker-reference-spy", []);
+        var supplied = new ConnectedWorker
+        {
+            Id = replacement.Id,
+            Role = WorkerRole.Reviewer,
+            Capabilities = [],
+        };
+        var task = new WorkTask
+        {
+            TaskId = "task-reference-spy",
+            GoalId = "goal-reference-spy",
+            GoalDescription = "reference spy fixture",
+            Prompt = "do the work",
+            Role = WorkerRole.Coder,
+            Model = "reference-model",
+            Repositories = [],
+        };
+        var spy = new GatewayPublishSpy();
+        var gateway = new GrpcWorkerGateway(workerPool, spy);
+        using var cts = new CancellationTokenSource();
+
+        var send = gateway.SendTaskAsync(supplied, task, cts.Token);
+        try
+        {
+            await spy.Entered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            Assert.Same(supplied, spy.ReceivedWorker);
+            Assert.NotSame(replacement, spy.ReceivedWorker);
+            Assert.Same(task, spy.ReceivedTask);
+            Assert.Equal(cts.Token, spy.ReceivedCancellationToken);
+            Assert.Equal(1, spy.InvocationCount);
+            Assert.False(send.IsCompleted);
+
+            spy.Release();
+            Assert.Equal(
+                WorkerTaskSendOutcome.Published,
+                await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken));
+            Assert.Equal(1, spy.InvocationCount);
+        }
+        finally
+        {
+            spy.Release();
+            try
+            {
+                await send.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
+            }
+            catch
+            {
+                // The assertion path owns any primary failure; cleanup only settles the operation.
+            }
+        }
+    }
+
+    /// <summary>
+    /// The reference guidance overload targets only the supplied instance, never a same-ID pool
+    /// replacement. Its returned task also represents the real channel write: a closed supplied
+    /// channel faults the awaited operation rather than being detached.
+    /// </summary>
+    [Fact]
+    public async Task SendAgentsUpdateAsync_ReferenceOverload_TargetsSuppliedInstanceAndAwaitsWrite()
+    {
+        var workerPool = new WorkerPool();
+        var replacement = workerPool.RegisterWorker("worker-reference-guidance", []);
+        var supplied = new ConnectedWorker
+        {
+            Id = replacement.Id,
+            Role = WorkerRole.Coder,
+            Capabilities = [],
+        };
+        var gateway = new GrpcWorkerGateway(workerPool);
+
+        await gateway.SendAgentsUpdateAsync(
+            supplied, "coder", "reference guidance", TestContext.Current.CancellationToken);
+
+        Assert.True(supplied.MessageChannel.Reader.TryRead(out var update));
+        Assert.Equal("coder", update.UpdateAgents.Role);
+        Assert.Equal("reference guidance", update.UpdateAgents.AgentsMdContent);
+        Assert.False(replacement.MessageChannel.Reader.TryRead(out _));
+
+        var closedSupplied = new ConnectedWorker
+        {
+            Id = replacement.Id,
+            Role = WorkerRole.Coder,
+            Capabilities = [],
+        };
+        Assert.True(closedSupplied.MessageChannel.Writer.TryComplete());
+        await Assert.ThrowsAsync<System.Threading.Channels.ChannelClosedException>(
+            () => gateway.SendAgentsUpdateAsync(
+                closedSupplied, "coder", "must be awaited", TestContext.Current.CancellationToken));
+        Assert.False(replacement.MessageChannel.Reader.TryRead(out _));
+    }
+
+    /// <summary>
     /// THE POST-RECORD FAULT AT THE GATEWAY BOUNDARY, over the REAL
     /// <see cref="WorkerAssignmentPublisher"/> and the REAL store: the completed channel makes the
     /// publisher's own post-record write throw, and the REAL
-    /// <see cref="GrpcWorkerGateway.SendTaskAsync"/> propagates that EXACT fault type instead of
+    /// <c>GrpcWorkerGateway.SendTaskAsync</c> propagates that EXACT fault type instead of
     /// reporting <see cref="WorkerTaskSendOutcome.Blocked"/> — while the row the publisher recorded
     /// stays.
     /// </summary>

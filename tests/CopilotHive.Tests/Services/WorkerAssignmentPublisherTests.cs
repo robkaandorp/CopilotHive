@@ -2062,7 +2062,7 @@ public sealed class WorkerAssignmentReadyCancellationTests : IDisposable
     }
 }
 /// <summary>
-/// THE EAGER SEND BOUNDARY: <see cref="GrpcWorkerGateway.SendTaskAsync"/> delegates its whole
+/// THE EAGER SEND BOUNDARY: <c>GrpcWorkerGateway.SendTaskAsync</c> delegates its whole
 /// publication to the existing publisher and REPORTS the outcome — <c>Published</c> only after the
 /// publisher's channel write completed, and <c>Blocked</c> for a
 /// <see cref="WorkerAssignmentRecordingException"/> instead of throwing it. The gateway resolves the

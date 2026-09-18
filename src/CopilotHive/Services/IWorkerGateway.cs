@@ -7,6 +7,43 @@ namespace CopilotHive.Services;
 public interface IWorkerGateway
 {
     /// <summary>
+    /// THE CHECKED CLAIM, forwarded verbatim to the pool primitive
+    /// <see cref="WorkerPool.TryClaimAndActivate"/>: the ACTUAL dequeued task is activated in
+    /// <paramref name="queue"/> and the SUPPLIED instance is published busy with it — or NOTHING is
+    /// mutated at all.
+    /// </summary>
+    /// <remarks>
+    /// <c>false</c> means precisely "this caller did not win" and is a CONFIRMED no-mutation
+    /// refusal. A THROW is a different thing entirely: it proves nothing about what was mutated, so
+    /// a caller must neither requeue nor claim the activation happened.
+    /// </remarks>
+    /// <param name="expected">The exact instance the caller selected — the ONLY instance mutated.</param>
+    /// <param name="task">The ACTUAL dequeued task this claim is for.</param>
+    /// <param name="queue">The concrete queue the task was dequeued from.</param>
+    /// <returns><c>true</c> when the claim was taken; <c>false</c> when it was refused.</returns>
+    bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue);
+
+    /// <summary>
+    /// Sends a task assignment to the EXACT supplied worker instance, reporting whether the
+    /// assignment was actually published or refused (blocked) by the assignment-recording contract.
+    /// </summary>
+    /// <remarks>
+    /// THE SUPPLIED INSTANCE IS THE ONLY TARGET: no ID is resolved to redirect the assignment to a
+    /// replacement. Outcome semantics are identical to the ID-based overload.
+    /// </remarks>
+    /// <param name="worker">The PINNED worker instance the assignment belongs to.</param>
+    /// <param name="task">The ACTUAL delivered work task.</param>
+    /// <param name="ct">The caller's cancellation token.</param>
+    /// <returns>The publication outcome; see the ID-based overload.</returns>
+    Task<WorkerTaskSendOutcome> SendTaskAsync(ConnectedWorker worker, WorkTask task, CancellationToken ct = default);
+
+    /// <summary>
+    /// Sends an agents.md update to the EXACT supplied worker instance — its own channel, never a
+    /// replacement resolved by ID.
+    /// </summary>
+    Task SendAgentsUpdateAsync(ConnectedWorker worker, string role, string content, CancellationToken ct = default);
+
+    /// <summary>
     /// Sends a task assignment to the specified worker, reporting whether the assignment was
     /// actually published or refused (blocked) by the assignment-recording contract.
     /// </summary>
@@ -39,7 +76,8 @@ public interface IWorkerGateway
 }
 
 /// <summary>
-/// The outcome of <see cref="IWorkerGateway.SendTaskAsync"/>.
+/// The outcome of <see cref="IWorkerGateway.SendTaskAsync(ConnectedWorker, WorkTask, CancellationToken)"/>
+/// and its ID-based overload.
 /// </summary>
 public enum WorkerTaskSendOutcome
 {

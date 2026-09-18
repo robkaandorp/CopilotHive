@@ -145,6 +145,26 @@ internal sealed class DispatcherMaintenance
         LastAgentsSync = DateTime.UtcNow;
     }
 
+    /// <summary>
+    /// Sends the role's AGENTS.md to the EXACT supplied worker instance. Best-effort for an
+    /// ORDINARY failure; the caller's OWN cancellation is propagated UNCHANGED.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE REFERENCE OVERLOAD IS USED DELIBERATELY: the guidance goes to the instance the caller
+    /// selected, never to a replacement an ID lookup might resolve.
+    /// </para>
+    /// <para>
+    /// THE PROPAGATION CONTRACT, which the eager dispatch's post-claim guidance step relies on:
+    /// the ONLY exception that can leave the send below is the CALLER'S OWN
+    /// <see cref="OperationCanceledException"/> — the EXACT instance the gateway raised, so its
+    /// identity survives end-to-end instead of being replaced by a later recheck. Every other
+    /// outcome is contained here, THE DIAGNOSTIC INCLUDED: the warning is emitted through a
+    /// no-throw guard, so a logger that itself throws (an
+    /// <see cref="OperationCanceledException"/> carrying the now-cancelled caller token above all)
+    /// can never escape and be mistaken for the caller's cancellation.
+    /// </para>
+    /// </remarks>
     public async Task SendAgentsMdToWorkerAsync(ConnectedWorker worker, WorkerRole role, CancellationToken ct)
     {
         if (_agentsManager is null) return;
@@ -154,12 +174,38 @@ internal sealed class DispatcherMaintenance
         var roleName = role.ToRoleName();
         try
         {
-            await _workerGateway.SendAgentsUpdateAsync(worker.Id, roleName, content, ct);
+            await _workerGateway.SendAgentsUpdateAsync(worker, roleName, content, ct);
+        }
+        catch (OperationCanceledException cancellation)
+            when (ct.IsCancellationRequested && cancellation.CancellationToken == ct)
+        {
+            // THE CALLER'S OWN CANCELLATION, raised by the send itself: the EXACT caught instance
+            // propagates. No diagnostic is emitted for it — a diagnostic here could only replace it.
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to send AGENTS.md to worker {WorkerId} for role {Role}",
-                worker.Id, roleName);
+            // ORDINARY FAILURE — best-effort, and the emission is GUARDED so a throwing logger can
+            // neither escape nor supply a cancellation the caller never made.
+            LogSafely(() => _logger.LogWarning(ex, "Failed to send AGENTS.md to worker {WorkerId} for role {Role}",
+                worker.Id, roleName));
+        }
+    }
+
+    /// <summary>
+    /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never
+    /// replace the guarded operation's own outcome.
+    /// </summary>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never become the reported outcome.
         }
     }
 

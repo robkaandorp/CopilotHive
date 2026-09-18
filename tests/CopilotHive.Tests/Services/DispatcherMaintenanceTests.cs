@@ -597,6 +597,60 @@ public sealed class DispatcherMaintenanceTests
     }
 
     [Fact]
+    public async Task SendAgentsMdToWorkerAsync_UsesAndAwaitsReferenceOverload_NotPoisonIdOverload()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dispatcher-maintenance-agents-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var gateway = new PoisonIdGuidanceGateway();
+        Task send = Task.CompletedTask;
+        try
+        {
+            var agents = new AgentsManager(root);
+            agents.UpdateAgentsMd(WorkerRole.Coder, "# exact reference guidance");
+            var maintenance = new DispatcherMaintenance(
+                new GoalPipelineManager(), new GoalManager(), new TaskQueue(), gateway,
+                brain: null, agentsManager: agents, configRepo: null,
+                new ConcurrentQueue<string>(), NullLogger.Instance);
+            var worker = new ConnectedWorker
+            {
+                Id = "worker-poison-id",
+                Role = WorkerRole.Coder,
+                Capabilities = [],
+            };
+            using var cts = new CancellationTokenSource();
+
+            send = maintenance.SendAgentsMdToWorkerAsync(worker, WorkerRole.Coder, cts.Token);
+            await gateway.ReferenceEntered.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, gateway.IdCalls);
+            Assert.Equal(1, gateway.ReferenceCalls);
+            Assert.Same(worker, gateway.Worker);
+            Assert.Equal("coder", gateway.Role);
+            Assert.Equal("# exact reference guidance", gateway.Content);
+            Assert.Equal(cts.Token, gateway.Token);
+            Assert.False(send.IsCompleted, "maintenance must await the reference guidance send");
+
+            gateway.Release();
+            await send.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            gateway.Release();
+            try
+            {
+                await send.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
+            }
+            catch
+            {
+                // The assertion path owns the primary failure; cleanup only settles the operation.
+            }
+
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task RestoreActivePipelinesAsync_ActivePipelineAlreadyInProgress_DoesNotRewriteStatus()
     {
         using var db = CopilotHiveDbContext.CreateInMemory();
@@ -637,6 +691,56 @@ public sealed class DispatcherMaintenanceTests
                 It.IsAny<GoalUpdateMetadata?>(),
                 It.IsAny<CancellationToken>()),
             Times.Never);
+    }
+
+    private sealed class PoisonIdGuidanceGateway : IWorkerGateway
+    {
+        private readonly TaskCompletionSource _entered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task ReferenceEntered => _entered.Task;
+        public int IdCalls { get; private set; }
+        public int ReferenceCalls { get; private set; }
+        public ConnectedWorker? Worker { get; private set; }
+        public string? Role { get; private set; }
+        public string? Content { get; private set; }
+        public CancellationToken Token { get; private set; }
+        public void Release() => _release.TrySetResult();
+
+        public async Task SendAgentsUpdateAsync(
+            ConnectedWorker worker, string role, string content, CancellationToken ct = default)
+        {
+            ReferenceCalls++;
+            Worker = worker;
+            Role = role;
+            Content = content;
+            Token = ct;
+            _entered.TrySetResult();
+            await _release.Task;
+        }
+
+        public Task SendAgentsUpdateAsync(
+            string workerId, string role, string content, CancellationToken ct = default)
+        {
+            IdCalls++;
+            throw new InvalidOperationException("poison ID guidance overload was called");
+        }
+
+        public bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue) => false;
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(
+            ConnectedWorker worker, WorkTask task, CancellationToken ct = default) =>
+            Task.FromResult(WorkerTaskSendOutcome.Blocked);
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(
+            string workerId, WorkTask task, CancellationToken ct = default) =>
+            Task.FromResult(WorkerTaskSendOutcome.Blocked);
+        public Task SendCancelAsync(
+            string workerId, string taskId, string reason, CancellationToken ct = default) =>
+            Task.CompletedTask;
+        public ConnectedWorker? GetIdleWorker() => null;
+        public IReadOnlyList<ConnectedWorker> GetAllWorkers() => [];
+        public void MarkBusy(string workerId, string taskId) { }
     }
 }
 

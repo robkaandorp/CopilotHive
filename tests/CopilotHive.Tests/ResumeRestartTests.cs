@@ -998,7 +998,32 @@ public sealed class ResumeRestartGateTests
 
         public List<WorkTask> SentTasks { get; } = [];
 
+
+        /// <summary>
+        /// THE CHECKED CLAIM, mirroring the pool primitive's shape checks: a foreign instance and a
+        /// worker that is not idle with a null task are REFUSED. Never an unconditional success.
+        /// </summary>
+        public bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue)
+        {
+            if (!ReferenceEquals(expected, _worker) || expected.IsBusy || expected.CurrentTaskId is not null)
+                return false;
+
+            queue.Activate(task, expected.Id);
+            expected.IsBusy = true;
+            expected.CurrentTaskId = task.TaskId;
+            expected.CurrentTaskStartedAt = DateTime.UtcNow;
+            expected.Role = task.Role;
+            expected.CurrentModel = task.Model;
+            return true;
+        }
+
         public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+        {
+            SentTasks.Add(task);
+            return Task.FromResult(WorkerTaskSendOutcome.Published);
+        }
+
+        public Task<WorkerTaskSendOutcome> SendTaskAsync(ConnectedWorker worker, WorkTask task, CancellationToken ct = default)
         {
             SentTasks.Add(task);
             return Task.FromResult(WorkerTaskSendOutcome.Published);
@@ -1008,6 +1033,9 @@ public sealed class ResumeRestartGateTests
             Task.CompletedTask;
 
         public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task SendAgentsUpdateAsync(ConnectedWorker worker, string role, string content, CancellationToken ct = default) =>
             Task.CompletedTask;
 
         public ConnectedWorker? GetIdleWorker() => _worker;

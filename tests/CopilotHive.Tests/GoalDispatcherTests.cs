@@ -5152,10 +5152,33 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
         Capabilities = [],
     };
 
-    /// <summary>True once <see cref="SendTaskAsync"/> has been invoked.</summary>
+    /// <summary>True once a send has been invoked.</summary>
     public bool SendAttempted { get; private set; }
 
+    /// <summary>
+    /// THE CHECKED CLAIM, mirroring the pool primitive's shape checks: a foreign instance and a
+    /// worker that is not idle with a null task are REFUSED — never an unconditional success.
+    /// </summary>
+    public bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue)
+    {
+        if (!ReferenceEquals(expected, _worker) || expected.IsBusy || expected.CurrentTaskId is not null)
+            return false;
+
+        queue.Activate(task, expected.Id);
+        expected.IsBusy = true;
+        expected.CurrentTaskId = task.TaskId;
+        expected.Role = task.Role;
+        expected.CurrentModel = task.Model;
+        return true;
+    }
+
     public Task<WorkerTaskSendOutcome> SendTaskAsync(string workerId, WorkTask task, CancellationToken ct = default)
+    {
+        SendAttempted = true;
+        throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");
+    }
+
+    public Task<WorkerTaskSendOutcome> SendTaskAsync(ConnectedWorker worker, WorkTask task, CancellationToken ct = default)
     {
         SendAttempted = true;
         throw new InvalidOperationException("Simulated worker send failure after SetActiveTask.");
@@ -5165,6 +5188,9 @@ file sealed class ThrowingSendWorkerGateway : IWorkerGateway
         Task.CompletedTask;
 
     public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task SendAgentsUpdateAsync(ConnectedWorker worker, string role, string content, CancellationToken ct = default) =>
         Task.CompletedTask;
 
     public ConnectedWorker? GetIdleWorker() => _worker;

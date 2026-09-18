@@ -8,8 +8,8 @@ namespace CopilotHive.Services;
 /// gRPC implementation of <see cref="IWorkerGateway"/>. Converts domain types to
 /// protobuf messages and writes them to the worker's gRPC message channel.
 /// <para>
-/// THE TASK DELIVERY IS DELEGATED, NOT WRITTEN HERE. <see cref="SendTaskAsync"/> resolves the
-/// worker and then hands the whole publication to the EXISTING
+/// THE TASK DELIVERY IS DELEGATED, NOT WRITTEN HERE. <c>SendTaskAsync</c> hands the whole
+/// publication to the EXISTING
 /// <see cref="IWorkerAssignmentPublisher"/> — the single production path that records the
 /// delivered assignment's context and only then writes the same
 /// <see cref="OrchestratorMessage.Assignment"/> to the pinned worker's channel. There is no raw
@@ -26,7 +26,7 @@ public sealed class GrpcWorkerGateway : IWorkerGateway
     /// <summary>
     /// THE MANDATORY PRODUCTION RECORDER, optional in the constructor signature only so the many
     /// existing <c>new GrpcWorkerGateway(new WorkerPool())</c> fixtures keep compiling. It is never
-    /// a fall-back-to-raw-write switch: when it is absent <see cref="SendTaskAsync"/> FAILS CLOSED
+    /// a fall-back-to-raw-write switch: when it is absent <c>SendTaskAsync</c> FAILS CLOSED
     /// with <see cref="WorkerTaskSendOutcome.Blocked"/>.
     /// </summary>
     private readonly IWorkerAssignmentPublisher? _publisher;
@@ -53,18 +53,40 @@ public sealed class GrpcWorkerGateway : IWorkerGateway
 
     /// <inheritdoc/>
     /// <remarks>
-    /// THE WORKER RESOLUTION IS AN EXCEPTION PATH and happens exactly ONCE, here — a missing worker
-    /// is never reported as <see cref="WorkerTaskSendOutcome.Blocked"/>. From there the ONLY
-    /// outcome that yields <see cref="WorkerTaskSendOutcome.Blocked"/> is a
-    /// <see cref="WorkerAssignmentRecordingException"/>: a missing publisher or any recording
-    /// refusal. The caller's own cancellation (<see cref="OperationCanceledException"/>) and every
-    /// post-record mapping or channel-write failure propagate UNCHANGED.
+    /// A DIRECT FORWARD to the EXISTING pool primitive, using the CALLER'S OWN queue instance: this
+    /// gateway adds no reservation state, no probe and no second claim of its own.
     /// </remarks>
-    public async Task<WorkerTaskSendOutcome> SendTaskAsync(
+    public bool TryClaimAndActivate(ConnectedWorker expected, WorkTask task, TaskQueue queue) =>
+        _workerPool.TryClaimAndActivate(expected, task, queue);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// THE ID RESOLUTION IS AN EXCEPTION PATH and happens exactly ONCE, here — a missing worker is
+    /// never reported as <see cref="WorkerTaskSendOutcome.Blocked"/>. The resolved instance is then
+    /// handed to the REFERENCE-TAKING overload, which owns the whole recorded publication; the
+    /// delegation is never the other way round.
+    /// </remarks>
+    public Task<WorkerTaskSendOutcome> SendTaskAsync(
         string workerId, WorkTask task, CancellationToken ct = default)
     {
         var worker = _workerPool.GetWorker(workerId)
             ?? throw new InvalidOperationException($"Worker '{workerId}' not found.");
+
+        return SendTaskAsync(worker, task, ct);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// THE ASSIGNMENT GOES TO THE SUPPLIED INSTANCE'S OWN CHANNEL — no ID is resolved to redirect it
+    /// to a replacement. The ONLY outcome that yields <see cref="WorkerTaskSendOutcome.Blocked"/> is
+    /// a <see cref="WorkerAssignmentRecordingException"/>: a missing publisher or any recording
+    /// refusal. The caller's own cancellation (<see cref="OperationCanceledException"/>) and every
+    /// post-record mapping or channel-write failure propagate UNCHANGED.
+    /// </remarks>
+    public async Task<WorkerTaskSendOutcome> SendTaskAsync(
+        ConnectedWorker worker, WorkTask task, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
 
         // THE RECORDED PUBLICATION — the whole send is delegated. The publisher performs the very
         // same channel write this gateway used to perform itself, but only after the assignment's
@@ -162,10 +184,26 @@ public sealed class GrpcWorkerGateway : IWorkerGateway
     }
 
     /// <inheritdoc/>
-    public async Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default)
+    /// <remarks>
+    /// The ID is resolved ONCE and the resolved instance is handed to the REFERENCE-TAKING overload.
+    /// </remarks>
+    public Task SendAgentsUpdateAsync(string workerId, string role, string content, CancellationToken ct = default)
     {
         var worker = _workerPool.GetWorker(workerId)
             ?? throw new InvalidOperationException($"Worker '{workerId}' not found.");
+
+        return SendAgentsUpdateAsync(worker, role, content, ct);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// WRITES THE SUPPLIED INSTANCE'S OWN CHANNEL — no ID lookup, so a same-id replacement can never
+    /// receive this guidance in the pinned instance's place.
+    /// </remarks>
+    public async Task SendAgentsUpdateAsync(
+        ConnectedWorker worker, string role, string content, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
 
         await worker.MessageChannel.Writer.WriteAsync(
             new OrchestratorMessage
