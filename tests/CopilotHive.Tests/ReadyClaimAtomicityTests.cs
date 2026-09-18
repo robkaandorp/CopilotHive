@@ -577,4 +577,225 @@ public sealed class ReadyClaimAtomicityTests
         Assert.False(task.Metadata.ContainsKey("assigned_worker"));
         Assert.Equal(0, f.NotifyCount);
     }
+
+    // ── round-2 additions: the Ready boundary's remaining vectors ─────────────
+
+    /// <summary>
+    /// THE ACCEPTED READY PUBLISHES THE WHOLE CLAIM AND NOTHING MORE: the claimed instance carries
+    /// the task's role and model, is busy with the exact task id, and carries ONE shared timestamp
+    /// for both clocks; the queue's active entry is the EXACT dequeued instance tagged with the
+    /// worker id; the publisher received the EXACT claimed instance and the EXACT dequeued task; and
+    /// the dashboard was notified EXACTLY ONCE for the accepted path.
+    /// </summary>
+    [Fact]
+    public async Task Ready_ClaimSucceeds_PublishesExactInstanceStateQueueAndOneNotification()
+    {
+        var f = Fixture.Create();
+        var task = BuildTask("task-accepted-ready");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // THE WORKER'S PUBLISHED STATE, all from ONE claim.
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerRole.Coder, f.Worker.Role);
+        Assert.Equal(task.Model, f.Worker.CurrentModel);
+        Assert.NotNull(f.Worker.CurrentTaskStartedAt);
+        Assert.Equal(f.Worker.CurrentTaskStartedAt, f.Worker.LastActivityAt);
+
+        // THE QUEUE'S ACTIVE ENTRY IS THE EXACT DEQUEUED INSTANCE, tagged with this worker.
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+        Assert.Null(f.Queue.TryDequeueAny());
+
+        // THE PUBLISHER RECEIVED THE EXACT CLAIMED INSTANCE AND THE EXACT DEQUEUED TASK — exactly
+        // once.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+
+        // EXACTLY ONE DASHBOARD NOTIFICATION for the accepted path — and none extra.
+        Assert.Equal(1, f.NotifyCount);
+
+        // NO REFUSAL OR BLOCKED WORDING: this delivery was published.
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("claim refused", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("assignment blocked", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// ABA AT THE READY BOUNDARY: the pinned instance is REMOVED and a replacement re-registered under
+    /// the same ID while the Ready is parked in the pre-claim window. The claim is refused for the
+    /// stale pinned instance, the ACTUAL dequeued task goes back EXACTLY ONCE, the replacement is
+    /// untouched, and nothing was published, notified or recorded.
+    /// </summary>
+    [Fact]
+    public async Task Ready_PinnedInstanceReplacedInWindow_RequeuesTheActualTaskOnceAndLeavesTheReplacementUntouched()
+    {
+        var f = Fixture.Create();
+        var task = BuildTask("task-aba-ready");
+        f.Queue.Enqueue(task);
+
+        // THE REPLACEMENT WINS INSIDE THE WINDOW: the pinned instance is removed and a replacement
+        // re-registered under the same ID, distinguishable by its model.
+        f.Service.OnBeforeReadyClaimForTest = () =>
+        {
+            Assert.True(f.Pool.RemoveWorker(f.Worker));
+            var replacement = f.Pool.RegisterWorker(WorkerId, []);
+            replacement.CurrentModel = "replacement-model";
+        };
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // THE STALE PINNED INSTANCE WAS NEVER MUTATED — the claim refused it.
+        Assert.False(f.Worker.IsBusy);
+        Assert.Null(f.Worker.CurrentTaskId);
+        Assert.Null(f.Worker.CurrentModel);
+        Assert.Equal(WorkerRole.Unspecified, f.Worker.Role);
+
+        // THE REPLACEMENT UNDER THE SAME ID IS UNTOUCHED by the stale Ready.
+        var replacement = f.Pool.GetWorker(WorkerId)!;
+        Assert.NotSame(f.Worker, replacement);
+        Assert.False(replacement.IsBusy);
+        Assert.Null(replacement.CurrentTaskId);
+        Assert.Equal("replacement-model", replacement.CurrentModel);
+
+        // THE ACTUAL DEQUEUED TASK IS BACK, EXACTLY ONCE, AS THE VERY SAME INSTANCE.
+        Assert.Same(task, f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.TryDequeueAny());
+        Assert.Null(f.Queue.GetActiveTask(task.TaskId));
+        Assert.False(task.Metadata.ContainsKey("assigned_worker"));
+
+        // ZERO PUBLICATION, ZERO NOTIFICATION.
+        Assert.Empty(f.Publisher.Calls);
+        Assert.Equal(0, f.NotifyCount);
+    }
+
+    /// <summary>
+    /// A MISSING PUBLISHER (the fail-closed shape) BLOCKS THE RECORDING AND RETURNS NORMALLY: the
+    /// claim stands — the worker stays busy with the task and the queue keeps its active entry — no
+    /// assignment is published, the task is NOT requeued, and the blocked disposition is reported.
+    /// </summary>
+    [Fact]
+    public async Task Ready_MissingPublisher_RetainsTheClaimAndReturnsNormally()
+    {
+        var f = Fixture.Create(withPublisher: false);
+        var task = BuildTask("task-missing-publisher");
+        f.Queue.Enqueue(task);
+
+        await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+        // THE CLAIM STANDS — no rollback of the busy state or the active entry.
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Equal(WorkerRole.Coder, f.Worker.Role);
+        Assert.Equal(task.Model, f.Worker.CurrentModel);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+
+        // THE TASK WAS NOT REQUEUED and nothing reached the publisher seam.
+        Assert.Null(f.Queue.TryDequeueAny());
+        Assert.Empty(f.Publisher.Calls);
+
+        // THE HANDLED DISPOSITION RETURNED NORMALLY, reported as blocked — not refused.
+        Assert.Contains(
+            f.Logger.Messages,
+            m => m.Contains("assignment blocked", StringComparison.Ordinal)
+                 && m.Contains("MissingPublisher", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            f.Logger.Messages, m => m.Contains("claim refused", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// SIMULTANEOUS READIES ON DEDICATED THREADS RACE FOR THE SAME WORKER AND THE SAME QUEUE: both
+    /// Readies park at a REAL two-participant barrier INSIDE the production pre-claim hook, so both
+    /// have dequeued before either claims. Exactly one claim wins — the other's dequeued task is
+    /// requeued exactly once, the winner's published state is complete and untorn, and exactly one
+    /// notification is fired. No sleeps, no polling: the barrier is the rendezvous.
+    /// </summary>
+    [Fact]
+    public async Task Ready_SimultaneousOnDedicatedThreads_ProduceExactlyOneWinnerAndOneRequeue()
+    {
+        var f = Fixture.Create();
+        var winnerTask = BuildTask("task-race-winner", "race-winner-model");
+        var loserTask = BuildTask("task-race-loser", "race-loser-model");
+        f.Queue.Enqueue(winnerTask);
+        f.Queue.Enqueue(loserTask);
+
+        // THE REAL WINDOW, RENDEZVOUSED: both Readies must reach the pre-claim hook before either
+        // proceeds to its claim, so the two claims genuinely contend at the pool's activity lock.
+        using var barrier = new Barrier(participantCount: 2);
+        f.Service.OnBeforeReadyClaimForTest = barrier.SignalAndWait;
+
+        Task firstReady = Task.CompletedTask, secondReady = Task.CompletedTask;
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var firstThread = new Thread(() =>
+        {
+            started.Task.GetAwaiter().GetResult();
+            firstReady = InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+            firstReady.GetAwaiter().GetResult();
+        })
+        { IsBackground = true };
+        var secondThread = new Thread(() =>
+        {
+            started.Task.GetAwaiter().GetResult();
+            secondReady = InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+            secondReady.GetAwaiter().GetResult();
+        })
+        { IsBackground = true };
+
+        try
+        {
+            firstThread.Start();
+            secondThread.Start();
+            started.SetResult();
+
+            // JOIN ORIGINAL OPERATIONS so a failing assertion cannot leak parked work.
+            Assert.True(firstThread.Join(BoundedWait), "the first Ready thread did not finish");
+            Assert.True(secondThread.Join(BoundedWait), "the second Ready thread did not finish");
+
+            await firstReady;
+            await secondReady;
+
+            // EXACTLY ONE WINNER: one claim took the worker, the loser's task is back.
+            Assert.True(f.Worker.IsBusy);
+            var winnerId = f.Worker.CurrentTaskId!;
+            Assert.True(
+                winnerId is "task-race-winner" or "task-race-loser",
+                $"the claimed task id {winnerId} must be one of the two racing tasks.");
+
+            // THE WINNER'S STATE IS UNTORN: the winning model, role, and one shared timestamp.
+            var winningTask = winnerId == "task-race-winner" ? winnerTask : loserTask;
+            Assert.Equal(winningTask.Model, f.Worker.CurrentModel);
+            Assert.Equal(WorkerRole.Coder, f.Worker.Role);
+            Assert.NotNull(f.Worker.CurrentTaskStartedAt);
+            Assert.Equal(f.Worker.CurrentTaskStartedAt, f.Worker.LastActivityAt);
+            Assert.Same(winningTask, f.Queue.GetActiveTask(winnerId));
+            Assert.Equal(WorkerId, winningTask.Metadata["assigned_worker"]);
+
+            // THE LOSER'S TASK WAS REQUEUED EXACTLY ONCE — the very same instance, untouched.
+            var losingTask = winnerId == "task-race-winner" ? loserTask : winnerTask;
+            var requeued = f.Queue.TryDequeueAny();
+            Assert.Same(losingTask, requeued);
+            Assert.False(requeued!.Metadata.ContainsKey("assigned_worker"));
+            Assert.Null(f.Queue.TryDequeueAny());
+
+            // EXACTLY ONE NOTIFICATION for the one accepted claim, and exactly one publication.
+            Assert.Equal(1, f.NotifyCount);
+            var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+            Assert.Same(f.Worker, publishedWorker);
+            Assert.Same(winningTask, publishedTask);
+        }
+        finally
+        {
+            // JOIN ORIGINAL OPERATIONS so a failing assertion cannot leak parked work.
+            if (firstThread.IsAlive) firstThread.Join(BoundedWait);
+            if (secondThread.IsAlive) secondThread.Join(BoundedWait);
+            await firstReady.WaitAsync(TestContext.Current.CancellationToken);
+            await secondReady.WaitAsync(TestContext.Current.CancellationToken);
+        }
+    }
 }
