@@ -3068,6 +3068,161 @@ public sealed class CompletionTransportOwnershipTests
     }
 
     /// <summary>
+    /// A READY ENQUEUED WHILE THE COMPLETION PUBLICATION IS PAUSED IS NOT LOST: the real WorkStream
+    /// serializes Complete and Ready, so a Ready pushed during the paused post-release publication
+    /// window is read only AFTER that publication finishes — by which time the SHORT hold has already
+    /// been ended by its own finally. That single Ready is therefore accepted, clears the readiness
+    /// wait, and dispatches the pending successor through the real publication point — with NO second
+    /// Ready and no buffering, wake loop or deferred-Ready machinery anywhere.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THE ORDERING IS EXACT RATHER THAN RACED. The publication window is the production hook
+    /// between the checked release and the acknowledgement attempt, and the read loop handles one
+    /// message at a time — so the Ready cannot be read while the completion handler is still paused.
+    /// The acknowledgement and the downstream notification awaited BEFORE the Ready's acceptance line
+    /// prove the publication had fully finished (hold cleared in its finally, wait still installed)
+    /// before the Ready was handled.
+    /// </para>
+    /// <para>
+    /// WHY THE DELIVERY PROVES THE WAIT. Between the publication's end and the Ready's acceptance the
+    /// instance is idle, unheld and still awaiting its own Ready — unselectable for NEW selection, yet
+    /// exactly the shape the checked idle accepts. One Ready then clears the wait and hands out the
+    /// pending successor, which is the criterion's "no second Ready" proof.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Ready_EnqueuedDuringThePausedPublication_IsNotLostAndDeliversAfterIt()
+    {
+        var dbPath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-ready-in-window-{Guid.NewGuid():N}.db");
+
+        try
+        {
+            // THE PUBLISHED-ASSIGNMENT HARNESS: the Ready route's real publisher is wired, so the
+            // successor's delivery is a genuine production publication, not a fail-closed refusal.
+            var h = Harness.CreateWithRequestedAckAndPublishedAssignmentSupport(dbPath);
+            await RunAsync(h, async () =>
+            {
+                // ── A IS GENUINELY ASSIGNED AND THE SUCCESSOR IS PENDING ─────────────────────────
+                const string taskId = "task-ready-in-window";
+                h.Assign(taskId, model: "assigned-model");
+                h.ResetDashboardNotifications();
+
+                // THE SUCCESSOR'S DISPATCHABLE SETUP: a real pipeline with a Pending slot at the
+                // active-task pointer and the task→goal mapping registered, so the Ready route's
+                // REAL publisher can record and publish its delivery.
+                const string successorId = "task-ready-in-window-successor";
+                const string successorGoalId = "goal-ready-in-window-successor";
+                var successorGoal = new Goal { Id = successorGoalId, Description = "successor" };
+                h.Manager.CreatePipeline(successorGoal, maxRetries: 3);
+                h.GoalSource.Register(successorGoal);
+                var successorPipeline = h.Manager.GetByGoalId(successorGoalId);
+                Assert.NotNull(successorPipeline);
+                successorPipeline!.AllocateAttemptAndRegisterSlot(
+                    successorId, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+                successorPipeline.SetActiveTask(successorId);
+                h.Manager.RegisterTask(successorId, successorGoalId);
+
+                h.Queue.Enqueue(
+                    h.BuildTask(successorId, "successor-model") with { GoalId = successorGoalId });
+
+                var acknowledgement = h.AwaitAcknowledgementAsync();
+                var downstream = h.DispatcherLogger.WaitFor(taskId);
+
+                // ── THE PAUSE: INSIDE THE REAL COMPLETION PUBLICATION, HOLD IN FORCE ─────────────
+                var window = h.PauseInCompletionPublicationWindow();
+                try
+                {
+                    h.PushCompletion(taskId, "assigned-model", true);
+                    await window.Entered.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                    // THE PRECONDITIONS ARE PRODUCTION'S OWN: released, hold installed, NOT
+                    // selectable — the release installed the instance's readiness wait.
+                    Assert.True(h.Worker.CompletionPublicationPending);
+                    Assert.True(h.Worker.AwaitingWorkerReady);
+                    Assert.Null(h.Pool.GetIdleWorker());
+
+                    // ── THE READY IS ENQUEUED INTO THE REAL STREAM WHILE THE PUBLICATION IS PAUSED ──
+                    // The read loop is synchronous, so the message CANNOT be read while the
+                    // completion handler is paused inside this window; it simply waits behind it.
+                    var accepted = h.ServiceLogger.WaitFor(ProductionLogFragments.ReadyAccepted);
+                    var forwarded = h.Writer.WaitForAssignment();
+                    h.PushReady();
+
+                    // ── THE PUBLICATION FINISHES (the window is the ONLY thing holding it) ──────────
+                    h.ClearCompletionPublicationHook();
+                    window.Release();
+
+                    var ack = await acknowledgement;
+                    Assert.Equal(taskId, ack.TaskId);
+                    await downstream.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                    // ── THE IN-WINDOW READY IS READ AFTERWARD, ACCEPTED, AND NOT LOST ───────────────
+                    // The SHORT hold is already gone, so the checked idle accepts this ONE Ready: it
+                    // ends the wait and dispatches the pending successor — no second Ready needed.
+                    await accepted.WaitAsync(BoundedWait, TestContext.Current.CancellationToken);
+
+                    var assignment = await forwarded.WaitAsync(
+                        BoundedWait, TestContext.Current.CancellationToken);
+                    Assert.Equal(successorId, assignment.TaskId);
+
+                    // ── THE ORDERING, READ OFF THE ONE LEDGER THE REAL PUMP WRITES ─────────────────
+                    // ACK(A) was forwarded BEFORE Assignment(successor): the completion publication
+                    // (hold cleared in its finally, wait installed) fully finished before the Ready
+                    // that had been enqueued behind it was read and dispatched the successor.
+                    var messages = h.Writer.Messages;
+                    var ackIndex = IndexOfMessage(
+                        messages,
+                        m => m.PayloadCase == OrchestratorMessage.PayloadOneofCase.CompletionReceiptAck
+                             && string.Equals(m.CompletionReceiptAck.TaskId, taskId, StringComparison.Ordinal));
+                    var assignmentIndex = IndexOfMessage(
+                        messages,
+                        m => m.Assignment is not null
+                             && string.Equals(m.Assignment.TaskId, successorId, StringComparison.Ordinal));
+
+                    Assert.True(ackIndex >= 0, "the completion's acknowledgement was never forwarded");
+                    Assert.True(assignmentIndex >= 0, "the successor's assignment was never forwarded");
+                    Assert.True(
+                        ackIndex < assignmentIndex,
+                        "the successor's assignment was forwarded BEFORE the completion's acknowledgement — "
+                        + "the paused publication did not finish before the in-window Ready was read");
+
+                    // THE WAIT IS ENDED BY THAT ONE READY — and the successor is genuinely claimed.
+                    Assert.False(h.Worker.AwaitingWorkerReady);
+                    Assert.False(h.Worker.CompletionPublicationPending);
+                    Assert.True(h.Worker.IsBusy);
+                    Assert.Equal(successorId, h.Worker.CurrentTaskId);
+                    Assert.Equal("successor-model", h.Worker.CurrentModel);
+                    Assert.NotNull(h.Queue.GetActiveTask(successorId));
+                    Assert.Null(h.Queue.TryDequeueAny());
+                }
+                finally
+                {
+                    h.ClearCompletionPublicationHook();
+                    window.Release();
+                }
+            });
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var candidate in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+                catch
+                {
+                    // Best-effort cleanup — a leftover temp file must never fail a test.
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Asserts NO acknowledgement was forwarded to the worker: not as the new oneof case, and not as
     /// a stray message that happens to carry a <see cref="CompletionReceiptAck"/> payload.
     /// </summary>
@@ -5127,6 +5282,14 @@ public sealed class CompletionTransportOwnershipTests
                 WorkerId = WorkerId,
                 Complete = BuildComplete(taskId, model, modelPresent, status),
             });
+
+        /// <summary>
+        /// Pushes ONE Ready for the pinned worker onto the real request stream, so a vector can
+        /// enqueue the worker's own readiness statement at a chosen instant (e.g. behind a paused
+        /// completion publication) without touching the reader itself.
+        /// </summary>
+        public void PushReady() =>
+            Reader.Push(new WorkerMessage { WorkerId = WorkerId, Ready = new WorkerReady() });
 
         /// <summary>
         /// THE DETERMINISTIC HANDLE ON ONE COMPLETION-PUBLICATION WINDOW: the signal that the window
