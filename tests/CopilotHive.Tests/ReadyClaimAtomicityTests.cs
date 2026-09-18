@@ -56,6 +56,23 @@ public sealed class ReadyClaimAtomicityTests
 
         private string? _agentsPath;
 
+        /// <summary>
+        /// THE REAL AGENTS ROOT this fixture handed to <see cref="AgentsManager"/>, or <c>null</c>
+        /// when the fixture was built without one. A vector that must fault the production read has
+        /// to target THIS root — a freshly generated one would be a different directory the service
+        /// never opens.
+        /// </summary>
+        public string AgentsRoot =>
+            _agentsPath ?? throw new InvalidOperationException(
+                "this fixture was created without an AgentsManager, so it has no agents root");
+
+        /// <summary>
+        /// THE EXACT FILE the production guidance read opens for <paramref name="role"/>, composed
+        /// the same way <c>AgentsManager.GetAgentsMdPath</c> composes it (root + role name).
+        /// </summary>
+        public string AgentsFilePath(WorkerRole role) =>
+            Path.Combine(AgentsRoot, $"{role.ToRoleName()}.agents.md");
+
         public static Fixture Create(
             CapturingLogger? logger = null,
             bool withAgentsManager = false,
@@ -876,78 +893,92 @@ public sealed class ReadyClaimAtomicityTests
     /// <summary>
     /// THE OUTER GUIDANCE WARNING'S OWN GUARD IS GENUINELY REACHABLE AND HOLDS: a guidance failure
     /// that happens BEFORE the send's inner <c>try</c> — the agents.md read itself faults — escapes
-    /// <c>SendAgentsMdAsync</c> to the Ready path's outer catch, whose
-    /// <see cref="HiveOrchestratorService"/> guidance warning is then guarded, so even a logger that
-    /// throws ON that warning cannot escape or mask the outcome. Publication continues on the exact
-    /// claimed instance.
+    /// <c>SendAgentsMdAsync</c> to the Ready path's outer catch, whose guidance warning is then
+    /// guarded, so even a logger that throws ON that warning cannot escape or mask the outcome.
+    /// Publication continues on the exact claimed instance.
     /// </summary>
     /// <remarks>
-    /// THE FAULT IS DETERMINISTIC AND REAL: the coder role's agents.md path is REPLACED BY A
-    /// DIRECTORY, so the production <c>File.ReadAllText</c> inside <c>GetAgentsMd</c> — which runs
-    /// outside the send's inner try — throws a plain IO exception. This is the only remaining vector
-    /// that genuinely reaches the outer <c>LogGuidanceBestEffortFailed</c> emission after the
-    /// send-failure diagnostic was guarded.
+    /// <para>
+    /// THE FAULT IS REAL, DETERMINISTIC AND AT THE PATH PRODUCTION ACTUALLY OPENS. The file is the
+    /// fixture's OWN agents root (the root handed to <c>AgentsManager</c>) composed exactly as
+    /// <c>AgentsManager.GetAgentsMdPath</c> composes it — never a freshly generated directory the
+    /// service would never read.
+    /// </para>
+    /// <para>
+    /// THE MECHANISM IS AN EXCLUSIVE FILE HANDLE, NOT A DIRECTORY SWAP. <c>GetAgentsMd</c> tests
+    /// <c>File.Exists</c> BEFORE reading, and <c>File.Exists</c> is FALSE for a directory — so
+    /// replacing the file with a directory makes the read silently return empty and never faults.
+    /// Holding the real file open with <see cref="FileShare.None"/> keeps <c>File.Exists</c> TRUE
+    /// while <c>File.ReadAllText</c> throws, and it works even when the test process runs as root
+    /// (unlike permission bits, which root bypasses).
+    /// </para>
+    /// <para>
+    /// THE READ FAULT IS ASSERTED, NOT ASSUMED: the outer warning entry can only exist if the read
+    /// really threw, so the mechanism proves itself inside the vector.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task Ready_GuidanceReadFault_OuterGuidanceWarningGuardSurvivesAThrowingLogger()
     {
         var f = Fixture.Create(withAgentsManager: true);
+
+        // THE OUTER warning is the emission under test — matched on its real production wording.
         var loggerFailure = new InvalidOperationException("the guidance warning's logger threw");
         f.Logger.ThrowFactory = message =>
-            message.StartsWith("agents.md update failed", StringComparison.Ordinal)
+            message.Contains("agents.md update failed after the assignment was claimed",
+                StringComparison.Ordinal)
                 ? loggerFailure
                 : null;
 
-        // THE REAL PRE-TRY FAULT: the agents.md "file" for the delivered role is a directory, so the
-        // read inside GetAgentsMd throws before SendAgentsMdAsync's inner try is even entered.
-        var agentsFilePath = Path.Combine(
-            Path.GetTempPath(), $"copilothive-ready-claim-agents-{Guid.NewGuid():N}",
-            $"{WorkerRole.Coder.ToRoleName()}.agents.md");
-        Directory.CreateDirectory(agentsFilePath);
+        // THE EXACT FILE the production read opens, in the fixture's OWN root.
+        var agentsFilePath = f.AgentsFilePath(WorkerRole.Coder);
+        Assert.True(
+            File.Exists(agentsFilePath),
+            $"the fixture's agents file is missing, so this vector would fault nothing: {agentsFilePath}");
 
-        try
+        var task = BuildTask("task-guidance-read-fault");
+        f.Queue.Enqueue(task);
+
+        // THE PRE-TRY FAULT, held for the whole Ready: File.Exists stays true, ReadAllText throws.
+        using (new FileStream(agentsFilePath, FileMode.Open, FileAccess.Read, FileShare.None))
         {
-            var task = BuildTask("task-guidance-read-fault");
-            f.Queue.Enqueue(task);
+            Assert.True(File.Exists(agentsFilePath), "File.Exists must stay TRUE while the file is held");
 
+            // MUST NOT THROW: the logger's throw is contained by the outer warning's guard.
             await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
-
-            // THE OUTER GUIDANCE WARNING REALLY WAS ATTEMPTED, and its guard contained the throw:
-            // the failing emission is not recorded (the guard swallowed it), but the send reached
-            // the outer catch — so the vector is not vacuous. The send's own guarded diagnostic is
-            // NOT the one here: no "Failed to send AGENTS.md" line can exist, because the fault
-            // happened before the send's inner try.
-            Assert.DoesNotContain(
-                f.Logger.Entries,
-                e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
-            Assert.Contains(
-                f.Logger.Entries,
-                e => e.Message.Contains("Worker w-ready-claim is ready", StringComparison.Ordinal));
-
-            // NOTHING ESCAPED and the primary outcome stands: the claim stands and publication
-            // continued on the exact claimed instance and the ACTUAL task.
-            var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
-            Assert.Same(f.Worker, publishedWorker);
-            Assert.Same(task, publishedTask);
-            Assert.True(f.Worker.IsBusy);
-            Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
-            Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
-            Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
-            Assert.Null(f.Queue.TryDequeueAny());
         }
-        finally
-        {
-            // BEST-EFFORT CLEANUP: remove the directory standing in for the agents file.
-            try
-            {
-                if (Directory.Exists(agentsFilePath))
-                    Directory.Delete(agentsFilePath);
-            }
-            catch
-            {
-                // A leftover directory must never fail the test.
-            }
-        }
+
+        // (1) THE OUTER WARNING REALLY WAS ATTEMPTED. The logger records the entry BEFORE invoking
+        // ThrowFactory, so this entry existing proves the read faulted, the outer catch ran and the
+        // guarded emission was reached — the whole point of the vector.
+        var outer = Assert.Single(
+            f.Logger.Entries,
+            e => e.Message.Contains("agents.md update failed after the assignment was claimed",
+                StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, outer.Level);
+        Assert.Null(outer.Exception);
+
+        // (2) THE VECTOR CANNOT BE SATISFIED BY THE INNER SEND DIAGNOSTIC: the fault happened before
+        // the send's inner try, so that line can never have been emitted.
+        Assert.DoesNotContain(
+            f.Logger.Entries,
+            e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
+
+        // (3) THE READY REALLY HAPPENED.
+        Assert.Contains(
+            f.Logger.Entries,
+            e => e.Message.Contains($"Worker {WorkerId} is ready", StringComparison.Ordinal));
+
+        // (4) THE PRIMARY OUTCOME STANDS: publication continued on the EXACT claimed instance and
+        // the ACTUAL task, the claim is retained, and nothing was requeued.
+        var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+        Assert.Same(f.Worker, publishedWorker);
+        Assert.Same(task, publishedTask);
+        Assert.True(f.Worker.IsBusy);
+        Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+        Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+        Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+        Assert.Null(f.Queue.TryDequeueAny());
     }
 
     /// <summary>
