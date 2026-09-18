@@ -506,9 +506,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
 
             // THE SEPARATELY OWNED READINESS WRITE — the ACTUAL task the response loop started from
             // the report's published eligibility, and the one every later transition joins.
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained the assignment's readiness write.");
+            var readinessWrite = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained the assignment's readiness write.");
 
             // REPORTING HAS TERMINATED INDEPENDENTLY: only the readiness WRITE is still held, and
             // it is a task of its OWN — never the reporting task.
@@ -654,9 +654,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 "Reporting must terminate independently of the readiness write — a failed/cancelled "
                 + "Complete write leaves its producer OBSERVED, never re-raised.");
 
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained the assignment's readiness write.");
+            var readinessWrite = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained the assignment's readiness write.");
             Assert.NotSame(reporting, readinessWrite);
             requests.ReleaseReady(0);
             await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -739,9 +739,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 reporting.IsCompletedSuccessfully,
                 "Reporting must terminate independently of the readiness write.");
 
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained the assignment's readiness write.");
+            var readinessWrite = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained the assignment's readiness write.");
             Assert.NotSame(reporting, readinessWrite);
 
             requests.ReleaseReady(0);
@@ -807,6 +807,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         // Hoisted so the finally joins EVERY original task it started, even after a failure.
         Task? execution = null;
         Task? reporting = null;
+        Task? readinessWrite = null;
         var teardownEnteredRegistration = default(CancellationTokenRegistration);
         try
         {
@@ -851,14 +852,29 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // connection is still usable, i.e. only if teardown really is waiting on this assignment.
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "Teardown must settle and start the assignment's readiness write.");
+            readinessWrite = CaptureReadinessWrite(
+                service,
+                "Teardown must settle and start the assignment's readiness write.");
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(
                 reporting.IsCompletedSuccessfully,
                 "The report must terminate independently of the readiness write.");
             Assert.NotSame(reporting, readinessWrite);
+
+            // PRE-RELEASE, WITH THE READINESS WRITE STILL HELD. This is what makes the readiness
+            // JOIN removal-proof rather than incidental: teardown may not have finished, may not
+            // have cleared the ownership slot and may not have retired the connection while the
+            // write it started is outstanding. A drain that skipped the readiness join would already
+            // have completed all three by now, failing these BY NAME.
+            Assert.False(readinessWrite.IsCompleted, "The readiness write must still be held.");
+            Assert.False(
+                loop.IsCompleted,
+                "The loop must not finish while the readiness write its teardown started is held.");
+            Assert.NotNull(GetActiveAssignment(service));
+            Assert.Equal(1, GetSlotOccupancy(service));
+            Assert.False(
+                connection.IsRetired,
+                "Retirement must follow the drain that joins the readiness write.");
 
             requests.ReleaseReady(0);
 
@@ -880,6 +896,7 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             await JoinAllForTeardownAsync(service,
                 ("assignment execution", execution),
                 ("assignment reporting", reporting),
+                ("assignment readiness write", readinessWrite),
                 ("loop", loop));
             TryDelete(root);
         }
@@ -994,9 +1011,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             requests.ReleaseComplete(0);
             await requests.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained the assignment's readiness write.");
+            var readinessWrite = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained the assignment's readiness write.");
 
             Assert.True(execution.IsCompletedSuccessfully);
 
@@ -1568,9 +1585,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             Assert.True(
                 reportingA.IsCompletedSuccessfully,
                 "A's report must terminate independently of the readiness write.");
-            readinessA = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained A's readiness write.");
+            readinessA = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained A's readiness write.");
             capturedReadinessA = readinessA;
             Assert.NotSame(reportingA, readinessA);
 
@@ -1626,8 +1643,20 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 + "the replacement drain did not run, was detached, or was not awaited."));
 
             // RELEASE A'S READINESS WRITE ONLY NOW — after every pre-release observation above has
-            // been taken. From here A's drain can settle its remaining work and proceed, which is
-            // what lets a DETACHED drain resume and expose its consequence below.
+            // been taken, INCLUDING the positive in-handler rendezvous check that B's session reset
+            // has not been reached. From here A's drain can finish joining and proceed, which is
+            // also what lets a DETACHED drain resume and expose its consequence below.
+            //
+            // THE HELD-WRITE PRE-RELEASE INVARIANTS, asserted immediately before the release so a
+            // transition that skipped the readiness join fails BY NAME rather than incidentally: the
+            // loop is still running, A still owns the slot, and the connection is not retired.
+            CapturePreRelease(() => Assert.False(
+                readinessA.IsCompleted, "A's readiness write must still be held at the release point."));
+            CapturePreRelease(() => Assert.False(
+                loop.IsCompleted, "The loop must not finish while A's readiness write is held."));
+            CapturePreRelease(() => Assert.Same(ownerA, GetActiveAssignment(service)));
+            CapturePreRelease(() => Assert.Equal(taskA, GetActiveTaskId(service)));
+
             requests.ReleaseReady(0);
 
             // THE DETERMINISTIC RENDEZVOUS. BOTH a correct handler and a drain-less one reach B's
@@ -2187,9 +2216,9 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             // execution and never to the report: the report terminated successfully as soon as it
             // published the eligibility, and the ORIGINAL write task carries the fault — observed by
             // the DRAIN (its nonfatal, sanitized treatment), never propagated out of reporting.
-            var readinessWrite = GetRetainedReadinessWrite(service)
-                ?? throw new Xunit.Sdk.XunitException(
-                    "The loop must have started and retained the assignment's readiness write.");
+            var readinessWrite = CaptureReadinessWrite(
+                service,
+                "The loop must have started and retained the assignment's readiness write.");
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(
                 reporting.IsCompletedSuccessfully,
@@ -4867,6 +4896,67 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             "_currentTaskId", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(service);
 
     /// <summary>
+    /// The ACTIVE owner's SEPARATELY OWNED readiness write, RECORDED in the owner-slot-independent
+    /// registry so teardown can still join it after any ownership clear. Fails by name when no write
+    /// has been started.
+    /// </summary>
+    private Task CaptureReadinessWrite(WorkerService service, string because)
+    {
+        var write = GetRetainedReadinessWrite(service)
+            ?? throw new Xunit.Sdk.XunitException(because);
+
+        TrackReadinessWrite(write);
+        return write;
+    }
+
+    /// <summary>
+    /// The ACTIVE owner's SEPARATELY OWNED readiness write, or <c>null</c> when the slot is empty or
+    /// no write has been started. Observation only.
+    /// </summary>
+    private static Task? ActiveReadinessWrite(object? active)
+    {
+        if (active is null)
+            return null;
+
+        var slot = active.GetType().GetProperty("OrdinaryReady")!.GetValue(active)!;
+        return (Task?)slot.GetType().GetProperty("Write")!.GetValue(slot);
+    }
+
+    // ── Readiness-write registry (owner-slot independent) ─────────────────────
+    //
+    // The retained readiness write is reachable through the ownership slot ONLY while that slot is
+    // occupied, and a join-removal mutant clears it early — exactly when an orphaned write is most
+    // likely. Every write a test observes is therefore ALSO recorded here, in per-test fixture state
+    // no production transition can clear, and teardown joins this registry too.
+
+    /// <summary>Every readiness write THIS test observed, independent of the ownership slot.</summary>
+    private readonly List<Task> _startedReadinessWrites = [];
+
+    /// <summary>Records a readiness write in the registry. Idempotent by reference.</summary>
+    private void TrackReadinessWrite(Task? write)
+    {
+        if (write is null)
+            return;
+
+        lock (_startedReadinessWrites)
+        {
+            foreach (var tracked in _startedReadinessWrites)
+            {
+                if (ReferenceEquals(tracked, write))
+                    return;
+            }
+
+            _startedReadinessWrites.Add(write);
+        }
+    }
+
+    /// <summary>A snapshot of every recorded readiness write, oldest first.</summary>
+    private IReadOnlyList<Task> TrackedReadinessWrites
+    {
+        get { lock (_startedReadinessWrites) return [.. _startedReadinessWrites]; }
+    }
+
+    /// <summary>
     /// JOINS EVERY ORIGINAL TASK a test started, each under its OWN bounded wait, and only then
     /// reports whatever went wrong.
     /// </summary>
@@ -4890,12 +4980,11 @@ public sealed class WorkerServiceAssignmentOwnershipTests
     /// The started tasks, in the order they should be joined. <c>null</c> entries (a producer a
     /// test never started) are skipped.
     /// </param>
-    private static async Task JoinAllForTeardownAsync(
+    private async Task JoinAllForTeardownAsync(
         WorkerService service,
         params (string Name, Task? Producer)[] producers)
     {
         List<Exception> failures = [];
-
         // EVERY REAL ASSIGNMENT EXECUTION the runner ever observed. These are the enclosing
         // Task.Run bodies (ActiveAssignment.Execution) — NOT prompt-return surrogates, which go
         // terminal while the real execution is still creating its result and writing Complete/Ready.
@@ -4938,6 +5027,13 @@ public sealed class WorkerServiceAssignmentOwnershipTests
         if (activeReporting is not null)
             AddProducer("active assignment reporting", activeReporting);
 
+        // THE SEPARATELY OWNED READINESS WRITE — the THIRD task an assignment can have outstanding.
+        // It is taken from the slot here AND from the fixture-owned registry below, because a
+        // join-removal mutant clears the slot early: that is exactly when the write is most likely
+        // to be orphaned, and it would otherwise be invisible to teardown.
+        if (ActiveReadinessWrite(active) is { } activeReadiness)
+            AddProducer("active assignment readiness write", activeReadiness);
+
         foreach (var (name, producer) in producers)
         {
             if (producer is not null)
@@ -4964,6 +5060,12 @@ public sealed class WorkerServiceAssignmentOwnershipTests
             && AddProducer("late active assignment reporting", lateActiveReporting))
         {
             await JoinOneAsync("late active assignment reporting", lateActiveReporting);
+        }
+
+        if (ActiveReadinessWrite(active) is { } lateActiveReadiness
+            && AddProducer("late active assignment readiness write", lateActiveReadiness))
+        {
+            await JoinOneAsync("late active assignment readiness write", lateActiveReadiness);
         }
 
         // THE CLOSURE HANDSHAKE. Seal the runner's recording, then drain to a FIXPOINT: join
@@ -5014,6 +5116,19 @@ public sealed class WorkerServiceAssignmentOwnershipTests
                 continue;
 
             await JoinOneAsync($"late-started prompt body #{index}", body);
+        }
+
+        // FINAL SWEEP of the OWNER-SLOT-INDEPENDENT readiness-write registry. A join-removal mutant
+        // clears the ownership slot early, so a write it orphaned is reachable only here — this is
+        // what keeps an abandoned readiness write a loud, named teardown failure.
+        var trackedReadinessWrites = TrackedReadinessWrites;
+        for (var index = 0; index < trackedReadinessWrites.Count; index++)
+        {
+            var write = trackedReadinessWrites[index];
+            if (!AddProducer($"tracked readiness write #{index}", write))
+                continue;
+
+            await JoinOneAsync($"tracked readiness write #{index}", write);
         }
 
         // A using declaration would dispose the service while a timed-out original task is still
