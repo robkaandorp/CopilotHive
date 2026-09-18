@@ -64,6 +64,62 @@ public sealed class ConnectedWorker
     public int ContextUsagePercent { get; set; }
 
     /// <summary>
+    /// THE COMPLETION-PUBLICATION SELECTION HOLD of THIS instance: <c>true</c> only during the short
+    /// interval in which the instance has already been RELEASED by a negotiated ordinary completion
+    /// but its completion-receipt acknowledgement has not yet been queued on its own stream.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT IS FOR, AND HOW NARROW THAT IS. A normal completion releases the worker to idle
+    /// BEFORE the stream-local acknowledgement eligibility is advanced and before the
+    /// acknowledgement is enqueued. An independently running dispatcher can NEWLY SELECT that
+    /// just-released worker inside that gap (the eager push path consults the pool, never the
+    /// stream) and enqueue another assignment. This flag closes ONLY that interval: while it is set,
+    /// <see cref="WorkerPool.GetIdleWorker"/> never returns this instance and
+    /// <see cref="WorkerPool.TryMarkIdleForReady"/> refuses it.
+    /// </para>
+    /// <para>
+    /// IT IS NEITHER A RESERVATION NOR A DELIVERY CLAIM. It does not block a dispatcher that already
+    /// holds an older candidate from calling the existing ID-based busy marking, it carries no task
+    /// id, no deadline, no owner and no history, it is not keyed or looked up by worker id, and it
+    /// says nothing about whether the queued acknowledgement was ever received. Stale-candidate /
+    /// atomic-claim and failed-acknowledgement recovery remain SEPARATE contracts, and the
+    /// stream-local eligibility holder remains the only thing that authorizes a re-acknowledgement.
+    /// </para>
+    /// <para>
+    /// ONLY <see cref="WorkerPool"/> MUTATES IT, AND ONLY INSIDE ITS ACTIVITY LOCK. The hold is
+    /// INSTALLED in the very lock span that applies the checked completion release, so the instance
+    /// is never observable as idle-and-selectable; it is CLEARED in a later lock span that touches
+    /// nothing else at all — not the role, not the model, not the task id and not any activity clock.
+    /// A read made outside that lock is an OBSERVATION ONLY and establishes nothing. The setter is
+    /// private and the two mutation methods below are the pool's only entry points.
+    /// </para>
+    /// </remarks>
+    internal bool CompletionPublicationPending { get; private set; }
+
+    /// <summary>
+    /// INSTALLS the completion-publication selection hold. Callers must hold the pool's activity
+    /// lock; this method itself takes no lock of its own.
+    /// </summary>
+    /// <remarks>
+    /// IT IS THE POOL'S MUTATION PRIMITIVE, NOT A PUBLIC SWITCH: the property's setter is private,
+    /// so the only way to set the hold is through this method, and the only caller is the checked
+    /// completion release's own lock span.
+    /// </remarks>
+    internal void BeginCompletionPublicationHold() => CompletionPublicationPending = true;
+
+    /// <summary>
+    /// CLEARS the completion-publication selection hold, touching NOTHING else on the instance.
+    /// Callers must hold the pool's activity lock.
+    /// </summary>
+    /// <remarks>
+    /// IT IS IDEMPOTENT AND NARROW ON PURPOSE: clearing an already-clear hold is a no-op, and no
+    /// role, model, task id, activity clock or heartbeat value is written. Ending the hold is the
+    /// ONLY thing that happens when a publication finishes.
+    /// </remarks>
+    internal void EndCompletionPublicationHold() => CompletionPublicationPending = false;
+
+    /// <summary>
     /// THE EXCLUSIVE, ONE-WAY WORKSTREAM ATTACHMENT CLAIM of this instance. <c>0</c> = unclaimed,
     /// <c>1</c> = claimed. Mutated ONLY through <see cref="Interlocked.CompareExchange(ref int, int, int)"/>.
     /// </summary>

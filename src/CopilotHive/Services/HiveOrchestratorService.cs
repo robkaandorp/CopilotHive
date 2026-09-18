@@ -98,6 +98,42 @@ public sealed class HiveOrchestratorService(
     /// </remarks>
     internal Action<ConnectedWorker, string>? _afterCompletionActivityDecisionForTest;
 
+    /// <summary>
+    /// THE COMPLETION PUBLICATION'S OWN WINDOW: the instant AFTER an ordinary completion's checked
+    /// release has been applied (and its queue entry removed) and BEFORE the stream-local
+    /// acknowledgement eligibility is advanced and the acknowledgement is enqueued — with NO pool
+    /// lock held.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. The property under test is that the just-released worker cannot be NEWLY
+    /// SELECTED by an independently running dispatcher while its acknowledgement is still being
+    /// published. That interval is otherwise unaddressable from a test: the read loop is
+    /// synchronous, so no external scheduling can land inside it. This hook is the smallest thing
+    /// that makes the interval reachable — and the ONLY hook that sits at this exact point.
+    /// </para>
+    /// <para>
+    /// IT IS NOT A BEHAVIOUR. It is <c>null</c> in production and in every fixture that does not
+    /// install one, so the completion path is EXACTLY the release, the eligibility advance, the
+    /// best-effort enqueue and the ordinary notification. It carries no state, returns nothing and
+    /// decides nothing; the only thing it can do is OBSERVE and DELAY, because everything it could
+    /// touch is re-validated by the guards that follow it.
+    /// </para>
+    /// <para>
+    /// THE PRE-EXISTING CLASSIFICATION HOOK IS TOO EARLY FOR THIS, AND A RESPONSE-WRITER GATE IS TOO
+    /// LATE: the first runs before the handler is even entered (nothing has been released yet), and
+    /// the second runs after the acknowledgement has already been queued and forwarded. This one is
+    /// the only point that is genuinely post-release and pre-enqueue.
+    /// </para>
+    /// <para>
+    /// IT IS INSIDE THE PUBLICATION'S GUARDED SCOPE, DELIBERATELY: a hook that waits and then throws
+    /// is a test bug that must be loud, and the enclosing <c>finally</c> still ends the
+    /// completion-publication hold before the fault leaves — so a faulty hook can never strand the
+    /// instance unselectable.
+    /// </para>
+    /// </remarks>
+    internal Action<ConnectedWorker, string>? _afterCompletionReleaseBeforeAckForTest;
+
     /// <summary>Maximum number of tracked heartbeat entries before the oldest is evicted.</summary>
     internal int MaxHeartbeatEntries { get; set; } = 200;
 
@@ -658,9 +694,16 @@ public sealed class HiveOrchestratorService(
     /// Exposed as <c>internal</c> for unit testing via <c>InternalsVisibleTo</c>.
     /// </summary>
     /// <remarks>
-    /// A REFUSAL MUTATES NOTHING: no idle reset, no model write and no queue removal. That is what
-    /// keeps a late completion from releasing a SUCCESSOR's assignment — including a successor that
-    /// is already busy with a DIFFERENT task id, whose active queue entry must survive untouched.
+    /// <para>
+    /// THE EXISTING ROUTE, PRESERVED VERBATIM IN EFFECT: it installs NO completion-publication hold,
+    /// so every existing/direct caller keeps the unchanged release behaviour and never has unrelated
+    /// selection state written on its behalf.
+    /// </para>
+    /// <para>
+    /// THE NEGOTIATED ORDINARY COMPLETION PATH DOES NOT USE IT: it calls the pool's holding route
+    /// directly (see <see cref="HandleClassifiedTaskComplete"/>) because that path must also place the
+    /// active-queue removal INSIDE the guarded scope that ends the hold.
+    /// </para>
     /// </remarks>
     /// <param name="worker">The worker that completed the task.</param>
     /// <param name="taskId">The identifier of the completed task.</param>
@@ -1468,44 +1511,115 @@ public sealed class HiveOrchestratorService(
             return;
         }
 
-        // ══ THE CHECKED RELEASE ══════════════════════════════════════════════════════════════
+        // ══ THE CHECKED RELEASE, WITH THE COMPLETION-PUBLICATION HOLD ═════════════════════════
         // Re-validated at the mutation point: a refusal releases nothing, removes nothing and
-        // notifies nothing.
-        if (!ApplyTaskCompletion(worker, complete.TaskId))
+        // notifies nothing, and — crucially — INSTALLS NO HOLD.
+        //
+        // THE HOLD IS THE NEGOTIATED PATH'S ALONE. It is requested ONLY when this registration
+        // negotiated completion-receipt acknowledgements, because only such a registration has an
+        // acknowledgement to publish after the release. A legacy/disabled registration takes the
+        // EXISTING route (idle reset, model clear, queue removal) with NO selection state written on
+        // its behalf, so its runtime is exactly what it was.
+        //
+        // THE RELEASE INSTALLS THE HOLD INSIDE THE SAME POOL LOCK SPAN THAT APPLIES THE IDLE RESET,
+        // so the released worker is NEVER observable as idle-and-selectable in the interval before
+        // its acknowledgement is queued — a dispatcher that NEWLY SELECTS workers (the eager push
+        // path) can therefore no longer pick it up in that gap.
+        //
+        // THE HOLD IS A NARROW SELECTION HOLD: not a task reservation, not an acknowledgement
+        // delivery confirmation, and no permission to make the worker wait for anything.
+        var holdForCompletionPublication = worker.CompletionReceiptAckEnabled;
+
+        var completionPublicationHeld = holdForCompletionPublication
+            ? workerPool.TryReleaseCompletedTaskHoldingForPublication(worker, complete.TaskId)
+            : ApplyTaskCompletion(worker, complete.TaskId);
+
+        if (!completionPublicationHeld)
         {
             LogCompletionIgnored(
                 worker.Id, complete.TaskId, OwnershipRefusalReasons.CheckedReleaseRefused);
             return;
         }
 
-        // MUTATION OWNERSHIP: transport does NOT touch the pipeline. The active-task pointer and
-        // the phase entry's worker output are owned exclusively by the ADMITTED completion path
-        // (TaskCompletionService's guards + admission, and the PipelineDriver it drives). A
+        // ── THE PUBLICATION'S OWN GUARDED SCOPE ──────────────────────────────────────────────
+        // EVERYTHING after the acquisition is inside ONE try/finally, so the hold is ended on
+        // SUCCESS, on a refusal and on an EXCEPTION alike: the active-queue removal, the test hook,
+        // the eligibility advance and the enqueue can each fault without leaving the instance
+        // stranded unselectable. A REFUSED release never reaches this block at all, so it can never
+        // clear a hold it did not acquire.
+        //
+        // WHAT IS *NOT* DONE HERE: no database work, no response WriteAsync, no notification, no
+        // arbitrary callback and no logger call happens while the pool's activity lock is held. The
+        // lock is held only inside the pool operations themselves; this whole block runs with no pool
+        // lock held.
+        //
+        // MUTATION OWNERSHIP: transport still does NOT touch the pipeline. The active-task pointer
+        // and the phase entry's worker output remain owned exclusively by the ADMITTED completion
+        // path (TaskCompletionService's guards + admission, and the PipelineDriver it drives). A
         // pre-admission write here could clear a SUCCESSOR's live pointer and overwrite its phase
         // output on behalf of a duplicate completion that admission subsequently rejects.
-
-        // ══ THE ACKNOWLEDGEMENT ELIGIBILITY ═══════════════════════════════════════════════════
-        // THE CONSERVATIVE EMISSION BOUNDARY: only a confirmed Record FOLLOWED BY an APPLIED checked
-        // release reaches here, so only such a completion can create eligibility. A mapping failure,
-        // a recording refusal and a refused checked release all returned above, so none of them
-        // creates eligibility and none of them emits an acknowledgement.
-        //
-        // THE CALLER'S HOLDER IS ADVANCED BEFORE THE ENQUEUE, deliberately: the eligibility fact must
-        // exist even if the best-effort publication below fails, because it is state about what
-        // happened, not about what could be delivered.
-        //
-        // A DISABLED registration stores nothing and acknowledges nothing. This is what keeps an
-        // existing (legacy) worker's runtime completely unchanged.
-        if (worker.CompletionReceiptAckEnabled)
+        try
         {
-            ackState.AdvanceLatestEligible(complete.TaskId);
+            // THE EXACT ACTIVE-QUEUE REMOVAL, inside the guarded scope on the holding route. It runs
+            // OUTSIDE the pool's lock and after the hold is already installed, so even a fault here
+            // ends the hold through the finally below. On the NON-holding route this removal already
+            // happened inside the preserved two-argument operation, so it is deliberately not
+            // repeated.
+            if (holdForCompletionPublication)
+                taskQueue.MarkComplete(complete.TaskId);
 
-            // THE BEST-EFFORT ACKNOWLEDGEMENT. Its failure is ISOLATED: it must never suppress the
-            // ordinary dashboard/downstream notification below, must never undo the release that
-            // already happened, and must never cause another Record or notification.
-            TryPublishCompletionReceiptAck(worker, complete.TaskId);
+            // THE POST-RELEASE, PRE-ACKNOWLEDGEMENT WINDOW ITSELF, OBSERVABLE. Null in production
+            // (the default), so this is exactly the release and removal above followed by the
+            // eligibility advance and the best-effort enqueue below — see the field's own
+            // documentation for why it exists, where exactly it sits, and what it may not do. It runs
+            // OUTSIDE the pool's lock: the release has already been applied and the hold is already
+            // installed, so the instance is already unselectable while this runs.
+            _afterCompletionReleaseBeforeAckForTest?.Invoke(worker, complete.TaskId);
+
+            // ══ THE ACKNOWLEDGEMENT ELIGIBILITY ══════════════════════════════════════════════
+            // THE CONSERVATIVE EMISSION BOUNDARY: only a confirmed Record FOLLOWED BY an APPLIED
+            // checked release reaches here, so only such a completion can create eligibility. A
+            // mapping failure, a recording refusal and a refused checked release all returned
+            // above, so none of them creates eligibility and none of them emits an acknowledgement.
+            //
+            // THE CALLER'S HOLDER IS ADVANCED BEFORE THE ENQUEUE, deliberately: the eligibility
+            // fact must exist even if the best-effort publication below fails, because it is state
+            // about what happened, not about what could be delivered. It is the SAME holder the
+            // classification was made against — never a fresh or shared one.
+            //
+            // A DISABLED registration stores nothing and acknowledges nothing, which is what keeps
+            // an existing (legacy) worker's runtime completely unchanged.
+            if (worker.CompletionReceiptAckEnabled)
+            {
+                ackState.AdvanceLatestEligible(complete.TaskId);
+
+                // THE BEST-EFFORT ACKNOWLEDGEMENT ENQUEUE. Its failure is ISOLATED: it must never
+                // suppress the ordinary dashboard/downstream notification below, must never undo the
+                // release that already happened, and must never cause another Record or notification.
+                //
+                // THE ENQUEUE ATTEMPT — NOT ITS DELIVERY — IS WHAT THE HOLD COVERS. Whatever this
+                // returns or throws, the hold ends below: a refused enqueue, a closed channel, a
+                // throwing diagnostic and a response writer that fails later in the pump all end the
+                // hold no later than the attempt, so the worker is never stranded unselectable on
+                // behalf of an acknowledgement nobody may ever receive.
+                TryPublishCompletionReceiptAck(worker, complete.TaskId);
+            }
+        }
+        finally
+        {
+            // THE HOLD IS ENDED FOR THE EXACT STILL-REGISTERED INSTANCE, and ONLY when THIS
+            // invocation acquired one: a release refusal or a legacy/disabled registration never
+            // clears anything. Only the hold flag is cleared — no role, model, task id or activity
+            // state is touched, and an ABA replacement is left untouched. It is a single
+            // lock-guarded flag write — no timeout, no retry loop, no lease expiry — and it
+            // deliberately does NOT wait for the acknowledgement to be written to the network or
+            // acknowledged by the worker.
+            if (holdForCompletionPublication)
+                workerPool.ClearCompletionPublicationHold(worker);
         }
 
+        // THE ORDINARY DASHBOARD/DOWNSTREAM NOTIFICATION, AFTER the hold is finished: the
+        // notification path never runs while the instance is still withheld from selection.
         _dashboardNotifier?.NotifyStateChanged();
         _ = Task.Run(async () =>
         {

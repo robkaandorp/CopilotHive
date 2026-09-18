@@ -2260,6 +2260,394 @@ public sealed class CompletionReceiptAckTests
     }
 
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  (4c) THE COMPLETION-PUBLICATION SELECTION HOLD'S ORDER AND SCOPE
+    //      (structural: the production completion path's statement order)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE COMPLETION PUBLICATION'S EXACT SHAPE, read off the production source: the release acquires
+    /// the hold only on the negotiated path, everything after the acquisition sits inside ONE
+    /// try/finally, the hold ends only for the invocation that acquired it, and the ordinary
+    /// notification follows the hold's end.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A STRUCTURAL VECTOR IS HONEST HERE. The properties it asserts are STATEMENT-ORDER
+    /// properties of one synchronous method — "is every operation after the acquisition inside the
+    /// guarded scope", "is the hold's end before the notification", "is the hold's end conditional on
+    /// having acquired one". Behavioural vectors (this suite and the transport ownership suite) prove
+    /// the effects; this one proves the SHAPE, so a future edit that hoists the clear out of the
+    /// finally, drops the opt-in gate or moves the notification inside the guarded scope fails loudly
+    /// rather than passing on a happy path.
+    /// </para>
+    /// <para>
+    /// IT IS NARROW: it names the exact identifiers it expects, so it cannot be satisfied by a
+    /// different arrangement that happens to contain the same words.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationHold_TheAcquisitionGateScopeAndOrderAreTheContract()
+    {
+        var source = ReadOrchestratorServiceSource();
+        var handler = StripComments(source.Between(
+            "private void HandleClassifiedTaskComplete(",
+            "private void LogCompletionNotRecorded("));
+
+        // ── (1) THE OPT-IN GATE: the hold is requested ONLY for a NEGOTIATED registration ───────
+        Assert.Contains(
+            "var holdForCompletionPublication = worker.CompletionReceiptAckEnabled;",
+            handler,
+            StringComparison.Ordinal);
+
+        // …and it selects between the two release routes on that exact condition: the holding route
+        // for the negotiated path, and the PRESERVED route for everything else.
+        Assert.Contains(
+            "var completionPublicationHeld = holdForCompletionPublication\n"
+            + "            ? workerPool.TryReleaseCompletedTaskHoldingForPublication(worker, complete.TaskId)\n"
+            + "            : ApplyTaskCompletion(worker, complete.TaskId);",
+            handler,
+            StringComparison.Ordinal);
+
+        // ── (2) THE RELEASE REFUSAL RETURNS BEFORE ANY HOLD END COULD RUN ──────────────────────
+        var refusalIndex = handler.IndexOf(
+            "OwnershipRefusalReasons.CheckedReleaseRefused", StringComparison.Ordinal);
+        Assert.True(refusalIndex >= 0, "the checked-release refusal reason is gone from the handler.");
+
+        // ── (3) ONE GUARDED SCOPE COVERS EVERY OPERATION AFTER THE ACQUISITION ─────────────────
+        // THE ANCHOR IS THE ACQUISITION ITSELF, NOT A FIRST TEXTUAL MATCH. `HandleClassifiedTaskComplete`
+        // contains SEVERAL earlier `try` blocks (the boundary mapping and the recorder), so anchoring on
+        // the first "        try" would select one of THOSE and the membership/ordering assertions below
+        // would be satisfied by a publication whose operations had escaped their guarded scope entirely.
+        // The publication's `try` is located strictly AFTER the refusal return, and its extent is
+        // computed by BALANCED BRACE MATCHING rather than by the next textual "finally".
+        var releaseIndex = handler.IndexOf(
+            "var completionPublicationHeld = holdForCompletionPublication", StringComparison.Ordinal);
+        Assert.True(releaseIndex >= 0, "the guarded release acquisition is gone from the handler.");
+        Assert.True(
+            releaseIndex < refusalIndex,
+            "the checked release must be attempted BEFORE its refusal return is evaluated.");
+
+        var tryIndex = handler.IndexOf("\n        try\n", refusalIndex, StringComparison.Ordinal);
+        Assert.True(
+            tryIndex >= 0,
+            "no guarded scope follows the checked release's refusal return — the publication's own "
+            + "try/finally is gone.");
+
+        // THE TWO BODIES, BY BALANCED BRACES: everything the publication does must live inside the
+        // FIRST, and the hold's end inside the SECOND.
+        var (tryBodyStart, tryBodyEnd) = BraceScopedBody(handler, tryIndex);
+        var finallyIndex = handler.IndexOf("\n        finally\n", tryBodyEnd, StringComparison.Ordinal);
+        Assert.True(
+            finallyIndex >= 0,
+            "the publication's guarded scope has no `finally` — the hold could not be ended on every path.");
+        var (finallyBodyStart, finallyBodyEnd) = BraceScopedBody(handler, finallyIndex);
+
+        var guardedScope = handler[tryBodyStart..tryBodyEnd];
+        var finallyBlock = handler[finallyBodyStart..finallyBodyEnd];
+
+        // EVERY POST-ACQUISITION OPERATION IS *INSIDE* THE GUARDED SCOPE. Moving any one of them
+        // before the `try` (or after the `finally`) fails here, which is the mandatory requirement:
+        // a removal, hook, eligibility or enqueue fault must never strand the hold.
+        foreach (var (name, statement) in new[]
+                 {
+                     ("the active-queue removal", "taskQueue.MarkComplete(complete.TaskId)"),
+                     ("the post-release window",
+                         "_afterCompletionReleaseBeforeAckForTest?.Invoke(worker, complete.TaskId)"),
+                     ("the eligibility advance", "ackState.AdvanceLatestEligible(complete.TaskId)"),
+                     ("the acknowledgement enqueue",
+                         "TryPublishCompletionReceiptAck(worker, complete.TaskId)"),
+                 })
+        {
+            Assert.True(
+                guardedScope.Contains(statement, StringComparison.Ordinal),
+                $"{name} is not inside the completion publication's try/finally scope, so a fault "
+                + "there would leave the selection hold installed.");
+
+            // …and it appears EXACTLY ONCE in the whole handler, so the membership above cannot be
+            // satisfied by a copy inside the scope while the live statement sits outside it.
+            Assert.Equal(1, CountOccurrences(handler, statement));
+        }
+
+        // THE ORDER INSIDE THE SCOPE IS STILL THE CONTRACT.
+        var queueRemovalIndex = handler.IndexOf(
+            "taskQueue.MarkComplete(complete.TaskId)", StringComparison.Ordinal);
+        var windowIndex = handler.IndexOf(
+            "_afterCompletionReleaseBeforeAckForTest?.Invoke(worker, complete.TaskId)",
+            StringComparison.Ordinal);
+        var eligibilityIndex = handler.IndexOf(
+            "ackState.AdvanceLatestEligible(complete.TaskId)", StringComparison.Ordinal);
+        var enqueueIndex = handler.IndexOf(
+            "TryPublishCompletionReceiptAck(worker, complete.TaskId)", StringComparison.Ordinal);
+        var clearIndex = handler.IndexOf(
+            "workerPool.ClearCompletionPublicationHold(worker);", StringComparison.Ordinal);
+        var notificationIndex = handler.IndexOf(
+            "_dashboardNotifier?.NotifyStateChanged();", StringComparison.Ordinal);
+
+        foreach (var (name, index) in new[]
+                 {
+                     ("the hold's end", clearIndex),
+                     ("the dashboard notification", notificationIndex),
+                 })
+        {
+            Assert.True(index >= 0, $"{name} is missing from the completion publication.");
+        }
+
+        Assert.True(
+            releaseIndex < refusalIndex && refusalIndex < tryIndex
+            && tryIndex < queueRemovalIndex && queueRemovalIndex < windowIndex
+            && windowIndex < eligibilityIndex && eligibilityIndex < enqueueIndex
+            && enqueueIndex < finallyIndex && finallyIndex < clearIndex
+            && clearIndex < notificationIndex,
+            "the completion publication's order changed: the release, its refusal return, the guarded "
+            + "scope, the queue removal, the window, the eligibility, the enqueue, the hold's end and "
+            + "the ordinary notification must appear in exactly that order.");
+
+        // ── (4) THE HOLD'S END IS INSIDE THE `finally` AND CONDITIONAL ON HAVING ACQUIRED ONE ──
+        // A refusal (or a legacy registration) must never clear a hold this invocation did not take,
+        // and the clear must be reached on EVERY path out of the scope — including an exception.
+        Assert.True(
+            finallyBlock.Contains("workerPool.ClearCompletionPublicationHold(worker);", StringComparison.Ordinal),
+            "the hold's end is not inside the publication's `finally`, so an exception would strand it.");
+        Assert.Contains(
+            "if (holdForCompletionPublication)",
+            finallyBlock,
+            StringComparison.Ordinal);
+
+        // ── (5) THE ORDINARY NOTIFICATION IS OUTSIDE THE GUARDED SCOPE ─────────────────────────
+        // A notification fault must not be able to reach the hold's end, and nothing is notified while
+        // the publication's scope is still open.
+        Assert.True(
+            notificationIndex > finallyBodyEnd,
+            "the ordinary dashboard notification must follow the END of the publication's guarded "
+            + "scope, not merely the textual position of the hold's end.");
+        Assert.DoesNotContain(
+            "_dashboardNotifier?.NotifyStateChanged", guardedScope, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "_dashboardNotifier?.NotifyStateChanged", finallyBlock, StringComparison.Ordinal);
+
+        // ── (6) NO DATABASE/LOGGER/CALLBACK WORK INSIDE THE RELEASE CALL ITSELF ────────────────
+        // The only calls the publication makes before the guarded scope are the two release routes;
+        // the pool owns the lock, so nothing held here can deadlock against a logger or a store.
+        Assert.Equal(1, CountOccurrences(handler, "TryReleaseCompletedTaskHoldingForPublication("));
+        Assert.Equal(1, CountOccurrences(handler, "ClearCompletionPublicationHold("));
+    }
+
+    /// <summary>
+    /// THE SELECTION HOLD'S THREE POOL-SIDE EFFECTS, read off the production source with BRACE-SCOPED
+    /// extraction: the idle-selection predicate is the COMBINED idle-and-not-held test evaluated
+    /// INSIDE the activity lock's body, the hold's INSTALLATION sits inside the checked release's own
+    /// lock body, and the checked Ready idle refuses while the hold is active.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// IT COMPLEMENTS THE BEHAVIOURAL WORKER-POOL VECTORS: they prove the effects, this one proves the
+    /// SHAPE — in particular that the two facts are read as ONE predicate INSIDE ONE lock body rather
+    /// than as two independent unlocked reads, which is exactly the difference between a real exclusion
+    /// and a window.
+    /// </para>
+    /// <para>
+    /// WHY BRACE SCOPE AND NOT TEXT ORDER. A bare "the lock keyword appears before the predicate"
+    /// assertion is satisfied by an EMPTY lock followed by an unlocked predicate, and by a
+    /// <c>BeginCompletionPublicationHold</c> call moved to AFTER the release's lock body closes — both
+    /// of which reintroduce the forbidden selectable interval. Binding each statement to the matched
+    /// BODY of its own <c>lock (_activityLock)</c> is what makes those mutations fail.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationHold_TheSelectionPredicateAndReadyRefusalAreTheContract()
+    {
+        var poolSource = ReadSourceFile("src/CopilotHive/Services/WorkerPool.cs");
+        var pool = new OrchestratorSource { Text = StripComments(poolSource) };
+
+        // ── (1) THE COMBINED PREDICATE LIVES INSIDE GetIdleWorker's OWN LOCK BODY ──────────────
+        const string combinedPredicate =
+            "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)";
+
+        var selection = pool.Between(
+            "public ConnectedWorker? GetIdleWorker()", "public IReadOnlyList<ConnectedWorker> GetAllWorkers()");
+        Assert.Contains(combinedPredicate, selection, StringComparison.Ordinal);
+
+        var selectionLockBody = LockBodyOf(selection, "GetIdleWorker");
+        Assert.True(
+            selectionLockBody.Contains(combinedPredicate, StringComparison.Ordinal),
+            "the combined idle-and-not-held predicate must be evaluated INSIDE the activity lock's "
+            + "body: an empty lock followed by an unlocked read is exactly the torn observation this "
+            + "predicate exists to prevent.");
+
+        // …and there is exactly ONE such predicate and ONE lock in the method, so the membership above
+        // cannot be satisfied by a second, unlocked copy doing the real selection.
+        Assert.Equal(1, CountOccurrences(selection, combinedPredicate));
+        Assert.Equal(1, CountOccurrences(selection, "lock (_activityLock)"));
+
+        // The selection also returns ONLY from inside that lock body — a return placed after the lock
+        // closes would re-open the very window under test.
+        Assert.Equal(2, CountOccurrences(selectionLockBody, "return "));
+        Assert.Equal(2, CountOccurrences(selection, "return "));
+
+        // ── (2) THE HOLD'S INSTALLATION LIVES INSIDE THE CHECKED RELEASE'S OWN LOCK BODY ───────
+        // This is the atomicity requirement itself: the idle reset and the hold must be applied in
+        // ONE lock span. A BeginCompletionPublicationHold moved AFTER the release's lock body — which
+        // a post-condition-only test cannot see — fails here.
+        const string holdInstallation = "expected.BeginCompletionPublicationHold();";
+
+        var release = pool.Between(
+            "private bool ReleaseCompletedTaskCore(", "internal bool ClearCompletionPublicationHold(");
+        Assert.Contains(holdInstallation, release, StringComparison.Ordinal);
+
+        var releaseLockBody = LockBodyOf(release, "ReleaseCompletedTaskCore");
+        foreach (var (name, statement) in new[]
+                 {
+                     ("the idle reset", "ResetToIdleNoLock(expected);"),
+                     ("the model clear", "expected.CurrentModel = null;"),
+                     ("the hold's installation", holdInstallation),
+                 })
+        {
+            Assert.True(
+                releaseLockBody.Contains(statement, StringComparison.Ordinal),
+                $"{name} must be applied INSIDE the checked release's activity-lock body, so the "
+                + "release and the hold are ONE observable step with no selectable interval between "
+                + "them.");
+        }
+
+        // …exactly once each, so none of them can also exist outside the lock body.
+        Assert.Equal(1, CountOccurrences(release, holdInstallation));
+        Assert.Equal(1, CountOccurrences(release, "lock (_activityLock)"));
+
+        // AND IT IS GATED ON THE OPT-IN, so the preserved route installs nothing.
+        Assert.Contains(
+            "if (holdForCompletionPublication)\n                expected.BeginCompletionPublicationHold();",
+            releaseLockBody,
+            StringComparison.Ordinal);
+
+        // ── (3) THE HOLD'S END ALSO HAPPENS UNDER THE LOCK, FOR THE EXACT REGISTERED INSTANCE ──
+        var clear = pool.Between(
+            "internal bool ClearCompletionPublicationHold(", "internal bool TryMarkIdleForReady(");
+        var clearLockBody = LockBodyOf(clear, "ClearCompletionPublicationHold");
+        Assert.True(
+            clearLockBody.Contains("expected.EndCompletionPublicationHold();", StringComparison.Ordinal),
+            "the hold's end must happen under the activity lock.");
+        Assert.True(
+            clearLockBody.Contains("ReferenceEquals(registered, expected)", StringComparison.Ordinal),
+            "the hold's end must re-check the exact registered instance under the same lock, so an "
+            + "ABA replacement is never mutated.");
+
+        // ── (4) THE CHECKED READY IDLE REFUSES WHILE HELD ─────────────────────────────────────
+        var ready = pool.Between(
+            "internal bool TryMarkIdleForReady(", "private bool IsStillOwnedNoLock(");
+        Assert.Contains(
+            "if (expected.CompletionPublicationPending)\n                return false;",
+            ready,
+            StringComparison.Ordinal);
+
+        var readyLockBody = LockBodyOf(ready, "TryMarkIdleForReady");
+        Assert.True(
+            readyLockBody.Contains(
+                "if (expected.CompletionPublicationPending)", StringComparison.Ordinal),
+            "the Ready refusal must be evaluated under the activity lock.");
+
+        // AND THE IDLE RESET DOES NOT ERASE THE HOLD: the shared field set is exactly the assignment
+        // fields.
+        var reset = pool.Between(
+            "private static void ResetToIdleNoLock(", "internal bool TryGetWorkerSnapshot(");
+        Assert.DoesNotContain("CompletionPublication", reset, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Extracts the BODY of the first <c>lock (_activityLock)</c> statement in
+    /// <paramref name="methodText"/>, delimited by BALANCED BRACES rather than by the next textual
+    /// closing brace.
+    /// </summary>
+    /// <remarks>
+    /// THE BALANCED MATCH IS THE WHOLE POINT: a lock body contains nested blocks (loops, ifs), so a
+    /// naive "up to the next `}`" slice would end at the first inner block and would then happily
+    /// report that a statement sitting OUTSIDE the lock is inside it.
+    /// </remarks>
+    /// <param name="methodText">The comment-stripped method text to search.</param>
+    /// <param name="methodName">The method's name, for a legible failure message.</param>
+    /// <returns>The text between the lock body's outermost braces.</returns>
+    private static string LockBodyOf(string methodText, string methodName)
+    {
+        var lockIndex = methodText.IndexOf("lock (_activityLock)", StringComparison.Ordinal);
+        Assert.True(
+            lockIndex >= 0,
+            $"'{methodName}' no longer takes the activity lock at all.");
+
+        var (start, end) = BraceScopedBody(methodText, lockIndex);
+        return methodText[start..end];
+    }
+
+    /// <summary>
+    /// Returns the half-open range of the block body that OPENS at the first <c>{</c> at or after
+    /// <paramref name="from"/>, matched by BALANCED BRACE COUNTING.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THIS EXISTS. Every structural claim in this file's hold vectors is a SCOPE claim — "this
+    /// statement is inside that try/lock body" — and a scope claim cannot be made with
+    /// <c>IndexOf</c> ordering alone: a first textual match can select an EARLIER, unrelated block,
+    /// and a naive end-delimiter can stop at the first nested block's closing brace. Both mistakes
+    /// make a scope assertion pass for code that escaped the scope.
+    /// </para>
+    /// <para>
+    /// IT IS A TEST-SIDE READER ONLY: it parses the comment-stripped production text and mutates
+    /// nothing. Brace counting is sufficient here because the scanned bodies contain no braces inside
+    /// string or character literals; an unbalanced input is a LOUD failure rather than a silent
+    /// truncation.
+    /// </para>
+    /// </remarks>
+    /// <param name="text">The comment-stripped source text.</param>
+    /// <param name="from">The index at or after which the block's opening brace is found.</param>
+    /// <returns>The body's start (just after <c>{</c>) and end (at the matching <c>}</c>).</returns>
+    private static (int Start, int End) BraceScopedBody(string text, int from)
+    {
+        var open = text.IndexOf('{', from);
+        Assert.True(open >= 0, "no block body opens after the anchor; the production shape changed.");
+
+        var depth = 0;
+        for (var i = open; i < text.Length; i++)
+        {
+            if (text[i] == '{')
+            {
+                depth++;
+            }
+            else if (text[i] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                    return (open + 1, i);
+            }
+        }
+
+        Assert.Fail("the block body opened at the anchor is never closed; the production shape changed.");
+        return default;
+    }
+
+    /// <summary>
+    /// Loads a repository file by its repository-relative path, walking up from the test assembly to
+    /// the repository root. A MISSING FILE IS A LOUD FAILURE, never a silently skipped assertion.
+    /// </summary>
+    /// <param name="relative">The repository-relative path.</param>
+    /// <returns>The file's text.</returns>
+    private static string ReadSourceFile(string relative)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine(
+                directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+
+            directory = directory.Parent;
+        }
+
+        Assert.Fail(
+            $"'{relative}' was not found walking up from '{AppContext.BaseDirectory}'; the structural "
+            + "vector cannot be evaluated.");
+        return null!;
+    }
+
     /// <summary>
     /// THE PRODUCTION LOG FRAGMENTS these duplicate vectors synchronize on. Kept together so a wording
     /// change in production surfaces as one obvious edit rather than as scattered flaky waits.
@@ -4129,9 +4517,24 @@ public sealed class CompletionReceiptAckTests
             var message = formatter(state, exception);
 
             List<TaskCompletionSource> matched = [];
+            var faulted = false;
             lock (_messages)
             {
                 _messages.Add(message);
+
+                // ARMED FAULTS ARE COUNTED BEFORE any waiter is released: a test that awaits the
+                // diagnostic's own signal must never observe a counter that has not yet been
+                // incremented. The THROW itself still happens after the waiters are released, so
+                // the production code really emitted the diagnostic and the FAULT is what its
+                // guard must survive.
+                foreach (var fragment in _armed.Keys)
+                {
+                    if (!message.Contains(fragment, StringComparison.Ordinal))
+                        continue;
+
+                    Interlocked.Increment(ref _throwCount);
+                    faulted = true;
+                }
 
                 for (var i = _waiters.Count - 1; i >= 0; i--)
                 {
@@ -4146,16 +4549,8 @@ public sealed class CompletionReceiptAckTests
             foreach (var signal in matched)
                 signal.TrySetResult();
 
-            // ARMED FAULTS FIRE AFTER the message was recorded and its waiters were released, so the
-            // production code really emitted the diagnostic and the FAULT is what its guard must survive.
-            foreach (var fragment in _armed.Keys)
-            {
-                if (!message.Contains(fragment, StringComparison.Ordinal))
-                    continue;
-
-                Interlocked.Increment(ref _throwCount);
+            if (faulted)
                 throw new InvalidOperationException("the logger itself threw SENTINEL");
-            }
         }
     }
 

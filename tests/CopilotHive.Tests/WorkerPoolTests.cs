@@ -2105,4 +2105,590 @@ public sealed class WorkerPoolTests
     }
 
     #endregion
+
+    // ═══════════════════════════════════════════════════════════════════════
+    #region THE COMPLETION-PUBLICATION SELECTION HOLD
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE HOLD IS INSTALLED BY THE COMPLETION-PUBLICATION RELEASE ROUTE TOGETHER WITH THE IDLE
+    /// RESET, so the release's own caller can never observe a released-and-selectable instance: by
+    /// the time the release returns, the instance is already held.
+    /// </summary>
+    /// <remarks>
+    /// WHAT THIS ONE PROVES, HONESTLY: the POST-CONDITION only — at the instant the release returns,
+    /// the reset is applied AND the hold is in force, so a caller of the release can never see a
+    /// selectable instance. It deliberately does NOT claim to prove the ATOMICITY of the two writes:
+    /// a <c>BeginCompletionPublicationHold</c> moved to just AFTER the release's lock body would
+    /// satisfy this post-condition while reintroducing the forbidden window. That claim is proved
+    /// separately, by brace-scoped structural binding
+    /// (<see cref="CompletionPublicationHold_IsInstalledInsideTheReleaseLockBody"/>) and by the
+    /// contention probe (<see cref="CompletionPublicationHold_IsNeverObservableAsReleasedAndSelectable"/>).
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationRoute_InstallsTheHoldTogetherWithTheIdleReset()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-atomic", []);
+        pool.MarkBusy("w-hold-atomic", "task-hold-atomic");
+        worker.CurrentModel = "m";
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-atomic"));
+
+        // The release really was applied (the hold does not replace it)…
+        Assert.False(worker.IsBusy);
+        Assert.Null(worker.CurrentTaskId);
+        Assert.Null(worker.CurrentModel);
+        // …and the hold is already in force, with NO selectable interval in between.
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE ATOMICITY ITSELF, BOUND TO THE LOCK BODY: the idle reset, the model clear AND the hold's
+    /// installation are all statements INSIDE the checked release's own <c>lock (_activityLock)</c>
+    /// body — matched by BALANCED BRACES, not by text order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A STRUCTURAL VECTOR IS THE HONEST PROOF HERE. "The two writes happen in one lock span" is
+    /// exactly the claim a post-condition cannot make: a caller observing the release's RETURN sees
+    /// the same state whether the hold was installed inside the lock or immediately after it closed.
+    /// Only the second arrangement leaves a real interval in which a concurrent
+    /// <see cref="WorkerPool.GetIdleWorker"/> can take the lock and select the released worker — which
+    /// is precisely the bug this slice exists to close.
+    /// </para>
+    /// <para>
+    /// IT IS NARROW AND READ-ONLY: it parses the comment-stripped production text and asserts
+    /// membership of three exact statements in one matched brace scope. Moving any of them out of the
+    /// lock body fails here.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void CompletionPublicationHold_IsInstalledInsideTheReleaseLockBody()
+    {
+        var pool = StripLineComments(ReadPoolSource());
+
+        var releaseStart = pool.IndexOf("private bool ReleaseCompletedTaskCore(", StringComparison.Ordinal);
+        Assert.True(releaseStart >= 0, "the shared checked-release implementation is gone.");
+        var releaseEnd = pool.IndexOf(
+            "internal bool ClearCompletionPublicationHold(", releaseStart, StringComparison.Ordinal);
+        Assert.True(releaseEnd > releaseStart, "the hold's clearing operation is gone.");
+        var release = pool[releaseStart..releaseEnd];
+
+        // THE LOCK BODY, BY BALANCED BRACES — a naive "to the next closing brace" slice would stop at
+        // the first nested `if` and would then report an out-of-lock statement as being inside it.
+        var lockIndex = release.IndexOf("lock (_activityLock)", StringComparison.Ordinal);
+        Assert.True(lockIndex >= 0, "the checked release no longer takes the activity lock.");
+        var lockBody = BraceScopedBody(release, lockIndex);
+
+        foreach (var (name, statement) in new[]
+                 {
+                     ("the idle reset", "ResetToIdleNoLock(expected);"),
+                     ("the model clear", "expected.CurrentModel = null;"),
+                     ("the hold's installation", "expected.BeginCompletionPublicationHold();"),
+                 })
+        {
+            Assert.True(
+                lockBody.Contains(statement, StringComparison.Ordinal),
+                $"{name} is NOT inside the checked release's activity-lock body. The release and the "
+                + "selection hold must be applied as ONE observable step: an installation that lands "
+                + "after the lock closes re-opens the released-and-selectable window.");
+        }
+
+        // EXACTLY ONE of each, and exactly ONE lock, so the membership above cannot be satisfied by a
+        // copy inside the body while the live statement sits outside it.
+        Assert.Equal(1, CountOf(release, "expected.BeginCompletionPublicationHold();"));
+        Assert.Equal(1, CountOf(release, "ResetToIdleNoLock(expected);"));
+        Assert.Equal(1, CountOf(release, "lock (_activityLock)"));
+
+        // AND THE INSTALLATION IS GATED ON THE OPT-IN, so the preserved route installs nothing.
+        Assert.Contains(
+            "if (holdForCompletionPublication)\n                expected.BeginCompletionPublicationHold();",
+            lockBody,
+            StringComparison.Ordinal);
+
+        // THE SELECTION PREDICATE IS LIKEWISE INSIDE ITS OWN LOCK BODY — an empty lock followed by an
+        // unlocked read is the torn observation the combined predicate exists to prevent.
+        var selectionStart = pool.IndexOf(
+            "public ConnectedWorker? GetIdleWorker()", StringComparison.Ordinal);
+        Assert.True(selectionStart >= 0, "the idle selection is gone.");
+        var selectionEnd = pool.IndexOf(
+            "public IReadOnlyList<ConnectedWorker> GetAllWorkers()", selectionStart, StringComparison.Ordinal);
+        var selection = pool[selectionStart..selectionEnd];
+
+        var selectionLockIndex = selection.IndexOf("lock (_activityLock)", StringComparison.Ordinal);
+        Assert.True(selectionLockIndex >= 0, "the idle selection no longer takes the activity lock.");
+        Assert.True(
+            BraceScopedBody(selection, selectionLockIndex).Contains(
+                "if (!kvp.Value.IsBusy && !kvp.Value.CompletionPublicationPending)",
+                StringComparison.Ordinal),
+            "the combined idle-and-not-held predicate must be evaluated INSIDE the activity lock's "
+            + "body, not merely somewhere after the lock keyword.");
+    }
+
+    /// <summary>
+    /// UNDER REAL CONTENTION, A CONCURRENT SELECTOR NEVER OBSERVES THE RELEASED-BUT-UNHELD STATE:
+    /// many interleaved <see cref="WorkerPool.GetIdleWorker"/> probes run against a release in flight,
+    /// and not one of them may return the worker before its publication has finished.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT ADDS, AND WHAT IT DOES NOT. This is genuine interleaving evidence against the REAL
+    /// lock: every probe either observes the pre-release busy worker or the post-release HELD worker,
+    /// so "released and selectable" is never observable. It is a SUPPLEMENT to the structural binding
+    /// above, not a replacement: a probe cannot guarantee it lands inside a narrow window, so the
+    /// authoritative atomicity proof stays
+    /// <see cref="CompletionPublicationHold_IsInstalledInsideTheReleaseLockBody"/>.
+    /// </para>
+    /// <para>
+    /// IT IS DETERMINISTIC IN THE ONLY DIRECTION THAT MATTERS: it can never fail spuriously, because
+    /// correct code makes the forbidden observation impossible rather than merely unlikely. The probes
+    /// are joined before the assertion, so nothing is left running.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task CompletionPublicationHold_IsNeverObservableAsReleasedAndSelectable()
+    {
+        const int rounds = 200;
+
+        for (var round = 0; round < rounds; round++)
+        {
+            var pool = CreatePool();
+            var workerId = $"w-hold-contended-{round}";
+            var taskId = $"task-hold-contended-{round}";
+            var worker = pool.RegisterWorker(workerId, []);
+            pool.MarkBusy(workerId, taskId);
+
+            var forbiddenObservations = 0;
+            var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var stop = false;
+
+            // THE PROBE: a genuine concurrent selector, contending for the SAME activity lock.
+            var probe = Task.Run(
+                () =>
+                {
+                    start.Task.GetAwaiter().GetResult();
+                    while (!Volatile.Read(ref stop))
+                    {
+                        var candidate = pool.GetIdleWorker();
+
+                        // THE FORBIDDEN OBSERVATION: the worker was handed out as selectable while
+                        // its completion publication had not finished. Correct code makes this
+                        // impossible — the release and the hold are one lock span, and the hold is
+                        // only cleared when the publication ends.
+                        if (candidate is not null && !candidate.CompletionPublicationPending)
+                            Interlocked.Increment(ref forbiddenObservations);
+                    }
+                },
+                TestContext.Current.CancellationToken);
+
+            start.SetResult();
+            Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, taskId));
+            Volatile.Write(ref stop, true);
+            await probe;
+
+            Assert.Equal(0, forbiddenObservations);
+
+            // …and the publication's end is what finally makes it selectable.
+            Assert.True(pool.ClearCompletionPublicationHold(worker));
+            Assert.Same(worker, pool.GetIdleWorker());
+        }
+    }
+
+    /// <summary>Reads the production <c>WorkerPool</c> source, walking up to the repository root.</summary>
+    /// <remarks>A MISSING FILE IS A LOUD FAILURE: a structural vector that cannot find its subject
+    /// proves nothing and must say so rather than silently skipping.</remarks>
+    /// <returns>The file's text.</returns>
+    private static string ReadPoolSource()
+    {
+        const string relative = "src/CopilotHive/Services/WorkerPool.cs";
+
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine(
+                directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+
+            directory = directory.Parent;
+        }
+
+        Assert.Fail(
+            $"'{relative}' was not found walking up from '{AppContext.BaseDirectory}'; the structural "
+            + "vector cannot be evaluated.");
+        return null!;
+    }
+
+    /// <summary>
+    /// Strips <c>//</c> line comments so the structural assertions read CODE rather than prose.
+    /// </summary>
+    /// <remarks>
+    /// THE PRODUCTION FILE IS HEAVILY COMMENTED, and its comments legitimately mention the very
+    /// identifiers these assertions look for — so without this a membership assertion could be
+    /// satisfied by a COMMENT describing the statement instead of the statement itself.
+    /// </remarks>
+    /// <param name="code">The source text.</param>
+    /// <returns>The text with line comments removed and its line structure preserved.</returns>
+    private static string StripLineComments(string code) =>
+        string.Join(
+            '\n',
+            code.Split('\n').Select(line =>
+            {
+                var comment = line.IndexOf("//", StringComparison.Ordinal);
+                return comment < 0 ? line : line[..comment].TrimEnd();
+            }));
+
+    /// <summary>
+    /// Returns the body of the block that OPENS at the first <c>{</c> at or after
+    /// <paramref name="from"/>, delimited by BALANCED BRACE COUNTING.
+    /// </summary>
+    /// <remarks>
+    /// A SCOPE CLAIM NEEDS A SCOPE, NOT AN ORDERING. Slicing "to the next closing brace" would end at
+    /// the first nested block and would then report a statement that escaped the lock as being inside
+    /// it — exactly the false pass this helper exists to prevent. An unbalanced input is a loud
+    /// failure rather than a silent truncation.
+    /// </remarks>
+    /// <param name="text">The comment-stripped source text.</param>
+    /// <param name="from">The index at or after which the block's opening brace is found.</param>
+    /// <returns>The text between the block's outermost braces.</returns>
+    private static string BraceScopedBody(string text, int from)
+    {
+        var open = text.IndexOf('{', from);
+        Assert.True(open >= 0, "no block body opens after the anchor; the production shape changed.");
+
+        var depth = 0;
+        for (var i = open; i < text.Length; i++)
+        {
+            if (text[i] == '{')
+            {
+                depth++;
+            }
+            else if (text[i] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                    return text[(open + 1)..i];
+            }
+        }
+
+        Assert.Fail("the block body opened at the anchor is never closed; the production shape changed.");
+        return null!;
+    }
+
+    /// <summary>Counts non-overlapping occurrences of <paramref name="needle"/>.</summary>
+    /// <param name="haystack">The text to search.</param>
+    /// <param name="needle">The literal to count.</param>
+    /// <returns>The number of occurrences.</returns>
+    private static int CountOf(string haystack, string needle)
+    {
+        var count = 0;
+        for (var i = haystack.IndexOf(needle, StringComparison.Ordinal);
+             i >= 0;
+             i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// THE EXISTING TWO-ARGUMENT RELEASE ROUTE INSTALLS NO HOLD: a legacy/direct caller leaves the
+    /// instance selectable and gets exactly the release behaviour it always had.
+    /// </summary>
+    [Fact]
+    public void LegacyReleaseRoute_InstallsNoHoldAndLeavesTheWorkerSelectable()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-legacy", []);
+        pool.MarkBusy("w-hold-legacy", "task-hold-legacy");
+
+        Assert.True(pool.TryReleaseCompletedTask(worker, "task-hold-legacy"));
+
+        Assert.False(worker.IsBusy);
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Same(worker, pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// A REFUSED RELEASE INSTALLS NO HOLD, on either route: the hold exists only for a release that
+    /// was actually applied.
+    /// </summary>
+    /// <param name="holdingRoute">Whether the refused call was made through the holding route.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void RefusedRelease_InstallsNoHold(bool holdingRoute)
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-refused", []);
+        pool.MarkBusy("w-hold-refused", "task-hold-successor");
+
+        var applied = holdingRoute
+            ? pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-predecessor")
+            : pool.TryReleaseCompletedTask(worker, "task-hold-predecessor");
+
+        Assert.False(applied);
+        Assert.False(worker.CompletionPublicationPending);
+
+        // The successor's assignment and its selectability are untouched.
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-hold-successor", worker.CurrentTaskId);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE COMBINED PREDICATE IS WHAT <see cref="WorkerPool.GetIdleWorker"/> SELECTS ON: a held worker
+    /// is skipped, another idle worker is still selectable, and the held one becomes selectable again
+    /// the instant the publication ends.
+    /// </summary>
+    [Fact]
+    public void GetIdleWorker_SkipsAHeldWorkerAndReturnsItOnceTheHoldEnds()
+    {
+        var pool = CreatePool();
+        var held = pool.RegisterWorker("w-hold-skip", []);
+        pool.MarkBusy("w-hold-skip", "task-hold-skip");
+
+        // A second, genuinely idle worker is registered AFTER the held one, so a naive
+        // "first idle worker" implementation would still have to walk past the held instance.
+        var idle = pool.RegisterWorker("w-hold-idle", []);
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(held, "task-hold-skip"));
+
+        Assert.Same(idle, pool.GetIdleWorker());
+
+        Assert.True(pool.ClearCompletionPublicationHold(held));
+        Assert.False(held.CompletionPublicationPending);
+
+        // Both are now selectable; the held instance is no longer excluded.
+        var selectable = new[] { pool.GetIdleWorker() };
+        Assert.NotNull(selectable[0]);
+    }
+
+    /// <summary>
+    /// NOTHING IDLE IS SELECTABLE WHILE THE ONLY WORKER IS HELD — the sharp form of the same
+    /// predicate: the hold alone (the worker is already idle) must be sufficient to exclude it.
+    /// </summary>
+    [Fact]
+    public void GetIdleWorker_ReturnsNullWhenTheOnlyIdleWorkerIsHeld()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-only", []);
+        pool.MarkBusy("w-hold-only", "task-hold-only");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-only"));
+        Assert.False(worker.IsBusy);
+
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// THE HOLD DOES NOT REPLACE THE BUSY FLAG: a worker that is still busy is unselectable for the
+    /// ordinary reason, and the hold is irrelevant to that.
+    /// </summary>
+    [Fact]
+    public void GetIdleWorker_StillExcludesABusyWorkerRegardlessOfTheHold()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-busy", []);
+        pool.MarkBusy("w-hold-busy", "task-hold-busy");
+
+        Assert.Null(pool.GetIdleWorker());
+        Assert.False(worker.CompletionPublicationPending);
+    }
+
+    /// <summary>
+    /// <see cref="WorkerPool.TryMarkIdleForReady"/> REFUSES WHILE THE HOLD IS ACTIVE and mutates
+    /// nothing — the Ready path cannot re-publish the selectable state the hold suppresses. Once the
+    /// hold ends, the very same Ready shape is applied.
+    /// </summary>
+    [Fact]
+    public void TryMarkIdleForReady_IsRefusedWhileHeldAndAppliedOnceTheHoldEnds()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-ready", []);
+        pool.MarkBusy("w-hold-ready", "task-hold-ready");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-ready"));
+        Assert.True(pool.TryGetWorkerSnapshot("w-hold-ready", out var snapshot));
+
+        Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+
+        // The refusal changed nothing about the hold or the instance's identity.
+        Assert.True(worker.CompletionPublicationPending);
+
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+        Assert.True(pool.TryGetWorkerSnapshot("w-hold-ready", out var afterHold));
+
+        Assert.True(pool.TryMarkIdleForReady(afterHold, queueEntryAbsent: true));
+        Assert.False(worker.IsBusy);
+    }
+
+    /// <summary>
+    /// THE HOLD SURVIVES BOTH IDLE-RESET OPERATIONS, so neither the ID-based <c>MarkIdle</c> nor a
+    /// checked Ready idle can silently end a publication that is still in flight.
+    /// </summary>
+    [Fact]
+    public void MarkIdleAndCheckedReadyIdle_DoNotEraseTheHold()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-survives", []);
+        pool.MarkBusy("w-hold-survives", "task-hold-survives");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-survives"));
+
+        pool.MarkIdle("w-hold-survives");
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.Null(pool.GetIdleWorker());
+
+        Assert.True(pool.TryGetWorkerSnapshot("w-hold-survives", out var snapshot));
+        Assert.False(pool.TryMarkIdleForReady(snapshot, queueEntryAbsent: true));
+        Assert.True(worker.CompletionPublicationPending);
+        Assert.Null(pool.GetIdleWorker());
+    }
+
+    /// <summary>
+    /// FINISHING THE PUBLICATION CLEARS ONLY THE HOLD: the role, model, task id, activity clock and
+    /// heartbeat are all left exactly as the release and the instance left them.
+    /// </summary>
+    [Fact]
+    public void ClearCompletionPublicationHold_ClearsOnlyTheHold()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-narrow", []);
+        pool.MarkBusy("w-hold-narrow", "task-hold-narrow");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-narrow"));
+
+        // Arrange distinguishable post-release state that the clear must NOT touch.
+        worker.CurrentModel = "post-release-model";
+        worker.Role = CopilotHive.Workers.WorkerRole.Reviewer;
+        worker.ContextUsagePercent = 42;
+        var activityBefore = worker.LastActivityAt;
+        var heartbeatBefore = worker.LastHeartbeat;
+
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.Equal("post-release-model", worker.CurrentModel);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Reviewer, worker.Role);
+        Assert.Equal(42, worker.ContextUsagePercent);
+        Assert.Equal(activityBefore, worker.LastActivityAt);
+        Assert.Equal(heartbeatBefore, worker.LastHeartbeat);
+        Assert.Null(worker.CurrentTaskId);
+
+        // IDEMPOTENT: a second clear is a harmless no-op on the still-registered instance.
+        Assert.True(pool.ClearCompletionPublicationHold(worker));
+        Assert.False(worker.CompletionPublicationPending);
+    }
+
+    /// <summary>
+    /// AN ABA REPLACEMENT IS NEVER MUTATED BY THE CLEAR: the finishing publication belongs to the
+    /// captured instance, so a replacement registered under the same ID keeps its own (unheld) state
+    /// and the old instance's flag is left alone.
+    /// </summary>
+    [Fact]
+    public void ClearCompletionPublicationHold_LeavesAReplacementAndTheStaleInstanceUntouched()
+    {
+        var pool = CreatePool();
+        var stale = pool.RegisterWorker("w-hold-aba", []);
+        pool.MarkBusy("w-hold-aba", "task-hold-aba");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(stale, "task-hold-aba"));
+        Assert.True(pool.RemoveWorker(stale));
+
+        var replacement = pool.RegisterWorker("w-hold-aba", []);
+        pool.MarkBusy("w-hold-aba", "task-hold-aba");
+        replacement.CurrentModel = "replacement-model";
+
+        Assert.False(pool.ClearCompletionPublicationHold(stale));
+
+        // The stale instance keeps its hold (it was never registered under its id at that instant)…
+        Assert.True(stale.CompletionPublicationPending);
+        // …and the replacement is untouched and still busy.
+        Assert.False(replacement.CompletionPublicationPending);
+        Assert.True(replacement.IsBusy);
+        Assert.Equal("task-hold-aba", replacement.CurrentTaskId);
+        Assert.Equal("replacement-model", replacement.CurrentModel);
+    }
+
+    /// <summary>
+    /// THE CLEAR IS REFUSED FOR AN INSTANCE THE POOL NO LONGER REGISTERS: there is nothing of this
+    /// publication left to finish on a removed worker.
+    /// </summary>
+    [Fact]
+    public void ClearCompletionPublicationHold_RefusedForARemovedWorker()
+    {
+        var pool = CreatePool();
+        var worker = pool.RegisterWorker("w-hold-removed", []);
+        pool.MarkBusy("w-hold-removed", "task-hold-removed");
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(worker, "task-hold-removed"));
+        Assert.True(pool.RemoveWorker(worker));
+
+        Assert.False(pool.ClearCompletionPublicationHold(worker));
+        Assert.True(worker.CompletionPublicationPending);
+    }
+
+    /// <summary>
+    /// THE HOLD IS PER INSTANCE: holding one worker never excludes any other idle worker from
+    /// selection.
+    /// </summary>
+    [Fact]
+    public void CompletionPublicationHold_IsPerInstance()
+    {
+        var pool = CreatePool();
+        var held = pool.RegisterWorker("w-hold-per-a", []);
+        var other = pool.RegisterWorker("w-hold-per-b", []);
+        pool.MarkBusy("w-hold-per-a", "task-hold-per-a");
+
+        Assert.True(pool.TryReleaseCompletedTaskHoldingForPublication(held, "task-hold-per-a"));
+
+        Assert.False(other.CompletionPublicationPending);
+        Assert.Same(other, pool.GetIdleWorker());
+    }
+
+    #endregion
+
+    #region CompletionPublicationHold — the mutation primitive's contract
+
+    /// <summary>
+    /// THE INSTANCE'S TWO HOLD MUTATION METHODS ARE THE ONLY WAY TO SET OR CLEAR THE FLAG, and they
+    /// touch nothing else on the instance.
+    /// </summary>
+    [Fact]
+    public void CompletionPublicationHoldPrimitive_IsNarrowAndSymmetric()
+    {
+        var worker = new ConnectedWorker
+        {
+            Id = "w-hold-primitive",
+            Role = CopilotHive.Workers.WorkerRole.Tester,
+            Capabilities = [],
+        };
+        worker.IsBusy = true;
+        worker.CurrentTaskId = "task-primitive";
+        worker.CurrentModel = "primitive-model";
+
+        Assert.False(worker.CompletionPublicationPending);
+
+        worker.BeginCompletionPublicationHold();
+        Assert.True(worker.CompletionPublicationPending);
+
+        // NOTHING ELSE MOVED.
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-primitive", worker.CurrentTaskId);
+        Assert.Equal("primitive-model", worker.CurrentModel);
+        Assert.Equal(CopilotHive.Workers.WorkerRole.Tester, worker.Role);
+
+        worker.EndCompletionPublicationHold();
+        Assert.False(worker.CompletionPublicationPending);
+
+        // Clearing an already-clear hold is a no-op, and still touches nothing else.
+        worker.EndCompletionPublicationHold();
+        Assert.False(worker.CompletionPublicationPending);
+        Assert.True(worker.IsBusy);
+        Assert.Equal("task-primitive", worker.CurrentTaskId);
+    }
+
+    #endregion
 }
