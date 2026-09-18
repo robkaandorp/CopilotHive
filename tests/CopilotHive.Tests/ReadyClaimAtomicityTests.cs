@@ -874,6 +874,83 @@ public sealed class ReadyClaimAtomicityTests
     }
 
     /// <summary>
+    /// THE OUTER GUIDANCE WARNING'S OWN GUARD IS GENUINELY REACHABLE AND HOLDS: a guidance failure
+    /// that happens BEFORE the send's inner <c>try</c> — the agents.md read itself faults — escapes
+    /// <c>SendAgentsMdAsync</c> to the Ready path's outer catch, whose
+    /// <see cref="HiveOrchestratorService"/> guidance warning is then guarded, so even a logger that
+    /// throws ON that warning cannot escape or mask the outcome. Publication continues on the exact
+    /// claimed instance.
+    /// </summary>
+    /// <remarks>
+    /// THE FAULT IS DETERMINISTIC AND REAL: the coder role's agents.md path is REPLACED BY A
+    /// DIRECTORY, so the production <c>File.ReadAllText</c> inside <c>GetAgentsMd</c> — which runs
+    /// outside the send's inner try — throws a plain IO exception. This is the only remaining vector
+    /// that genuinely reaches the outer <c>LogGuidanceBestEffortFailed</c> emission after the
+    /// send-failure diagnostic was guarded.
+    /// </remarks>
+    [Fact]
+    public async Task Ready_GuidanceReadFault_OuterGuidanceWarningGuardSurvivesAThrowingLogger()
+    {
+        var f = Fixture.Create(withAgentsManager: true);
+        var loggerFailure = new InvalidOperationException("the guidance warning's logger threw");
+        f.Logger.ThrowFactory = message =>
+            message.StartsWith("agents.md update failed", StringComparison.Ordinal)
+                ? loggerFailure
+                : null;
+
+        // THE REAL PRE-TRY FAULT: the agents.md "file" for the delivered role is a directory, so the
+        // read inside GetAgentsMd throws before SendAgentsMdAsync's inner try is even entered.
+        var agentsFilePath = Path.Combine(
+            Path.GetTempPath(), $"copilothive-ready-claim-agents-{Guid.NewGuid():N}",
+            $"{WorkerRole.Coder.ToRoleName()}.agents.md");
+        Directory.CreateDirectory(agentsFilePath);
+
+        try
+        {
+            var task = BuildTask("task-guidance-read-fault");
+            f.Queue.Enqueue(task);
+
+            await InvokeReadyAsync(f.Service, f.Worker, TestContext.Current.CancellationToken);
+
+            // THE OUTER GUIDANCE WARNING REALLY WAS ATTEMPTED, and its guard contained the throw:
+            // the failing emission is not recorded (the guard swallowed it), but the send reached
+            // the outer catch — so the vector is not vacuous. The send's own guarded diagnostic is
+            // NOT the one here: no "Failed to send AGENTS.md" line can exist, because the fault
+            // happened before the send's inner try.
+            Assert.DoesNotContain(
+                f.Logger.Entries,
+                e => e.Message.StartsWith("Failed to send AGENTS.md", StringComparison.Ordinal));
+            Assert.Contains(
+                f.Logger.Entries,
+                e => e.Message.Contains("Worker w-ready-claim is ready", StringComparison.Ordinal));
+
+            // NOTHING ESCAPED and the primary outcome stands: the claim stands and publication
+            // continued on the exact claimed instance and the ACTUAL task.
+            var (publishedWorker, publishedTask) = Assert.Single(f.Publisher.Calls);
+            Assert.Same(f.Worker, publishedWorker);
+            Assert.Same(task, publishedTask);
+            Assert.True(f.Worker.IsBusy);
+            Assert.Equal(task.TaskId, f.Worker.CurrentTaskId);
+            Assert.Same(task, f.Queue.GetActiveTask(task.TaskId));
+            Assert.Equal(WorkerId, task.Metadata["assigned_worker"]);
+            Assert.Null(f.Queue.TryDequeueAny());
+        }
+        finally
+        {
+            // BEST-EFFORT CLEANUP: remove the directory standing in for the agents file.
+            try
+            {
+                if (Directory.Exists(agentsFilePath))
+                    Directory.Delete(agentsFilePath);
+            }
+            catch
+            {
+                // A leftover directory must never fail the test.
+            }
+        }
+    }
+
+    /// <summary>
     /// THE REFUSAL PATH'S HOOK CONTRACT IS UNCHANGED: a hook-thrown
     /// <see cref="OperationCanceledException"/> on the REFUSAL path still propagates UNCHANGED —
     /// the pre-claim path's containment is specific to the cancellation path, where the caller's
