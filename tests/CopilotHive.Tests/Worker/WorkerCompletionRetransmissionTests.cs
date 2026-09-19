@@ -996,6 +996,53 @@ public sealed class WorkerCompletionRetransmissionTests
     }
 
     /// <summary>
+    /// ASSERTION-FAILURE CLEANUP: a deliberate xUnit failure is raised while the real loop and a
+    /// concrete retry task are live. The fixture's normal <c>finally</c> teardown must join both,
+    /// delete the unique temp root, and never replace the original assertion with cleanup output.
+    /// </summary>
+    [Fact]
+    public async Task Teardown_OnAssertionFailure_KeepsPrimaryAndDeletesRootAfterJoiningTasks()
+    {
+        RetryHarness? harness = null;
+        Task? loop = null;
+        Task? retry = null;
+
+        var failure = await Record.ExceptionAsync(async () =>
+        {
+            var owned = harness = new RetryHarness();
+            try
+            {
+                await owned.StartAsync();
+                owned.ReleasePrompt(TaskA);
+                await owned.CompleteEnteredAsync(0);
+                await owned.RetryParkedInDelayAsync(1);
+
+                loop = owned.Loop;
+                retry = owned.Retry;
+                Assert.False(loop.IsCompleted);
+                Assert.False(retry.IsCompleted);
+                Assert.True(owned.RootExists, "precondition: the temp root must exist.");
+
+                Assert.Fail("DELIBERATE-RETRY-HARNESS-PRIMARY");
+            }
+            finally
+            {
+                await owned.TeardownAsync();
+            }
+        });
+
+        var primary = Assert.IsType<Xunit.Sdk.FailException>(failure);
+        Assert.Contains("DELIBERATE-RETRY-HARNESS-PRIMARY", primary.Message, StringComparison.Ordinal);
+
+        var disposed = Assert.IsType<RetryHarness>(harness);
+        Assert.NotNull(loop);
+        Assert.NotNull(retry);
+        Assert.True(loop.IsCompleted, "teardown must join the real loop before returning.");
+        Assert.True(retry.IsCompleted, "teardown must join the concrete retry before returning.");
+        Assert.False(disposed.RootExists, "assertion-failure teardown must delete: " + disposed.RootPath);
+    }
+
+    /// <summary>
     /// NO PAYLOAD, NO RETRY. A handled provisioning failure produces NO result, so nothing is
     /// frozen, no delay is ever created and no Complete is ever written — in EVERY negotiation
     /// mode. The loop stays healthy throughout.

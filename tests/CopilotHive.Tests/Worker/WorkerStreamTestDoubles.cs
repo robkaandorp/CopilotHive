@@ -111,9 +111,6 @@ internal static class SendGateObserver
     /// <summary>Bound for <see cref="WaitForWaitersAsync"/>; generous enough never to fire on a healthy schedule.</summary>
     private static readonly TimeSpan ArrivalFailsafe = TimeSpan.FromSeconds(10);
 
-    /// <summary>Sampling interval while waiting for an arrival (observation only, never ordering).</summary>
-    private static readonly TimeSpan SamplingInterval = TimeSpan.FromMilliseconds(1);
-
     /// <summary>
     /// Counts the callers currently enrolled in <paramref name="gate"/>'s async waiter queue,
     /// i.e. the sends that have reached the boundary and are parked awaiting a permit.
@@ -172,7 +169,11 @@ internal static class SendGateObserver
                     + "routed through the serialization boundary.");
             }
 
-            await Task.Delay(SamplingInterval, ct);
+            // Observation-only cooperative yield: no sleep/timer is used for synchronization.
+            // The reflected queue itself is the positive milestone; this yield merely lets the
+            // sender run until it enrolls, while the stopwatch remains the failure guard.
+            ct.ThrowIfCancellationRequested();
+            await Task.Yield();
         }
     }
 }
