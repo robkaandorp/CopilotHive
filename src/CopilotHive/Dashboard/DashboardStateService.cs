@@ -83,9 +83,22 @@ public sealed class DashboardStateService : IDisposable
     // ── Snapshot ───────────────────────────────────────────────────────────────
 
     /// <summary>Creates a snapshot of current system state.</summary>
+    /// <remarks>
+    /// The worker projection is built from ONE pool-owned, lock-consistent capture of the pool's
+    /// state, and every worker count on the returned snapshot is derived from that same capture — so
+    /// the totals and the per-worker rows of one snapshot always describe the same instant. That
+    /// consistency is relative to pool-owned worker-state mutations ONLY; it makes no claim about
+    /// external writes to a leaked worker instance, and the goals and pipelines in this snapshot come
+    /// from their own separate reads.
+    /// </remarks>
     public async Task<DashboardSnapshot> GetSnapshot()
     {
-        var workers = _workerPool.GetAllWorkers();
+        // ONE pool-owned capture of the worker status, taken under the pool's activity lock: the
+        // per-worker rows AND every worker aggregate below are derived from THIS list, never from a
+        // second read of the pool — so no total can disagree with the rows beside it, and the counts
+        // can never describe two different instants. The capture is detached (copied values), so
+        // projecting it holds no live worker reference.
+        var workers = _workerPool.CaptureWorkerStatus();
         var pipelines = _pipelineManager.GetAllPipelines();
 
         var goalsById = new Dictionary<string, Goal>();
@@ -126,6 +139,8 @@ public sealed class DashboardStateService : IDisposable
                 ConnectedAt = w.ConnectedAt,
                 CurrentModel = w.CurrentModel,
                 ContextUsagePercent = w.ContextUsagePercent,
+                IsAvailable = w.IsAvailable,
+                AwaitingWorkerReady = w.AwaitingWorkerReady,
             }).ToList(),
             Pipelines = pipelines.Select(p => new PipelineInfo
             {
@@ -151,6 +166,8 @@ public sealed class DashboardStateService : IDisposable
             TotalWorkers = workers.Count,
             BusyWorkers = workers.Count(w => w.IsBusy),
             IdleWorkers = workers.Count(w => !w.IsBusy),
+            AvailableWorkers = workers.Count(w => w.IsAvailable),
+            AwaitingReadyWorkers = workers.Count(w => w.AwaitingWorkerReady),
         };
     }
 

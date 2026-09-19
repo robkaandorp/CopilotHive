@@ -25,6 +25,22 @@ public sealed class DashboardSnapshot
     public int TotalWorkers { get; init; }
     /// <summary>Workers currently executing tasks.</summary>
     public int BusyWorkers { get; init; }
-    /// <summary>Workers waiting for work.</summary>
+    /// <summary>
+    /// Workers NOT currently executing tasks. This INCLUDES workers withheld from selection (awaiting
+    /// their own accepted Ready, or still publishing a completion), so it is NOT a count of
+    /// assignable capacity — see <see cref="AvailableWorkers"/> for that.
+    /// </summary>
     public int IdleWorkers { get; init; }
+    /// <summary>
+    /// Workers available at the captured instant: not busy, carrying no task, holding no completion
+    /// publication and not awaiting their own accepted Ready. Defaults to <c>0</c>.
+    /// </summary>
+    /// <remarks>An OBSERVATION, NOT A RESERVATION AND NOT A DELIVERY GUARANTEE.</remarks>
+    public int AvailableWorkers { get; init; }
+    /// <summary>
+    /// Workers awaiting their own accepted Ready at the captured instant — withheld from selection
+    /// and unavailable for assignment. Defaults to <c>0</c>.
+    /// </summary>
+    /// <remarks>An OBSERVATION ONLY, carrying no reservation and no delivery guarantee.</remarks>
+    public int AwaitingReadyWorkers { get; init; }
 }

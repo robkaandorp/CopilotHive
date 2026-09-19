@@ -5,14 +5,40 @@ using CopilotHive.Workers;
 namespace CopilotHive.Services;
 
 /// <summary>Aggregate statistics about the worker pool at a point in time.</summary>
+/// <remarks>
+/// THE COUNTS DESCRIBE ONE INSTANT AND ARE NOT RESERVATIONS. They are derived from a single
+/// pool-owned capture, so no two counts of one instance of this record can disagree about the
+/// instant they describe — but the workers remain free to change immediately afterwards.
+/// </remarks>
 public sealed record WorkerPoolStats
 {
     /// <summary>Total number of registered workers.</summary>
     public required int TotalWorkers { get; init; }
     /// <summary>Number of workers currently executing a task.</summary>
     public required int BusyWorkers { get; init; }
-    /// <summary>Number of workers that are idle and available for tasks.</summary>
+    /// <summary>
+    /// Number of workers NOT currently executing a task. This INCLUDES workers that are withheld from
+    /// selection (awaiting their own accepted Ready, or still publishing a completion), so it is NOT
+    /// a count of assignable capacity — see <see cref="AvailableWorkers"/> for that.
+    /// </summary>
     public required int IdleWorkers { get; init; }
+    /// <summary>
+    /// Number of workers that were AVAILABLE at the captured instant: not busy, carrying no task,
+    /// holding no completion publication and not awaiting their own accepted Ready — i.e. eligible for
+    /// the checked pool claim's own state predicate.
+    /// </summary>
+    /// <remarks>
+    /// It is an OBSERVATION, NOT A RESERVATION AND NOT A DELIVERY GUARANTEE: a worker counted here may
+    /// be claimed, withdrawn or withheld by the time a dispatcher acts, and this count neither offers
+    /// nor holds capacity for anyone.
+    /// </remarks>
+    public int AvailableWorkers { get; init; }
+    /// <summary>
+    /// Number of workers awaiting their own accepted Ready at the captured instant. These are the
+    /// longer-withheld members of <see cref="IdleWorkers"/> and are unavailable for assignment.
+    /// </summary>
+    /// <remarks>An OBSERVATION ONLY, carrying no reservation and no delivery guarantee.</remarks>
+    public int AwaitingReadyWorkers { get; init; }
     /// <summary>Count of workers grouped by their role string.</summary>
     public required IReadOnlyDictionary<string, int> WorkersByRole { get; init; }
 }
@@ -284,6 +310,83 @@ public sealed class WorkerPool : IWorkerPool
     /// <returns>The worker, or <c>null</c> if not found.</returns>
     public ConnectedWorker? GetWorker(string id) =>
         _workers.GetValueOrDefault(id);
+
+    /// <summary>
+    /// THE AVAILABILITY PREDICATE the operator-facing counts and flags are derived from: <c>true</c>
+    /// only for an instance the checked pool claim could take right now — the shared selectability
+    /// predicate (<see cref="IsSelectableIdleNoLock"/>) AND the claim's own null-task shape.
+    /// Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    /// <remarks>
+    /// IT COMPOSES THE EXISTING PREDICATE RATHER THAN RESTATING IT, so availability can never drift
+    /// from what <see cref="TryClaimAndActivate"/> would accept: the claim refuses a non-null task
+    /// explicitly and then re-applies <see cref="IsSelectableIdleNoLock"/>, which is exactly this
+    /// conjunction. Like the predicate it wraps, it OBSERVES ONLY — it reserves nothing, offers no
+    /// capacity and issues no Ready.
+    /// </remarks>
+    /// <param name="worker">The instance to evaluate — never re-resolved by ID.</param>
+    /// <returns><c>true</c> only when the instance is currently available for a new assignment.</returns>
+    private static bool IsAvailableIdleNoLock(ConnectedWorker worker) =>
+        worker.CurrentTaskId is null
+        && IsSelectableIdleNoLock(worker);
+
+    /// <summary>
+    /// Copies the operator-visible status of every registered worker ONCE into a detached,
+    /// lock-consistent list. Callers must hold <c>_activityLock</c>.
+    /// </summary>
+    /// <remarks>
+    /// NO AWAITING, NO NOTIFIER, NO CALLBACK, NO FORMATTING AND NO I/O happens here — only field
+    /// copies and the two pure predicates — so the lock is never held across anything that could
+    /// block or re-enter. Strings and DTOs are built by the callers AFTER the lock is released.
+    /// </remarks>
+    /// <returns>A detached list of <see cref="WorkerStatusSnapshot"/> values for the captured instant.</returns>
+    private List<WorkerStatusSnapshot> CaptureWorkerStatusNoLock()
+    {
+        var snapshots = new List<WorkerStatusSnapshot>(_workers.Count);
+
+        foreach (var worker in _workers.Values)
+        {
+            snapshots.Add(new WorkerStatusSnapshot
+            {
+                Id = worker.Id,
+                Role = worker.Role,
+                IsBusy = worker.IsBusy,
+                CurrentTaskId = worker.CurrentTaskId,
+                CompletionPublicationPending = worker.CompletionPublicationPending,
+                AwaitingWorkerReady = worker.AwaitingWorkerReady,
+                IsAvailable = IsAvailableIdleNoLock(worker),
+                CurrentModel = worker.CurrentModel,
+                ContextUsagePercent = worker.ContextUsagePercent,
+                LastHeartbeat = worker.LastHeartbeat,
+                ConnectedAt = worker.ConnectedAt,
+            });
+        }
+
+        return snapshots;
+    }
+
+    /// <summary>
+    /// Takes the pool's ONE detached capture of every registered worker's operator-visible status,
+    /// under <c>_activityLock</c>, for a single response or projection.
+    /// </summary>
+    /// <remarks>
+    /// EVERY CALL PERFORMS ITS OWN CAPTURE: there is no implicit cache and no shared last-result
+    /// state, so a caller can never be shown a stale capture dressed up as the current one. The
+    /// returned view holds COPIED VALUES ONLY — no <see cref="ConnectedWorker"/> alias — so consumers
+    /// derive all counts and flags of one response from the SAME instant.
+    /// <para>
+    /// THE CONSISTENCY IS RELATIVE TO POOL-OWNED STATE MUTATIONS. It says nothing about external
+    /// property writes on a leaked instance, and nothing about any other snapshot (goals, pipelines).
+    /// </para>
+    /// </remarks>
+    /// <returns>A detached, read-only list of captured worker statuses.</returns>
+    internal IReadOnlyList<WorkerStatusSnapshot> CaptureWorkerStatus()
+    {
+        lock (_activityLock)
+        {
+            return CaptureWorkerStatusNoLock().AsReadOnly();
+        }
+    }
 
     /// <summary>
     /// Gets the number of workers currently registered in the pool.
@@ -917,43 +1020,68 @@ public sealed class WorkerPool : IWorkerPool
         && worker.CurrentTaskId is not null
         && now - worker.LastActivityAt > timeout;
 
-    /// <summary>Returns aggregate statistics about the worker pool.</summary>
+    /// <summary>
+    /// Returns aggregate statistics about the worker pool, derived from ONE own capture of the
+    /// pool's state.
+    /// </summary>
+    /// <remarks>
+    /// The <see cref="WorkerPoolStats"/> counts in one result therefore all describe the SAME
+    /// instant. <see cref="WorkerPoolStats.IdleWorkers"/> keeps its historical meaning ("not
+    /// currently executing") and so still counts withheld workers; <see cref="WorkerPoolStats.AvailableWorkers"/>
+    /// and <see cref="WorkerPoolStats.AwaitingReadyWorkers"/> are the honest observations layered on
+    /// top. No dispatch policy is consulted or changed here.
+    /// </remarks>
     /// <returns>A <see cref="WorkerPoolStats"/> snapshot.</returns>
     public WorkerPoolStats GetWorkerStats()
     {
-        var workers = _workers.Values.ToList();
-        var workersByRole = workers
+        var captured = CaptureWorkerStatus();
+
+        // Projection only — every value comes from the detached capture, never from a live instance.
+        var workersByRole = captured
             .GroupBy(w => w.Role.ToString())
             .ToDictionary(g => g.Key, g => g.Count());
 
         return new WorkerPoolStats
         {
-            TotalWorkers = workers.Count,
-            BusyWorkers = workers.Count(w => w.IsBusy),
-            IdleWorkers = workers.Count(w => !w.IsBusy),
+            TotalWorkers = captured.Count,
+            BusyWorkers = captured.Count(w => w.IsBusy),
+            IdleWorkers = captured.Count(w => !w.IsBusy),
+            AvailableWorkers = captured.Count(w => w.IsAvailable),
+            AwaitingReadyWorkers = captured.Count(w => w.AwaitingWorkerReady),
             WorkersByRole = workersByRole,
         };
     }
 
     /// <summary>
     /// Returns detailed worker pool statistics including per-worker information,
-    /// suitable for the <c>/health</c> endpoint response.
+    /// suitable for the <c>/health</c> endpoint response, derived from ONE own capture of the pool's
+    /// state.
     /// </summary>
+    /// <remarks>
+    /// THE AGGREGATE COUNTS AND THE PER-WORKER ENTRIES COME FROM THE SAME CAPTURE, so a response can
+    /// never show a total that disagrees with the list beside it. The captured values are copied, not
+    /// aliased, and the DTOs are built after the activity lock has been released.
+    /// </remarks>
     /// <returns>A <see cref="WorkerPoolStatsDto"/> snapshot with worker details.</returns>
     public WorkerPoolStatsDto GetDetailedStats()
     {
-        var workers = _workers.Values.ToList();
+        var captured = CaptureWorkerStatus();
+
         return new WorkerPoolStatsDto
         {
-            TotalWorkers = workers.Count,
-            IdleWorkers = workers.Count(w => !w.IsBusy),
-            BusyWorkers = workers.Count(w => w.IsBusy),
-            Workers = workers.Select(w => new WorkerInfoDto
+            TotalWorkers = captured.Count,
+            IdleWorkers = captured.Count(w => !w.IsBusy),
+            BusyWorkers = captured.Count(w => w.IsBusy),
+            AvailableWorkers = captured.Count(w => w.IsAvailable),
+            AwaitingReadyWorkers = captured.Count(w => w.AwaitingWorkerReady),
+            Workers = captured.Select(w => new WorkerInfoDto
             {
                 Id = w.Id,
                 Role = w.Role == WorkerRole.Unspecified ? null : w.Role.ToString(),
                 IsBusy = w.IsBusy,
                 CurrentTaskId = w.CurrentTaskId,
+                IsAvailable = w.IsAvailable,
+                AwaitingWorkerReady = w.AwaitingWorkerReady,
             }).ToList(),
         };
     }
