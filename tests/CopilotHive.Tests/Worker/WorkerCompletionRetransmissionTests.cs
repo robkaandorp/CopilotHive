@@ -67,10 +67,27 @@ public sealed class WorkerCompletionRetransmissionTests
     private static readonly TimeSpan SuppressionBound = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
-    /// THE PRODUCTION FIVE-SECOND INTERVAL, read from production's own constant so this fixture
-    /// never hard-codes an approximation the retry does not actually use.
+    /// THE PRODUCTION FIVE-SECOND INTERVAL, read from production's own constant ONLY for the
+    /// convenience advances that simply need "one whole interval" to elapse.
     /// </summary>
+    /// <remarks>
+    /// IT IS DELIBERATELY NOT USED BY THE BOUNDARY VECTORS. A fixture that both reads the constant
+    /// and advances by it can never notice the constant changing, so
+    /// <see cref="RetransmissionInterval_IsExactlyFiveSeconds_NoAttemptJustBeforeTheBoundary"/>
+    /// states the five seconds INDEPENDENTLY (see <see cref="SpecifiedInterval"/>) and asserts the
+    /// just-before / exactly-at behaviour against that stated value.
+    /// </remarks>
     private static readonly TimeSpan ProductionInterval = ReadProductionInterval();
+
+    /// <summary>
+    /// THE SPEC'S OWN FIVE SECONDS, stated here and derived from NOTHING in production. The exact
+    /// boundary vector advances to just before this instant (no attempt) and then onto it (exactly
+    /// one attempt), so a production constant changed to any other value fails by name.
+    /// </summary>
+    private static readonly TimeSpan SpecifiedInterval = TimeSpan.FromSeconds(5);
+
+    /// <summary>The smallest step the boundary vector uses to cross the stated interval exactly.</summary>
+    private static readonly TimeSpan BoundaryEpsilon = TimeSpan.FromMilliseconds(1);
 
     private const string TaskA = "task-retry-A";
     private const string TaskB = "task-retry-B";
@@ -111,14 +128,19 @@ public sealed class WorkerCompletionRetransmissionTests
             Assert.Equal(1, harness.ExecutionCount);
 
             var original = harness.Completes[0];
+            var rawOriginal = harness.RawCompletes[0];
 
             await harness.AdvanceOneIntervalAsync();
             await harness.CompleteEnteredAsync(1);
             var retransmission = harness.Completes[1];
 
-            // THE SAME COMPLETE EVIDENCE, as a FRESH clone (never the same object).
-            Assert.NotSame(original, retransmission);
-            Assert.NotSame(original.Complete, retransmission.Complete);
+            // THE SAME COMPLETE EVIDENCE, as a FRESH clone. The identity assertions are taken on
+            // the RAW writer arguments (the exact objects production handed to WriteAsync, never
+            // fixture-cloned), so a mutant that re-delivers the SAME frozen object cannot pass by
+            // relying on the fixture's defensive clone.
+            var rawRetransmission = harness.RawCompletes[1];
+            Assert.NotSame(rawOriginal, rawRetransmission);
+            Assert.NotSame(rawOriginal.Complete, rawRetransmission.Complete);
             Assert.Equal(AssignedWorkerId, retransmission.WorkerId);
             Assert.Equal(original.Complete, retransmission.Complete);
 
@@ -194,6 +216,98 @@ public sealed class WorkerCompletionRetransmissionTests
 
             // …and the retained result keeps its EXACT identity (never cloned or replaced).
             Assert.Same(retained, harness.RetainedResult);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE PRIVATE SNAPSHOT IS NEVER HANDED TO A WRITER, proved on the RAW writer arguments and by
+    /// MUTATING one of them. Each send's raw argument — the exact object production passed to
+    /// <c>WriteAsync</c>, with no fixture-side clone in between — is a DISTINCT instance (message
+    /// and nested <c>TaskComplete</c> alike) carrying EQUAL evidence. The first raw argument's
+    /// nested collections are then CLEARED in place, and the next retransmission's raw argument
+    /// still carries the ORIGINAL evidence in the ORIGINAL ORDER.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THE RAW ARGUMENT IS LOAD-BEARING. A reference-inequality assertion taken on a
+    /// fixture-CLONED record proves nothing: two clones of one object are two objects, so a
+    /// production mutant that hands the SAME frozen <c>TaskComplete</c> to every writer would pass.
+    /// The raw list is retained by reference precisely so that mutant is caught.
+    /// </para>
+    /// <para>
+    /// WHY THE MUTATION IS LOAD-BEARING. Reference distinctness alone still permits a mutant that
+    /// shallow-copies the message while SHARING the nested <c>Metrics.Issues</c> /
+    /// <c>GitStatus.ChangedFiles</c> collections. Clearing those on the delivered raw argument and
+    /// requiring the NEXT delivered raw argument to be unchanged rejects any shared nested state.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Retransmission_RawWriterArguments_AreDistinctInstances_UnaffectedByMutatingADeliveredOne()
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryDelayCreatedAsync(1);
+
+            // THE ORIGINAL SEND'S RAW ARGUMENT — the exact object production handed to the writer.
+            var rawOriginal = harness.RawCompletes[0];
+            var frozenIssues = rawOriginal.Complete.Metrics.Issues.ToArray();
+            var frozenChangedFiles = rawOriginal.Complete.GitStatus.ChangedFiles.ToArray();
+
+            // NON-VACUITY: the real executor chain produced genuine nested evidence, so clearing it
+            // below actually changes something observable.
+            Assert.NotEmpty(frozenIssues);
+            Assert.NotEmpty(frozenChangedFiles);
+
+            // FIRST RETRANSMISSION — a DISTINCT raw object with EQUAL evidence.
+            await harness.AdvanceOneIntervalAsync();
+            await harness.CompleteEnteredAsync(1);
+            var rawRetry1 = harness.RawCompletes[1];
+
+            Assert.NotSame(rawOriginal, rawRetry1);
+            Assert.NotSame(rawOriginal.Complete, rawRetry1.Complete);
+            Assert.NotSame(rawOriginal.Complete.Metrics, rawRetry1.Complete.Metrics);
+            Assert.NotSame(rawOriginal.Complete.GitStatus, rawRetry1.Complete.GitStatus);
+            Assert.Equal(rawOriginal.Complete, rawRetry1.Complete);
+
+            // THE MUTATION — performed on the DELIVERED raw arguments themselves, exactly as a
+            // hostile (or merely careless) writer could. If production handed out the snapshot, or
+            // shared its nested collections, the NEXT attempt would carry this damage.
+            rawOriginal.Complete.Metrics.Issues.Clear();
+            rawOriginal.Complete.Metrics.Issues.Add("MUTATED-BY-THE-FIRST-WRITER");
+            rawOriginal.Complete.GitStatus.ChangedFiles.Clear();
+            rawOriginal.Complete.GitStatus.ChangedFiles.Add("mutated/by/first/writer.cs");
+            rawRetry1.Complete.Metrics.Issues.Clear();
+            rawRetry1.Complete.GitStatus.ChangedFiles.Clear();
+            rawRetry1.Complete.Output = "MUTATED-OUTPUT";
+
+            // THE NEXT RETRANSMISSION still carries the FROZEN evidence, in the ORIGINAL ORDER.
+            await harness.AdvanceOneIntervalAsync();
+            await harness.CompleteEnteredAsync(2);
+            var rawRetry2 = harness.RawCompletes[2];
+
+            Assert.NotSame(rawOriginal, rawRetry2);
+            Assert.NotSame(rawRetry1, rawRetry2);
+            Assert.NotSame(rawRetry1.Complete, rawRetry2.Complete);
+            Assert.Equal(frozenIssues, rawRetry2.Complete.Metrics.Issues);
+            Assert.Equal(frozenChangedFiles, rawRetry2.Complete.GitStatus.ChangedFiles);
+            Assert.DoesNotContain("MUTATED-BY-THE-FIRST-WRITER", rawRetry2.Complete.Metrics.Issues);
+            Assert.DoesNotContain("mutated/by/first/writer.cs", rawRetry2.Complete.GitStatus.ChangedFiles);
+            Assert.NotEqual("MUTATED-OUTPUT", rawRetry2.Complete.Output);
+            Assert.Equal(AssignedWorkerId, rawRetry2.WorkerId);
+
+            // …and the retained domain result was never cloned or replaced along the way.
+            Assert.Equal(1, harness.ExecutionCount);
 
             harness.CompleteStream();
             await harness.JoinAsync();
@@ -559,12 +673,114 @@ public sealed class WorkerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// REPEATED MISSING-ACK ATTEMPTS STAY STRICTLY SEQUENTIAL. Each advance of exactly one interval
-    /// produces exactly ONE attempt and exactly ONE FRESH delay afterwards — never a catch-up burst,
-    /// and never more than one delay or one attempt outstanding.
+    /// REPEATED MISSING-ACK ATTEMPTS STAY STRICTLY SEQUENTIAL, proved against a HELD attempt. One
+    /// retry write is admitted and PARKED inside the writer; additional whole intervals are then
+    /// advanced while it is still held, and NO new delay timer and NO new write appear. Releasing
+    /// the held write requires a FRESH FULL interval before the next attempt — a just-before /
+    /// at-the-boundary pair, so the fresh interval is measured, not assumed.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY A HELD WRITE IS REQUIRED. With immediately-completing retry writes, an implementation
+    /// that overlaps only SLOW writes is indistinguishable: every attempt finishes before the next
+    /// advance, so "one per advance" holds either way. Holding one attempt open is what makes the
+    /// overlap observable.
+    /// </para>
+    /// <para>
+    /// MUTATION PROOF. A retransmitter that armed its next delay BEFORE the current attempt
+    /// terminated (or that allowed a second concurrent attempt) creates a timer, or writes, while
+    /// the first write is still parked — both are asserted absent over bounded windows. The
+    /// CONCRETE retry task is retained up front, so the final join can never be satisfied by an
+    /// already-cleared ownership slot.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task RepeatedMissingAckAttempts_StayStrictlySequential()
+    public async Task RepeatedMissingAckAttempts_StayStrictlySequential_EvenWhenAnAttemptIsHeld()
+    {
+        var harness = new RetryHarness { HoldRetries = true };
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryParkedInDelayAsync(1);
+
+            // THE CONCRETE retry task, captured before any drain could clear the slot.
+            var retry = harness.Retry;
+
+            // ATTEMPT 1 is admitted and HELD inside the writer.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.Equal(2, harness.Completes.Count);
+            Assert.False(harness.RetryWriteCompleted(1), "attempt 1 must still be parked.");
+            Assert.Equal(1, harness.Clock.TimerCount);
+
+            // ADVANCING MORE INTERVALS WHILE IT IS HELD CHANGES NOTHING: no new delay is armed
+            // (the retransmitter cannot be waiting — it is inside a write) and nothing new is sent.
+            harness.Advance(SpecifiedInterval * 3);
+            var noNewDelay = await Record.ExceptionAsync(() =>
+                harness.Clock.WaitForRetryParkedInDelayAsync(2, TestContext.Current.CancellationToken)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(noNewDelay);
+            Assert.Equal(1, harness.Clock.TimerCount);
+            await AssertNoRetrySendAsync(harness, "while a prior retry write is still admitted and held");
+            Assert.Equal(2, harness.Completes.Count);
+            Assert.False(retry.IsCompleted);
+
+            // RELEASE attempt 1: only its OWN termination arms the next delay.
+            harness.ReleaseComplete(1);
+            await harness.RetryParkedInDelayAsync(2);
+            Assert.True(harness.RetryWriteCompleted(1));
+
+            // THE FRESH INTERVAL IS FULL: just-before produces nothing; the final millisecond
+            // produces exactly one attempt.
+            harness.Advance(SpecifiedInterval - BoundaryEpsilon);
+            await AssertNoRetrySendAsync(harness, "one millisecond before the fresh interval elapsed");
+            Assert.Equal(2, harness.Completes.Count);
+
+            harness.Advance(BoundaryEpsilon);
+            await harness.CompleteEnteredAsync(2);
+            Assert.Equal(3, harness.Completes.Count);
+            harness.ReleaseComplete(2);
+            await harness.RetryParkedInDelayAsync(3);
+
+            Assert.Equal(1, harness.ExecutionCount);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(retry.IsCompleted, "the drain must join the retained retry task.");
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE INTERVAL IS EXACTLY FIVE SECONDS, stated independently of production's constant. With
+    /// the retry provably parked in its delay, advancing to ONE MILLISECOND BEFORE five seconds
+    /// produces NO attempt (positive non-completion over a bounded window); advancing that last
+    /// millisecond — reaching exactly five seconds of virtual time — produces EXACTLY ONE attempt.
+    /// The next interval is then measured the same way, so the "fresh full interval after each
+    /// prior attempt" shape is pinned at the same precision.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THE VALUE IS STATED, NOT READ. Reading production's own constant and advancing by that
+    /// same value is a tautology: any changed constant still passes. This vector advances by
+    /// <see cref="SpecifiedInterval"/> — five seconds written down here, from the spec — so a
+    /// production interval shortened to (say) one second fires at the 1s mark and fails the
+    /// just-before-the-boundary assertion, and one lengthened to ten seconds never fires and fails
+    /// the at-the-boundary rendezvous.
+    /// </para>
+    /// <para>
+    /// THE MANUAL CLOCK KEEPS VIRTUAL ABSOLUTE TIME, so advancing 4.999s and then 1ms is exactly
+    /// equivalent to advancing 5s once — the split is an observation device, never a nudge.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task RetransmissionInterval_IsExactlyFiveSeconds_NoAttemptJustBeforeTheBoundary()
     {
         var harness = new RetryHarness();
         try
@@ -572,22 +788,100 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.StartAsync();
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
-            await harness.RetryDelayCreatedAsync(1);
 
-            for (var attempt = 1; attempt <= 3; attempt++)
-            {
-                var delaysBefore = harness.Clock.TimerCount;
-                await harness.AdvanceOneIntervalAsync();
-                await harness.CompleteEnteredAsync(attempt);
+            // THE RETRY IS PARKED IN ITS DELAY — positive evidence, through the clock seam.
+            await harness.RetryParkedInDelayAsync(1);
+            Assert.Single(harness.Completes);
 
-                // EXACTLY ONE new attempt and EXACTLY ONE new delay, in order.
-                Assert.Equal(attempt + 1, harness.Completes.Count);
-                await harness.RetryDelayCreatedAsync(delaysBefore + 1);
-                Assert.Equal(delaysBefore + 1, harness.Clock.TimerCount);
-            }
+            // JUST BEFORE the stated five seconds: NOTHING is attempted.
+            harness.Advance(SpecifiedInterval - BoundaryEpsilon);
+            await AssertNoRetrySendAsync(harness, "one millisecond before the five-second boundary");
+            Assert.Single(harness.Completes);
+            Assert.Equal(1, harness.Clock.TimerCount);
 
-            Assert.Equal(4, harness.Completes.Count);
+            // AT the boundary — the final millisecond — EXACTLY ONE attempt.
+            harness.Advance(BoundaryEpsilon);
+            await harness.CompleteEnteredAsync(1);
+            Assert.Equal(2, harness.Completes.Count);
+
+            // The NEXT interval is measured from that attempt's termination, to the same precision.
+            await harness.RetryParkedInDelayAsync(2);
+            harness.Advance(SpecifiedInterval - BoundaryEpsilon);
+            await AssertNoRetrySendAsync(harness, "one millisecond before the SECOND boundary");
+            Assert.Equal(2, harness.Completes.Count);
+
+            harness.Advance(BoundaryEpsilon);
+            await harness.CompleteEnteredAsync(2);
+            Assert.Equal(3, harness.Completes.Count);
             Assert.Equal(1, harness.ExecutionCount);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// THE CLOCK IS CAPTURED PER ASSIGNMENT, not re-read per wait. After the assignment has been
+    /// built (its retry is already parked in a delay on the ORIGINAL clock), the service's
+    /// <c>TimeProvider</c> property is SWAPPED for a second, independent manual clock. The
+    /// assignment keeps using its ORIGINAL provider: advancing the ORIGINAL clock drives the
+    /// attempts, while the REPLACEMENT clock is never consulted at all — it creates no timer and
+    /// advancing it produces nothing.
+    /// </summary>
+    /// <remarks>
+    /// MUTATION PROOF. A production that re-read the mutable <c>TimeProvider</c> property on each
+    /// iteration would arm its NEXT delay on the replacement clock: the replacement's timer count
+    /// would become non-zero (failing the zero-timer assertion by name) and advancing the ORIGINAL
+    /// clock would no longer produce the second attempt (failing that rendezvous by name).
+    /// </remarks>
+    [Fact]
+    public async Task RetryUsesTheClockCapturedWithTheAssignment_EvenAfterTheServiceClockIsSwapped()
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+
+            // The assignment exists and its retry is parked on the ORIGINAL clock.
+            await harness.RetryParkedInDelayAsync(1);
+            var originalClock = harness.Clock;
+            Assert.Equal(1, originalClock.TimerCount);
+
+            // THE SWAP — strictly AFTER the assignment was constructed and its retry started.
+            var replacementClock = harness.SwapServiceClock();
+            Assert.NotSame(originalClock, replacementClock);
+            Assert.Equal(0, replacementClock.TimerCount);
+
+            // The FIRST attempt is driven by the ORIGINAL clock alone.
+            originalClock.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.Equal(2, harness.Completes.Count);
+
+            // The retry's FRESH delay was armed on the ORIGINAL clock too — the replacement was
+            // never consulted, so it still holds no timer at all.
+            await originalClock
+                .WaitForRetryParkedInDelayAsync(2, TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(2, originalClock.TimerCount);
+            Assert.Equal(0, replacementClock.TimerCount);
+
+            // ADVANCING THE REPLACEMENT DOES NOTHING: it owns no timer of this assignment's.
+            replacementClock.Advance(SpecifiedInterval * 3);
+            await AssertNoRetrySendAsync(harness, "after advancing only the REPLACEMENT clock");
+            Assert.Equal(2, harness.Completes.Count);
+            Assert.Equal(0, replacementClock.TimerCount);
+
+            // …and the ORIGINAL clock still drives the next attempt.
+            originalClock.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(2);
+            Assert.Equal(3, harness.Completes.Count);
+            Assert.Equal(0, replacementClock.TimerCount);
 
             harness.CompleteStream();
             await harness.JoinAsync();
@@ -747,54 +1041,89 @@ public sealed class WorkerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// STOP BEFORE THE PAYLOAD: a MATCHING CANCEL arrives while reporting has NOT yet published its
-    /// payload (the original Complete is held). The drain still closes retry admission, cancels the
-    /// pending wait and JOINS the retry — with NO acknowledgement involved — and the cancel's
-    /// existing single fallback Ready is preserved.
+    /// STOP BEFORE THE PAYLOAD IS EVEN MAPPED: a MATCHING CANCEL arrives while the assignment's
+    /// EXECUTION is still held, so reporting has not mapped, has not frozen and has not armed —
+    /// there is no payload anywhere. The drain still closes retry admission, cancels the (never
+    /// created) wait and JOINS the retained retry task, with NO acknowledgement involved, and the
+    /// cancel's existing single fallback Ready is preserved.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE BARRIER IS PRE-MAPPING, NOT PRE-WRITE. Waiting for the Complete write to ENTER would be
+    /// too late: by then production has already mapped, frozen and armed. This vector instead holds
+    /// the PROMPT — so the execution has not produced a result at all — and states that fact
+    /// positively (<c>ReceiptArmed == false</c>, zero Completes, zero delay timers) before pushing
+    /// the cancel.
+    /// </para>
+    /// <para>
+    /// MUTATION PROOF. A drain that closed admission only AFTER joining reporting is killed here:
+    /// once the execution is released, reporting maps/freezes/arms and the retry would then park in
+    /// a five-second delay this fixture NEVER advances, so the retained retry task never terminates
+    /// and its bounded join fails by name. The message ordinals are B-specific — the cancel is
+    /// message 2 (the assignment is message 1) and the trailing probe is message 3 — so neither
+    /// barrier can be satisfied by earlier traffic.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task MatchingCancelBeforePayload_ClosesAndJoinsTheRetryWithoutAnyAck()
+    public async Task MatchingCancelBeforeMappingOrFreeze_ClosesAndJoinsTheRetryWithoutAnyAck()
     {
-        var harness = new RetryHarness { HoldOriginalComplete = true };
+        var harness = new RetryHarness();
         try
         {
             await harness.StartAsync();
-            harness.ReleasePrompt(TaskA);
-            await harness.CompleteEnteredAsync(0);
 
-            // The payload is NOT published yet (the Complete write is still parked).
-            Assert.False(harness.Reporting.IsCompleted);
+            // THE EXECUTION IS HELD: the prompt never returns, so the executor cannot produce a
+            // result and reporting cannot map, freeze or arm anything.
+            await harness.PromptStartedAsync(TaskA);
+            await harness.AwaitOwnerInstalledAsync();
+
+            // THE CONCRETE retry task, captured BEFORE any drain can clear the ownership slot.
             var retry = harness.Retry;
 
-            harness.PushCancel(TaskA);
-
-            // The cancel is READ (the loop re-arms its next read only after the handler returns), so
-            // this is the positive proof the handler was entered — and it stays parked there.
-            await harness.ConsumedAsync(1);
-
-            // THE DRAIN IS PARKED ON THE UNPUBLISHED REPORTING: the matching-cancel drain always
-            // joins reporting, so with the Complete write still held the loop cannot reach the
-            // ownership clear. Nothing has been settled and no delay exists yet.
-            var parked = await Record.ExceptionAsync(() =>
-                harness.JoinAsync().WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
-            Assert.IsType<TimeoutException>(parked);
+            // POSITIVE PRE-MAPPING STATE: nothing armed, nothing written, no delay ever created.
+            Assert.False(harness.ReceiptArmed, "Precondition: reporting has not mapped or armed.");
+            Assert.False(harness.Reporting.IsCompleted);
+            Assert.False(harness.Execution.IsCompleted);
+            Assert.Empty(harness.Completes);
             Assert.Equal(0, harness.Clock.TimerCount);
-            Assert.Equal(1, harness.SlotOccupancy);
 
-            // RELEASING the Complete lets reporting terminate; the drain then closes retry admission,
-            // cancels the (never-created) wait and JOINS the retry — with NO acknowledgement involved.
-            harness.ReleaseComplete(0);
+            // THE MATCHING CANCEL — message 2 (the assignment was message 1), so this barrier is
+            // cancel-specific and cannot be satisfied by the assignment's own consumption.
+            var cancelConsumed = harness.ConsumedAsync(2);
+            harness.PushCancel(TaskA);
+            await cancelConsumed;
+
+            // The matching-cancel drain cancels the assignment, which unblocks the held prompt;
+            // execution and reporting then terminate and the drain joins the retry. The clock is
+            // NEVER advanced, so a retry that was allowed to park in a delay could not terminate.
             await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            Assert.True(retry.IsCompletedSuccessfully, "The drain must join the retry cleanly, with no ACK.");
+            Assert.True(
+                retry.IsCompletedSuccessfully,
+                "The drain must close admission and join the retry cleanly, with no ACK.");
+
+            // NO RETRY DELAY WAS EVER CREATED. This is the load-bearing discriminator: admission
+            // was closed BEFORE the drain joined reporting, so even though reporting subsequently
+            // produced and mapped the CANCELLED result (the executor's legitimate terminal
+            // outcome), the retransmitter never entered a wait — and the clock, never advanced,
+            // could not have released one.
+            Assert.Equal(0, harness.Clock.TimerCount);
+            Assert.Equal(0, harness.Clock.AdvanceCount);
+
+            // …and nothing was ever RE-sent: at most the assignment's own single terminal Complete.
+            Assert.True(
+                harness.Completes.Count <= 1,
+                $"No retransmission may occur; observed {harness.Completes.Count} Complete(s).");
 
             // The existing cancel fallback Ready is preserved exactly once. It is the cancel
-            // handler's OWN direct write (not a slot-owned one), so its completion is observed
-            // through a trailing probe that the loop can only read AFTER the handler returned.
+            // handler's OWN direct write, so its completion is observed through a trailing probe
+            // (message 3) the loop can only read AFTER the handler returned.
             await harness.ReadyEnteredAsync(0);
             harness.ReleaseReady(0);
+            var afterCancel = harness.ConsumedAsync(3);
             harness.PushProbe("after-cancel-ready");
-            await harness.ConsumedAsync(2);
+            await afterCancel;
             Assert.Equal(1, harness.ReadyCount);
+            Assert.Equal(0, harness.SlotOccupancy);
 
             harness.CompleteStream();
             await harness.JoinAsync();
@@ -821,14 +1150,25 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.CompleteEnteredAsync(0);
 
             // The retry is PROVABLY parked (its delay exists); the clock is NEVER advanced.
-            await harness.RetryDelayCreatedAsync(1);
-            Assert.False(harness.Retry.IsCompleted);
+            await harness.RetryParkedInDelayAsync(1);
+
+            // THE CONCRETE retry task, captured BEFORE the EOF can clear the ownership slot. A
+            // post-drain lookup would read null, which is also what an implementation that
+            // cancelled and then ABANDONED the unwind produces — so it could never discriminate.
+            var retry = harness.Retry;
+            Assert.False(retry.IsCompleted);
 
             harness.CompleteStream();
             await harness.JoinAsync();
 
-            // Joined, and nothing was retransmitted or readied.
-            await harness.JoinedRetryAsync();
+            // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop returned: the drain
+            // JOINED the retry, so by the time the loop completed the EXACT retained task had
+            // already terminated. No further await may intervene — awaiting first would let a
+            // drain that merely cancelled and ABANDONED the unwind pass.
+            Assert.True(
+                retry.IsCompleted,
+                "the drain must JOIN the retained retry task BEFORE the loop returns.");
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Single(harness.Completes);
             Assert.Equal(0, harness.ReadyCount);
             Assert.Equal(0, harness.Clock.AdvanceCount);
@@ -854,16 +1194,26 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.StartAsync();
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
-            await harness.RetryDelayCreatedAsync(1);
+            await harness.RetryParkedInDelayAsync(1);
+
+            // THE CONCRETE retry task, captured BEFORE the EOF clears the ownership slot.
+            var retry = harness.Retry;
 
             await harness.HoldSendGateAsync();
-            await harness.AdvanceOneIntervalAsync();
+            harness.Advance(SpecifiedInterval);
             await harness.RetryQueuedOnSendGateAsync();
+            Assert.False(retry.IsCompleted, "the retry must be parked on the permit queue.");
 
             // EOF while the retry is queued: teardown must still converge.
             harness.CompleteStream();
             await harness.JoinAsync();
-            await harness.JoinedRetryAsync();
+
+            // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop returned: the permit
+            // wait was cancelled AND JOINED, never abandoned.
+            Assert.True(
+                retry.IsCompleted,
+                "the drain must JOIN the retained retry task BEFORE the loop returns.");
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             // No retransmission was ever invoked.
             Assert.Single(harness.Completes);
@@ -933,28 +1283,55 @@ public sealed class WorkerCompletionRetransmissionTests
     [Fact]
     public async Task ReaderFaultWhileRetryIsParkedMidDelay_ClosesAdmission_JoinsAndPropagates()
     {
-        var harness = new RetryHarness { UseFaultingReader = true };
+        var harness = new RetryHarness { UseFaultingReader = true, HoldRetries = true };
         try
         {
             await harness.StartAsync();
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
 
-            // The retry is PROVABLY parked in its delay; the clock is NEVER advanced.
-            await harness.RetryDelayCreatedAsync(1);
-            Assert.False(harness.Retry.IsCompleted);
-            Assert.Equal(0, harness.Clock.AdvanceCount);
+            // The retry is PROVABLY parked in its delay.
+            await harness.RetryParkedInDelayAsync(1);
+
+            // THE CONCRETE retry task, captured BEFORE the fault can clear the ownership slot.
+            var retry = harness.Retry;
+            Assert.False(retry.IsCompleted);
+
+            // ADMIT AND HOLD one retransmission write. This is what makes the JOIN observable: a
+            // drain that merely cancels admission cannot finish this task, so the loop must
+            // genuinely wait for the write's own termination.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.False(harness.RetryWriteCompleted(1), "the retry write must be admitted and HELD.");
+            Assert.False(retry.IsCompleted);
 
             // THE READER FAULT — the ACK is permanently absent (it is never pushed).
             harness.ArmReaderFault(new ReaderFaultPrimaryException("injected reader fault"));
+
+            // IN-WINDOW PROOF: the loop CANNOT finish while the admitted write is held, because
+            // the drain joins the retry. A drain that abandoned the unwind would finish here.
+            var premature = await Record.ExceptionAsync(() =>
+                harness.Loop.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.False(retry.IsCompleted);
+            Assert.Equal(1, harness.SlotOccupancy);
+
+            // RELEASE: the drain observes the write's own termination and then propagates the
+            // reader's ORIGINAL exception.
+            harness.ReleaseComplete(1);
             var propagated = await Assert.ThrowsAsync<ReaderFaultPrimaryException>(() =>
                 harness.JoinAsync());
             Assert.Equal("injected reader fault", propagated.Message);
 
-            // The drain closed admission and joined EVERYTHING before clearing: no retransmission,
-            // no Ready, ownership empty, and the fault's IDENTITY propagated unchanged.
-            Assert.Equal(0, harness.Clock.AdvanceCount);
-            Assert.Single(harness.Completes);
+            // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop's fault surfaced: the
+            // drain closed admission and JOINED the task — never merely detached it from the slot.
+            Assert.True(
+                retry.IsCompleted,
+                "the drain must JOIN the retained retry task BEFORE the loop's fault surfaces.");
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // No Ready was emitted (the receipt was never confirmed) and ownership is empty.
+            Assert.Equal(2, harness.Completes.Count);
             Assert.Equal(0, harness.ReadyCount);
             Assert.Equal(0, harness.SlotOccupancy);
         }
@@ -983,10 +1360,22 @@ public sealed class WorkerCompletionRetransmissionTests
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
 
-            // The retry is PROVABLY parked; the clock is NEVER advanced.
-            await harness.RetryDelayCreatedAsync(1);
-            Assert.False(harness.Retry.IsCompleted);
-            Assert.Equal(0, harness.Clock.AdvanceCount);
+            // The retry is PROVABLY parked in its delay.
+            await harness.RetryParkedInDelayAsync(1);
+
+            // THE CONCRETE retry task, captured BEFORE the cancellation clears the slot.
+            var retry = harness.Retry;
+            Assert.False(retry.IsCompleted);
+
+            // PARK THE RETRY ON THE PRODUCTION PERMIT QUEUE and KEEP the permit held for the whole
+            // teardown. This is the device that makes the JOIN observable under run cancellation:
+            // the permit wait observes the retry's OWN lifetime token (never the stream token), so
+            // ONLY the drain's admission close can release it — the test never releases the permit.
+            await harness.HoldSendGateAsync();
+            harness.Advance(SpecifiedInterval);
+            await harness.RetryQueuedOnSendGateAsync();
+            Assert.False(retry.IsCompleted, "the retry must be parked on the permit queue.");
+            Assert.Single(harness.Completes);
 
             // THE RUN CANCELLATION: no ACK will ever arrive, and the response stream is never
             // completed — the reader stays open, so EOF cannot be the drain's trigger.
@@ -994,13 +1383,24 @@ public sealed class WorkerCompletionRetransmissionTests
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
                 harness.JoinAsync());
 
-            Assert.Equal(0, harness.Clock.AdvanceCount);
+            // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop's cancellation
+            // surfaced: the teardown closed admission, which cancelled the permit wait, and then
+            // JOINED the retained task — it did not abandon the unwind. The permit is STILL held
+            // by this test, so nothing else could have completed that task.
+            Assert.True(
+                retry.IsCompleted,
+                "the teardown must JOIN the retained retry task BEFORE the loop unwinds.");
+            Assert.Equal(0, harness.SendGateCurrentCount);
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // No retransmission was ever invoked, and no Ready was emitted.
             Assert.Single(harness.Completes);
             Assert.Equal(0, harness.ReadyCount);
             Assert.Equal(0, harness.SlotOccupancy);
         }
         finally
         {
+            harness.ReleaseSendGate();
             await harness.TeardownAsync();
         }
     }
@@ -1010,19 +1410,39 @@ public sealed class WorkerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// NO OLD RETRY ON A SUCCESSOR ASSIGNMENT. Assignment A completes and its (closed) retry is
-    /// retained; a successor B arrives — authorized by A's STARTED Ready write, the negotiated
-    /// boundary — and gets its OWN retry task with its OWN frozen envelope. A's evidence never
-    /// reappears and A's retry task is not B's.
+    /// NO OLD RETRY ON A SUCCESSOR ASSIGNMENT, and the replacement drain JOINS an ADMITTED retry.
+    /// Assignment A reaches its authorized Ready, then a RETRY of A's frozen completion is admitted
+    /// and HELD inside the writer. The successor B arrives while that retry write is still parked:
+    /// the replacement drain must JOIN it — proved IN-WINDOW, by showing B cannot reset the runner
+    /// or start its prompt until the held write is released — and only then does B install with its
+    /// OWN retry task and OWN frozen envelope. A's evidence never replays.
     /// </summary>
     /// <remarks>
-    /// REMOVAL PROOF. A retry that outlived the ownership clear is either the SAME task instance
-    /// (asserted different) or resends A's frozen completion under A's identity (asserted by task id).
+    /// <para>
+    /// WHY A'S RETRY MUST BE ADMITTED. ACK-ing A while its retry is merely DELAYED lets the drain
+    /// join a task that was already finishing, so removing the retry join from the replacement path
+    /// is not discriminated. Holding A's retry write open forces the drain to actually wait for it.
+    /// </para>
+    /// <para>
+    /// MUTATION PROOF. A replacement that joined NEITHER A's retry nor A's authorized Ready resets
+    /// the runner and starts B while A's write is still parked — the in-window "B must not have
+    /// started" assertions fail by name. A retry that outlived the ownership clear is caught by the
+    /// distinct-task and task-identity assertions on B's own sends.
+    /// </para>
+    /// <para>
+    /// RESIDUAL, STATED HONESTLY. This vector cannot isolate "the retry join alone was removed":
+    /// A's authorized Ready is queued on the SAME send permit behind A's admitted retry write, so
+    /// the drain's readiness join independently blocks the replacement for exactly as long. That is
+    /// a consequence of production's single-gate design, not a gap in the barrier — the
+    /// retry-join-only mutant is isolated instead by the teardown vectors, where no Ready is ever
+    /// authorized (the receipt stays unconfirmed) and the retry join is therefore the ONLY thing
+    /// that can hold the drain.
+    /// </para>
     /// </remarks>
     [Fact]
-    public async Task SuccessorAssignment_GetsItsOwnRetry_AndThePredecessorsNeverReplays()
+    public async Task SuccessorAssignment_ReplacementJoinsAnAdmittedRetry_ThenBGetsItsOwn()
     {
-        var harness = new RetryHarness();
+        var harness = new RetryHarness { HoldRetries = true };
         try
         {
             await harness.StartAsync();
@@ -1030,22 +1450,63 @@ public sealed class WorkerCompletionRetransmissionTests
             // ── ASSIGNMENT A ──────────────────────────────────────────────────────
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
-            await harness.RetryDelayCreatedAsync(1);
+            await harness.RetryParkedInDelayAsync(1);
 
             var ownerA = harness.Owner;
             var retryA = harness.Retry;
 
-            // A's authorized ordinary Ready: the ACK authorizes the write, which is what makes the
-            // successor legitimate at the pre-Ready boundary.
+            // A's AUTHORIZED Ready — the pre-Ready boundary that makes a successor legitimate.
+            // The ACK also closes A's retry ADMISSION, so A's retry must be admitted FIRST.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.False(harness.RetryWriteCompleted(1), "A's retry write must be admitted and HELD.");
+
+            // THE ACK authorizes the ordinary Ready. That Ready CANNOT enter the wire yet: it
+            // serializes behind the admitted retry on the ONE send permit, so the positive
+            // milestone is the gate's own waiter queue, and the retained slot write is the
+            // authorization fact the successor boundary consults.
             harness.PushAck(TaskA);
+            harness.PushProbe("ack-returned");
+            await harness.ConsumedAsync(3);
+            await harness.SenderQueuedOnSendGateAsync();
+            var authorizedReadyA = harness.ReadinessSlotWrite
+                ?? throw new Xunit.Sdk.XunitException("A's authorized Ready write must be retained.");
+            Assert.Equal(0, harness.ReadyCount);
+
+            // A's RETRY IS STILL PARKED INSIDE ITS ADMITTED WRITE: the ACK must not release it.
+            Assert.False(retryA.IsCompleted, "the ACK must never cancel an admitted transport write.");
+            Assert.False(harness.RetryWriteCompleted(1));
+
+            // ── THE SUCCESSOR ARRIVES while A's retry write is still held ────────
+            var resetBaseline = harness.ResetCount;
+            harness.PushAssignment(TaskB);
+            await harness.ConsumedAsync(4); // assignment A, ACK, probe, then B.
+
+            // IN-WINDOW JOIN PROOF: B has been consumed, but the replacement drain is parked on
+            // A's admitted retry write, so the runner has NOT been reset and B has NOT started.
+            var prematureReset = await Record.ExceptionAsync(() =>
+                harness.ResetCountReachedAsync(resetBaseline + 1)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(prematureReset);
+            Assert.Equal(resetBaseline, harness.ResetCount);
+            Assert.False(harness.PromptStarts.Contains(TaskB), "B must not start while A's retry is held.");
+            Assert.Same(ownerA, harness.Owner);
+            Assert.False(retryA.IsCompleted);
+
+            // RELEASE A's admitted retry write: the drain joins it, then joins A's queued Ready,
+            // clears ownership and admits B.
+            harness.ReleaseComplete(1);
+            await retryA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(retryA.IsCompleted, "the replacement drain must JOIN A's admitted retry.");
+
             await harness.ReadyEnteredAsync(0);
             harness.ReleaseReady(0);
-            await harness.JoinedReadyWriteAsync();
+            await authorizedReadyA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // ── ASSIGNMENT B ──────────────────────────────────────────────────────
-            harness.PushAssignment(TaskB);
+            await harness.ResetCountReachedAsync(resetBaseline + 1);
             await harness.PromptStartedAsync(TaskB);
 
+            // ── ASSIGNMENT B ──────────────────────────────────────────────────────
             var ownerB = harness.Owner;
             Assert.NotSame(ownerA, ownerB);
 
@@ -1053,20 +1514,18 @@ public sealed class WorkerCompletionRetransmissionTests
             Assert.NotNull(retryB);
             Assert.NotSame(retryA, retryB);
 
-            // B's own frozen envelope names B, and B's execution is its own.
             harness.ReleasePrompt(TaskB);
-            await harness.CompleteEnteredAsync(1);
-            Assert.Equal(TaskA, harness.Completes[0].Complete.TaskId);
-            Assert.Equal(TaskB, harness.Completes[1].Complete.TaskId);
-
-            // B is genuinely WAITING for its own interval, and NOTHING has been re-sent yet: A's
-            // closed retry contributed no attempt at all.
-            await harness.RetryDelayCreatedAsync(2);
-            Assert.Equal(2, harness.Completes.Count);
-
-            // THE ONE interval produces B's retry, under B's identity — A's never replays.
-            await harness.AdvanceOneIntervalAsync();
             await harness.CompleteEnteredAsync(2);
+            harness.ReleaseComplete(2);
+            Assert.Equal(TaskA, harness.Completes[0].Complete.TaskId);
+            Assert.Equal(TaskA, harness.Completes[1].Complete.TaskId); // A's admitted retry.
+            Assert.Equal(TaskB, harness.Completes[2].Complete.TaskId);
+
+            // B waits its OWN interval and then re-sends B's OWN evidence; A's never replays.
+            await harness.RetryParkedInDelayAsync(2);
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(3);
+            harness.ReleaseComplete(3);
             Assert.Equal(TaskB, harness.Completes[^1].Complete.TaskId);
             Assert.Equal(2, harness.ExecutionCount);
 
@@ -1080,13 +1539,29 @@ public sealed class WorkerCompletionRetransmissionTests
     }
 
     /// <summary>
-    /// A SEQUENTIAL RUN STARTS WITH A FRESH RETRY BOUND TO THE NEW REGISTRATION. The service's single
-    /// published connection is replaced by a second run's connection (the per-attempt shape
-    /// <c>Program.cs</c> produces): the new assignment's retry observes the NEW connection, and the
-    /// OLD retry task was already joined so it cannot write on the new one.
+    /// A SEQUENTIAL RUN STARTS WITH A FRESH RETRY BOUND TO THE NEW REGISTRATION'S OWN STREAM. Run 1
+    /// ends with its retry joined and ownership cleared; run 2 publishes a SECOND connection with
+    /// its OWN request-stream writer. Run 2's retry arms its OWN delay (its writer's clock evidence
+    /// is counted from zero for that run) and its retransmission is written on the NEW connection's
+    /// stream — the OLD writer receives NOTHING after run 1 ended.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY SEPARATE WRITERS. With one shared writer, "the third Complete names B" is satisfied by a
+    /// retry writing on either stream, and a cumulative timer count cannot say WHICH run armed a
+    /// delay. Per-connection writers make the target stream an observable, and the run-2 delay
+    /// count is taken as a DELTA over run 1's, so run 2 must arm its own.
+    /// </para>
+    /// <para>
+    /// MUTATION PROOF. A retransmitter bound to anything other than its OWN assignment's connection
+    /// (for example a service-lifetime binding to the first connection ever published) writes run
+    /// 2's retransmission onto writer 1: the new-stream count assertion and the old-stream
+    /// no-further-writes assertion both fail by name. A run 2 that never armed its own delay fails
+    /// the delta assertion by name.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task SequentialRun_StartsAFreshRetry_BoundToTheNewConnection()
+    public async Task SequentialRun_StartsAFreshRetry_ArmingItsOwnDelay_OnTheNewConnectionsStream()
     {
         var harness = new RetryHarness();
         try
@@ -1095,25 +1570,29 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.StartAsync();
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
-            await harness.RetryDelayCreatedAsync(1);
+            await harness.RetryParkedInDelayAsync(1);
 
             var firstConnection = harness.Connection;
             var retry1 = harness.Retry;
+            var delaysAfterRun1 = harness.Clock.TimerCount;
+            Assert.Equal(1, delaysAfterRun1);
+            Assert.Single(harness.CompletesOnWriter(0));
 
             // Run 1 ends: EOF drains, joins the retry and clears ownership.
             harness.CompleteStream();
             await harness.JoinAsync();
-            await harness.JoinedRetryAsync();
+            await retry1.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(0, harness.SlotOccupancy);
             Assert.Equal(0, harness.ReadyCount);
             Assert.True(retry1.IsCompleted);
 
-            // ── RUN 2, on a NEW connection (the per-attempt registration shape) ────
+            var writesOnOldStreamAtRun1End = harness.CompletesOnWriter(0).Count;
+
+            // ── RUN 2, on a NEW connection with its OWN request stream ────────────
             await harness.StartSecondRunAsync();
 
             harness.ReleasePrompt(TaskB);
-            await harness.CompleteEnteredAsync(1);
-            await harness.RetryDelayCreatedAsync(1);
+            await harness.CompleteEnteredOnWriterAsync(1, 0);
 
             var secondConnection = harness.Connection;
             Assert.NotSame(firstConnection, secondConnection);
@@ -1122,12 +1601,106 @@ public sealed class WorkerCompletionRetransmissionTests
             Assert.NotNull(retry2);
             Assert.NotSame(retry1, retry2);
 
-            // The NEW retry re-sends the NEW assignment's frozen evidence.
-            await harness.AdvanceOneIntervalAsync();
-            await harness.CompleteEnteredAsync(2);
-            Assert.Equal(TaskA, harness.Completes[0].Complete.TaskId);
-            Assert.Equal(TaskB, harness.Completes[1].Complete.TaskId);
-            Assert.Equal(TaskB, harness.Completes[2].Complete.TaskId);
+            // RUN 2 ARMED ITS OWN DELAY: a NEW timer, over and above every timer run 1 created.
+            await harness.RetryParkedInDelayAsync(delaysAfterRun1 + 1);
+            Assert.Equal(delaysAfterRun1 + 1, harness.Clock.TimerCount);
+
+            // THE RETRANSMISSION LANDS ON THE NEW CONNECTION'S STREAM.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredOnWriterAsync(1, 1);
+
+            var newStreamCompletes = harness.CompletesOnWriter(1);
+            Assert.Equal(2, newStreamCompletes.Count);
+            Assert.Equal(TaskB, newStreamCompletes[0].Complete.TaskId);
+            Assert.Equal(TaskB, newStreamCompletes[1].Complete.TaskId);
+
+            // …and the OLD stream received NOTHING after run 1 ended: the joined retry cannot
+            // write on a connection whose run is over, nor can it be retargeted.
+            Assert.Equal(writesOnOldStreamAtRun1End, harness.CompletesOnWriter(0).Count);
+            Assert.Equal(TaskA, harness.CompletesOnWriter(0)[0].Complete.TaskId);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+            Assert.Equal(writesOnOldStreamAtRun1End, harness.CompletesOnWriter(0).Count);
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// AN INVALID ACK NEVER CLOSES RETRY ADMISSION. A wrong-TASK ack, a wrong-WORKER ack and a
+    /// DUPLICATE-before-confirmation ack are each consumed as no-ops: the receipt stays unconfirmed,
+    /// the ordinary Ready stays withheld — and, crucially, ADVANCING THE RETRY CLOCK AFTERWARDS
+    /// still produces the retransmission, proving the retry was never closed.
+    /// </summary>
+    /// <remarks>
+    /// MUTATION PROOF. A handler that closed admission on ANY incoming ack (rather than only on the
+    /// FIRST ACCEPTED one) leaves the retry stopped here: the post-ack advance then produces no
+    /// attempt and the rendezvous fails by name. Ready-suppression alone cannot discriminate that
+    /// mutant, which is precisely why the advance is part of this vector.
+    /// </remarks>
+    [Theory]
+    [InlineData(InvalidAckKind.WrongTask)]
+    [InlineData(InvalidAckKind.WrongWorker)]
+    public async Task InvalidAck_NeverClosesRetryAdmission_TheRetryStillHappensAfterwards(
+        InvalidAckKind kind)
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryParkedInDelayAsync(1);
+
+            var retry = harness.Retry;
+
+            // THE INVALID ACK, consumed as a no-op (the trailing probe is the handler-return
+            // barrier: the loop re-arms its next read only after the handler returned).
+            switch (kind)
+            {
+                case InvalidAckKind.WrongTask:
+                    harness.PushAck(TaskB);
+                    break;
+                case InvalidAckKind.WrongWorker:
+                    harness.PushAckForWorker(TaskA, "worker-impostor");
+                    break;
+                default:
+                    throw new Xunit.Sdk.XunitException($"Unhandled invalid-ack kind: {kind}");
+            }
+
+            harness.PushProbe("invalid-ack-returned");
+            await harness.ConsumedAsync(3);
+
+            // NOTHING WAS CONFIRMED and the Ready stays withheld.
+            Assert.False(harness.ReceiptConfirmed);
+            Assert.Equal(0, harness.ReadyCount);
+            Assert.False(retry.IsCompleted, "an invalid ACK must never end the retry task.");
+
+            // THE DISCRIMINATOR: the retry is STILL live, so the interval still produces an attempt.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.Equal(2, harness.Completes.Count);
+            Assert.Equal(TaskA, harness.Completes[1].Complete.TaskId);
+            await harness.RetryParkedInDelayAsync(2);
+
+            // …and the EXACT ack then closes it, so the suppression that follows is meaningful.
+            harness.PushAck(TaskA);
+            harness.PushProbe("exact-ack-returned");
+            await harness.ConsumedAsync(5);
+            Assert.True(harness.ReceiptConfirmed);
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            harness.Advance(SpecifiedInterval);
+            await AssertNoRetrySendAsync(harness, "after the EXACT ACK closed admission");
+            Assert.Equal(2, harness.Completes.Count);
+
+            await harness.ReadyEnteredAsync(0);
+            harness.ReleaseReady(0);
+            await harness.JoinedReadyWriteAsync();
+            Assert.Equal(1, harness.ReadyCount);
 
             harness.CompleteStream();
             await harness.JoinAsync();
@@ -1136,6 +1709,74 @@ public sealed class WorkerCompletionRetransmissionTests
         {
             await harness.TeardownAsync();
         }
+    }
+
+    /// <summary>
+    /// A DUPLICATE ACK AFTER CONFIRMATION changes nothing — and, because the FIRST accepted ack
+    /// already closed admission, the retry stays closed across the duplicate: advancing the clock
+    /// afterwards still produces no attempt, and exactly one Ready was ever emitted.
+    /// </summary>
+    /// <remarks>
+    /// This is the complement of the invalid-ack rows: there the advance proves the retry was NOT
+    /// closed; here it proves a duplicate cannot REOPEN it (nor duplicate the Ready).
+    /// </remarks>
+    [Fact]
+    public async Task DuplicateAckAfterConfirmation_LeavesTheRetryClosed_AndEmitsNoSecondReady()
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryParkedInDelayAsync(1);
+
+            var retry = harness.Retry;
+
+            // THE EXACT ACK closes admission and authorizes the single Ready.
+            harness.PushAck(TaskA);
+            harness.PushProbe("first-ack-returned");
+            await harness.ConsumedAsync(3);
+            Assert.True(harness.ReceiptConfirmed);
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            await harness.ReadyEnteredAsync(0);
+            harness.ReleaseReady(0);
+            await harness.JoinedReadyWriteAsync();
+            Assert.Equal(1, harness.ReadyCount);
+
+            // THE DUPLICATE: consumed, and it changes nothing at all.
+            harness.PushAck(TaskA);
+            harness.PushProbe("duplicate-ack-returned");
+            await harness.ConsumedAsync(5);
+
+            harness.Advance(SpecifiedInterval * 2);
+            await AssertNoRetrySendAsync(harness, "after a DUPLICATE ACK following confirmation");
+            Assert.Single(harness.Completes);
+            Assert.Equal(1, harness.ReadyCount);
+            Assert.True(retry.IsCompleted);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+            Assert.Equal(1, harness.ReadyCount);
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// The kinds of INVALID acknowledgement the retry-admission vectors drive. Public so an xUnit
+    /// theory can take it as a parameter.
+    /// </summary>
+    public enum InvalidAckKind
+    {
+        /// <summary>A correct worker identity but a DIFFERENT task id.</summary>
+        WrongTask,
+
+        /// <summary>The correct task id but a DIFFERENT worker identity.</summary>
+        WrongWorker,
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1152,7 +1793,14 @@ public sealed class WorkerCompletionRetransmissionTests
     {
         private readonly WorkerService _service;
         private readonly ScriptedRunner _runner = new();
-        private readonly RetransmissionWriter _writer = new();
+
+        /// <summary>
+        /// ONE REQUEST-STREAM WRITER PER RUN. A sequential run publishes a NEW connection with its
+        /// OWN writer, so "which stream did this write land on" is an observable rather than an
+        /// inference from a shared log. <see cref="Completes"/> and the release/entry milestones
+        /// address the CURRENT run's writer; <see cref="CompletesOnWriter"/> addresses any run's.
+        /// </summary>
+        private readonly List<RetransmissionWriter> _writers = [];
         private readonly string _root;
         private readonly IDisposable _gitRestore;
         private readonly IDisposable _consoleRestore;
@@ -1225,40 +1873,31 @@ public sealed class WorkerCompletionRetransmissionTests
         }
 
         /// <summary>Whether the ORIGINAL (index 0) Complete write parks until released.</summary>
-        internal bool HoldOriginalComplete
-        {
-            init => _writer.HoldOriginalComplete = value;
-        }
+        /// <remarks>
+        /// The hold/fault switches are stored as CONFIGURATION rather than pushed into a writer
+        /// instance, because each run builds its OWN writer (see <c>_writers</c>). They are applied
+        /// when a run's writer is created, so a sequential run inherits the same configured shape.
+        /// </remarks>
+        internal bool HoldOriginalComplete { get; init; }
 
-        /// <summary>
-        /// Whether RETRY Complete writes (index &gt;= 1) park until released.
-        /// </summary>
-        internal bool HoldRetries
-        {
-            init => _writer.HoldRetries = value;
-        }
+        /// <summary>Whether RETRY Complete writes (index &gt;= 1) park until released.</summary>
+        internal bool HoldRetries { get; init; }
 
         /// <summary>
         /// Whether READY writes park until released — which is what makes a FAILING Ready fault come
         /// from inside a genuine suspension (exactly as a real gRPC writer's does) rather than
         /// synchronously out of the settlement that starts the write.
         /// </summary>
-        internal bool HoldReadies
-        {
-            init => _writer.HoldReadies = value;
-        }
+        internal bool HoldReadies { get; init; }
 
-        /// <summary>A ONE-SHOT failure for the next RETRY write.</summary>
-        internal Exception? FailNextRetryWrite
-        {
-            init => _writer.FailNextRetryWrite = value;
-        }
+        /// <summary>A ONE-SHOT failure for the next RETRY write (applied to the FIRST run's writer).</summary>
+        internal Exception? FailNextRetryWrite { get; init; }
 
-        /// <summary>A ONE-SHOT failure for the first Ready write.</summary>
-        internal Exception? FailFirstReadyWrite
-        {
-            init => _writer.FailNextReadyWrite = value;
-        }
+        /// <summary>A ONE-SHOT failure for the first Ready write (applied to the FIRST run's writer).</summary>
+        internal Exception? FailFirstReadyWrite { get; init; }
+
+        /// <summary>The CURRENT run's request-stream writer.</summary>
+        private RetransmissionWriter Writer => _writers[^1];
 
         /// <summary>The connection's negotiated ACK fact (both-flags default).</summary>
         internal bool AckEnabled { get; init; } = true;
@@ -1295,15 +1934,46 @@ public sealed class WorkerCompletionRetransmissionTests
         internal Task Loop => _loops[^1];
 
         /// <summary>Snapshot of every Complete the wire has seen, oldest first.</summary>
-        internal IReadOnlyList<WorkerMessage> Completes => _writer.Completes;
+        internal IReadOnlyList<WorkerMessage> Completes => Writer.Completes;
 
-        internal int ReadyCount => _writer.ReadyCount;
+        /// <summary>
+        /// The RAW writer arguments for every Complete — the EXACT objects production handed to
+        /// <c>WriteAsync</c>, never cloned by the fixture. These are the only values the
+        /// private-snapshot ownership assertions may use.
+        /// </summary>
+        internal IReadOnlyList<WorkerMessage> RawCompletes => Writer.RawCompletes;
+
+        internal int ReadyCount => Writer.ReadyCount;
+
+        /// <summary>
+        /// The Completes recorded by the run at <paramref name="runIndex"/>'s OWN writer (0 is the
+        /// first run). This is what makes "which stream did this land on" observable across a
+        /// sequential run rather than an inference from a shared log.
+        /// </summary>
+        internal IReadOnlyList<WorkerMessage> CompletesOnWriter(int runIndex) =>
+            _writers[runIndex].Completes;
+
+        /// <summary>Entry milestone for a Complete on a SPECIFIC run's writer.</summary>
+        internal Task CompleteEnteredOnWriterAsync(int runIndex, int index) =>
+            _writers[runIndex].CompleteEntered(index)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>The number of prompt invocations that ENTERED (one per execution).</summary>
         internal int ExecutionCount => _runner.PromptCount;
 
         /// <summary>Task ids whose prompt ever started, in order.</summary>
         internal IReadOnlyList<string> PromptStarts => _runner.StartedTaskIds;
+
+        /// <summary>
+        /// How many runner session RESETS production has entered. The reset is the FIRST production
+        /// step after a replacement drain returns, so this is the load-bearing witness that a
+        /// successor was actually admitted (rather than an end-state guess about the prompt).
+        /// </summary>
+        internal int ResetCount => _runner.ResetCount;
+
+        /// <summary>Completes once production has entered at least <paramref name="count"/> resets.</summary>
+        internal Task ResetCountReachedAsync(int count) =>
+            _runner.ResetCountReached(count).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>Everything production has written to stderr so far.</summary>
         internal string Diagnostics => _runner.Diagnostics;
@@ -1332,8 +2002,15 @@ public sealed class WorkerCompletionRetransmissionTests
 
         internal bool ReceiptConfirmed => (bool)ReadReceiptProperty("IsConfirmed");
 
+        /// <summary>
+        /// Whether the assignment's receipt has been ARMED — i.e. reporting mapped a result and
+        /// froze the envelope. It is the positive witness a "before payload" barrier needs to state
+        /// WHICH side of the mapping it is on.
+        /// </summary>
+        internal bool ReceiptArmed => (bool)ReadReceiptProperty("IsArmed");
+
         /// <summary>Whether the writer observed the retry write at <paramref name="index"/> COMPLETE.</summary>
-        internal bool RetryWriteCompleted(int index) => _writer.CompleteCompleted(index);
+        internal bool RetryWriteCompleted(int index) => Writer.CompleteCompleted(index);
 
         // ── driving ─────────────────────────────────────────────────────────────
 
@@ -1386,8 +2063,28 @@ public sealed class WorkerCompletionRetransmissionTests
                 : new ChannelResponseReader();
             _readers.Add(reader);
 
+            // THIS RUN'S OWN WRITER, configured with the vector's hold/fault shape. A sequential
+            // run therefore gets a SEPARATE stream, which is what makes "run 2's retransmission
+            // landed on the NEW connection" an observation rather than an inference. The one-shot
+            // faults belong to the FIRST run's writer only (a second run must not inherit a
+            // consumed one-shot).
+            var writer = new RetransmissionWriter
+            {
+                HoldOriginalComplete = HoldOriginalComplete,
+                HoldRetries = HoldRetries,
+                HoldReadies = HoldReadies,
+            };
+
+            if (_writers.Count == 0)
+            {
+                writer.FailNextRetryWrite = FailNextRetryWrite;
+                writer.FailNextReadyWrite = FailFirstReadyWrite;
+            }
+
+            _writers.Add(writer);
+
             var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
-                _writer, reader,
+                writer, reader,
                 _ => Task.FromResult(new Metadata()),
                 _ => new Status(StatusCode.OK, string.Empty),
                 _ => new Metadata(),
@@ -1463,6 +2160,15 @@ public sealed class WorkerCompletionRetransmissionTests
             CompletionReceiptAck = new CompletionReceiptAck { TaskId = taskId, WorkerId = AssignedWorkerId },
         });
 
+        /// <summary>
+        /// Pushes an acknowledgement carrying an ARBITRARY worker identity — the wrong-WORKER
+        /// invalid-ack vector. Every other field matches, so only the identity discriminates.
+        /// </summary>
+        internal void PushAckForWorker(string taskId, string workerId) => PushToReader(new OrchestratorMessage
+        {
+            CompletionReceiptAck = new CompletionReceiptAck { TaskId = taskId, WorkerId = workerId },
+        });
+
         internal void PushProbe(string requestId) => PushToReader(new OrchestratorMessage
         {
             ToolResponse = new ToolCallResponse { RequestId = requestId, Success = true, ResultJson = "{}" },
@@ -1493,17 +2199,45 @@ public sealed class WorkerCompletionRetransmissionTests
         // ── milestones ───────────────────────────────────────────────────────────
 
         internal Task CompleteEnteredAsync(int index) =>
-            _writer.CompleteEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Writer.CompleteEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-        internal void ReleaseComplete(int index) => _writer.ReleaseComplete(index);
+        internal void ReleaseComplete(int index) => Writer.ReleaseComplete(index);
 
         internal Task ReadyEnteredAsync(int index) =>
-            _writer.ReadyEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Writer.ReadyEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-        internal void ReleaseReady(int index) => _writer.ReleaseReady(index);
+        internal void ReleaseReady(int index) => Writer.ReleaseReady(index);
 
         internal Task RetryDelayCreatedAsync(int count) =>
-            Clock.WaitForTimerCountAsync(count, TestContext.Current.CancellationToken);
+            Clock.WaitForTimerCountAsync(count, TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+        /// <summary>
+        /// POSITIVE, NON-POLLING evidence that the retry has PARKED IN ITS DELAY: the creation of
+        /// the <paramref name="count"/>-th delay timer through the production clock seam. The
+        /// rendezvous is completed by the creation itself, so abandoning it on a shorter bounded
+        /// wait leaves no stray poller behind.
+        /// </summary>
+        internal Task RetryParkedInDelayAsync(int count) =>
+            Clock.WaitForRetryParkedInDelayAsync(count, TestContext.Current.CancellationToken)
+                .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+        /// <summary>Advances the CURRENT assignment's clock by an EXPLICIT amount.</summary>
+        internal void Advance(TimeSpan delta) => Clock.Advance(delta);
+
+        /// <summary>
+        /// Replaces the SERVICE's <c>TimeProvider</c> with a FRESH manual clock and returns it —
+        /// used strictly AFTER an assignment has been constructed, to prove that assignment keeps
+        /// using the provider it captured. <see cref="Clock"/> keeps returning the ORIGINAL clock.
+        /// </summary>
+        internal ManualRetransmissionClock SwapServiceClock()
+        {
+            var replacement = new ManualRetransmissionClock();
+            typeof(WorkerService)
+                .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .SetValue(_service, replacement);
+            return replacement;
+        }
 
         internal Task JoinedReportingAsync() =>
             Reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1511,10 +2245,16 @@ public sealed class WorkerCompletionRetransmissionTests
         internal Task JoinedExecutionAsync() =>
             Execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+        /// <summary>
+        /// Joins the CURRENT owner's retry task. It FAILS LOUDLY when the ownership slot is already
+        /// empty rather than returning a completed task: a drain vector must capture the CONCRETE
+        /// retry task BEFORE it triggers the drain, because "the slot is null" is exactly the state
+        /// an implementation that cancels and then ABANDONS the unwind would also produce.
+        /// </summary>
         internal Task JoinedRetryAsync() =>
-            RetryTask is { } retry
-                ? retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken)
-                : Task.CompletedTask;
+            (RetryTask ?? throw new Xunit.Sdk.XunitException(
+                "No retry task is retained — capture the CONCRETE task before triggering the drain."))
+            .WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>
         /// POSITIVE evidence the CURRENT owner's retry task is GONE — used by the teardown rows,
@@ -1589,6 +2329,13 @@ public sealed class WorkerCompletionRetransmissionTests
         internal Task RetryQueuedOnSendGateAsync() =>
             SendGateObserver.WaitForWaitersAsync(_sendGate, 1, TestContext.Current.CancellationToken);
 
+        /// <summary>
+        /// POSITIVE proof that SOME sender (here the authorized Ready) is PARKED on the production
+        /// permit queue behind an admitted write — the gate's own async waiter list reports one.
+        /// </summary>
+        internal Task SenderQueuedOnSendGateAsync() =>
+            SendGateObserver.WaitForWaitersAsync(_sendGate, 1, TestContext.Current.CancellationToken);
+
         /// <summary>The production send gate's current count: 0 while a write holds the permit.</summary>
         internal int SendGateCurrentCount => _sendGate.CurrentCount;
 
@@ -1598,7 +2345,7 @@ public sealed class WorkerCompletionRetransmissionTests
         /// release rather than racing it.
         /// </summary>
         internal Task ReadyWriteEnteredAfterRetryTerminatedAsync() =>
-            _writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         // ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -1614,7 +2361,8 @@ public sealed class WorkerCompletionRetransmissionTests
         {
             ReleaseSendGate();
             _runner.ReleaseAll();
-            _writer.ReleaseAll();
+            foreach (var writer in _writers)
+                writer.ReleaseAll();
 
             foreach (var reader in _readers)
             {
@@ -1788,6 +2536,21 @@ public sealed class WorkerCompletionRetransmissionTests
     {
         private readonly object _gate = new();
         private readonly List<WorkerMessage> _completes = [];
+
+        /// <summary>
+        /// THE RAW WRITER ARGUMENTS — the EXACT <see cref="WorkerMessage"/> objects production handed
+        /// to <c>WriteAsync</c>, retained WITHOUT any fixture-side clone.
+        /// </summary>
+        /// <remarks>
+        /// WHY BOTH LISTS EXIST. <see cref="Completes"/> keeps a defensive CLONE so a fixture that
+        /// only reads payload values is unaffected by later mutation. That clone would, however,
+        /// MASK a production mutant that hands the SAME frozen <c>TaskComplete</c> to every writer:
+        /// two clones of one object are still two objects. The raw list is therefore the ONLY
+        /// evidence the private-snapshot ownership assertions use — reference distinctness of the
+        /// raw arguments, plus mutating a raw argument and proving the NEXT raw argument is
+        /// unaffected.
+        /// </remarks>
+        private readonly List<WorkerMessage> _rawCompletes = [];
         private readonly List<WorkerMessage> _readies = [];
         private readonly List<bool> _completeDone = [];
         private readonly Dictionary<int, TaskCompletionSource> _completeEntered = [];
@@ -1799,16 +2562,16 @@ public sealed class WorkerCompletionRetransmissionTests
         private Exception? _failNextRetryWrite;
         private Exception? _failNextReadyWrite;
 
-        internal bool HoldOriginalComplete { get; set; }
+        internal bool HoldOriginalComplete { get; init; }
 
-        internal bool HoldRetries { get; set; }
+        internal bool HoldRetries { get; init; }
 
         /// <summary>
         /// Whether READY writes park until released. A failing Ready must be raised from INSIDE a
         /// genuine suspension, exactly as a real gRPC writer's fault is, rather than synchronously
         /// out of the settlement that starts the write.
         /// </summary>
-        internal bool HoldReadies { get; set; }
+        internal bool HoldReadies { get; init; }
 
         internal Exception? FailNextRetryWrite
         {
@@ -1823,6 +2586,15 @@ public sealed class WorkerCompletionRetransmissionTests
         internal IReadOnlyList<WorkerMessage> Completes
         {
             get { lock (_gate) return [.. _completes]; }
+        }
+
+        /// <summary>
+        /// The RAW writer arguments, oldest first — the exact objects production passed to
+        /// <c>WriteAsync</c>, never cloned by this fixture.
+        /// </summary>
+        internal IReadOnlyList<WorkerMessage> RawCompletes
+        {
+            get { lock (_gate) return [.. _rawCompletes]; }
         }
 
         internal int ReadyCount { get { lock (_gate) return _readies.Count; } }
@@ -1902,6 +2674,11 @@ public sealed class WorkerCompletionRetransmissionTests
             {
                 index = _completes.Count;
                 _completes.Add(message.Clone());
+
+                // THE RAW ARGUMENT, retained BY REFERENCE. This is the object identity the
+                // private-snapshot assertions compare and mutate; cloning it here would make a
+                // "same frozen object handed to every writer" mutant indistinguishable.
+                _rawCompletes.Add(message);
                 _completeDone.Add(false);
                 entered = Slot(_completeEntered, index);
                 release = Slot(_completeRelease, index);
@@ -2014,6 +2791,33 @@ public sealed class WorkerCompletionRetransmissionTests
 
         internal int PromptCount { get { lock (_gate) return _startedIds.Count; } }
 
+        /// <summary>
+        /// How many session RESETS production has ENTERED. Resets are counted by ORDER, never keyed
+        /// by task id: the executor sets the runner's current-task id AFTER the reset, so the id
+        /// visible inside a reset is the PREDECESSOR's.
+        /// </summary>
+        internal int ResetCount { get { lock (_gate) return _resetCount; } }
+
+        private int _resetCount;
+        private readonly List<(int Count, TaskCompletionSource Waiter)> _resetWaiters = [];
+
+        /// <summary>
+        /// Completes once production has entered at least <paramref name="count"/> resets — a
+        /// creation-signalled rendezvous, never a poll.
+        /// </summary>
+        internal Task ResetCountReached(int count)
+        {
+            lock (_gate)
+            {
+                if (_resetCount >= count)
+                    return Task.CompletedTask;
+
+                var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _resetWaiters.Add((count, waiter));
+                return waiter.Task;
+            }
+        }
+
         internal IReadOnlyList<string> StartedTaskIds { get { lock (_gate) return [.. _startedIds]; } }
 
         internal string Diagnostics { get { lock (_diagnostics) return _diagnostics.ToString(); } }
@@ -2110,7 +2914,27 @@ public sealed class WorkerCompletionRetransmissionTests
         public void SetConfigProvisioner(Func<string?, CancellationToken, Task>? provisioner) { }
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task ResetSessionAsync(string? model, ReasoningEffort? reasoningEffort, CancellationToken ct = default)
-            => Task.CompletedTask;
+        {
+            List<TaskCompletionSource> satisfied = [];
+            lock (_gate)
+            {
+                _resetCount++;
+                for (var i = _resetWaiters.Count - 1; i >= 0; i--)
+                {
+                    var (count, waiter) = _resetWaiters[i];
+                    if (_resetCount >= count)
+                    {
+                        satisfied.Add(waiter);
+                        _resetWaiters.RemoveAt(i);
+                    }
+                }
+            }
+
+            foreach (var waiter in satisfied)
+                waiter.TrySetResult();
+
+            return Task.CompletedTask;
+        }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
         /// <summary>A <see cref="TextWriter"/> that forwards to the real stderr and taps the line.</summary>
