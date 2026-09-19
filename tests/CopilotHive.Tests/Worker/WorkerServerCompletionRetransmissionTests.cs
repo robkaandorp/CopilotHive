@@ -88,160 +88,179 @@ public sealed class WorkerServerCompletionRetransmissionTests
     /// THE ONE MANDATORY AC7 VECTOR: drop the FIRST acknowledgement, keep the stream perfectly alive,
     /// and prove the retransmitted completion is confirmed and readied end to end.
     /// </summary>
+    /// <remarks>
+    /// LIFETIME OWNERSHIP. The worker's <c>run</c> task, the server stream tasks and every
+    /// constructor-subscribed downstream handler are owned by <see cref="LostAckFixture"/>, which
+    /// joins them in a <c>finally</c> BEFORE any channel completion or resource disposal. An
+    /// assertion failure therefore stays the authoritative exception while the worker lifecycle is
+    /// still joined — nothing unwinds against a disposed SQLite store or a deleted temp root.
+    /// </remarks>
     [Fact]
     public async Task LostFirstAck_OnALiveStream_WorkerResendsAndTheRealServerConfirmsAndReadies()
     {
-        var root = CreateRoot();
-        try
-        {
-            var chain = new ServerChain(Path.Combine(root, "receipts.db"), root);
-            try
-            {
-                var worker = chain.BuildWorker();
-                await using var bridge = chain.StartBridge(worker);
-                worker.Install(bridge);
+        await using var fixture = new LostAckFixture();
+        var chain = fixture.Chain;
+        var worker = fixture.Worker;
+        var bridge = fixture.Bridge;
 
-                var run = worker.Service.RunAsync(TestContext.Current.CancellationToken);
+        fixture.StartWorkerRun();
 
-                // ── THE REAL REGISTRATION, PRODUCTION'S OWN ANSWER ─────────────────────────────
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Ready, 0, TestContext.Current.CancellationToken);
+        // ── THE REAL REGISTRATION, PRODUCTION'S OWN ANSWER ─────────────────────────────
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Ready, 0, TestContext.Current.CancellationToken);
 
-                Assert.Equal(1, bridge.RegisterCalls);
-                Assert.True(bridge.LastRegistrationAccepted);
-                Assert.True(bridge.LastRegistrationAckEnabled);
-                Assert.True(bridge.LastRegistrationReadyRequired);
+        Assert.Equal(1, bridge.RegisterCalls);
+        Assert.True(bridge.LastRegistrationAccepted);
+        Assert.True(bridge.LastRegistrationAckEnabled);
+        Assert.True(bridge.LastRegistrationReadyRequired);
 
-                var connection = chain.PublishedConnection(worker.Service)
-                    ?? throw new Xunit.Sdk.XunitException("RunAsync must publish its accepted connection.");
-                Assert.True(connection.CompletionReceiptAckEnabled);
-                Assert.True(connection.CompletionReadyRequired);
-                Assert.Equal(WorkerId, connection.AssignedId);
+        var connection = chain.PublishedConnection(worker.Service)
+            ?? throw new Xunit.Sdk.XunitException("RunAsync must publish its accepted connection.");
+        Assert.True(connection.CompletionReceiptAckEnabled);
+        Assert.True(connection.CompletionReadyRequired);
+        Assert.Equal(WorkerId, connection.AssignedId);
 
-                // ── THE INITIAL READY DRIVES THE REAL ASSIGNMENT PUBLICATION ───────────────────
-                var assignment = await worker.AssignmentDelivered.WaitAsync(
-                    Failsafe, TestContext.Current.CancellationToken);
-                Assert.Equal(TaskId, assignment.TaskId);
+        // ── THE INITIAL READY DRIVES THE REAL ASSIGNMENT PUBLICATION ───────────────────
+        var assignment = await worker.AssignmentDelivered.WaitAsync(
+            Failsafe, TestContext.Current.CancellationToken);
+        Assert.Equal(TaskId, assignment.TaskId);
 
-                // THE REAL PUBLISHER CONFIRMED PUBLICATION, and the REAL assignment store holds the row.
-                Assert.Equal(1, chain.Publisher.PublishCalls);
-                Assert.Equal(TaskId, chain.Publisher.LastPublishedTask);
-                Assert.NotNull(chain.Stores.AssignmentStore.Load(TaskId));
+        // THE REAL PUBLISHER CONFIRMED PUBLICATION, and the REAL assignment store holds the row.
+        Assert.Equal(1, chain.Publisher.PublishCalls);
+        Assert.Equal(TaskId, chain.Publisher.LastPublishedTask);
+        Assert.NotNull(chain.Stores.AssignmentStore.Load(TaskId));
 
-                // ── ARM THE ONE DROP, THEN LET THE WORKER FINISH ───────────────────────────────
-                // The drop covers EXACTLY the FIRST acknowledgement; every later one forwards.
-                bridge.ArmDropFirstAck();
-                worker.ReleasePrompt();
+        // ── ARM THE ONE DROP, THEN LET THE WORKER FINISH ───────────────────────────────
+        // The drop covers EXACTLY the FIRST acknowledgement; every later one forwards.
+        bridge.ArmDropFirstAck();
+        worker.ReleasePrompt();
 
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Complete, 0, TestContext.Current.CancellationToken);
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Complete, 0, TestContext.Current.CancellationToken);
 
-                // THE REAL SERVER RECORDED THE RECEIPT DURABLY (read back through a FRESH store).
-                var receipt = await chain.WaitForStoredReceiptAsync(Failsafe);
-                Assert.Equal(TaskId, receipt.Receipt.Slot.TaskId);
-                Assert.Equal(WorkerId, receipt.Receipt.WorkerId);
-                Assert.Equal(GoalId, receipt.Receipt.GoalId);
+        // THE REAL SERVER RECORDED THE RECEIPT DURABLY. The rendezvous is the forwarding recorder's
+        // own signal, raised AFTER production's Record returned — no polling, no sampling window.
+        var receiptBefore = await chain.WaitForStoredReceiptAsync(Failsafe);
+        Assert.Equal(TaskId, receiptBefore.Receipt.Slot.TaskId);
+        Assert.Equal(WorkerId, receiptBefore.Receipt.WorkerId);
+        Assert.Equal(GoalId, receiptBefore.Receipt.GoalId);
 
-                // THE ONE DROPPED ACK: the server really attempted it; the bridge swallowed it.
-                await bridge.DroppedAckObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.Equal(1, bridge.AckWriteAttempts);
-                Assert.Equal(0, bridge.AckForwardedCount);
+        // THE ONE DROPPED ACK: the server really attempted it; the bridge swallowed it.
+        await bridge.DroppedAckObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        Assert.Equal(1, bridge.AckWriteAttempts);
+        Assert.Equal(0, bridge.AckForwardedCount);
 
-                // ── NO ORDINARY READY YET: the readiness wait is REAL ──────────────────────────
-                // Only the INITIAL Ready exists, and that absence is observed with a bounded window
-                // while the loop is provably alive behind it. The Ready-ACCEPTANCE baseline is taken
-                // AFTER the initial Ready (which legitimately is the one Ready the server has
-                // accepted so far), so the assertion below is about what the COMPLETION did.
-                Assert.Single(bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Ready));
-                var acceptedAfterInitialReady = chain.OrdinaryReadyAcceptedCount;
-                var withheld = await Record.ExceptionAsync(async () =>
-                    await bridge.WorkerWriter
-                        .WaitForMessageAsync(
-                            WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken)
-                        .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
-                Assert.IsType<TimeoutException>(withheld);
-                Assert.Equal(0, chain.Recorder.ConfirmCalls);
-                Assert.Equal(acceptedAfterInitialReady, chain.OrdinaryReadyAcceptedCount);
+        // ── NO ORDINARY READY YET: the readiness wait is REAL ──────────────────────────
+        // Only the INITIAL Ready exists, and that absence is observed with a bounded window
+        // while the loop is provably alive behind it. The Ready-ACCEPTANCE baseline is taken
+        // AFTER the initial Ready (which legitimately is the one Ready the server has
+        // accepted so far), so the assertion below is about what the COMPLETION did.
+        Assert.Single(bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Ready));
+        var acceptedAfterInitialReady = chain.OrdinaryReadyAcceptedCount;
+        var withheld = await Record.ExceptionAsync(async () =>
+            await bridge.WorkerWriter
+                .WaitForMessageAsync(
+                    WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken)
+                .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+        Assert.IsType<TimeoutException>(withheld);
+        Assert.Equal(0, chain.Recorder.ConfirmCalls);
+        Assert.Equal(acceptedAfterInitialReady, chain.OrdinaryReadyAcceptedCount);
 
-                // ── ADVANCE THE WORKER'S OWN RETRY CLOCK ───────────────────────────────────────
-                await worker.RetryDelayCreatedAsync(1, TestContext.Current.CancellationToken);
-                worker.Clock.Advance(chain.RetryInterval);
+        // ── ADVANCE THE WORKER'S OWN RETRY CLOCK ───────────────────────────────────────
+        await worker.RetryDelayCreatedAsync(1, TestContext.Current.CancellationToken);
+        worker.Clock.Advance(chain.RetryInterval);
 
-                // ── THE WORKER RESENDS ITS FROZEN COMPLETION ON THE SAME STREAM ─────────────────
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Complete, 1, TestContext.Current.CancellationToken);
+        // ── THE WORKER RESENDS ITS FROZEN COMPLETION ON THE SAME STREAM ─────────────────
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Complete, 1, TestContext.Current.CancellationToken);
 
-                var original = bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Complete)[0];
-                var resent = bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Complete)[1];
-                Assert.NotSame(original, resent);
-                Assert.NotSame(original.Complete, resent.Complete);
-                Assert.Equal(original.WorkerId, resent.WorkerId);
-                Assert.Equal(original.Complete, resent.Complete);
+        // CLONE OWNERSHIP, ON THE RAW WRITER ARGUMENTS. These are the EXACT objects production
+        // handed to WriteAsync — no fixture clone in between — so a production that re-delivered
+        // its private snapshot object would show ONE object here, not two.
+        var rawCompletes = bridge.WorkerWriter.RawOf(WorkerMessage.PayloadOneofCase.Complete);
+        var rawOriginal = rawCompletes[0];
+        var rawResent = rawCompletes[1];
 
-                // ── THE REAL SERVER CONFIRMS AND RE-ACKS ────────────────────────────────────────
-                await bridge.ReAckForwarded.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.Equal(1, chain.Recorder.ConfirmCalls);
-                Assert.Equal(1, chain.Recorder.ConfirmAccepted);
-                Assert.Equal(1, chain.Recorder.RecordCalls);
+        Assert.NotSame(rawOriginal, rawResent);
+        Assert.NotSame(rawOriginal.Complete, rawResent.Complete);
+        Assert.NotSame(rawOriginal.Complete.Metrics, rawResent.Complete.Metrics);
+        Assert.NotSame(rawOriginal.Complete.GitStatus, rawResent.Complete.GitStatus);
+        Assert.Equal(rawOriginal.WorkerId, rawResent.WorkerId);
+        Assert.Equal(rawOriginal.Complete, rawResent.Complete);
 
-                // THE RECEIPT IS UNCHANGED: the re-acknowledgement re-recorded and rebound nothing.
-                var afterReAck = chain.Stores.NewReceiptStore().Load(TaskId);
-                Assert.NotNull(afterReAck);
-                Assert.Equal(receipt.Receipt.Slot.TaskId, afterReAck.Receipt.Slot.TaskId);
-                Assert.Equal(receipt.Receipt.WorkerId, afterReAck.Receipt.WorkerId);
-                Assert.Equal(receipt.Receipt.GoalId, afterReAck.Receipt.GoalId);
-                Assert.Equal(receipt.Receipt.Result.Output, afterReAck.Receipt.Result.Output);
-                Assert.Equal(receipt.Receipt.Result.Model, afterReAck.Receipt.Result.Model);
-                Assert.Equal(receipt.FirstStoredAtUtc, afterReAck.FirstStoredAtUtc);
+        // THE MUTATION, applied to the DELIVERED raw argument itself. The frozen evidence captured
+        // here is what the NEXT retransmission must still carry; a shallow copy that shared the
+        // nested collections would leak this damage forward.
+        var frozenIssues = rawOriginal.Complete.Metrics.Issues.ToArray();
+        var frozenChangedFiles = rawOriginal.Complete.GitStatus.ChangedFiles.ToArray();
+        Assert.NotEmpty(frozenIssues); // NON-VACUITY: there is real nested evidence to damage.
+        Assert.NotEmpty(frozenChangedFiles);
 
-                // ── EXACTLY ONE ORDINARY READY, ACCEPTED BY THE REAL SERVER ─────────────────────
-                var ordinaryReady = await bridge.WorkerWriter.WaitForMessageAsync(
-                    WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken);
-                Assert.Equal(WorkerId, ordinaryReady.WorkerId);
-                Assert.Equal(2, bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Ready).Count);
+        rawOriginal.Complete.Metrics.Issues.Clear();
+        rawOriginal.Complete.Metrics.Issues.Add("MUTATED-BY-THE-FIRST-WRITER");
+        rawOriginal.Complete.GitStatus.ChangedFiles.Clear();
+        rawOriginal.Complete.Output = "MUTATED-ORIGINAL-OUTPUT";
 
-                await chain.WaitForOrdinaryReadyAcceptedAsync(Failsafe);
+        // THE ALREADY-DELIVERED RETRANSMISSION still carries the ORIGINAL evidence, IN ORDER.
+        Assert.Equal(frozenIssues, rawResent.Complete.Metrics.Issues);
+        Assert.Equal(frozenChangedFiles, rawResent.Complete.GitStatus.ChangedFiles);
+        Assert.DoesNotContain("MUTATED-BY-THE-FIRST-WRITER", rawResent.Complete.Metrics.Issues);
+        Assert.NotEqual("MUTATED-ORIGINAL-OUTPUT", rawResent.Complete.Output);
 
-                // ── THE SAME REGISTRATION AND THE SAME STREAM THROUGHOUT ────────────────────────
-                Assert.Same(connection, chain.PublishedConnection(worker.Service));
-                Assert.False(connection.IsRetired);
-                Assert.Equal(1, bridge.RegisterCalls);
-                Assert.Equal(1, bridge.StreamOpens);
-                Assert.Equal(1, bridge.ServerStreamCount);
+        // ── THE REAL SERVER CONFIRMS AND RE-ACKS ────────────────────────────────────────
+        await bridge.ReAckForwarded.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-                // ── ONE EXECUTION, ONE ORDINARY RECORD, ONE COMPLETION NOTIFICATION ─────────────
-                Assert.Equal(ExpectedPromptCount, worker.PromptCount);
-                Assert.True(
-                    chain.DownstreamCompletions == 1,
-                    $"exactly one downstream completion notification is expected, but observed: {string.Join(" ; ", chain.Notified)}");
+        // THE RECEIPT IS UNCHANGED. Both sides are read back through a FRESH store, and the
+        // COMPLETE persisted value is compared — production's own canonical encoding plus every
+        // individual field, including FirstStoredAtUtc.
+        var receiptAfter = await chain.WaitForReConfirmedReceiptAsync(Failsafe);
+        AssertPersistedReceiptUnchanged(receiptBefore, receiptAfter);
 
-                // THE DASHBOARD STATE CHANGES ARE EXACTLY TWO, AND BOTH ARE EXPECTED PRODUCTION
-                // BEHAVIOR: the ONE completion publication, and the ONE accepted ordinary Ready
-                // (whose own handler notifies after its accepted claim). A third would mean the
-                // completion path ran — or was readied — more than once.
-                Assert.True(
-                    chain.DashboardCompletionNotifications == 2,
-                    "expected exactly the completion publication plus the accepted Ready notification, observed "
-                        + chain.DashboardCompletionNotifications);
+        Assert.Equal(1, chain.Recorder.ConfirmCalls);
+        Assert.Equal(1, chain.Recorder.ConfirmAccepted);
+        Assert.Equal(1, chain.Recorder.RecordCalls);
 
-                // ── TEARDOWN: EOF ENDS BOTH SIDES CLEANLY AND EVERYTHING REMAINS JOINED ─────────
-                bridge.CompleteServerSide();
-                await bridge.JoinServerStreamAsync();
+        // ── EXACTLY ONE ORDINARY READY, ACCEPTED BY THE REAL SERVER ─────────────────────
+        var ordinaryReady = await bridge.WorkerWriter.WaitForMessageAsync(
+            WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken);
+        Assert.Equal(WorkerId, ordinaryReady.WorkerId);
+        Assert.Equal(2, bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Ready).Count);
 
-                // EOF for the WORKER side last, so the whole lost-ACK window above ran with BOTH
-                // sides of the stream fully live.
-                bridge.CompleteWorkerSide();
-                await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.True(run.IsCompletedSuccessfully, "the worker lifecycle must end normally: " + run.Status);
-            }
-            finally
-            {
-                chain.Dispose();
-            }        }
-        finally
-        {
-            TryDelete(root);
-        }
+        await chain.WaitForOrdinaryReadyAcceptedAsync(Failsafe);
+
+        // ── THE SAME REGISTRATION AND THE SAME STREAM THROUGHOUT ────────────────────────
+        Assert.Same(connection, chain.PublishedConnection(worker.Service));
+        Assert.False(connection.IsRetired);
+        Assert.Equal(1, bridge.RegisterCalls);
+        Assert.Equal(1, bridge.StreamOpens);
+        Assert.Equal(1, bridge.ServerStreamCount);
+
+        // ── ONE EXECUTION, ONE ORDINARY RECORD, ONE COMPLETION NOTIFICATION ─────────────
+        Assert.Equal(ExpectedPromptCount, worker.PromptCount);
+        Assert.True(
+            chain.DownstreamCompletions == 1,
+            $"exactly one downstream completion notification is expected, but observed: {string.Join(" ; ", chain.Notified)}");
+
+        // THE DASHBOARD STATE CHANGES ARE EXACTLY TWO, AND BOTH ARE EXPECTED PRODUCTION
+        // BEHAVIOR: the ONE completion publication, and the ONE accepted ordinary Ready
+        // (whose own handler notifies after its accepted claim). A third would mean the
+        // completion path ran — or was readied — more than once.
+        Assert.True(
+            chain.DashboardCompletionNotifications == 2,
+            "expected exactly the completion publication plus the accepted Ready notification, observed "
+                + chain.DashboardCompletionNotifications);
+
+        // ── TEARDOWN: EOF ENDS BOTH SIDES CLEANLY AND EVERYTHING REMAINS JOINED ─────────
+        // The fixture's DisposeAsync performs the EOF/join/dispose ordering on EVERY path; here
+        // the NORMAL finish is additionally asserted, which a failure path cannot claim.
+        await fixture.EndStreamAndJoinWorkerAsync();
+        Assert.True(
+            fixture.Run.IsCompletedSuccessfully,
+            "the worker lifecycle must end normally: " + fixture.Run.Status);
+
+        // A BROKEN TEARDOWN CANNOT HIDE BEHIND A GREEN RUN: on this passing path the fixture's
+        // captured cleanup failures (if any) are surfaced now, where no assertion failure competes.
+        fixture.AssertCleanTeardown();
     }
 
     /// <summary>
@@ -249,75 +268,243 @@ public sealed class WorkerServerCompletionRetransmissionTests
     /// single ordinary Ready and the retry never even arms a delay — so the vector above is genuinely
     /// about the DROPPED message and not about a stream that simply never acknowledges.
     /// </summary>
+    /// <remarks>
+    /// It uses the SAME <see cref="LostAckFixture"/> ownership, so the worker's <c>run</c> task and
+    /// every subscribed handler are joined in a <c>finally</c> before anything is disposed here too.
+    /// </remarks>
     [Fact]
     public async Task NoDroppedAck_TheFirstAcknowledgementAloneAuthorizesTheSingleReady()
     {
-        var root = CreateRoot();
-        try
+        await using var fixture = new LostAckFixture();
+        var chain = fixture.Chain;
+        var worker = fixture.Worker;
+        var bridge = fixture.Bridge;
+
+        fixture.StartWorkerRun();
+
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Ready, 0, TestContext.Current.CancellationToken);
+
+        var assignment = await worker.AssignmentDelivered.WaitAsync(
+            Failsafe, TestContext.Current.CancellationToken);
+        Assert.Equal(TaskId, assignment.TaskId);
+
+        worker.ReleasePrompt();
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Complete, 0, TestContext.Current.CancellationToken);
+
+        // THE FIRST ACK IS FORWARDED (no drop armed), and it authorizes the single Ready.
+        await bridge.FirstAckForwarded.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        Assert.Equal(1, bridge.AckForwardedCount);
+        Assert.Equal(0, bridge.AckWriteAttempts - bridge.AckForwardedCount);
+
+        await bridge.WorkerWriter.WaitForAsync(
+            WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken);
+        await chain.WaitForOrdinaryReadyAcceptedAsync(Failsafe);
+
+        // THE DURABLE RECEIPT EXISTS, observed through the SAME non-polling recorder rendezvous.
+        var receipt = await chain.WaitForStoredReceiptAsync(Failsafe);
+        Assert.Equal(TaskId, receipt.Receipt.Slot.TaskId);
+
+        // NO RETRY WAS EVER NEEDED: production created AT MOST the one delay timer whose
+        // wait the first acknowledgement then cancelled, and no second Complete was written.
+        Assert.True(worker.RetryDelayTimers <= 1, "a forwarded first ACK must not require retries");
+        Assert.Equal(ExpectedPromptCount, worker.PromptCount);
+        Assert.Single(bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Complete));
+        Assert.Single(bridge.WorkerWriter.RawOf(WorkerMessage.PayloadOneofCase.Complete));
+        Assert.Equal(1, chain.Recorder.RecordCalls);
+        Assert.Equal(0, chain.Recorder.ConfirmCalls);
+        Assert.True(
+            chain.DownstreamCompletions == 1,
+            $"exactly one downstream completion notification is expected, but observed: {string.Join(" ; ", chain.Notified)}");
+
+        // The ONE completion publication plus the ONE accepted Ready notification.
+        Assert.True(
+            chain.DashboardCompletionNotifications == 2,
+            "expected exactly the completion publication plus the accepted Ready notification, observed "
+                + chain.DashboardCompletionNotifications);
+
+        await fixture.EndStreamAndJoinWorkerAsync();
+        Assert.True(fixture.Run.IsCompletedSuccessfully);
+        fixture.AssertCleanTeardown();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  THE OWNED LIFETIME
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE ONE OWNER OF EVERY LIFETIME THIS FIXTURE STARTS: the temp root, the real server chain
+    /// (with its constructor-subscribed downstream handlers), the bridge with its REAL server stream
+    /// tasks, the worker harness — and the worker's own <see cref="WorkerService.RunAsync"/> task.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. With the <c>run</c> task as a test-local awaited only on the success path, an
+    /// assertion failure unwound the test while the REAL worker lifecycle was still running — and
+    /// the enclosing <c>finally</c> blocks then disposed the SQLite stores and deleted the temp root
+    /// underneath it. Disposal ordering is therefore owned HERE, in one place, and applied on EVERY
+    /// path.
+    /// </para>
+    /// <para>
+    /// THE ORDER IS THE CONTRACT, and nothing is disposed before the joins:
+    /// <list type="number">
+    ///   <item>EOF the SERVER side and JOIN the real <c>WorkStream</c> tasks;</item>
+    ///   <item>EOF the WORKER side and JOIN the <c>run</c> task — the worker lifecycle reaches
+    ///   quiescence while its stores and temp root are still alive;</item>
+    ///   <item>DETACH and quiesce every constructor-subscribed downstream handler
+    ///   (<c>TaskCompletionNotifier.OnTaskCompleted</c>, <c>DashboardNotifier.OnStateChanged</c>,
+    ///   <c>TaskQueue.OnEnqueue</c> and the service logger's armed rendezvous), joining any handler
+    ///   invocation still in flight;</item>
+    ///   <item>only THEN dispose the stores, the worker harness and the temp root.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// THE PRIMARY FAILURE ALWAYS WINS. <see cref="DisposeAsync"/> never throws: a cleanup failure is
+    /// captured and REPORTED through the guarded diagnostic, so an assertion failure remains the
+    /// authoritative exception the test reports. A cleanup failure on an OTHERWISE PASSING test is
+    /// surfaced by <see cref="AssertCleanTeardown"/>, which the tests call at the end of their happy
+    /// path — so a broken teardown cannot hide behind a green run either.
+    /// </para>
+    /// </remarks>
+    private sealed class LostAckFixture : IAsyncDisposable
+    {
+        private readonly string _root;
+        private readonly List<string> _cleanupFailures = [];
+        private Task? _run;
+        private bool _streamEnded;
+
+        internal LostAckFixture()
         {
-            var chain = new ServerChain(Path.Combine(root, "receipts.db"), root);
-            try
-            {
-                var worker = chain.BuildWorker();
-                await using var bridge = chain.StartBridge(worker);
-                worker.Install(bridge);
+            _root = CreateRoot();
+            Chain = new ServerChain(Path.Combine(_root, "receipts.db"), _root);
+            Worker = Chain.BuildWorker();
+            Bridge = Chain.StartBridge(Worker);
+            Worker.Install(Bridge);
+        }
 
-                var run = worker.Service.RunAsync(TestContext.Current.CancellationToken);
+        internal ServerChain Chain { get; }
 
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Ready, 0, TestContext.Current.CancellationToken);
+        internal WorkerHarness Worker { get; }
 
-                var assignment = await worker.AssignmentDelivered.WaitAsync(
-                    Failsafe, TestContext.Current.CancellationToken);
-                Assert.Equal(TaskId, assignment.TaskId);
+        internal Bridge Bridge { get; }
 
-                worker.ReleasePrompt();
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Complete, 0, TestContext.Current.CancellationToken);
+        /// <summary>The worker's REAL lifecycle task, owned and joined by this fixture.</summary>
+        internal Task Run => _run
+            ?? throw new Xunit.Sdk.XunitException("StartWorkerRun must be called before Run is read.");
 
-                // THE FIRST ACK IS FORWARDED (no drop armed), and it authorizes the single Ready.
-                await bridge.FirstAckForwarded.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.Equal(1, bridge.AckForwardedCount);
-                Assert.Equal(0, bridge.AckWriteAttempts - bridge.AckForwardedCount);
+        /// <summary>Starts the REAL worker lifecycle and RETAINS its task for the guaranteed join.</summary>
+        internal void StartWorkerRun()
+        {
+            if (_run is not null)
+                throw new Xunit.Sdk.XunitException("The worker run has already been started.");
 
-                await bridge.WorkerWriter.WaitForAsync(
-                    WorkerMessage.PayloadOneofCase.Ready, 1, TestContext.Current.CancellationToken);
-                await chain.WaitForOrdinaryReadyAcceptedAsync(Failsafe);
+            _run = Worker.Service.RunAsync(TestContext.Current.CancellationToken);
+        }
 
-                // NO RETRY WAS EVER NEEDED: production created AT MOST the one delay timer whose
-                // wait the first acknowledgement then cancelled, and no second Complete was written.
-                Assert.True(worker.RetryDelayTimers <= 1, "a forwarded first ACK must not require retries");
-                Assert.Equal(ExpectedPromptCount, worker.PromptCount);
-                Assert.Single(bridge.WorkerWriter.Of(WorkerMessage.PayloadOneofCase.Complete));
-                Assert.Equal(1, chain.Recorder.RecordCalls);
-                Assert.Equal(0, chain.Recorder.ConfirmCalls);
-                Assert.True(
-                    chain.DownstreamCompletions == 1,
-                    $"exactly one downstream completion notification is expected, but observed: {string.Join(" ; ", chain.Notified)}");
+        /// <summary>
+        /// ENDS BOTH SIDES OF THE STREAM AND JOINS THE WORKER, in the production-meaningful order:
+        /// the server side first (so its pump finishes), then the worker side (so the whole lost-ACK
+        /// window above ran with BOTH sides live). Idempotent, so <see cref="DisposeAsync"/> can call
+        /// it again safely on every path.
+        /// </summary>
+        internal async Task EndStreamAndJoinWorkerAsync()
+        {
+            if (_streamEnded)
+                return;
 
-                // The ONE completion publication plus the ONE accepted Ready notification.
-                Assert.True(
-                    chain.DashboardCompletionNotifications == 2,
-                    "expected exactly the completion publication plus the accepted Ready notification, observed "
-                        + chain.DashboardCompletionNotifications);
+            _streamEnded = true;
 
-                bridge.CompleteServerSide();
-                await bridge.JoinServerStreamAsync();
+            Bridge.CompleteServerSide();
+            await Bridge.JoinServerStreamAsync();
 
-                // EOF for the WORKER side last, so the whole lost-ACK window above ran with BOTH
-                // sides of the stream fully live.
-                bridge.CompleteWorkerSide();
+            Bridge.CompleteWorkerSide();
+            if (_run is { } run)
                 await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-                Assert.True(run.IsCompletedSuccessfully);
-            }
-            finally
+        }
+
+        /// <summary>
+        /// Fails the test when teardown itself failed. Called at the END of a passing test, so a
+        /// broken teardown surfaces on a green run without ever competing with a real assertion
+        /// failure (on a failing path the primary exception is already unwinding and this is not
+        /// reached).
+        /// </summary>
+        internal void AssertCleanTeardown()
+        {
+            lock (_cleanupFailures)
             {
-                chain.Dispose();
+                if (_cleanupFailures.Count > 0)
+                    throw new Xunit.Sdk.XunitException(
+                        "Teardown failed: " + string.Join(" ; ", _cleanupFailures));
             }
         }
-        finally
+
+        public async ValueTask DisposeAsync()
         {
-            TryDelete(root);
+            // 1-2. EOF BOTH SIDES AND JOIN THE SERVER STREAMS AND THE WORKER RUN — before any
+            //      resource is released, so the worker never unwinds against a disposed store.
+            await CaptureAsync("stream EOF / worker join", EndStreamAndJoinWorkerAsync);
+
+            // On a FAILURE path the join above may itself time out; the run task is still observed
+            // so a faulted lifecycle never becomes an unobserved task exception.
+            await CaptureAsync("worker run observation", async () =>
+            {
+                if (_run is { } run)
+                {
+                    try
+                    {
+                        await run.WaitAsync(Failsafe, CancellationToken.None);
+                    }
+                    catch (Exception)
+                    {
+                        // The run's real outcome is asserted on the test's normal path; here it is
+                        // only OBSERVED so it can never surface as an unobserved task exception.
+                    }
+                }
+            });
+
+            // 3. DETACH AND QUIESCE the constructor-subscribed downstream handlers, joining any
+            //    handler invocation still in flight.
+            await CaptureAsync("downstream handler quiescence", Chain.QuiesceSubscriptionsAsync);
+
+            // 4. ONLY NOW release resources.
+            Capture("chain dispose", Chain.Dispose);
+            Capture("worker dispose", Worker.Dispose);
+            Capture("temp root delete", () => TryDelete(_root));
+        }
+
+        private void Capture(string stage, Action action)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                Note(stage, ex);
+            }
+        }
+
+        private async Task CaptureAsync(string stage, Func<Task> action)
+        {
+            try
+            {
+                await action();
+            }
+            catch (Exception ex)
+            {
+                Note(stage, ex);
+            }
+        }
+
+        /// <summary>
+        /// Records a cleanup failure WITHOUT throwing, so it can never replace an assertion failure
+        /// that is already unwinding. The text is a type/stage classification only.
+        /// </summary>
+        private void Note(string stage, Exception ex)
+        {
+            lock (_cleanupFailures)
+                _cleanupFailures.Add($"{stage}: {ex.GetType().Name}");
         }
     }
 
@@ -362,6 +549,11 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
             // THE PENDING WORK the real Ready handler dequeues — enqueued as production would, so the
             // dequeue, the claim, the recording and the publication are all the REAL path.
+            //
+            // A REPOSITORY IS SUPPLIED DELIBERATELY: the executor's per-repo status probe is what
+            // produces real GitStatus.ChangedFiles evidence, so the receipt carries NESTED, ORDERED
+            // collections. That is what lets the clone-ownership vector mutate something real, and
+            // what makes the complete-receipt comparison cover git evidence rather than nulls.
             Queue.Enqueue(new WorkTask
             {
                 TaskId = TaskId,
@@ -370,7 +562,15 @@ public sealed class WorkerServerCompletionRetransmissionTests
                 Prompt = "do the lost-ack work",
                 Role = CopilotHive.Workers.WorkerRole.Coder,
                 Model = AssignedModel,
-                Repositories = [],
+                Repositories =
+                [
+                    new TargetRepository
+                    {
+                        Name = "repo-lost-ack",
+                        Url = "https://example.invalid/repo-lost-ack",
+                        DefaultBranch = "main",
+                    },
+                ],
             });
 
             RealPublisher = new WorkerAssignmentPublisher(Manager, Pool, Stores.AssignmentStore);
@@ -472,21 +672,36 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
         internal Bridge StartBridge(WorkerHarness worker) => new(this, worker);
 
-        /// <summary>Awaits the REAL server's receipt row, read through a FRESH store.</summary>
+        /// <summary>
+        /// Awaits the REAL server's receipt row DETERMINISTICALLY and reads it back through a FRESH
+        /// store. The rendezvous is the forwarding recorder's own signal, raised from inside the
+        /// decorator strictly AFTER the production <c>Record</c> returned, so there is NO polling
+        /// and no sampling window: when this returns, the durable write has provably completed.
+        /// </summary>
         internal async Task<CompletionReceiptReadResult> WaitForStoredReceiptAsync(TimeSpan bound)
         {
-            var deadline = DateTime.UtcNow + bound;
-            while (DateTime.UtcNow < deadline)
-            {
-                var loaded = Stores.NewReceiptStore().Load(TaskId);
-                if (loaded is not null)
-                    return loaded;
+            await Recorder.FirstRecordStored.WaitAsync(bound, TestContext.Current.CancellationToken);
 
-                await Task.Delay(5, TestContext.Current.CancellationToken);
-            }
+            return Stores.NewReceiptStore().Load(TaskId)
+                ?? throw new Xunit.Sdk.XunitException(
+                    "The REAL recorder returned from Record, so the receipt row must be readable "
+                    + "through a fresh store.");
+        }
 
-            throw new Xunit.Sdk.XunitException(
-                "The REAL server never durably recorded the completion receipt.");
+        /// <summary>
+        /// Awaits the REAL server's re-CONFIRMATION deterministically — the same forwarding-recorder
+        /// technique, signalled after production's <c>ConfirmStoredReceipt</c> returned — and reads
+        /// the receipt back through a FRESH store so the comparison is against durable state rather
+        /// than a writer's own view.
+        /// </summary>
+        internal async Task<CompletionReceiptReadResult> WaitForReConfirmedReceiptAsync(TimeSpan bound)
+        {
+            await Recorder.FirstConfirmReturned.WaitAsync(bound, TestContext.Current.CancellationToken);
+
+            return Stores.NewReceiptStore().Load(TaskId)
+                ?? throw new Xunit.Sdk.XunitException(
+                    "The REAL recorder returned from ConfirmStoredReceipt, so the receipt row must "
+                    + "still be readable through a fresh store.");
         }
 
         internal Task WaitForOrdinaryReadyAcceptedAsync(TimeSpan bound) =>
@@ -500,12 +715,68 @@ public sealed class WorkerServerCompletionRetransmissionTests
                 .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
                 .GetValue(service);
 
-        /// <summary>Detaches every fixture-owned subscription so no test leaves one behind.</summary>
-        public void Dispose()
+        /// <summary>
+        /// DETACHES every fixture-owned subscription and JOINS any handler invocation still in
+        /// flight, so no downstream handler can still be running when the stores are disposed.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// THE CONSTRUCTOR SUBSCRIBES FOUR DOWNSTREAM HANDLERS — <c>TaskCompletionNotifier
+        /// .OnTaskCompleted</c>, <c>DashboardNotifier.OnStateChanged</c>, <c>TaskQueue.OnEnqueue</c>
+        /// and the service logger's armed Ready-acceptance rendezvous. All four are owned here: the
+        /// three events are detached, the logger's arming is cleared, and the ONE asynchronous
+        /// handler (<c>OnTaskCompleted</c> returns a <c>Task</c>) is joined through its retained
+        /// invocation.
+        /// </para>
+        /// <para>
+        /// DETACH THEN JOIN, in that order: detaching first means no NEW invocation can start while
+        /// the join is running, so the join is over a closed set.
+        /// </para>
+        /// </remarks>
+        internal async Task QuiesceSubscriptionsAsync()
         {
+            DetachSubscriptions();
+
+            // JOIN every handler invocation that was already in flight when it was detached.
+            List<Task> inFlight;
+            lock (_handlerInvocations)
+                inFlight = [.. _handlerInvocations];
+
+            foreach (var invocation in inFlight)
+            {
+                try
+                {
+                    await invocation.WaitAsync(Failsafe, CancellationToken.None);
+                }
+                catch (Exception)
+                {
+                    // OBSERVED only: a handler's own outcome is asserted on the test's normal path,
+                    // and a faulted handler must not become an unobserved task exception.
+                }
+            }
+        }
+
+        /// <summary>Detaches every fixture-owned subscription. Idempotent.</summary>
+        private void DetachSubscriptions()
+        {
+            if (Interlocked.Exchange(ref _subscriptionsDetached, 1) != 0)
+                return;
+
             Notifier.OnTaskCompleted -= OnTaskCompleted;
             Dashboard.OnStateChanged -= OnDashboardStateChanged;
             Queue.OnEnqueue -= OnTaskEnqueued;
+            Logger.ClearArmings();
+        }
+
+        private int _subscriptionsDetached;
+
+        /// <summary>Every asynchronous downstream handler invocation this chain started.</summary>
+        private readonly List<Task> _handlerInvocations = [];
+
+        /// <summary>Detaches every fixture-owned subscription so no test leaves one behind.</summary>
+        public void Dispose()
+        {
+            DetachSubscriptions();
             Stores.Dispose();
         }
 
@@ -515,7 +786,14 @@ public sealed class WorkerServerCompletionRetransmissionTests
                 _notified.Add($"{result.TaskId}|{result.Status}|{result.Output.Length}");
 
             Interlocked.Increment(ref _downstreamCompletions);
-            return Task.CompletedTask;
+
+            // The handler's own (already completed) task is RETAINED so the teardown join is over a
+            // real invocation set rather than an assumption that handlers are synchronous.
+            var invocation = Task.CompletedTask;
+            lock (_handlerInvocations)
+                _handlerInvocations.Add(invocation);
+
+            return invocation;
         }
 
         private readonly List<string> _notified = [];
@@ -682,12 +960,19 @@ public sealed class WorkerServerCompletionRetransmissionTests
         internal Task JoinServerStreamAsync() =>
             Task.WhenAll(_serverStreams).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
+        /// <summary>
+        /// A LAST-RESORT sweep only. <see cref="LostAckFixture"/> owns the real ordering (EOF both
+        /// sides, join the server streams, join the WORKER RUN, quiesce handlers, then dispose), so
+        /// this deliberately does NOT dispose the worker harness or the stores — doing so here would
+        /// re-introduce the very race the fixture exists to remove, by releasing resources while the
+        /// worker lifecycle may still be unwinding.
+        /// </summary>
         public async ValueTask DisposeAsync()
         {
             CompleteServerSide();
             try
             {
-                await Task.WhenAll(_serverStreams).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                await Task.WhenAll(_serverStreams).WaitAsync(Failsafe, CancellationToken.None);
             }
             catch (Exception)
             {
@@ -695,7 +980,6 @@ public sealed class WorkerServerCompletionRetransmissionTests
             }
 
             WorkerReader.Complete();
-            _worker.Dispose();
         }
 
         private static ServerCallContext MockContext() => new Mock<ServerCallContext>().Object;
@@ -706,6 +990,15 @@ public sealed class WorkerServerCompletionRetransmissionTests
     /// the REAL server <c>WorkStream</c> reads, and COUNTS by payload case — so "one Complete",
     /// "two Readies" and the frozen-evidence equality are all positive observations. The cancellable
     /// overload is implemented explicitly, exactly as production writes.
+    /// <para>
+    /// IT ALSO RETAINS THE RAW WRITER ARGUMENTS. <see cref="Of"/> hands out defensive CLONES so a
+    /// value assertion is stable, but a clone MASKS the one mutant that matters here: a production
+    /// that hands the SAME private snapshot object to every write would still look like two objects
+    /// once each is cloned. <see cref="RawOf"/> therefore returns the EXACT objects production passed
+    /// to <c>WriteAsync</c>, by reference, with no fixture-side copy in between — and the forwarding
+    /// clone below is taken from the raw argument only AFTER it has been retained, so the server
+    /// still receives an independent object exactly as before.
+    /// </para>
     /// </summary>
     private sealed class WorkerMessageWriter : IClientStreamWriter<WorkerMessage>
     {
@@ -713,6 +1006,12 @@ public sealed class WorkerServerCompletionRetransmissionTests
         private readonly Channel<WorkerMessage> _sink;
         private readonly object _gate = new();
         private readonly List<WorkerMessage> _messages = [];
+
+        /// <summary>
+        /// THE RAW WRITER ARGUMENTS, retained BY REFERENCE and never cloned — the only evidence the
+        /// private-snapshot ownership assertions may use.
+        /// </summary>
+        private readonly List<WorkerMessage> _rawMessages = [];
         private readonly Dictionary<int, TaskCompletionSource<bool>> _waiters = [];
 
         internal WorkerMessageWriter(ServerChain chain, Channel<WorkerMessage> sink)
@@ -734,6 +1033,16 @@ public sealed class WorkerServerCompletionRetransmissionTests
         {
             lock (_gate)
                 return [.. _messages.Where(m => m.PayloadCase == payloadCase)];
+        }
+
+        /// <summary>
+        /// The RAW writer arguments of the given payload case, oldest first — the exact objects
+        /// production handed to <c>WriteAsync</c>, never cloned by this fixture.
+        /// </summary>
+        internal IReadOnlyList<WorkerMessage> RawOf(WorkerMessage.PayloadOneofCase payloadCase)
+        {
+            lock (_gate)
+                return [.. _rawMessages.Where(m => m.PayloadCase == payloadCase)];
         }
 
         /// <summary>
@@ -775,9 +1084,18 @@ public sealed class WorkerServerCompletionRetransmissionTests
             ct.ThrowIfCancellationRequested();
 
             List<TaskCompletionSource<bool>> ready = [];
+            WorkerMessage forwarded;
             lock (_gate)
             {
+                // THE RAW ARGUMENT FIRST, by reference: cloning it here would make a production
+                // mutant that re-delivers its private snapshot object indistinguishable.
+                _rawMessages.Add(message);
                 _messages.Add(message.Clone());
+
+                // The forwarding copy is taken NOW, while the raw argument is still exactly as
+                // production handed it over, so the server receives an independent object and a
+                // later fixture-side mutation of the raw argument cannot reach the server.
+                forwarded = message.Clone();
 
                 // The COMPLETION PHASE opens the instant the FIRST Complete is written, so any
                 // dashboard notification from here on is attributable to the completion path.
@@ -799,9 +1117,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
             foreach (var waiter in ready)
                 waiter.TrySetResult(true);
 
-            // FORWARD to the REAL server reader. The clone is deliberate: the recorded observation
-            // must not be mutable by any later consumer.
-            _sink.Writer.TryWrite(message.Clone());
+            // FORWARD to the REAL server reader.
+            _sink.Writer.TryWrite(forwarded);
             return Task.CompletedTask;
         }
 
@@ -935,7 +1252,15 @@ public sealed class WorkerServerCompletionRetransmissionTests
                 if (command.Contains("rev-parse HEAD", StringComparison.Ordinal))
                     return new GitProcessResult(0, "0123456789abcdef0123456789abcdef01234567\n", string.Empty);
                 if (command.Contains("diff --numstat", StringComparison.Ordinal))
-                    return new GitProcessResult(0, "2\t1\tsrc/one.cs\0", string.Empty);
+                {
+                    // NUL-DELIMITED records, exactly the `--numstat -z` shape the parser expects.
+                    // SEVERAL files, so the ORDER of the resulting ChangedFiles is itself evidence
+                    // the clone-ownership and complete-receipt comparisons can pin.
+                    return new GitProcessResult(
+                        0,
+                        "2\t1\tsrc/one.cs\0" + "5\t0\tsrc/two.cs\0" + "0\t3\tsrc/three.cs\0",
+                        string.Empty);
+                }
                 if (command.Contains("status --porcelain", StringComparison.Ordinal))
                     return new GitProcessResult(0, string.Empty, string.Empty);
                 return new GitProcessResult(0, string.Empty, string.Empty);
@@ -1148,9 +1473,25 @@ public sealed class WorkerServerCompletionRetransmissionTests
     /// delegated FIRST — so the real durable write and the real confirmation are what actually happen
     /// — and counted afterwards, with RECORDS and CONFIRMATIONS counted separately so "one ordinary
     /// record" is never confused with the later read-only confirmation.
+    /// <para>
+    /// IT IS ALSO THE DURABLE-STATE RENDEZVOUS. Each signal is raised from INSIDE this forwarding
+    /// path, strictly AFTER the real <c>Record</c> / <c>ConfirmStoredReceipt</c> has RETURNED — so a
+    /// completed signal means the production write really finished, and the row is readable through a
+    /// fresh store. That is what lets the fixture observe "the first durable receipt exists" and "the
+    /// receipt was re-confirmed" WITHOUT polling: no <c>Task.Delay</c> loop, no sampling window, and
+    /// no chance of reading a half-written row.
+    /// </para>
+    /// <para>
+    /// A THROWING inner call signals NOTHING and propagates unchanged: the signal can never claim a
+    /// durable write that did not happen.
+    /// </para>
     /// </summary>
     private sealed class CountingRecorder(IWorkerCompletionRecorder inner) : IWorkerCompletionRecorder
     {
+        private readonly TaskCompletionSource<bool> _firstRecordStored =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _firstConfirmReturned =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _recordCalls;
         private int _confirmCalls;
         private int _confirmAccepted;
@@ -1161,19 +1502,37 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
         internal int ConfirmAccepted => Volatile.Read(ref _confirmAccepted);
 
+        /// <summary>
+        /// Completes once the REAL recorder's <c>Record</c> has RETURNED for the first completion —
+        /// i.e. the durable receipt row is written and readable through a fresh store.
+        /// </summary>
+        internal Task FirstRecordStored => _firstRecordStored.Task;
+
+        /// <summary>
+        /// Completes once the REAL recorder's <c>ConfirmStoredReceipt</c> has RETURNED for the first
+        /// time — i.e. the re-acknowledged receipt has been re-confirmed against durable state.
+        /// </summary>
+        internal Task FirstConfirmReturned => _firstConfirmReturned.Task;
+
         public void Record(string workerId, WorkTask task, TaskResult result)
         {
+            // DELEGATE FIRST: the real durable write is what actually happens here.
             inner.Record(workerId, task, result);
+
+            // ONLY NOW is the row durable, so only now may the rendezvous complete.
             Interlocked.Increment(ref _recordCalls);
+            _firstRecordStored.TrySetResult(true);
         }
 
         public bool ConfirmStoredReceipt(string workerId, string taskId, TaskResult result)
         {
             var confirmed = inner.ConfirmStoredReceipt(workerId, taskId, result);
+
             Interlocked.Increment(ref _confirmCalls);
             if (confirmed)
                 Interlocked.Increment(ref _confirmAccepted);
 
+            _firstConfirmReturned.TrySetResult(true);
             return confirmed;
         }
     }
@@ -1254,6 +1613,16 @@ public sealed class WorkerServerCompletionRetransmissionTests
                 _armed[fragment] = new Arming(occurrence, signal, onArmed);
         }
 
+        /// <summary>
+        /// CLEARS every armed rendezvous — the logger's own "subscription" — so no armed callback can
+        /// run after the fixture has begun tearing down. Idempotent.
+        /// </summary>
+        internal void ClearArmings()
+        {
+            lock (_gate)
+                _armed.Clear();
+        }
+
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
         public bool IsEnabled(LogLevel logLevel) => true;
@@ -1308,6 +1677,97 @@ public sealed class WorkerServerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
     //  shared helpers
     // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// ASSERTS THAT THE COMPLETE PERSISTED RECEIPT IS UNCHANGED across the re-acknowledgement.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// BOTH VALUES ARE READ BACK THROUGH A FRESH <c>CompletionReceiptStore</c> over the same database
+    /// file, so this compares DURABLE STATE on both sides — never a locally constructed input against
+    /// itself, and never a writer's own in-memory view.
+    /// </para>
+    /// <para>
+    /// THE WHOLE VALUE IS COMPARED, TWO WAYS. First the CANONICAL ENCODING: production's own
+    /// <see cref="CompletionReceiptCodec.Encode"/> is the exact serialization the store round-trips,
+    /// so an ordinal equality of the two encodings covers EVERY field the codec carries — including
+    /// any field a future change adds, which a hand-listed comparison would silently skip. Then the
+    /// individual fields are asserted as well, so a failure NAMES what moved instead of printing two
+    /// long JSON blobs: identifiers (worker, goal, task), role, slot position (iteration, phase,
+    /// occurrence) and attempt, model PRESENCE and value, result status/output, the complete metrics
+    /// (verdict, build flag, test counts, coverage, issues IN ORDER, summary), the complete git
+    /// evidence (counts, pushed flag, changed files IN ORDER) and the iteration SHA — plus
+    /// <c>FirstStoredAtUtc</c>, which is what proves the row was not re-inserted.
+    /// </para>
+    /// </remarks>
+    /// <param name="before">The receipt read back BEFORE the re-acknowledgement.</param>
+    /// <param name="after">The receipt read back AFTER the re-acknowledgement.</param>
+    private static void AssertPersistedReceiptUnchanged(
+        CompletionReceiptReadResult before, CompletionReceiptReadResult after)
+    {
+        // NON-VACUITY: the two reads are genuinely separate objects from separate store instances,
+        // so an equality below can never be an object comparing to itself.
+        Assert.NotSame(before, after);
+        Assert.NotSame(before.Receipt, after.Receipt);
+
+        // ── THE WHOLE VALUE, through production's own canonical serialization ─────────────
+        Assert.Equal(
+            CompletionReceiptCodec.Encode(before.Receipt),
+            CompletionReceiptCodec.Encode(after.Receipt));
+
+        // ── AND FIELD BY FIELD, so a regression names itself ─────────────────────────────
+        Assert.Equal(before.Receipt.WorkerId, after.Receipt.WorkerId);
+        Assert.Equal(before.Receipt.GoalId, after.Receipt.GoalId);
+        Assert.Equal(before.Receipt.Role, after.Receipt.Role);
+
+        Assert.Equal(before.Receipt.Slot.TaskId, after.Receipt.Slot.TaskId);
+        Assert.Equal(before.Receipt.Slot.Attempt, after.Receipt.Slot.Attempt);
+        Assert.Equal(before.Receipt.Slot.Position.Iteration, after.Receipt.Slot.Position.Iteration);
+        Assert.Equal(before.Receipt.Slot.Position.Phase, after.Receipt.Slot.Position.Phase);
+        Assert.Equal(before.Receipt.Slot.Position.Occurrence, after.Receipt.Slot.Position.Occurrence);
+
+        var beforeResult = before.Receipt.Result;
+        var afterResult = after.Receipt.Result;
+        Assert.Equal(beforeResult.TaskId, afterResult.TaskId);
+        Assert.Equal(beforeResult.Status, afterResult.Status);
+        Assert.Equal(beforeResult.Output, afterResult.Output);
+        Assert.Equal(beforeResult.IterationStartSha, afterResult.IterationStartSha);
+
+        // MODEL PRESENCE AND VALUE are separate facts: an empty model means "assigned model
+        // unknown/empty" and must never silently become absent.
+        Assert.Equal(beforeResult.Model is null, afterResult.Model is null);
+        Assert.Equal(beforeResult.Model, afterResult.Model);
+
+        Assert.Equal(beforeResult.Metrics is null, afterResult.Metrics is null);
+        if (beforeResult.Metrics is { } beforeMetrics && afterResult.Metrics is { } afterMetrics)
+        {
+            Assert.Equal(beforeMetrics.Verdict, afterMetrics.Verdict);
+            Assert.Equal(beforeMetrics.BuildSuccess, afterMetrics.BuildSuccess);
+            Assert.Equal(beforeMetrics.TotalTests, afterMetrics.TotalTests);
+            Assert.Equal(beforeMetrics.PassedTests, afterMetrics.PassedTests);
+            Assert.Equal(beforeMetrics.FailedTests, afterMetrics.FailedTests);
+            Assert.Equal(beforeMetrics.CoveragePercent, afterMetrics.CoveragePercent);
+            Assert.Equal(beforeMetrics.Summary, afterMetrics.Summary);
+
+            // IN ORDER: a reordered issue list is a changed receipt.
+            Assert.Equal(beforeMetrics.Issues, afterMetrics.Issues);
+        }
+
+        Assert.Equal(beforeResult.GitStatus is null, afterResult.GitStatus is null);
+        if (beforeResult.GitStatus is { } beforeGit && afterResult.GitStatus is { } afterGit)
+        {
+            Assert.Equal(beforeGit.FilesChanged, afterGit.FilesChanged);
+            Assert.Equal(beforeGit.Insertions, afterGit.Insertions);
+            Assert.Equal(beforeGit.Deletions, afterGit.Deletions);
+            Assert.Equal(beforeGit.Pushed, afterGit.Pushed);
+
+            // IN ORDER: the changed-file evidence is ordered evidence.
+            Assert.Equal(beforeGit.ChangedFiles, afterGit.ChangedFiles);
+        }
+
+        // THE ROW WAS NEVER RE-INSERTED: the first-stored instant is preserved exactly.
+        Assert.Equal(before.FirstStoredAtUtc, after.FirstStoredAtUtc);
+    }
 
     private static string CreateRoot()
     {
