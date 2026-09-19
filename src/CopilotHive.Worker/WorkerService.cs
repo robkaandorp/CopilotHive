@@ -128,6 +128,17 @@ public sealed class WorkerService(
     /// </summary>
     internal Func<WorkerConnection, CancellationTokenSource, Task>? HeartbeatTaskFactory { get; set; }
 
+    /// <summary>
+    /// THE CLOCK SEAM FOR COMPLETION RETRANSMISSION — the ONLY test hook this behavior adds, and the
+    /// ONLY clock production reads for the retry wait. It defaults to
+    /// <see cref="System.TimeProvider.System"/>, is read exactly ONCE per assignment (the value is
+    /// snapshotted into the assignment when the assignment is built), and is used for NOTHING else:
+    /// the retransmission delay is its only caller, through the
+    /// <see cref="Task.Delay(TimeSpan, TimeProvider, CancellationToken)"/> overload, so no heartbeat,
+    /// drain, gate or readiness timing becomes dependent on it.
+    /// </summary>
+    internal TimeProvider TimeProvider { get; set; } = System.TimeProvider.System;
+
     /// <summary>The currently published connection, or <c>null</c> when none is published.</summary>
     private WorkerConnection? CurrentConnection => Volatile.Read(ref _connection);
 
@@ -759,6 +770,23 @@ public sealed class WorkerService(
         }
     }
 
+    /// <summary>The sanitized report message for a RETRANSMISSION attempt that failed.</summary>
+    private const string RetransmissionFailedMessage = "Completion retransmission failed";
+
+    /// <summary>
+    /// Reports ONE failed retransmission attempt through the EXISTING guarded sanitized path. It is
+    /// the retransmitter's only diagnostic: a successful attempt logs nothing at all, so a long-lived
+    /// unacknowledged assignment cannot spam the log, and a failed attempt never propagates — the
+    /// original Complete attempt's outcome, the retained result and the assignment's own error
+    /// handling are all left exactly as they were.
+    /// </summary>
+    /// <param name="failure">The attempt's failure to classify — never rendered as text.</param>
+    private void ReportRetransmissionFailure(Exception failure)
+    {
+        if (failure is not null)
+            TryLogSanitized(RetransmissionFailedMessage, failure);
+    }
+
     /// <summary>
     /// A single-use claim guaranteeing exactly ONE <c>WorkerReady</c> per assignment.
     /// <para>
@@ -853,6 +881,16 @@ public sealed class WorkerService(
     /// until ACK is NOT a postcondition of this slice, and a delayed ACK that arrives after the
     /// existing ownership clear is simply ignored.
     /// </para>
+    /// <para>
+    /// IT ALSO CARRIES THE ASSIGNMENT'S ONE RETRANSMITTER. On a both-flags connection the assignment
+    /// handler attaches the <see cref="CompletionRetry"/> that re-sends this assignment's frozen
+    /// completion while the receipt stays unacknowledged; a legacy, ACK-only or readiness-only
+    /// connection attaches none, so this stays exactly what it was. The tracker is the natural
+    /// carrier because it is the assignment-local object BOTH the reporter (which freezes and arms)
+    /// and the reader (which confirms) already hold. The retransmitter holds no completion payload of
+    /// its own — the frozen envelope is its own private state — so the retained
+    /// <see cref="TaskResult"/> is still neither stored, replaced nor read here.
+    /// </para>
     /// </summary>
     /// <param name="owner">
     /// The connection this assignment arrived on. An acknowledgement delivered on any OTHER
@@ -871,8 +909,20 @@ public sealed class WorkerService(
 
         private int _state = Unarmed;
 
+        /// <summary>
+        /// THE ASSIGNMENT'S ONE RETRANSMITTER, or <c>null</c> for an assignment that has none — the
+        /// legacy, ACK-only and readiness-only connections, which produce no retry task, no snapshot,
+        /// no wait and no attempt. It is attached ONCE, before either owned task starts, by the
+        /// assignment handler that decided the GATED shape, so the reporting flow can freeze the ONE
+        /// envelope into it and the reader can reach it through the assignment it still retains.
+        /// </summary>
+        private CompletionRetry? _retry;
+
         /// <summary>The connection this assignment — and therefore this receipt — belongs to.</summary>
         public WorkerConnection Owner { get; } = owner;
+
+        /// <summary>The assignment's retransmitter, or <c>null</c> when this assignment has none.</summary>
+        public CompletionRetry? Retry => Volatile.Read(ref _retry);
 
         /// <summary>Whether a Complete attempt has made an acknowledgement possible for this assignment.</summary>
         public bool IsArmed => Volatile.Read(ref _state) != Unarmed;
@@ -896,27 +946,435 @@ public sealed class WorkerService(
         public bool TryConfirm(WorkerConnection deliveringConnection) =>
             ReferenceEquals(Owner, deliveringConnection)
             && Interlocked.CompareExchange(ref _state, Confirmed, Armed) == Armed;
+
+        /// <summary>
+        /// ATTACHES the ONE retransmitter this assignment may have. Called at most once, by the
+        /// assignment handler, before either owned task starts — while nothing can be armed yet, so
+        /// no send and no retry can be in flight. It fails fast on a second attach rather than
+        /// silently replacing what is already retained.
+        /// </summary>
+        /// <param name="retry">The retransmitter built for this assignment.</param>
+        public void AttachRetry(CompletionRetry retry)
+        {
+            ArgumentNullException.ThrowIfNull(retry);
+
+            if (Interlocked.CompareExchange(ref _retry, retry, null) is not null)
+                throw new InvalidOperationException(
+                    "A retransmitter is already attached to this assignment — it must be attached once.");
+        }
+    }
+
+    /// <summary>
+    /// THE RETRANSMISSION INTERVAL. One frozen, still-UNCONFIRMED completion is re-sent exactly this
+    /// long after the previous attempt TERMINATED (a successful write, a failed write and a
+    /// cancelled write alike). It is a constant: there is deliberately no backoff, no jitter, no
+    /// configuration surface and no finite attempt cap.
+    /// </summary>
+    private static readonly TimeSpan RetransmissionInterval = TimeSpan.FromSeconds(5);
+
+    /// <summary>The one frozen completion envelope a gated assignment can own: its ORIGINAL connection's
+    /// assigned worker identity together with the SINGLE mapped <see cref="TaskComplete"/> payload.</summary>
+    /// <remarks>
+    /// The payload is the mapping RESULT and is never handed to a writer directly — every send, the
+    /// original Complete attempt included, clones it — so no writer can mutate what the next attempt
+    /// will re-send, and the retained <see cref="TaskResult"/> is never re-mapped or re-read.
+    /// </remarks>
+    private sealed class FrozenCompletion(string workerId, TaskComplete payload)
+    {
+        /// <summary>The assigned worker identity captured with the payload.</summary>
+        public string WorkerId { get; } = workerId;
+
+        /// <summary>The mapped completion payload, used ONLY as the source of per-send clones.</summary>
+        public TaskComplete Payload { get; } = payload;
+    }
+
+    /// <summary>
+    /// THE ASSIGNMENT-LOCAL LIVE RETRANSMITTER: ONE privately frozen completion envelope, ONE owned
+    /// background task, and the retransmission of that frozen envelope on the ORIGINAL connection
+    /// while its durable receipt acknowledgement is still missing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT IS FOR. An acknowledgement can be lost while the stream is still perfectly alive —
+    /// either because the original Complete write failed locally or because the server's receipt
+    /// answer never arrived. On a connection whose ACCEPTED registration carried BOTH negotiated
+    /// facts, the assignment's ordinary Ready is withheld until a matching receipt is confirmed, so
+    /// such a loss would stall the worker forever. Re-sending the SAME completion on the SAME stream
+    /// lets the server's existing latest-eligible re-acknowledgement close the gap. This is
+    /// deliberately NOT disconnect, restart or reconnect survival: it neither opens nor targets any
+    /// other connection, and the frozen envelope never outlives its assignment.
+    /// </para>
+    /// <para>
+    /// GATED ONLY, AND BOUNDED. It exists only for an assignment whose accepted registration carried
+    /// both negotiated facts (the assignment handler builds it — and the receipt attaches it — only
+    /// in that shape), so a legacy, ACK-only or readiness-only connection has no snapshot, no task,
+    /// no wait and no attempt at all. At most one envelope is ever frozen (<see cref="Freeze"/> fails
+    /// fast on a second), at most one task is ever started (<see cref="Start"/> fails fast on a
+    /// second), and the one task re-uses ONE delay and ONE retransmission at a time — there is no
+    /// attempt history, no accumulating continuation, no timer backlog and no catch-up burst.
+    /// </para>
+    /// <para>
+    /// ONE GATE, ONE WRITER. The retransmission acquires the SAME service-wide
+    /// <see cref="SemaphoreSlim"/> gate every other write uses, so it can never run concurrently with
+    /// the assignment's own Complete or readiness write, and it is awaited to termination with the
+    /// assignment's EXISTING stream token and released only afterwards. The retry-lifetime
+    /// cancellation stops the pending delay and the permit acquisition, but the admitted write is
+    /// awaited with the STREAM token, so no cancellation of this retry can abandon a write that has
+    /// already begun.
+    /// </para>
+    /// <para>
+    /// ADMISSION IS DECIDED AFTER THE PERMIT. Waiting for the permit and THEN checking the receipt is
+    /// what makes the stop meaningful: the admission decision is taken atomically under this object's
+    /// own lock once the permit is already held, so a confirmation that won performs no transport
+    /// invocation at all, while a retry admitted first may finish even if the acknowledgement arrives
+    /// before its writer invocation. No lock is ever held across an <c>await</c>.
+    /// </para>
+    /// <para>
+    /// IT NEVER REPLACES AN OUTCOME. An attempt that fails is reported through ONE guarded, sanitized
+    /// diagnostic and the loop waits another full interval; nothing here re-raises, retries the
+    /// original reporting, touches the retained result, the ownership slot, the Ready claim or the
+    /// acknowledgement handler's own recording.
+    /// </para>
+    /// </remarks>
+    private sealed class CompletionRetry
+    {
+        private readonly object _gate = new();
+        private readonly WorkerConnection _connection;
+        private readonly CancellationToken _streamToken;
+        private readonly CompletionReceiptTracker _receipt;
+        private readonly TimeProvider _clock;
+        private readonly SemaphoreSlim _sendGate;
+        private readonly Action<Exception> _reportFailure;
+
+        /// <summary>
+        /// THE RETRANSMISSION LIFETIME — this retry's OWN source, deliberately NOT linked to the
+        /// assignment's CTS and never handed to a write: cancelling it stops the pending delay and
+        /// the permit acquisition only, so an already-admitted transport write (awaited with the
+        /// stream token) can never be cancelled by it.
+        /// </summary>
+        private readonly CancellationTokenSource _lifetime = new();
+
+        private FrozenCompletion? _frozen;
+        private int _started;
+        private bool _admissionClosed;
+
+        /// <summary>
+        /// Creates the retransmitter for ONE assignment. It freezes, starts and writes nothing by
+        /// itself: the exact connection, stream token, receipt tracker, clock and the SERVICE'S ONE
+        /// send gate are captured here, before either owned task starts.
+        /// </summary>
+        /// <param name="connection">The ORIGINAL connection the assignment arrived on.</param>
+        /// <param name="streamToken">The ORIGINAL stream token every retransmission is awaited with.</param>
+        /// <param name="receipt">The assignment-local receipt tracker the admission decision consults.</param>
+        /// <param name="clock">The clock snapshotted for this assignment; the retry delay's only consumer.</param>
+        /// <param name="sendGate">The service's SINGLE send gate, shared, never a second gate.</param>
+        /// <param name="reportFailure">The guarded sanitized reporter for a failed attempt.</param>
+        public CompletionRetry(
+            WorkerConnection connection,
+            CancellationToken streamToken,
+            CompletionReceiptTracker receipt,
+            TimeProvider clock,
+            SemaphoreSlim sendGate,
+            Action<Exception> reportFailure)
+        {
+            _connection = connection;
+            _streamToken = streamToken;
+            _receipt = receipt;
+            _clock = clock;
+            _sendGate = sendGate;
+            _reportFailure = reportFailure;
+        }
+
+        /// <summary>
+        /// FREEZES the ONE privately owned envelope for this assignment — the captured assigned
+        /// worker identity plus the mapped payload — exactly once. Called by the reporting flow on
+        /// the successful-mapping path only and BEFORE the receipt is armed, so an absent result or a
+        /// mapping that threw freezes nothing and no retransmission can ever occur.
+        /// </summary>
+        /// <param name="workerId">The ORIGINAL connection's assigned identity.</param>
+        /// <param name="payload">The SINGLE mapped completion payload.</param>
+        public void Freeze(string workerId, TaskComplete payload)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(workerId);
+            ArgumentNullException.ThrowIfNull(payload);
+
+            if (Interlocked.CompareExchange(
+                    ref _frozen, new FrozenCompletion(workerId, payload), null) is not null)
+            {
+                throw new InvalidOperationException(
+                    "A completion envelope is already frozen for this assignment — it must be frozen once.");
+            }
+        }
+
+        /// <summary>
+        /// Builds the NEXT send from a FRESH deep clone of the frozen snapshot: a new message carrying
+        /// a new <see cref="TaskComplete"/> each time, so the private snapshot is never handed to a
+        /// writer and never mutated by one. Used by the ORIGINAL Complete attempt as well as by every
+        /// retransmission, so both send the identical payload.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Nothing has been frozen for this assignment.</exception>
+        public WorkerMessage NextMessage()
+        {
+            var frozen = Volatile.Read(ref _frozen)
+                ?? throw new InvalidOperationException(
+                    "No completion envelope has been frozen for this assignment.");
+
+            return new WorkerMessage
+            {
+                WorkerId = frozen.WorkerId,
+                Complete = frozen.Payload.Clone(),
+            };
+        }
+
+        /// <summary>
+        /// STARTS the ONE owned retransmission task, which OBSERVES the original reporting task's
+        /// termination and then re-sends the frozen completion while it stays armed and unconfirmed.
+        /// Called exactly once by the assignment handler, AFTER the reporting task exists; the
+        /// returned task is what <see cref="ActiveAssignment.Retry"/> retains and every drain joins.
+        /// </summary>
+        /// <param name="reporting">The assignment's ORIGINAL reporting task.</param>
+        /// <returns>The ONE owned retransmission task.</returns>
+        public Task Start(Task reporting)
+        {
+            ArgumentNullException.ThrowIfNull(reporting);
+
+            if (Interlocked.Exchange(ref _started, 1) != 0)
+                throw new InvalidOperationException(
+                    "The retransmission task is already started for this assignment — it must be started once.");
+
+            return RunAsync(reporting);
+        }
+
+        /// <summary>
+        /// CLOSES retry admission for good and cancels the pending delay or permit wait. Called by
+        /// every drain BEFORE it joins the task. It is synchronous, awaits nothing, touches no
+        /// transport and — because an admitted write is awaited with the stream token — cannot cancel
+        /// a write already in flight.
+        /// </summary>
+        public void CloseAdmission()
+        {
+            lock (_gate)
+            {
+                if (_admissionClosed)
+                    return;
+
+                _admissionClosed = true;
+            }
+
+            CancelPendingWait();
+        }
+
+        /// <summary>
+        /// ACCEPTS one acknowledgement ON BEHALF of the assignment's
+        /// <see cref="CompletionReceiptTracker"/> and, on the FIRST acceptance only, closes future
+        /// retry admission — the receipt transition and the admission close happening under this
+        /// object's OWN lock, so the retransmission's post-permit arbitration (which reads the same
+        /// state under the same lock) can never observe a confirmation without also observing the
+        /// closed admission.
+        /// </summary>
+        /// <remarks>
+        /// It never awaits, never joins the retry task and never cancels an admitted transport write:
+        /// only the pending delay or permit wait is stopped. A duplicate, a wrong task, a wrong worker,
+        /// an unarmed assignment and a delivery on another connection all return <c>false</c> and
+        /// leave admission exactly as it was.
+        /// </remarks>
+        /// <param name="deliveringConnection">The connection the acknowledgement was delivered on.</param>
+        /// <returns><c>true</c> for the FIRST accepted receipt only.</returns>
+        public bool TryConfirm(WorkerConnection deliveringConnection)
+        {
+            lock (_gate)
+            {
+                if (!_receipt.TryConfirm(deliveringConnection))
+                    return false;
+
+                _admissionClosed = true;
+            }
+
+            CancelPendingWait();
+            return true;
+        }
+
+        /// <summary>Releases the retry-lifetime source, AFTER the task has been joined.</summary>
+        public void Dispose() => _lifetime.Dispose();
+
+        /// <summary>
+        /// Cancels the pending delay and the pending permit acquisition by cancelling this retry's OWN
+        /// lifetime — never the transport write, which is awaited with the assignment's stream token.
+        /// Called OUTSIDE the lock, so no cancellation callback ever runs under it, and fault-contained,
+        /// so a failing cancellation request can never escape a handler or a drain.
+        /// </summary>
+        private void CancelPendingWait()
+        {
+            try
+            {
+                _lifetime.Cancel();
+            }
+            catch
+            {
+                // A cancellation request must never mask the caller's own outcome.
+            }
+        }
+
+        /// <summary>
+        /// THE ONE RETRANSMISSION TASK: observe reporting termination, then — for as long as a frozen,
+        /// armed completion remains unconfirmed — wait one interval and attempt one retransmission,
+        /// waiting a FRESH interval after every attempt that terminates. It ends when nothing is
+        /// frozen, when the receipt is no longer armed, when admission is closed (a confirmation or a
+        /// drain) or when the retry lifetime is cancelled.
+        /// </summary>
+        /// <param name="reporting">The ORIGINAL reporting task.</param>
+        private async Task RunAsync(Task reporting)
+        {
+            // THE PRODUCER JOIN IS UNCONDITIONAL AND UNCANCELLABLE: awaiting the ORIGINAL task (never
+            // through a cancellation-skippable continuation) means a producer that was cancelled
+            // before its body started is still observed, and its fault is never re-raised here —
+            // reporting keeps its own evidence and its own outcome.
+            try
+            {
+                await reporting;
+            }
+            catch
+            {
+                // Observed only: reporting's outcome is reported by the drains that join it.
+            }
+
+            while (true)
+            {
+                if (!RetransmissionWanted())
+                    return;
+
+                try
+                {
+                    // THE CLOCK SEAM'S ONLY USE: the TimeProvider-aware overload, cancelled by the
+                    // retry lifetime alone.
+                    await Task.Delay(RetransmissionInterval, _clock, _lifetime.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                if (!RetransmissionWanted())
+                    return;
+
+                if (!await TryRetransmitAsync())
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// WHETHER another retransmission is still wanted: a completion was frozen, the receipt is
+        /// ARMED (the mapped Complete made an acknowledgement possible) and NO matching receipt has
+        /// been confirmed yet, admission has not been closed by a confirmation or a drain, and the
+        /// ORIGINAL connection is still usable.
+        /// </summary>
+        private bool RetransmissionWanted()
+        {
+            lock (_gate)
+                return AdmissionHolds_Locked();
+        }
+
+        /// <summary>
+        /// THE ONE ADMISSION PREDICATE, evaluated under this object's lock from facts that only ever
+        /// move in one direction — which is what makes the post-permit arbitration and the
+        /// acknowledgement's atomic acceptance agree. A retired connection is NOT a live stream, so a
+        /// loss on it is out of this retry's scope: it stops the task quietly instead of manufacturing
+        /// a failed-attempt diagnostic against a connection that will never accept a write again.
+        /// </summary>
+        private bool AdmissionHolds_Locked() =>
+            !_admissionClosed
+            && !_connection.IsRetired
+            && Volatile.Read(ref _frozen) is not null
+            && _receipt.IsArmed
+            && !_receipt.IsConfirmed;
+
+        /// <summary>
+        /// ONE retransmission attempt: acquire the SHARED send permit, arbitrate admission atomically
+        /// under this object's lock, and — only when admission won — await the actual transport write
+        /// with the ORIGINAL stream token, releasing the permit after it terminates.
+        /// </summary>
+        /// <returns><c>true</c> to keep retransmitting after a fresh interval; <c>false</c> to stop.</returns>
+        private async Task<bool> TryRetransmitAsync()
+        {
+            try
+            {
+                // NOT MERELY CHECKED BEFORE THE WAIT: the permit is taken first (cancellable by the
+                // retry lifetime, so a closed/drained retry never holds it), because only a decision
+                // taken with the permit IN HAND can guarantee that a confirmation which won performs
+                // no transport invocation.
+                await _sendGate.WaitAsync(_lifetime.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+
+            try
+            {
+                var admitted = false;
+                lock (_gate)
+                {
+                    // ARBITRATION — atomic, and the ONLY decision point. The decision is taken WITH
+                    // THE PERMIT IN HAND and under the SAME lock the acknowledgement's confirmation
+                    // and admission close use, so a confirmation that won performs no transport
+                    // invocation at all, while a retry admitted first keeps its own in-flight write
+                    // even if the acknowledgement arrives before that writer invocation.
+                    admitted = AdmissionHolds_Locked();
+                }
+
+                if (!admitted)
+                    return false;
+
+                // THE TRANSPORT: a FRESH clone of the frozen snapshot, the ORIGINAL connection and
+                // the ORIGINAL stream token, awaited INSIDE the shared permit. Retirement is checked
+                // by the connection's own boundary, exactly as every other write does.
+                await _connection.EnsureUsable().Stream.RequestStream.WriteAsync(
+                    NextMessage(), _streamToken);
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                // ONE guarded, sanitized diagnostic per FAILED attempt (type classification only —
+                // never a raw message, which can echo provisioned configuration). The attempt failed,
+                // so the loop waits a fresh interval and tries again: a failed write is exactly the
+                // loss this retry exists to recover from.
+                _reportFailure(ex);
+                return true;
+            }
+            finally
+            {
+                // RELEASED ONLY AFTER THE WRITE TERMINATED — success, failure or cancellation alike.
+                _sendGate.Release();
+            }
+        }
     }
 
     /// <summary>
     /// Tracks one assignment's identity, its in-flight EXECUTION, its separately owned
-    /// connection-bound REPORTING, its cancellation scope, its Ready claim, its terminal result and
-    /// its ordinary-readiness slot.
+    /// connection-bound REPORTING, its separately owned RETRANSMISSION, its cancellation scope, its
+    /// Ready claim, its terminal result and its ordinary-readiness slot.
     /// </summary>
     /// <remarks>
-    /// TWO OWNED TASKS, ONE OWNER. Execution is the work itself (provisioning, preparation, the
-    /// executor and the retention of its result); reporting is the transport work of the
+    /// UP TO THREE OWNED TASKS, ONE OWNER. Execution is the work itself (provisioning, preparation,
+    /// the executor and the retention of its result); reporting is the transport work of the
     /// ORIGINAL connection's stream (the Complete write) together with the publication of the
-    /// ordinary-Ready eligibility fact. They are separated so a held, failed or cancelled
-    /// transport write can no longer keep the execution task itself running. The owner keeps BOTH
-    /// ORIGINAL tasks, and every ownership transition (replacement, matching cancel, teardown)
-    /// joins BOTH — and any readiness write already started from the eligibility — before the CTS
-    /// is disposed and the slot is cleared, so nothing is ever abandoned.
+    /// ordinary-Ready eligibility fact; and on a both-flags connection a THIRD task retransmits the
+    /// frozen completion while its receipt stays unacknowledged. They are separated so a held, failed
+    /// or cancelled transport write — and a held retransmission — can never keep the execution task
+    /// itself running, and so a retry can never hold reporting. The owner keeps EVERY owned task, and
+    /// every ownership transition (replacement, matching cancel, teardown) joins ALL of them — and
+    /// any readiness write already started from the eligibility — before the CTS is disposed and the
+    /// slot is cleared, so nothing is ever abandoned.
     /// </remarks>
     private sealed class ActiveAssignment(
         string taskId,
         Task execution,
         Task reporting,
+        Task? retry,
         CancellationTokenSource cts,
         ReadyClaim readyClaim,
         TerminalResultHolder terminalResult,
@@ -942,9 +1400,18 @@ public sealed class WorkerService(
         /// The CONNECTION-BOUND REPORTING task. It awaits the ORIGINAL <see cref="Execution"/>,
         /// consumes the already-retained result for the Complete mapping and write, and makes the
         /// assignment's single Ready attempt through the shared claim. A blocked or failing write
-        /// holds only THIS task.
+        /// holds only THIS task; the retransmission task (which observes this one) is separately
+        /// owned, so neither can hold the other.
         /// </summary>
         public Task Reporting { get; } = reporting;
+
+        /// <summary>
+        /// THE ASSIGNMENT'S ONE RETRANSMISSION TASK, or <c>null</c> on a connection whose accepted
+        /// registration did not carry both negotiated facts. It is a SEPARATELY OWNED task, joined
+        /// beside the two original tasks by every ownership transition, so no retry can outlive the
+        /// assignment's ownership or write on a later connection.
+        /// </summary>
+        public Task? Retry { get; } = retry;
 
         /// <summary>Cancellation source scoped to this assignment.</summary>
         public CancellationTokenSource Cts { get; } = cts;
@@ -1020,6 +1487,13 @@ public sealed class WorkerService(
     /// plus a matching same-connection receipt confirmation — the facts may arrive in ANY order, and
     /// each arrival wakes the parked reader, so the Ready is neither lost nor produced early. The
     /// predicate is monotonic, so the reader that wakes can only ever find it satisfied.
+    /// </para>
+    /// <para>
+    /// NO SECOND GATE. The readiness write goes through the SAME <c>_sendGate</c> as everything else,
+    /// so a Ready started while an admitted retransmission is still finishing simply serializes
+    /// behind it: the two can never write concurrently and neither needs a gate of its own. This slot
+    /// is otherwise untouched by retransmission — it never observes, awaits, joins or retries it, and
+    /// no Ready retry or successor buffer is added.
     /// </para>
     /// </summary>
     /// <param name="owner">The connection this assignment arrived on.</param>
@@ -1299,10 +1773,11 @@ public sealed class WorkerService(
     private ActiveAssignment? _activeAssignment;
 
     /// <summary>
-    /// Ownership transition — INSTALL. Called after BOTH original tasks have been OBTAINED (the
-    /// execution from <c>Task.Run</c> and the reporting from its own async invocation), so only
-    /// fully constructed state (task ID, both tasks, CTS, Ready claim, result holder) is ever
-    /// published; those tasks capture the assignment-local values, not this slot.
+    /// Ownership transition — INSTALL. Called after EVERY owned task has been OBTAINED (the execution
+    /// from <c>Task.Run</c>, the reporting from its own async invocation, and the retransmission from
+    /// its own <c>Start</c> on a both-flags connection), so only fully constructed state (task ID,
+    /// the owned tasks, CTS, Ready claim, result holder) is ever published; those tasks capture the
+    /// assignment-local values, not this slot.
     /// </summary>
     private void InstallActiveAssignment(ActiveAssignment assignment) => _activeAssignment = assignment;
 
@@ -1369,16 +1844,18 @@ public sealed class WorkerService(
     }
 
     /// <summary>
-    /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits BOTH the retained execution
-    /// and its reporting WITHOUT cancelling them (their Ready already flowed, so they are finished
-    /// or finishing), disposes the CTS, and only then clears the slot.
+    /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits the retained execution and its
+    /// reporting (and, in the gated shape, its retransmission) WITHOUT cancelling them — their Ready
+    /// already flowed, so they are finished or finishing — disposes the CTS, and only then clears the
+    /// slot.
     /// </summary>
     /// <remarks>
-    /// The clear happens ONLY after the drain returned — i.e. after BOTH original tasks joined and
-    /// the CTS disposal was attempted — so a replacement never installs its own assignment, nor
-    /// resets the shared runner, while the original execution or its report is still running. With
-    /// <c>cancelFirst: false</c> there is no cancellation callback to fail, so nothing is deferred
-    /// here.
+    /// The clear happens ONLY after the drain returned — i.e. after every owned task joined and the
+    /// CTS disposal was attempted — so a replacement never installs its own assignment, nor resets the
+    /// shared runner, while the original execution, its report or its retransmission is still running.
+    /// The retransmission is stopped first (admission closed, pending wait cancelled) so its join
+    /// needs no acknowledgement and no interval. With <c>cancelFirst: false</c> there is no
+    /// cancellation callback to fail, so nothing is deferred here.
     /// <para>
     /// It also joins any already-started ordinary readiness write (the drain's shared settlement
     /// returns the retained task for a slot that was already settled), so a successor's replacement
@@ -1398,7 +1875,7 @@ public sealed class WorkerService(
 
     /// <summary>
     /// Ownership transition — MATCHING-CANCEL clear. Requests assignment cancellation FIRST, drains
-    /// BOTH original tasks, disposes the CTS, and only then clears the slot. Returns the drained
+    /// every owned task, disposes the CTS, and only then clears the slot. Returns the drained
     /// assignment (so the caller can still consult its single-flight Ready claim) together with
     /// any DEFERRED cancellation-cleanup failure for the caller to propagate AFTER its own
     /// cleanup.
@@ -1427,8 +1904,8 @@ public sealed class WorkerService(
     /// cancellation failure is handled by the caller AFTER its own heartbeat-state cleanup.
     /// </summary>
     /// <remarks>
-    /// The ownership slot is cleared here — after BOTH original tasks joined and the CTS disposal
-    /// was attempted — so a deferred cancellation failure can never leave the slot occupied for a
+    /// The ownership slot is cleared here — after every owned task joined and the CTS disposal was
+    /// attempted — so a deferred cancellation failure can never leave the slot occupied for a
     /// subsequent loop invocation.
     /// </remarks>
     private async Task<Exception?> DrainRetainedForTeardownAsync()
@@ -1536,6 +2013,16 @@ public sealed class WorkerService(
     /// the started write before the runner reset and the ownership clear. Legacy and ACK-only
     /// connections keep their existing replacement behavior unchanged.
     /// </para>
+    /// <para>
+    /// THE RETRANSMISSION BOUNDARY. On a both-flags connection the assignment also owns a
+    /// retransmission task, which re-sends the frozen completion while its receipt stays
+    /// unacknowledged. It is started with the assignment, retained beside the two original tasks, and
+    /// joined by every ownership transition — so a successor's replacement drain closes its admission
+    /// and cancels its pending wait BEFORE joining it, the runner reset and the ownership clear
+    /// happen only afterwards, and no retry can outlive the assignment or write on a successor's
+    /// connection. The retry shares the ONE send gate, so an ordinary Ready started while an admitted
+    /// retransmission is finishing simply serializes behind it. No other mode has a retry at all.
+    /// </para>
     /// </remarks>
     private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
     {
@@ -1606,13 +2093,14 @@ public sealed class WorkerService(
                         // await cannot starve a previous task of its ToolResponse.
                         if (_activeAssignment is not null)
                         {
-                            // Await BOTH original tasks WITHOUT cancelling: single-flight Ready
-                            // means a new assignment only follows a Ready this assignment already
-                            // emitted, so its execution and its report are finished or finishing.
-                            // Cancelling here would abort work that the orchestrator still expects
-                            // to complete. On a both-flags connection this drain is reached only
-                            // AFTER the boundary above, so it also joins the already-started
-                            // ordinary Ready write before the runner reset and the ownership clear.
+                            // Await the retained assignment's owned tasks WITHOUT cancelling:
+                            // single-flight Ready means a new assignment only follows a Ready this
+                            // assignment already emitted, so its execution, its report and (in the
+                            // gated shape) its retransmission are finished or finishing. Cancelling
+                            // here would abort work that the orchestrator still expects to complete.
+                            // On a both-flags connection this drain is reached only AFTER the
+                            // boundary above, so it also joins the already-started ordinary Ready
+                            // write before the runner reset and the ownership clear.
                             await DrainRetainedForReplacementAsync();
                         }
 
@@ -1659,9 +2147,28 @@ public sealed class WorkerService(
                         // matching receipt. Every other combination builds the UNGATED slot and keeps
                         // today's behavior exactly — the initial Ready is sent by SendWorkerReady
                         // before this loop and is ungated in every mode.
-                        var ordinaryReady = OrdinaryReadyGateEnabled(connection)
+                        var gated = OrdinaryReadyGateEnabled(connection);
+                        var ordinaryReady = gated
                             ? new OrdinaryReadySlot(connection, ct, readyClaim, receipt)
                             : new OrdinaryReadySlot(connection, ct, readyClaim);
+
+                        // THE ASSIGNMENT-LOCAL RETRANSMITTER — built ONLY in the GATED shape (the
+                        // accepted registration that carried BOTH negotiated facts), beside the
+                        // tracker that carries it and BEFORE either owned task starts, so the
+                        // reporting flow can freeze the one envelope into it and every ownership
+                        // transition can close and join it. Legacy, ACK-only and readiness-only
+                        // connections get NONE of it: no snapshot, no task, no wait and no attempt is
+                        // ever produced for them. Its CLOCK is snapshotted from the service's seam
+                        // HERE, once, so a later change of that seam cannot retarget an assignment
+                        // that is already running; the ONE shared send gate is passed in rather than
+                        // a second gate being created.
+                        var retry = gated
+                            ? new CompletionRetry(
+                                connection, ct, receipt, TimeProvider, _sendGate,
+                                ReportRetransmissionFailure)
+                            : null;
+                        if (retry is not null)
+                            receipt.AttachRetry(retry);
 
                         // THE CONNECTION-BOUND DEPENDENCY PAIR for this assignment. Built from the
                         // assignment's EXPECTED connection BEFORE either task starts, and the SAME
@@ -1750,11 +2257,20 @@ public sealed class WorkerService(
                         var reporting = ReportAssignmentAsync(
                             execution, domainTask, connection, terminalResult, receipt, ordinaryReady);
 
-                        // BOTH ORIGINAL TASKS are obtained BEFORE the fully constructed owner is
+                        // THE ONE RETRANSMISSION TASK — started from the ORIGINAL reporting task and
+                        // ONLY in the gated shape (a non-gated assignment has no retransmitter at
+                        // all, so this is <c>null</c>: no task, no wait, no attempt). It observes
+                        // reporting's termination and then re-sends the frozen completion while it
+                        // stays unconfirmed, on THIS connection and THIS stream token. It is a
+                        // SEPARATELY OWNED task, so a held or failing retransmission can never hold
+                        // reporting itself.
+                        var retryTask = receipt.Retry?.Start(reporting);
+
+                        // EVERY OWNED TASK is obtained BEFORE the fully constructed owner is
                         // published, so the slot never exposes a half-built assignment.
                         InstallActiveAssignment(
                             new ActiveAssignment(
-                                domainTask.TaskId, execution, reporting, taskCts, readyClaim,
+                                domainTask.TaskId, execution, reporting, retryTask, taskCts, readyClaim,
                                 terminalResult, receipt, ordinaryReady));
                         break;
 
@@ -2041,11 +2557,22 @@ public sealed class WorkerService(
     /// </para>
     /// <para>
     /// EVERYTHING ELSE IS UNTOUCHED. It never clears the retained result or the ownership slot,
-    /// never cancels or joins execution or reporting, never resets the runner, never sends a Ready
-    /// and never resends a Complete. In particular an acknowledgement that arrives while the actual
-    /// Complete write is STILL PENDING is simply latched: the write keeps its own send permit, its
-    /// own outcome and its own owner. Receipt confirmation and local write success stay SEPARATE
+    /// never cancels or joins execution, reporting or the retransmission task, never resets the
+    /// runner and never sends a Ready. THIS HANDLER ITSELF WRITES NOTHING: the only completion
+    /// re-send anywhere is the assignment's own retransmission task, which this handler merely STOPS
+    /// from admitting further attempts. In particular an acknowledgement that arrives while the
+    /// actual Complete write is STILL PENDING is simply latched: the write keeps its own send permit,
+    /// its own outcome and its own owner. Receipt confirmation and local write success stay SEPARATE
     /// facts, so an early ACK can never convert a later failed or cancelled write into a success.
+    /// </para>
+    /// <para>
+    /// IT ALSO CLOSES THE GATED ASSIGNMENT'S RETRY ADMISSION, as part of the SAME atomic acceptance —
+    /// and nothing more. A pending retransmission delay or permit wait is cancelled, so no FURTHER
+    /// attempt is admitted; the retry task is NOT awaited (the drains join it) and an
+    /// already-admitted transport write is NOT cancelled, because that write is awaited with the
+    /// ORIGINAL stream token. This is the ACK-side half of the arbitration: a confirmation that wins
+    /// performs no further retransmission, while one that loses to an attempt already admitted leaves
+    /// that attempt to finish.
     /// </para>
     /// <para>
     /// A duplicate, a wrong task, a wrong worker, an unarmed or already-cleared assignment, a
@@ -2079,7 +2606,18 @@ public sealed class WorkerService(
 
         // ARMED + SAME ORIGINAL CONNECTION, decided by the tracker's single atomic transition. It
         // returns true for the FIRST accepted receipt only, so duplicates change nothing.
-        if (!assignment.Receipt.TryConfirm(connection))
+        //
+        // IN THE GATED SHAPE THE SAME ACCEPTANCE ALSO CLOSES FUTURE RETRY ADMISSION, atomically under
+        // the retransmitter's own lock — the transition and the close are one step, so the pending
+        // retry can never slip an attempt in between. This awaits nothing, joins nothing and cancels
+        // no admitted transport write; only a pending delay or permit wait is stopped. A wrong task,
+        // a wrong worker, a duplicate acknowledgement and a delivery on another connection all return
+        // false here and leave the receipt — and admission — untouched.
+        var receipt = assignment.Receipt;
+        var confirmed = receipt.Retry is { } retry
+            ? retry.TryConfirm(connection)
+            : receipt.TryConfirm(connection);
+        if (!confirmed)
             return;
 
         // WAKE — the ONLY other thing this case does, and only in the GATED shape. In that shape the
@@ -2105,22 +2643,30 @@ public sealed class WorkerService(
     }
 
     /// <summary>
-    /// Waits for BOTH of an assignment's ORIGINAL tasks — its EXECUTION and its connection-bound
-    /// REPORTING — to finish, optionally cancelling the assignment first, then disposes its
-    /// <see cref="CancellationTokenSource"/>. Never throws for cancellation: the whole point is to
-    /// reach a quiescent state.
+    /// Waits for EVERY owned task of an assignment — its EXECUTION, its connection-bound REPORTING
+    /// and (in the gated shape) its RETRANSMISSION — to finish, optionally cancelling the assignment
+    /// first, then disposes its <see cref="CancellationTokenSource"/>. Never throws for cancellation:
+    /// the whole point is to reach a quiescent state.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// BOTH JOINS ALWAYS HAPPEN, in that order, WITHOUT a caller token — a caller token can never
-    /// make either join vacuous, and neither task is ever abandoned. An EXECUTION fault cannot skip
-    /// the REPORTING join (it is captured, exactly as before) and neither can a throwing
+    /// ALL JOINS ALWAYS HAPPEN, in that order, WITHOUT a caller token — a caller token can never
+    /// make a join vacuous, and no task is ever abandoned. An EXECUTION fault cannot skip the
+    /// REPORTING join (it is captured, exactly as before) and neither can a throwing
     /// cancellation callback: that failure is CAPTURED and returned to the caller, to be re-raised
-    /// <em>after</em> both joins and the disposal below, rather than skipping them.
+    /// <em>after</em> every join and the disposal below, rather than skipping them.
+    /// </para>
+    /// <para>
+    /// RETRY ADMISSION IS CLOSED AND THE PENDING WAIT CANCELLED FIRST, before any join, and
+    /// independently of any receipt fact: a retained retransmission parks in a fixed delay or in the
+    /// send gate's permit queue, and both are stopped by that call, so the retry join terminates
+    /// promptly even when reporting never published a payload and even when NO acknowledgement ever
+    /// arrives — an ACK is never a prerequisite for drain completion. The retry-lifetime source is
+    /// released only after its task has been joined.
     /// </para>
     /// <para>
     /// Ordinary cancellation tolerance and the sanitized treatment of task faults are unchanged for
-    /// both tasks: an <see cref="OperationCanceledException"/> is expected, and any other fault is
+    /// every task: an <see cref="OperationCanceledException"/> is expected, and any other fault is
     /// reported in sanitized form (guarded, so a diagnostic can never skip the remaining join or
     /// the disposal) rather than propagating into the message loop or teardown path. A producer
     /// exception the reporting task merely OBSERVED is not re-raised there, so it is reported here
@@ -2138,7 +2684,21 @@ public sealed class WorkerService(
     /// </returns>
     private async Task<Exception?> DrainAssignmentAsync(ActiveAssignment assignment, bool cancelFirst)
     {
-        // CAPTURE FIRST: a callback failure must not bypass either join or the disposal below.
+        // CLOSE RETRANSMISSION ADMISSION AND CANCEL ITS PENDING WAIT FIRST — before the assignment's
+        // own cancellation is even requested and therefore before any join, on EVERY drain (matching
+        // cancel, replacement, EOF, reader fault, run cancellation) and unconditionally: a non-gated
+        // assignment simply has no retry, and a drain that arrives while reporting has not yet
+        // published its payload closes admission just the same. This is what makes the retry join
+        // below terminate: the retry task parks in a five-second delay or in the send gate's permit
+        // queue, and the retry-lifetime cancellation stops BOTH. It is deliberately INDEPENDENT of any
+        // receipt fact — an acknowledgement is NEVER a prerequisite for drain completion. The call is
+        // synchronous, awaits nothing, is fault-contained (a throwing cancellation callback is
+        // swallowed there rather than allowed to skip a join) and touches no transport: an
+        // already-admitted write is awaited with the ORIGINAL stream token, so this can never cancel
+        // it.
+        assignment.Receipt.Retry?.CloseAdmission();
+
+        // CAPTURE NEXT: a callback failure must not bypass either join or the disposal below.
         var deferredCancellationFailure = cancelFirst
             ? await CaptureCancellationFailureAsync(assignment.Cts)
             : null;
@@ -2151,6 +2711,17 @@ public sealed class WorkerService(
             await CaptureJoinFailureAsync(assignment.Execution), DrainObservedFaultMessage);
         ReportIfPresent(
             await CaptureJoinFailureAsync(assignment.Reporting), DrainObservedFaultMessage);
+
+        // THEN THE RETRANSMISSION TASK — the third owned task in the gated shape. Its admission was
+        // already closed and its pending wait already cancelled above, so this join reaches
+        // termination without waiting for any interval and without waiting for an acknowledgement. It
+        // is joined BEFORE the readiness settlement below, so a retry can never be writing while the
+        // single Ready is started and can never outlive the ownership clear that follows this drain.
+        if (assignment.Retry is { } retryTask)
+        {
+            ReportIfPresent(
+                await CaptureJoinFailureAsync(retryTask), DrainObservedFaultMessage);
+        }
 
         // THEN SETTLE AND JOIN THE ORDINARY READINESS WRITE — the third owned task an assignment can
         // now have outstanding. Settlement is EXACTLY ONCE and shared with the response loop, and it
@@ -2165,6 +2736,10 @@ public sealed class WorkerService(
             ReportIfPresent(
                 await CaptureJoinFailureAsync(readinessWrite), DrainObservedFaultMessage);
         }
+
+        // THE RETRY LIFETIME SOURCE IS RELEASED ONLY NOW — after its task joined. A source that a
+        // still-running retry could observe is therefore never disposed underneath it.
+        assignment.Receipt.Retry?.Dispose();
 
         // Disposal is attempted AFTER every join and runs even when a deferred cancellation failure
         // is waiting to propagate — the deferred failure surfaces only once resources are released.
@@ -2270,6 +2845,14 @@ public sealed class WorkerService(
     /// response loop, or an ownership transition) is the only observer, and it starts the single
     /// readiness write once the slot's whole predicate holds.
     /// </param>
+    /// <remarks>
+    /// FREEZE ONCE, SEND CLONES. On the successful-mapping path only, the mapped
+    /// <see cref="TaskComplete"/> is handed to the assignment's retransmitter ONCE (a non-gated
+    /// assignment's tracker carries none, so nothing is frozen there) and the receipt is armed
+    /// AFTERWARDS. Every send built here and by that retransmitter is a FRESH deep clone of the
+    /// private envelope, so no writer is ever handed the snapshot itself. The retained
+    /// <see cref="TaskResult"/> keeps its exact identity: it is never cloned, re-mapped or replaced.
+    /// </remarks>
     private async Task ReportAssignmentAsync(
         Task execution,
         WorkTask task,
@@ -2291,6 +2874,15 @@ public sealed class WorkerService(
                 // like an absent result does.
                 var completion = GrpcMapper.ToGrpc(result);
 
+                // FREEZE ONCE, BEFORE ARMING. The captured assigned worker identity and the SINGLE
+                // mapped payload become a privately owned envelope that no writer ever receives: the
+                // ORIGINAL Complete below and every later retransmission each send a FRESH deep clone
+                // of it, so nothing a writer does can alter what the next attempt re-sends — and the
+                // retained TaskResult is never re-mapped, cloned or replaced. A retransmitter exists
+                // only in the gated shape, so freezing is a no-op for every other connection.
+                var retry = receipt.Retry;
+                retry?.Freeze(connection.AssignedId, completion);
+
                 // ARM — on the ENABLED connection only, with the exact mapped result in hand and
                 // the single Complete attempt about to invoke the EXISTING send. Nothing waits on
                 // it: an acknowledgement that arrives while the write below is still pending is
@@ -2307,13 +2899,22 @@ public sealed class WorkerService(
                 // acknowledgement means the evidence was durably retained, not that this local write
                 // succeeded. Publishing that fact consumes no Ready claim, writes nothing and waits
                 // for nothing.
+                //
+                // THE SENT MESSAGE IS A FRESH CLONE of the frozen envelope (or the just-mapped value
+                // on a non-gated connection, which has no retransmitter at all): the private snapshot
+                // is never handed to the writer.
                 try
                 {
-                    await SendAsync(connection, new WorkerMessage
-                    {
-                        WorkerId = connection.AssignedId,
-                        Complete = completion,
-                    }, ordinaryReady.StreamToken);
+                    await SendAsync(
+                        connection,
+                        retry is null
+                            ? new WorkerMessage
+                            {
+                                WorkerId = connection.AssignedId,
+                                Complete = completion,
+                            }
+                            : retry.NextMessage(),
+                        ordinaryReady.StreamToken);
 
                     _log.Info($"Task {task.TaskId} completed ({result.Status})");
                 }
