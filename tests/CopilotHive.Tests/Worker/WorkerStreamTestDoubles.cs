@@ -477,9 +477,19 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
     private readonly Channel<OrchestratorMessage> _channel = Channel.CreateUnbounded<OrchestratorMessage>();
     private readonly object _gate = new();
     private readonly Dictionary<int, TaskCompletionSource> _consumedWaiters = [];
+    private readonly Dictionary<int, TaskCompletionSource> _readStartedWaiters = [];
     private int _consumed;
+    private int _readsStarted;
 
     public OrchestratorMessage Current { get; private set; } = null!;
+
+    /// <summary>
+    /// How many reads production has STARTED. It advances once per <c>MoveNext</c> entry, and
+    /// production re-arms exactly one pending read per dispatched message only AFTER that
+    /// message's handler returns — so a read count that has NOT advanced is positive evidence
+    /// that the loop is still inside the handler it last entered.
+    /// </summary>
+    internal int ReadsStarted { get { lock (_gate) return _readsStarted; } }
 
     /// <summary>Pushes one message; <c>null</c> completes the stream.</summary>
     internal void Push(OrchestratorMessage? message)
@@ -508,10 +518,140 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
         }
     }
 
+    /// <summary>Completes once production has STARTED at least <paramref name="count"/> reads.</summary>
+    internal Task ReadStarted(int count)
+    {
+        lock (_gate)
+        {
+            if (_readsStarted >= count)
+                return Task.CompletedTask;
+            if (!_readStartedWaiters.TryGetValue(count, out var waiter))
+            {
+                waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _readStartedWaiters[count] = waiter;
+            }
+            return waiter.Task;
+        }
+    }
+
     public async Task<bool> MoveNext(CancellationToken cancellationToken)
     {
+        List<TaskCompletionSource> readReady;
+        lock (_gate)
+        {
+            _readsStarted++;
+            readReady = [];
+            foreach (var (threshold, waiter) in _readStartedWaiters)
+            {
+                if (_readsStarted >= threshold)
+                    readReady.Add(waiter);
+            }
+        }
+
+        foreach (var waiter in readReady)
+            waiter.TrySetResult();
+
         if (!await _channel.Reader.WaitToReadAsync(cancellationToken))
             return false;
+
+        if (!_channel.Reader.TryRead(out var message))
+            return false;
+
+        Current = message;
+        List<TaskCompletionSource> ready = [];
+        lock (_gate)
+        {
+            _consumed++;
+            foreach (var (threshold, waiter) in _consumedWaiters)
+            {
+                if (_consumed >= threshold)
+                    ready.Add(waiter);
+            }
+        }
+
+        foreach (var waiter in ready)
+            waiter.TrySetResult();
+
+        return true;
+    }
+}
+
+/// <summary>
+/// A channel-backed reader that behaves exactly like <see cref="ChannelResponseReader"/> until
+/// <see cref="ArmFault"/> is called, then throws the ORIGINAL exception from the next
+/// <c>MoveNext</c> — modelling a reader fault whose identity the loop must propagate.
+/// </summary>
+internal sealed class FaultingResponseReader : IAsyncStreamReader<OrchestratorMessage>
+{
+    private readonly Channel<OrchestratorMessage> _channel =
+        Channel.CreateUnbounded<OrchestratorMessage>();
+
+    private readonly object _gate = new();
+    private readonly Dictionary<int, TaskCompletionSource> _consumedWaiters = [];
+    private Exception? _fault;
+    private int _consumed;
+
+    public OrchestratorMessage Current { get; private set; } = null!;
+
+    internal void Push(OrchestratorMessage message) => _channel.Writer.TryWrite(message);
+
+    internal void TryComplete() => _channel.Writer.TryComplete();
+
+    /// <summary>
+    /// One-shot: the next <c>MoveNext</c> outcome surfaces <paramref name="fault"/>. The channel
+    /// is also completed, so a loop ALREADY parked inside <c>WaitToReadAsync</c> wakes
+    /// deterministically and reaches the fault check.
+    /// </summary>
+    internal void ArmFault(Exception fault)
+    {
+        lock (_gate) _fault = fault;
+        _channel.Writer.TryComplete();
+    }
+
+    /// <summary>Completes once the loop has consumed at least <paramref name="count"/> messages.</summary>
+    internal Task Consumed(int count)
+    {
+        lock (_gate)
+        {
+            if (_consumed >= count)
+                return Task.CompletedTask;
+            if (!_consumedWaiters.TryGetValue(count, out var waiter))
+            {
+                waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _consumedWaiters[count] = waiter;
+            }
+            return waiter.Task;
+        }
+    }
+
+    public async Task<bool> MoveNext(CancellationToken cancellationToken)
+    {
+        Exception? fault;
+        lock (_gate)
+        {
+            fault = _fault;
+            _fault = null;
+        }
+
+        if (fault is not null)
+            throw fault;
+
+        if (!await _channel.Reader.WaitToReadAsync(cancellationToken))
+        {
+            // A loop ALREADY parked inside WaitToReadAsync when ArmFault completed the channel
+            // wakes here, so the fault must be surfaced from THIS outcome — not silently turned
+            // into an EOF.
+            lock (_gate)
+            {
+                fault = _fault;
+                _fault = null;
+            }
+
+            if (fault is not null)
+                throw fault;
+
+            return false;
+        }
 
         if (!_channel.Reader.TryRead(out var message))
             return false;
