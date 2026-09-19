@@ -4,6 +4,14 @@
 @inject DashboardStateService State
 @inject PageHeaderState PageHeader
 
+@*
+    The summary cards report genuinely different things, from one captured snapshot. Total and Busy
+    keep their historical meanings. "Available" is the honest assignable count (a captured
+    observation, not a reservation). "Awaiting Ready" is the withheld subset. The not-busy total is
+    deliberately NOT presented as capacity: it is labelled "Not busy (incl. waiting)" so a reader can
+    never mistake it for green assignable capacity, and it is rendered in a muted colour rather than
+    the available green.
+*@
 <div class="cards">
     <div class="card">
         <div class="label">Total</div>
@@ -14,8 +22,16 @@
         <div class="value" style="color:var(--accent)">@_snap.BusyWorkers</div>
     </div>
     <div class="card">
-        <div class="label">Idle</div>
-        <div class="value" style="color:var(--green)">@_snap.IdleWorkers</div>
+        <div class="label">Available</div>
+        <div class="value" style="color:var(--green)">@_snap.AvailableWorkers</div>
+    </div>
+    <div class="card">
+        <div class="label">Awaiting Ready</div>
+        <div class="value" style="color:var(--accent)">@_snap.AwaitingReadyWorkers</div>
+    </div>
+    <div class="card">
+        <div class="label">Not busy (incl. waiting)</div>
+        <div class="value" style="color:var(--text-muted)">@_snap.IdleWorkers</div>
     </div>
 </div>
 
@@ -83,9 +99,13 @@
                         }
                     </td>
                     <td>
-                        <span class="badge @(w.IsBusy ? "badge-yellow" : "badge-green")">
-                            @(w.IsBusy ? "Busy" : "Idle")
-                        </span>
+                        @*
+                            The row status is decided by the pure presentation helper on WorkerInfo, so
+                            Busy / Available / Awaiting Ready / Unavailable are distinguishable without
+                            any UI dependency — and a non-busy row is never rendered as green available
+                            capacity unless it really was available.
+                        *@
+                        <span class="badge @w.StatusCssClass">@w.StatusLabel</span>
                     </td>
                     <td style="font-size:0.85rem">@(w.CurrentTaskId ?? "—")</td>
                     <td style="color:var(--text-muted);font-size:0.85rem">@FormatAgo(w.LastHeartbeat)</td>

@@ -37,6 +37,13 @@ public static class ApiEndpoints
             var count = Interlocked.Increment(ref checkCount);
             var uptime = DateTime.UtcNow - serverStartTime;
             var goals = await goalStore.GetAllGoalsAsync();
+
+            // ONE capture for the whole response: the nested worker_pool snapshot is taken once and
+            // the top-level worker total is projected from THAT SAME snapshot, so the two totals in
+            // one response can never disagree. A separate GetAllWorkers().Count read here would be a
+            // second, independent instant.
+            var workerPoolStats = workerPool.GetDetailedStats();
+
             return Results.Ok(new HealthResponse
             {
                 Status = "Healthy",
@@ -44,12 +51,12 @@ public static class ApiEndpoints
                 UptimeSpan = uptime,
                 ActiveGoals = goals.Count(g => g.Status is GoalStatus.Pending or GoalStatus.InProgress),
                 CompletedGoals = goals.Count(g => g.Status == GoalStatus.Completed),
-                ConnectedWorkers = workerPool.GetAllWorkers().Count,
+                ConnectedWorkers = workerPoolStats.TotalWorkers,
                 Version = version,
                 SharpCoderVersion = typeof(SharpCoder.CodingAgent).Assembly.GetName().Version?.ToString(),
                 ServerTime = DateTime.UtcNow,
                 CheckNumber = count,
-                WorkerPool = workerPool.GetDetailedStats(),
+                WorkerPool = workerPoolStats,
             });
         }).AllowAnonymous();
 
