@@ -3201,6 +3201,185 @@ public sealed class WorkerServiceReceiptGateTests
         }
     }
 
+    /// <summary>
+    /// MATCHING CANCEL AT A REAL PRE-MAPPING BARRIER. The REAL message loop owns a fully wired
+    /// gated <c>ActiveAssignment</c>: a pending execution task, the REAL reporting method waiting
+    /// on it, a real attached-and-started <c>CompletionRetry</c>, and the real readiness/receipt
+    /// objects. The matching cancel enters the REAL handler while execution is still pending and
+    /// the holder is empty — so reporting has not mapped, frozen or armed anything. Only AFTER the
+    /// drain's cancellation boundary is positively observed does the test publish a valid result
+    /// and complete execution, letting reporting map/freeze/arm and terminate.
+    /// <para>
+    /// REMOVAL PROOF. Correct production closes retry admission BEFORE cancellation or any join,
+    /// so the subsequently mapped payload cannot arm a delay: the concrete retry task terminates
+    /// with ZERO timers. A mutant that moves <c>CloseAdmission</c> until AFTER the reporting join
+    /// lets the already-started retry observe the now-frozen/armed report and create its delay;
+    /// because this clock is never advanced, the timer-count assertion (and bounded handler return)
+    /// fail by name. This differs from a prompt-cancellation vector, where cancellation can prevent
+    /// any result from existing and makes the late-close mutant vacuous.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task MatchingCancel_PreMappingWiredOwner_ClosesAdmissionBeforeReportingJoin()
+    {
+        const string taskId = "task-cancel-pre-mapping";
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var clock = new ManualRetransmissionClock();
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, clock);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+
+        var serviceType = typeof(WorkerService);
+        var holderType = serviceType.GetNestedType("TerminalResultHolder", BindingFlags.NonPublic)!;
+        var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+        var receiptType = serviceType.GetNestedType("CompletionReceiptTracker", BindingFlags.NonPublic)!;
+        var slotType = serviceType.GetNestedType("OrdinaryReadySlot", BindingFlags.NonPublic)!;
+
+        var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+        var ready = Activator.CreateInstance(readyType, nonPublic: true)!;
+        var receipt = Activator.CreateInstance(
+            receiptType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [connection],
+            culture: null)!;
+        var ordinaryReady = Activator.CreateInstance(
+            slotType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [connection, CancellationToken.None, ready, receipt],
+            culture: null)!;
+
+        // Deliberately inline: reporting registered on this task BEFORE the drain can, so completing
+        // it runs reporting (and then the retry's earlier reporting continuation) through its
+        // pre-mapping window before the drain continuation can resume past its execution/reporting
+        // joins. This deterministic registration order is what kills the late-CloseAdmission mutant.
+        var executionSource = new TaskCompletionSource();
+        var domainTask = GrpcMapper.ToDomain(ResultAssignment(taskId).Assignment);
+        var retry = NewCompletionRetry(service, connection, receipt, clock);
+        receiptType.GetMethod("AttachRetry")!.Invoke(receipt, [retry]);
+
+        var reporting = (Task)serviceType.GetMethod(
+                "ReportAssignmentAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, [
+                executionSource.Task,
+                domainTask,
+                connection,
+                holder,
+                receipt,
+                ordinaryReady,
+            ])!;
+        var retryTask = (Task)retry.GetType().GetMethod("Start")!.Invoke(retry, [reporting])!;
+
+        // THE DRAIN-JOIN BARRIER. It includes the real reporting task, then stays incomplete until
+        // the test releases it. Production retains `reporting` directly; this transparent wrapper
+        // adds only an AFTER-report boundary so the test can observe whether the already-started
+        // retry creates a delay while a late-close mutant is still blocked in the reporting join.
+        var releaseReportingJoin = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var retainedReporting = HoldAfterAsync(reporting, releaseReportingJoin.Task);
+
+        using var cts = new CancellationTokenSource();
+        var assignment = NewActiveAssignment(
+            taskId, executionSource.Task, retainedReporting, retryTask, cts, ready, holder, receipt, ordinaryReady);
+        serviceType.GetMethod("InstallActiveAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(service, [assignment]);
+
+        var drainEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registration = cts.Token.Register(() => drainEntered.TrySetResult());
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+        try
+        {
+            // THE TRUE PRE-MAPPING STATE: execution pending, holder empty, receipt unarmed,
+            // reporting pending, concrete retry started but not waiting, and nothing on the wire.
+            Assert.False(executionSource.Task.IsCompleted);
+            Assert.Null(holderType.GetProperty("Result")!.GetValue(holder));
+            Assert.False(GetReceiptArmed(receipt));
+            Assert.False(reporting.IsCompleted);
+            Assert.False(retryTask.IsCompleted);
+            Assert.Equal(0, clock.TimerCount);
+            Assert.Empty(writer.Completes);
+
+            // THE REAL MATCHING-CANCEL HANDLER enters. The assignment CTS callback runs only after
+            // DrainAssignmentAsync has executed its pre-cancellation CloseAdmission in correct
+            // production, and before it awaits the still-pending execution.
+            reader.Push(MatchingCancel(taskId));
+            await drainEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(executionSource.Task.IsCompleted);
+            Assert.False(reporting.IsCompleted);
+            Assert.False(retryTask.IsCompleted);
+            Assert.Equal(0, clock.TimerCount);
+
+            // NOW publish a valid result and complete execution. Reporting genuinely maps, freezes,
+            // arms and writes the original Complete. Correct production's admission was already
+            // closed; a late-close mutant creates its first delay here.
+            holderType.GetMethod("Publish")!.Invoke(holder, [new TaskResult
+            {
+                TaskId = taskId,
+                Status = TaskOutcome.Completed,
+                Output = "mapped-after-cancel-entered",
+                Model = domainTask.Model,
+            }]);
+            executionSource.TrySetResult();
+
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptArmed(receipt), "reporting really mapped and armed the payload.");
+
+            // HOLD the drain in its retained-reporting join and observe the retry independently.
+            // Correct production closed admission before reaching this join, so the concrete retry
+            // terminates with no timer. A late-close mutant remains blocked on retainedReporting
+            // with admission open; the already-started retry creates its timer and this NEGATIVE
+            // rendezvous completes instead of timing out.
+            var lateTimer = await Record.ExceptionAsync(() =>
+                clock.WaitForRetryParkedInDelayAsync(1, TestContext.Current.CancellationToken)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(lateTimer);
+            Assert.Equal(0, clock.TimerCount);
+            Assert.True(retryTask.IsCompletedSuccessfully);
+
+            // Release only after the discriminator has been observed; the real drain can now finish.
+            releaseReportingJoin.TrySetResult();
+            await retainedReporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await retryTask.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE LOAD-BEARING CLAIM: the concrete retry terminated without ever creating a wait.
+            Assert.Equal(0, clock.AdvanceCount);
+            Assert.Single(writer.Completes);
+
+            // The cancel's existing fallback Ready completes the real handler; read #2 proves the
+            // handler returned and ownership was cleared.
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            writer.ReleaseReady(0);
+            await reader.ReadStarted(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Null(GetActiveAssignment(service));
+            Assert.Equal(1, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            registration.Dispose();
+            executionSource.TrySetResult();
+            releaseReportingJoin.TrySetResult();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await ObserveTaskAsync(reporting);
+            await ObserveTaskAsync(retainedReporting);
+            await ObserveTaskAsync(retryTask);
+            await ObserveTaskAsync(loop);
+            connection.Retire();
+            service.Dispose();
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // Harness
     // ══════════════════════════════════════════════════════════════════════════
@@ -3337,6 +3516,16 @@ public sealed class WorkerServiceReceiptGateTests
         (Task)typeof(WorkerService)
             .GetMethod("DrainAssignmentAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(service, [assignment, cancelFirst])!;
+
+    /// <summary>
+    /// Retains a real producer's termination and then exposes a deterministic AFTER-producer barrier.
+    /// Used only by the pre-mapping matching-cancel vector to hold the real drain's reporting join.
+    /// </summary>
+    private static async Task HoldAfterAsync(Task producer, Task release)
+    {
+        await producer;
+        await release;
+    }
 
     /// <summary>Awaits a task to quiescence in teardown; the real outcome is asserted on the happy path.</summary>
     private static async Task ObserveTaskAsync(Task task)

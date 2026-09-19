@@ -1353,54 +1353,59 @@ public sealed class WorkerCompletionRetransmissionTests
     [Fact]
     public async Task RunCancellationWithParkedRetry_DrainsCancelsAndJoinsWithoutReady()
     {
-        var harness = new RetryHarness();
+        var harness = new RetryHarness
+        {
+            HoldRetries = true,
+            HoldRetryCancellationUnwind = true,
+        };
         try
         {
             await harness.StartAsync();
             harness.ReleasePrompt(TaskA);
             await harness.CompleteEnteredAsync(0);
-
-            // The retry is PROVABLY parked in its delay.
             await harness.RetryParkedInDelayAsync(1);
 
-            // THE CONCRETE retry task, captured BEFORE the cancellation clears the slot.
+            // THE CONCRETE retry task, captured BEFORE cancellation can clear the slot. Admit its
+            // write and hold it inside the writer; this transport consumes the STREAM token.
             var retry = harness.Retry;
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            Assert.False(harness.RetryWriteCompleted(1));
             Assert.False(retry.IsCompleted);
 
-            // PARK THE RETRY ON THE PRODUCTION PERMIT QUEUE and KEEP the permit held for the whole
-            // teardown. This is the device that makes the JOIN observable under run cancellation:
-            // the permit wait observes the retry's OWN lifetime token (never the stream token), so
-            // ONLY the drain's admission close can release it — the test never releases the permit.
-            await harness.HoldSendGateAsync();
-            harness.Advance(SpecifiedInterval);
-            await harness.RetryQueuedOnSendGateAsync();
-            Assert.False(retry.IsCompleted, "the retry must be parked on the permit queue.");
-            Assert.Single(harness.Completes);
-
-            // THE RUN CANCELLATION: no ACK will ever arrive, and the response stream is never
-            // completed — the reader stays open, so EOF cannot be the drain's trigger.
+            // THE RUN CANCELLATION: no ACK and no EOF. The admitted writer observes stream-token
+            // cancellation, then parks in its OWN deterministic cancellation-unwind barrier before
+            // rethrowing. This is a real writer boundary, not a token-only assertion.
             harness.CancelLoopToken();
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-                harness.JoinAsync());
+            await harness.RetryCancellationObservedAsync();
+            Assert.False(retry.IsCompleted, "the retry must still be unwinding in the writer.");
 
-            // ORDERING CLAIM, taken SYNCHRONOUSLY at the instant the loop's cancellation
-            // surfaced: the teardown closed admission, which cancelled the permit wait, and then
-            // JOINED the retained task — it did not abandon the unwind. The permit is STILL held
-            // by this test, so nothing else could have completed that task.
+            // IN-WINDOW JOIN PROOF. Correct production cannot let the loop surface cancellation
+            // while the concrete retry is still unwinding. Removing the retry join returns here.
+            var premature = await Record.ExceptionAsync(() =>
+                harness.Loop.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.False(retry.IsCompleted);
+            Assert.Equal(1, harness.SlotOccupancy);
+
+            // RELEASE the writer's cancellation unwind. The retry now terminates and only then may
+            // the loop's original cancellation surface.
+            harness.ReleaseRetryCancellationUnwind();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => harness.JoinAsync());
+
             Assert.True(
                 retry.IsCompleted,
                 "the teardown must JOIN the retained retry task BEFORE the loop unwinds.");
-            Assert.Equal(0, harness.SendGateCurrentCount);
             await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // No retransmission was ever invoked, and no Ready was emitted.
-            Assert.Single(harness.Completes);
+            // The admitted attempt entered but never completed successfully, and no Ready emitted.
+            Assert.Equal(2, harness.Completes.Count);
             Assert.Equal(0, harness.ReadyCount);
             Assert.Equal(0, harness.SlotOccupancy);
         }
         finally
         {
-            harness.ReleaseSendGate();
+            harness.ReleaseRetryCancellationUnwind();
             await harness.TeardownAsync();
         }
     }
@@ -1408,6 +1413,67 @@ public sealed class WorkerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
     // 8. Successor and sequential-run boundaries.
     // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE REPLACEMENT DRAIN'S RETRY JOIN, ISOLATED FROM THE READY JOIN. A real gated assignment's
+    /// retry is admitted and HELD inside its transport writer while the receipt remains unconfirmed
+    /// (therefore no ordinary Ready task exists). The real <c>DrainRetainedForReplacementAsync</c>
+    /// member is invoked: it must remain incomplete until that admitted retry write terminates,
+    /// then join the concrete retry and clear ownership.
+    /// <para>
+    /// REMOVAL PROOF. Removing ONLY the retry join makes the replacement drain return and clear
+    /// ownership while the admitted retry writer remains parked; because no Ready was authorized,
+    /// there is no co-guarding readiness join to hide that defect. The pre-release bounded
+    /// non-completion and retained-owner assertions both fail under that mutant.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ReplacementDrain_WithoutAReadyTask_JoinsTheAdmittedRetryBeforeClearing()
+    {
+        var harness = new RetryHarness { HoldRetries = true };
+        Task? drain = null;
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryParkedInDelayAsync(1);
+
+            // Admit and hold A's real retry while the receipt stays UNCONFIRMED: no Ready task can
+            // exist, so the retry join is the replacement drain's ONLY blocker.
+            harness.Advance(SpecifiedInterval);
+            await harness.CompleteEnteredAsync(1);
+            var owner = harness.Owner;
+            var retry = harness.Retry;
+            Assert.False(harness.ReceiptConfirmed);
+            Assert.Null(harness.ReadinessSlotWrite);
+            Assert.False(harness.RetryWriteCompleted(1));
+
+            drain = harness.InvokeReplacementDrainAsync();
+
+            // IN-WINDOW: the real replacement drain must not return or clear while the admitted
+            // retry write is held. A retry-join removal returns here immediately.
+            var premature = await Record.ExceptionAsync(() =>
+                drain.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.Same(owner, harness.Owner);
+            Assert.False(retry.IsCompleted);
+            Assert.Equal(1, harness.SlotOccupancy);
+
+            // The write's OWN termination releases the join; only then may replacement clear.
+            harness.ReleaseComplete(1);
+            await drain.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(retry.IsCompleted, "replacement must join the concrete retry task.");
+            await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(0, harness.SlotOccupancy);
+        }
+        finally
+        {
+            if (drain is not null)
+                await RetryHarness.ObserveForTeardownAsync(drain);
+            await harness.TeardownAsync();
+        }
+    }
 
     /// <summary>
     /// NO OLD RETRY ON A SUCCESSOR ASSIGNMENT, and the replacement drain JOINS an ADMITTED retry.
@@ -1644,6 +1710,8 @@ public sealed class WorkerCompletionRetransmissionTests
     [Theory]
     [InlineData(InvalidAckKind.WrongTask)]
     [InlineData(InvalidAckKind.WrongWorker)]
+    [InlineData(InvalidAckKind.PreviousConnection)]
+    [InlineData(InvalidAckKind.RepeatedWrongTask)]
     public async Task InvalidAck_NeverClosesRetryAdmission_TheRetryStillHappensAfterwards(
         InvalidAckKind kind)
     {
@@ -1667,12 +1735,24 @@ public sealed class WorkerCompletionRetransmissionTests
                 case InvalidAckKind.WrongWorker:
                     harness.PushAckForWorker(TaskA, "worker-impostor");
                     break;
+                case InvalidAckKind.PreviousConnection:
+                    harness.DeliverAckOnPreviousConnection(TaskA);
+                    break;
+                case InvalidAckKind.RepeatedWrongTask:
+                    harness.PushAck(TaskB);
+                    harness.PushAck(TaskB);
+                    break;
                 default:
                     throw new Xunit.Sdk.XunitException($"Unhandled invalid-ack kind: {kind}");
             }
 
             harness.PushProbe("invalid-ack-returned");
-            await harness.ConsumedAsync(3);
+            await harness.ConsumedAsync(kind switch
+            {
+                InvalidAckKind.PreviousConnection => 2, // assignment + probe; ACK invoked directly.
+                InvalidAckKind.RepeatedWrongTask => 4, // assignment + two wrong ACKs + probe.
+                _ => 3, // assignment + one invalid ACK + probe.
+            });
 
             // NOTHING WAS CONFIRMED and the Ready stays withheld.
             Assert.False(harness.ReceiptConfirmed);
@@ -1687,9 +1767,15 @@ public sealed class WorkerCompletionRetransmissionTests
             await harness.RetryParkedInDelayAsync(2);
 
             // …and the EXACT ack then closes it, so the suppression that follows is meaningful.
+            var consumedBeforeExact = kind switch
+            {
+                InvalidAckKind.PreviousConnection => 2,
+                InvalidAckKind.RepeatedWrongTask => 4,
+                _ => 3,
+            };
             harness.PushAck(TaskA);
             harness.PushProbe("exact-ack-returned");
-            await harness.ConsumedAsync(5);
+            await harness.ConsumedAsync(consumedBeforeExact + 2);
             Assert.True(harness.ReceiptConfirmed);
             await retry.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
@@ -1777,6 +1863,12 @@ public sealed class WorkerCompletionRetransmissionTests
 
         /// <summary>The correct task id but a DIFFERENT worker identity.</summary>
         WrongWorker,
+
+        /// <summary>Matching wire identities delivered through a DIFFERENT connection object.</summary>
+        PreviousConnection,
+
+        /// <summary>The same wrong-task acknowledgement delivered twice before any confirmation.</summary>
+        RepeatedWrongTask,
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1806,6 +1898,7 @@ public sealed class WorkerCompletionRetransmissionTests
         private readonly IDisposable _consoleRestore;
         private readonly List<Task> _loops = [];
         private readonly List<WorkerConnection> _connections = [];
+        private readonly List<WorkerConnection> _foreignConnections = [];
         private readonly List<IAsyncStreamReader<OrchestratorMessage>> _readers = [];
         private readonly List<CancellationTokenSource> _loopCtsList = [];
         private readonly SemaphoreSlim _sendGate;
@@ -1882,6 +1975,12 @@ public sealed class WorkerCompletionRetransmissionTests
 
         /// <summary>Whether RETRY Complete writes (index &gt;= 1) park until released.</summary>
         internal bool HoldRetries { get; init; }
+
+        /// <summary>
+        /// Whether an admitted retry write, after observing stream-token cancellation, must park in
+        /// a deterministic cancellation-unwind barrier before it can rethrow and terminate.
+        /// </summary>
+        internal bool HoldRetryCancellationUnwind { get; init; }
 
         /// <summary>
         /// Whether READY writes park until released — which is what makes a FAILING Ready fault come
@@ -2072,6 +2171,7 @@ public sealed class WorkerCompletionRetransmissionTests
             {
                 HoldOriginalComplete = HoldOriginalComplete,
                 HoldRetries = HoldRetries,
+                HoldRetryCancellationUnwind = HoldRetryCancellationUnwind,
                 HoldReadies = HoldReadies,
             };
 
@@ -2169,6 +2269,37 @@ public sealed class WorkerCompletionRetransmissionTests
             CompletionReceiptAck = new CompletionReceiptAck { TaskId = taskId, WorkerId = workerId },
         });
 
+        /// <summary>
+        /// Delivers a matching acknowledgement through a DIFFERENT, unpublished connection object
+        /// — the previous/stale-connection vector the real reader cannot manufacture. It invokes
+        /// the SAME private handler the loop's ACK case calls, with only the delivering connection
+        /// changed; the foreign connection is retained and retired during teardown.
+        /// </summary>
+        internal void DeliverAckOnPreviousConnection(string taskId)
+        {
+            var reader = new ChannelResponseReader();
+            var writer = new RetransmissionWriter();
+            var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
+                writer, reader,
+                _ => Task.FromResult(new Metadata()),
+                _ => new Status(StatusCode.OK, string.Empty),
+                _ => new Metadata(),
+                _ => { },
+                null!);
+            var previous = TestConnectionFactory.CreateUnpublished(
+                AssignedWorkerId, stream,
+                completionReceiptAckEnabled: true,
+                completionReadyRequired: true);
+            _foreignConnections.Add(previous);
+
+            typeof(WorkerService)
+                .GetMethod("HandleCompletionReceiptAck", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(_service, [
+                    previous,
+                    new CompletionReceiptAck { TaskId = taskId, WorkerId = AssignedWorkerId },
+                ]);
+        }
+
         internal void PushProbe(string requestId) => PushToReader(new OrchestratorMessage
         {
             ToolResponse = new ToolCallResponse { RequestId = requestId, Success = true, ResultJson = "{}" },
@@ -2202,6 +2333,11 @@ public sealed class WorkerCompletionRetransmissionTests
             Writer.CompleteEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         internal void ReleaseComplete(int index) => Writer.ReleaseComplete(index);
+
+        internal Task RetryCancellationObservedAsync() =>
+            Writer.RetryCancellationObserved.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+        internal void ReleaseRetryCancellationUnwind() => Writer.ReleaseRetryCancellationUnwind();
 
         internal Task ReadyEnteredAsync(int index) =>
             Writer.ReadyEntered(index).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2353,6 +2489,17 @@ public sealed class WorkerCompletionRetransmissionTests
             Loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         /// <summary>
+        /// Invokes the REAL replacement drain against the CURRENT retained owner. Used to isolate
+        /// the retry join from the pre-Ready protocol boundary and from any readiness write join.
+        /// </summary>
+        internal Task InvokeReplacementDrainAsync() =>
+            (Task)typeof(WorkerService)
+                .GetMethod("DrainRetainedForReplacementAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(_service, null)!;
+
+        internal static Task ObserveForTeardownAsync(Task task) => ObserveAsync(task);
+
+        /// <summary>
         /// Releases every parked gate, joins every started task within the bound, retires the
         /// connections, disposes the service and releases the temp root — so a failing assertion
         /// cannot leave a producer stuck.
@@ -2382,6 +2529,8 @@ public sealed class WorkerCompletionRetransmissionTests
                 await ObserveAsync(task);
 
             foreach (var connection in _connections)
+                connection.Retire();
+            foreach (var connection in _foreignConnections)
                 connection.Retire();
 
             _service.Dispose();
@@ -2558,6 +2707,10 @@ public sealed class WorkerCompletionRetransmissionTests
         private readonly Dictionary<int, TaskCompletionSource> _readyEntered = [];
         private readonly Dictionary<int, TaskCompletionSource> _readyRelease = [];
         private readonly Dictionary<int, TaskCompletionSource> _readyCountWaiters = [];
+        private readonly TaskCompletionSource _retryCancellationObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _retryCancellationRelease =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         private bool _releaseImmediately;
         private Exception? _failNextRetryWrite;
         private Exception? _failNextReadyWrite;
@@ -2565,6 +2718,12 @@ public sealed class WorkerCompletionRetransmissionTests
         internal bool HoldOriginalComplete { get; init; }
 
         internal bool HoldRetries { get; init; }
+
+        internal bool HoldRetryCancellationUnwind { get; init; }
+
+        internal Task RetryCancellationObserved => _retryCancellationObserved.Task;
+
+        internal void ReleaseRetryCancellationUnwind() => _retryCancellationRelease.TrySetResult();
 
         /// <summary>
         /// Whether READY writes park until released. A failing Ready must be raised from INSIDE a
@@ -2641,6 +2800,7 @@ public sealed class WorkerCompletionRetransmissionTests
                 _releaseImmediately = true;
                 foreach (var source in _completeRelease.Values) source.TrySetResult();
                 foreach (var source in _readyRelease.Values) source.TrySetResult();
+                _retryCancellationRelease.TrySetResult();
             }
         }
 
@@ -2696,7 +2856,20 @@ public sealed class WorkerCompletionRetransmissionTests
             entered.TrySetResult();
 
             // The CANCELLABLE path: a cancelled in-flight write unwinds like a real gRPC writer.
-            await release.Task.WaitAsync(ct);
+            try
+            {
+                await release.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (index > 0 && HoldRetryCancellationUnwind)
+            {
+                // POSITIVE writer-boundary evidence for the run-cancellation drain vector. The
+                // stream token was genuinely observed inside the admitted retry write; hold the
+                // unwind until the test releases it so an awaited join is distinguishable from a
+                // drain that cancels and abandons the concrete retry task.
+                _retryCancellationObserved.TrySetResult();
+                await _retryCancellationRelease.Task;
+                throw;
+            }
 
             if (failure is not null)
                 throw failure;
