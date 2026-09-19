@@ -43,7 +43,8 @@ internal static class TestConnectionFactory
         string assignedId,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
         WorkerConfigProvisioner? provisioner = null,
-        bool completionReceiptAckEnabled = false)
+        bool completionReceiptAckEnabled = false,
+        bool completionReadyRequired = false)
     {
         var connection = new WorkerConnection(
             assignedId,
@@ -52,7 +53,8 @@ internal static class TestConnectionFactory
             provisioner,
             includeProductionProvisioner: false,
             provisioningEnvironment: null,
-            completionReceiptAckEnabled: completionReceiptAckEnabled);
+            completionReceiptAckEnabled: completionReceiptAckEnabled,
+            completionReadyRequired: completionReadyRequired);
 
         service.PublishConnection(connection);
         return connection;
@@ -66,7 +68,8 @@ internal static class TestConnectionFactory
     internal static WorkerConnection CreateUnpublished(
         string assignedId,
         AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage> stream,
-        bool completionReceiptAckEnabled = false) =>
+        bool completionReceiptAckEnabled = false,
+        bool completionReadyRequired = false) =>
         new(
             assignedId,
             new HiveOrchestrator.HiveOrchestratorClient(Channel),
@@ -74,7 +77,8 @@ internal static class TestConnectionFactory
             provisionerOverride: null,
             includeProductionProvisioner: false,
             provisioningEnvironment: null,
-            completionReceiptAckEnabled: completionReceiptAckEnabled);
+            completionReceiptAckEnabled: completionReceiptAckEnabled,
+            completionReadyRequired: completionReadyRequired);
 }
 
 /// <summary>

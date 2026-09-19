@@ -535,10 +535,419 @@ public sealed class WorkerConnectionLifecycleTests
     }
 
     /// <summary>
-    /// A REJECTED REGISTRATION OPENS AND PUBLISHES NOTHING even when the orchestrator's response
-    /// carries <c>completion_receipt_ack_enabled = true</c>: no stream, no connection, no captured
-    /// negotiation fact. The request still asked — the rejection is what stops everything else.
+    /// THE SECOND NEGOTIATED ANSWER — ordinary-readiness requirement — captured over the REAL
+    /// <c>RunAsync</c> for EVERY combination of <c>CompletionReadyRequired</c> x
+    /// <c>CompletionReceiptAckEnabled</c>, plus the default/omitted-field case.
+    /// <para>
+    /// WHAT IS PINNED, per combination, through the actual accepted-registration path from the fake
+    /// <see cref="RegisterResponse"/>:
+    /// <list type="bullet">
+    ///   <item>each IMMUTABLE per-connection fact is exactly its own field of the accepted answer —
+    ///   captured, never derived from the other flag, the version, the capabilities or a model;</item>
+    ///   <item>the fact was ALREADY on the published connection at the instant the initial Ready was
+    ///   written, which is the capture-before-publication ordering claim;</item>
+    ///   <item>the initial post-registration Ready is written UNCONDITIONALLY in every mode — its
+    ///   presence is the ungated assertion — and it carries the connection's own assigned ID;</item>
+    ///   <item>the outgoing request is unchanged: one explicit ACK request, no readiness-request
+    ///   field at all, so the requirement can only ever arrive as an ANSWER.</item>
+    /// </list>
+    /// No inference exists: two registrations that differ ONLY in one answer field produce
+    /// connections that differ ONLY in that fact.
+    /// </para>
     /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task RunAsync_CapturesCompletionReadyRequiredPerCombination_ReadyStaysUngated(
+        bool readyRequiredByOrchestrator, bool ackEnabledByOrchestrator)
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+            OrchestratorVersion = "test",
+            CompletionReceiptAckEnabled = ackEnabledByOrchestrator,
+            CompletionReadyRequired = readyRequiredByOrchestrator,
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+
+        // Observed INSIDE the initial Ready write: BOTH facts on the published connection AT that
+        // instant, so capture-before-publication is an ordering claim for each of them.
+        bool? readyRequiredAtFirstWrite = null;
+        bool? ackEnabledAtFirstWrite = null;
+        requests.OnWrite = message =>
+        {
+            var connection = GetPublishedConnection(service);
+            if (connection is null)
+                return;
+            readyRequiredAtFirstWrite ??= connection.CompletionReadyRequired;
+            ackEnabledAtFirstWrite ??= connection.CompletionReceiptAckEnabled;
+        };
+
+        var stream = BuildRunStream(requests, responses, () => { });
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+
+            // THE INITIAL READY IS THE UNGATED WITNESS. In every mode the very first post-
+            // registration write is the Ready: it never waits for a receipt, a completion or any
+            // negotiated answer. Its arrival is awaited on its own bound.
+            await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+            // THE OUTGOING REQUEST is unchanged by the new answer: the ACK request is explicit and
+            // there is no readiness-request field at all — the requirement can only be an ANSWER.
+            var sent = Assert.IsType<RegisterRequest>(invoker.LastRegisterRequest);
+            Assert.True(
+                sent.RequestCompletionReceiptAck,
+                "The production registration must explicitly request completion-receipt ACKs.");
+            Assert.Equal(LocalWorkerId, sent.WorkerId);
+
+            // THE TWO CAPTURED FACTS, each exactly its own field of the accepted answer.
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.Equal(
+                readyRequiredByOrchestrator, connection.CompletionReadyRequired);
+            Assert.Equal(
+                ackEnabledByOrchestrator, connection.CompletionReceiptAckEnabled);
+            Assert.Equal(AssignedWorkerId, connection.AssignedId);
+
+            // ...and BOTH were already on the connection when the initial Ready was written.
+            Assert.Equal(readyRequiredByOrchestrator, readyRequiredAtFirstWrite);
+            Assert.Equal(ackEnabledByOrchestrator, ackEnabledAtFirstWrite);
+
+            // THE UNGATED READY ITSELF: exactly one Ready, carrying the connection's identity, and
+            // written before anything else could have gated it (nothing else was ever sent).
+            var ready = Assert.Single(requests.Writes);
+            Assert.Equal(WorkerMessage.PayloadOneofCase.Ready, ready.PayloadCase);
+            Assert.Equal(AssignedWorkerId, ready.WorkerId);
+
+            responses.TryComplete();
+            var outcome = await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerRunOutcome.WorkStreamEnded, outcome);
+        }
+        finally
+        {
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// AN ABSENT READINESS-REQUIREMENT ANSWER STAYS FALSE — the omitted-field case through the REAL
+    /// registration flow. An orchestrator that never sets the field at all (an old one, parsing as
+    /// the proto default) leaves the published connection's readiness requirement FALSE even though
+    /// it answered ENABLED on the ACK field, which is the combination that proves the two facts are
+    /// captured independently and neither implies the other.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_AcceptedRegistrationWithoutReadyRequiredAnswer_LeavesRequirementDisabled()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = true,
+            AssignedWorkerId = AssignedWorkerId,
+            OrchestratorVersion = "99.99.99",
+            CompletionReceiptAckEnabled = true,
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        var stream = BuildRunStream(requests, responses, () => { });
+        service.CallInvokerFactory = () => invoker;
+        service.WorkStreamFactory = (_, _) => stream;
+
+        using var loopCts = new CancellationTokenSource();
+        Task<WorkerRunOutcome>? run = null;
+        try
+        {
+            run = service.RunAsync(loopCts.Token);
+            await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+            var connection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+            Assert.False(
+                connection.CompletionReadyRequired,
+                "An absent readiness answer must leave the requirement disabled — it is never inferred.");
+            Assert.True(
+                connection.CompletionReceiptAckEnabled,
+                "The ACK answer is its own fact and must not have been reset by the absent one.");
+
+            responses.TryComplete();
+            await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            var cancellationFailure = await CancelForTeardownAsync(loopCts);
+            responses.TryComplete();
+            await JoinAllForTeardownAsync(service, cancellationFailure, ("RunAsync", run));
+        }
+    }
+
+    /// <summary>
+    /// THE CONSTRUCTOR'S OPTIONAL READINESS-REQUIREMENT ARGUMENT defaults to false, exactly like the
+    /// ACK argument. This calls the constructor shape directly without naming the new argument, so
+    /// changing that default would fail while old callers and direct-loop fixtures remain
+    /// source-compatible.
+    /// </summary>
+    [Fact]
+    public void WorkerConnection_OmittedReadyRequiredArgument_DefaultsDisabled()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse { Accepted = true });
+        var requests = new RecordingRequestStream();
+        var responses = new ChannelResponseReader();
+        using var stream = BuildRunStream(requests, responses, () => { });
+        var connection = new WorkerConnection(
+            AssignedWorkerId,
+            new HiveOrchestrator.HiveOrchestratorClient(invoker),
+            stream,
+            provisionerOverride: null,
+            includeProductionProvisioner: false);
+
+        try
+        {
+            Assert.False(connection.CompletionReadyRequired);
+            Assert.False(connection.CompletionReceiptAckEnabled);
+        }
+        finally
+        {
+            connection.Retire();
+            responses.TryComplete();
+        }
+    }
+
+    /// <summary>
+    /// A REJECTED REGISTRATION OPENS AND PUBLISHES NOTHING even when the response carries
+    /// <c>CompletionReadyRequired = true</c>: no stream, no connection, no captured readiness fact.
+    /// The rejection is what stops everything else — the accepted-registration capture is the only
+    /// source of the fact.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_RejectedRegistrationWithReadyRequiredAnswer_PublishesNothing()
+    {
+        var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+        {
+            Accepted = false,
+            CompletionReadyRequired = true,
+            CompletionReceiptAckEnabled = true,
+            AssignedWorkerId = AssignedWorkerId,
+        });
+
+        var runner = new ProvisionerCapturingRunner();
+        var streamOpened = 0;
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        try
+        {
+            service.CallInvokerFactory = () => invoker;
+            service.WorkStreamFactory = (_, _) =>
+            {
+                Interlocked.Increment(ref streamOpened);
+                throw new InvalidOperationException("No stream may be opened for a rejected registration.");
+            };
+
+            var outcome = await service.RunAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(WorkerRunOutcome.RegistrationRejected, outcome);
+
+            Assert.Null(GetPublishedConnection(service));
+            Assert.Equal(0, streamOpened);
+            Assert.Null(runner.ConfigProvisioner);
+        }
+        finally
+        {
+            await JoinAllForTeardownAsync(service, priorFailure: null);
+        }
+    }
+
+    /// <summary>
+    /// SEQUENTIAL ISOLATION FOR THE READINESS REQUIREMENT. Run 1 is answered REQUIRE+ENABLED
+    /// (the gated combination), run 2 (same service instance) is answered NEITHER: the second run's
+    /// published connection must be a different object carrying its OWN two facts, retaining NOTHING
+    /// from the first. The first connection — retired and unpublished — keeps its own captured
+    /// facts, which proves the values are per-connection and not service-global state that merely
+    /// happened to be overwritten. The initial Ready is ungated in BOTH runs.
+    /// </summary>
+    [Fact]
+    public async Task SequentialRuns_ReadyRequiredThenNot_KeepEachConnectionOwnNegotiatedFacts()
+    {
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var firstResponses = new ChannelResponseReader();
+        var secondResponses = new ChannelResponseReader();
+        Task<WorkerRunOutcome>? firstRun = null;
+        Task<WorkerRunOutcome>? secondRun = null;
+        WorkerConnection? firstConnection = null;
+
+        try
+        {
+            // RUN 1 — answered BOTH TRUE (the gated combination).
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = true,
+                    CompletionReadyRequired = true,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, firstResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                firstRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+                firstConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.True(firstConnection.CompletionReadyRequired);
+                Assert.True(firstConnection.CompletionReceiptAckEnabled);
+
+                firstResponses.TryComplete();
+                await firstRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Null(GetPublishedConnection(service));
+            }
+
+            // RUN 2 — answered NEITHER, on the SAME service instance.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = false,
+                    CompletionReadyRequired = false,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, secondResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                secondRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+                var secondConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.NotSame(firstConnection, secondConnection);
+                Assert.False(
+                    secondConnection.CompletionReadyRequired,
+                    "A sequential run must retain NO readiness requirement from its predecessor.");
+                Assert.False(
+                    secondConnection.CompletionReceiptAckEnabled,
+                    "A sequential run must retain NO ACK answer from its predecessor.");
+
+                secondResponses.TryComplete();
+                await secondRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            // The retired predecessor keeps its OWN facts: the values are per-connection, not global.
+            Assert.True(firstConnection!.IsRetired);
+            Assert.True(firstConnection.CompletionReadyRequired);
+            Assert.True(firstConnection.CompletionReceiptAckEnabled);
+        }
+        finally
+        {
+            firstResponses.TryComplete();
+            secondResponses.TryComplete();
+            await JoinAllForTeardownAsync(
+                service, ("first RunAsync", firstRun), ("second RunAsync", secondRun));
+        }
+    }
+
+    /// <summary>
+    /// SEQUENTIAL ISOLATION, INVERSE DIRECTION: run 1 answers NEITHER, run 2 answers BOTH TRUE on
+    /// the SAME service instance. The second connection gates on nothing inherited — its two facts
+    /// arrive only from its OWN answer — yet its initial Ready is still ungated.
+    /// </summary>
+    [Fact]
+    public async Task SequentialRuns_NotReadyRequiredThenReadyRequired_CapturesOnlyOwnAnswer()
+    {
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var firstResponses = new ChannelResponseReader();
+        var secondResponses = new ChannelResponseReader();
+        Task<WorkerRunOutcome>? firstRun = null;
+        Task<WorkerRunOutcome>? secondRun = null;
+        WorkerConnection? firstConnection = null;
+
+        try
+        {
+            // RUN 1 — answered NEITHER.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, firstResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                firstRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+                firstConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.False(firstConnection.CompletionReadyRequired);
+                Assert.False(firstConnection.CompletionReceiptAckEnabled);
+
+                firstResponses.TryComplete();
+                await firstRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Null(GetPublishedConnection(service));
+            }
+
+            // RUN 2 — answered BOTH TRUE, on the SAME service instance.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = true,
+                    CompletionReadyRequired = true,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, secondResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                secondRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+                var secondConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.NotSame(firstConnection, secondConnection);
+                Assert.True(
+                    secondConnection.CompletionReadyRequired,
+                    "The requirement comes ONLY from this run's own accepted answer.");
+                Assert.True(
+                    secondConnection.CompletionReceiptAckEnabled,
+                    "The ACK answer comes ONLY from this run's own accepted answer.");
+
+                secondResponses.TryComplete();
+                await secondRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            }
+
+            Assert.True(firstConnection!.IsRetired);
+            Assert.False(firstConnection.CompletionReadyRequired);
+        }
+        finally
+        {
+            firstResponses.TryComplete();
+            secondResponses.TryComplete();
+            await JoinAllForTeardownAsync(
+                service, ("first RunAsync", firstRun), ("second RunAsync", secondRun));
+        }
+    }
     [Fact]
     public async Task RunAsync_RejectedRegistrationWithEnabledAnswer_PublishesNothing()
     {
