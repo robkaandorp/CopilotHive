@@ -90,6 +90,13 @@ internal sealed class WorkerConnection
     /// absent or <c>false</c> answer — and every existing caller that does not supply it — keeps a
     /// connection that expects no acknowledgement at all.
     /// </param>
+    /// <param name="completionReadyRequired">
+    /// THE SECOND NEGOTIATED ANSWER for THIS registration, captured from the SAME ACCEPTED
+    /// <c>RegisterResponse</c> BEFORE this connection is published. It defaults to <c>false</c>, so an
+    /// absent or <c>false</c> answer — and every existing caller that does not supply it — keeps a
+    /// connection whose ordinary readiness is unchanged. It is a REQUEST-RESPONSE fact only: this
+    /// constructor negotiates nothing.
+    /// </param>
     internal WorkerConnection(
         string assignedId,
         HiveOrchestrator.HiveOrchestratorClient client,
@@ -97,7 +104,8 @@ internal sealed class WorkerConnection
         WorkerConfigProvisioner? provisionerOverride = null,
         bool includeProductionProvisioner = true,
         WorkerProvisioningEnvironment? provisioningEnvironment = null,
-        bool completionReceiptAckEnabled = false)
+        bool completionReceiptAckEnabled = false,
+        bool completionReadyRequired = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(assignedId);
         ArgumentNullException.ThrowIfNull(client);
@@ -107,6 +115,7 @@ internal sealed class WorkerConnection
         Client = client;
         Stream = stream;
         CompletionReceiptAckEnabled = completionReceiptAckEnabled;
+        CompletionReadyRequired = completionReadyRequired;
         Provisioner = provisionerOverride
             ?? (includeProductionProvisioner
                 ? CreateProductionProvisioner(provisioningEnvironment)
@@ -145,6 +154,31 @@ internal sealed class WorkerConnection
     /// </para>
     /// </remarks>
     internal bool CompletionReceiptAckEnabled { get; }
+
+    /// <summary>
+    /// THE NEGOTIATED ORDINARY-READINESS REQUIREMENT for THIS registration — an IMMUTABLE
+    /// per-connection value captured from the SAME ACCEPTED <c>RegisterResponse</c>'s explicit answer
+    /// before publication.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It is NEVER inferred: not from the protocol/orchestrator version, not from the advertised
+    /// capabilities, and not from a task's model. An absent or <c>false</c> answer means the ordinary
+    /// readiness requirement is NOT in force, which is also the default for every connection built
+    /// without one.
+    /// </para>
+    /// <para>
+    /// It is a SEPARATE fact from <see cref="CompletionReceiptAckEnabled"/>, not a restatement of it:
+    /// each is captured from its own field of the accepted answer, and neither implies the other. The
+    /// gated ordinary-readiness behavior requires BOTH.
+    /// </para>
+    /// <para>
+    /// Because it belongs to THIS object and connections are never revived, a sequential run's new
+    /// connection carries only its OWN advertised answer: a requiring connection followed by a
+    /// non-requiring one retains nothing from its predecessor.
+    /// </para>
+    /// </remarks>
+    internal bool CompletionReadyRequired { get; }
 
     /// <summary>
     /// The provisioner associated with this connection, or <c>null</c> for a connection built
