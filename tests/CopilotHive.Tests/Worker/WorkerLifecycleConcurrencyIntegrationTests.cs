@@ -1375,6 +1375,144 @@ public sealed class WorkerServiceSendSerializationTests
         }
     }
 
+    /// <summary>
+    /// THE DRAIN BOUNDARY FOR THE RETRANSMISSION TASK. On a BOTH-FLAGS connection with a completed
+    /// but UNACKNOWLEDGED report, the assignment owns a retransmission task parked in its
+    /// five-second delay. An EOF teardown must (a) close retry admission and cancel the pending
+    /// delay BEFORE joining, (b) join the retry alongside the execution and reporting tasks, and
+    /// (c) finish the loop WITHOUT any acknowledgement and WITHOUT emitting the ordinary Ready —
+    /// an ACK is never a prerequisite for drain completion. The un-advanced manual clock is the
+    /// positive witness: the retry is provably STILL INSIDE its delay when the drain begins, so a
+    /// drain that waited for an ACK or for the next interval would leave the loop unjoinable past
+    /// the bounded join and fail by name.
+    /// <para>
+    /// REMOVAL PROOF. Removing the drain's <c>CloseAdmission</c> (or ordering it after the joins)
+    /// leaves the retry parked in a delay only the un-advanced clock could satisfy, so the bounded
+    /// loop join times out; a drain that also joined a STILL-WRITING retry before its completion
+    /// is caught by the join's own termination assertion. On a legacy connection the same teardown
+    /// has no retry at all, so its loop join must not depend on any of this.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task EofDrain_ClosesAndJoinsParkedRetransmission_WithoutAnyAck()
+    {
+        var clock = new ManualRetransmissionClock();
+        var runner = new OneShotProgressRunner();
+        var harness = new SendHarness("worker-retry-drain");
+        harness.ReplaceRunner(runner);
+
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(harness.Service, clock);
+
+        // BOTH negotiated facts: the gated shape is what makes the assignment own a retry.
+        harness.UseBothFlags();
+
+        using var loopCts = new CancellationTokenSource();
+        try
+        {
+            var loop = harness.InvokeProcessMessages(loopCts.Token);
+            try
+            {
+                harness.Responses.Push(SendHarness.Assignment("task-a", "model-a"));
+
+                // The runner's fire-and-forget progress write enters first and parks, holding
+                // the gate — the same production shape the ToolVsComplete fixture pins.
+                await harness.Requests.WaitForWriteEnteredAsync(0, TestContext.Current.CancellationToken);
+                Assert.Equal(WorkerMessage.PayloadOneofCase.ToolRequest, harness.Requests.EnteredWrites[0].PayloadCase);
+                Assert.Equal(0, harness.SendGateCurrentCount);
+
+                // Release the tool write: the body's terminal Complete is the write that enters
+                // next. It is released immediately, so the report terminates with NO ACK.
+                harness.Requests.ReleaseCurrentWrite();
+                await runner.ProgressSend.WaitAsync(TestContext.Current.CancellationToken);
+                await harness.Requests.WaitForWriteEnteredAsync(1, TestContext.Current.CancellationToken);
+                Assert.Equal(WorkerMessage.PayloadOneofCase.Complete, harness.Requests.EnteredWrites[1].PayloadCase);
+                harness.Requests.ReleaseCurrentWrite();
+
+                // THE GATED SHAPE: with NO ACK the ordinary Ready is WITHHELD — the write after
+                // the Complete is never a Ready, so no third write enters. Positive non-completion
+                // with a bounded wait keeps this from being an end-state guess.
+                var prematureReady = await Record.ExceptionAsync(() =>
+                    harness.Requests.WaitForWriteEnteredAsync(2, TestContext.Current.CancellationToken)
+                        .WaitAsync(TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken));
+                Assert.IsType<TimeoutException>(prematureReady);
+                Assert.Equal(2, harness.Requests.EnteredWriteCount);
+                await runner.WaitForTurnCompletedAsync(TestContext.Current.CancellationToken);
+
+                // THE RETRY'S OWN DELAY — the first (and, because the test never advances the
+                // clock, the only) timer created through the production TimeProvider seam. Its
+                // presence is positive evidence the retransmitter exists and is PARKED.
+                await clock.WaitForRetryParkedInDelayAsync(1, TestContext.Current.CancellationToken);
+                Assert.Equal(1, clock.TimerCount);
+                Assert.Equal(2, harness.Requests.CompletedWriteCount); // tool write + Complete. No retransmission.
+
+                // THE CONCRETE RETRY TASK, captured BEFORE the EOF can clear the ownership slot.
+                // A post-drain lookup would read null — which is exactly what an implementation
+                // that cancelled the delay and then ABANDONED the unwind also produces — so the
+                // termination assertion below is taken on this retained task alone.
+                var retry = harness.ActiveRetryTask
+                    ?? throw new Xunit.Sdk.XunitException(
+                        "The gated assignment must own a retransmission task.");
+                Assert.False(retry.IsCompleted, "the retry must still be parked in its delay.");
+
+                // ADMIT AND HOLD one retransmission write: advancing the clock releases the retry
+                // from its delay and it parks inside the overlap-detecting writer. This is what
+                // makes the drain's JOIN observable — a drain that only cancelled admission could
+                // not finish a task that is inside a transport write.
+                clock.Advance(TimeSpan.FromSeconds(5));
+                await harness.Requests.WaitForWriteEnteredAsync(2, TestContext.Current.CancellationToken);
+                Assert.Equal(
+                    WorkerMessage.PayloadOneofCase.Complete,
+                    harness.Requests.EnteredWrites[2].PayloadCase);
+                Assert.Equal(3, harness.Requests.EnteredWriteCount);
+                Assert.Equal(2, harness.Requests.CompletedWriteCount); // the retry write is PARKED.
+                Assert.False(retry.IsCompleted);
+
+                // THE DRAIN: EOF with the receipt permanently unconfirmed and the retry inside its
+                // admitted write. The loop must NOT finish until that write terminates.
+                harness.Responses.Push(null);
+                var prematureLoop = await Record.ExceptionAsync(() =>
+                    loop.WaitAsync(TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken));
+                Assert.IsType<TimeoutException>(prematureLoop);
+                Assert.False(retry.IsCompleted, "the drain must be joining the admitted retry write.");
+
+                // RELEASE the admitted write: the drain joins it and the loop then completes.
+                harness.Requests.ReleaseCurrentWrite();
+                await loop.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // THE EXACT retained retry task TERMINATED. The claim is taken SYNCHRONOUSLY at
+                // the instant the loop returned — awaiting first would let a drain that merely
+                // cancelled and ABANDONED the unwind pass.
+                Assert.True(
+                    retry.IsCompleted,
+                    "the EOF drain must JOIN the retained retry task BEFORE the loop returns.");
+                await retry.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // The teardown joined everything: the gate is back to one permit, and NO ordinary
+                // Ready was emitted by the drain (the gate held — the receipt was never confirmed).
+                // Exactly THREE writes ever entered — the tool request, the original Complete and
+                // the ONE admitted retransmission — so the drain neither added a Ready nor let a
+                // further retry through.
+                Assert.Equal(1, harness.SendGateCurrentCount);
+                Assert.Equal(3, harness.Requests.EnteredWriteCount);
+                Assert.Equal(
+                    WorkerMessage.PayloadOneofCase.Complete,
+                    harness.Requests.EnteredWrites[2].PayloadCase);
+            }
+            finally
+            {
+                loopCts.Cancel();
+                runner.CompleteProgressSendIfNotStarted();
+                await DrainProducersAsync(harness.Requests, loop, runner.ProgressSend);
+            }
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
     private static bool TokenMatches(IReadOnlyList<string> tokens, params string[] prefix)
     {
         if (tokens.Count < prefix.Length)
@@ -1430,6 +1568,16 @@ public sealed class WorkerServiceSendSerializationTests
         internal void UseProvisioner(WorkerConfigProvisioner? provisioner) =>
             Connection = TestConnectionFactory.Attach(Service, _workerId, CreateDuplex(), provisioner);
 
+        /// <summary>
+        /// Re-publishes this harness's connection carrying BOTH negotiated facts, so the assignment
+        /// handler builds the GATED shape (an OrdinaryReadySlot with the receipt and a
+        /// retransmitter). Needed by the retransmission drain test; everything else stays default.
+        /// </summary>
+        internal void UseBothFlags() =>
+            Connection = TestConnectionFactory.Attach(
+                Service, _workerId, CreateDuplex(), Service.TestProvisioner,
+                completionReceiptAckEnabled: true, completionReadyRequired: true);
+
         /// <summary>The production send gate instance (never mutated — read for observation only).</summary>
         private SemaphoreSlim SendGate =>
             (SemaphoreSlim)typeof(WorkerService)
@@ -1438,6 +1586,29 @@ public sealed class WorkerServiceSendSerializationTests
 
         /// <summary>Current count of the production send gate: 1 free, 0 while a write is gated.</summary>
         internal int SendGateCurrentCount => SendGate.CurrentCount;
+
+        /// <summary>
+        /// The retained assignment's CONCRETE retransmission task, or <c>null</c> when nothing is
+        /// retained or the assignment owns no retry (a non-gated connection).
+        /// </summary>
+        /// <remarks>
+        /// A drain vector MUST capture this BEFORE triggering the teardown: once ownership is
+        /// cleared this reads <c>null</c>, which is also the state an implementation that cancelled
+        /// the retry and then ABANDONED its unwind would produce, so a post-drain lookup could
+        /// never discriminate the two.
+        /// </remarks>
+        internal Task? ActiveRetryTask
+        {
+            get
+            {
+                var owner = typeof(WorkerService)
+                    .GetField("_activeAssignment", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .GetValue(Service);
+                return owner is null
+                    ? null
+                    : (Task?)owner.GetType().GetProperty("Retry")!.GetValue(owner);
+            }
+        }
 
         /// <summary>Senders currently PARKED at the send boundary awaiting a permit.</summary>
         internal int SendGateWaiterCount => SendGateObserver.CountWaiters(SendGate);
