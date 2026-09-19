@@ -15,9 +15,14 @@ else
         <div class="card">
             <div class="label">Status</div>
             <div class="value">
-                <span class="badge @(_worker.IsBusy ? "badge-yellow" : "badge-green")">
-                    @(_worker.IsBusy ? "Busy" : "Idle")
-                </span>
+                @*
+                    The status is decided by the shared presentation helper on WorkerInfo — the same
+                    one the Workers list renders — so Busy / Awaiting Ready / Available / Unavailable
+                    stay distinguishable and a non-busy worker is never shown as green available
+                    capacity unless it really was available. The policy itself lives on the model,
+                    not here.
+                *@
+                <span class="badge @_worker.StatusCssClass">@_worker.StatusLabel</span>
             </div>
         </div>
         <div class="card">

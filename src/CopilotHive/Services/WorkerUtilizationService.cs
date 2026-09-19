@@ -3,8 +3,14 @@ using CopilotHive.Models;
 namespace CopilotHive.Services;
 
 /// <summary>
-/// Computes worker utilization metrics from the current state of the <see cref="WorkerPool"/>.
+/// Computes worker utilization metrics from ONE detached capture of the <see cref="WorkerPool"/>.
 /// </summary>
+/// <remarks>
+/// <see cref="WorkerPool.CaptureWorkerStatus"/> is called exactly once per result, so the overall
+/// counts, every per-role fraction and the bottleneck list all describe the SAME captured instant
+/// instead of mixing facts read at different times. The capture is a DETACHED copy of pool-owned
+/// values, and all grouping and arithmetic happens after it, outside any pool lock.
+/// </remarks>
 public sealed class WorkerUtilizationService
 {
     private readonly WorkerPool _workerPool;
@@ -19,7 +25,8 @@ public sealed class WorkerUtilizationService
     }
 
     /// <summary>
-    /// Returns a <see cref="WorkerUtilizationMetrics"/> snapshot computed from the current worker pool state.
+    /// Returns a <see cref="WorkerUtilizationMetrics"/> snapshot computed from ONE capture of the
+    /// worker pool state.
     /// </summary>
     /// <returns>
     /// A <see cref="WorkerUtilizationMetrics"/> instance containing overall utilization,
@@ -27,13 +34,16 @@ public sealed class WorkerUtilizationService
     /// </returns>
     public WorkerUtilizationMetrics GetUtilization()
     {
-        var workers = _workerPool.GetAllWorkers();
-        var totalWorkers = workers.Count;
-        var busyWorkers = workers.Count(w => w.IsBusy);
+        // THE ONE CAPTURE: every value below is derived from this single detached local — no second
+        // pool read, so no two figures of one result can describe different instants.
+        var captured = _workerPool.CaptureWorkerStatus();
+
+        var totalWorkers = captured.Count;
+        var busyWorkers = captured.Count(w => w.IsBusy);
 
         var overallUtilization = totalWorkers == 0 ? 0.0 : (double)busyWorkers / totalWorkers;
 
-        var roleGroups = workers.GroupBy(w => w.Role.ToString());
+        var roleGroups = captured.GroupBy(w => w.Role.ToString());
         var roleBreakdown = new Dictionary<string, double>();
         var bottleneckRoles = new List<string>();
 
