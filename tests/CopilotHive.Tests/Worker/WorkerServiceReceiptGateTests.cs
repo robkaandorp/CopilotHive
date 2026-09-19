@@ -1438,17 +1438,159 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
-    /// THE AUTHORIZATION-BOUNDARY KILLER VECTORS. Eligibility alone is NOT authorization: with
-    /// eligibility published, the Complete write terminated and the receipt confirmed — every
-    /// predicate fact present — but the write never STARTED (no ACK-wake has run, the loop was
-    /// parked in a cancel-handler drain so no settlement could race), a successor is STILL refused.
-    /// The refusal is therefore bound to the started-and-retained write and to nothing else.
+    /// THE READER-FIRST AUTHORIZATION KILLER. The production reader is arranged so TaskB and the
+    /// fully satisfied readiness observation are BOTH complete before <c>Task.WhenAny</c>: because
+    /// the read is checked first, TaskB reaches the Assignment handler while every predicate fact
+    /// is present but <c>OrdinaryReadySlot.Write</c> is still null. The literal protocol refusal is
+    /// required, and teardown is held inside the predecessor CTS callback so the retained owner can
+    /// be inspected BEFORE cleanup clears it.
+    /// <para>
+    /// MUTATION PROOF. A boundary keyed on eligibility / full predicate facts instead of the
+    /// started-and-retained write accepts TaskB and increments the reset count, failing the literal
+    /// exception, owner-identity and reset-delta assertions. Removing the boundary likewise starts
+    /// TaskB. Reader-first ordering is real: the one-shot BeforeNextRead hook synchronously publishes
+    /// eligibility and enqueues B before MoveNext returns, so pendingRead and readinessWait are both
+    /// complete and production's read-first tie rule selects B without first settling Ready.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task AllPredicateFactsButNoStartedWrite_SuccessorStillRefused()
     {
         var runner = new GatedRunner();
-        var writer = new GatedWriter();
+        var writer = new GatedWriter { HoldCompletes = true };
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        var output = new StringWriter();
+        var successThrower = new MarkerThrowingWriter(
+            "Task task-A completed", output, new EligibilityDiagnosticException());
+        var reportingDiagnostic = new MarkerBlockingWriter("Task execution failed", output);
+        var teardownEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTeardown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tiePrepared = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var teardownRegistration = default(CancellationTokenRegistration);
+
+        Task? execution = null;
+        Task? reporting = null;
+        object? owner = null;
+        try
+        {
+            Console.SetOut(successThrower);
+            Console.SetError(reportingDiagnostic);
+
+            reader.Push(ResultAssignment(TaskA)); // message 1
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            owner = GetActiveAssignment(service);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            var slot = GetOwnerOrdinaryReady(service);
+            var receipt = GetOwnerReceipt(service);
+            var claim = GetOwnerReadyClaim(service);
+            var resetBaseline = runner.ResetCount;
+            Assert.Equal(1, resetBaseline);
+            Assert.True(GetReceiptArmed(receipt));
+            Assert.False(GetReceiptConfirmed(receipt));
+            Assert.False(IsCompleteWriteTerminated(slot));
+            Assert.False(IsOrdinaryReadyEligible(slot));
+            Assert.Null(GetRetainedReadinessWrite(service));
+
+            // Hold the loop's teardown at its FIRST cancellation boundary. Once this callback fires,
+            // the refusal was thrown and the finally entered, but the captured predecessor is still
+            // directly retained — cleanup cannot join, clear or replace it until releaseTeardown.
+            teardownRegistration = GetOwnerCts(service).Token.Register(() =>
+            {
+                teardownEntered.TrySetResult();
+                releaseTeardown.Task.GetAwaiter().GetResult();
+            });
+
+            // Install the one-shot hook BEFORE pushing the ACK into the already-pending read #2.
+            // The hook runs synchronously inside read #3, before the loop can arm readiness:
+            //  1) release Complete; the success diagnostic throws, inner finally publishes
+            //     termination, and outer error diagnostic blocks before eligibility;
+            //  2) publish eligibility via the exact production slot method;
+            //  3) enqueue TaskB and return. Thus pendingRead(B) and readiness are BOTH complete.
+            reader.BeforeNextRead = () =>
+            {
+                writer.ReleaseComplete(0);
+                reportingDiagnostic.Entered.Task.GetAwaiter().GetResult();
+                PublishOrdinaryReadyEligibility(slot);
+                reader.Push(ResultAssignment(TaskB)); // message 3
+                tiePrepared.TrySetResult();
+                return Task.CompletedTask;
+            };
+
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            await tiePrepared.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await teardownEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE EXACT PRE-BOUNDARY STATE, inspected while teardown is deterministically held.
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.True(IsCompleteWriteTerminated(slot));
+            Assert.True(IsOrdinaryReadyEligible(slot));
+            Assert.False(IsOrdinaryReadySettled(slot));
+            Assert.Null(GetRetainedReadinessWrite(service));
+            Assert.Equal(0, GetReadyClaimState(claim));
+            Assert.Equal(0, writer.ReadyCount);
+            Assert.Same(owner, GetActiveAssignment(service));
+            Assert.Equal(TaskA, TaskIdOf(owner!));
+
+            // NO SUCCESSOR SIDE EFFECTS. Reset count is the load-bearing witness (not the task-keyed
+            // set): a mutation that drains/resets before throwing increments it. Prompt absence is
+            // retained as a second, non-load-bearing witness.
+            Assert.Equal(resetBaseline, runner.ResetCount);
+            Assert.False(runner.HasPromptStarted(TaskB));
+            Assert.True(reader.Consumed(3).IsCompleted, "TaskB must have been consumed in the tie.");
+
+            // Release both held cleanup boundaries. Teardown is allowed to settle/join the now-full
+            // predecessor predicate, but the PRIMARY refusal must surface unchanged afterwards.
+            reportingDiagnostic.Release();
+            releaseTeardown.TrySetResult();
+            writer.ReleaseAll();
+
+            var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal("Assignment received before authorized Ready.", refusal.Message);
+            Assert.Equal(resetBaseline, runner.ResetCount);
+            Assert.False(runner.HasPromptStarted(TaskB));
+        }
+        finally
+        {
+            reportingDiagnostic.Release();
+            releaseTeardown.TrySetResult();
+            teardownRegistration.Dispose();
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// THE DRAIN IS AN INDEPENDENT LEGITIMATE SETTLER. With every predicate fact present while the
+    /// loop is already inside a matching-cancel drain, the drain starts and retains the one
+    /// authorized Ready, JOINS it before clearing, and suppresses the cancel fallback because the
+    /// shared claim was consumed. This is intentionally separate from the reader-first refusal.
+    /// </summary>
+    [Fact]
+    public async Task MatchingCancelDrain_FullPredicate_StartsAndJoinsOneAuthorizedReady()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter { HoldCompletes = true };
         var reader = new ChannelResponseReader();
         var service = BuildService(runner);
 
@@ -1459,6 +1601,7 @@ public sealed class WorkerServiceReceiptGateTests
 
         Task? execution = null;
         Task? reporting = null;
+        Task? readinessWrite = null;
         var drainEnteredRegistration = default(CancellationTokenRegistration);
         try
         {
@@ -1469,62 +1612,44 @@ public sealed class WorkerServiceReceiptGateTests
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
 
-            // CONFIRM the receipt FIRST (with a trailing probe as the handler-return barrier), so
-            // by the time A's report terminates, EVERY predicate fact is present: eligibility will
-            // publish, the Complete write has terminated, the receipt is confirmed.
-            reader.Push(ReceiptAck(TaskA, connection.AssignedId));
-            reader.Push(Probe("ack-handler-returned"));
-            reader.Push(Probe("ack-barrier-follows"));
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            reader.Push(Probe("drain-ack-returned")); // message 3
             await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(GetReceiptConfirmed(GetOwnerReceipt(service)));
 
-            // PARK THE LOOP INSIDE THE MATCHING-CANCEL HANDLER'S DRAIN. The drain's first step
-            // requests cancellation, so this benign callback fires from inside the handler; with
-            // the Complete write's successor messages NOT yet delivered the drain parks on its
-            // reporting join — the loop cannot be at its readiness observation, so NO settlement
-            // can start the write while the assertions below run.
             var drainEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             drainEnteredRegistration = GetOwnerCts(service).Token.Register(
                 () => drainEntered.TrySetResult());
-
             var readsBeforeCancel = reader.ReadsStarted;
-            reader.Push(MatchingCancel(TaskA));
+            reader.Push(MatchingCancel(TaskA)); // message 4
             await drainEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            // POSITIVE IN-HANDLER EVIDENCE: the loop has not re-armed its pending read, so it is
-            // inside the handler and cannot have settled the slot.
             Assert.Equal(readsBeforeCancel, reader.ReadsStarted);
 
-            // Release the Complete write so the report terminates and publishes eligibility while
-            // the loop is provably parked inside the drain.
+            // Complete terminates and reporting publishes eligibility while the loop is inside the
+            // drain. The drain itself is the only participant that can settle the full predicate.
             writer.ReleaseComplete(0);
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            var slot = GetOwnerOrdinaryReady(service);
-
-            // The predicate is complete, so the DRAIN ITSELF (the first settler) starts the ONE
-            // authorized write — the readiness is never lost, whichever participant settles it.
-            // The drain then JOINS that write before clearing; the cancel fallback is suppressed
-            // because the claim was consumed by this settlement (not by the fallback).
             await AwaitRendezvousAsync(
                 writer.ReadyEntered(0),
-                "The drain must settle and start the ONE authorized write once the predicate holds.");
-            var drainWrite = CaptureReadinessWrite(
-                service, "The drain must retain the write it started.");
+                "The matching-cancel drain must start the one authorized Ready.");
+            readinessWrite = CaptureReadinessWrite(service, "The drain must retain the write it starts.");
+
             Assert.Equal(1, GetReadyClaimState(GetOwnerReadyClaim(service)));
+            Assert.False(readinessWrite.IsCompleted);
+            Assert.NotNull(GetActiveAssignment(service));
 
-            // The write's outcome is observed, not abandoned.
             writer.ReleaseReady(0);
-            await drainWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            await writer.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
-            Assert.Equal(1, writer.ReadyCount);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // The cancel fallback could not have duplicated it (claim already consumed), and the
-            // ownership is cleared after the join.
-            reader.Push(Probe("after-cancel"));
-            await reader.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // The next read starts only after the drain joined the write and cleared ownership.
+            await reader.ReadStarted(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Null(GetActiveAssignment(service));
+            Assert.Equal(1, writer.ReadyCount); // no cancel fallback duplicate.
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -1535,6 +1660,7 @@ public sealed class WorkerServiceReceiptGateTests
             await JoinAllForTeardownAsync(service,
                 ("assignment execution", execution),
                 ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
                 ("loop", loop));
         }
     }
@@ -1595,15 +1721,28 @@ public sealed class WorkerServiceReceiptGateTests
             var writesAtDelivery = writer.ReadyCount;
 
             // THE SUCCESSOR arrives while A's authorized write is STARTED but STILL PENDING.
-            reader.Push(ResultAssignment(TaskB));
-            await reader.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            await reader.ReadStarted(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // These are B-specific milestones: A+ACK already account for messages 1 and 2 / reads
+            // 1..3, so neither B-consumed(3) nor next-read(4) can be satisfied before B is pushed.
+            var bConsumed = reader.Consumed(3);
+            var nextReadAfterB = reader.ReadStarted(4);
+            Assert.False(bConsumed.IsCompleted);
+            Assert.False(nextReadAfterB.IsCompleted);
+            var resetBaseline = runner.ResetCount;
+            Assert.Equal(1, resetBaseline);
 
-            // IN-WINDOW JOIN PROOF, with A's write still HELD: B was consumed, but correct code
-            // cannot possibly have reached the reset (the drain parks on the write join), so B
-            // must never have started a prompt, A must still be the retained owner, and the loop
-            // must still be alive — all bounded by the fact that the write's TCS has not fired
-            // (not by any timeout).
+            reader.Push(ResultAssignment(TaskB)); // message 3
+            await bConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // IN-WINDOW JOIN PROOF, with A's write still HELD: B has now been consumed, but the
+            // handler cannot return/re-arm read 4 or reset/start B because its replacement drain is
+            // parked on A's write join. Every assertion is taken before the write is released.
+            Assert.False(
+                nextReadAfterB.IsCompleted,
+                "The loop must not re-arm after B while A's write remains unreleased.");
+            var prematureNextRead = await Record.ExceptionAsync(() =>
+                nextReadAfterB.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(prematureNextRead);
+            Assert.Equal(resetBaseline, runner.ResetCount);
             Assert.False(
                 readinessWriteA.IsCompleted,
                 "A's authorized write must still be held inside its gated writer.");
@@ -1624,8 +1763,9 @@ public sealed class WorkerServiceReceiptGateTests
                 "The write's outcome is OBSERVED by the join, never abandoned.");
 
             await AwaitResetCountAsync(runner, 2, loop,
-                "B's handler must be reached once A's write is released (the boundary accepted it).");
+                "B's reset must follow release and the completed write join.");
             await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await nextReadAfterB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.NotSame(ownerA, GetActiveAssignment(service));
             Assert.Equal(TaskB, TaskIdOf(GetActiveAssignment(service)!));
 
@@ -1656,6 +1796,128 @@ public sealed class WorkerServiceReceiptGateTests
                 ("assignment execution A", executionA),
                 ("assignment reporting A", reportingA),
                 ("readiness write A", readinessWriteA),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// STARTED-THEN-FAILED AUTHORIZATION IS MONOTONIC. On a both-flags connection A's exact ACK
+    /// starts and retains its authorized Ready task; that exact task then FAULTS. TaskB must still
+    /// be accepted because authorization is the fact that the write was started/retained — never
+    /// its later outcome. The replacement drain observes the original failure through the existing
+    /// sanitized diagnostic, does not retry A's Ready, then resets/starts B normally.
+    /// <para>
+    /// MUTATION PROOF. Withdrawing authorization when <c>Write.IsFaulted</c>, clearing Write after
+    /// failure, or refusing a successor based on successful completion faults the loop with the
+    /// protocol error and prevents reset/prompt B. Retrying A's failed Ready changes the pre-B
+    /// Ready count from exactly one and fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SuccessorAfterAuthorizedReadyWriteFaulted_IsAccepted_DrainObservesFailureWithoutRetry()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var readyFailure = new AuthorizedReadyFailureException("raw ready failure must stay sanitized");
+        writer.FailNextReadyWrite = readyFailure;
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? executionA = null;
+        Task? reportingA = null;
+        Task? readinessA = null;
+        Task? executionB = null;
+        Task? reportingB = null;
+        Task? readinessB = null;
+        try
+        {
+            Console.SetError(stdErr);
+
+            reader.Push(ResultAssignment(TaskA)); // message 1
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            executionA = GetActiveExecution(service);
+            reportingA = GetActiveReporting(service);
+            await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(0), "A's exact ACK must start the authorized Ready.");
+            readinessA = CaptureReadinessWrite(service, "A's authorized Ready must be retained.");
+            Assert.False(readinessA.IsCompleted);
+
+            // The ORIGINAL retained task faults; its exact exception identity is preserved. The
+            // write remains retained and authorization cannot be withdrawn. Exactly one attempt.
+            writer.ReleaseReady(0);
+            var observed = await Assert.ThrowsAsync<AuthorizedReadyFailureException>(
+                () => readinessA.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Same(readyFailure, observed);
+            Assert.True(readinessA.IsFaulted);
+            Assert.Same(readinessA, GetRetainedReadinessWrite(service));
+            Assert.Equal(1, writer.ReadyCount);
+
+            var resetBaseline = runner.ResetCount;
+            Assert.Equal(1, resetBaseline);
+            var bConsumed = reader.Consumed(3);
+            var nextReadAfterB = reader.ReadStarted(4);
+            Assert.False(bConsumed.IsCompleted);
+            Assert.False(nextReadAfterB.IsCompleted);
+
+            // TaskB AFTER the fault must be accepted. Its replacement drain observes A's already-
+            // faulted write (no blocking, no retry), reports the failure in sanitized form, then
+            // reaches reset/prompt B and re-arms the next read.
+            reader.Push(ResultAssignment(TaskB)); // message 3
+            await bConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await AwaitResetCountAsync(runner, 2, loop,
+                "A faulted-but-started Ready must still authorize successor B.");
+            await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await nextReadAfterB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, writer.ReadyCount); // A was NOT retried.
+            Assert.Equal(2, runner.ResetCount);
+            Assert.False(loop.IsCompleted);
+            var diagnostics = stdErr.ToString();
+            Assert.Contains("Task drain observed a fault", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(nameof(AuthorizedReadyFailureException), diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(readyFailure.Message, diagnostics, StringComparison.Ordinal);
+
+            // Complete B and prove the stream remains usable after observing A's failure.
+            executionB = GetActiveExecution(service);
+            reportingB = GetActiveReporting(service);
+            runner.Release(TaskB);
+            await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            reader.Push(ReceiptAck(TaskB, connection.AssignedId)); // message 4
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(1), "B must reach its own authorized Ready after A's fault.");
+            readinessB = CaptureReadinessWrite(service, "B's authorized Ready must be retained.");
+            writer.ReleaseReady(1);
+            await readinessB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(2, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution A", executionA),
+                ("assignment reporting A", reportingA),
+                ("readiness write A", readinessA),
+                ("assignment execution B", executionB),
+                ("assignment reporting B", reportingB),
+                ("readiness write B", readinessB),
                 ("loop", loop));
         }
     }
@@ -1746,15 +2008,16 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
-    /// CELL 5(d): the refusal MUST NOT fire on legacy and ACK-ONLY connections. A predecessor is
-    /// retained with NO started Ready write — the exact state that is refused on a both-flags
-    /// connection — and the successor is accepted and runs to its own single Ready on an ACK-only
-    /// connection (and on a fully legacy one). REMOVAL PROOF for the mode check: a boundary that
-    /// ignored the negotiated shape would refuse here and fail the acceptance rendezvous.
+    /// CELL 5(d): the refusal MUST NOT fire on legacy, ACK-ONLY or readiness-ONLY connections. A
+    /// predecessor is retained with NO started Ready write — the exact state that is refused on a
+    /// both-flags connection — and the successor is accepted and runs to its own single Ready in
+    /// every non-gated mode. MUTATION PROOF for the mode check: removing that check while retaining
+    /// <c>!HasStartedWrite</c> refuses all three rows and fails their reset/prompt rendezvous.
     /// </summary>
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]
+    [InlineData(true, false)]
     public async Task LegacyAndAckOnlyConnections_NeverRefuseAPreReadySuccessor(
         bool readyRequired, bool ackEnabled)
     {
@@ -1776,55 +2039,76 @@ public sealed class WorkerServiceReceiptGateTests
         Task? readinessB = null;
         try
         {
-            // Predecessor A retained with NO started Ready write. In these modes the ordinary
-            // Ready is ungated, so it starts at eligibility — HOLD it via the gated writer and do
-            // NOT release it: the write is started (pending) but A is still retained, which is
-            // precisely the shape the both-flags boundary ACCEPTS; to make the control stronger,
-            // the successor is delivered while A's write is held and B must still proceed.
-            reader.Push(ResultAssignment(TaskA));
+            // PREDECESSOR A is retained BEFORE any Ready task starts: its prompt is still held, so
+            // execution/reporting are live and OrdinaryReadySlot.Write is null. This is the exact
+            // pre-Ready state that a guard with the MODE CHECK REMOVED would wrongly refuse.
+            reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            runner.Release(TaskA);
-            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            readinessA = CaptureReadinessWrite(
-                service, "The ungated shape must have started A's readiness write.");
             executionA = GetActiveExecution(service);
             reportingA = GetActiveReporting(service);
+            var ownerA = GetActiveAssignment(service);
+            Assert.Null(GetRetainedReadinessWrite(service));
+            Assert.Equal(0, writer.ReadyCount);
+
+            // B-specific barriers: neither can be satisfied by A. Assert that BEFORE pushing B.
+            var bConsumed = reader.Consumed(2);
+            var nextReadAfterB = reader.ReadStarted(3);
+            Assert.False(bConsumed.IsCompleted);
+            Assert.False(nextReadAfterB.IsCompleted);
+            var resetBaseline = runner.ResetCount;
+            Assert.Equal(1, resetBaseline);
+
+            reader.Push(ResultAssignment(TaskB)); // message 2
+            await bConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // The non-gated mode check admitted B into the unchanged replacement drain. With A's
+            // execution still held, the handler cannot reset/start B or re-arm read 3 yet.
+            Assert.False(nextReadAfterB.IsCompleted);
+            Assert.Equal(resetBaseline, runner.ResetCount);
+            Assert.False(runner.HasPromptStarted(TaskB));
+            Assert.Same(ownerA, GetActiveAssignment(service));
+            Assert.Null(GetRetainedReadinessWrite(service));
+            Assert.False(loop.IsCompleted, "A mode-guard removal would fault the loop here.");
+
+            // Release A. Its report writes Complete, then its ungated ordinary Ready starts. The
+            // replacement drain must join that HELD write before reset/prompt B.
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            readinessA = CaptureReadinessWrite(
+                service, "The ungated replacement drain must start and retain A's Ready.");
             await reportingA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await executionA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // The successor arrives while A's write is STILL HELD. In these modes there is no
-            // boundary: the replacement drain joins A's held write (proven by B not starting until
-            // the release), then B runs.
-            reader.Push(ResultAssignment(TaskB));
-            await reader.Consumed(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            await reader.ReadStarted(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
-            // IN-WINDOW, with the write still held: B was consumed, but correct code cannot
-            // possibly have reached the reset (the drain parks on the write join), so B must never
-            // have started a prompt.
             Assert.False(readinessA.IsCompleted);
-            Assert.False(
-                runner.HasPromptStarted(TaskB),
-                "The replacement drain must join A's held write before B starts (unchanged behavior).");
+            Assert.False(nextReadAfterB.IsCompleted);
+            var prematureNextRead = await Record.ExceptionAsync(() =>
+                nextReadAfterB.WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(prematureNextRead);
+            Assert.Equal(resetBaseline, runner.ResetCount);
+            Assert.False(runner.HasPromptStarted(TaskB));
+            Assert.Same(ownerA, GetActiveAssignment(service));
 
+            // Release → write joins → reset → prompt → next read. Each later milestone was proved
+            // absent before release, so this sequence cannot pass vacuously.
             writer.ReleaseReady(0);
             await readinessA.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-
             await AwaitResetCountAsync(runner, 2, loop,
-                "The successor must be accepted on a legacy/ACK-only connection (no refusal).");
+                "The successor must be accepted on 00/01/10 connections before any Ready started.");
             await runner.PromptStarted(TaskB).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            runner.Release(TaskB);
-            await writer.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
-            readinessB = CaptureReadinessWrite(service, "B's own readiness write must start.");
+            await nextReadAfterB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
             executionB = GetActiveExecution(service);
             reportingB = GetActiveReporting(service);
+            runner.Release(TaskB);
+            await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await writer.ReadyEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            readinessB = CaptureReadinessWrite(service, "B's own ungated Ready must start.");
             writer.ReleaseReady(1);
             await readinessB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await reportingB.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.Equal(2, writer.ReadyCount);
-            // A's own result-mapping Complete writes exist in the ungated modes (one per completed
-            // task); the important fact is exactly one per assignment and no refusal artifacts.
             Assert.Equal(2, writer.Completes.Count);
 
             reader.TryComplete();
@@ -2430,6 +2714,14 @@ public sealed class WorkerServiceReceiptGateTests
             .GetField("_eligible", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(slot)!;
 
+    private static bool IsCompleteWriteTerminated(object slot) =>
+        (bool)slot.GetType()
+            .GetField("_completeWriteTerminated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(slot)!;
+
+    private static void PublishOrdinaryReadyEligibility(object slot) =>
+        slot.GetType().GetMethod("PublishEligibility")!.Invoke(slot, null);
+
     private static Task ArmOrdinaryReady(object slot) =>
         (Task)slot.GetType().GetMethod("Arm")!.Invoke(slot, null)!;
 
@@ -2623,8 +2915,20 @@ public sealed class WorkerServiceReceiptGateTests
         private readonly Dictionary<int, TaskCompletionSource> _readyCountWaiters = [];
         private bool _releaseImmediately;
         private Exception? _failCompleteAtIndexZero;
+        private Exception? _failNextReadyWrite;
 
         internal bool HoldCompletes { get; init; }
+
+        /// <summary>
+        /// ONE-SHOT failure for the next Ready write, applied after its explicit release. The
+        /// attempted message remains recorded, so no-retry and monotonic-authorization assertions
+        /// can distinguish a faulted original task from no write at all.
+        /// </summary>
+        internal Exception? FailNextReadyWrite
+        {
+            get { lock (_gate) return _failNextReadyWrite; }
+            set { lock (_gate) _failNextReadyWrite = value; }
+        }
 
         internal Exception? FailCompleteAtIndexZero
         {
@@ -2701,12 +3005,15 @@ public sealed class WorkerServiceReceiptGateTests
             int readyIndex;
             TaskCompletionSource readyEntered;
             TaskCompletionSource readyRelease;
+            Exception? readyFailure;
             lock (_gate)
             {
                 readyIndex = _readies.Count;
                 _readies.Add(message.Clone());
                 readyEntered = Slot(_readyEntered, readyIndex);
                 readyRelease = Slot(_readyRelease, readyIndex);
+                readyFailure = _failNextReadyWrite;
+                _failNextReadyWrite = null;
                 if (_releaseImmediately)
                     readyRelease.TrySetResult();
 
@@ -2726,6 +3033,9 @@ public sealed class WorkerServiceReceiptGateTests
 
             readyEntered.TrySetResult();
             await readyRelease.Task.WaitAsync(ct);
+
+            if (readyFailure is not null)
+                throw readyFailure;
         }
 
         private static TaskCompletionSource PreCompleted()
@@ -3020,6 +3330,8 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     private sealed class GatedWritePrimaryException(string message) : Exception(message);
+
+    private sealed class AuthorizedReadyFailureException(string message) : Exception(message);
 
     /// <summary>Sentinel thrown by the success diagnostic to reach the outer reporting catch.</summary>
     private sealed class EligibilityDiagnosticException : Exception;

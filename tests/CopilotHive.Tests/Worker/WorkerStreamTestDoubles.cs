@@ -491,6 +491,14 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
     /// </summary>
     internal int ReadsStarted { get { lock (_gate) return _readsStarted; } }
 
+    /// <summary>
+    /// Optional ONE-SHOT hook awaited at the start of the NEXT <see cref="MoveNext"/>, after the
+    /// read-start counter advances but before the channel is consulted. It lets a fixture construct
+    /// a genuine reader-first tie from inside the production read call; null keeps existing users'
+    /// behavior byte-for-byte unchanged.
+    /// </summary>
+    internal Func<Task>? BeforeNextRead { get; set; }
+
     /// <summary>Pushes one message; <c>null</c> completes the stream.</summary>
     internal void Push(OrchestratorMessage? message)
     {
@@ -537,9 +545,12 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
     public async Task<bool> MoveNext(CancellationToken cancellationToken)
     {
         List<TaskCompletionSource> readReady;
+        Func<Task>? before;
         lock (_gate)
         {
             _readsStarted++;
+            before = BeforeNextRead;
+            BeforeNextRead = null;
             readReady = [];
             foreach (var (threshold, waiter) in _readStartedWaiters)
             {
@@ -550,6 +561,9 @@ internal sealed class ChannelResponseReader : IAsyncStreamReader<OrchestratorMes
 
         foreach (var waiter in readReady)
             waiter.TrySetResult();
+
+        if (before is not null)
+            await before();
 
         if (!await _channel.Reader.WaitToReadAsync(cancellationToken))
             return false;
