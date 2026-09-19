@@ -1368,13 +1368,18 @@ public sealed class WorkerServiceReceiptGateTests
             completionReceiptAckEnabled: true, completionReadyRequired: true);
         var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
 
+        var teardownEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTeardown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var teardownRegistration = default(CancellationTokenRegistration);
         Task? execution = null;
         Task? reporting = null;
+        object? owner = null;
         try
         {
             // Predecessor A: locally completed report, NO ACK — retained, eligible, but the Ready
-            // write has never been started.
-            reader.Push(ResultAssignment(TaskA));
+            // write has never been started. This is the UNCONFIRMED refusal state, distinct from
+            // the full-predicate reader-first vector below.
+            reader.Push(ResultAssignment(TaskA)); // message 1
             await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             runner.Release(TaskA);
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -1384,49 +1389,61 @@ public sealed class WorkerServiceReceiptGateTests
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            var owner = GetActiveAssignment(service);
+            owner = GetActiveAssignment(service);
             var readyClaim = GetOwnerReadyClaim(service);
+            var receipt = OwnerReceiptOf(owner!);
             var slot = GetOwnerOrdinaryReady(service);
+            var resetBaseline = runner.ResetCount;
+            Assert.Equal(1, resetBaseline);
             Assert.True(IsOrdinaryReadyEligible(slot), "Precondition: eligibility is published.");
+            Assert.False(GetReceiptConfirmed(receipt), "Precondition: receipt remains unconfirmed.");
             Assert.Null(GetRetainedReadinessWrite(service)); // NOT started.
             Assert.Equal(0, writer.ReadyCount);
 
-            // The unexpected successor, while A is retained with NO started write.
-            reader.Push(ResultAssignment(TaskB));
+            // Hold fault-teardown at its FIRST cancellation boundary. When this fires, TaskB's
+            // refusal was thrown and the loop entered finally, but cancellation/drain/clear cannot
+            // proceed. The service slot must therefore still directly contain the exact owner A.
+            teardownRegistration = GetOwnerCts(service).Token.Register(() =>
+            {
+                teardownEntered.TrySetResult();
+                releaseTeardown.Task.GetAwaiter().GetResult();
+            });
 
-            // THE REFUSAL: the loop faults with the EXACT fixed text (an exception thrown from the
-            // Assignment handler propagates out of the loop — the loop records primaries unchanged).
-            var propagated = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
-            Assert.Equal("Assignment received before authorized Ready.", propagated.Message);
+            // TaskB-specific consumption barrier: A is message 1, so Consumed(2) cannot already be
+            // satisfied. This proves the refusal is reached only after B is actually consumed.
+            var bConsumed = reader.Consumed(2);
+            Assert.False(bConsumed.IsCompleted);
+            reader.Push(ResultAssignment(TaskB)); // message 2
+            await bConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await teardownEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // NOTHING ELSE EVER HAPPENED — positive evidence, not end-state inference:
-            // (pre-fault evidence, captured on the owner object the test already holds)
-            Assert.Same(owner, GetActiveAssignment(service) ?? owner);
+            // NON-VACUOUS SIDE-EFFECT PROOF while teardown is held BEFORE clear:
+            Assert.Same(owner, GetActiveAssignment(service));
             Assert.Equal(TaskA, TaskIdOf(owner!));
-            Assert.Equal(0, GetReadyClaimState(readyClaim));
-            Assert.Single(writer.Completes); // ONLY A's own Complete; the successor added none.
-
-            // NO successor work ever reached the runner — positive absence witnesses:
-            Assert.False(
-                runner.ResetEntered(TaskB),
-                "A refused successor must never reset the runner.");
+            Assert.Equal(resetBaseline, runner.ResetCount);
             Assert.False(
                 runner.HasPromptStarted(TaskB),
                 "A refused successor must never start a prompt.");
-
-            // The refusal did not invent an ACK either: the predecessor's receipt stays UNCONFIRMED
-            // (the fallback teardown drain in the loop's finally clears the slot, so the retained
-            // owner is only assertable through the captured object above).
+            Assert.Equal(0, GetReadyClaimState(readyClaim));
+            Assert.Single(writer.Completes); // ONLY A's own Complete; B added none.
+            Assert.Equal(0, writer.ReadyCount);
             Assert.False(
-                GetReceiptConfirmed(OwnerReceiptOf(owner!)),
-                "A refused successor must never be confirmed by an inferred acknowledgement.");
-            // NOTE: the loop HAS faulted with the refusal (that is the boundary's observable), so
-            // the loop's own teardown retirement is expected afterwards; the refusal itself did
-            // nothing — proven by the runner/claim/Complete/receipt evidence above.
+                GetReceiptConfirmed(receipt),
+                "An unconfirmed refusal must never infer an ACK.");
+
+            // Release teardown and assert the literal PRIMARY refusal unchanged. Normal teardown
+            // may now clear/retire; all no-side-effect assertions above were taken before it could.
+            releaseTeardown.TrySetResult();
+            var propagated = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken));
+            Assert.Equal("Assignment received before authorized Ready.", propagated.Message);
+            Assert.Equal(resetBaseline, runner.ResetCount);
+            Assert.False(runner.HasPromptStarted(TaskB));
         }
         finally
         {
+            releaseTeardown.TrySetResult();
+            teardownRegistration.Dispose();
             runner.ReleaseAll();
             writer.ReleaseAll();
             reader.TryComplete();
@@ -1513,7 +1530,17 @@ public sealed class WorkerServiceReceiptGateTests
                 releaseTeardown.Task.GetAwaiter().GetResult();
             });
 
-            // Install the one-shot hook BEFORE pushing the ACK into the already-pending read #2.
+            // PREFERRED DETERMINISTIC ARMING ROUTE: first await READ #2 STARTED. MoveNext increments
+            // that counter only after it has taken the reader gate and atomically read+cleared the
+            // current hook. Therefore this await proves read #2 already consumed the default null;
+            // assigning below cannot be stolen by read #2. Read #3 cannot start until the ACK is
+            // pushed and its handler returns, and the hook is assigned before that push, so there is
+            // no concurrent assignment/read-and-clear window.
+            await reader.ReadStarted(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(2, reader.ReadsStarted);
+            Assert.False(tiePrepared.Task.IsCompleted);
+
+            // Arm the one-shot ONLY for read #3, then push the ACK into already-pending read #2.
             // The hook runs synchronously inside read #3, before the loop can arm readiness:
             //  1) release Complete; the success diagnostic throws, inner finally publishes
             //     termination, and outer error diagnostic blocks before eligibility;
@@ -1529,6 +1556,10 @@ public sealed class WorkerServiceReceiptGateTests
                 return Task.CompletedTask;
             };
 
+            // Still exactly two reads and the hook has not fired: read #2 cannot consume an arm
+            // installed after its read-and-clear point. Only now is the ACK allowed to complete it.
+            Assert.Equal(2, reader.ReadsStarted);
+            Assert.False(tiePrepared.Task.IsCompleted);
             reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
             await tiePrepared.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await teardownEntered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
