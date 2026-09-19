@@ -1079,6 +1079,22 @@ public sealed class WorkerService(
             get { lock (_gate) return _write; }
         }
 
+        /// <summary>
+        /// Whether this assignment's authorized ordinary Ready WRITE TASK has already been STARTED
+        /// and RETAINED — the ONE authorization fact the negotiated successor boundary consults.
+        /// </summary>
+        /// <remarks>
+        /// It is deliberately NOT local write COMPLETION: the write may still be pending, and it may
+        /// yet fail or be cancelled, exactly as it could before this boundary existed — the server is
+        /// allowed to receive the Ready and dispatch a successor while that write is still in flight.
+        /// It is also NOT "the assignment has eligible facts": eligibility, a terminated Complete or a
+        /// confirmed receipt are all facts about the PREDICATE, and none of them means Ready has been
+        /// emitted. Only a settlement that consumed the shared claim and started (and retained) the
+        /// write makes this <c>true</c>, and it is monotonic, so the drain that follows can never
+        /// observe authorization being withdrawn.
+        /// </remarks>
+        public bool HasStartedWrite => Write is not null;
+
         /// <summary>Whether the ordinary readiness has already been settled.</summary>
         public bool IsSettled
         {
@@ -1291,6 +1307,68 @@ public sealed class WorkerService(
     private void InstallActiveAssignment(ActiveAssignment assignment) => _activeAssignment = assignment;
 
     /// <summary>
+    /// THE FIXED, SECRET-FREE protocol error text for an unexpected successor assignment that arrived
+    /// BEFORE the retained predecessor's authorized ordinary Ready write task had been started.
+    /// </summary>
+    internal const string AssignmentBeforeAuthorizedReadyMessage =
+        "Assignment received before authorized Ready.";
+
+    /// <summary>
+    /// OWNERSHIP BOUNDARY — THE PRE-READY ASSIGNMENT REFUSAL. Consulted from the message loop BEFORE
+    /// any replacement drain, runner reset, successor installation or successor execution, so a
+    /// refused assignment provably leaves the predecessor's work, the runner and the ownership slot
+    /// exactly as they were.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHERE THE BOUNDARY IS. For a connection whose ACCEPTED registration carried BOTH negotiated
+    /// facts, the orchestrator advertised that this registration's NEXT ordinary assignment waits for
+    /// an accepted Ready after its negotiated completion. An assignment that arrives while a
+    /// predecessor is still retained is therefore legitimate ONLY once this worker has actually
+    /// STARTED AND RETAINED that predecessor's authorized ordinary Ready write task — which is the
+    /// point at which the server could have received the Ready and dispatched the successor. The
+    /// boundary is deliberately NOT local write COMPLETION (the dispatched successor may well run
+    /// while the write is still in flight) and NOT merely having eligible facts (eligibility, a
+    /// terminated Complete and a confirmed receipt are predicate facts, not a sent Ready).
+    /// </para>
+    /// <para>
+    /// A READER-FIRST TIE IS THE PRE-BOUNDARY CASE. If the loop wins the race and receives the
+    /// assignment before the readiness settlement has run, the predecessor has eligible facts but no
+    /// started write, so the assignment is refused — merely being eligible is not authorization.
+    /// </para>
+    /// <para>
+    /// NO RETAINED OWNER IS ALWAYS ALLOWED. The initial assignment, and any state after the EXISTING
+    /// explicit ownership clear (a matching cancel, or a completed teardown drain), has nothing to
+    /// authorize against, so the ordinary assignment path proceeds untouched.
+    /// </para>
+    /// <para>
+    /// LEGACY AND ACK-ONLY CONNECTIONS ARE BYTE-IDENTICAL TO BEFORE. With the gate disabled — the
+    /// ACK-only shape, the readiness-requirement-only shape, and a connection that negotiated neither
+    /// fact — this returns immediately, so the existing replacement drain and its behavior are
+    /// completely unchanged. Nothing is inferred here: no acknowledgement, no completion and no
+    /// synthesized result.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">The connection the assignment arrived on.</param>
+    /// <exception cref="InvalidOperationException">
+    /// A both-flags connection retained a predecessor whose authorized ordinary Ready write task had
+    /// not yet been started. The text is the fixed <see cref="AssignmentBeforeAuthorizedReadyMessage"/>.
+    /// </exception>
+    private void RefuseAssignmentBeforeAuthorizedReady(WorkerConnection connection)
+    {
+        // LEGACY / ACK-ONLY FIRST: the boundary does not exist for those shapes at all.
+        if (!OrdinaryReadyGateEnabled(connection))
+            return;
+
+        // THE BOUNDARY. A retained predecessor whose ordinary Ready write task was never started has
+        // authorized nothing, so the successor is refused BEFORE it can reset the runner, install
+        // itself, or begin any work — and no ACK, completion or buffered assignment is invented to
+        // paper over the gap.
+        if (_activeAssignment is { } retained && !retained.OrdinaryReady.HasStartedWrite)
+            throw new InvalidOperationException(AssignmentBeforeAuthorizedReadyMessage);
+    }
+
+    /// <summary>
     /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits BOTH the retained execution
     /// and its reporting WITHOUT cancelling them (their Ready already flowed, so they are finished
     /// or finishing), disposes the CTS, and only then clears the slot.
@@ -1301,6 +1379,13 @@ public sealed class WorkerService(
     /// resets the shared runner, while the original execution or its report is still running. With
     /// <c>cancelFirst: false</c> there is no cancellation callback to fail, so nothing is deferred
     /// here.
+    /// <para>
+    /// It also joins any already-started ordinary readiness write (the drain's shared settlement
+    /// returns the retained task for a slot that was already settled), so a successor's replacement
+    /// joins that write BEFORE the runner is reset or the ownership slot is cleared. This is the
+    /// post-boundary half of the negotiated successor rule; the pre-boundary half is the refusal
+    /// above, and neither path ever waits for an acknowledgement.
+    /// </para>
     /// </remarks>
     private async Task DrainRetainedForReplacementAsync()
     {
@@ -1443,6 +1528,14 @@ public sealed class WorkerService(
     /// ownership transition can emit an unacknowledged Ready. Neither drain ever WAITS for an
     /// acknowledgement: the gates are pure local facts, and a missing receipt simply settles nothing.
     /// </para>
+    /// <para>
+    /// THE NEGOTIATED SUCCESSOR BOUNDARY. On a both-flags connection, a successor assignment that
+    /// arrives while a predecessor is still retained is accepted ONLY once that predecessor's
+    /// authorized ordinary Ready write task has been started and retained; before that the assignment
+    /// is refused with the fixed protocol error, and after it the existing replacement drain joins
+    /// the started write before the runner reset and the ownership clear. Legacy and ACK-only
+    /// connections keep their existing replacement behavior unchanged.
+    /// </para>
     /// </remarks>
     private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
     {
@@ -1493,6 +1586,19 @@ public sealed class WorkerService(
                 switch (message.PayloadCase)
                 {
                     case OrchestratorMessage.PayloadOneofCase.Assignment:
+                        // THE PRE-READY BOUNDARY, CHECKED FIRST — before the replacement drain, the
+                        // runner reset, the CTS/claim construction and the successor installation. On
+                        // a connection whose accepted registration carried BOTH negotiated facts, an
+                        // assignment that arrives while a predecessor is retained is legitimate ONLY
+                        // once that predecessor's authorized ordinary Ready write task has actually
+                        // been STARTED and RETAINED (the point at which the server could have received
+                        // the Ready and dispatched this successor). Otherwise this throws the FIXED
+                        // protocol error and NOTHING has happened yet: no runner reset, no successor
+                        // installed or executed, no ACK inferred and no work buffered. Legacy and
+                        // ACK-only connections return immediately, so their replacement behavior is
+                        // byte-identical to before.
+                        RefuseAssignmentBeforeAuthorizedReady(connection);
+
                         // Task-assignment ownership is serialized: only one task may ever own the
                         // mutable runner and its LLM client, so the previous one is drained BEFORE
                         // the runner is reset. Single-flight Ready (above) ensures the orchestrator
@@ -1504,7 +1610,9 @@ public sealed class WorkerService(
                             // means a new assignment only follows a Ready this assignment already
                             // emitted, so its execution and its report are finished or finishing.
                             // Cancelling here would abort work that the orchestrator still expects
-                            // to complete.
+                            // to complete. On a both-flags connection this drain is reached only
+                            // AFTER the boundary above, so it also joins the already-started
+                            // ordinary Ready write before the runner reset and the ownership clear.
                             await DrainRetainedForReplacementAsync();
                         }
 
