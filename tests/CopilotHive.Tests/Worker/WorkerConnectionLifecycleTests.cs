@@ -962,6 +962,17 @@ public sealed class WorkerConnectionLifecycleTests
     /// and emits its ordinary Ready WITHOUT any ACK. The inverse answers cannot leak across runs.
     /// </para>
     /// <para>
+    /// HERMETIC ENVIRONMENT. The runner stub does NOT bypass the worker's EAGER per-assignment
+    /// config-repo preparation, so this fixture uses the SAME isolation as the accepted-registration
+    /// test above: a UNIQUE temporary directory passed explicitly to the service, a fixture-only
+    /// config repo URL/token, and a scoped fake git launcher that reports a HEALTHY repo — no real
+    /// git, no network and NO root-directory assumption (a shared absolute path such as
+    /// <c>/config-repo</c> can be uncreatable/unreadable for the CI user, which is exactly what turned
+    /// the first assignment's preparation into an execution failure and the pre-ACK write rendezvous
+    /// below into a timeout). The scoped override stays installed across BOTH runs AND their teardown
+    /// and is restored only after every producer has been joined.
+    /// </para>
+    /// <para>
     /// MUTATION PROOF. Changing production's <c>ackEnabled &amp;&amp; readyRequired</c> predicate to
     /// <c>readyRequired</c> gates run 2 and fails its no-ACK Ready rendezvous. Ignoring the accepted
     /// response or failing to publish its facts leaves run 1 ungated and fails its pre-ACK exact
@@ -973,7 +984,22 @@ public sealed class WorkerConnectionLifecycleTests
     public async Task SequentialRunAsync_Registered11GatesUntilAck_Registered10RemainsUngated()
     {
         var runner = new ProvisionerCapturingRunner();
-        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        // HERMETIC ENVIRONMENT — the eager per-assignment preparation runs against a fixture-only
+        // config repo URL/token over a fake git launcher, from a UNIQUE temporary directory. The
+        // fixture URL is IDENTICAL to the fake launcher's reported origin, so no origin
+        // reconciliation work is ever needed and no real git process, network call or
+        // root-owned/absent path is involved.
+        var provisionerHarness = new ProvisionerHarness(
+            configRepoUrl: "https://github.com/org/config-repo.git", ghToken: "ghp_fixture_token");
+        var configRepoDir = CreateTempDir();
+        var launcher = new FakeGitLauncher(HealthyRepoHandler(configRepoDir));
+
+        // The SCOPED PROCESS-RUNNER OVERRIDE lives to the END of this method — past BOTH real runs
+        // AND their joined teardown — so no late assignment body can fall back to a real git launch.
+        using var processRunner = WorkerServiceConfigRepoHarness.InstallProcessRunner(launcher);
+
+        var service = BuildService(runner, provisionerHarness.Provisioner, configRepoDir);
 
         var firstResponses = new ChannelResponseReader();
         var secondResponses = new ChannelResponseReader();
@@ -1008,6 +1034,19 @@ public sealed class WorkerConnectionLifecycleTests
                     requests.Writes,
                     message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Complete);
                 Assert.Equal("registered-gated", firstComplete.Complete.TaskId);
+
+                // THE PREPARATION ITSELF IS WITNESSED — the assignment's Complete can only have been
+                // produced by work that got PAST the eager per-assignment preparation, and the
+                // evidence shows that preparation used THIS fixture's configuration and the SCOPED
+                // fake launcher rather than the ambient environment: the health probe was launched
+                // through the seam, and the unconditional agents directory was created under the
+                // temporarily configured repo directory.
+                Assert.True(
+                    launcher.Saw("rev-parse", "--is-inside-work-tree"),
+                    "The eager per-assignment preparation must run the health probe through the fake launcher.");
+                Assert.True(
+                    Directory.Exists(Path.Combine(configRepoDir, "agents")),
+                    "The eager per-assignment preparation must create the agents directory under the configured path.");
 
                 // The ordinary Ready is WITHHELD after Complete while the real loop still consumes
                 // a ToolResponse. The probe is message 2 and its own barrier is not pre-satisfied.
@@ -1102,6 +1141,11 @@ public sealed class WorkerConnectionLifecycleTests
             secondResponses.TryComplete();
             await JoinAllForTeardownAsync(
                 service, ("first registered RunAsync", firstRun), ("second registered RunAsync", secondRun));
+
+            // The temporary config-repo root is removed only AFTER every producer is joined — on the
+            // assertion-failure paths too — while the scoped process-runner override is still
+            // installed, and is restored by its own disposal once this method unwinds.
+            TryDelete(configRepoDir);
         }
     }
 
