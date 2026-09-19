@@ -133,10 +133,42 @@ public sealed class WorkerServerCompletionRetransmissionTests
         // ── ARM THE ONE DROP, THEN LET THE WORKER FINISH ───────────────────────────────
         // The drop covers EXACTLY the FIRST acknowledgement; every later one forwards.
         bridge.ArmDropFirstAck();
+
+        // HOLD THE REAL DURABLE WRITE OPEN. The gated forwarding inner sits between the counting
+        // decorator and the REAL recorder, so once Record is ENTERED the production durable write
+        // has provably NOT happened yet. This is what makes the signal ORDERING observable instead
+        // of merely source-ordered.
+        chain.RecorderGate.HoldRecord();
+
         worker.ReleasePrompt();
 
         await bridge.WorkerWriter.WaitForAsync(
             WorkerMessage.PayloadOneofCase.Complete, 0, TestContext.Current.CancellationToken);
+
+        // ── SIGNAL ORDERING FOR Record: ENTERED, HELD, AND STILL UNSIGNALLED ───────────
+        await chain.RecorderGate.RecordEntered.WaitAsync(
+            Failsafe, TestContext.Current.CancellationToken);
+
+        // THE REAL WRITE HAS NOT RUN, so a fresh store finds NO row — positive evidence that an
+        // early signal would be a lie, not merely early.
+        Assert.Null(chain.Stores.NewReceiptStore().Load(TaskId));
+
+        // AND THE PRODUCTION SIGNAL IS STILL INCOMPLETE. A bounded positive non-completion window,
+        // so this is an observation rather than an instantaneous check. Moving
+        // CountingRecorder.Record's TrySetResult BEFORE its inner call completes this wait and
+        // fails here by name.
+        Assert.False(
+            chain.Recorder.FirstRecordStored.IsCompleted,
+            "The durable-record signal must not complete while the real write is entered and held.");
+        var earlyRecordSignal = await Record.ExceptionAsync(() =>
+            chain.Recorder.FirstRecordStored.WaitAsync(
+                SuppressionBound, TestContext.Current.CancellationToken));
+        Assert.IsType<TimeoutException>(earlyRecordSignal);
+        Assert.Null(chain.Stores.NewReceiptStore().Load(TaskId));
+
+        // RELEASE: only now does the real write run, and only after it RETURNS may the signal
+        // complete — which is exactly what the rendezvous below then observes.
+        chain.RecorderGate.ReleaseRecord();
 
         // THE REAL SERVER RECORDED THE RECEIPT DURABLY. The rendezvous is the forwarding recorder's
         // own signal, raised AFTER production's Record returned — no polling, no sampling window.
@@ -167,6 +199,11 @@ public sealed class WorkerServerCompletionRetransmissionTests
         Assert.Equal(acceptedAfterInitialReady, chain.OrdinaryReadyAcceptedCount);
 
         // ── ADVANCE THE WORKER'S OWN RETRY CLOCK ───────────────────────────────────────
+        // HOLD THE REAL CONFIRMATION OPEN FIRST, before the retransmission can reach the server, so
+        // the confirmation-ordering evidence below is taken STRICTLY BEFORE the re-ACK barrier and
+        // therefore cannot be masked by it.
+        chain.RecorderGate.HoldConfirm();
+
         await worker.RetryDelayCreatedAsync(1, TestContext.Current.CancellationToken);
         worker.Clock.Advance(chain.RetryInterval);
 
@@ -206,6 +243,35 @@ public sealed class WorkerServerCompletionRetransmissionTests
         Assert.Equal(frozenChangedFiles, rawResent.Complete.GitStatus.ChangedFiles);
         Assert.DoesNotContain("MUTATED-BY-THE-FIRST-WRITER", rawResent.Complete.Metrics.Issues);
         Assert.NotEqual("MUTATED-ORIGINAL-OUTPUT", rawResent.Complete.Output);
+
+        // ── SIGNAL ORDERING FOR ConfirmStoredReceipt, BEFORE THE RE-ACK BARRIER ────────
+        // The real confirmation is ENTERED and HELD, so it has NOT returned. This evidence is
+        // deliberately taken here — strictly before the re-ACK rendezvous below — because the
+        // re-ACK is DOWNSTREAM of ConfirmStoredReceipt: awaiting it first would mask an early
+        // confirmation signal entirely.
+        await chain.RecorderGate.ConfirmEntered.WaitAsync(
+            Failsafe, TestContext.Current.CancellationToken);
+
+        // NO RE-ACK HAS BEEN FORWARDED YET, so this window genuinely precedes that barrier.
+        Assert.False(
+            bridge.ReAckForwarded.IsCompleted,
+            "The confirmation-ordering window must precede the re-ACK barrier.");
+
+        // THE PRODUCTION CONFIRMATION SIGNAL IS STILL INCOMPLETE while the real call is held —
+        // observed with a bounded positive non-completion window. Moving
+        // CountingRecorder.ConfirmStoredReceipt's TrySetResult BEFORE its inner call completes this
+        // wait and fails here by name.
+        Assert.False(
+            chain.Recorder.FirstConfirmReturned.IsCompleted,
+            "The confirmation signal must not complete while the real confirmation is entered and held.");
+        var earlyConfirmSignal = await Record.ExceptionAsync(() =>
+            chain.Recorder.FirstConfirmReturned.WaitAsync(
+                SuppressionBound, TestContext.Current.CancellationToken));
+        Assert.IsType<TimeoutException>(earlyConfirmSignal);
+        Assert.Equal(0, chain.Recorder.ConfirmCalls);
+
+        // RELEASE: the real confirmation runs, returns, and only then may the signal complete.
+        chain.RecorderGate.ReleaseConfirm();
 
         // ── THE REAL SERVER CONFIRMS AND RE-ACKS ────────────────────────────────────────
         await bridge.ReAckForwarded.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -523,6 +589,12 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
         public async ValueTask DisposeAsync()
         {
+            // 0. OPEN EVERY RECORDER GATE FIRST. A vector that failed while the real recorder call
+            //    was HELD would otherwise leave a server-side thread parked inside it, and the
+            //    stream/worker joins below would block behind it. Releasing is idempotent and
+            //    cannot affect a passing run, where both gates are already open.
+            Capture("recorder gate release", Chain.RecorderGate.ReleaseAll);
+
             // 1-2. EOF BOTH SIDES AND JOIN THE SERVER STREAMS AND THE WORKER RUN — before any
             //      resource is released, so the worker never unwinds against a disposed store.
             await CaptureAsync("stream EOF / worker join", EndStreamAndJoinWorkerAsync);
@@ -685,8 +757,14 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
             RealPublisher = new WorkerAssignmentPublisher(Manager, Pool, Stores.AssignmentStore);
             Publisher = new RecordingPublisher(RealPublisher);
-            Recorder = new CountingRecorder(
+
+            // THE RECORDER CHAIN: CountingRecorder → GatedForwardingRecorder → the REAL recorder.
+            // The gate is OPEN by default, so every existing vector behaves exactly as before; a
+            // vector that wants to prove SIGNAL ORDERING closes it, so the real inner call is
+            // provably entered-but-not-returned while the production signal is observed.
+            RecorderGate = new GatedForwardingRecorder(
                 new WorkerCompletionRecorder(Stores.AssignmentStore, Stores.ReceiptStore));
+            Recorder = new CountingRecorder(RecorderGate);
 
             // ── CONSTRUCTOR-SUBSCRIBED DOWNSTREAM HANDLERS, CONTROLLED AND JOINED ─────────────
             // The fixture owns each subscription so it can count AND detach it on teardown.
@@ -742,6 +820,12 @@ public sealed class WorkerServerCompletionRetransmissionTests
         internal RecordingPublisher Publisher { get; }
 
         internal CountingRecorder Recorder { get; }
+
+        /// <summary>
+        /// THE GATED FORWARDING INNER between <see cref="Recorder"/> and the real recorder. Open by
+        /// default; an ordering vector closes it to hold the real durable call open.
+        /// </summary>
+        internal GatedForwardingRecorder RecorderGate { get; }
 
         internal TaskCompletionNotifier Notifier { get; }
 
@@ -889,6 +973,10 @@ public sealed class WorkerServerCompletionRetransmissionTests
         public void Dispose()
         {
             DetachSubscriptions();
+
+            // OPEN BOTH GATES FIRST: a held real recorder call must never block a teardown join.
+            RecorderGate.ReleaseAll();
+            RecorderGate.Dispose();
             Stores.Dispose();
         }
 
@@ -1653,6 +1741,97 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
             _firstConfirmReturned.TrySetResult(true);
             return confirmed;
+        }
+    }
+
+    /// <summary>
+    /// THE GATED FORWARDING INNER — a TRANSPARENT <see cref="IWorkerCompletionRecorder"/> decorator
+    /// that sits BETWEEN <see cref="CountingRecorder"/> and the REAL
+    /// <c>WorkerCompletionRecorder</c>. It signals its own ENTRY and then HOLDS, so the call
+    /// <see cref="CountingRecorder"/> made is provably ENTERED-BUT-NOT-RETURNED for as long as the
+    /// test wants.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY IT EXISTS. <see cref="CountingRecorder"/> raises its durable-state signals AFTER its inner
+    /// call returns, but source order alone kills no mutant: with an ungated inner the real write
+    /// completes almost immediately, so moving a signal BEFORE the inner call still satisfies every
+    /// observation (the fresh-store read resumes asynchronously and the real write usually lands
+    /// first). Holding the inner call open removes that luck entirely.
+    /// </para>
+    /// <para>
+    /// IT HOLDS BEFORE DELEGATING, deliberately: while the gate is closed the REAL durable write has
+    /// NOT happened, so a fresh-store read provably finds NO row. That is exactly the danger an
+    /// early signal creates, and it is what the ordering vector observes.
+    /// </para>
+    /// <para>
+    /// IT IS OTHERWISE TRANSPARENT: it adds no counting, changes no argument and returns the real
+    /// recorder's own answer. The bounded wait converts a test that forgets to release into a NAMED
+    /// failure instead of a hung run; it never orders anything on the happy path.
+    /// </para>
+    /// </remarks>
+    private sealed class GatedForwardingRecorder(IWorkerCompletionRecorder inner)
+        : IWorkerCompletionRecorder, IDisposable
+    {
+        /// <summary>Bound that turns a forgotten release into a named failure rather than a hang.</summary>
+        private static readonly TimeSpan GateBound = TimeSpan.FromSeconds(20);
+
+        private readonly ManualResetEventSlim _recordRelease = new(initialState: true);
+        private readonly ManualResetEventSlim _confirmRelease = new(initialState: true);
+        private readonly TaskCompletionSource<bool> _recordEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _confirmEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes once the REAL recorder's <c>Record</c> call has been ENTERED.</summary>
+        internal Task RecordEntered => _recordEntered.Task;
+
+        /// <summary>Completes once the REAL <c>ConfirmStoredReceipt</c> call has been ENTERED.</summary>
+        internal Task ConfirmEntered => _confirmEntered.Task;
+
+        /// <summary>Closes the RECORD gate: the next <c>Record</c> enters and then holds.</summary>
+        internal void HoldRecord() => _recordRelease.Reset();
+
+        /// <summary>Opens the RECORD gate, letting the held call delegate to the real recorder.</summary>
+        internal void ReleaseRecord() => _recordRelease.Set();
+
+        /// <summary>Closes the CONFIRM gate: the next confirmation enters and then holds.</summary>
+        internal void HoldConfirm() => _confirmRelease.Reset();
+
+        /// <summary>Opens the CONFIRM gate.</summary>
+        internal void ReleaseConfirm() => _confirmRelease.Set();
+
+        /// <summary>Opens both gates — teardown, so a held call can never block a join.</summary>
+        internal void ReleaseAll()
+        {
+            _recordRelease.Set();
+            _confirmRelease.Set();
+        }
+
+        public void Record(string workerId, WorkTask task, TaskResult result)
+        {
+            _recordEntered.TrySetResult(true);
+
+            if (!_recordRelease.Wait(GateBound))
+                throw new InvalidOperationException("The gated Record was never released.");
+
+            inner.Record(workerId, task, result);
+        }
+
+        public bool ConfirmStoredReceipt(string workerId, string taskId, TaskResult result)
+        {
+            _confirmEntered.TrySetResult(true);
+
+            if (!_confirmRelease.Wait(GateBound))
+                throw new InvalidOperationException("The gated ConfirmStoredReceipt was never released.");
+
+            return inner.ConfirmStoredReceipt(workerId, taskId, result);
+        }
+
+        public void Dispose()
+        {
+            _recordRelease.Dispose();
+            _confirmRelease.Dispose();
         }
     }
 

@@ -3006,11 +3006,25 @@ public sealed class WorkerServiceReceiptGateTests
             retry = GetActiveRetry(service);
             Assert.NotNull(retry);
 
+            // THE RETRANSMITTER ITSELF, reached through the receipt tracker exactly as production's
+            // ACK handler and drains reach it. Captured BEFORE the drain clears ownership, so the
+            // frozen-slot assertions below survive the clear.
+            var retransmitter = GetActiveRetransmitter(service)
+                ?? throw new Xunit.Sdk.XunitException(
+                    "A both-flags assignment must own a retransmitter.");
+
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             Assert.Null(GetRetainedResult(service));
             Assert.Empty(writer.Completes);
+
+            // NOTHING WAS FROZEN. An absent result never reaches the mapping, so production's
+            // freeze — which happens only on the successful-mapping path — cannot have run. This is
+            // the load-bearing observable: a mutant that froze a fabricated envelope without arming
+            // would still produce no timer and no send (admission also requires ARMED), so only
+            // inspecting the slot itself rejects it.
+            Assert.Null(ReadFrozenSlot(retransmitter));
 
             // THE LIVE RETRY CANNOT ACT: nothing was frozen, so it never creates a delay timer and
             // never sends. Advancing the clock cannot conjure an attempt either.
@@ -3031,6 +3045,10 @@ public sealed class WorkerServiceReceiptGateTests
             Assert.True(retry.IsCompleted, "The drain must join the assignment's retry task.");
             Assert.Equal(0, GetSlotOccupancy(service));
             Assert.Empty(writer.Completes);
+
+            // STILL NOTHING FROZEN AFTER THE DRAIN — asserted on the retransmitter captured before
+            // the ownership clear, so this remains observable once the slot is empty.
+            Assert.Null(ReadFrozenSlot(retransmitter));
         }
         finally
         {
@@ -3152,12 +3170,24 @@ public sealed class WorkerServiceReceiptGateTests
             retryTask = (Task)retry.GetType().GetMethod("Start")!.Invoke(retry, [reporting])!;
             Assert.NotNull(retryTask);
 
+            // PRECONDITION: nothing is frozen before reporting runs, so the post-report assertion
+            // below is about what the MAPPING FAILURE did rather than about an empty start state.
+            Assert.Null(ReadFrozenSlot(retry));
+
             await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
-            // THE MAPPING-FAILURE FACTS: UNARMED, no Complete written, result retained verbatim,
-            // no payload leaked.
+            // THE MAPPING-FAILURE FACTS: UNARMED, NOTHING FROZEN, no Complete written, result
+            // retained verbatim, no payload leaked.
             Assert.False(GetReceiptArmed(receipt));
             Assert.False(GetReceiptConfirmed(receipt));
+
+            // THE FROZEN SLOT IS THE LOAD-BEARING OBSERVABLE. Production freezes ONLY on the
+            // successful-mapping path, so a mapper that threw must leave this null. A mutant that
+            // catches the mapping failure and installs a fabricated envelope WITHOUT arming would
+            // satisfy every behavioural assertion below (admission needs ARMED too, so it would
+            // still create no timer and send nothing) — only this assertion rejects it.
+            Assert.Null(ReadFrozenSlot(retry));
+
             Assert.Empty(writer.Completes);
             Assert.Same(unmappable, holderType.GetProperty("Result")!.GetValue(holder));
             Assert.DoesNotContain(payloadSecret, stdErr.ToString(), StringComparison.Ordinal);
@@ -3183,6 +3213,11 @@ public sealed class WorkerServiceReceiptGateTests
             Assert.True(
                 retryTask.IsCompletedSuccessfully,
                 "An unarmed retry must terminate cleanly, never faulted.");
+
+            // STILL NOTHING FROZEN AFTER THE DRAIN: the drain closes admission and joins, it never
+            // installs a payload, so the slot a failed mapping left empty stays empty.
+            Assert.Null(ReadFrozenSlot(retry));
+
             Assert.Equal(0, clock.TimerCount);
             Assert.Empty(writer.Completes);
         }
@@ -3484,6 +3519,39 @@ public sealed class WorkerServiceReceiptGateTests
             binder: null,
             args: [connection, CancellationToken.None, receipt, clock, sendGate, reportFailure],
             culture: null)!;
+    }
+
+    /// <summary>
+    /// THE RETRANSMITTER'S PRIVATE FROZEN SLOT — production's own <c>_frozen</c> field on the
+    /// assignment's <c>CompletionRetry</c>, read by reflection. <c>null</c> means NOTHING has been
+    /// frozen for that assignment.
+    /// </summary>
+    /// <remarks>
+    /// WHY THIS IS THE LOAD-BEARING OBSERVABLE. "No delay timer" and "no send" are both downstream
+    /// of production's <c>AdmissionHolds_Locked</c>, which requires the receipt to be ARMED as well
+    /// as a frozen payload to exist. A mutant that freezes a fabricated payload but does NOT arm
+    /// therefore produces no timer and no send, and passes every behavioural assertion — while
+    /// having violated the "freeze once, on the successful-mapping path only" contract. Inspecting
+    /// the frozen slot directly is what makes that mutant observable.
+    /// </remarks>
+    /// <param name="retransmitter">The assignment's <c>CompletionRetry</c> instance.</param>
+    private static object? ReadFrozenSlot(object retransmitter) =>
+        retransmitter.GetType()
+            .GetField("_frozen", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(retransmitter);
+
+    /// <summary>
+    /// The RETAINED assignment's <c>CompletionRetry</c> instance (not its task), reached through the
+    /// receipt tracker exactly as production's ACK handler and drains reach it. <c>null</c> when the
+    /// assignment owns no retransmitter.
+    /// </summary>
+    private static object? GetActiveRetransmitter(WorkerService service)
+    {
+        var owner = GetActiveAssignment(service)
+            ?? throw new Xunit.Sdk.XunitException("Expected an active assignment owner.");
+        var receipt = owner.GetType().GetProperty("Receipt")!.GetValue(owner)
+            ?? throw new Xunit.Sdk.XunitException("Expected the assignment's receipt tracker.");
+        return receipt.GetType().GetProperty("Retry")!.GetValue(receipt);
     }
 
     /// <summary>

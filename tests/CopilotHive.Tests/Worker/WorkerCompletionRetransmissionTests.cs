@@ -948,6 +948,54 @@ public sealed class WorkerCompletionRetransmissionTests
     // ══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
+    /// THE HARNESS RELEASES ITS TEMP ROOT. A full retry cycle runs, and after
+    /// <c>TeardownAsync</c> the harness's unique <c>/tmp/copilothive-retry-*</c> directory is GONE.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHY THIS EXISTS. The teardown comment claimed the temp root was released, but nothing
+    /// deleted it, so every run of every vector in this fixture leaked a directory. This vector
+    /// makes the claim an ASSERTION: it runs the same real loop the other vectors do (so the root
+    /// genuinely contains a config-repo and the git seam really used it), tears down explicitly,
+    /// and then requires the directory to be absent.
+    /// </para>
+    /// <para>
+    /// IT VERIFIES THE ROOT EXISTED FIRST, so a harness that silently stopped creating one could
+    /// not satisfy this by accident. The second teardown in the <c>finally</c> is harmless: the
+    /// delete is idempotent and best-effort.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task Teardown_DeletesTheHarnessTempRoot()
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryParkedInDelayAsync(1);
+
+            // NON-VACUITY: the root really exists and really was used by the run above.
+            Assert.True(harness.RootExists, "the harness must create its temp root: " + harness.RootPath);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+
+            // THE EXPLICIT TEARDOWN — the same call every vector makes in its finally.
+            await harness.TeardownAsync();
+
+            Assert.False(
+                harness.RootExists,
+                "teardown must delete the harness temp root, but it still exists: " + harness.RootPath);
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
     /// NO PAYLOAD, NO RETRY. A handled provisioning failure produces NO result, so nothing is
     /// frozen, no delay is ever created and no Complete is ever written — in EVERY negotiation
     /// mode. The loop stays healthy throughout.
@@ -1895,6 +1943,9 @@ public sealed class WorkerCompletionRetransmissionTests
         /// </summary>
         private readonly List<RetransmissionWriter> _writers = [];
         private readonly string _root;
+
+        /// <summary>One-way latch making <see cref="TeardownAsync"/> idempotent.</summary>
+        private int _tornDown;
         private readonly IDisposable _gitRestore;
         private readonly IDisposable _consoleRestore;
         private readonly List<Task> _loops = [];
@@ -2502,11 +2553,23 @@ public sealed class WorkerCompletionRetransmissionTests
 
         /// <summary>
         /// Releases every parked gate, joins every started task within the bound, retires the
-        /// connections, disposes the service and releases the temp root — so a failing assertion
-        /// cannot leave a producer stuck.
+        /// connections, disposes the service and DELETES the temp root — so a failing assertion
+        /// cannot leave a producer stuck or a <c>/tmp/copilothive-retry-*</c> directory behind.
         /// </summary>
+        /// <remarks>
+        /// THE ORDER MATTERS: every join and disposal happens FIRST, so nothing still holds a file
+        /// under the root when <see cref="Dispose"/> deletes it. The delete itself is best-effort
+        /// and never throws, so it can never replace a primary assertion failure.
+        /// </remarks>
         internal async Task TeardownAsync()
         {
+            // IDEMPOTENT: every vector calls this in its finally, and a vector that also calls it
+            // explicitly (the temp-root vector) must not then cancel an already-disposed CTS or
+            // dispose the service twice. The FIRST caller performs the teardown; later callers are
+            // no-ops, which keeps the single teardown path shared by every vector.
+            if (Interlocked.Exchange(ref _tornDown, 1) != 0)
+                return;
+
             ReleaseSendGate();
             _runner.ReleaseAll();
             foreach (var writer in _writers)
@@ -2598,7 +2661,38 @@ public sealed class WorkerCompletionRetransmissionTests
         {
             _consoleRestore.Dispose();
             _gitRestore.Dispose();
+
+            // THE TEMP ROOT IS ACTUALLY DELETED — best effort, and LAST, so the console/git seam
+            // restores above always happen even if the delete fails. A leaked
+            // /tmp/copilothive-retry-* directory per test is what this closes.
+            TryDeleteRoot();
         }
+
+        /// <summary>
+        /// Best-effort recursive delete of this harness's temp root. It NEVER throws: a teardown
+        /// failure must not replace the test's primary assertion failure, and a locked file on a
+        /// failing path is not the outcome under test.
+        /// </summary>
+        private void TryDeleteRoot()
+        {
+            try
+            {
+                if (Directory.Exists(_root))
+                    Directory.Delete(_root, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        /// <summary>Whether this harness's temp root still exists on disk.</summary>
+        internal bool RootExists => Directory.Exists(_root);
+
+        /// <summary>The harness's temp root path, for the teardown assertion.</summary>
+        internal string RootPath => _root;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
