@@ -505,14 +505,18 @@ public sealed class WorkerService(
         //    snapshot is the PROCESS's, not this attempt's. Nothing else is shared: the connection
         //    still owns its identity, client, stream and provisioner.
         //
-        //    THE NEGOTIATED ACK ANSWER is captured here, from the ACCEPTED response's EXPLICIT field
-        //    and from nothing else, so it is a fixed fact of this connection BEFORE publication. An
-        //    absent or false answer leaves the connection disabled, and because the fact lives on the
-        //    connection object, a later sequential run retains nothing from this one.
+        //    THE TWO NEGOTIATED ANSWERS are captured here, each from the ACCEPTED response's own
+        //    EXPLICIT field and from nothing else, so they are fixed facts of this connection BEFORE
+        //    publication. An absent or false answer leaves its own fact false, and because the facts
+        //    live on the connection object, a later sequential run retains nothing from this one.
+        //    They are captured, never derived from one another: the ACK answer comes from the Ack
+        //    field and the ordinary-readiness requirement from the Ready field, and the gated
+        //    ordinary readiness needs BOTH.
         var connection = new WorkerConnection(
             assignedId, client, stream, provisionerOverride: TestProvisioner,
             provisioningEnvironment: _provisioningEnvironment,
-            completionReceiptAckEnabled: registerResponse.CompletionReceiptAckEnabled);
+            completionReceiptAckEnabled: registerResponse.CompletionReceiptAckEnabled,
+            completionReadyRequired: registerResponse.CompletionReadyRequired);
 
         // 4. PUBLISH — only now that construction has fully succeeded, and BEFORE the initial Ready
         //    and before any assignment processing.
@@ -835,6 +839,14 @@ public sealed class WorkerService(
     /// that write, and a write that later fails or is cancelled keeps its own existing outcome.
     /// </para>
     /// <para>
+    /// IT IS ALSO THE GATE'S RECEIPT AUTHORITY. On a connection whose accepted registration carried
+    /// BOTH negotiated facts, the assignment's ordinary-readiness predicate reads its ARMED and
+    /// CONFIRMED answers — and the local write's own termination is tracked separately by the slot —
+    /// so the ordinary Ready is withheld until all three hold. The tracker still records the receipt
+    /// in every mode (an ACK-only connection stays tracking-only) and never stores a completion
+    /// payload, so the slot reading it cannot observe or alter the retained result.
+    /// </para>
+    /// <para>
     /// The publication is a single <see cref="Interlocked"/> transition — the reporter arms, the
     /// reader acknowledges — so there is no waiting task, no timer, no service and no generalized
     /// protocol framework behind it. Nothing here ever waits for an acknowledgement: retention
@@ -960,11 +972,12 @@ public sealed class WorkerService(
         public CompletionReceiptTracker Receipt { get; } = receipt;
 
         /// <summary>
-        /// THE ASSIGNMENT'S ORDINARY-READINESS SLOT — the separately published fact that the OLD
-        /// ORDINARY-READY POINT was reached, plus the ONE readiness write started from it. Created
-        /// before either owned task starts and captured directly by the reporting flow (which
-        /// publishes the fact) and by the reader (which observes it once and starts the write), so
-        /// neither has to discover it through the ownership slot.
+        /// THE ASSIGNMENT'S ORDINARY-READINESS SLOT — the separately published facts that decide the
+        /// OLD ORDINARY-READY POINT was reached (the execution terminated NORMALLY, and in the gated
+        /// shape also that the mapped/armed Complete's original local write terminated), plus the ONE
+        /// readiness write started from them. Created before either owned task starts and captured
+        /// directly by the reporting flow (which publishes the facts) and by the reader (which observes
+        /// them once and starts the write), so neither has to discover it through the ownership slot.
         /// </summary>
         public OrdinaryReadySlot OrdinaryReady { get; } = ordinaryReady;
     }
@@ -996,13 +1009,47 @@ public sealed class WorkerService(
     /// point — the settlement starts nothing and leaves the shared claim UNCONSUMED, which is
     /// exactly what preserves the cancel handler's fallback single-Ready behavior.
     /// </para>
+    /// <para>
+    /// TWO SHAPES, ONE SLOT. A slot built WITHOUT a receipt tracker is the UNGATED shape: eligibility
+    /// alone is the predicate, exactly as before. A slot built WITH the assignment's
+    /// <see cref="CompletionReceiptTracker"/> is the GATED shape, and is supplied by the assignment
+    /// handler EXACTLY when this connection's accepted registration carried BOTH negotiated facts
+    /// (<see cref="WorkerConnection.CompletionReceiptAckEnabled"/> AND
+    /// <see cref="WorkerConnection.CompletionReadyRequired"/>). In that shape the ordinary Ready
+    /// additionally waits for the mapped, ARMED Complete whose ORIGINAL local write has TERMINATED,
+    /// plus a matching same-connection receipt confirmation — the facts may arrive in ANY order, and
+    /// each arrival wakes the parked reader, so the Ready is neither lost nor produced early. The
+    /// predicate is monotonic, so the reader that wakes can only ever find it satisfied.
+    /// </para>
     /// </summary>
     /// <param name="owner">The connection this assignment arrived on.</param>
     /// <param name="streamToken">The ORIGINAL stream token the readiness write is made with.</param>
     /// <param name="claim">The assignment's shared single-flight Ready claim.</param>
+    /// <param name="receipt">
+    /// The assignment-local completion-receipt tracker, or <c>null</c> for the UNGATED shape. It is
+    /// consulted ONLY for the two receipt facts the tracker is the single authority for (the write
+    /// was ARMED, and a matching receipt was CONFIRMED); the completion payload itself is never read
+    /// from here, and nothing in this slot ever awaits an acknowledgement or joins any write.
+    /// </param>
     private sealed class OrdinaryReadySlot(
-        WorkerConnection owner, CancellationToken streamToken, ReadyClaim claim)
+        WorkerConnection owner,
+        CancellationToken streamToken,
+        ReadyClaim claim,
+        CompletionReceiptTracker? receipt)
     {
+        /// <summary>
+        /// THE UNGATED SHAPE, for a slot that must not wait for a receipt. Equivalent to a connection
+        /// whose accepted registration did not carry both negotiated facts: eligibility alone is the
+        /// predicate, so the ordinary Ready is exactly what it was before the gate existed.
+        /// </summary>
+        /// <param name="owner">The connection this assignment arrived on.</param>
+        /// <param name="streamToken">The ORIGINAL stream token the readiness write is made with.</param>
+        /// <param name="claim">The assignment's shared single-flight Ready claim.</param>
+        public OrdinaryReadySlot(WorkerConnection owner, CancellationToken streamToken, ReadyClaim claim)
+            : this(owner, streamToken, claim, receipt: null)
+        {
+        }
+
         /// <summary>
         /// The shared await for a SETTLED slot: nothing is left to observe, and because it never
         /// completes it can never be spun on. One instance is reused, so a settled assignment adds
@@ -1010,11 +1057,12 @@ public sealed class WorkerService(
         /// </summary>
         private static readonly Task NoObservation = new TaskCompletionSource().Task;
 
-        /// <summary>The shared await for a slot whose eligibility is already published: settle NOW, without waiting.</summary>
+        /// <summary>The shared await for a slot whose readiness predicate already holds: settle NOW, without waiting.</summary>
         private static readonly Task ReadyObservation = Task.CompletedTask;
 
         private readonly object _gate = new();
         private bool _eligible;
+        private bool _completeWriteTerminated;
         private bool _settled;
         private TaskCompletionSource? _wake;
         private Task? _write;
@@ -1031,6 +1079,22 @@ public sealed class WorkerService(
             get { lock (_gate) return _write; }
         }
 
+        /// <summary>
+        /// Whether this assignment's authorized ordinary Ready WRITE TASK has already been STARTED
+        /// and RETAINED — the ONE authorization fact the negotiated successor boundary consults.
+        /// </summary>
+        /// <remarks>
+        /// It is deliberately NOT local write COMPLETION: the write may still be pending, and it may
+        /// yet fail or be cancelled, exactly as it could before this boundary existed — the server is
+        /// allowed to receive the Ready and dispatch a successor while that write is still in flight.
+        /// It is also NOT "the assignment has eligible facts": eligibility, a terminated Complete or a
+        /// confirmed receipt are all facts about the PREDICATE, and none of them means Ready has been
+        /// emitted. Only a settlement that consumed the shared claim and started (and retained) the
+        /// write makes this <c>true</c>, and it is monotonic, so the drain that follows can never
+        /// observe authorization being withdrawn.
+        /// </remarks>
+        public bool HasStartedWrite => Write is not null;
+
         /// <summary>Whether the ordinary readiness has already been settled.</summary>
         public bool IsSettled
         {
@@ -1038,12 +1102,48 @@ public sealed class WorkerService(
         }
 
         /// <summary>
+        /// THE ONE READINESS PREDICATE, evaluated under this slot's lock from facts that only ever
+        /// move in one direction.
+        /// </summary>
+        /// <remarks>
+        /// ELIGIBILITY IS ALWAYS REQUIRED: it is published at exactly the condition that gated the
+        /// previous ordinary-Ready attempt. The UNGATED shape stops there. The GATED shape
+        /// additionally requires the complete set of facts — a mapped and ARMED Complete, that
+        /// Complete's ORIGINAL local write TERMINATED, and a matching receipt confirmation — with no
+        /// dependence on the order in which they arrived and no exemption for an assignment that was
+        /// never armed (an absent result, a handled provisioning failure or a mapping failure
+        /// therefore produces NO ordinary Ready). Because an unarmed assignment can never be
+        /// confirmed, the tracked facts can never disagree with the tracker.
+        /// </remarks>
+        private bool ReadinessHolds_Locked()
+        {
+            if (!_eligible)
+                return false;
+
+            // UNGATED SHAPE: eligibility is the whole predicate, exactly as before this gate.
+            if (receipt is null)
+                return true;
+
+            // GATED SHAPE: every remaining fact must have arrived. ARMED is what a successfully
+            // mapped result produced immediately before the single Complete attempt; TERMINATED is
+            // that attempt's own local outcome (success, failure or cancellation alike — an
+            // acknowledgement is durable receipt, not local write success); CONFIRMED is the
+            // tracker's accepted, same-connection, matching receipt.
+            return receipt.IsArmed && _completeWriteTerminated && receipt.IsConfirmed;
+        }
+
+        /// <summary>
         /// ARMS the one wait the reader races its pending response read against. The returned task
-        /// completes when the eligibility is published — and is ALREADY complete when it was
-        /// published before this call — and becomes a never-completing await once the slot has been
+        /// completes only when the WHOLE readiness predicate holds — and is ALREADY complete when it
+        /// held before this call — and becomes a never-completing await once the slot has been
         /// SETTLED, so the reader can neither spin on an already-observed signal nor accumulate
         /// waiters: exactly one wait exists per assignment.
         /// </summary>
+        /// <remarks>
+        /// AN ELIGIBLE-BUT-NOT-YET-READY ASSIGNMENT PARKS HERE. In the gated shape the eligibility
+        /// alone does NOT hand the reader a completed signal, so the reader waits until the remaining
+        /// facts arrive and wakes it; only a satisfied predicate makes the wait complete.
+        /// </remarks>
         public Task Arm()
         {
             lock (_gate)
@@ -1051,7 +1151,7 @@ public sealed class WorkerService(
                 if (_settled)
                     return NoObservation;
 
-                if (_eligible)
+                if (ReadinessHolds_Locked())
                     return ReadyObservation;
 
                 _wake ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1065,13 +1165,67 @@ public sealed class WorkerService(
         /// </summary>
         public void PublishEligibility()
         {
-            TaskCompletionSource? wake;
             lock (_gate)
             {
                 if (_eligible)
                     return;
 
                 _eligible = true;
+            }
+
+            WakeIfReady();
+        }
+
+        /// <summary>
+        /// PUBLISHES the fact that the assignment's ORIGINAL local Complete write has TERMINATED —
+        /// success, failure or cancellation alike. Idempotent and additive only: it never consumes
+        /// the shared Ready claim, never writes, and never waits, so a write whose outcome is a
+        /// failure keeps that outcome and can still authorize the ordinary Ready once the receipt is
+        /// confirmed.
+        /// </summary>
+        public void PublishCompleteWriteTerminated()
+        {
+            lock (_gate)
+            {
+                if (_completeWriteTerminated)
+                    return;
+
+                _completeWriteTerminated = true;
+            }
+
+            WakeIfReady();
+        }
+
+        /// <summary>
+        /// WAKES a parked observation because the matching receipt has just been CONFIRMED. The
+        /// receipt itself is recorded by the assignment's <see cref="CompletionReceiptTracker"/>, so
+        /// this only re-evaluates the predicate for whoever is parked on it — it never awaits, never
+        /// joins the write, and never touches the retained result or the ownership slot.
+        /// </summary>
+        public void NoteReceiptConfirmed()
+        {
+            // UNGATED SHAPE: the receipt was never part of this slot's predicate, so there is
+            // genuinely nothing to re-evaluate — the acknowledgement stays tracking-only.
+            if (receipt is null)
+                return;
+
+            WakeIfReady();
+        }
+
+        /// <summary>
+        /// Completes the ONE parked observation when the readiness predicate holds. A no-op when
+        /// there is nothing parked (a later <see cref="Arm"/> sees the satisfied predicate directly)
+        /// or when the slot has already settled: the wait is never handed out twice, and a fact that
+        /// arrives after settlement can neither produce a second Ready nor resurrect a settled slot.
+        /// </summary>
+        private void WakeIfReady()
+        {
+            TaskCompletionSource? wake;
+            lock (_gate)
+            {
+                if (_settled || !ReadinessHolds_Locked())
+                    return;
+
                 wake = _wake;
             }
 
@@ -1080,9 +1234,17 @@ public sealed class WorkerService(
 
         /// <summary>
         /// SETTLES the ordinary readiness EXACTLY ONCE and returns the ONE retained write (or
-        /// <c>null</c> when the assignment is not eligible, or when the shared claim was already
-        /// taken). The caller joins the returned write; nothing here awaits it.
+        /// <c>null</c> when the readiness predicate does not hold, or when the shared claim was
+        /// already taken). The caller joins the returned write; nothing here awaits it.
         /// </summary>
+        /// <remarks>
+        /// A predicate that does not (yet) hold settles NOTHING: the slot stays unsettled and the
+        /// shared claim stays UNCONSUMED, so a later arrival of the missing fact can still produce
+        /// the assignment's single Ready and a matching cancel still retains its fallback. This is
+        /// the SAME gate every drain and ownership transition consults, so no drain can ever emit an
+        /// unacknowledged ordinary Ready — and no drain ever waits for an acknowledgement, because a
+        /// missing receipt simply settles nothing.
+        /// </remarks>
         /// <param name="startWrite">
         /// Starts the single readiness write and returns the ORIGINAL task for it — the very task
         /// every ownership transition joins. It is invoked at most once, INSIDE this slot's lock, so
@@ -1096,9 +1258,11 @@ public sealed class WorkerService(
                 if (_settled)
                     return _write;
 
-                // NOT ELIGIBLE: leave the shared claim UNCONSUMED so a cancel handler can still emit
-                // its fallback single Ready, exactly as the pre-split body did.
-                if (!_eligible)
+                // THE PREDICATE, NOT MERELY ELIGIBILITY. A gated assignment whose receipt has not
+                // been confirmed yet starts nothing and leaves the shared claim UNCONSUMED, exactly
+                // as an ineligible assignment does, so the cancel handler's fallback single Ready is
+                // preserved.
+                if (!ReadinessHolds_Locked())
                     return null;
 
                 _settled = true;
@@ -1143,6 +1307,68 @@ public sealed class WorkerService(
     private void InstallActiveAssignment(ActiveAssignment assignment) => _activeAssignment = assignment;
 
     /// <summary>
+    /// THE FIXED, SECRET-FREE protocol error text for an unexpected successor assignment that arrived
+    /// BEFORE the retained predecessor's authorized ordinary Ready write task had been started.
+    /// </summary>
+    internal const string AssignmentBeforeAuthorizedReadyMessage =
+        "Assignment received before authorized Ready.";
+
+    /// <summary>
+    /// OWNERSHIP BOUNDARY — THE PRE-READY ASSIGNMENT REFUSAL. Consulted from the message loop BEFORE
+    /// any replacement drain, runner reset, successor installation or successor execution, so a
+    /// refused assignment provably leaves the predecessor's work, the runner and the ownership slot
+    /// exactly as they were.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHERE THE BOUNDARY IS. For a connection whose ACCEPTED registration carried BOTH negotiated
+    /// facts, the orchestrator advertised that this registration's NEXT ordinary assignment waits for
+    /// an accepted Ready after its negotiated completion. An assignment that arrives while a
+    /// predecessor is still retained is therefore legitimate ONLY once this worker has actually
+    /// STARTED AND RETAINED that predecessor's authorized ordinary Ready write task — which is the
+    /// point at which the server could have received the Ready and dispatched the successor. The
+    /// boundary is deliberately NOT local write COMPLETION (the dispatched successor may well run
+    /// while the write is still in flight) and NOT merely having eligible facts (eligibility, a
+    /// terminated Complete and a confirmed receipt are predicate facts, not a sent Ready).
+    /// </para>
+    /// <para>
+    /// A READER-FIRST TIE IS THE PRE-BOUNDARY CASE. If the loop wins the race and receives the
+    /// assignment before the readiness settlement has run, the predecessor has eligible facts but no
+    /// started write, so the assignment is refused — merely being eligible is not authorization.
+    /// </para>
+    /// <para>
+    /// NO RETAINED OWNER IS ALWAYS ALLOWED. The initial assignment, and any state after the EXISTING
+    /// explicit ownership clear (a matching cancel, or a completed teardown drain), has nothing to
+    /// authorize against, so the ordinary assignment path proceeds untouched.
+    /// </para>
+    /// <para>
+    /// LEGACY AND ACK-ONLY CONNECTIONS ARE BYTE-IDENTICAL TO BEFORE. With the gate disabled — the
+    /// ACK-only shape, the readiness-requirement-only shape, and a connection that negotiated neither
+    /// fact — this returns immediately, so the existing replacement drain and its behavior are
+    /// completely unchanged. Nothing is inferred here: no acknowledgement, no completion and no
+    /// synthesized result.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">The connection the assignment arrived on.</param>
+    /// <exception cref="InvalidOperationException">
+    /// A both-flags connection retained a predecessor whose authorized ordinary Ready write task had
+    /// not yet been started. The text is the fixed <see cref="AssignmentBeforeAuthorizedReadyMessage"/>.
+    /// </exception>
+    private void RefuseAssignmentBeforeAuthorizedReady(WorkerConnection connection)
+    {
+        // LEGACY / ACK-ONLY FIRST: the boundary does not exist for those shapes at all.
+        if (!OrdinaryReadyGateEnabled(connection))
+            return;
+
+        // THE BOUNDARY. A retained predecessor whose ordinary Ready write task was never started has
+        // authorized nothing, so the successor is refused BEFORE it can reset the runner, install
+        // itself, or begin any work — and no ACK, completion or buffered assignment is invented to
+        // paper over the gap.
+        if (_activeAssignment is { } retained && !retained.OrdinaryReady.HasStartedWrite)
+            throw new InvalidOperationException(AssignmentBeforeAuthorizedReadyMessage);
+    }
+
+    /// <summary>
     /// Ownership transition — DRAIN-THEN-CLEAR on REPLACEMENT. Awaits BOTH the retained execution
     /// and its reporting WITHOUT cancelling them (their Ready already flowed, so they are finished
     /// or finishing), disposes the CTS, and only then clears the slot.
@@ -1153,6 +1379,13 @@ public sealed class WorkerService(
     /// resets the shared runner, while the original execution or its report is still running. With
     /// <c>cancelFirst: false</c> there is no cancellation callback to fail, so nothing is deferred
     /// here.
+    /// <para>
+    /// It also joins any already-started ordinary readiness write (the drain's shared settlement
+    /// returns the retained task for a slot that was already settled), so a successor's replacement
+    /// joins that write BEFORE the runner is reset or the ownership slot is cleared. This is the
+    /// post-boundary half of the negotiated successor rule; the pre-boundary half is the refusal
+    /// above, and neither path ever waits for an acknowledgement.
+    /// </para>
     /// </remarks>
     private async Task DrainRetainedForReplacementAsync()
     {
@@ -1280,13 +1513,28 @@ public sealed class WorkerService(
     /// </para>
     /// <para>
     /// TWO WAITS, ONE READER. The loop owns exactly ONE pending response read and, beside it, the
-    /// retained assignment's ordinary-readiness fact. A COMPLETELY QUIET response stream therefore
-    /// still wakes the loop when an assignment's report terminates: the readiness fact is observed
-    /// ONCE (the slot stops handing out an awaitable signal as soon as it is settled, so the loop
-    /// can never spin on an already-observed fact) and the ACTUAL Ready write is STARTED and
-    /// RETAINED — never awaited here — so an outstanding Ready write cannot block ToolResponse or
-    /// receipt-ACK consumption. There is no second reader, no dispatch queue, no polling and no
-    /// detached continuation: the loop remains the ONLY ownership transition authority.
+    /// retained assignment's ordinary-readiness observation. A COMPLETELY QUIET response stream
+    /// therefore still wakes the loop when an assignment's report terminates and, in the negotiated
+    /// mode, its receipt is confirmed: the readiness predicate is observed ONCE (the slot stops
+    /// handing out an awaitable signal as soon as it is settled, so the loop can never spin on an
+    /// already-observed fact) and the ACTUAL Ready write is STARTED and RETAINED — never awaited here
+    /// — so an outstanding Ready write cannot block ToolResponse or receipt-ACK consumption. There is
+    /// no second reader, no dispatch queue, no polling and no detached continuation: the loop remains
+    /// the ONLY ownership transition authority.
+    /// </para>
+    /// <para>
+    /// BOTH DRAIN PATHS CONSULT THE SAME GATE. A held WriteAsync — and, in the negotiated mode, a
+    /// withheld ordinary Ready — means the predicate does not hold, so neither an EOF nor any
+    /// ownership transition can emit an unacknowledged Ready. Neither drain ever WAITS for an
+    /// acknowledgement: the gates are pure local facts, and a missing receipt simply settles nothing.
+    /// </para>
+    /// <para>
+    /// THE NEGOTIATED SUCCESSOR BOUNDARY. On a both-flags connection, a successor assignment that
+    /// arrives while a predecessor is still retained is accepted ONLY once that predecessor's
+    /// authorized ordinary Ready write task has been started and retained; before that the assignment
+    /// is refused with the fixed protocol error, and after it the existing replacement drain joins
+    /// the started write before the runner reset and the ownership clear. Legacy and ACK-only
+    /// connections keep their existing replacement behavior unchanged.
     /// </para>
     /// </remarks>
     private async Task ProcessMessagesAsync(WorkerConnection connection, CancellationToken ct)
@@ -1317,11 +1565,14 @@ public sealed class WorkerService(
                 var completed = await Task.WhenAny(pendingRead, readinessWait);
                 if (ReferenceEquals(completed, readinessWait))
                 {
-                    // REPORT TERMINATION, observed even on a completely QUIET stream. The
-                    // eligibility is settled exactly ONCE and the ACTUAL Ready write started from it
-                    // is RETAINED by the assignment — joined by every ownership transition, NEVER
-                    // awaited here — so an outstanding Ready write cannot hold off ToolResponse or
-                    // receipt-ACK consumption.
+                    // REPORT TERMINATION, observed even on a completely QUIET stream. The readiness
+                    // predicate is settled exactly ONCE — when it holds — and the ACTUAL Ready write
+                    // started from it is RETAINED by the assignment — joined by every ownership
+                    // transition, NEVER awaited here — so an outstanding Ready write cannot hold off
+                    // ToolResponse or receipt-ACK consumption. The SAME gate is consulted by every
+                    // drain and ownership transition, so an EOF can never emit an unacknowledged
+                    // ordinary Ready, and a predicate that does not hold settles nothing and waits for
+                    // nothing.
                     if (_activeAssignment is { } reported)
                         _ = SettleOrdinaryReady(reported.OrdinaryReady);
 
@@ -1335,6 +1586,19 @@ public sealed class WorkerService(
                 switch (message.PayloadCase)
                 {
                     case OrchestratorMessage.PayloadOneofCase.Assignment:
+                        // THE PRE-READY BOUNDARY, CHECKED FIRST — before the replacement drain, the
+                        // runner reset, the CTS/claim construction and the successor installation. On
+                        // a connection whose accepted registration carried BOTH negotiated facts, an
+                        // assignment that arrives while a predecessor is retained is legitimate ONLY
+                        // once that predecessor's authorized ordinary Ready write task has actually
+                        // been STARTED and RETAINED (the point at which the server could have received
+                        // the Ready and dispatched this successor). Otherwise this throws the FIXED
+                        // protocol error and NOTHING has happened yet: no runner reset, no successor
+                        // installed or executed, no ACK inferred and no work buffered. Legacy and
+                        // ACK-only connections return immediately, so their replacement behavior is
+                        // byte-identical to before.
+                        RefuseAssignmentBeforeAuthorizedReady(connection);
+
                         // Task-assignment ownership is serialized: only one task may ever own the
                         // mutable runner and its LLM client, so the previous one is drained BEFORE
                         // the runner is reset. Single-flight Ready (above) ensures the orchestrator
@@ -1346,7 +1610,9 @@ public sealed class WorkerService(
                             // means a new assignment only follows a Ready this assignment already
                             // emitted, so its execution and its report are finished or finishing.
                             // Cancelling here would abort work that the orchestrator still expects
-                            // to complete.
+                            // to complete. On a both-flags connection this drain is reached only
+                            // AFTER the boundary above, so it also joins the already-started
+                            // ordinary Ready write before the runner reset and the ownership clear.
                             await DrainRetainedForReplacementAsync();
                         }
 
@@ -1374,17 +1640,28 @@ public sealed class WorkerService(
                         var bodyCts = taskCts;
                         var terminalResult = new TerminalResultHolder();
 
+                        // THE ASSIGNMENT-LOCAL RECEIPT TRACKER, bound to THIS connection and created
+                        // alongside the result holder — before either owned task starts, so it is
+                        // reachable by the reporting flow (through its closure), by the readiness slot
+                        // below and by its eventual owner (installed below) before any execution or
+                        // reporting can run.
+                        var receipt = new CompletionReceiptTracker(connection);
+
                         // THE ASSIGNMENT-LOCAL ORDINARY-READINESS SLOT, created alongside the claim
                         // and bound to THIS connection and THIS stream token — before either task
                         // starts, so the reporting flow publishes into it and the loop observes it
                         // without either ever discovering it through the ownership slot.
-                        var ordinaryReady = new OrdinaryReadySlot(connection, ct, readyClaim);
-
-                        // THE ASSIGNMENT-LOCAL RECEIPT TRACKER, bound to THIS connection and created
-                        // alongside the result holder — before either owned task starts, so it is
-                        // reachable by the reporting flow (through its closure) and by its eventual
-                        // owner (installed below) before any execution or reporting can run.
-                        var receipt = new CompletionReceiptTracker(connection);
+                        //
+                        // THE GATED SHAPE IS CHOSEN ONCE, HERE, from the two IMMUTABLE negotiated
+                        // facts of the ACCEPTED registration this assignment arrived on: only when
+                        // BOTH are true is the tracker handed in, so the ordinary Ready then waits for
+                        // the mapped/armed Complete whose original local write terminated plus a
+                        // matching receipt. Every other combination builds the UNGATED slot and keeps
+                        // today's behavior exactly — the initial Ready is sent by SendWorkerReady
+                        // before this loop and is ungated in every mode.
+                        var ordinaryReady = OrdinaryReadyGateEnabled(connection)
+                            ? new OrdinaryReadySlot(connection, ct, readyClaim, receipt)
+                            : new OrdinaryReadySlot(connection, ct, readyClaim);
 
                         // THE CONNECTION-BOUND DEPENDENCY PAIR for this assignment. Built from the
                         // assignment's EXPECTED connection BEFORE either task starts, and the SAME
@@ -1649,10 +1926,11 @@ public sealed class WorkerService(
 
     /// <summary>
     /// The readiness wait for the CURRENTLY retained assignment: the assignment's ONE armed
-    /// observation of its ordinary-Ready eligibility. Nothing retained means a never-completing
-    /// task, and a SETTLED assignment also yields a never-completing await — so the loop neither
-    /// polls, re-arms, nor accumulates waiters, and a started readiness write is never raced here
-    /// (the ownership transitions join it instead).
+    /// observation of its ordinary-Ready readiness predicate — eligibility, plus (in the gated shape)
+    /// the mapped/armed Complete whose original local write terminated and a matching receipt
+    /// confirmation. Nothing retained means a never-completing task, and a SETTLED assignment also
+    /// yields a never-completing await — so the loop neither polls, re-arms, nor accumulates waiters,
+    /// and a started readiness write is never raced here (the ownership transitions join it instead).
     /// </summary>
     private Task OrdinaryReadinessWait() =>
         _activeAssignment is { } assignment
@@ -1666,11 +1944,33 @@ public sealed class WorkerService(
     private static readonly Task NeverCompletingTask = new TaskCompletionSource().Task;
 
     /// <summary>
-    /// SETTLES the retained assignment's ordinary-Ready eligibility EXACTLY ONCE and STARTS the
-    /// single readiness write from it — WITHOUT awaiting that write here, so the settlement can
-    /// never hold a caller (the response loop, or an ownership transition) off. Returns the ONE
-    /// retained write for the caller to join, or <c>null</c> when the assignment is not eligible or
-    /// the shared claim was already taken.
+    /// THE ONE PLACE THE GATED ORDINARY READINESS IS DECIDED: <c>true</c> only when the ACCEPTED
+    /// registration behind <paramref name="connection"/> carried BOTH negotiated facts.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ACK answer alone is the previous tracking-only behavior — the receipt is still recorded, and
+    /// the ordinary Ready is still ungated. The readiness requirement alone, and neither fact at all,
+    /// are the fully legacy behavior. Only BOTH together gate the ordinary Ready.
+    /// </para>
+    /// <para>
+    /// It reads the two IMMUTABLE per-connection facts directly and derives nothing: no version, no
+    /// capability and no model is consulted, and no third fact is inferred from these two. Because
+    /// both are the assignment's OWN connection's facts, a successor registration can never gate — or
+    /// ungate — this assignment's readiness.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">The connection the assignment arrived on.</param>
+    /// <returns><c>true</c> when the ordinary Ready must wait for a confirmed receipt.</returns>
+    private static bool OrdinaryReadyGateEnabled(WorkerConnection connection) =>
+        connection.CompletionReceiptAckEnabled && connection.CompletionReadyRequired;
+
+    /// <summary>
+    /// SETTLES the retained assignment's ordinary readiness EXACTLY ONCE — when its predicate holds —
+    /// and STARTS the single readiness write from it — WITHOUT awaiting that write here, so the
+    /// settlement can never hold a caller (the response loop, or an ownership transition) off. Returns
+    /// the ONE retained write for the caller to join, or <c>null</c> when the predicate does not hold
+    /// or the shared claim was already taken.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1681,6 +1981,12 @@ public sealed class WorkerService(
     /// assignment's ORIGINAL connection object and its ORIGINAL stream token, so it can never be
     /// retargeted at a successor assignment or connection. The write is started ONCE: a failed (or
     /// cancelled) write consumes the shared claim and is never retried.
+    /// </para>
+    /// <para>
+    /// THE SAME GATE FOR EVERY CALLER. This is the single settlement entry point, so the response loop
+    /// and all three ownership-transition drains decide the ordinary Ready from IDENTICAL facts. In the
+    /// negotiated mode an unconfirmed receipt is simply a predicate that does not hold, so the ordinary
+    /// Ready is withheld — including across an EOF — while nothing here waits for an acknowledgement.
     /// </para>
     /// <para>
     /// ERROR PRECEDENCE. A failed ordinary Ready write is NONFATAL, exactly as the previous
@@ -1711,7 +2017,8 @@ public sealed class WorkerService(
     /// <summary>
     /// THE COMPLETION-RECEIPT ACK CASE. It records — idempotently, on the assignment the loop still
     /// retains — that the orchestrator acknowledged durably retaining that task's completion
-    /// evidence, and does nothing else whatsoever.
+    /// evidence, and it notifies the retained assignment's ordinary-readiness observation so that a
+    /// Ready which was waiting for exactly this fact can proceed. It does nothing else whatsoever.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1722,6 +2029,15 @@ public sealed class WorkerService(
     /// <c>WorkerId</c> against this connection's assigned identity. Nothing is parsed, trimmed,
     /// normalized or case-folded, and an acknowledgement is NEVER inferred from a completed write,
     /// a <c>Ready</c>, or the arrival of a successor assignment.
+    /// </para>
+    /// <para>
+    /// THE NOTIFICATION IS PURE AND ONLY IN THE GATED SHAPE. It re-evaluates the assignment's own
+    /// readiness predicate for whoever is parked on it — an acknowledgement that arrived while the
+    /// Complete write was still pending simply parks the reader until that write's termination is
+    /// also observed, and one that arrived first wakes a reader that already has every other fact. It
+    /// never awaits, never joins the write, never takes the Ready claim and never writes: the actual
+    /// Ready is still produced by the ONE settlement. In the ACK-only shape the slot's predicate does
+    /// not include the receipt, so this is genuinely a no-op and tracking is unchanged.
     /// </para>
     /// <para>
     /// EVERYTHING ELSE IS UNTOUCHED. It never clears the retained result or the ownership slot,
@@ -1765,6 +2081,14 @@ public sealed class WorkerService(
         // returns true for the FIRST accepted receipt only, so duplicates change nothing.
         if (!assignment.Receipt.TryConfirm(connection))
             return;
+
+        // WAKE — the ONLY other thing this case does, and only in the GATED shape. In that shape the
+        // ordinary readiness was withheld pending exactly this fact, so the parked readiness
+        // observation is re-evaluated and completes now that the predicate holds. This is pure
+        // notification: it does NOT await, does NOT join (or resend, or complete) the Complete write,
+        // does NOT consume the Ready claim, and touches neither the retained result nor the ownership
+        // slot. In the UNGATED shape there is nothing to wake, so the receipt stays tracking-only.
+        assignment.OrdinaryReady.NoteReceiptConfirmed();
 
         // ONE GUARDED DIAGNOSTIC, for the first accepted receipt only. It states RETENTION of the
         // completion evidence and nothing more — not processing, not phase advancement, not that
@@ -1829,10 +2153,12 @@ public sealed class WorkerService(
             await CaptureJoinFailureAsync(assignment.Reporting), DrainObservedFaultMessage);
 
         // THEN SETTLE AND JOIN THE ORDINARY READINESS WRITE — the third owned task an assignment can
-        // now have outstanding. Settlement is EXACTLY ONCE and shared with the response loop: a
-        // transition that sees the report terminate before the loop could therefore still start the
-        // single Ready (it is never lost), while a loop that already started it leaves the shared
-        // claim consumed (so the cancel fallback below can never duplicate it).
+        // now have outstanding. Settlement is EXACTLY ONCE and shared with the response loop, and it
+        // consults the SAME gate: a transition that sees the report terminate before the loop could
+        // therefore still start the single Ready (it is never lost), while a loop that already started
+        // it leaves the shared claim consumed (so the cancel fallback below can never duplicate it). A
+        // predicate that does not hold — in the negotiated mode an unconfirmed receipt — settles
+        // nothing and WAITS for nothing: no drain ever blocks on an acknowledgement.
         var readinessWrite = SettleOrdinaryReady(assignment.OrdinaryReady);
         if (readinessWrite is not null)
         {
@@ -1892,16 +2218,16 @@ public sealed class WorkerService(
     /// <summary>
     /// CONNECTION-BOUND REPORTING for ONE assignment: it awaits the ORIGINAL execution task,
     /// consumes the already-retained terminal result for the Complete mapping, write and completion
-    /// diagnostic, clears the heartbeat's task state, and PUBLISHES the ordinary-Ready eligibility
-    /// for its owner to settle.
+    /// diagnostic, publishes the termination of that write, clears the heartbeat's task state, and
+    /// PUBLISHES the ordinary-Ready eligibility for its owner to settle.
     /// </summary>
     /// <remarks>
     /// <para>
     /// ASSIGNMENT-LOCAL INPUTS ONLY. Every value it needs — the ORIGINAL execution task, the domain
-    /// task, the EXPECTED connection, the holder and the eligibility slot — is passed in by the
-    /// assignment handler that created them. Nothing is discovered through the ownership slot and
-    /// nothing is re-read from the published connection, so a report can never be retargeted to a
-    /// later registration.
+    /// task, the EXPECTED connection, the holder, the receipt tracker and the readiness slot — is
+    /// passed in by the assignment handler that created them. Nothing is discovered through the
+    /// ownership slot and nothing is re-read from the published connection, so a report can never be
+    /// retargeted to a later registration.
     /// </para>
     /// <para>
     /// THE PRODUCER JOIN IS UNCONDITIONAL. The execution task is awaited directly (never through a
@@ -1915,11 +2241,12 @@ public sealed class WorkerService(
     /// "a result exists": a handled provisioning failure produces NO result, no Complete, the
     /// existing exception handling (OCE-tolerant/sanitized) and yet still publishes the eligibility.
     /// It is NOT inferred from local send success either: a failed or cancelled Complete leaves the
-    /// eligibility published exactly as the pre-split body would still have attempted Ready. A
-    /// pre-start execution cancellation or an escaping diagnostic leaves it UNPUBLISHED, so the
-    /// shared Ready claim stays UNCONSUMED and a matching cancel can still emit its fallback single
-    /// Ready. Reporting never awaits an acknowledgement, readiness, or the readiness WRITE: it
-    /// terminates independently of it.
+    /// eligibility published (and, separately, its own terminated-write fact published) exactly as the
+    /// pre-split body would still have attempted Ready. A pre-start execution cancellation or an
+    /// escaping diagnostic leaves the eligibility UNPUBLISHED, so the shared Ready claim stays
+    /// UNCONSUMED and a matching cancel can still emit its fallback single Ready. Reporting never
+    /// awaits an acknowledgement, readiness, or the readiness WRITE: it terminates independently of
+    /// it, and it makes its existing ONE Complete attempt in every mode.
     /// </para>
     /// </remarks>
     /// <param name="execution">The ORIGINAL execution task this report belongs to.</param>
@@ -1938,9 +2265,10 @@ public sealed class WorkerService(
     /// publication and the send below is unchanged.
     /// </param>
     /// <param name="ordinaryReady">
-    /// The assignment-local ordinary-readiness slot this report PUBLISHES into. The owner (the
-    /// response loop) is the only observer, and it starts the single readiness write from the
-    /// published fact.
+    /// The assignment-local ordinary-readiness slot this report PUBLISHES into — the eligibility at
+    /// the old ordinary-Ready point, and the termination of the single Complete write. The owner (the
+    /// response loop, or an ownership transition) is the only observer, and it starts the single
+    /// readiness write once the slot's whole predicate holds.
     /// </param>
     private async Task ReportAssignmentAsync(
         Task execution,
@@ -1970,13 +2298,29 @@ public sealed class WorkerService(
                 if (connection.CompletionReceiptAckEnabled)
                     receipt.Arm();
 
-                await SendAsync(connection, new WorkerMessage
+                // THE ORIGINAL LOCAL WRITE, OBSERVED TO TERMINATION. This is the single Complete
+                // attempt and NOTHING here changes its outcome: success, failure and cancellation
+                // each keep propagating exactly as before, the send permit is still released by the
+                // send itself, the error is never replaced and the retained result is never altered.
+                // The `finally` adds only the FACT that the attempt has terminated — which the GATED
+                // ordinary readiness needs before it can authorize a Ready, because an
+                // acknowledgement means the evidence was durably retained, not that this local write
+                // succeeded. Publishing that fact consumes no Ready claim, writes nothing and waits
+                // for nothing.
+                try
                 {
-                    WorkerId = connection.AssignedId,
-                    Complete = completion,
-                }, ordinaryReady.StreamToken);
+                    await SendAsync(connection, new WorkerMessage
+                    {
+                        WorkerId = connection.AssignedId,
+                        Complete = completion,
+                    }, ordinaryReady.StreamToken);
 
-                _log.Info($"Task {task.TaskId} completed ({result.Status})");
+                    _log.Info($"Task {task.TaskId} completed ({result.Status})");
+                }
+                finally
+                {
+                    ordinaryReady.PublishCompleteWriteTerminated();
+                }
             }
         }
         catch (OperationCanceledException) { }
