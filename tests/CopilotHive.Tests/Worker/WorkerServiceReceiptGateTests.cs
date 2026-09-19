@@ -444,6 +444,230 @@ public sealed class WorkerServiceReceiptGateTests
         }
     }
 
+
+    /// <summary>
+    /// CANCELLED LOCAL COMPLETE TERMINATION — the missing third termination state. The exact ACK
+    /// arrives FIRST while the Complete write is held; releasing that ORIGINAL write then makes it
+    /// terminate Canceled (the writer's cancellable overload reports the in-write cancellation),
+    /// and only after that termination does the one Ready follow. The ACK never completes the write,
+    /// never replaces its cancellation, and never changes the retained result.
+    /// <para>
+    /// MUTATION PROOF. Removing <c>PublishCompleteWriteTerminated</c> from the write's finally — or
+    /// withdrawing authorization specifically for a cancelled write — leaves Ready absent and fails
+    /// the named rendezvous. Treating the early ACK as write completion fails the pre-termination
+    /// zero-Ready/claim assertions. Treating cancellation as a failed execution would suppress Ready
+    /// and fail the same rendezvous.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task GatedMode_EarlyAckThenCancelledCompleteTermination_PreservesCancellationBeforeSingleReady()
+    {
+        var runner = new GatedRunner();
+        var injected = new OperationCanceledException("injected local Complete cancellation");
+        var writer = new GatedWriter
+        {
+            HoldCompletes = true,
+            FailCompleteAtIndexZero = injected,
+        };
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        var completeCancelled = new TaskCompletionSource<OperationCanceledException>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        writer.OnCompleteCancelled = (_, cancellation) => completeCancelled.TrySetResult(cancellation);
+
+        Task? execution = null;
+        Task? reporting = null;
+        Task? readinessWrite = null;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retainedBeforeCancellation = Assert.IsType<TaskResult>(GetRetainedResult(service));
+            var readyClaim = GetOwnerReadyClaim(service);
+
+            // RECEIPT FIRST while the original Complete write is still pending. A trailing probe
+            // proves the ACK handler returned; the write remains held and nothing has settled.
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            reader.Push(Probe("cancelled-write-ack-handler-returned")); // message 3
+            await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptConfirmed(GetOwnerReceipt(service)));
+            Assert.False(reporting.IsCompleted);
+            Assert.Equal(0, writer.ReadyCount);
+            Assert.Equal(0, GetReadyClaimState(readyClaim));
+
+            // The ORIGINAL writer task now terminates CANCELED from inside its cancellable path.
+            writer.ReleaseComplete(0);
+            var observedCancellation = await completeCancelled.Task.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+            Assert.Same(
+                injected,
+                observedCancellation);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(
+                reporting.IsCompletedSuccessfully,
+                "Reporting observes a cancelled local Complete write without replacing its outcome.");
+
+            // RECEIPT + CANCELLED TERMINATION + ELIGIBILITY authorize exactly one Ready.
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(0),
+                "A cancelled-but-terminated Complete write must still authorize Ready after its ACK.");
+            readinessWrite = CaptureReadinessWrite(service, "The cancelled-write Ready must be retained.");
+            Assert.Equal(1, GetReadyClaimState(readyClaim));
+            Assert.Same(retainedBeforeCancellation, GetRetainedResult(service));
+            Assert.Single(writer.Completes);
+
+            writer.ReleaseReady(0);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+        }
+        finally
+        {
+            writer.OnCompleteCancelled = null;
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// ELIGIBILITY IS AN INDEPENDENT REQUIRED CONJUNCT. The Complete is mapped/ARMED, the exact
+    /// receipt is CONFIRMED, and the original local Complete write has TERMINATED — but reporting
+    /// is deliberately held in its success diagnostic BEFORE its finally publishes eligibility.
+    /// Ready must remain absent until that diagnostic is released and eligibility is published.
+    /// <para>
+    /// MUTATION PROOF. Removing <c>_eligible</c> from <c>ReadinessHolds_Locked</c> makes the ACK wake
+    /// settle Ready while this test still holds reporting at the diagnostic; the bounded
+    /// non-completion assertion then fails (ReadyEntered completes instead of timing out). This
+    /// varies only the eligibility conjunct: arm, receipt and write termination are all asserted
+    /// true first.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task GatedMode_ArmedConfirmedTerminatedButIneligible_WithholdsReadyUntilEligibilityPublishes()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter { HoldCompletes = true };
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        var originalOut = Console.Out;
+        var originalErr = Console.Error;
+        var output = new StringWriter();
+        var successDiagnosticFailure = new EligibilityDiagnosticException();
+        var successThrower = new MarkerThrowingWriter(
+            "Task task-A completed", output, successDiagnosticFailure);
+        var diagnosticGate = new MarkerBlockingWriter("Task execution failed", output);
+        Task? execution = null;
+        Task? reporting = null;
+        Task? readinessWrite = null;
+        try
+        {
+            // The successful completion diagnostic throws; its enclosing inner finally publishes
+            // the terminated-write fact. The outer catch then enters the blocking error diagnostic,
+            // holding reporting before its outer finally can publish eligibility.
+            Console.SetOut(successThrower);
+            Console.SetError(diagnosticGate);
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            var receipt = GetOwnerReceipt(service);
+            var slot = GetOwnerOrdinaryReady(service);
+            var claim = GetOwnerReadyClaim(service);
+            Assert.True(GetReceiptArmed(receipt), "The successfully mapped Complete is armed.");
+            Assert.False(IsOrdinaryReadyEligible(slot), "Eligibility is deliberately still false.");
+
+            // RECEIPT FIRST while the Complete is still held. The ACK handler can return before the
+            // diagnostic gate is entered, so the Console.Out synchronization cannot mask the
+            // handler-return barrier.
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            reader.Push(Probe("ineligible-ack-handler-returned")); // message 3
+            await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.False(IsOrdinaryReadyEligible(slot));
+            Assert.Equal(0, GetReadyClaimState(claim));
+
+            // Now terminate the original Complete write. The success diagnostic throws AFTER
+            // SendAsync returned; its inner finally publishes the terminated-write fact. Entering
+            // the blocking OUTER error diagnostic therefore proves termination is published while
+            // eligibility is still false (the outer finally has not run).
+            writer.ReleaseComplete(0);
+            await diagnosticGate.Entered.Task.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.True(execution.IsCompleted);
+            Assert.False(reporting.IsCompleted, "Reporting is held before eligibility publication.");
+            Assert.Single(writer.Completes);
+            Assert.True(GetReceiptConfirmed(receipt));
+            Assert.False(IsOrdinaryReadyEligible(slot));
+            Assert.Equal(0, GetReadyClaimState(claim));
+
+            // POSITIVE NON-COMPLETION while ONLY eligibility is absent.
+            var prematureReady = await Record.ExceptionAsync(() =>
+                writer.ReadyEntered(0).WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(prematureReady);
+            Assert.Equal(0, writer.ReadyCount);
+
+            // Release the diagnostic: reporting's finally now publishes eligibility. The same
+            // already-armed/confirmed/terminated facts immediately authorize exactly one Ready.
+            diagnosticGate.Release();
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(0),
+                "Publishing the final eligibility conjunct must authorize the one Ready.");
+            readinessWrite = CaptureReadinessWrite(service, "Eligibility publication must retain Ready.");
+            writer.ReleaseReady(0);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            diagnosticGate.Release();
+            Console.SetOut(originalOut);
+            Console.SetError(originalErr);
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
+                ("loop", loop));
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // (c) Suppression ONLY in both-flags mode.
     // ══════════════════════════════════════════════════════════════════════════
@@ -460,6 +684,7 @@ public sealed class WorkerServiceReceiptGateTests
     [Theory]
     [InlineData(false, false, true)]
     [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
     [InlineData(true, true, false)]
     public async Task MissingResult_SuppressesReadyOnlyInGatedMode(
         bool readyRequired, bool ackEnabled, bool expectReady)
@@ -562,6 +787,7 @@ public sealed class WorkerServiceReceiptGateTests
     [Theory]
     [InlineData(false, false, true)]
     [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
     [InlineData(true, true, false)]
     public async Task MappingFailure_SuppressesReadyOnlyInGatedMode(
         bool readyRequired, bool ackEnabled, bool expectReady)
@@ -607,21 +833,26 @@ public sealed class WorkerServiceReceiptGateTests
             };
             holderType.GetMethod("Publish")!.Invoke(holder, [unmappable]);
 
-            // THE SLOT, in the EXACT shape the assignment handler builds for this mode: gated
-            // (both flags) hands in the receipt tracker; every other combination leaves it out.
+            // THE SLOT, in the EXACT shape the assignment handler builds for this mode. The shape
+            // is selected by invoking production's OWN OrdinaryReadyGateEnabled predicate — NEVER
+            // from expectReady — so a mutation from `ack && readyRequired` to `readyRequired`
+            // changes the 10 cell to a gated slot and is killed by its expected ungated Ready.
+            var gateEnabled = InvokeOrdinaryReadyGateEnabled(connection);
+            Assert.Equal(!expectReady, gateEnabled);
+
             var slotType = serviceType.GetNestedType("OrdinaryReadySlot", BindingFlags.NonPublic)!;
-            var ordinaryReady = expectReady
+            var ordinaryReady = gateEnabled
                 ? Activator.CreateInstance(
                     slotType,
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                     binder: null,
-                    args: [connection, CancellationToken.None, ready],
+                    args: [connection, CancellationToken.None, ready, receipt],
                     culture: null)!
                 : Activator.CreateInstance(
                     slotType,
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                     binder: null,
-                    args: [connection, CancellationToken.None, ready, receipt],
+                    args: [connection, CancellationToken.None, ready],
                     culture: null)!;
 
             reporting = (System.Threading.Tasks.Task)serviceType.GetMethod(
@@ -1663,8 +1894,12 @@ public sealed class WorkerServiceReceiptGateTests
             // NO ACK: the ordinary gate withholds the settlement, so the shared claim is FREE for
             // the cancel fallback.
             var owner = GetActiveAssignment(service);
+            var capturedReceipt = OwnerReceiptOf(owner!);
             var readyClaim = GetOwnerReadyClaim(service);
             Assert.Equal(0, GetReadyClaimState(readyClaim));
+            Assert.False(
+                GetReceiptConfirmed(capturedReceipt),
+                "Precondition: no receipt has been confirmed before the cancel fallback.");
 
             var readsBeforeCancel = reader.ReadsStarted;
 
@@ -1689,21 +1924,40 @@ public sealed class WorkerServiceReceiptGateTests
             // THE CLAIM WAS CONSUMED EXACTLY ONCE by the fallback; no retry or re-send follows.
             Assert.Equal(1, GetReadyClaimState(readyClaim));
             Assert.Equal(1, writer.ReadyCount);
+            Assert.False(
+                GetReceiptConfirmed(capturedReceipt),
+                "The cancel fallback itself must NOT be treated as receipt confirmation.");
 
             // THE FALLBACK IS NOT RECEIPT CONFIRMATION. A LATER ACK for that task — after the clear
-            // — confirms NOTHING: the slot is empty, so the receipt has no assignment to land on,
-            // no second Ready is written, and the fallback is not re-sent.
-            reader.Push(ReceiptAck(TaskA, connection.AssignedId));
-            reader.Push(Probe("after-late-ack"));
+            // — confirms NOTHING on the CAPTURED predecessor receipt, writes no second Ready, and
+            // cannot re-send the fallback. The count-4 barrier names the trailing probe and is
+            // proved incomplete both before the ACK and after only the ACK (message 3) is consumed.
+            var lateAckHandlerReturned = reader.Consumed(4);
+            Assert.False(lateAckHandlerReturned.IsCompleted);
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 3
             await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(
+                lateAckHandlerReturned.IsCompleted,
+                "The trailing-probe barrier must not be satisfied by consuming the ACK itself.");
+            reader.Push(Probe("after-late-ack")); // message 4
+            await lateAckHandlerReturned.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.False(
+                GetReceiptConfirmed(capturedReceipt),
+                "A late ACK after cancel-clear must not confirm the captured predecessor receipt.");
             Assert.Equal(1, writer.ReadyCount);
             Assert.Null(GetActiveAssignment(service));
 
-            // The connection binding is preserved: a further probe is still consumed on the SAME
-            // loop, and the connection was never retired by a matching cancel.
+            // The connection binding is preserved: the NEW binding probe is message 5. Its own
+            // milestone is created and proved incomplete BEFORE the push, so it cannot pass on the
+            // prior ACK or trailing probe.
             Assert.False(connection.IsRetired);
-            reader.Push(Probe("binding-check"));
-            await reader.Consumed(4).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var bindingProbeConsumed = reader.Consumed(5);
+            Assert.False(bindingProbeConsumed.IsCompleted);
+            reader.Push(Probe("binding-check")); // message 5
+            await bindingProbeConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(6).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
             reader.TryComplete();
             await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
@@ -2086,6 +2340,16 @@ public sealed class WorkerServiceReceiptGateTests
     }
 
     /// <summary>
+    /// Invokes production's OWN gate-selection predicate. This keeps direct-reporting fixtures
+    /// wired to the exact predicate the real Assignment handler uses, so mutating
+    /// <c>ack &amp;&amp; required</c> to either single flag changes the test's slot shape and is observable.
+    /// </summary>
+    private static bool InvokeOrdinaryReadyGateEnabled(WorkerConnection connection) =>
+        (bool)typeof(WorkerService)
+            .GetMethod("OrdinaryReadyGateEnabled", BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, [connection])!;
+
+    /// <summary>
     /// Invokes the production settlement for a slot and returns the ONE retained write (or
     /// <c>null</c> when the readiness predicate does not hold / the claim was already taken) — the
     /// identical entry point the loop and every ownership transition use.
@@ -2368,7 +2632,7 @@ public sealed class WorkerServiceReceiptGateTests
             set { lock (_gate) _failCompleteAtIndexZero = value; }
         }
 
-        internal Action<int>? OnCompleteCancelled { get; set; }
+        internal Action<int, OperationCanceledException>? OnCompleteCancelled { get; set; }
 
         internal IReadOnlyList<WorkerMessage> Completes
         {
@@ -2410,10 +2674,20 @@ public sealed class WorkerServiceReceiptGateTests
                 {
                     await release.Task.WaitAsync(ct);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException cancelled)
                 {
-                    OnCompleteCancelled?.Invoke(index);
+                    OnCompleteCancelled?.Invoke(index, cancelled);
                     throw;
+                }
+
+                if (failure is OperationCanceledException injectedCancellation)
+                {
+                    // A test-injected CANCELLED local termination is reported from inside the
+                    // actual cancellable writer path, immediately before that original write task
+                    // terminates as Canceled. The loop token itself stays live, so the separately
+                    // authorized Ready can still be written afterwards.
+                    OnCompleteCancelled?.Invoke(index, injectedCancellation);
+                    throw injectedCancellation;
                 }
 
                 if (failure is not null)
@@ -2691,7 +2965,64 @@ public sealed class WorkerServiceReceiptGateTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
+    /// <summary>
+    /// A diagnostic writer that throws on one marker and forwards everything else. The throw is
+    /// used to enter reporting's real catch after the inner write-termination finally has run.
+    /// </summary>
+    private sealed class MarkerThrowingWriter(
+        string marker, TextWriter inner, Exception failure) : TextWriter
+    {
+        public override System.Text.Encoding Encoding => inner.Encoding;
+
+        public override void WriteLine(string? value)
+        {
+            if (value?.Contains(marker, StringComparison.Ordinal) == true)
+                throw failure;
+            inner.WriteLine(value);
+        }
+
+        public override void Write(string? value) => inner.Write(value);
+        public override void Write(char value) => inner.Write(value);
+    }
+
+    /// <summary>
+    /// A diagnostic writer that blocks ONE marker line synchronously on the production logging
+    /// stack. This creates a deterministic window after the Complete write's termination fact is
+    /// published but before reporting's outer finally publishes eligibility — no sleep, polling or
+    /// production hook.
+    /// </summary>
+    private sealed class MarkerBlockingWriter(string marker, TextWriter inner) : TextWriter
+    {
+        private readonly TaskCompletionSource _release = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource Entered { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override System.Text.Encoding Encoding => inner.Encoding;
+
+        public override void WriteLine(string? value)
+        {
+            if (value?.Contains(marker, StringComparison.Ordinal) == true)
+            {
+                Entered.TrySetResult();
+                _release.Task.GetAwaiter().GetResult();
+            }
+
+            inner.WriteLine(value);
+        }
+
+        public override void Write(string? value) => inner.Write(value);
+
+        public override void Write(char value) => inner.Write(value);
+
+        internal void Release() => _release.TrySetResult();
+    }
+
     private sealed class GatedWritePrimaryException(string message) : Exception(message);
+
+    /// <summary>Sentinel thrown by the success diagnostic to reach the outer reporting catch.</summary>
+    private sealed class EligibilityDiagnosticException : Exception;
 
     /// <summary>An agent-boundary failure the REAL executor maps into a FAILED result.</summary>
     private sealed class GatedAgentFailureException(Exception inner)

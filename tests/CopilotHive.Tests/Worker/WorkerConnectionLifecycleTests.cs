@@ -948,6 +948,163 @@ public sealed class WorkerConnectionLifecycleTests
                 service, ("first RunAsync", firstRun), ("second RunAsync", secondRun));
         }
     }
+
+    /// <summary>
+    /// REAL ACCEPTED-REGISTRATION → ASSIGNMENT → COMPLETE → ACK → ORDINARY READY, followed by a
+    /// sequential accepted 10 registration on the SAME service that remains UNGATED. This is the
+    /// production <see cref="WorkerService.RunAsync"/> path from the fake RegisterResponse — never
+    /// a hand-built connection — and therefore proves the captured answers actually select the
+    /// ordinary behavior used by the real message loop.
+    /// <para>
+    /// RUN 1 (11): initial Ready is ungated; after the assignment's Complete, ordinary Ready stays
+    /// withheld while a ToolResponse is consumed; the exact ACK then emits exactly one ordinary
+    /// Ready. RUN 2 (10): a new accepted connection receives ReadyRequired=true but AckEnabled=false
+    /// and emits its ordinary Ready WITHOUT any ACK. The inverse answers cannot leak across runs.
+    /// </para>
+    /// <para>
+    /// MUTATION PROOF. Changing production's <c>ackEnabled &amp;&amp; readyRequired</c> predicate to
+    /// <c>readyRequired</c> gates run 2 and fails its no-ACK Ready rendezvous. Ignoring the accepted
+    /// response or failing to publish its facts leaves run 1 ungated and fails its pre-ACK exact
+    /// one-Ready assertion. A direct-loop-only implementation cannot satisfy this vector because
+    /// both WorkerConnections are created and published only by <c>RunAsync</c>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SequentialRunAsync_Registered11GatesUntilAck_Registered10RemainsUngated()
+    {
+        var runner = new ProvisionerCapturingRunner();
+        var service = BuildService(runner, new ProvisionerHarness().Provisioner);
+
+        var firstResponses = new ChannelResponseReader();
+        var secondResponses = new ChannelResponseReader();
+        Task<WorkerRunOutcome>? firstRun = null;
+        Task<WorkerRunOutcome>? secondRun = null;
+        WorkerConnection? firstConnection = null;
+        try
+        {
+            // RUN 1 — REAL accepted registration, BOTH answers true.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = true,
+                    CompletionReadyRequired = true,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, firstResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                firstRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+                firstConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.True(firstConnection.CompletionReceiptAckEnabled);
+                Assert.True(firstConnection.CompletionReadyRequired);
+
+                firstResponses.Push(LifecycleAssignment("registered-gated")); // message 1
+                await requests.WaitForWriteCountAsync(2, TestContext.Current.CancellationToken);
+                var firstComplete = Assert.Single(
+                    requests.Writes,
+                    message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Complete);
+                Assert.Equal("registered-gated", firstComplete.Complete.TaskId);
+
+                // The ordinary Ready is WITHHELD after Complete while the real loop still consumes
+                // a ToolResponse. The probe is message 2 and its own barrier is not pre-satisfied.
+                var withheldProbe = firstResponses.Consumed(2);
+                Assert.False(withheldProbe.IsCompleted);
+                firstResponses.Push(LifecycleProbe("registered-withheld"));
+                await withheldProbe.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Single(
+                    requests.Writes,
+                    message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Ready);
+
+                // The exact ACK (message 3) through the real RunAsync loop authorizes exactly ONE
+                // ordinary Ready. Message 4 is a handler-return barrier and is proved incomplete
+                // before it is pushed.
+                firstResponses.Push(new OrchestratorMessage
+                {
+                    CompletionReceiptAck = new CompletionReceiptAck
+                    {
+                        TaskId = "registered-gated",
+                        WorkerId = AssignedWorkerId,
+                    },
+                });
+                await requests.WaitForReadyCountAsync(2, TestContext.Current.CancellationToken);
+                var ackHandlerReturned = firstResponses.Consumed(4);
+                Assert.False(ackHandlerReturned.IsCompleted);
+                firstResponses.Push(LifecycleProbe("registered-ack-returned"));
+                await ackHandlerReturned.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+                Assert.Equal(
+                    2,
+                    requests.Writes.Count(
+                        message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Ready));
+                Assert.Single(
+                    requests.Writes,
+                    message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Complete);
+
+                firstResponses.TryComplete();
+                var outcome = await firstRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Equal(WorkerRunOutcome.WorkStreamEnded, outcome);
+                Assert.Null(GetPublishedConnection(service));
+            }
+
+            // RUN 2 — same service, REAL accepted registration, READY-ONLY (10). The previous 11
+            // gate cannot leak: ordinary Ready must arrive without any ACK.
+            {
+                var invoker = new FakeOrchestratorInvoker(new RegisterResponse
+                {
+                    Accepted = true,
+                    AssignedWorkerId = AssignedWorkerId,
+                    CompletionReceiptAckEnabled = false,
+                    CompletionReadyRequired = true,
+                });
+                var requests = new RecordingRequestStream();
+                var stream = BuildRunStream(requests, secondResponses, () => { });
+                service.CallInvokerFactory = () => invoker;
+                service.WorkStreamFactory = (_, _) => stream;
+
+                secondRun = service.RunAsync(TestContext.Current.CancellationToken);
+                await requests.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+                var secondConnection = Assert.IsType<WorkerConnection>(GetPublishedConnection(service));
+                Assert.NotSame(firstConnection, secondConnection);
+                Assert.False(secondConnection.CompletionReceiptAckEnabled);
+                Assert.True(secondConnection.CompletionReadyRequired);
+
+                secondResponses.Push(LifecycleAssignment("registered-ready-only")); // message 1
+                await requests.WaitForReadyCountAsync(2, TestContext.Current.CancellationToken);
+                await requests.WaitForWriteCountAsync(3, TestContext.Current.CancellationToken);
+
+                // NO ACK was ever pushed. Run 2 still produced exactly its initial + ordinary Ready,
+                // with one Complete — the 10 combination is unequivocally ungated.
+                Assert.Equal(
+                    2,
+                    requests.Writes.Count(
+                        message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Ready));
+                var secondComplete = Assert.Single(
+                    requests.Writes,
+                    message => message.PayloadCase == WorkerMessage.PayloadOneofCase.Complete);
+                Assert.Equal("registered-ready-only", secondComplete.Complete.TaskId);
+
+                secondResponses.TryComplete();
+                var outcome = await secondRun.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Equal(WorkerRunOutcome.WorkStreamEnded, outcome);
+            }
+
+            Assert.True(firstConnection!.IsRetired);
+            Assert.True(firstConnection.CompletionReceiptAckEnabled);
+            Assert.True(firstConnection.CompletionReadyRequired);
+        }
+        finally
+        {
+            firstResponses.TryComplete();
+            secondResponses.TryComplete();
+            await JoinAllForTeardownAsync(
+                service, ("first registered RunAsync", firstRun), ("second registered RunAsync", secondRun));
+        }
+    }
+
     [Fact]
     public async Task RunAsync_RejectedRegistrationWithEnabledAnswer_PublishesNothing()
     {
@@ -3642,6 +3799,31 @@ public sealed class WorkerConnectionLifecycleTests
             // Best effort: a leaked temp directory must never fail a test.
         }
     }
+
+    /// <summary>An assignment used by the real RunAsync negotiation-to-behavior vectors.</summary>
+    private static OrchestratorMessage LifecycleAssignment(string taskId) => new()
+    {
+        Assignment = new TaskAssignment
+        {
+            TaskId = taskId,
+            GoalId = "goal-registration-gate",
+            GoalDescription = "exercise registered completion gate",
+            Prompt = "complete through the accepted connection",
+            Role = GrpcWorkerRole.Coder,
+            Model = FixtureModel,
+        },
+    };
+
+    /// <summary>A harmless response-loop probe with its own unique request id.</summary>
+    private static OrchestratorMessage LifecycleProbe(string requestId) => new()
+    {
+        ToolResponse = new ToolCallResponse
+        {
+            RequestId = requestId,
+            Success = true,
+            ResultJson = "{}",
+        },
+    };
 
     private static WorkerService BuildService(
         IAgentRunner runner, WorkerConfigProvisioner provisioner, string configRepoDir = "/config-repo")
