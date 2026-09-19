@@ -1038,6 +1038,14 @@ public sealed class WorkerServiceReceiptGateTests
     /// held; the write then terminates (success); the one Ready follows from the last-arriving fact.
     /// The mirrored order (write first, ACK second) is pinned by the (a) fixture, so together they
     /// prove the predicate's order independence through the REAL loop.
+    /// <para>
+    /// EVERY BARRIER IS A REAL MESSAGE/HANDLER BOUNDARY. The retained owner tasks are read only
+    /// after read #2 has STARTED — the loop re-arms exactly one read after the Assignment handler
+    /// returned, and the owner slot is installed inside that handler, so writer entry alone (which
+    /// the reporting task can reach before the install) is never used as installation evidence. The
+    /// receipt is observed only after the ACK's own handler-return boundary, and the trailing probe
+    /// has its own not-already-satisfied message-count milestone.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task GatedMode_ReceiptBeforeWriteTermination_SameSingleReady()
@@ -1062,15 +1070,28 @@ public sealed class WorkerServiceReceiptGateTests
             runner.Release(TaskA);
 
             await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE OWNER-INSTALLATION MILESTONE, taken while the original Complete write stays HELD.
+            // Read #1 consumed the assignment; the loop re-arms exactly one pending read only AFTER
+            // that Assignment handler returned (WorkerService's re-arm point), and
+            // InstallActiveAssignment runs INSIDE that handler — so read #2 STARTING is positive
+            // proof that the owner slot is published. Writer entry alone proves nothing about the
+            // slot: `reporting` is created before the install and can reach this held Complete write
+            // first, so the retained owner tasks could otherwise be read before they are installed.
+            await reader.ReadStarted(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             execution = GetActiveExecution(service);
             reporting = GetActiveReporting(service);
 
             // ELIGIBILITY not yet published (the write is held), but the RECEIPT is already
-            // confirmed: nothing settles.
-            reader.Push(ReceiptAck(TaskA, connection.AssignedId));
-            reader.Push(Probe("receipt-first"));
-            reader.Push(Probe("ack-handler-returned"));
-            await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // confirmed: nothing settles. The trailing probe is the HANDLER-RETURN boundary and is
+            // message 3: it is consumed by read #3, which the loop re-arms only after the ACK handler
+            // returned — so this milestone (created and proved UNSATISFIED before the pushes) proves
+            // the receipt was actually latched, not merely delivered.
+            var ackHandlerReturned = reader.Consumed(3);
+            Assert.False(ackHandlerReturned.IsCompleted);
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId)); // message 2
+            reader.Push(Probe("ack-handler-returned")); // message 3
+            await ackHandlerReturned.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.True(GetReceiptConfirmed(GetOwnerReceipt(service)));
             var slot = GetOwnerOrdinaryReady(service);
             Assert.False(IsOrdinaryReadySettled(slot));
@@ -1099,8 +1120,17 @@ public sealed class WorkerServiceReceiptGateTests
             Assert.False(
                 ArmOrdinaryReady(slot).IsCompleted,
                 "A settled slot must hand out a never-completing observation.");
-            reader.Push(Probe("after-settled"));
-            await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            // THE AFTER-SETTLED PROBE'S OWN MILESTONE. This probe is message 4 (assignment, ACK and
+            // the handler-return probe are 1..3), so Consumed(3) is already satisfied and would
+            // prove nothing. Consumed(4) cannot be satisfied before this push, and read #5 starting
+            // afterwards additionally proves this probe's handler returned.
+            var afterSettledConsumed = reader.Consumed(4);
+            Assert.False(
+                afterSettledConsumed.IsCompleted,
+                "The after-settled barrier must not be an already-satisfied milestone.");
+            reader.Push(Probe("after-settled")); // message 4
+            await afterSettledConsumed.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reader.ReadStarted(5).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
             Assert.Equal(1, writer.ReadyCount);
 
             reader.TryComplete();
