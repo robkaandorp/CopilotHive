@@ -473,6 +473,87 @@ public sealed class WorkerCompletionRetransmissionTests
         }
     }
 
+    /// <summary>
+    /// THE ORDINARY READY SERIALIZES BEHIND AN ADMITTED RETRY ON THE SAME SEND PERMIT. The retry's
+    /// own transport write is admitted and HELD, the exact ACK authorizes the ordinary Ready, and
+    /// the Ready write must then QUEUE on the production send gate — reached only after the retry's
+    /// admitted write terminates and releases the permit — and enter only after that release.
+    /// <para>
+    /// REMOVAL PROOF. With the shared-permit serialization removed (a second gate, or a bypass),
+    /// the Ready writes straight through while the retry is still parked: the queued-waiter
+    /// observation fails, or the overlap-detecting writer records the overlap. A production that
+    /// arbitrated the Ready BEFORE acquiring the permit would write it while the retry is parked,
+    /// failing the zero-Ready observation at the queued barrier.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OrdinaryReady_SerializesBehindAnAdmittedHeldRetry_OnTheSameSendGate()
+    {
+        var harness = new RetryHarness { HoldRetries = true };
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+            await harness.RetryDelayCreatedAsync(1);
+
+            // THE RETRY IS ADMITTED AND HELD in the writer — it owns the production send permit
+            // (the send releases it only after the write terminates, so the permit is BUSY here).
+            await harness.AdvanceOneIntervalAsync();
+            await harness.CompleteEnteredAsync(1);
+            Assert.False(harness.Retry.IsCompleted);
+            Assert.False(harness.RetryWriteCompleted(1));
+            Assert.Equal(0, harness.SendGateCurrentCount);
+
+            // THE EXACT ACK lands while the admitted retry is still held. It latches the receipt
+            // and authorizes the ordinary Ready — which must then QUEUE on the SAME permit.
+            harness.PushAck(TaskA);
+            harness.PushProbe("admitted-ack-returned");
+            await harness.ConsumedAsync(3);
+            Assert.True(harness.ReceiptConfirmed);
+
+            // THE READY IS AUTHORIZED — its slot write is STARTED — and is PROVABLY PARKED ON THE
+            // PERMIT QUEUE, not on the wire: the gate's own waiter list reports one waiter, and the
+            // wire still has exactly the two Completes and NO Ready. The slot write's existence is
+            // the positive proof the settlement already authorized it (it cannot write before the
+            // permit, so its own entry milestone only fires after the release below).
+            var slotWrite = harness.ReadinessSlotWrite
+                ?? throw new Xunit.Sdk.XunitException("The authorized Ready write must be retained.");
+            await harness.RetryQueuedOnSendGateAsync();
+            Assert.Equal(2, harness.Completes.Count);
+            Assert.Equal(0, harness.ReadyCount);
+
+            // POSITIVE NON-COMPLETION with a bounded window: with the permit still held the queued
+            // Ready cannot enter the wire, so its writer entry stays absent beyond the bound.
+            var premature = await Record.ExceptionAsync(() =>
+                harness.ReadyWriteEnteredAfterRetryTerminatedAsync()
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.Equal(0, harness.ReadyCount);
+
+            // RELEASE the admitted retry: the permit is released only by the write's own unwind,
+            // so the queued Ready can only NOW enter — strictly after the retry write completed.
+            harness.ReleaseComplete(1);
+            await harness.JoinedRetryAsync();
+            Assert.True(harness.RetryWriteCompleted(1), "the admitted retry write must have completed.");
+            await slotWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await harness.ReadyWriteEnteredAfterRetryTerminatedAsync();
+
+            // The Ready write finally happens — ONE Ready, after the retry.
+            harness.ReleaseReady(0);
+            await slotWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, harness.ReadyCount);
+            Assert.Equal(2, harness.Completes.Count);
+
+            harness.CompleteStream();
+            await harness.JoinAsync();
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // 5. Sequentially bounded attempts, and a failed attempt that retries.
     // ══════════════════════════════════════════════════════════════════════════
@@ -836,6 +917,94 @@ public sealed class WorkerCompletionRetransmissionTests
         }
     }
 
+    /// <summary>
+    /// READER-FAULT TEARDOWN WITH A PARKED RETRY: a reader fault whose identity the loop propagates
+    /// arrives while the retry is parked in its never-advanced five-second delay. The drain must
+    /// close retry admission, cancel the pending delay BEFORE joining, join the retry and the
+    /// original tasks, and propagate the reader's ORIGINAL exception — with NO acknowledgement and
+    /// NO ordinary Ready. The un-advanced clock is the positive witness the retry really was parked
+    /// when the fault armed.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL PROOF. A drain that skipped the admission close (or ordered it after the joins)
+    /// leaves the retry parked in a delay only the un-advanced clock could satisfy, so the bounded
+    /// loop join times out; a drain that emitted an unacknowledged Ready fails the zero-Ready count.
+    /// </remarks>
+    [Fact]
+    public async Task ReaderFaultWhileRetryIsParkedMidDelay_ClosesAdmission_JoinsAndPropagates()
+    {
+        var harness = new RetryHarness { UseFaultingReader = true };
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+
+            // The retry is PROVABLY parked in its delay; the clock is NEVER advanced.
+            await harness.RetryDelayCreatedAsync(1);
+            Assert.False(harness.Retry.IsCompleted);
+            Assert.Equal(0, harness.Clock.AdvanceCount);
+
+            // THE READER FAULT — the ACK is permanently absent (it is never pushed).
+            harness.ArmReaderFault(new ReaderFaultPrimaryException("injected reader fault"));
+            var propagated = await Assert.ThrowsAsync<ReaderFaultPrimaryException>(() =>
+                harness.JoinAsync());
+            Assert.Equal("injected reader fault", propagated.Message);
+
+            // The drain closed admission and joined EVERYTHING before clearing: no retransmission,
+            // no Ready, ownership empty, and the fault's IDENTITY propagated unchanged.
+            Assert.Equal(0, harness.Clock.AdvanceCount);
+            Assert.Single(harness.Completes);
+            Assert.Equal(0, harness.ReadyCount);
+            Assert.Equal(0, harness.SlotOccupancy);
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
+    /// <summary>
+    /// RUN-CANCELLATION TEARDOWN WITH A PARKED RETRY: cancelling the loop's own token drains and
+    /// clears WITHOUT any ACK wait, cancels the retry's parked delay (never-advanced clock), joins
+    /// the retry, emits NO ordinary Ready and retires the connection.
+    /// </summary>
+    /// <remarks>
+    /// REMOVAL PROOF. A drain that waited for an ACK leaves the loop alive past the bounded join; a
+    /// drain that skipped the admission close leaves the retry parked past the join.
+    /// </remarks>
+    [Fact]
+    public async Task RunCancellationWithParkedRetry_DrainsCancelsAndJoinsWithoutReady()
+    {
+        var harness = new RetryHarness();
+        try
+        {
+            await harness.StartAsync();
+            harness.ReleasePrompt(TaskA);
+            await harness.CompleteEnteredAsync(0);
+
+            // The retry is PROVABLY parked; the clock is NEVER advanced.
+            await harness.RetryDelayCreatedAsync(1);
+            Assert.False(harness.Retry.IsCompleted);
+            Assert.Equal(0, harness.Clock.AdvanceCount);
+
+            // THE RUN CANCELLATION: no ACK will ever arrive, and the response stream is never
+            // completed — the reader stays open, so EOF cannot be the drain's trigger.
+            harness.CancelLoopToken();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                harness.JoinAsync());
+
+            Assert.Equal(0, harness.Clock.AdvanceCount);
+            Assert.Single(harness.Completes);
+            Assert.Equal(0, harness.ReadyCount);
+            Assert.Equal(0, harness.SlotOccupancy);
+        }
+        finally
+        {
+            await harness.TeardownAsync();
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // 8. Successor and sequential-run boundaries.
     // ══════════════════════════════════════════════════════════════════════════
@@ -989,7 +1158,8 @@ public sealed class WorkerCompletionRetransmissionTests
         private readonly IDisposable _consoleRestore;
         private readonly List<Task> _loops = [];
         private readonly List<WorkerConnection> _connections = [];
-        private readonly List<ChannelResponseReader> _readers = [];
+        private readonly List<IAsyncStreamReader<OrchestratorMessage>> _readers = [];
+        private readonly List<CancellationTokenSource> _loopCtsList = [];
         private readonly SemaphoreSlim _sendGate;
         private bool _gateHeld;
         private string _taskId = TaskA;
@@ -1099,6 +1269,25 @@ public sealed class WorkerCompletionRetransmissionTests
         /// <summary>Whether the assignment's connection carries a provisioner that always fails.</summary>
         internal bool FailProvisioning { get; init; }
 
+        /// <summary>
+        /// Whether this run's response reader is a <see cref="FaultingResponseReader"/> instead of a
+        /// plain <see cref="ChannelResponseReader"/> — the reader-fault teardown vector's switch.
+        /// </summary>
+        internal bool UseFaultingReader { get; init; }
+
+        /// <summary>Arms the CURRENT run's reader fault (one-shot; see <c>FaultingResponseReader</c>).</summary>
+        internal void ArmReaderFault(Exception fault)
+        {
+            if (CurrentReader is FaultingResponseReader faulting)
+                faulting.ArmFault(fault);
+            else
+                throw new Xunit.Sdk.XunitException(
+                    "ArmReaderFault requires UseFaultingReader: the current reader cannot fault.");
+        }
+
+        /// <summary>Cancels the CURRENT run's loop token (the run-cancellation teardown vector).</summary>
+        internal void CancelLoopToken() => _loopCtsList[^1].Cancel();
+
         internal ManualRetransmissionClock Clock { get; }
 
         internal WorkerConnection Connection => _connections[^1];
@@ -1184,9 +1373,17 @@ public sealed class WorkerCompletionRetransmissionTests
                     (_, _) => { })
                 : _service.TestProvisioner;
 
+            // THE PER-RUN LOOP TOKEN: the run-cancellation teardown vector cancels THIS source, and
+            // teardown disposes every one of them.
+            var loopCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            _loopCtsList.Add(loopCts);
+
             // A FRESH reader per run: the loop's own consumption counters are then unambiguous,
-            // which is what the barrier counts rely on.
-            var reader = new ChannelResponseReader();
+            // which is what the barrier counts rely on. The reader-fault vector substitutes the
+            // FAULTING reader for the run that asked for it.
+            IAsyncStreamReader<OrchestratorMessage> reader = UseFaultingReader && _readers.Count == 0
+                ? new FaultingResponseReader()
+                : new ChannelResponseReader();
             _readers.Add(reader);
 
             var stream = new AsyncDuplexStreamingCall<WorkerMessage, OrchestratorMessage>(
@@ -1205,17 +1402,45 @@ public sealed class WorkerCompletionRetransmissionTests
 
             _loops.Add((Task)typeof(WorkerService)
                 .GetMethod("ProcessMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
-                .Invoke(_service, [connection, TestContext.Current.CancellationToken])!);
+                .Invoke(_service, [connection, loopCts.Token])!);
         }
 
-        private ChannelResponseReader CurrentReader => _readers[^1];
+        private dynamic CurrentReader => _readers[^1];
+
+        /// <summary>
+        /// The CURRENT run's reader as the channel-backed double when it is one, so Push/Consumed/
+        /// CompleteStream keep their existing shape. The faulting reader exposes the same members.
+        /// </summary>
+        private void PushToReader(OrchestratorMessage message)
+        {
+            if (CurrentReader is ChannelResponseReader channel)
+                channel.Push(message);
+            else
+                ((FaultingResponseReader)(object)CurrentReader).Push(message);
+        }
+
+        private Task ConsumedOnReaderAsync(int count) =>
+            (CurrentReader switch
+            {
+                ChannelResponseReader channel => channel.Consumed(count),
+                FaultingResponseReader faulting => faulting.Consumed(count),
+                _ => throw new Xunit.Sdk.XunitException("Unknown reader shape."),
+            }).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+        private void CompleteCurrentReader()
+        {
+            if (CurrentReader is ChannelResponseReader channel)
+                channel.TryComplete();
+            else
+                ((FaultingResponseReader)(object)CurrentReader).TryComplete();
+        }
 
         internal Task PromptStartedAsync(string taskId) =>
             _runner.PromptStarted(taskId).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
 
         internal void ReleasePrompt(string taskId) => _runner.Release(taskId);
 
-        internal void PushAssignment(string taskId) => CurrentReader.Push(new OrchestratorMessage
+        internal void PushAssignment(string taskId) => PushToReader(new OrchestratorMessage
         {
             Assignment = new TaskAssignment
             {
@@ -1233,25 +1458,24 @@ public sealed class WorkerCompletionRetransmissionTests
             },
         });
 
-        internal void PushAck(string taskId) => CurrentReader.Push(new OrchestratorMessage
+        internal void PushAck(string taskId) => PushToReader(new OrchestratorMessage
         {
             CompletionReceiptAck = new CompletionReceiptAck { TaskId = taskId, WorkerId = AssignedWorkerId },
         });
 
-        internal void PushProbe(string requestId) => CurrentReader.Push(new OrchestratorMessage
+        internal void PushProbe(string requestId) => PushToReader(new OrchestratorMessage
         {
             ToolResponse = new ToolCallResponse { RequestId = requestId, Success = true, ResultJson = "{}" },
         });
 
-        internal void PushCancel(string taskId) => CurrentReader.Push(new OrchestratorMessage
+        internal void PushCancel(string taskId) => PushToReader(new OrchestratorMessage
         {
             Cancel = new CancelTask { TaskId = taskId, Reason = "matching cancel" },
         });
 
-        internal void CompleteStream() => CurrentReader.TryComplete();
+        internal void CompleteStream() => CompleteCurrentReader();
 
-        internal Task ConsumedAsync(int count) =>
-            CurrentReader.Consumed(count).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        internal Task ConsumedAsync(int count) => ConsumedOnReaderAsync(count);
 
         /// <summary>
         /// OWNER-INSTALLED BARRIER. The assignment handler installs the ownership slot only after it
@@ -1307,6 +1531,11 @@ public sealed class WorkerCompletionRetransmissionTests
             return write.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
         }
 
+        /// <summary>The CURRENT assignment's retained readiness write, or <c>null</c> before it started.</summary>
+        internal Task? ReadinessSlotWrite => ReadOwnerProperty("OrdinaryReady") is not { } slot
+            ? null
+            : (Task?)slot.GetType().GetProperty("Write")!.GetValue(slot);
+
         /// <summary>
         /// Completes once production has emitted the guarded SANITIZED RETRANSMISSION diagnostic.
         /// </summary>
@@ -1360,6 +1589,17 @@ public sealed class WorkerCompletionRetransmissionTests
         internal Task RetryQueuedOnSendGateAsync() =>
             SendGateObserver.WaitForWaitersAsync(_sendGate, 1, TestContext.Current.CancellationToken);
 
+        /// <summary>The production send gate's current count: 0 while a write holds the permit.</summary>
+        internal int SendGateCurrentCount => _sendGate.CurrentCount;
+
+        /// <summary>
+        /// Completes once the FIRST Ready write has ENTERED the writer — used AFTER the admitted
+        /// retry terminated, so the assertion proves the queued Ready entered only after that
+        /// release rather than racing it.
+        /// </summary>
+        internal Task ReadyWriteEnteredAfterRetryTerminatedAsync() =>
+            _writer.ReadyEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
         // ── lifecycle ────────────────────────────────────────────────────────────
 
         internal Task JoinAsync() =>
@@ -1377,7 +1617,15 @@ public sealed class WorkerCompletionRetransmissionTests
             _writer.ReleaseAll();
 
             foreach (var reader in _readers)
-                reader.TryComplete();
+            {
+                if (reader is ChannelResponseReader channel)
+                    channel.TryComplete();
+                else
+                    ((FaultingResponseReader)reader).TryComplete();
+            }
+
+            foreach (var loopCts in _loopCtsList)
+                await loopCts.CancelAsync();
 
             foreach (var loop in _loops)
                 await ObserveAsync(loop);
@@ -1389,6 +1637,10 @@ public sealed class WorkerCompletionRetransmissionTests
                 connection.Retire();
 
             _service.Dispose();
+
+            foreach (var loopCts in _loopCtsList)
+                loopCts.Dispose();
+
             Dispose();
         }
 
@@ -1889,4 +2141,7 @@ public sealed class WorkerCompletionRetransmissionTests
 
     /// <summary>A failure injected as the first ordinary Ready write's fault.</summary>
     private sealed class ReadyWriteFailureException(string message) : Exception(message);
+
+    /// <summary>A reader fault whose IDENTITY the loop must propagate unchanged.</summary>
+    private sealed class ReaderFaultPrimaryException(string message) : Exception(message);
 }
