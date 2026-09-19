@@ -205,11 +205,18 @@ public sealed class WorkerPoolAvailabilityStatsTests
 
         var awaiting = WorkerInfo.DescribeStatus(isBusy: false, isAvailable: false, awaitingWorkerReady: true);
         Assert.Equal("Awaiting Ready", awaiting.Label);
-        Assert.NotEqual("badge-green", awaiting.CssClass);
+        Assert.Equal("badge-blue", awaiting.CssClass);
 
         var other = WorkerInfo.DescribeStatus(isBusy: false, isAvailable: false, awaitingWorkerReady: false);
         Assert.Equal("Unavailable", other.Label);
         Assert.Equal("badge-muted", other.CssClass);
+
+        // THE PRIORITY ORDER Busy > Awaiting Ready > Available > Unavailable: a worker carrying BOTH
+        // the awaiting flag and an available verdict is rendered as Awaiting Ready, never green —
+        // the wait is the stronger fact, so a withheld instance can never be shown as capacity.
+        var both = WorkerInfo.DescribeStatus(isBusy: false, isAvailable: true, awaitingWorkerReady: true);
+        Assert.Equal("Awaiting Ready", both.Label);
+        Assert.Equal("badge-blue", both.CssClass);
 
         // The four states are mutually distinct, so no two rows can be conflated.
         var labels = new[] { busy.Label, available.Label, awaiting.Label, other.Label };
@@ -311,6 +318,75 @@ public sealed class WorkerPoolAvailabilityStatsTests
         Assert.Equal("task-snap-busy", busy.CurrentTaskId);
         Assert.True(busy.LastHeartbeat > DateTime.MinValue);
         Assert.True(busy.ConnectedAt > DateTime.MinValue);
+    }
+
+    /// <summary>
+    /// THE WORKER DETAIL PAGE CONSUMES THE SHARED PRESENTATION HELPER: its Status card renders
+    /// <c>_worker.StatusCssClass</c> / <c>_worker.StatusLabel</c> instead of a two-way
+    /// <c>IsBusy ? … : …</c> badge, so a non-busy-but-withheld worker is never shown as green Idle.
+    /// </summary>
+    /// <remarks>
+    /// THE MUTATIONS THIS KILLS: restoring the two-way badge, restating the badge policy in the page
+    /// (a local <c>? "Busy" : "Idle"</c> or a hardcoded <c>badge-green</c> for the non-busy branch),
+    /// or rendering the shared helper while ignoring one of its two outputs — e.g. keeping the label
+    /// and re-deriving the class locally, which the exact class/text assertions below reject.
+    /// </remarks>
+    [Fact]
+    public void WorkerDetail_StatusCard_ConsumesTheSharedStatusPresentation()
+    {
+        var page = ReadProductionSource("src/CopilotHive/Components/Pages/WorkerDetail.razor");
+
+        // The Status card is extracted by TAG-SCOPED, not whole-file, matching: the badge span is
+        // the exact element whose class and text are asserted, so a second, unrelated badge
+        // elsewhere on the page cannot satisfy the consumption claim.
+        var cardStart = page.IndexOf("<div class=\"label\">Status</div>", StringComparison.Ordinal);
+        Assert.True(cardStart >= 0, "the Status card label is gone from WorkerDetail.");
+        var valueStart = page.IndexOf("<div class=\"value\">", cardStart, StringComparison.Ordinal);
+        Assert.True(valueStart > cardStart, "the Status card value block is gone from WorkerDetail.");
+        var cardEnd = page.IndexOf("</div>", valueStart, StringComparison.Ordinal);
+        Assert.True(cardEnd > valueStart, "the Status card value block never closes.");
+        var statusValue = page[valueStart..cardEnd];
+
+        // The badge element binds BOTH outputs of the shared helper, verbatim.
+        Assert.Contains("<span class=\"badge @_worker.StatusCssClass\">@_worker.StatusLabel</span>",
+            statusValue, StringComparison.Ordinal);
+
+        // The shared policy lives on the model, never restated here: no two-way conditional and no
+        // locally hardcoded badge class inside the status card's value block.
+        Assert.DoesNotContain("IsBusy", statusValue, StringComparison.Ordinal);
+        Assert.DoesNotContain("? \"Busy\"", statusValue, StringComparison.Ordinal);
+        Assert.DoesNotContain(": \"Idle\"", statusValue, StringComparison.Ordinal);
+        Assert.DoesNotContain("badge-green", statusValue, StringComparison.Ordinal);
+        Assert.DoesNotContain("badge-yellow", statusValue, StringComparison.Ordinal);
+        Assert.DoesNotContain("badge-muted", statusValue, StringComparison.Ordinal);
+
+        // The rest of the page is untouched: its fields, progress section and refresh wiring remain.
+        Assert.Contains("GetDisplayModel(_info.RoleModels)", page, StringComparison.Ordinal);
+        Assert.Contains("State.OnStateChanged += RefreshState;", page, StringComparison.Ordinal);
+        Assert.Contains("State.OnStateChanged -= RefreshState;", page, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Loads a production file by its repository-relative path, walking up from the test assembly to
+    /// the repository root. A MISSING FILE IS A LOUD FAILURE, never a silently skipped assertion.
+    /// </summary>
+    private static string ReadProductionSource(string relative)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine(
+                directory.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+
+            directory = directory.Parent;
+        }
+
+        Assert.Fail(
+            $"'{relative}' was not found walking up from '{AppContext.BaseDirectory}'; the structural "
+            + "vector cannot be evaluated.");
+        return null!;
     }
 }
 
