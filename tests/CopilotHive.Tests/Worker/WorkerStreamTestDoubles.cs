@@ -8,6 +8,8 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Threading.Channels;
 
+using System.Threading;
+
 namespace CopilotHive.Tests.Worker;
 
 /// <summary>
@@ -686,5 +688,222 @@ internal sealed class FaultingResponseReader : IAsyncStreamReader<OrchestratorMe
             waiter.TrySetResult();
 
         return true;
+    }
+}
+/// <summary>
+/// A MANUAL <see cref="TimeProvider"/> for the completion-retransmission fixtures: the retry
+/// delay's ONLY clock, advanced exclusively through <see cref="Advance"/>. It is handed to the
+/// service's internal <c>TimeProvider</c> seam, which the assignment handler reads ONCE per
+/// assignment, so the five-second sequencing is proven against the REAL clock seam production
+/// reads for the retry wait — never against a real timer, never against a sleep.
+/// <para>
+/// WHAT IT OBSERVES. Every created delay timer (the production delay calls <c>CreateTimer</c>
+/// exactly once per retry attempt) is recorded, and <see cref="TimerCount"/> is a positive,
+/// monotone witness that a retry actually ENTERED its wait through this clock. A fixture that
+/// wants to prove "no retransmission was ever attempted" asserts <see cref="TimerCount"/> stays
+/// at zero while a bounded window elapses.
+/// </para>
+/// <para>
+/// WHAT IT NEVER DOES. It never runs anything on a real thread-pool timer: the timers it returns
+/// are fully owned by the clock, so a delay parks until the test advances this clock or the
+/// retry's own lifetime cancels the wait (via <see cref="ITimer.Change"/> /
+/// <see cref="IDisposable.Dispose"/>, which production's Task.Delay uses on cancellation).
+/// That is what makes the
+/// "at most one attempt at a time" and "a fresh interval after every prior retry terminates"
+/// assertions deterministic — the test, not the wall clock, orders the attempts.
+/// </para>
+/// </summary>
+internal sealed class ManualRetransmissionClock : TimeProvider
+{
+    private readonly object _gate = new();
+    private int _timerCount;
+    private int _advanceCount;
+    private readonly List<ManualTimer> _timers = [];
+    private bool _inFireLoop;
+
+    /// <summary>How many delay timers this clock has CREATED (one per production retry wait).</summary>
+    internal int TimerCount { get { lock (_gate) return _timerCount; } }
+
+    /// <summary>How many times the test has advanced the clock.</summary>
+    internal int AdvanceCount { get { lock (_gate) return _advanceCount; } }
+
+    /// <summary>
+    /// Completes once this clock has created at least <paramref name="count"/> delay timers —
+    /// positive evidence that a retry reached its wait THROUGH the production clock seam.
+    /// </summary>
+    internal async Task WaitForTimerCountAsync(int count, CancellationToken ct)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            lock (_gate)
+            {
+                if (_timerCount >= count)
+                    return;
+            }
+
+            if (stopwatch.Elapsed > TimeSpan.FromSeconds(10))
+                throw new TimeoutException(
+                    $"Timed out waiting for {count} delay timer(s) to be created through the " +
+                    "production TimeProvider seam; the retry never reached its wait.");
+
+            await Task.Delay(1, ct);
+        }
+    }
+
+    /// <summary>
+    /// Advances the clock by the given duration. Timers armed with a due time within that
+    /// duration fire, in creation order, repeatedly, until none is due any more — so a timer
+    /// that re-arms itself from inside its own callback (the retry's "fresh interval" loop does
+    /// exactly that, through the SAME clock) is also driven by the SAME advance.
+    /// </summary>
+    internal void Advance(TimeSpan delta)
+    {
+        lock (_gate)
+        {
+            _advanceCount++;
+
+            // ONE reset per advance: a timer created from inside a LATER fire of THIS advance is
+            // marked below and therefore never re-fired by the same advance. Timers created in
+            // EARLIER advances are cleared here so the NEXT advance drives them.
+            foreach (var timer in _timers)
+                timer.CreatedDuringCurrentAdvance = false;
+        }
+
+        var guard = 0;
+        while (true)
+        {
+            if (Interlocked.Increment(ref guard) > 1000)
+                throw new InvalidOperationException(
+                    "ManualRetransmissionClock.Advance fired a timer more than 1000 times: a " +
+                    "re-armed timer is re-firing without its wait being cancelled.");
+
+            List<ManualTimer> due;
+            lock (_gate)
+            {
+                due = [];
+                foreach (var timer in _timers)
+                {
+                    if (timer.Disposed)
+                        continue;
+
+                    // A timer created during the CURRENT fire loop (the retry's fresh interval,
+                    // created from inside the previous timer's callback) is never due for THIS
+                    // advance: its deadline is measured from now, which is the fresh-interval
+                    // shape, and the NEXT advance drives it.
+                    if (timer.CreatedDuringCurrentAdvance
+                        || timer.DueTime is not TimeSpan remaining
+                        || remaining > delta)
+                        continue;
+
+                    // Park this timer while firing it.
+                    timer.DueTime = null;
+                    due.Add(timer);
+                }
+
+                if (due.Count == 0)
+                {
+                    foreach (var timer in _timers)
+                    {
+                        if (timer.DueTime is TimeSpan remaining)
+                            timer.DueTime = remaining - delta;
+                    }
+
+                    return;
+                }
+            }
+
+            _inFireLoop = true;
+            foreach (var timer in due)
+            {
+                timer.CreatedDuringCurrentAdvance = true;
+                timer.Fire();
+            }
+
+            _inFireLoop = false;
+        }
+    }
+
+    /// <summary>Creates and records ONE timer for the production delay.</summary>
+    public override ITimer CreateTimer(
+        TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+    {
+        var timer = new ManualTimer(this, callback, state, dueTime);
+        lock (_gate)
+        {
+            _timerCount++;
+            _timers.Add(timer);
+
+            // A timer created while a fire loop is running (the retry's fresh interval after the
+            // prior attempt) belongs to the NEXT advance, never to the one still running.
+            timer.CreatedDuringCurrentAdvance = _inFireLoop;
+        }
+
+        return timer;
+    }
+
+    /// <summary>
+    /// THE ONE fully test-owned timer. Nothing here touches the thread pool: <see cref="Fire"/>
+    /// runs the production callback synchronously on the ADVANCING thread, and production's
+    /// cancellation path (<c>Change</c> with <c>-1</c> and <see cref="Dispose"/>) simply parks
+    /// or drops the timer, which is exactly what stops a pending retry delay.
+    /// </summary>
+    private sealed class ManualTimer(
+        ManualRetransmissionClock clock, TimerCallback callback, object? state, TimeSpan dueTime)
+        : ITimer
+    {
+        /// <summary>Time remaining until the callback fires, or <c>null</c> while parked.</summary>
+        internal TimeSpan? DueTime { get; set; } =
+            dueTime == TimeSpan.FromMilliseconds(-1) ? null : dueTime;
+
+        internal bool Disposed { get; private set; }
+
+        /// <summary>
+        /// Set while the advance that will fire this timer is running, so a timer created FROM
+        /// INSIDE that advance (the retry's fresh interval after a prior attempt) is never
+        /// re-fired by the SAME advance — it waits for the NEXT one. That is exactly the "one
+        /// attempt at a time, fresh interval after each prior retry" shape.
+        /// </summary>
+        internal bool CreatedDuringCurrentAdvance { get; set; }
+
+
+        /// <summary>Runs the production callback synchronously — the ONLY fire path.</summary>
+        internal void Fire()
+        {
+            if (Disposed)
+                return;
+
+            callback(state);
+
+            // NO RE-ARM FROM THE CALLBACK. The production delay passes an INFINITE period, so
+            // the timer stays parked after firing; the retry's "fresh interval" loop re-arms
+            // itself by creating a NEW timer, which is how the next delay's timer appears through
+            // the SAME clock instance. A periodic timer (period >= 0) would re-arm here — no
+            // production call site uses one, so this branch is deliberately absent.
+        }
+
+        public bool Change(TimeSpan dueTime, TimeSpan period)
+        {
+            if (Disposed)
+                return false;
+
+            DueTime = dueTime == TimeSpan.FromMilliseconds(-1) ? null : dueTime;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            lock (clock._gate)
+            {
+                Disposed = true;
+                DueTime = null;
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
     }
 }

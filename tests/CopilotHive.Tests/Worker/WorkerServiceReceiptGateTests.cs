@@ -64,6 +64,13 @@ public sealed class WorkerServiceReceiptGateTests
     private const string TaskA = "task-A";
     private const string TaskB = "task-B";
 
+    /// <summary>
+    /// THE FIVE-SECOND RETRANSMISSION SEQUENCE VALUE the test clock is advanced by. It is the
+    /// EXACT constant the production retransmitter waits, so advancing the manual clock by this
+    /// amount is precisely one production interval — not an approximation the test chose.
+    /// </summary>
+    private static readonly TimeSpan RetransmissionIntervalFiveSeconds = TimeSpan.FromSeconds(5);
+
     // ══════════════════════════════════════════════════════════════════════════
     // (a) Withhold-then-ACK through the REAL loop.
     // ══════════════════════════════════════════════════════════════════════════
@@ -2577,6 +2584,441 @@ public sealed class WorkerServiceReceiptGateTests
                 ("assignment execution", execution),
                 ("assignment reporting", reporting),
                 ("loop", loop));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // RETRANSMISSION — the gated assignment's ONE frozen envelope re-sent while its receipt
+    // stays unacknowledged. Driven through the REAL loop and the REAL TimeProvider seam.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// THE GATE, EXACTLY WHEN BOTH FLAGS HOLD. On a BOTH-FLAGS connection a completed but
+    /// unacknowledged report's frozen envelope is retransmitted: the retry's FIRST delay timer is
+    /// created through the production <c>TimeProvider</c> seam after reporting terminates, and
+    /// advancing the clock drives ONE retransmission Complete whose payload is IDENTICAL to the
+    /// original — the deep clone of the frozen snapshot. On legacy (00), ACK-only (01) and
+    /// Ready-only (10) connections NO retry exists: no delay timer is EVER created through the
+    /// clock seam (positive non-completion of the retransmitter's entry, observed over a bounded
+    /// window while the loop keeps consuming), and the exact ACK still authorizes the single
+    /// Ready exactly as before.
+    /// <para>
+    /// REMOVAL PROOF. Removing the both-flags gate puts the retry on legacy/ACK-only rows too, so
+    /// their <see cref="ManualRetransmissionClock.TimerCount"/> is no longer zero and the
+    /// zero-timer assertion fails by name; removing the retransmitter itself leaves the both-flags
+    /// row's first timer absent and its retransmission rendezvous failing by name.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, true)]
+    public async Task Retransmission_FirstDelayThroughClockSeam_OnlyOnBothFlagsConnection(
+        bool readyRequired, bool ackEnabled, bool expectRetransmission)
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var clock = new ManualRetransmissionClock();
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, clock);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: ackEnabled, completionReadyRequired: readyRequired);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? execution = null;
+        Task? reporting = null;
+        Task? readinessWrite = null;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var originalComplete = Assert.Single(writer.Completes);
+            Assert.Equal(TaskA, originalComplete.Complete.TaskId);
+            Assert.Equal(connection.AssignedId, originalComplete.WorkerId);
+
+            if (!expectRetransmission)
+            {
+                // NON-GATED: the retransmitter must never exist. POSITIVE NON-COMPLETION with a
+                // bounded wait: while the loop keeps consuming (the probe proves the loop is
+                // alive) and the retained assignment stays in place, the clock seam must have
+                // created ZERO delay timers. A mode-guard removal (retry built on a legacy,
+                // ACK-only or Ready-only connection) creates the first timer here and fails by name.
+                reader.Push(Probe("non-gated-window"));
+                await reader.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Equal(0, clock.TimerCount);
+
+                var suppressed = await Record.ExceptionAsync(() =>
+                    clock.WaitForTimerCountAsync(1, TestContext.Current.CancellationToken)
+                        .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+                Assert.IsType<TimeoutException>(suppressed);
+                Assert.Equal(0, clock.TimerCount);
+                Assert.Single(writer.Completes);
+
+                // The legacy/ACK-only settlement path is UNCHANGED: the exact ACK still
+                // authorizes exactly ONE Ready on the ungated slot.
+                reader.Push(ReceiptAck(TaskA, connection.AssignedId));
+                await AwaitRendezvousAsync(
+                    writer.ReadyEntered(0),
+                    "The exact ACK must still authorize the one ungated Ready on a non-gated connection.");
+                readinessWrite = CaptureReadinessWrite(service, "The ACK must authorize the write.");
+                writer.ReleaseReady(0);
+                await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                await writer.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+                reader.Push(Probe("after-non-gated-ready"));
+                await reader.Consumed(3).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                Assert.Equal(1, writer.ReadyCount);
+                Assert.Single(writer.Completes); // no retransmission Complete followed.
+                Assert.Equal(0, clock.TimerCount);
+
+                reader.TryComplete();
+                await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+                return;
+            }
+
+            // BOTH-FLAGS: the frozen envelope's FIRST retry delay is created through the seam —
+            // positively witnessed, never a sleep.
+            await clock.WaitForTimerCountAsync(1, TestContext.Current.CancellationToken);
+
+            // Advancing the clock drives ONE retransmission attempt: a SECOND Complete whose
+            // payload is the frozen envelope's deep clone — identical identity to the original.
+            clock.Advance(RetransmissionIntervalFiveSeconds);
+            await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retransmission = writer.Completes[1];
+            Assert.NotSame(originalComplete, retransmission);
+            Assert.Equal(originalComplete.Complete.TaskId, retransmission.Complete.TaskId);
+            Assert.Equal(originalComplete.Complete.Output, retransmission.Complete.Output);
+            Assert.Equal(originalComplete.Complete.Status, retransmission.Complete.Status);
+            Assert.Equal(originalComplete.WorkerId, retransmission.WorkerId);
+            Assert.Equal(originalComplete.Complete.Model, retransmission.Complete.Model);
+            Assert.Equal(originalComplete.Complete.Metrics, retransmission.Complete.Metrics);
+
+            // ONE assignment-local retry task, at most one attempt at a time: with the receipt
+            // still unconfirmed, the SAME advance (one interval) produced exactly ONE further
+            // Complete. The retransmitter parks in a FRESH delay afterwards — witnessed by the
+            // second timer created through the seam.
+            Assert.Equal(2, writer.Completes.Count);
+            Assert.Equal(2, clock.TimerCount);
+
+            // THE EXACT ACK still closes the retry and authorizes the single Ready, unchanged.
+            reader.Push(ReceiptAck(TaskA, connection.AssignedId));
+            await AwaitRendezvousAsync(
+                writer.ReadyEntered(0),
+                "The exact ACK must still authorize the one gated Ready alongside the retry.");
+            readinessWrite = CaptureReadinessWrite(service, "The ACK must authorize the write.");
+            writer.ReleaseReady(0);
+            await readinessWrite.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await writer.WaitForReadyCountAsync(1, TestContext.Current.CancellationToken);
+
+            // After the ACK, NO further retransmission is admitted: advancing the clock again
+            // (a bounded window) produces no new Complete.
+            var completesAfterAck = writer.Completes.Count;
+            reader.Push(Probe("after-ack"));
+            await reader.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            clock.Advance(RetransmissionIntervalFiveSeconds);
+            var premature = await Record.ExceptionAsync(() =>
+                writer.CompleteEntered(completesAfterAck)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.Equal(completesAfterAck, writer.Completes.Count);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Equal(1, writer.ReadyCount);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("readiness write", readinessWrite),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// THE FROZEN ENVELOPE IS NEVER HANDED TO A WRITER, and the retained
+    /// <see cref="TaskResult"/> keeps its exact identity across the ORIGINAL send and every
+    /// retransmission. The original Complete and the retransmitted Complete both carry a payload
+    /// EQUAL to the mapped completion but NEITHER is reference-identical to the other, so no
+    /// writer can mutate what the next attempt re-sends; the retained result is never re-mapped,
+    /// cloned or replaced, and a domain-result mutation after freezing does NOT change what the
+    /// retransmission sends — the frozen clone is stable.
+    /// <para>
+    /// REMOVAL PROOF. A retransmitter that handed the snapshot itself to the writer, or re-mapped
+    /// the retained result per attempt, is caught because the two sent messages would then be
+    /// reference-identical to each other (or to a later mutated mapping) rather than equal
+    /// clones; a mapping-failure leak would arm the receipt without a frozen envelope and fail
+    /// the TimerCount == 0 assertion after the mapping failure.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Retransmission_FrozenSnapshotStableAcrossDomainMutation_CloneNotIdentity()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var clock = new ManualRetransmissionClock();
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, clock);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            reader.Push(ResultAssignment(TaskA));
+            await runner.PromptStarted(TaskA).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            runner.Release(TaskA);
+            await writer.CompleteEntered(0).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            var retained = Assert.IsType<TaskResult>(GetRetainedResult(service));
+            var original = Assert.Single(writer.Completes);
+            Assert.Equal(TaskA, original.Complete.TaskId);
+
+            // THE RETAINED RESULT IS NEVER REPLACED by freezing: identical instance, full payload.
+            Assert.Same(retained, GetRetainedResult(service));
+            Assert.Equal(TaskOutcome.Completed, retained.Status);
+            Assert.Equal(TaskA, retained.TaskId);
+
+            // THE FIRST RETRANSMISSION — a FRESH deep clone of the frozen envelope, not the
+            // snapshot itself and not a re-mapped result.
+            await clock.WaitForTimerCountAsync(1, TestContext.Current.CancellationToken);
+            clock.Advance(RetransmissionIntervalFiveSeconds);
+            await writer.CompleteEntered(1).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var retransmitted = writer.Completes[1];
+
+            Assert.NotSame(original, retransmitted);
+            Assert.NotSame(original.Complete, retransmitted.Complete);
+            Assert.Equal(original.Complete, retransmitted.Complete); // equal CLONE, not identity.
+
+            // A SECOND attempt sends the SAME frozen payload again: a fresh clone of the ONE
+            // snapshot, never a re-read or re-map of the retained result. The frozen evidence is
+            // stable: every attempt sends an EQUAL, fresh clone of the ONE envelope.
+            clock.Advance(RetransmissionIntervalFiveSeconds);
+            await writer.CompleteEntered(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            var third = writer.Completes[2];
+            Assert.Equal(original.Complete, third.Complete);
+            Assert.NotSame(retransmitted.Complete, third.Complete);
+            Assert.Equal(3, writer.Completes.Count);
+            Assert.Equal(3, clock.TimerCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// NO RETRANSMISSION WITHOUT A MAPPED PAYLOAD. A MISSING result (a handled provisioning
+    /// failure) freezes NOTHING: on a both-flags connection the assignment has no armed Complete
+    /// and therefore no retransmission — no delay timer is ever created through the clock seam,
+    /// observed over a bounded window while the loop keeps consuming.
+    /// <para>
+    /// REMOVAL PROOF. A freeze that fired on the absent-result path (or a retransmitter started
+    /// without a payload) creates the first delay timer for an assignment that will never arm,
+    /// and the zero-timer assertion fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Retransmission_MissingResult_FreezesNothing_NoRetryDelayEverCreated()
+    {
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var clock = new ManualRetransmissionClock();
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, clock);
+        service.TestProvisioner = FailingProvisioner();
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+        var loop = InvokeProcessMessages(service, connection, TestContext.Current.CancellationToken);
+
+        Task? execution = null;
+        Task? reporting = null;
+        try
+        {
+            reader.Push(Assignment(TaskA));
+            reader.Push(Probe("installed"));
+            await reader.Consumed(2).WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            execution = GetActiveExecution(service);
+            reporting = GetActiveReporting(service);
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            await execution.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            Assert.Null(GetRetainedResult(service));
+            Assert.Empty(writer.Completes);
+
+            // POSITIVE NON-COMPLETION: no delay timer through the seam over a bounded window.
+            var premature = await Record.ExceptionAsync(() =>
+                clock.WaitForTimerCountAsync(1, TestContext.Current.CancellationToken)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.Equal(0, clock.TimerCount);
+            Assert.Equal(0, writer.ReadyCount);
+
+            reader.TryComplete();
+            await loop.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            Assert.Empty(writer.Completes);
+        }
+        finally
+        {
+            runner.ReleaseAll();
+            writer.ReleaseAll();
+            reader.TryComplete();
+            await JoinAllForTeardownAsync(service,
+                ("assignment execution", execution),
+                ("assignment reporting", reporting),
+                ("loop", loop));
+        }
+    }
+
+    /// <summary>
+    /// NO RETRANSMISSION AFTER A MAPPING FAILURE. An UNARMED assignment on a both-flags
+    /// connection (an unknown outcome makes <c>GrpcMapper.ToGrpc</c> throw through the REAL
+    /// reporting method) freezes nothing: no delay timer is ever created through the seam, the
+    /// receipt stays unarmed, no Complete is written, and the ungated Ready is withheld —
+    /// exactly as the mapping-failure cell pins, now also without a retry.
+    /// <para>
+    /// REMOVAL PROOF. A freeze or retry attached outside the successful-mapping path (e.g.
+    /// started beside the reporting task unconditionally) creates the first delay timer for an
+    /// assignment that can never confirm, and the zero-timer assertion fails by name.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Retransmission_MappingFailure_NoRetryDelayEverCreated()
+    {
+        const string taskId = "task-unmappable-retry";
+        const string payloadSecret = "completion-payload-must-not-enter-diagnostic";
+        var runner = new GatedRunner();
+        var writer = new GatedWriter();
+        var reader = new ChannelResponseReader();
+        var service = BuildService(runner);
+        var clock = new ManualRetransmissionClock();
+        typeof(WorkerService)
+            .GetProperty("TimeProvider", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(service, clock);
+
+        var connection = TestConnectionFactory.Attach(
+            service, "worker-1", BuildStream(writer, reader), service.TestProvisioner,
+            completionReceiptAckEnabled: true, completionReadyRequired: true);
+
+        var originalErr = Console.Error;
+        var stdErr = new StringWriter();
+        Task? reporting = null;
+        try
+        {
+            Console.SetError(stdErr);
+
+            var serviceType = typeof(WorkerService);
+            var holderType = serviceType.GetNestedType("TerminalResultHolder", BindingFlags.NonPublic)!;
+            var readyType = serviceType.GetNestedType("ReadyClaim", BindingFlags.NonPublic)!;
+            var receiptType = serviceType.GetNestedType("CompletionReceiptTracker", BindingFlags.NonPublic)!;
+            var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+            var ready = Activator.CreateInstance(readyType, nonPublic: true)!;
+            var receipt = Activator.CreateInstance(
+                receiptType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args: [connection],
+                culture: null)!;
+
+            var domainTask = GrpcMapper.ToDomain(ResultAssignment(taskId).Assignment);
+            var unmappable = new TaskResult
+            {
+                TaskId = taskId,
+                Status = (TaskOutcome)int.MaxValue,
+                Output = payloadSecret,
+                Model = domainTask.Model,
+            };
+            holderType.GetMethod("Publish")!.Invoke(holder, [unmappable]);
+
+            var gateEnabled = InvokeOrdinaryReadyGateEnabled(connection);
+            Assert.True(gateEnabled, "Precondition: the BOTH-FLAGS shape is gated.");
+
+            var slotType = serviceType.GetNestedType("OrdinaryReadySlot", BindingFlags.NonPublic)!;
+            var ordinaryReady = Activator.CreateInstance(
+                slotType,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                args: [connection, CancellationToken.None, ready, receipt],
+                culture: null)!;
+
+            reporting = (Task)serviceType.GetMethod(
+                    "ReportAssignmentAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(service, [
+                    Task.CompletedTask,
+                    domainTask,
+                    connection,
+                    holder,
+                    receipt,
+                    ordinaryReady,
+                ])!;
+
+            await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+
+            // THE MAPPING-FAILURE FACTS: UNARMED, no Complete written, result retained verbatim,
+            // no payload leaked — and NO retry delay timer was ever created through the seam.
+            Assert.False(GetReceiptArmed(receipt));
+            Assert.False(GetReceiptConfirmed(receipt));
+            Assert.Empty(writer.Completes);
+            Assert.DoesNotContain(payloadSecret, stdErr.ToString(), StringComparison.Ordinal);
+            var premature = await Record.ExceptionAsync(() =>
+                clock.WaitForTimerCountAsync(1, TestContext.Current.CancellationToken)
+                    .WaitAsync(SuppressionBound, TestContext.Current.CancellationToken));
+            Assert.IsType<TimeoutException>(premature);
+            Assert.Equal(0, clock.TimerCount);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+            if (reporting is not null)
+                await reporting.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            writer.ReleaseAll();
+            reader.TryComplete();
+            connection.Retire();
+            service.Dispose();
         }
     }
 
