@@ -329,6 +329,66 @@ public sealed class WorkerServerCompletionRetransmissionTests
         fixture.AssertCleanTeardown();
     }
 
+    /// <summary>
+    /// THE FAILURE-PATH OWNERSHIP CONTROL. It deliberately triggers a real xUnit assertion failure
+    /// while the worker RunAsync lifecycle, real WorkStream and a held assignment are all live, and
+    /// injects a cleanup failure into the fixture's captured cleanup report. The assertion failure
+    /// must remain the exact primary outcome; disposal must return without replacing it, while still
+    /// joining both producers and every subscribed handler BEFORE stores, worker resources or the
+    /// temporary root are released.
+    /// </summary>
+    [Fact]
+    public async Task LostAckFixture_DeliberateAssertionFailure_RemainsPrimaryAndJoinsBeforeDisposal()
+    {
+        LostAckFixture? fixture = null;
+        var failure = await Record.ExceptionAsync(async () =>
+        {
+            await using var owned = fixture = new LostAckFixture();
+            owned.StartWorkerRun();
+
+            // Positive live-producer evidence: registration/initial Ready completed and the REAL
+            // Ready-driven publisher delivered the assignment, whose prompt is still held.
+            await owned.Bridge.WorkerWriter.WaitForAsync(
+                WorkerMessage.PayloadOneofCase.Ready, 0, TestContext.Current.CancellationToken);
+            await owned.Worker.AssignmentDelivered.WaitAsync(
+                Failsafe, TestContext.Current.CancellationToken);
+            Assert.False(owned.Run.IsCompleted);
+            Assert.Contains(owned.Bridge.ServerStreamTasks, task => !task.IsCompleted);
+
+            // A secondary cleanup failure is already recorded. DisposeAsync must report/retain it,
+            // never throw it over the assertion that follows.
+            owned.InjectCleanupFailureForTest();
+            Assert.Fail("DELIBERATE-PRIMARY-ASSERTION");
+        });
+
+        var primary = Assert.IsType<Xunit.Sdk.FailException>(failure);
+        Assert.Contains("DELIBERATE-PRIMARY-ASSERTION", primary.Message, StringComparison.Ordinal);
+
+        var disposed = Assert.IsType<LostAckFixture>(fixture);
+        Assert.True(disposed.Run.IsCompleted, "the worker RunAsync task must be joined on failure.");
+        Assert.All(disposed.Bridge.ServerStreamTasks, task => Assert.True(task.IsCompleted));
+        Assert.True(disposed.Chain.SubscriptionsDetached);
+        Assert.True(disposed.Chain.Stores.IsDisposed);
+        Assert.True(disposed.Worker.IsDisposed);
+        Assert.False(disposed.RootExists);
+        Assert.Contains(
+            disposed.CleanupFailures,
+            value => value.Contains(nameof(InjectedCleanupFailureException), StringComparison.Ordinal));
+
+        // THE ORDER, observed by the fixture as each stage completed successfully. No resource
+        // release can precede the server/worker joins or handler quiescence.
+        Assert.Equal(
+            [
+                "server-streams-joined",
+                "worker-run-joined",
+                "handlers-joined",
+                "chain-disposed",
+                "worker-disposed",
+                "root-deleted",
+            ],
+            disposed.CleanupOrder);
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  THE OWNED LIFETIME
     // ══════════════════════════════════════════════════════════════════════════
@@ -371,6 +431,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
     {
         private readonly string _root;
         private readonly List<string> _cleanupFailures = [];
+        private readonly List<string> _cleanupOrder = [];
+        private int _injectCleanupFailureAfterJoins;
         private Task? _run;
         private bool _streamEnded;
 
@@ -388,6 +450,18 @@ public sealed class WorkerServerCompletionRetransmissionTests
         internal WorkerHarness Worker { get; }
 
         internal Bridge Bridge { get; }
+
+        internal bool RootExists => Directory.Exists(_root);
+
+        internal IReadOnlyList<string> CleanupFailures
+        {
+            get { lock (_cleanupFailures) return [.. _cleanupFailures]; }
+        }
+
+        internal IReadOnlyList<string> CleanupOrder
+        {
+            get { lock (_cleanupOrder) return [.. _cleanupOrder]; }
+        }
 
         /// <summary>The worker's REAL lifecycle task, owned and joined by this fixture.</summary>
         internal Task Run => _run
@@ -417,10 +491,18 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
             Bridge.CompleteServerSide();
             await Bridge.JoinServerStreamAsync();
+            RecordCleanupOrder("server-streams-joined");
 
             Bridge.CompleteWorkerSide();
             if (_run is { } run)
                 await run.WaitAsync(Failsafe, TestContext.Current.CancellationToken);
+            RecordCleanupOrder("worker-run-joined");
+
+            // TEST-ONLY FAILURE INJECTION, deliberately AFTER both producer joins and BEFORE every
+            // handler/resource cleanup. DisposeAsync must capture this secondary failure, continue
+            // quiescence/disposal in order, and never replace an assertion already unwinding.
+            if (Interlocked.Exchange(ref _injectCleanupFailureAfterJoins, 0) != 0)
+                throw new InjectedCleanupFailureException();
         }
 
         /// <summary>
@@ -465,12 +547,40 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
             // 3. DETACH AND QUIESCE the constructor-subscribed downstream handlers, joining any
             //    handler invocation still in flight.
-            await CaptureAsync("downstream handler quiescence", Chain.QuiesceSubscriptionsAsync);
+            await CaptureAsync("downstream handler quiescence", async () =>
+            {
+                await Chain.QuiesceSubscriptionsAsync();
+                RecordCleanupOrder("handlers-joined");
+            });
 
             // 4. ONLY NOW release resources.
-            Capture("chain dispose", Chain.Dispose);
-            Capture("worker dispose", Worker.Dispose);
-            Capture("temp root delete", () => TryDelete(_root));
+            Capture("chain dispose", () =>
+            {
+                Chain.Dispose();
+                RecordCleanupOrder("chain-disposed");
+            });
+            Capture("worker dispose", () =>
+            {
+                Worker.Dispose();
+                RecordCleanupOrder("worker-disposed");
+            });
+            Capture("temp root delete", () =>
+            {
+                TryDelete(_root);
+                RecordCleanupOrder("root-deleted");
+            });
+        }
+
+        internal void InjectCleanupFailureForTest() =>
+            Interlocked.Exchange(ref _injectCleanupFailureAfterJoins, 1);
+
+        private void RecordCleanupOrder(string stage)
+        {
+            lock (_cleanupOrder)
+            {
+                if (!_cleanupOrder.Contains(stage, StringComparer.Ordinal))
+                    _cleanupOrder.Add(stage);
+            }
         }
 
         private void Capture(string stage, Action action)
@@ -769,6 +879,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
         }
 
         private int _subscriptionsDetached;
+
+        internal bool SubscriptionsDetached => Volatile.Read(ref _subscriptionsDetached) != 0;
 
         /// <summary>Every asynchronous downstream handler invocation this chain started.</summary>
         private readonly List<Task> _handlerInvocations = [];
@@ -1233,6 +1345,7 @@ public sealed class WorkerServerCompletionRetransmissionTests
         private readonly string _configRepoDir;
         private readonly TaskCompletionSource<WorkTask> _assignmentDelivered =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _disposed;
 
         internal WorkerHarness(ServerChain chain)
         {
@@ -1287,6 +1400,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
         internal int PromptCount => _runner.PromptCount;
 
+        internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
         /// <summary>How many retry delay timers production created through the clock seam.</summary>
         internal int RetryDelayTimers => Clock.TimerCount;
 
@@ -1319,7 +1434,11 @@ public sealed class WorkerServerCompletionRetransmissionTests
 
         internal void NoteAssignmentDelivered(WorkTask task) => _assignmentDelivered.TrySetResult(task);
 
-        public void Dispose() => _gitRestore.Dispose();
+        public void Dispose()
+        {
+            _gitRestore.Dispose();
+            Interlocked.Exchange(ref _disposed, 1);
+        }
     }
 
     /// <summary>
@@ -1544,6 +1663,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
     /// </summary>
     private sealed class StoresImpl : IDisposable
     {
+        private int _disposed;
+
         private StoresImpl(IDbContextFactory<CopilotHiveDbContext> factory, string dbPath)
         {
             Factory = factory;
@@ -1564,6 +1685,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
         internal CompletionReceiptStore NewReceiptStore() =>
             new(Factory, NullLogger<CompletionReceiptStore>.Instance);
 
+        internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
         internal static StoresImpl FileBacked(string dbPath)
         {
             var factory = new FileDbContextFactory(dbPath);
@@ -1573,7 +1696,11 @@ public sealed class WorkerServerCompletionRetransmissionTests
             return new StoresImpl(factory, dbPath);
         }
 
-        public void Dispose() => SqliteConnection.ClearAllPools();
+        public void Dispose()
+        {
+            SqliteConnection.ClearAllPools();
+            Interlocked.Exchange(ref _disposed, 1);
+        }
 
         private sealed class FileDbContextFactory(string dbPath) : IDbContextFactory<CopilotHiveDbContext>
         {
@@ -1768,6 +1895,8 @@ public sealed class WorkerServerCompletionRetransmissionTests
         // THE ROW WAS NEVER RE-INSERTED: the first-stored instant is preserved exactly.
         Assert.Equal(before.FirstStoredAtUtc, after.FirstStoredAtUtc);
     }
+
+    private sealed class InjectedCleanupFailureException : Exception;
 
     private static string CreateRoot()
     {

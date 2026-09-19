@@ -1342,13 +1342,14 @@ public sealed class WorkerCompletionRetransmissionTests
     }
 
     /// <summary>
-    /// RUN-CANCELLATION TEARDOWN WITH A PARKED RETRY: cancelling the loop's own token drains and
-    /// clears WITHOUT any ACK wait, cancels the retry's parked delay (never-advanced clock), joins
-    /// the retry, emits NO ordinary Ready and retires the connection.
+    /// RUN-CANCELLATION TEARDOWN WITH AN ADMITTED RETRY: cancelling the loop's own token is observed
+    /// inside the retry writer, whose cancellation unwind is then held. The drain must join that
+    /// concrete task before surfacing the run cancellation, with NO ACK and NO ordinary Ready.
     /// </summary>
     /// <remarks>
-    /// REMOVAL PROOF. A drain that waited for an ACK leaves the loop alive past the bounded join; a
-    /// drain that skipped the admission close leaves the retry parked past the join.
+    /// REMOVAL PROOF. A drain that skipped the retry join surfaces the loop cancellation while the
+    /// admitted writer is still held in its cancellation unwind; the bounded non-completion
+    /// assertion then receives <see cref="OperationCanceledException"/> instead of timing out.
     /// </remarks>
     [Fact]
     public async Task RunCancellationWithParkedRetry_DrainsCancelsAndJoinsWithoutReady()
