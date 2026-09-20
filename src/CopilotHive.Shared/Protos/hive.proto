@@ -24,6 +24,72 @@ service HiveOrchestrator {
   // Worker fetches its LLM configuration (credentials + provider settings) from the
   // orchestrator so worker containers need no LLM credentials of their own.
   rpc GetWorkerConfig (GetWorkerConfigRequest) returns (GetWorkerConfigResponse);
+
+  // READ-ONLY EVIDENCE CONFIRMATION, callable BEFORE registration: reports whether EXACT
+  // durable completion evidence for this task is already retained. It does NOT authorize
+  // submitting missing evidence, does NOT release a restored-pipeline hold, and does NOT
+  // restore or run anything. A pre-upgrade server answers gRPC Unimplemented; there is no
+  // negotiation flag and no fallback registration.
+  rpc QueryCompletionReceipt (CompletionReceiptQueryRequest) returns (CompletionReceiptQueryResponse);
+}
+
+// === Completion-Receipt Evidence Query (read-only) ===
+
+// A read-only question about ONE task: "is the exact durable completion evidence described by
+// `completion` already retained for this task?". It is deliberately NOT a submission: the
+// `completion` payload is COMPARISON EVIDENCE, and a response never means it was accepted,
+// recorded, processed, acknowledged or recovered.
+//
+// `worker_id` IS COMPARISON EVIDENCE ONLY — not authentication and not recovered ownership. It is
+// never trimmed, normalized or looked up in the worker registry, and registration is NOT required
+// (this call may legitimately precede it).
+message CompletionReceiptQueryRequest {
+  // The worker whose retained evidence is compared against, echoed/compared VERBATIM. An opaque
+  // string that is never parsed, and never proof of identity.
+  string worker_id = 1;
+
+  // The completion evidence to compare. Its `task_id` is the OPAQUE lookup key; its status must
+  // be terminal and its `model` presence must be EXPLICIT (see `TaskComplete.model`).
+  TaskComplete completion = 2;
+}
+
+// The single recorded outcome of the evidence query.
+message CompletionReceiptQueryResponse {
+  CompletionReceiptOutcome outcome = 1;
+}
+
+// THE EVIDENCE-CONFIRMATION OUTCOMES, and what each one honestly means.
+//
+// EVIDENCE CONFIRMATION IS NOT PROCESSING OR RECOVERY AUTHORIZATION. `MATCHING_STORED` means exact
+// durable evidence exists for the task — the pipeline's own processing of that completion may still
+// be entirely unresolved. `NOT_CONFIRMED` deliberately MERGES absence and a genuine difference, and
+// is emphatically NOT permission to upload evidence, retry execution, release ownership or become
+// ready. `INVALID_REQUEST` means the request shape or status was rejected BEFORE any comparison.
+// `UNAVAILABLE` means the comparison could not be performed at all (for example, no recorder is
+// configured).
+//
+// NO STORED PAYLOAD, CREDENTIAL, EXCEPTION STRING OR PROCESSING STATUS IS EVER RETURNED.
+enum CompletionReceiptOutcome {
+  // Nothing was decided — the default of an untouched response, and never a production answer.
+  COMPLETION_RECEIPT_OUTCOME_UNSPECIFIED = 0;
+
+  // EXACT durable completion evidence for this task is already retained. This says evidence
+  // retention ONLY: it is not an acknowledgement, not a processing marker, not durable worker
+  // authorization and not replay/recovery permission.
+  COMPLETION_RECEIPT_OUTCOME_MATCHING_STORED = 1;
+
+  // Matching evidence is NOT confirmed: either nothing is retained for the task, or what is
+  // retained is a genuine difference. The two are deliberately indistinguishable, because neither
+  // is authorization to do anything.
+  COMPLETION_RECEIPT_OUTCOME_NOT_CONFIRMED = 2;
+
+  // The request itself was rejected — a missing identity, a missing completion, or a non-terminal
+  // status — BEFORE any evidence was compared.
+  COMPLETION_RECEIPT_OUTCOME_INVALID_REQUEST = 3;
+
+  // THE COMPARISON COULD NOT BE PERFORMED, so nothing is claimed in either direction: no recorder
+  // is configured, or the read of the retained evidence failed.
+  COMPLETION_RECEIPT_OUTCOME_UNAVAILABLE = 4;
 }
 
 // === Worker Configuration Provisioning ===

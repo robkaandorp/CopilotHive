@@ -717,6 +717,178 @@ public sealed class HiveOrchestratorService(
     }
 
     /// <summary>
+    /// THE READ-ONLY COMPLETION-EVIDENCE QUERY: answers whether EXACT durable completion evidence for
+    /// the named task is already retained — and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// WHAT IT IS. A single unary, synchronous, non-mutating question that may legitimately be asked
+    /// BEFORE a worker registers. It performs NO registration, reads or mutates NO readiness/busy/
+    /// current-task state, attaches NO stream, touches NO queue entry, pipeline, mapping or
+    /// restored-pipeline hold, records or acknowledges NOTHING through the stream path, sends NO
+    /// worker notification and drives NO phase. It does not look the caller up in
+    /// <see cref="WorkerPool"/> and requires no registration, no <c>WorkStream</c>, no assignment row,
+    /// no queue entry and no pipeline.
+    /// </para>
+    /// <para>
+    /// EVIDENCE CONFIRMATION IS NOT PROCESSING OR RECOVERY AUTHORIZATION.
+    /// <see cref="CompletionReceiptOutcome.MatchingStored"/> means exact durable evidence exists —
+    /// the pipeline's own processing of that completion may still be entirely unresolved.
+    /// <see cref="CompletionReceiptOutcome.NotConfirmed"/> deliberately MERGES absence and a genuine
+    /// difference and is never permission to upload evidence, retry execution, release ownership or
+    /// become ready. <see cref="CompletionReceiptOutcome.InvalidRequest"/> means the request shape or
+    /// status was rejected BEFORE any comparison.
+    /// <see cref="CompletionReceiptOutcome.Unavailable"/> means the comparison could not be performed
+    /// at all (for example, no recorder is configured).
+    /// </para>
+    /// <para>
+    /// THE SUPPLIED <see cref="CompletionReceiptQueryRequest.WorkerId"/> IS COMPARISON EVIDENCE ONLY
+    /// — not authentication and not recovered ownership. It is compared verbatim (never trimmed or
+    /// normalized) and is never used to resolve a registered instance. The request's
+    /// <see cref="TaskComplete"/> is mapped ONCE through the existing boundary mapper, passed
+    /// UNCHANGED, and never substituted from an active-queue model, a worker's current model or a
+    /// stored row. No stored payload, credential, exception string or processing status is ever
+    /// returned, and no diagnostic can change the outcome.
+    /// </para>
+    /// <para>
+    /// CANCELLATION IS THE CALLER'S, AND IT IS NEVER SWALLOWED. The caller's token is observed FIRST —
+    /// before any validation, mapping or recorder call — and AGAIN after the read, so a token
+    /// cancelled during the read cancels the RPC instead of producing an outcome, and an
+    /// <see cref="OperationCanceledException"/> raised by the recorder itself PROPAGATES rather than
+    /// being mapped to <see cref="CompletionReceiptOutcome.Unavailable"/>. The recorder call is
+    /// synchronous and takes no cancellation parameter, so nothing here promises interruption of an
+    /// in-flight read.
+    /// </para>
+    /// </remarks>
+    /// <param name="request">The completion evidence to compare, plus the worker it is compared against.</param>
+    /// <param name="context">Server call context; its token is the caller's cancellation.</param>
+    /// <returns>The single recorded evidence-confirmation outcome.</returns>
+    /// <exception cref="OperationCanceledException">The caller's token was cancelled.</exception>
+    public override Task<CompletionReceiptQueryResponse> QueryCompletionReceipt(
+        CompletionReceiptQueryRequest request, ServerCallContext context)
+    {
+        // ── (1) THE CALLER'S CANCELLATION, FIRST ───────────────────────────────────────────────
+        // BEFORE any validation, mapping or recorder call: caller cancellation is never swallowed
+        // into Unavailable and never observed only after a read has already happened.
+        context.CancellationToken.ThrowIfCancellationRequested();
+
+        // ── THE ONE RESPONSE PATH ──────────────────────────────────────────────────────────────
+        // EVERY response of this method is built HERE, and each one is preceded by the caller's
+        // cancellation check. That is what makes "caller cancellation is honored BEFORE returning" a
+        // property of the method rather than of a single branch: no validation refusal, no
+        // no-recorder refusal, no recorder-failure mapping and no confirmation outcome can be
+        // returned through any other route, so a token cancelled at ANY point — including while the
+        // read was in flight and then failed — cancels the RPC instead of producing an outcome.
+        //
+        // IT IS A LOCAL FUNCTION, NOT A DELEGATE FIELD: no state, no capture beyond the call context
+        // itself, and it is not `async` — it performs the check synchronously and hands back an
+        // already-completed task, exactly like every other return of this method.
+        Task<CompletionReceiptQueryResponse> Respond(CompletionReceiptOutcome outcome)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(new CompletionReceiptQueryResponse { Outcome = outcome });
+        }
+
+        // ── (2) THE REQUEST SHAPE, VALIDATED LOCALLY AND BEFORE THE RECORDER ───────────────────
+        // Every identity is compared VERBATIM: nothing is trimmed or normalized, and no goal, role or
+        // slot is ever inferred from the task id's text.
+        if (string.IsNullOrWhiteSpace(request.WorkerId))
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+
+        if (request.Completion is null)
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+
+        if (string.IsNullOrWhiteSpace(request.Completion.TaskId))
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+
+        // EXPLICIT MODEL PRESENCE IS REQUIRED — exactly as on the negotiated completion paths. A
+        // PRESENT-EMPTY or whitespace model is legitimate evidence and is preserved verbatim; only an
+        // ABSENT field (a legacy sender) is refused here, because the query's whole premise is "the
+        // exact evidence", and an absent model cannot be the exact evidence of anything.
+        if (!request.Completion.HasModel)
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+
+        // AN EXPLICIT STATUS MEMBERSHIP CHECK, decided by this endpoint rather than by the mapper: a
+        // non-terminal status is not a completion, and an unknown numeric value is not a request this
+        // endpoint can answer.
+        if (request.Completion.Status is not (Shared.Grpc.TaskStatus.Completed
+            or Shared.Grpc.TaskStatus.Failed
+            or Shared.Grpc.TaskStatus.Cancelled))
+        {
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+        }
+
+        // ── (3) THE ONE MAPPING, THROUGH THE EXISTING BOUNDARY MAPPER ──────────────────────────
+        // The result is handed to the recorder UNCHANGED: no active-queue model fallback, no worker
+        // current-model fallback, no stored-row fallback, no `with { ... }` substitution, and no
+        // codec pre-validation of the candidate — the existing comparator deliberately classifies
+        // candidate codec errors as a store error, and that classification is preserved rather than
+        // duplicated here. The mapper's own status failure is belt-and-braces (the membership check
+        // above already refused it) and is deliberately reported as the same request-shape refusal,
+        // never as a store or availability failure.
+        TaskResult evidence;
+        try
+        {
+            evidence = GrpcMapper.ToDomain(request.Completion);
+        }
+        catch (InvalidOperationException)
+        {
+            return Respond(CompletionReceiptOutcome.InvalidRequest);
+        }
+
+        // ── (4) NO RECORDER MEANS NO COMPARISON ────────────────────────────────────────────────
+        // Never a confirmation, never NotConfirmed, and no fall-through to any other path: nothing
+        // exists that could have retained the evidence, so nothing is claimed either way.
+        if (_completionRecorder is null)
+            return Respond(CompletionReceiptOutcome.Unavailable);
+
+        // ── (5) THE ONE READ-ONLY CONFIRMATION, CALLED EXACTLY ONCE ─────────────────────────────
+        bool confirmed;
+        try
+        {
+            confirmed = _completionRecorder.ConfirmStoredReceipt(
+                request.WorkerId, request.Completion.TaskId, evidence);
+        }
+        catch (OperationCanceledException)
+        {
+            // CANCELLATION PROPAGATES, FIRST AND UNMAPPED. The catch is ordered BEFORE the two
+            // classification catches below so a recorder-thrown cancellation can never be classified
+            // as Unavailable or as a request-shape refusal: it is rethrown with its ORIGINAL instance
+            // and its ORIGINAL token, because no other exception type can reach this clause.
+            throw;
+        }
+        catch (WorkerCompletionRecordingException refusal)
+        {
+            // AN INVALID CONTEXT is a request-shaped refusal: a missing/blank identity, or a result
+            // whose task id disagrees with the opaque key. Every OTHER refusal a recorder may raise —
+            // a store read/codec failure, and any Conflict/Indeterminate/MissingRecorder a substitute
+            // implementation may produce — means the comparison did not happen, so nothing is claimed.
+            return Respond(refusal.Reason == WorkerCompletionRecordingFailureReason.InvalidContext
+                ? CompletionReceiptOutcome.InvalidRequest
+                : CompletionReceiptOutcome.Unavailable);
+        }
+        catch (Exception)
+        {
+            // ANY OTHER THROW IS UNAVAILABLE, never a confirmation and never NotConfirmed: an
+            // unexpected failure leaves the comparison unperformed. The failure's own content is
+            // deliberately not surfaced anywhere. A cancellation that landed while this read was in
+            // flight is NOT swallowed here: the responder below observes the caller's token before
+            // this outcome can be returned.
+            return Respond(CompletionReceiptOutcome.Unavailable);
+        }
+
+        // ── (6) THE CONFIRMATION'S OWN MEANING ─────────────────────────────────────────────────
+        // `true` means EXACT durable evidence is retained — and nothing about processing,
+        // acknowledgement, ownership or recovery. `false` merges absence and a genuine difference.
+        // The responder observes the caller's token once more, so a token cancelled while the read
+        // was in flight cancels this RPC instead of producing an outcome from a read the caller
+        // abandoned.
+        return Respond(confirmed
+            ? CompletionReceiptOutcome.MatchingStored
+            : CompletionReceiptOutcome.NotConfirmed);
+    }
+
+    /// <summary>
     /// Applies a task assignment to a worker through the pool's CHECKED CLAIM: the ACTUAL dequeued
     /// task is activated in the queue and the CAPTURED instance is published busy with it — task id,
     /// task start, activity clock, role and <see cref="ConnectedWorker.CurrentModel"/>, all in ONE
