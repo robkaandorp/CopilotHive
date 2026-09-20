@@ -295,7 +295,10 @@ public sealed class PipelineStore : IAsyncDisposable
     /// the registry share the one capture; every other mutable field (plan, phase, metrics, the
     /// phase log, the conversation) keeps its existing capture timing and may change afterwards.
     /// The result is not a durably-consistent whole-pipeline snapshot, no admission/rollback
-    /// semantics are changed, and NOTHING consumes these checkpoints for recovery yet. A throwing
+    /// semantics are changed, and no checkpoint written here authorizes recovery: a HELD restore
+    /// hydrates a stored registry as EVIDENCE ONLY (see
+    /// <see cref="GoalPipeline.RestoredRegistryClassification"/>) and never as permission to
+    /// dispatch, replay or resume. A throwing
     /// <c>SaveChanges</c> does NOT by itself prove a rollback: after-commit/provider uncertainty is
     /// the existing limitation.
     /// </para>
@@ -2059,7 +2062,9 @@ public sealed class PipelineStore : IAsyncDisposable
     /// </para>
     /// <para>
     /// INERT BY DESIGN: nothing in production calls this yet. Storing a snapshot is NOT a decision
-    /// to restore one — the restore validation stays with <c>GoalPipeline.RestoreRegistry</c>.
+    /// to restore one — the restore validation stays with <c>GoalPipeline.RestoreRegistry</c>,
+    /// which a HELD restore now invokes to hydrate stored evidence; that hydration confers no
+    /// recovery, replay or dispatch authority and never makes a held instance checkpoint-eligible.
     /// </para>
     /// </remarks>
     /// <param name="goalId">The goal id whose pipeline row receives the snapshot.</param>
@@ -2476,8 +2481,14 @@ public sealed class PipelineSnapshot
     /// stored version-1 payload holding two empty collections ("an empty registry was captured").
     /// </para>
     /// <para>
-    /// INTERNAL on purpose: no public surface exposes the registry domain, and no production code
-    /// reads this yet — pipeline construction and restoration ignore it entirely.
+    /// INTERNAL on purpose: no public surface exposes the registry domain. The RESTORE path now
+    /// reads this carrier, but ONLY for a HELD instance
+    /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>), which decodes it and hydrates the
+    /// domain-valid slot/counter evidence as EVIDENCE ONLY — no recovery, replay or dispatch
+    /// authority is conferred, held instances never become checkpoint-eligible, and the existing
+    /// full/state saves still preserve these raw bytes byte-for-byte. UNHELD (null-pointer or
+    /// terminal-phase) restores and fresh <c>Goal</c>-created pipelines ignore it entirely, exactly
+    /// as before. The LOAD path itself is unchanged and still never decodes it.
     /// </para>
     /// </summary>
     internal string? WorkSlotRegistryJson { get; init; }

@@ -33,12 +33,15 @@ namespace CopilotHive.Services;
 /// <para>
 /// THE RESTORED-POLICY SUCCESSOR. The pipeline's slot retirement and the cleared pointer are
 /// IN-MEMORY: this reclaim calls NO <c>PersistFull</c> (or any other persistence) — the cleanup's
-/// mutation is intentionally not persisted. A pipeline restored after a restart has an EMPTY slot
-/// registry and its pointer is the snapshot's; the reconciliation of that restored state is owned
-/// by the completion-protocol successor, not by this method. Until that successor exists, a
-/// RESTORED pipeline whose snapshot carried a nonterminal phase and a non-null active pointer is
-/// HELD (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and the reclaim refuses it
-/// entirely — see <see cref="RescheduleAbandonedTask"/>.
+/// mutation is intentionally not persisted. A pipeline restored after a restart therefore still
+/// carries the PERSISTED evidence, not this reclaim's in-memory outcome: a HELD restore now
+/// hydrates the row's domain-valid slot/counter evidence into its registry (so a retired attempt
+/// can come back as its persisted state) and its pointer is the snapshot's. That hydration is
+/// EVIDENCE ONLY — it grants no recovery, replay or dispatch authority — and the reconciliation of
+/// the restored state is owned by the completion-protocol successor, not by this method. Until
+/// that successor exists, a RESTORED pipeline whose snapshot carried a nonterminal phase and a
+/// non-null active pointer is HELD (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and the
+/// reclaim refuses it entirely — see <see cref="RescheduleAbandonedTask"/>.
 /// </para>
 /// </remarks>
 public sealed class StaleWorkerCleanupService : BackgroundService

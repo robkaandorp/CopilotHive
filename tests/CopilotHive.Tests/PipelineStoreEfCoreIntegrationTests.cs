@@ -2932,24 +2932,110 @@ public sealed class WorkSlotRegistryStorageTests : IDisposable
     // ═══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// THE NO-ACTIVATION PROOF: neither the ordinary <see cref="GoalPipeline"/> restore constructor
-    /// nor <see cref="GoalPipelineManager"/>'s restoration paths look at the blob — with a
-    /// POPULATED payload or a MALFORMED one, the restored pipeline's registry comes up COMPLETELY
-    /// EMPTY, no exception is raised, and every other piece of restored state is exactly what it
-    /// would be with no blob at all. Recovery wiring is a LATER goal; this test fails the moment
-    /// anything starts activating it.
+    /// THE SPLIT, ROUND-1: the stored blob's treatment now DEPENDS ON THE HOLD. A HELD snapshot
+    /// (nonterminal phase + non-null pointer) hydrates domain-valid evidence through the restore
+    /// constructor — this test pins that intentionally changed path, with the ACTUAL registry
+    /// contents for the valid payload and the no-partial-install classification for the others.
+    /// The PRESERVED unheld ignore path lives in
+    /// <see cref="UnheldRestorePaths_StillIgnoreTheBlob_NoRegistryRecoveryActivates"/>, which keeps
+    /// the original whole-scope inertness contract for a NULL-pointer snapshot.
     /// </summary>
     [Theory]
     [InlineData("populated")]
     [InlineData("malformed")]
     [InlineData("empty-payload")]
-    public void RestorePaths_IgnoreTheBlobEntirely_NoRegistryRecoveryActivates(string blobKind)
+    public void HeldRestorePaths_HydrateOrClassifyTheBlob_ByItsValidity(string blobKind)
+    {
+        var goalId = "wsr-held-" + blobKind;
+        var pipeline = NewPipeline(goalId);
+        pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing] });
+        pipeline.AdvanceTo(GoalPhase.Coding);
+        pipeline.SetActiveTask("task-" + blobKind, "coder/" + goalId);
+        WithStore((store, _) => store.SavePipeline(pipeline));
+
+        var rich = BuildRichSourcePipeline(goalId + "-src").CaptureRegistry();
+        switch (blobKind)
+        {
+            case "populated":
+                Assert.True(WithStore((store, _) => store.SaveWorkSlotRegistry(goalId, rich)));
+                break;
+            case "empty-payload":
+                Assert.True(WithStore((store, _) =>
+                    store.SaveWorkSlotRegistry(goalId, new WorkSlotRegistrySnapshot([], []))));
+                break;
+            case "malformed":
+                ExecuteRaw($"UPDATE pipelines SET work_slot_registry_json = '{{not json' WHERE goal_id = '{goalId}'");
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled blob kind: {blobKind}");
+        }
+
+        // PRECONDITION: the column really is populated — otherwise the classification would be vacuous.
+        var blob = RawBlob(goalId);
+        Assert.NotNull(blob);
+
+        // THE RESTORE CONSTRUCTOR, HELD ROUTE.
+        var snapshot = WithStore((store, _) => store.LoadPipeline(goalId))!;
+        Assert.Equal(blob, snapshot.WorkSlotRegistryJson);   // the carrier IS populated…
+        var restoredDirectly = new GoalPipeline(snapshot);
+        Assert.True(restoredDirectly.IsRestoredActiveAttemptHold);
+        Assert.False(restoredDirectly.OwnershipCheckpointEligible,
+            "a held restored pipeline must stay ineligible for registry checkpoint writes");
+
+        switch (blobKind)
+        {
+            case "populated":
+                // THE HYDRATED CONTENTS, not just the label: the capture equals the stored snapshot.
+                Assert.Equal(RestoredRegistryOutcome.Restored, restoredDirectly.RestoredRegistryClassification);
+                Assert.Equal(SlotsOf(rich), SlotsOf(restoredDirectly.CaptureRegistry()));
+                Assert.Equal(AttemptsOf(rich), AttemptsOf(restoredDirectly.CaptureRegistry()));
+                // The active pointer's slot state is observed against the HYDRATED registry. The
+                // rich source's registry carries "claimed-task", but this row's pointer names
+                // "task-populated" — so the observation is honestly NoMatchingSlot (the evidence
+                // stays installed; disagreement is reported, never resolved).
+                Assert.Equal(
+                    RestoredActivePointerOutcome.NoMatchingSlot,
+                    restoredDirectly.RestoredActivePointerClassification);
+                Assert.False(restoredDirectly.RestoredActiveTaskMappingPresent,
+                    "the captured mappings list holds no (task-populated, goal) pair");
+                break;
+            case "empty-payload":
+                // A VALID EMPTY registry is Restored — never MissingRegistry.
+                Assert.Equal(RestoredRegistryOutcome.Restored, restoredDirectly.RestoredRegistryClassification);
+                Assert.Empty(restoredDirectly.CaptureRegistry().Slots);
+                Assert.Empty(restoredDirectly.CaptureRegistry().DispatchAttempts);
+                break;
+            case "malformed":
+                // A REPRESENTATION failure: nothing installed, both dictionaries stay empty.
+                Assert.Equal(RestoredRegistryOutcome.DecodeRejected, restoredDirectly.RestoredRegistryClassification);
+                Assert.Empty(restoredDirectly.CaptureRegistry().Slots);
+                Assert.Empty(restoredDirectly.CaptureRegistry().DispatchAttempts);
+                break;
+            default:
+                throw new InvalidOperationException($"Unhandled blob kind: {blobKind}");
+        }
+
+        // THE BLOB IS NEVER REWRITTEN by the hydration: the row keeps the exact bytes.
+        Assert.Equal(blob, RawBlob(goalId));
+    }
+
+    /// <summary>
+    /// THE PRESERVED UNHELD IGNORE PATH (the round-1 split's other half): a NULL-POINTER snapshot
+    /// is not held, consumes NO registry text, and comes up with a COMPLETELY EMPTY registry for
+    /// every blob kind — populated, malformed, or a valid empty payload. The durable blob is
+    /// untouched and the ordinary restored state is exactly what it always was.
+    /// </summary>
+    [Theory]
+    [InlineData("populated")]
+    [InlineData("malformed")]
+    [InlineData("empty-payload")]
+    public void UnheldRestorePaths_StillIgnoreTheBlob_NoRegistryRecoveryActivates(string blobKind)
     {
         var goalId = "wsr-noactivate-" + blobKind;
         var pipeline = NewPipeline(goalId);
         pipeline.SetPlan(new IterationPlan { Phases = [GoalPhase.Coding, GoalPhase.Testing] });
         pipeline.AdvanceTo(GoalPhase.Coding);
-        pipeline.SetActiveTask("task-" + blobKind, "coder/" + goalId);
+        // NO pointer is set — the row restores with a SQL-NULL active_task_id, so it is UNHELD.
         WithStore((store, _) => store.SavePipeline(pipeline));
 
         var rich = BuildRichSourcePipeline(goalId + "-src").CaptureRegistry();
@@ -2977,6 +3063,8 @@ public sealed class WorkSlotRegistryStorageTests : IDisposable
         var snapshot = WithStore((store, _) => store.LoadPipeline(goalId))!;
         Assert.Equal(blob, snapshot.WorkSlotRegistryJson);   // the carrier IS populated…
         var restoredDirectly = new GoalPipeline(snapshot);
+        Assert.False(restoredDirectly.IsRestoredActiveAttemptHold);
+        Assert.Equal(RestoredRegistryOutcome.NotApplicable, restoredDirectly.RestoredRegistryClassification);
         AssertRegistryCompletelyEmpty(restoredDirectly);     // …and the registry is STILL empty.
 
         // (b) GoalPipelineManager.RestoreFromStore (the startup path) ignores it.
@@ -2985,12 +3073,14 @@ public sealed class WorkSlotRegistryStorageTests : IDisposable
             var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
             var restored = manager.RestoreFromStore();
             var fromStartup = Assert.Single(restored, p => p.GoalId == goalId);
+            Assert.False(fromStartup.IsRestoredActiveAttemptHold);
+            Assert.Equal(RestoredRegistryOutcome.NotApplicable, fromStartup.RestoredRegistryClassification);
             AssertRegistryCompletelyEmpty(fromStartup);
 
             // Non-registry state restored exactly as it always did — unchanged startup behavior.
             Assert.Equal(GoalPhase.Coding, fromStartup.Phase);
-            Assert.Equal("task-" + blobKind, fromStartup.ActiveTaskId);
-            Assert.Equal("coder/" + goalId, fromStartup.CoderBranch);
+            Assert.Null(fromStartup.ActiveTaskId);
+            Assert.Null(fromStartup.CoderBranch);
         });
 
         // (c) GoalPipelineManager.RestorePipeline (the on-demand path) ignores it too.
@@ -2999,6 +3089,8 @@ public sealed class WorkSlotRegistryStorageTests : IDisposable
             var manager = new GoalPipelineManager(store, NullLogger<GoalPipelineManager>.Instance);
             var onDemand = manager.RestorePipeline(goalId);
             Assert.NotNull(onDemand);
+            Assert.False(onDemand!.IsRestoredActiveAttemptHold);
+            Assert.Equal(RestoredRegistryOutcome.NotApplicable, onDemand.RestoredRegistryClassification);
             AssertRegistryCompletelyEmpty(onDemand!);
         });
 

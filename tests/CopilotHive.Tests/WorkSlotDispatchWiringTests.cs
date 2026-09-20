@@ -2699,11 +2699,26 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
     }
 
     /// <summary>
-    /// THE RESTART VECTOR — the mapping-durability claim ONLY. After the reclaim's
-    /// <c>(true, true)</c> unregister, a FRESH manager/store round (new instances reading the
-    /// same persisted store) resolves the old completion to NO pipeline, and the REPLACEMENT's
-    /// completion flows. The restored pipeline's slot/pointer reconciliation is NOT asserted —
-    /// it belongs to the completion-protocol successor.
+    /// THE RESTART VECTOR — reclaim/restart IDENTITY. After the reclaim's <c>(true, true)</c>
+    /// unregister, a FRESH manager/store round (new instances reading the same persisted store)
+    /// resolves the OLD completion to NO pipeline, while a NEW attempt's completion still resolves
+    /// the restored pipeline.
+    /// <para>
+    /// THE RESTORED STATE IS NOW ASSERTED, because it is no longer empty. The reclaim retires the
+    /// slot and clears the pointer IN MEMORY ONLY and persists nothing, so the row still carries
+    /// the admission checkpoint's Pending slot and its pointer. The restart therefore reopens a
+    /// HELD instance (nonterminal phase + non-null captured pointer) that HYDRATES that persisted
+    /// slot/counter evidence — evidence only, conferring no recovery, replay or dispatch authority.
+    /// The vector pins the real restore-time classification values production produces, including
+    /// the honest DISAGREEMENT the reclaim left behind: the hydrated Pending slot is matched by the
+    /// captured pointer, yet the durable mapping for that same task is GONE.
+    /// </para>
+    /// <para>
+    /// CONSEQUENTLY the old position (1, Coding, 1) is legitimately OCCUPIED by the hydrated live
+    /// slot, so a same-position replacement allocation is genuinely refused with a real
+    /// <see cref="WorkSlotException"/> <c>DoubleAssignment</c> — asserted here rather than avoided.
+    /// The fresh attempt is therefore allocated at a position the restored state leaves FREE.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Cleanup_AfterReclaim_RestartedManagerCannotResolveOldCompletion_ButNewOneFlows()
@@ -2730,6 +2745,12 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
         Assert.Null(manager.GetByTaskId(firstTaskId));
         Assert.Null(ReadPersistedGoalId(firstTaskId));
 
+        // …while the reclaim's OWN mutations were in-memory only: it persisted nothing, so the row
+        // still carries the admission checkpoint's pointer and registry blob. That is precisely
+        // what the restart below reopens.
+        Assert.Equal(WorkSlotState.Abandoned, SingleSlot(pipeline).State);
+        Assert.Null(pipeline.ActiveTaskId);
+
         // THE RESTART: a FRESH manager and store round over the SAME persisted database.
         var restoredStore = CreateStore();
         var restartedManager = new GoalPipelineManager(restoredStore, new TestLogger<GoalPipelineManager>());
@@ -2747,21 +2768,55 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
             l.Message.Contains("No pipeline found for completed task") &&
             l.Message.Contains(firstTaskId));
 
-        // THE REPLACEMENT flows: a fresh dispatch in the restarted round claims its mapping IN
-        // MEMORY (the register is memory-only since the admission-atomic-switch; persistence
-        // belongs to the admission path), and the replacement's completion resolves the pipeline.
-        // The replacement id is a REAL allocated id from the allocator itself — never a
-        // hand-computed string. NOTE the RESTART-IDENTITY shape this pins: the restored pipeline's
-        // counters restarted, so the replacement's attempt is 1 AGAIN, over the SAME readable
-        // prefix — and its id is nevertheless DISTINCT from the first task's, because a genuinely
-        // new allocation mints its own nonce suffix. That is collision RESISTANCE, not restart
-        // recovery: no ID is replayed and no assignment is durably bound.
         var restoredPipeline = restartedManager.GetByGoalId(GoalId);
         Assert.NotNull(restoredPipeline);
-        var replacement = restoredPipeline!.AllocateAttemptAndRegisterSlotWithId(
-            GoalId, WorkerRole.Coder, new WorkSlotPosition(1, GoalPhase.Coding, 1));
+
+        // THE HYDRATED EVIDENCE, exactly as production reconstructed it: the row's checkpointed
+        // attempt survives the restart at its ORIGINAL position and state — nothing is renumbered,
+        // demoted or invented — and the restore-time classifications report the real observation,
+        // INCLUDING the disagreement the reclaim left: the pointer still names the hydrated Pending
+        // slot while that task's durable mapping was already unregistered.
+        Assert.True(restoredPipeline!.IsRestoredActiveAttemptHold);
+        Assert.False(restoredPipeline.OwnershipCheckpointEligible);
+        Assert.Equal(RestoredRegistryOutcome.Restored, restoredPipeline.RestoredRegistryClassification);
+        Assert.Equal(
+            RestoredActivePointerOutcome.ActiveSlotPending,
+            restoredPipeline.RestoredActivePointerClassification);
+        Assert.False(restoredPipeline.RestoredActiveTaskMappingPresent);
+        Assert.Equal(firstTaskId, restoredPipeline.ActiveTaskId);
+
+        var hydrated = SingleSlot(restoredPipeline);
+        Assert.Equal(firstTaskId, hydrated.Slot.TaskId);
+        Assert.Equal(new WorkSlotPosition(1, GoalPhase.Coding, 1), hydrated.Slot.Position);
+        Assert.Equal(1, hydrated.Slot.Attempt);
+        Assert.Equal(WorkSlotState.Pending, hydrated.State);
+
+        // THE OLD POSITION IS LEGITIMATELY OCCUPIED. Allocating a replacement at (1, Coding, 1) is
+        // refused with the REAL integrity exception — the hydrated live slot is genuinely there.
+        var refusal = Assert.Throws<WorkSlotException>(() =>
+            restoredPipeline.AllocateAttemptAndRegisterSlotWithId(
+                GoalId, WorkerRole.Coder, new WorkSlotPosition(1, GoalPhase.Coding, 1)));
+        Assert.Equal(WorkSlotEvent.DoubleAssignment, refusal.Event);
+        Assert.Equal(firstTaskId, refusal.ExistingTaskId);
+        // The refusal mutated nothing: the hydrated slot is still the only one.
+        Assert.Equal(firstTaskId, SingleSlot(restoredPipeline).Slot.TaskId);
+
+        // THE REPLACEMENT flows at a position the restored state leaves FREE: a fresh dispatch in
+        // the restarted round claims its mapping IN MEMORY (the register is memory-only since the
+        // admission-atomic-switch; persistence belongs to the admission path), and the
+        // replacement's completion RESOLVES the pipeline instead of falling into the no-pipeline
+        // branch. The replacement id is a REAL allocated id from the allocator itself — never a
+        // hand-computed string. NOTE the identity shape this pins: the free position carries no
+        // hydrated counter, so the fresh attempt is 1, and its id is nevertheless DISTINCT from the
+        // first task's because a genuinely new allocation mints its own nonce suffix. That is
+        // collision RESISTANCE, not restart recovery: no ID is replayed and no assignment is
+        // durably bound.
+        var freePosition = new WorkSlotPosition(1, GoalPhase.Coding, 2);
+        var replacement = restoredPipeline.AllocateAttemptAndRegisterSlotWithId(
+            GoalId, WorkerRole.Coder, freePosition);
         Assert.Equal(1, replacement.Attempt);
-        AssertSuffixedTaskId(replacement.TaskId, TaskIdPrefix(GoalId, WorkerRole.Coder, attempt: 1));
+        AssertSuffixedTaskId(
+            replacement.TaskId, TaskIdPrefix(GoalId, WorkerRole.Coder, occurrence: 2, attempt: 1));
         var replacementTaskId = replacement.TaskId;
         Assert.NotEqual(firstTaskId, replacementTaskId, StringComparer.Ordinal);
         restartedManager.RegisterTask(replacementTaskId, GoalId);
@@ -2774,9 +2829,10 @@ public sealed class WorkSlotDispatchWiringTests : IDisposable
                 Metrics = new TaskMetrics { Verdict = "PASS" },
             },
             TestContext.Current.CancellationToken);
-        // THE MAPPING CLAIM ONLY (not the restored-pipeline slot/pointer reconciliation — that is
-        // the completion-protocol successor's, per the production note): the restarted manager
-        // resolves the replacement task to the restored pipeline.
+        // THE MAPPING CLAIM: the restarted manager resolves the replacement task to the restored
+        // pipeline, so its completion reaches the pipeline rather than the no-pipeline branch. What
+        // the completion may then DO with a held instance is the hold fence's business, not this
+        // vector's — and the restored evidence above is untouched either way.
         Assert.Same(
             restartedManager.GetByGoalId(GoalId),
             restartedManager.GetByTaskId(replacementTaskId));

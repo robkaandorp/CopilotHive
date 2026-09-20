@@ -240,7 +240,13 @@ internal sealed class DispatcherMaintenance
     /// A RESTORED pipeline holding an active attempt
     /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is deliberately LEFT ALONE: it is
     /// reported and skipped, with no Brain registration, no session work, no goal-row change, no
-    /// pointer clear, no queue completion, no removal and no re-dispatch.
+    /// pointer clear, no queue completion, no removal and no re-dispatch. The report carries the
+    /// restore-time classification VALUES the pipeline already holds
+    /// (<see cref="GoalPipeline.RestoredRegistryClassification"/>,
+    /// <see cref="GoalPipeline.RestoredActivePointerClassification"/> and
+    /// <see cref="GoalPipeline.RestoredActiveTaskMappingPresent"/>) and never any registry
+    /// payload, result content or parser text; the facts stay readable on the object itself, so
+    /// observing them never requires startup logging.
     /// </summary>
     public async Task RestoreActivePipelinesAsync(CancellationToken ct)
     {
@@ -270,9 +276,26 @@ internal sealed class DispatcherMaintenance
             // reconciliation this slice does not implement.
             if (pipeline.IsRestoredActiveAttemptHold)
             {
+                // THE ENRICHED HOLD REPORT — CLASSIFICATION VALUES ONLY. The three restore-time
+                // facts are read straight off the pipeline object, where they are the AUTHORITATIVE
+                // record: this Warning merely reports them, so a direct/on-demand restore that
+                // never reaches startup logging can still read exactly the same values from
+                // GoalPipeline.
+                //
+                // NOTHING THAT COULD LEAK IS EMITTED: no raw registry JSON, no capture or decode
+                // result content, no slot/counter payload, no parser exception text and no
+                // exception object (which could carry such text into the sink). The classification
+                // enums and the mapping-present boolean are closed, fixed vocabularies; the goal id
+                // and the active-task pointer were already reported before this enrichment. The
+                // emission stays inside the no-throw LogSafely guard, and the early `continue`
+                // below is unchanged — this is a diagnostic enrichment, never a behavior change.
                 LogSafely(() => _logger.LogWarning(
-                    "Restored pipeline {GoalId} holds restored active attempt {TaskId} — awaiting reconciliation; the attempt is retained and no automatic re-dispatch is performed",
-                    pipeline.GoalId, pipeline.ActiveTaskId));
+                    "Restored pipeline {GoalId} holds restored active attempt {TaskId} — awaiting reconciliation; the attempt is retained and no automatic re-dispatch is performed (registry evidence {RegistryClassification}, active slot {ActiveSlotClassification}, active mapping present {ActiveMappingPresent})",
+                    pipeline.GoalId,
+                    pipeline.ActiveTaskId,
+                    pipeline.RestoredRegistryClassification,
+                    pipeline.RestoredActivePointerClassification,
+                    pipeline.RestoredActiveTaskMappingPresent));
                 continue;
             }
 

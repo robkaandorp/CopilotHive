@@ -218,21 +218,76 @@ public sealed class GoalPipeline
     /// owned. Orchestrator restart ALONE is not permission to invalidate or replace that same valid
     /// attempt, so every automatic consumer (startup restoration, the re-dispatch drain, the
     /// dispatch entry, the completion entry and the stale reclaim's unconditional
-    /// <c>MarkComplete</c>) refuses to act on a held instance. A legacy SQL-NULL registry, empty,
-    /// malformed or unsupported registry text, and inconsistent evidence are ALL held — no registry
-    /// blob is decoded to decide whether uncertainty permits destruction.
+    /// <c>MarkComplete</c>) refuses to act on a held instance. The fact is decided from the
+    /// snapshot's PHASE and POINTER alone: a legacy SQL-NULL registry, empty, malformed or
+    /// unsupported registry text, and inconsistent evidence are ALL held — whether the registry
+    /// text decodes never decides the hold, and a successful registry hydration never clears it.
     /// </para>
     /// <para>
     /// WHAT IT IS NOT: not authorization, not automatic resumption, not receipt replay and not
-    /// proof of worker survival. The operational work-slot registry stays UNACTIVATED
-    /// (<see cref="RestoreRegistry"/> is never called on a restore) and
+    /// proof of worker survival. A held restore DOES hydrate the persisted registry EVIDENCE into
+    /// the in-memory registry (<see cref="RestoreRegistry"/> runs for a held instance only — see
+    /// <see cref="RestoredRegistryClassification"/>), but that is evidence restoration, not
+    /// authority: nothing is dispatched, replayed or resumed from it, and
     /// <see cref="OwnershipCheckpointEligible"/> stays <c>false</c> for held instances, so the
     /// legacy blob-preserving save paths and the historical raw registry bytes are unchanged.
     /// Fresh (Goal-created) pipelines, terminal snapshot phases and restored null-pointer pipelines
-    /// are never held and keep exactly their existing behavior.
+    /// are never held, consume no registry text, and keep exactly their existing behavior.
     /// </para>
     /// </summary>
     internal bool IsRestoredActiveAttemptHold { get; }
+
+    /// <summary>
+    /// THE RESTORE-TIME REGISTRY-EVIDENCE CLASSIFICATION: what a restoring constructor did with the
+    /// snapshot's persisted <see cref="PipelineSnapshot.WorkSlotRegistryJson"/> text. Get-only and
+    /// INTERNAL, so a direct/on-demand restore can read the outcome without any startup logging.
+    /// <para>
+    /// The outcomes, exhaustively:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description><see cref="RestoredRegistryOutcome.NotApplicable"/> — the instance is not
+    ///     held, so no registry evidence was consumed at all (the raw blob is untouched).</description></item>
+    ///   <item><description><see cref="RestoredRegistryOutcome.MissingRegistry"/> — held, but the
+    ///     column was SQL NULL: the evidence is MISSING and nothing is installed. A VALID EMPTY
+    ///     registry is <see cref="RestoredRegistryOutcome.Restored"/>, never this.</description></item>
+    ///   <item><description><see cref="RestoredRegistryOutcome.DecodeRejected"/> — held, and the
+    ///     text was not a decodable version-1 envelope (a REPRESENTATION failure).</description></item>
+    ///   <item><description><see cref="RestoredRegistryOutcome.DomainRejected"/> — held, and the
+    ///     text decoded structurally but the DOMAIN refused the values.</description></item>
+    ///   <item><description><see cref="RestoredRegistryOutcome.Restored"/> — held, and the registry
+    ///     was hydrated through the existing <see cref="RestoreRegistry"/>.</description></item>
+    /// </list>
+    /// <para>
+    /// This classification is an OBSERVATION about this restore, never authorization: it is not a
+    /// recovery decision, not a licence to process anything, and it never changes
+    /// <see cref="IsRestoredActiveAttemptHold"/>.
+    /// </para>
+    /// </summary>
+    internal RestoredRegistryOutcome RestoredRegistryClassification { get; }
+
+    /// <summary>
+    /// THE RESTORE-TIME ACTIVE-POINTER OBSERVATION, captured AFTER hydration has been attempted and
+    /// classified purely against the HYDRATED registry — an observation about the snapshot's
+    /// captured pointer, never a live recalculation and never proof about the worker.
+    /// <para>
+    /// <see cref="RestoredActivePointerOutcome.Unassessed"/> means no assessment was possible
+    /// (nothing was hydrated — the evidence was missing, rejected, or the instance is not held):
+    /// it is NOT a claim that the task is missing. <see cref="RestoredActivePointerOutcome.BlankPointer"/>
+    /// is the blank captured pointer. <see cref="RestoredActivePointerOutcome.NoMatchingSlot"/> is a
+    /// non-blank pointer with no ordinal-matching slot in the hydrated registry. The four
+    /// <c>ActiveSlot*</c> outcomes report the EXACT matching slot's state.
+    /// </para>
+    /// </summary>
+    internal RestoredActivePointerOutcome RestoredActivePointerClassification { get; }
+
+    /// <summary>
+    /// THE RESTORE-TIME MAPPING OBSERVATION: whether the restored snapshot's own
+    /// <see cref="PipelineSnapshot.TaskMappings"/> list contains the exact ORDINAL
+    /// (active task, this goal) pair. <c>false</c> is an observation about that captured list
+    /// only — it is NOT proof that no foreign mapping exists elsewhere, and it is never used to
+    /// synthesize, repair or discard anything.
+    /// </summary>
+    internal bool RestoredActiveTaskMappingPresent { get; }
 
     /// <summary>
     /// Creates a new pipeline for the specified goal.
@@ -261,11 +316,72 @@ public sealed class GoalPipeline
         // THE HOLD IS ESTABLISHED BEFORE THIS INSTANCE CAN BE PUBLISHED. Get-only, so this is the
         // single assignment for the object's lifetime: a later terminal AdvanceTo or a later pointer
         // clear cannot unlock it. HELD when the snapshot is in a NONTERMINAL phase and still carries
-        // a NON-NULL active-task pointer (an empty string counts: it is non-null). No registry blob
-        // is decoded here — SQL NULL, empty, corrupt and unsupported registry text are all held, so
-        // uncertainty never permits destruction of the attempt.
+        // a NON-NULL active-task pointer (an empty string counts: it is non-null). The hold is
+        // decided from the PHASE and POINTER alone — SQL NULL, empty, corrupt and unsupported
+        // registry text are all held, so uncertainty never permits destruction of the attempt, and
+        // the hydration below can never clear the hold.
         IsRestoredActiveAttemptHold =
             snapshot.Phase is not (GoalPhase.Done or GoalPhase.Failed) && snapshot.ActiveTaskId is not null;
+
+        // ── THE HOLD-GATED EVIDENCE HYDRATION, executed directly after the immutable hold fact and
+        //    BEFORE this instance can be published by either restore route. ──
+        // ONLY a held instance consumes the persisted registry text; an unheld snapshot keeps
+        // today's behavior EXACTLY (nothing is decoded, the raw blob is untouched). SQL NULL is
+        // MISSING evidence and installs nothing. Otherwise the EXISTING codec decodes and the
+        // EXISTING RestoreRegistry copies/validates into its atomically-checked EMPTY target — no
+        // validation is duplicated here, and PreflightAdmissionOwnership (Pending-only, and so
+        // wrong for every other state) is deliberately NOT used. Task IDs, all four slot states,
+        // positions, attempts, gaps and counter-only/high-water entries are installed verbatim: no
+        // allocation, no renumbering, no demotion and no task-ID parsing. THIS IS EVIDENCE ONLY:
+        // nothing is dispatched, replayed or resumed, and the hold is never released by success.
+        WorkSlotRegistrySnapshot? hydratedRegistry = null;
+        if (IsRestoredActiveAttemptHold)
+        {
+            var registryJson = snapshot.WorkSlotRegistryJson;
+            if (registryJson is null)
+            {
+                RestoredRegistryClassification = RestoredRegistryOutcome.MissingRegistry;
+            }
+            else
+            {
+                try
+                {
+                    var decoded = WorkSlotRegistryCodec.Decode(registryJson);
+                    RestoreRegistry(decoded);
+                    RestoredRegistryClassification = RestoredRegistryOutcome.Restored;
+                    // The DETACHED evidence the hydration installed — the input to the pointer
+                    // observation below, so that observation is a restore-time capture rather than a
+                    // later live re-read of the registry.
+                    hydratedRegistry = decoded;
+                }
+                catch (WorkSlotRegistryCodecException)
+                {
+                    // A REPRESENTATION failure: the text is not a decodable version-1 envelope.
+                    RestoredRegistryClassification = RestoredRegistryOutcome.DecodeRejected;
+                }
+                catch (ArgumentException)
+                {
+                    // It decoded structurally, but the DOMAIN refused the values. RestoreRegistry
+                    // validates and copies BEFORE its atomic install, so nothing partial landed and
+                    // both registry dictionaries stay empty. A programming failure — such as the
+                    // nonempty-target InvalidOperationException — is deliberately NOT caught here.
+                    RestoredRegistryClassification = RestoredRegistryOutcome.DomainRejected;
+                }
+            }
+        }
+        else
+        {
+            RestoredRegistryClassification = RestoredRegistryOutcome.NotApplicable;
+        }
+
+        // ── THE SEPARATE RESTORE-TIME POINTER/MAPPING OBSERVATIONS, taken AFTER hydration was
+        //    attempted. They DISAGREE with the hydrated evidence freely and are never used to
+        //    discard it: a pointer with no matching slot, or an absent captured mapping, is an
+        //    observation — not a reason to drop valid historical slots or counters. ──
+        RestoredActivePointerClassification = ClassifyRestoredActivePointer(snapshot.ActiveTaskId, hydratedRegistry);
+        RestoredActiveTaskMappingPresent =
+            snapshot.ActiveTaskId is { } activeTask && !string.IsNullOrWhiteSpace(activeTask) &&
+            snapshot.TaskMappings.Contains((activeTask, GoalId));
 
         // Restore budgets from persisted scalar values.
         // IterationBudget: allowed = maxIterations - 1, used = iteration - 1
@@ -335,6 +451,56 @@ public sealed class GoalPipeline
             _installedPhases = null;
             StateMachine.RestoreFromPlan([], Phase);
         }
+    }
+
+    /// <summary>
+    /// THE RESTORE-TIME ACTIVE-POINTER CLASSIFIER: reports what the snapshot's captured pointer
+    /// implies about the registry THAT THIS RESTORE HYDRATED, and nothing more.
+    /// <para>
+    /// It inspects the DETACHED <paramref name="hydratedRegistry"/> the hydration installed — never
+    /// the live registry dictionaries, which no later mutation should be able to change this
+    /// restore-time observation. When no registry was hydrated (missing or rejected evidence, or an
+    /// unheld instance) the answer is <see cref="RestoredActivePointerOutcome.Unassessed"/> —
+    /// explicitly NOT proof that the task is missing. A blank pointer is
+    /// <see cref="RestoredActivePointerOutcome.BlankPointer"/>. A non-blank pointer with no
+    /// ORDINAL-matching slot is <see cref="RestoredActivePointerOutcome.NoMatchingSlot"/>;
+    /// otherwise the matching slot's exact state is reported, so all four slot states are
+    /// representable.
+    /// </para>
+    /// <para>
+    /// A PURE OBSERVATION: it mutates nothing, allocates nothing, parses no task ID and takes no
+    /// lock. It is never used to decide whether evidence is installed — a disagreement between the
+    /// pointer and the hydrated registry is REPORTED, not resolved. If a pointer happens to name
+    /// several slots (only possible in a direct-restore hand-built snapshot), the FIRST matching
+    /// entry in the hydrated order is reported.
+    /// </para>
+    /// </summary>
+    private static RestoredActivePointerOutcome ClassifyRestoredActivePointer(
+        string? activeTaskId, WorkSlotRegistrySnapshot? hydratedRegistry)
+    {
+        // Nothing was hydrated → nothing can be assessed. This is NOT a claim about the task.
+        if (hydratedRegistry is null)
+            return RestoredActivePointerOutcome.Unassessed;
+
+        if (string.IsNullOrWhiteSpace(activeTaskId))
+            return RestoredActivePointerOutcome.BlankPointer;
+
+        foreach (var view in hydratedRegistry.Slots)
+        {
+            if (!string.Equals(view.Slot.TaskId, activeTaskId, StringComparison.Ordinal))
+                continue;
+
+            return view.State switch
+            {
+                WorkSlotState.Pending => RestoredActivePointerOutcome.ActiveSlotPending,
+                WorkSlotState.Claimed => RestoredActivePointerOutcome.ActiveSlotClaimed,
+                WorkSlotState.Recorded => RestoredActivePointerOutcome.ActiveSlotRecorded,
+                WorkSlotState.Abandoned => RestoredActivePointerOutcome.ActiveSlotAbandoned,
+                _ => throw new InvalidOperationException($"Unhandled WorkSlotState: {view.State}"),
+            };
+        }
+
+        return RestoredActivePointerOutcome.NoMatchingSlot;
     }
 
     /// <summary>Advance to the next phase.</summary>
@@ -1676,6 +1842,51 @@ internal enum WorkSlotState
     Recorded,
     /// <summary>The slot has been abandoned; its result must never be recorded.</summary>
     Abandoned,
+}
+
+/// <summary>
+/// What a RESTORING constructor did with the snapshot's persisted work-slot registry text —
+/// <see cref="GoalPipeline.RestoredRegistryClassification"/>. These are restoration-time outcomes
+/// only: none of them authorizes, resumes or replays anything.
+/// </summary>
+internal enum RestoredRegistryOutcome
+{
+    /// <summary>The instance is not held, so no registry evidence was consumed at all.</summary>
+    NotApplicable,
+    /// <summary>Held, but the registry text was SQL NULL: the evidence is missing and nothing was installed.</summary>
+    MissingRegistry,
+    /// <summary>Held, and the text could not be decoded as a version-1 envelope (a representation failure).</summary>
+    DecodeRejected,
+    /// <summary>Held, and the text decoded structurally but domain validation refused the values.</summary>
+    DomainRejected,
+    /// <summary>Held, and the registry was hydrated through <see cref="GoalPipeline.RestoreRegistry"/>.</summary>
+    Restored,
+}
+
+/// <summary>
+/// The restore-time observation of the snapshot's captured active-task pointer against the registry
+/// THIS RESTORE HYDRATED — <see cref="GoalPipeline.RestoredActivePointerClassification"/>. It is an
+/// observation about captured evidence, never a live recalculation and never proof about a worker.
+/// </summary>
+internal enum RestoredActivePointerOutcome
+{
+    /// <summary>
+    /// No assessment was possible because nothing was hydrated (missing or rejected evidence, or an
+    /// unheld instance). This is explicitly NOT a claim that the task is missing.
+    /// </summary>
+    Unassessed,
+    /// <summary>The captured pointer was blank.</summary>
+    BlankPointer,
+    /// <summary>The captured pointer is non-blank and no ordinal-matching slot exists in the hydrated registry.</summary>
+    NoMatchingSlot,
+    /// <summary>The ordinal-matching slot in the hydrated registry is <see cref="WorkSlotState.Pending"/>.</summary>
+    ActiveSlotPending,
+    /// <summary>The ordinal-matching slot in the hydrated registry is <see cref="WorkSlotState.Claimed"/>.</summary>
+    ActiveSlotClaimed,
+    /// <summary>The ordinal-matching slot in the hydrated registry is <see cref="WorkSlotState.Recorded"/>.</summary>
+    ActiveSlotRecorded,
+    /// <summary>The ordinal-matching slot in the hydrated registry is <see cref="WorkSlotState.Abandoned"/>.</summary>
+    ActiveSlotAbandoned,
 }
 
 /// <summary>
