@@ -6,10 +6,12 @@ namespace CopilotHive.Services;
 /// <summary>
 /// Hosted background service that periodically scans the worker pool for stale workers
 /// (workers whose heartbeat has not been received within <see cref="CleanupDefaults.StaleTimeoutMinutes"/>
-/// minutes) and removes them. When a stale worker had an active task, the task is reclaimed:
-/// its queue entry is completed (never re-enqueued — the re-enqueue interim is retired), its
-/// pipeline work slot is retired atomically together with the active-task pointer, the durable
-/// task→goal mapping is unregistered, and the goal is queued for a FRESH re-dispatch.
+/// minutes) and removes them. When a stale worker had an active task, the task is reclaimed for an
+/// UNHELD pipeline: its queue entry is completed (never re-enqueued — the re-enqueue interim is
+/// retired), its pipeline work slot is retired atomically together with the active-task pointer, the
+/// durable task→goal mapping is unregistered, and the goal is queued for a FRESH re-dispatch. A
+/// HELD pipeline (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is refused instead — see
+/// <see cref="RescheduleAbandonedTask"/>.
 /// It also reclaims tasks that exceed <see cref="Configuration.OrchestratorConfig.WorkerTaskTimeoutMinutes"/>
 /// even while the worker keeps heartbeating, which covers hung LLM calls.
 /// </summary>
@@ -33,7 +35,10 @@ namespace CopilotHive.Services;
 /// IN-MEMORY: this reclaim calls NO <c>PersistFull</c> (or any other persistence) — the cleanup's
 /// mutation is intentionally not persisted. A pipeline restored after a restart has an EMPTY slot
 /// registry and its pointer is the snapshot's; the reconciliation of that restored state is owned
-/// by the completion-protocol successor, not by this method.
+/// by the completion-protocol successor, not by this method. Until that successor exists, a
+/// RESTORED pipeline whose snapshot carried a nonterminal phase and a non-null active pointer is
+/// HELD (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) and the reclaim refuses it
+/// entirely — see <see cref="RescheduleAbandonedTask"/>.
 /// </para>
 /// </remarks>
 public sealed class StaleWorkerCleanupService : BackgroundService
@@ -182,11 +187,35 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     }
 
     /// <summary>
+    /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never
+    /// escape a refusal fence or be mistaken for the refused operation's outcome.
+    /// </summary>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never affect the guarded operation.
+        }
+    }
+
+    /// <summary>
     /// Reclaims the task a removed (stale or timed-out) worker was holding, using the D2 shape:
     /// <list type="number">
-    ///   <item><description><see cref="TaskQueue.MarkComplete"/> on the task's queue entry —
-    ///     UNCONDITIONAL, with NO re-enqueue (the re-enqueue interim is retired; the queue entry
-    ///     is dropped, not handed to another worker).</description></item>
+    ///   <item><description>THE HOLD CHECK FIRST — <see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>
+    ///     on the pipeline resolved for the task. A HELD pipeline means the restored active attempt
+    ///     is retained awaiting reconciliation: the whole reclaim is refused with NOTHING mutated —
+    ///     no queue task removal, no slot/pointer change, no durable or in-memory mapping removal
+    ///     and no re-dispatch.</description></item>
+    ///   <item><description><see cref="TaskQueue.MarkComplete"/> on the task's queue entry — for
+    ///     every UNHELD pipeline (and every orphan), still with NO re-enqueue (the re-enqueue
+    ///     interim is retired; the queue entry is dropped, not handed to another worker). It is
+    ///     therefore no longer reachable from a held task, but its behavior on the unheld path is
+    ///     unchanged.</description></item>
     ///   <item><description>THE RETIRE — <see cref="GoalPipeline.RetireSlotAndClearIfCurrent"/>,
     ///     the D1 atomic primitive: the attempt's work slot is retired AND the active-task pointer
     ///     is cleared in one lock acquisition, when and only when the pointer still names the
@@ -202,22 +231,41 @@ public sealed class StaleWorkerCleanupService : BackgroundService
     /// </list>
     /// The false retirement outcomes (<see cref="SlotRetirementOutcome.SlotAbsent"/> and
     /// <see cref="SlotRetirementOutcome.AlreadyAbandoned"/>) are CONTINUATIONS: the mapping
-    /// unregister and the re-dispatch still run. The ORPHAN path (no pipeline for the task)
-    /// removes the active entry and dispatches NOTHING — a persisted mapping, if any, survives
-    /// for the successor's reconciliation.
+    /// unregister and the re-dispatch still run. The ORPHAN path (no pipeline for the task —
+    /// or a non-held one, which is unaffected) removes the active entry and dispatches NOTHING — a
+    /// persisted mapping, if any, survives for the successor's reconciliation.
     /// </summary>
     /// <param name="workerId">The id of the worker that was removed.</param>
     /// <param name="taskId">The task id the worker was holding.</param>
     private void RescheduleAbandonedTask(string workerId, string taskId)
     {
-        // (1) THE UNCONDITIONAL COMPLETION. The queue entry is dropped, never re-enqueued: the
-        // re-enqueue would double-dispatch (the old task re-enqueued AND the goal redispatched),
-        // so the re-enqueue interim is retired — the replacement comes only from the fresh
-        // dispatch the redispatch triggers.
+        // THE PIPELINE RESOLUTION COMES FIRST so the hold can be checked BEFORE the completion.
+        // It is a pure read — nothing is mutated by it — so the unheld path keeps its exact
+        // existing behavior.
+        var pipeline = _pipelineManager.GetByTaskId(taskId);
+
+        // THE HOLD FENCE — BEFORE the previously unconditional _taskQueue.MarkComplete. A held
+        // pipeline still owns the attempt it was restored with, so the reclaim refuses: NO queue
+        // task removal, no slot or pointer change, no durable or in-memory mapping removal and no
+        // redispatch. The refusal mutates nothing and is reported through a guarded, no-throw
+        // emission. This is transport-side reclamation only — it neither claims that the worker
+        // survived nor that it is proven dead; the pool-level stale/inactivity eviction that
+        // removed the worker is separate and unchanged.
+        if (pipeline is not null && pipeline.IsRestoredActiveAttemptHold)
+        {
+            LogSafely(() => _logger.LogWarning(
+                "WorkSlotIntegrity: reclaim-refused goal={GoalId} task={TaskId} worker={WorkerId} — the restored active attempt is held awaiting reconciliation; the queue entry, the slot, the pointer and the mappings are retained and no re-dispatch is enqueued",
+                pipeline.GoalId, taskId, workerId));
+            return;
+        }
+
+        // (1) THE UNCONDITIONAL COMPLETION, for an UNHELD pipeline (or an orphan task). The queue
+        // entry is dropped, never re-enqueued: the re-enqueue would double-dispatch (the old task
+        // re-enqueued AND the goal redispatched), so the re-enqueue interim is retired — the
+        // replacement comes only from the fresh dispatch the redispatch triggers.
         _taskQueue.MarkComplete(taskId);
 
         // The pipeline may not exist for the task (an orphan) — everything below is then skipped.
-        var pipeline = _pipelineManager.GetByTaskId(taskId);
         if (pipeline is null)
         {
             _logger.LogWarning(

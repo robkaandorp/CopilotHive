@@ -62,8 +62,9 @@ internal sealed class GoalDispatchService
     }
 
     /// <summary>
-    /// Drains the re-dispatch queue and dispatches the current phase for each
-    /// queued pipeline.
+    /// Drains the re-dispatch queue and dispatches the current phase for each queued pipeline.
+    /// A held pipeline (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is CONSUMED and
+    /// refused: no prompt resolution, no dispatch and no re-enqueue.
     /// </summary>
     public async Task DrainRedispatchQueueAsync(ConcurrentQueue<string> redispatchQueue, CancellationToken ct)
     {
@@ -71,6 +72,20 @@ internal sealed class GoalDispatchService
         {
             var pipeline = _pipelineManager.GetByGoalId(goalId);
             if (pipeline is null) continue;
+
+            // THE HOLD FENCE — checked before the pointer/phase filters so a held entry is
+            // consumed by this drain and REFUSED: no prompt resolution, no dispatch, no
+            // re-enqueue. A held pipeline still owns its persisted attempt, so consuming it here
+            // would replace the same valid attempt after a restart alone. The refusal is not a
+            // failure — the emission is guarded, so a logger fault cannot escape this fence.
+            if (pipeline.IsRestoredActiveAttemptHold)
+            {
+                LogSafely(() => _logger.LogWarning(
+                    "WorkSlotIntegrity: redispatch-refused goal={GoalId} task={TaskId} — the restored active attempt is held awaiting reconciliation; the entry is consumed and NOT re-enqueued",
+                    pipeline.GoalId, pipeline.ActiveTaskId));
+                continue;
+            }
+
             if (pipeline.ActiveTaskId is not null) continue;
             if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed) continue;
 
@@ -101,6 +116,23 @@ internal sealed class GoalDispatchService
                 : $"Continue task for: {pipeline.Description}";
 
             await _taskDispatchService.DispatchToRole(pipeline, role.Value, prompt, ct);
+        }
+    }
+
+    /// <summary>
+    /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never
+    /// escape a refusal fence or be mistaken for the refused operation's outcome.
+    /// </summary>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never affect the guarded operation.
         }
     }
 

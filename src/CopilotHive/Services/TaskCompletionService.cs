@@ -48,6 +48,20 @@ internal sealed class TaskCompletionService
             return;
         }
 
+        // THE HOLD FENCE — immediately after the held-pipeline lookup and BEFORE everything else
+        // this method does: the legacy NoSlot admission, the pointer clear, the output/metrics/
+        // conversation mutation, the phase drive and the persistence. A held pipeline still owns
+        // the attempt it was restored with, so a completion for it must not be replayed into the
+        // pipeline. The refusal is not a failure: it is reported through a guarded, no-throw
+        // emission and the method returns normally.
+        if (pipeline.IsRestoredActiveAttemptHold)
+        {
+            LogSafely(() => _logger.LogWarning(
+                "WorkSlotIntegrity: completion-refused goal={GoalId} task={TaskId} — the restored active attempt is held awaiting reconciliation; the completion is dropped without admitting, clearing, mutating or persisting",
+                pipeline.GoalId, result.TaskId));
+            return;
+        }
+
         // Guard: ignore late-arriving completions for goals already finished
         if (pipeline.Phase is GoalPhase.Done or GoalPhase.Failed)
         {
@@ -197,5 +211,22 @@ internal sealed class TaskCompletionService
             _dashboardNotifier?.NotifyStateChanged();
 
         _pipelineManager.PersistFull(pipeline);
+    }
+
+    /// <summary>
+    /// Runs a diagnostic emission best-effort: a logger's failure is swallowed so it can never
+    /// escape a refusal fence or be mistaken for the refused operation's outcome.
+    /// </summary>
+    /// <param name="emit">The guarded emission.</param>
+    private static void LogSafely(Action emit)
+    {
+        try
+        {
+            emit();
+        }
+        catch (Exception)
+        {
+            // Best-effort by contract: a diagnostic failure may never affect the guarded operation.
+        }
     }
 }

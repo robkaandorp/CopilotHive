@@ -1452,6 +1452,22 @@ public sealed class LlmSessionRegistryIntegrationTests
 
     // ── DispatcherMaintenance ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// THE UNHELD (NULL-POINTER) CODING CONTROL: the meaningful RegisterExistingGoalSession
+    /// integration coverage RETAINED on a restoration that is NOT held — a restored pipeline
+    /// with a NULL active-task pointer (mid-Planning evidence) keeps its pre-hold behavior. The
+    /// session file existed, so the restore logic takes the else branch and calls
+    /// RegisterExistingGoalSession, which adopts the EXISTING file rather than forking a fresh
+    /// master session. The registry entry is published by the goal's child actor on its first
+    /// call, and its token count proves the restored file (not a zero-token fork) is in use.
+    /// <para>
+    /// (The held counterpart — a NON-NULL restored pointer — performs NO Brain registration and
+    /// NO session work at all; that expectation is covered by
+    /// <see cref="RestoredActiveAttemptHoldTests"/>. The held control here was retired with the
+    /// old automatic-restore expectations: a held object must never be driven through
+    /// PlanIterationAsync merely to recreate the pre-hold registry evidence.)
+    /// </para>
+    /// </summary>
     [Fact]
     public async Task DispatcherMaintenance_RegistersExistingGoalSession_WhenSessionFileExists()
     {
@@ -1472,8 +1488,11 @@ public sealed class LlmSessionRegistryIntegrationTests
             // a distinctly non-zero token count. A fresh fork from the (empty) master session would
             // have zero tokens — so a non-zero CurrentTokens after restoration proves the EXISTING
             // file was read via RegisterExistingGoalSession, not re-forked from master.
+            const string persistedHistoryMarker =
+                "REGISTER_EXISTING_ONLY_MARKER_7c3d089486ba4f0ab06fa14a8b5d7374";
             var goalSessionFile = Path.Combine(tempDir, "actors", $"brain-goal-{goalId}.json");
             var goalSession = AgentSession.Create($"brain-goal-{goalId}");
+            goalSession.MessageHistory.Add(new ChatMessage(ChatRole.User, persistedHistoryMarker));
             for (var i = 0; i < 6; i++)
             {
                 goalSession.MessageHistory.Add(new ChatMessage(
@@ -1487,20 +1506,31 @@ public sealed class LlmSessionRegistryIntegrationTests
             // Simulate a restart: only the on-disk session file remains; no registry entry, no context.
             Assert.Null(FindSession(registry, $"brain-goal-{goalId}"));
 
-            // A store-backed pipeline manager with one active pipeline to restore for this goal.
+            // A store-backed pipeline manager with one NULL-POINTER pipeline to restore for this
+            // goal: mid-Planning (no ActiveTaskId) — the UNHELD restoration the gate processes.
             using var dbContext = CopilotHiveDbContext.CreateInMemory();
             var store = new PipelineStore(dbContext, NullLogger<PipelineStore>.Instance);
             var seedManager = new GoalPipelineManager(store);
             var goal = new Goal { Id = goalId, Description = "Restore existing goal", RepositoryNames = ["test-repo"] };
             var pipeline = seedManager.CreatePipeline(goal);
-            pipeline.AdvanceTo(GoalPhase.Coding);
-            pipeline.SetActiveTask("task-1", $"feature/{goalId}");
+            pipeline.AdvanceTo(GoalPhase.Planning);
             seedManager.PersistFull(pipeline);
+            Assert.False(pipeline.IsRestoredActiveAttemptHold);
 
             var restoreManager = new GoalPipelineManager(store);
+
+            // The restore's post-restore status-repair step resolves the goal's source through a
+            // GoalManager — register the same goal so that lookup succeeds (unrelated to the
+            // registry behavior under test).
+            var goalManager = new GoalManager();
+            goalManager.AddSource(new InMemoryGoalStore());
+            await goalManager.GetNextGoalAsync(TestContext.Current.CancellationToken);
+            var goalSource = new ExistingGoalSource(goal);
+            goalManager.AddSource(goalSource);
+
             var maintenance = new DispatcherMaintenance(
                 restoreManager,
-                new GoalManager(),
+                goalManager,
                 new TaskQueue(),
                 new GrpcWorkerGateway(new WorkerPool()),
                 brain: brain,
@@ -1515,10 +1545,19 @@ public sealed class LlmSessionRegistryIntegrationTests
 
             await maintenance.RestoreActivePipelinesAsync(TestContext.Current.CancellationToken);
 
+            // THE BRANCH DISCRIMINATOR. RegisterExistingGoalSession loads the existing file and
+            // therefore retains this opaque history marker. A mutant selecting ForkSession instead
+            // overwrites the goal file with a fresh master fork, where the marker cannot exist.
+            // This assertion is made immediately after maintenance and before any planning call.
+            var afterMaintenance = await AgentSession.LoadAsync(
+                goalSessionFile, TestContext.Current.CancellationToken);
+            Assert.Contains(afterMaintenance.MessageHistory,
+                message => message.Text == persistedHistoryMarker);
+
             // The session file existed, so the restore logic must take the else branch and call
             // RegisterExistingGoalSession, which adopts the EXISTING file rather than forking a
-            // fresh master session. The registry entry is published by the goal's child actor on its
-            // first call, and its token count proves the restored file (not a zero-token fork) is in use.
+            // fresh master session. The registry entry is published by the goal's child actor on
+            // its first call; planning is performed ONLY on this unheld null-pointer control.
             await brain.PlanIterationAsync(
                 new GoalPipeline(new Goal { Id = goalId, Description = "Restore existing goal" }),
                 null, TestContext.Current.CancellationToken);
@@ -1541,6 +1580,13 @@ public sealed class LlmSessionRegistryIntegrationTests
         }
     }
 
+    /// <summary>
+    /// THE UNHELD (NULL-POINTER) FORK CONTROL: the meaningful ForkSession integration coverage
+    /// RETAINED on a restoration that is NOT held — a pipeline restored with a NULL active-task
+    /// pointer. Session missing → the restore logic must fork a new session from master.
+    /// (A held restored pointer performs NO session work at all — no GoalSessionExists probe,
+    /// no fork, no registration — covered by <see cref="RestoredActiveAttemptHoldTests"/>.)
+    /// </summary>
     [Fact]
     public async Task DispatcherMaintenance_ForksSession_WhenSessionMissing()
     {
@@ -1550,17 +1596,23 @@ public sealed class LlmSessionRegistryIntegrationTests
 
         var goal = new Goal { Id = "goal-restore-2", Description = "Restore goal 2", RepositoryNames = ["test-repo"] };
         var pipeline = pipelineManager.CreatePipeline(goal);
-        pipeline.AdvanceTo(GoalPhase.Coding);
-        pipeline.SetActiveTask("task-2", "feature/goal-restore-2");
+        pipeline.AdvanceTo(GoalPhase.Planning);
         pipelineManager.PersistFull(pipeline);
+        Assert.False(pipeline.IsRestoredActiveAttemptHold);
 
         var restoreManager = new GoalPipelineManager(store);
+
+        // The restore's post-restore status-repair step resolves the goal's source through a
+        // GoalManager — register the same goal so that lookup succeeds (unrelated to the
+        // registry behavior under test).
+        var goalManager = new GoalManager();
+        goalManager.AddSource(new ExistingGoalSource(goal));
 
         // Session missing → the restore logic must fork a new session from master.
         var brain = new RegisterTrackingBrain(sessionExists: false);
         var maintenance = new DispatcherMaintenance(
             restoreManager,
-            new GoalManager(),
+            goalManager,
             new TaskQueue(),
             new GrpcWorkerGateway(new WorkerPool()),
             brain: brain,
@@ -1979,6 +2031,59 @@ file sealed class StatusCapturingStreamingChatClient(LlmSessionRegistry registry
 /// <summary>
 /// A fake <see cref="IDistributedBrain"/> that tracks fork/register/exists calls for
 /// DispatcherMaintenance restoration tests.
+/// </summary>
+/// <summary>
+/// A <see cref="IGoalSource"/> + <see cref="IGoalStore"/> double serving exactly one goal, so the
+/// restore's post-restore status-repair step can resolve the goal's source
+/// (<c>GoalManager.GetSourceForGoalAsync</c> searches IGoalStore sources only).
+/// </summary>
+file sealed class ExistingGoalSource(Goal goal) : IGoalSource, IGoalStore
+{
+    public string Name => "existing-goal-source";
+
+    public Task<IReadOnlyList<Goal>> GetPendingGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+    public Task UpdateGoalStatusAsync(
+        string goalId, GoalStatus status, GoalUpdateMetadata? metadata = null, CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    public Task<Goal?> GetGoalAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<Goal?>(goalId == goal.Id ? goal : null);
+
+    public Task<IReadOnlyList<Goal>> GetAllGoalsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([goal]);
+
+    public Task<Goal> CreateGoalAsync(Goal created, CancellationToken ct = default) => Task.FromResult(created);
+    public Task UpdateGoalAsync(Goal updated, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<bool> DeleteGoalAsync(string goalId, CancellationToken ct = default) => Task.FromResult(false);
+    public Task<IReadOnlyList<Goal>> SearchGoalsAsync(string query, GoalStatus? statusFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+    public Task<IReadOnlyList<Goal>> GetGoalsByStatusAsync(GoalStatus status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([goal]);
+    public Task AddIterationAsync(string goalId, IterationSummary summary, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<IReadOnlyList<IterationSummary>> GetIterationsAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<IterationSummary>>([]);
+    public Task<Release> CreateReleaseAsync(Release release, CancellationToken ct = default) => Task.FromResult(release);
+    public Task<Release?> GetReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult<Release?>(null);
+    public Task UpdateReleaseAsync(Release release, CancellationToken ct = default) => Task.CompletedTask;
+    public Task UpdateReleaseAsync(string releaseId, ReleaseUpdateData update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<bool> DeleteReleaseAsync(string releaseId, CancellationToken ct = default) => Task.FromResult(false);
+
+    public Task<IReadOnlyList<Release>> GetReleasesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Release>>([]);
+
+    public Task<IReadOnlyList<Goal>> GetGoalsByReleaseAsync(string releaseId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Goal>>([]);
+    public Task<IReadOnlyList<ConversationEntry>> GetPipelineConversationAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConversationEntry>>([]);
+    public Task ResetGoalIterationDataAsync(string goalId, CancellationToken ct = default) => Task.CompletedTask;
+    public Task<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>> GetAllClarificationsAsync(int? limit = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(string GoalId, PersistedClarification Clarification)>>([]);
+}
+
+/// <summary>
+/// Test double implementing <see cref="IDistributedBrain"/> that records fork/registration calls.
 /// </summary>
 file sealed class RegisterTrackingBrain(bool sessionExists) : IDistributedBrain
 {

@@ -201,6 +201,40 @@ public sealed class GoalPipeline
     internal bool OwnershipCheckpointEligible { get; set; }
 
     /// <summary>
+    /// THE RESTORE-ORIGIN HOLD: <c>true</c> only for an instance constructed from a
+    /// <see cref="PipelineSnapshot"/> whose phase is NONTERMINAL (neither <see cref="GoalPhase.Done"/>
+    /// nor <see cref="GoalPhase.Failed"/>) AND whose captured
+    /// <see cref="PipelineSnapshot.ActiveTaskId"/> is NON-NULL — an EMPTY-STRING pointer is non-null
+    /// and is therefore held too.
+    /// <para>
+    /// It is assigned ONCE, inside the restoring constructor, BEFORE either restore route
+    /// (<see cref="GoalPipelineManager.RestorePipeline"/> /
+    /// <see cref="GoalPipelineManager.RestoreFromStore"/>) can publish the instance, and it is
+    /// IMMUTABLE for the object's lifetime: a later terminal phase transition or a later pointer
+    /// change does not unlock it.
+    /// </para>
+    /// <para>
+    /// WHAT IT MEANS: the persisted attempt this pipeline was restored with is treated as still
+    /// owned. Orchestrator restart ALONE is not permission to invalidate or replace that same valid
+    /// attempt, so every automatic consumer (startup restoration, the re-dispatch drain, the
+    /// dispatch entry, the completion entry and the stale reclaim's unconditional
+    /// <c>MarkComplete</c>) refuses to act on a held instance. A legacy SQL-NULL registry, empty,
+    /// malformed or unsupported registry text, and inconsistent evidence are ALL held — no registry
+    /// blob is decoded to decide whether uncertainty permits destruction.
+    /// </para>
+    /// <para>
+    /// WHAT IT IS NOT: not authorization, not automatic resumption, not receipt replay and not
+    /// proof of worker survival. The operational work-slot registry stays UNACTIVATED
+    /// (<see cref="RestoreRegistry"/> is never called on a restore) and
+    /// <see cref="OwnershipCheckpointEligible"/> stays <c>false</c> for held instances, so the
+    /// legacy blob-preserving save paths and the historical raw registry bytes are unchanged.
+    /// Fresh (Goal-created) pipelines, terminal snapshot phases and restored null-pointer pipelines
+    /// are never held and keep exactly their existing behavior.
+    /// </para>
+    /// </summary>
+    internal bool IsRestoredActiveAttemptHold { get; }
+
+    /// <summary>
     /// Creates a new pipeline for the specified goal.
     /// </summary>
     /// <param name="goal">The goal to track.</param>
@@ -223,6 +257,15 @@ public sealed class GoalPipeline
         GoalId = snapshot.GoalId;
         Description = snapshot.Description;
         Phase = snapshot.Phase;
+
+        // THE HOLD IS ESTABLISHED BEFORE THIS INSTANCE CAN BE PUBLISHED. Get-only, so this is the
+        // single assignment for the object's lifetime: a later terminal AdvanceTo or a later pointer
+        // clear cannot unlock it. HELD when the snapshot is in a NONTERMINAL phase and still carries
+        // a NON-NULL active-task pointer (an empty string counts: it is non-null). No registry blob
+        // is decoded here — SQL NULL, empty, corrupt and unsupported registry text are all held, so
+        // uncertainty never permits destruction of the attempt.
+        IsRestoredActiveAttemptHold =
+            snapshot.Phase is not (GoalPhase.Done or GoalPhase.Failed) && snapshot.ActiveTaskId is not null;
 
         // Restore budgets from persisted scalar values.
         // IterationBudget: allowed = maxIterations - 1, used = iteration - 1

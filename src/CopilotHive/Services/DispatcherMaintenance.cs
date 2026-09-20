@@ -237,6 +237,10 @@ internal sealed class DispatcherMaintenance
     /// <summary>
     /// Restore active pipelines from the persistence store on startup.
     /// Re-primes Brain sessions so restored active pipelines are tracked by the pipeline manager.
+    /// A RESTORED pipeline holding an active attempt
+    /// (<see cref="GoalPipeline.IsRestoredActiveAttemptHold"/>) is deliberately LEFT ALONE: it is
+    /// reported and skipped, with no Brain registration, no session work, no goal-row change, no
+    /// pointer clear, no queue completion, no removal and no re-dispatch.
     /// </summary>
     public async Task RestoreActivePipelinesAsync(CancellationToken ct)
     {
@@ -253,6 +257,25 @@ internal sealed class DispatcherMaintenance
 
         foreach (var pipeline in restored)
         {
+            // THE RESTORE-ORIGIN HOLD GATE — recognised BEFORE anything else the loop does. An
+            // instance restored with a NONTERMINAL phase and a NON-NULL captured active-task
+            // pointer still owns the persisted attempt: orchestrator restart alone is not
+            // permission to invalidate or replace it. Every automatic step below is therefore
+            // skipped — no Brain registration, no session fork/registration, no planning or other
+            // LLM work, no goal-row status cleanup or status repair, no pointer clear, no
+            // TaskQueue.MarkComplete, no pipeline removal and no redispatch enqueue. NOTHING is
+            // mutated: the goal row and the pipeline are left exactly as restored, and the
+            // instance is left in the manager so GetActivePipelines keeps naming it and
+            // orphan-session cleanup retains its session files. The attempt waits for a
+            // reconciliation this slice does not implement.
+            if (pipeline.IsRestoredActiveAttemptHold)
+            {
+                LogSafely(() => _logger.LogWarning(
+                    "Restored pipeline {GoalId} holds restored active attempt {TaskId} — awaiting reconciliation; the attempt is retained and no automatic re-dispatch is performed",
+                    pipeline.GoalId, pipeline.ActiveTaskId));
+                continue;
+            }
+
             // Register restored active pipelines with the Brain so get_goal tool works
             if (pipeline.Phase is not (GoalPhase.Done or GoalPhase.Failed))
                 (_brain as DistributedBrain)?.RegisterActivePipeline(pipeline);
@@ -325,18 +348,12 @@ internal sealed class DispatcherMaintenance
                 await _goalManager.UpdateGoalStatusAsync(pipeline.GoalId, GoalStatus.InProgress, startedMeta, ct);
             }
 
-            // If the pipeline was mid-task (has ActiveTaskId), the old worker is gone
-            // after a restart. Clear the active task and enqueue for re-dispatch.
-            if (pipeline.ActiveTaskId is not null)
-            {
-                _logger.LogInformation("Pipeline {GoalId} was mid-task ({TaskId}) — clearing stale task for re-dispatch",
-                    pipeline.GoalId, pipeline.ActiveTaskId);
-
-                var staleTaskId = pipeline.ActiveTaskId;
-                _taskQueue.MarkComplete(staleTaskId);
-                pipeline.ClearActiveTask();
-                _redispatchQueue.Enqueue(pipeline.GoalId);
-            }
+            // THE MID-TASK ACTIVE-TASK CLEAR/REDISPATCH BRANCH IS DELETED. It used to treat every
+            // restored non-null pointer as a lost worker — clearing the queue entry, blanking the
+            // pointer and enqueuing a redispatch. That is exactly the destructive automatic
+            // replacement the restore-origin hold above now refuses, so the branch is gone rather
+            // than left as contradictory, unreachable logic. A restored non-null pointer is
+            // always held, so this point is reachable only for a restored NULL pointer.
         }
 
         _logger.LogInformation("Restored {Count} pipeline(s): {GoalIds}",
@@ -364,6 +381,9 @@ internal sealed class DispatcherMaintenance
             .Where(g => g.CompletedAt.HasValue && g.CompletedAt.Value < cutoff)
             .Where(g => !string.IsNullOrEmpty(g.MergeCommitHash))
             .Where(g => !g.BranchCleanedUp)
+            // THE HOLD IS ENFORCED HERE TOO: a held pipeline's restored attempt is retained, so its
+            // branch is not cleanable evidence of finished work — the automatic cleanup skips it.
+            .Where(g => _pipelineManager.GetByGoalId(g.Id)?.IsRestoredActiveAttemptHold != true)
             .ToList();
 
         if (eligible.Count == 0) return;

@@ -133,6 +133,69 @@ public sealed class DispatcherMaintenanceTests
         repoManager.Verify(r => r.DeleteRemoteBranchAsync("my-repo", "copilothive/old-goal", It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    /// <summary>
+    /// THE RESTORE-HOLD FILTER. Both goals independently satisfy EVERY ordinary cleanup predicate
+    /// (old CompletedAt, non-empty merge hash, BranchCleanedUp=false). The held goal owns a REAL
+    /// snapshot-restored nonterminal/non-null-pointer pipeline and is skipped, while the otherwise
+    /// identical fresh/unheld control is deleted and persisted. Removing the hold filter deletes
+    /// the held branch and fails; inverting it skips the control and fails.
+    /// </summary>
+    [Fact]
+    public async Task CleanupMergedBranches_HeldPipelineSkipped_UnheldEligibleControlRuns()
+    {
+        using var db = CopilotHiveDbContext.CreateInMemory();
+        await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
+
+        var heldGoal = MakeCompletedGoal(
+            "cleanup-held", completedAt: DateTime.UtcNow.AddHours(-72), repoName: "held-repo");
+        var controlGoal = MakeCompletedGoal(
+            "cleanup-unheld", completedAt: heldGoal.CompletedAt!.Value, repoName: "control-repo");
+
+        // Seed then RESTORE a nonterminal pipeline with a non-null pointer: this is the actual hold
+        // provenance, not a fresh pipeline with an assigned task.
+        var seedManager = new GoalPipelineManager(pipelineStore);
+        var seed = seedManager.CreatePipeline(heldGoal);
+        seed.AdvanceTo(GoalPhase.Coding);
+        seed.SetActiveTask("cleanup-held-task");
+        seedManager.PersistFull(seed);
+
+        var manager = new GoalPipelineManager(pipelineStore);
+        var held = Assert.Single(manager.RestoreFromStore(), p => p.GoalId == heldGoal.Id);
+        Assert.True(held.IsRestoredActiveAttemptHold);
+
+        // The control has the SAME eligible goal shape but a fresh Goal-created pipeline, so it is
+        // explicitly UNHELD while still present in the manager used by the filter.
+        var control = manager.CreatePipeline(controlGoal);
+        Assert.False(control.IsRestoredActiveAttemptHold);
+
+        var goalStore = new Mock<IGoalStore>();
+        goalStore.Setup(s => s.GetGoalsByStatusAsync(GoalStatus.Completed, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<Goal>)[heldGoal, controlGoal]);
+
+        var repoManager = new Mock<IBrainRepoManager>();
+        repoManager.Setup(r => r.DeleteRemoteBranchAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BranchDeleteResult.Success);
+        var config = new HiveConfigFile { Orchestrator = { BranchCleanupDelayHours = 48 } };
+        var maintenance = CreateMaintenance(
+            goalStore.Object, repoManager.Object, config, pipelineManager: manager);
+
+        await maintenance.CleanupMergedBranchesAsync(CancellationToken.None);
+
+        // HELD: zero deletion and zero goal update; its persisted cleanup flag stays false.
+        repoManager.Verify(r => r.DeleteRemoteBranchAsync(
+            "held-repo", "copilothive/cleanup-held", It.IsAny<CancellationToken>()), Times.Never);
+        goalStore.Verify(s => s.UpdateGoalAsync(heldGoal, It.IsAny<CancellationToken>()), Times.Never);
+        Assert.False(heldGoal.BranchCleanedUp);
+
+        // UNHELD CONTROL: cleanup really ran end-to-end.
+        repoManager.Verify(r => r.DeleteRemoteBranchAsync(
+            "control-repo", "copilothive/cleanup-unheld", It.IsAny<CancellationToken>()), Times.Once);
+        goalStore.Verify(s => s.UpdateGoalAsync(controlGoal, It.IsAny<CancellationToken>()), Times.Once);
+        Assert.True(controlGoal.BranchCleanedUp);
+        repoManager.VerifyNoOtherCalls();
+    }
+
     [Fact]
     public async Task CleanupMergedBranches_GoalPastDelayWindow_SetsBranchCleanedUpAndPersists()
     {
@@ -559,12 +622,15 @@ public sealed class DispatcherMaintenanceTests
     }
 
     [Fact]
-    public async Task RestoreActivePipelinesAsync_ActivePipelineButPendingGoal_PersistsInProgress()
+    public async Task RestoreActivePipelinesAsync_HeldRestoredAttempt_PreservesStalePendingGoalRow()
     {
         using var db = CopilotHiveDbContext.CreateInMemory();
         await using var pipelineStore = new PipelineStore(db, NullLogger<PipelineStore>.Instance);
 
         // Goal status drifted to Pending while its pipeline is genuinely mid-task.
+        // THE RESTORE-ORIGIN HOLD: the restored non-null active-task pointer means the attempt is
+        // still owned — orchestrator restart alone is not permission to repair the goal row (or to
+        // re-dispatch), so NOTHING is updated and the hold warning is emitted instead.
         var goal = new Goal { Id = "stale-pending-goal", Description = "Stale pending", Status = GoalStatus.Pending };
         var originalManager = new GoalPipelineManager(pipelineStore);
         var pipeline = originalManager.CreatePipeline(goal);
@@ -580,6 +646,7 @@ public sealed class DispatcherMaintenanceTests
         var goalManager = new GoalManager();
         goalManager.AddSource(goalStore.Object);
 
+        var logger = new TestLogger<StaleWorkerCleanupService>();
         var maintenance = CreateMaintenance(
             goalStore: goalStore.Object,
             pipelineManager: freshManager,
@@ -587,13 +654,20 @@ public sealed class DispatcherMaintenanceTests
 
         await maintenance.RestoreActivePipelinesAsync(CancellationToken.None);
 
+        // THE HOLD: no goal-row status repair at all — the old InProgress rewrite is refused.
         goalStore.Verify(
             s => s.UpdateGoalStatusAsync(
-                goal.Id,
-                GoalStatus.InProgress,
-                It.Is<GoalUpdateMetadata?>(m => m != null && m.StartedAt != null),
+                It.IsAny<string>(),
+                It.IsAny<GoalStatus>(),
+                It.IsAny<GoalUpdateMetadata?>(),
                 It.IsAny<CancellationToken>()),
-            Times.Once);
+            Times.Never);
+
+        // The held instance stays in the manager, still owning its restored pointer.
+        var held = freshManager.GetByGoalId(goal.Id);
+        Assert.NotNull(held);
+        Assert.True(held!.IsRestoredActiveAttemptHold);
+        Assert.Equal("stale-pending-goal-coder-001", held.ActiveTaskId);
     }
 
     [Fact]

@@ -244,6 +244,20 @@ internal sealed class TaskDispatchService
 
     internal async Task DispatchToRole(GoalPipeline pipeline, WorkerRole role, string? prompt, CancellationToken ct)
     {
+        // THE HOLD FENCE — at ENTRY, before the preparation. A held pipeline still owns the
+        // attempt it was restored with, so this dispatch is refused BEFORE the model/tier
+        // resolution, the repository/credential preparation, the lifecycle failure handling, the
+        // dispatch-position capture, the admission/enqueue and any gateway activity: nothing is
+        // prepared, mutated, admitted or delivered. The refusal is NOT a failure and is NOT a
+        // throw — the guarded emission cannot turn a logger fault into one.
+        if (pipeline.IsRestoredActiveAttemptHold)
+        {
+            LogSafely(() => _logger.LogWarning(
+                "WorkSlotIntegrity: dispatch-refused goal={GoalId} task={TaskId} role={Role} — the restored active attempt is held awaiting reconciliation; nothing was prepared, admitted or delivered",
+                pipeline.GoalId, pipeline.ActiveTaskId, role.ToRoleName()));
+            return;
+        }
+
         // PHASE 1 of the preparation. The missing-model refusal propagates from here UNCAUGHT.
         var head = BuildDispatchContext(pipeline, role, prompt);
 
