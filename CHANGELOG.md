@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+## [0.39.0] — 2026-09-21
+
+### Added
+
+- **Complete phase evidence and Brain context** — Selected phase reports now retain failed-worker diagnostics, coder no-op evidence including whitespace-only reports, and archived worker narratives. Review, retry, replanning, planning, and clarification prompts receive the complete relevant inputs. Tester workers again own test authoring, with per-command validation budgets and evidence capture guidance.
+- **Durable ownership and completion evidence** — Assignment context, model provenance, completion receipts, registry/checkpoint ownership, and rollback wiring are retained through the live ordinary manager path. Instance-pinned atomic assignment claims, negotiated same-live-stream completion ACKs, readiness gating, and same-stream retransmission protect delivery. Standalone store primitives remain available but are not presented as live recovery capabilities.
+- **Worker capacity and registry visibility** — Capacity projections distinguish Available from Awaiting-Ready workers, while legacy Idle continues to mean not-busy rather than assignable capacity. Restored active-pointer holds and validated registry hydration/classification preserve evidence for reconciliation; the pre-registration read-only receipt query has no worker production caller.
+
+### Changed
+
+- **Improver guidance lifecycle** — Guidance updates use an 8,000-character append-new/compress-old policy, verified workspace cleanup, and truthful publication diagnostics including stdout and stderr. Exhausted compression completes as `SKIP` without publication only after cleanup is verified; preparation or publication failures can still fail the parent goal. Metrics-triggered automatic `AGENTS.md` rollback was removed. The policy does not mechanically guarantee model compliance or readability, and concurrent semantic guidance-conflict resolution is deferred.
+- **SharpCoder dependencies** — SharpCoder and SharpCoder.Providers are consumed at 0.20.1. Deleted compatibility APIs, including `SubAgentOptions.MaxSummaryChars`, are not reintroduced.
+- **Operational completion protocol** — Completion receipts are durable retained evidence, not processed state, recovery permission, or exactly-once effects. Completion ACKs are negotiated on and scoped to the same live stream; Ready is accepted after confirmed receipt, and unacknowledged completion is retransmitted on that stream. Stream/disconnect loss can cancel or drain tasks and discard worker-retained evidence.
+
+### Fixed
+
+- **Actor and test reliability** — `Actor.DisposeAsync` now closes mailbox admission (`Writer.TryComplete`) before cancelling the loop token, so cancellation-triggered `Tell` calls are rejected rather than silently accepted during shutdown. Streaming/completion observation gates, disposal-while-streaming determinism, ACK-fixture completion-notification synchronization, and related CI-flake, stale-fixture, and test-isolation repairs make the reliability suite deterministic.
+
+### Limitations and upgrade note
+
+- **Restart recovery is not delivered** — v0.39.0 does not provide full non-destructive orchestrator restart. Held nonterminal active-pointer restores retain valid evidence but do not automatically resume or release; they can remain paused indefinitely, count against parallel-goal capacity, and remain checkpoint-ineligible. There is no recovered running/completed/idle handshake, lost-Ready recovery, or safe crash-window processing replay. Full integration is planned for 0.40.0, not delivered and not guaranteed by a date.
+- **Planned maintenance is manual** — Stop new submissions and approvals, including automation; keep new work Draft, revert eligible Pending work to Draft, and let actual active goals and worker tasks finish. This is not an atomic drain switch and there is no general drain or unhold action. Preserve relevant history, branches, and worker-local work before destructive choices. Cancellation removes pipeline ownership, marks a user-cancelled failure, may leave a worker running, is not a pause, and cannot later use branch-preserving extend-iterations resume. Failed → Draft reset followed by approval is a fresh run that can clear history and pipeline retry state and attempt feature-branch deletion. Delete is Draft/Failed only and destructive. Ordinary failed-goal resume requires an eligible failed pipeline with a branch or iteration exhaustion; it is not active-hold release.
+
 ## [0.38.0] — 2026-09-08
 
 ### Added
